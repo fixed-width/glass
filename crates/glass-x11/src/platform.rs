@@ -232,6 +232,15 @@ impl X11Platform {
         })
     }
 
+    /// Send everything buffered so far, without waiting for a reply. The input sinks commit
+    /// each step this way: a client that renders per frame sees a gesture unfold, where one
+    /// flush at the end delivers it as a single jump.
+    fn commit(&self) -> Result<()> {
+        self.conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
+    }
+
     /// Intern an atom by name (small helper for the multi-window scans).
     fn intern(&self, name: &[u8]) -> Result<Atom> {
         Ok(self
@@ -799,10 +808,7 @@ impl X11Platform {
         self.conn
             .set_input_focus(InputFocus::PARENT, win, x11rb::CURRENT_TIME)
             .map_err(|e| GlassError::Backend(format!("set_input_focus: {e}")))?;
-        self.conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-        Ok(())
+        self.commit()
     }
 
     /// Resolve a window-relative `region` (or the whole window) against `geo`
@@ -901,27 +907,18 @@ struct X11DragSink<'a> {
     kcs: Vec<u8>,
 }
 
-impl X11DragSink<'_> {
-    fn flush(&self) -> Result<()> {
-        self.p
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
-    }
-}
-
 impl glass_core::DragSink for X11DragSink<'_> {
     fn place(&mut self, x: i32, y: i32) -> Result<()> {
         self.move_to(x, y)
     }
     fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
         self.p.warp(self.ox, self.oy, x, y)?;
-        self.flush()
+        self.p.commit()
     }
     fn button(&mut self, down: bool) -> Result<()> {
         let kind = if down { XT_BTN_PRESS } else { XT_BTN_RELEASE };
         self.p.button(kind, self.b)?;
-        self.flush()
+        self.p.commit()
     }
     fn modifiers(&mut self, down: bool) -> Result<()> {
         if down {
@@ -929,7 +926,7 @@ impl glass_core::DragSink for X11DragSink<'_> {
         } else {
             self.p.release_mods(&self.kcs)?;
         }
-        self.flush()
+        self.p.commit()
     }
 }
 
@@ -950,10 +947,7 @@ impl glass_core::TypeSink for X11TypeSink<'_> {
         })?;
         self.idx += 1;
         self.p.key_with_mods(keysym, false, &[])?;
-        self.p
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
+        self.p.commit()
     }
 }
 
@@ -967,15 +961,6 @@ struct X11ChordSink<'a> {
     kcs: Vec<u8>,
 }
 
-impl X11ChordSink<'_> {
-    fn flush(&self) -> Result<()> {
-        self.p
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
-    }
-}
-
 impl glass_core::ChordSink for X11ChordSink<'_> {
     fn modifiers(&mut self, down: bool) -> Result<()> {
         if down {
@@ -983,7 +968,7 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
         } else {
             self.p.release_mods(&self.kcs)?;
         }
-        self.flush()
+        self.p.commit()
     }
     fn key(&mut self, down: bool) -> Result<()> {
         let kind = if down { XT_KEY_PRESS } else { XT_KEY_RELEASE };
@@ -999,7 +984,7 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
                 0,
             )
             .map_err(|e| GlassError::Backend(format!("xtest key: {e}")))?;
-        self.flush()
+        self.p.commit()
     }
 }
 
@@ -1018,15 +1003,6 @@ struct X11ScrollSink<'a> {
     kcs: Vec<u8>,
 }
 
-impl X11ScrollSink<'_> {
-    fn flush(&self) -> Result<()> {
-        self.p
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
-    }
-}
-
 impl glass_core::ScrollSink for X11ScrollSink<'_> {
     fn modifiers(&mut self, down: bool) -> Result<()> {
         if down {
@@ -1034,27 +1010,21 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
         } else {
             self.p.release_mods(&self.kcs)?;
         }
-        self.flush()
+        self.p.commit()
     }
     fn wheel(&mut self) -> Result<()> {
         self.p.warp(self.ox, self.oy, self.x, self.y)?;
         // 4=up,5=down,6=left,7=right; click |delta| times.
         self.p.scroll_button(5, 4, self.dy)?;
         self.p.scroll_button(7, 6, self.dx)?;
-        self.flush()
+        self.p.commit()
     }
 }
 
 impl Platform for X11Platform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        if spec.sandbox != glass_core::SandboxLevel::Off
-            && let glass_sandbox_linux::Availability::Unavailable(why) =
-                glass_sandbox_linux::availability()
-        {
-            return Err(GlassError::SandboxUnavailable(format!(
-                "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
-                     sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
-            )));
+        if let Some(e) = sandbox_refusal(spec.sandbox, glass_sandbox_linux::availability()) {
+            return Err(e);
         }
         glass_sandbox_linux::run_build(spec)?;
         // Opt-in private, isolated a11y bus (its own XDG_RUNTIME_DIR — never the host
@@ -1213,10 +1183,7 @@ impl Platform for X11Platform {
                 return Err(crate::unsupported_multi_touch());
             }
         }
-        self.conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-        Ok(())
+        self.commit()
     }
 
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
@@ -1245,10 +1212,7 @@ impl Platform for X11Platform {
                 glass_core::run_chord(&mut sink)?;
             }
         }
-        self.conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-        Ok(())
+        self.commit()
     }
 
     fn get_clipboard(&mut self) -> Result<String> {
@@ -1399,6 +1363,27 @@ impl Drop for X11Platform {
     }
 }
 
+/// Why a launch cannot go ahead under the requested containment, or `None` when it can.
+/// A `sandbox:"off"` launch never consults availability — bubblewrap being absent is not a
+/// reason to refuse a launch that was never going to use it.
+///
+/// Split from the probe so both answers are reachable from a test: whether bubblewrap works
+/// is a property of the machine the tests run on, not something they can choose.
+fn sandbox_refusal(
+    level: glass_core::SandboxLevel,
+    availability: glass_sandbox_linux::Availability,
+) -> Option<GlassError> {
+    match (level, availability) {
+        (glass_core::SandboxLevel::Off, _) | (_, glass_sandbox_linux::Availability::Ok) => None,
+        (_, glass_sandbox_linux::Availability::Unavailable(why)) => {
+            Some(GlassError::SandboxUnavailable(format!(
+                "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
+                 sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
+            )))
+        }
+    }
+}
+
 /// Search a `GetKeyboardMapping` table for `keysym`, returning the keycode that produces it
 /// and whether Shift is needed — column 0 is the unshifted keysym, column 1 the shifted one.
 ///
@@ -1532,6 +1517,40 @@ mod tests {
         let map = vec![0xaa, 0xbb, 0xcc];
         assert_eq!(super::keycode_in(&map, 1, 8, 10, 0xbb), Some((9, false)));
         assert_eq!(super::keycode_in(&map, 1, 8, 10, 0xcc), Some((10, false)));
+    }
+
+    #[test]
+    fn an_unconfined_launch_does_not_need_bubblewrap() {
+        use glass_core::SandboxLevel;
+        use glass_sandbox_linux::Availability;
+        assert!(
+            super::sandbox_refusal(
+                SandboxLevel::Off,
+                Availability::Unavailable("no bwrap".into())
+            )
+            .is_none(),
+            "sandbox:off never uses bubblewrap, so its absence cannot refuse the launch"
+        );
+    }
+
+    #[test]
+    fn a_contained_launch_is_refused_when_bubblewrap_cannot_work() {
+        use glass_core::{GlassError, SandboxLevel};
+        use glass_sandbox_linux::Availability;
+        let err = super::sandbox_refusal(
+            SandboxLevel::Default,
+            Availability::Unavailable("no user namespaces".into()),
+        )
+        .expect("a contained launch cannot proceed without containment");
+        assert!(matches!(err, GlassError::SandboxUnavailable(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("no user namespaces"),
+            "the real cause must survive into the message: {err}"
+        );
+        assert!(
+            super::sandbox_refusal(SandboxLevel::Default, Availability::Ok).is_none(),
+            "a working bubblewrap refuses nothing"
+        );
     }
 
     #[test]
@@ -2239,6 +2258,94 @@ mod display_tests {
     }
 
     #[test]
+    fn a_drag_with_a_modifier_holds_it_from_before_the_press_to_after_the_release() {
+        // A constrained drag (shift to snap an axis, ctrl to copy) is a different gesture
+        // from the same drag unmodified.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_pointer(&PointerEvent::Drag {
+            from_x: 10,
+            from_y: 10,
+            to_x: 80,
+            to_y: 80,
+            button: glass_core::MouseButton::Left,
+            modifiers: vec![glass_core::keys::Modifier::Shift],
+            duration_ms: 40,
+        })
+        .expect("drag");
+
+        let shift = plat
+            .modifier_keycode(glass_core::keys::Modifier::Shift)
+            .expect("shift");
+        let events = x.drain_events(Duration::from_millis(120));
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                x11rb::protocol::Event::KeyPress(k) if k.detail == shift
+            )),
+            "the modifier must go down for a modified drag: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                x11rb::protocol::Event::KeyRelease(k) if k.detail == shift
+            )),
+            "and must not be left held afterwards: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_drag_reaches_the_window_while_it_is_still_running() {
+        // Each step commits on its own. Held to one flush at the end, a client that renders
+        // per frame — a browser — sees the pointer jump rather than drag.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        let arrived_early = std::thread::scope(|s| {
+            s.spawn(|| {
+                plat.send_pointer(&PointerEvent::Drag {
+                    from_x: 10,
+                    from_y: 10,
+                    to_x: 300,
+                    to_y: 300,
+                    button: glass_core::MouseButton::Left,
+                    modifiers: vec![],
+                    duration_ms: 600,
+                })
+                .expect("drag");
+            });
+            // A third of the way in: far enough that the press and several motions are due,
+            // far enough from the end that a loaded machine cannot blur the two.
+            std::thread::sleep(Duration::from_millis(200));
+            !x.drain_events(Duration::ZERO).is_empty()
+        });
+
+        assert!(
+            arrived_early,
+            "nothing had reached the window 200ms into a 600ms drag"
+        );
+    }
+
+    #[test]
     fn a_multi_touch_gesture_is_refused_by_this_backend() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2605,6 +2712,118 @@ mod display_tests {
             plat.app_pid(),
             None,
             "a launch that failed must not leave its child behind"
+        );
+    }
+
+    #[test]
+    fn a_launch_waits_out_its_timeout_before_giving_up() {
+        // A deadline computed backwards, or a comparison the wrong way round, still reports a
+        // Timeout — it just reports it immediately, turning the caller's budget into nothing
+        // and failing every app slower than instant.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let spec = AppSpec {
+            build: None,
+            run: vec!["sleep".to_string(), "30".to_string()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 400,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
+        };
+        let started = Instant::now();
+        let err = plat.start_app(&spec).expect_err("no window ever appears");
+        let waited = started.elapsed();
+        assert!(matches!(err, GlassError::Timeout(400)), "{err:?}");
+        assert!(
+            waited >= Duration::from_millis(350),
+            "gave up after {waited:?}, which is not the 400ms budget it was given"
+        );
+    }
+
+    #[test]
+    fn an_untypable_character_is_reported_at_its_own_index() {
+        // The index is all the error may carry — naming the character would put typed
+        // content into the unredacted audit log — so it has to advance per character.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().create();
+        plat.window = Some(win);
+        let err = plat
+            .send_key(&KeyEvent::Text("a€".to_string()))
+            .expect_err("€ has no X11 keysym");
+        assert!(err.to_string().contains("index 1"), "{err}");
+    }
+
+    #[test]
+    fn a_scroll_with_a_modifier_holds_it_across_the_wheel() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_pointer(&PointerEvent::Scroll {
+            x: 5,
+            y: 5,
+            dx: 0,
+            dy: -1,
+            modifiers: vec![glass_core::keys::Modifier::Control],
+        })
+        .expect("scroll");
+
+        let control = plat
+            .modifier_keycode(glass_core::keys::Modifier::Control)
+            .expect("control");
+        let keys: Vec<u8> = x
+            .drain_events(Duration::from_millis(150))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            keys.contains(&control),
+            "a modified scroll must hold the modifier down: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_chord_whose_key_needs_shift_gets_shift_as_well_as_its_own_modifiers() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().watching_input().create();
+        plat.window = Some(win);
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_key(&KeyEvent::Chord("ctrl+A".to_string()))
+            .expect("chord");
+
+        let shift = plat
+            .modifier_keycode(glass_core::keys::Modifier::Shift)
+            .expect("shift");
+        let keys: Vec<u8> = x
+            .drain_events(Duration::from_millis(100))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            keys.contains(&shift),
+            "`A` sits in the shifted column, so ctrl+A is ctrl+shift+a: {keys:?}"
         );
     }
 

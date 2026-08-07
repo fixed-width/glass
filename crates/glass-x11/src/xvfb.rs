@@ -437,12 +437,19 @@ mod tests {
         // else entirely if it is wrong.
         let script = fixture("pid.sh", "echo 4321\nexec sleep 30\n");
         let server = start_fixture(&script, Duration::from_secs(5)).expect("must start");
-        let cmdline = std::fs::read(format!("/proc/{}/cmdline", server.pid()))
+        // Its parent, not its command line: the fixture `exec`s, so what it is running
+        // changes under it, while who spawned it does not.
+        let status = std::fs::read_to_string(format!("/proc/{}/status", server.pid()))
             .expect("the reported pid must be a live process");
-        let cmdline = String::from_utf8_lossy(&cmdline);
-        assert!(
-            cmdline.contains("pid.sh"),
-            "the reported pid must be this fixture's server, not another process: {cmdline}"
+        let parent = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .map(|v| v.trim().to_string())
+            .expect("every process reports a parent");
+        assert_eq!(
+            parent,
+            std::process::id().to_string(),
+            "the reported pid must be the server this test spawned, not another process"
         );
     }
 
