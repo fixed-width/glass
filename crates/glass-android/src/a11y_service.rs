@@ -102,10 +102,6 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
             walk.budget.hit(TruncationLimit::Depth);
             vec![]
         }
-        Some(_) if walk.budget.nodes_exhausted() => {
-            walk.budget.hit(TruncationLimit::Nodes);
-            vec![]
-        }
         Some(arr) => {
             let mut out = Vec::new();
             for (i, c) in arr.iter().enumerate() {
@@ -607,7 +603,9 @@ pub fn a11y_apk(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
 }
 
 struct Active {
-    serial: Option<String>,
+    /// The client the service was enabled through, kept rather than resolved again at teardown:
+    /// `Adb::from_env` reads the environment as it is *then*, which need not be what set this up.
+    adb: Adb,
     port: u16,
     prior_enabled: String,
     prior_a11y_enabled: String,
@@ -663,18 +661,11 @@ impl A11yServiceRegistry {
             port,
             READY_ATTEMPT,
             READY_ATTEMPTS,
-            &|step| {
-                // Last resort: the reinstall is what SIGKILLs the service and starts this
-                // race, and also the only step observed to bring a stuck binding back.
-                if step + 1 == READY_ATTEMPTS {
-                    install_service(adb, apk)?;
-                }
-                force_rebind(adb, &want)
-            },
+            &|step| escalate(adb, apk, &want, step, READY_ATTEMPTS),
             &|| restore_a11y(adb, prior, prior_a11y, port),
         )?;
         *self.state.lock().unwrap() = Some(Active {
-            serial: adb.serial().map(str::to_string),
+            adb: adb.clone(),
             port,
             prior_enabled: prior.to_string(),
             prior_a11y_enabled: prior_a11y.to_string(),
@@ -688,13 +679,22 @@ impl A11yServiceRegistry {
         if let Ok(mut g) = self.state.lock()
             && let Some(a) = g.take()
         {
-            let adb = match &a.serial {
-                Some(s) => Adb::from_env().with_serial(s.clone()),
-                None => Adb::from_env(),
-            };
-            restore_a11y(&adb, &a.prior_enabled, &a.prior_a11y_enabled, a.port);
+            restore_a11y(&a.adb, &a.prior_enabled, &a.prior_a11y_enabled, a.port);
         }
     }
+}
+
+/// The recovery for the `step`th readiness attempt that was refused for its whole budget: force
+/// the service's binding to be rebuilt, and on the LAST attempt reinstall the APK first.
+///
+/// The reinstall is what SIGKILLs the service and starts this race in the first place, and also
+/// the only step observed to bring a stuck binding back — so it is the last resort rather than
+/// the first move.
+fn escalate(adb: &Adb, apk: &str, want: &str, step: u32, attempts: u32) -> Result<()> {
+    if step + 1 == attempts {
+        install_service(adb, apk)?;
+    }
+    force_rebind(adb, want)
 }
 
 fn put_secure(adb: &Adb, key: &str, value: &str) -> Result<()> {
@@ -1186,6 +1186,147 @@ mod tests {
             "Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]"
         )));
         assert!(!is_signature_mismatch(&failed("error: device offline")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_install_recovers_from_a_differently_signed_build_and_reports_anything_else() {
+        use crate::adb::{Answer, FakeAdb};
+
+        // A clean install: one call, nothing removed.
+        let clean = FakeAdb::new(&[("*", Answer::Silent)]);
+        install_service(clean.adb(), "/opt/glass/glass-a11y.apk").expect("a clean install");
+        assert_eq!(clean.calls(), ["install -r /opt/glass/glass-a11y.apk"]);
+
+        // A differently-signed build already present: glass owns this package, so the stale copy
+        // goes and a fresh one is installed rather than the launch failing.
+        let stale_ok = Answer::fails(
+            "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package signatures do not \
+             match newer version; ignoring!]",
+        );
+        let fresh = Answer::Silent;
+        let mismatched = FakeAdb::scripted(&[
+            ("install *", vec![&stale_ok, &fresh]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+        install_service(mismatched.adb(), "/opt/glass/glass-a11y.apk")
+            .expect("a signature mismatch is recovered from");
+        assert!(
+            mismatched.called(&format!("uninstall {SERVICE_PACKAGE}")),
+            "{:?}",
+            mismatched.calls()
+        );
+
+        // Any other failure is reported, and nothing is uninstalled on the strength of it.
+        let other = FakeAdb::new(&[(
+            "install *",
+            Answer::fails("Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]"),
+        )]);
+        let err = install_service(other.adb(), "/opt/glass/glass-a11y.apk")
+            .expect_err("a full device is not a signature mismatch");
+        assert!(err.to_string().contains("INSUFFICIENT_STORAGE"), "{err}");
+        assert!(!other.called("uninstall"), "{:?}", other.calls());
+    }
+
+    #[test]
+    fn the_service_apk_is_the_configured_one_unless_accessibility_is_turned_off() {
+        let configured = |k: &str| match k {
+            "GLASS_ANDROID_A11Y_APK" => Some("/opt/glass/glass-a11y.apk".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            a11y_apk(&configured).as_deref(),
+            Some("/opt/glass/glass-a11y.apk")
+        );
+
+        let turned_off = |k: &str| match k {
+            "GLASS_ANDROID_A11Y" => Some("off".to_string()),
+            "GLASS_ANDROID_A11Y_APK" => Some("/opt/glass/glass-a11y.apk".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            a11y_apk(&turned_off),
+            None,
+            "off must win over a configured path, or the reader installs what it was told not to"
+        );
+    }
+
+    #[test]
+    fn a_node_is_placed_relative_to_the_window_and_reported_visible() {
+        // The device sends screen-absolute bounds and the window here starts at y=100, so an
+        // offset applied the wrong way puts every node twice the status bar's height down the
+        // screen — and a click lands there.
+        let node = mapped(Some("Save"), None);
+        let bounds = node.bounds.expect("the device always sends bounds");
+        assert_eq!(
+            (bounds.x, bounds.y),
+            (0, 0),
+            "screen y=100 in a window at y=100"
+        );
+        // The companion only ever describes what is on screen, and a node reported invisible is
+        // one `wait_for_element` will never settle on.
+        assert!(node.states.visible);
+    }
+
+    #[test]
+    fn a_child_list_stops_at_the_node_budget_and_says_so() {
+        // The cap is checked before each child rather than after, so the child that merely
+        // completes the tree is not mistaken for one the walk declined to visit.
+        let wide = json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 100, "h": 100},
+            "enabled": true,
+            "children": (0..8).map(|i| json!({
+                "class": "android.widget.TextView",
+                "text": format!("row {i}"),
+                "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
+                "enabled": true,
+            })).collect::<Vec<_>>(),
+        });
+        let mut walk = Walk::new(WalkLimits {
+            nodes: 4,
+            ..WalkLimits::DEFAULT
+        });
+        let root = json_to_node(&with_refs(&wide), &win(), 0, &mut walk).expect("maps");
+
+        assert!(root.children.len() < 8, "the cap must stop the walk");
+        assert_eq!(
+            walk.budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Nodes),
+            "a walk that declined children must say which cap did it"
+        );
+    }
+
+    #[test]
+    fn enclosure_is_measured_from_each_rectangle_far_edge() {
+        let rect = |x, y, width, height| {
+            Some(AxRect {
+                x,
+                y,
+                width,
+                height,
+            })
+        };
+        let outer = rect(0, 0, 100, 100);
+
+        assert!(
+            encloses(outer, rect(10, 10, 50, 50)),
+            "a box wholly inside is enclosed"
+        );
+        assert!(
+            !encloses(outer, rect(60, 10, 60, 50)),
+            "one whose right edge is past the outer's is not"
+        );
+        assert!(
+            !encloses(outer, rect(10, 60, 50, 60)),
+            "nor one whose bottom edge is"
+        );
+        assert!(
+            encloses(outer, rect(0, 0, 100, 100)),
+            "edges are inclusive, so an exact fit encloses"
+        );
+        assert!(!encloses(outer, None), "geometry that cannot be checked");
+        assert!(!encloses(None, rect(10, 10, 10, 10)));
     }
 
     /// `GLASS_ANDROID_A11Y_APK` is caller-supplied and lands in the argv the error names, so a
@@ -2405,6 +2546,18 @@ mod tests {
         packages: Vec<TreePackage>,
         on_tree: Vec<OnTree>,
     ) -> (u16, Arc<Mutex<Vec<String>>>) {
+        fake_service_stumbling(trees, on_action, packages, on_tree, 0)
+    }
+
+    /// [`fake_service_full`], dropping the first `stumbles` connections before the hello — a
+    /// service whose socket is up but which is not answering yet.
+    fn fake_service_stumbling(
+        trees: Vec<Value>,
+        on_action: Vec<OnAction>,
+        packages: Vec<TreePackage>,
+        on_tree: Vec<OnTree>,
+        stumbles: usize,
+    ) -> (u16, Arc<Mutex<Vec<String>>>) {
         // Numbered on the way out, like the real companion's `treeJson`, so a fixture never has
         // to restate what every device reply carries.
         let trees: Vec<Value> = trees.iter().map(with_refs).collect();
@@ -2418,6 +2571,10 @@ mod tests {
             let mut requested = 0usize;
             while let Ok((sock, _)) = listener.accept() {
                 conn += 1;
+                if conn <= stumbles {
+                    log.lock().unwrap().push(format!("conn{conn}:dropped"));
+                    continue;
+                }
                 let this_action = on_action[(conn - 1).min(on_action.len() - 1)];
                 let Ok(mut w) = sock.try_clone() else { break };
                 let mut r = std::io::BufReader::new(sock);
@@ -2680,6 +2837,275 @@ mod tests {
              failed, or worse — Refused's own AnswerLost sibling would read as a lost result \
              for an action that never left the host): {}",
             e.into_error()
+        );
+    }
+
+    /// A device that answers everything `ensure` asks, with `enabled_accessibility_services`
+    /// already reading `prior` and the forward landing on `port`.
+    #[cfg(unix)]
+    fn a_device_ready_to_enable(
+        prior: &str,
+        prior_enabled: &str,
+        port: u16,
+    ) -> crate::adb::FakeAdb {
+        use crate::adb::{Answer, FakeAdb};
+        FakeAdb::new(&[
+            (
+                "*settings get secure enabled_accessibility_services",
+                Answer::says(format!("{prior}\n")),
+            ),
+            (
+                "*settings get secure accessibility_enabled",
+                Answer::says(format!("{prior_enabled}\n")),
+            ),
+            ("*forward tcp:0 *", Answer::says(format!("{port}\n"))),
+            ("*", Answer::Silent),
+        ])
+    }
+
+    /// The value the last `settings put secure enabled_accessibility_services` wrote.
+    #[cfg(unix)]
+    fn enabled_list_written(fake: &crate::adb::FakeAdb) -> String {
+        fake.calls()
+            .iter()
+            .filter_map(|c| {
+                c.split_once("settings put secure enabled_accessibility_services ")
+                    .map(|(_, v)| v.to_string())
+            })
+            .next_back()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn enabling_the_service_adds_it_to_whatever_the_device_already_had() {
+        // The device's other accessibility services must survive: dropping them would turn off
+        // a screen reader for the duration of a glass session and leave it off if teardown is
+        // missed.
+        let (port, _ops) = fake_service(vec![compose_like()], OnAction::Ok);
+        let fake = a_device_ready_to_enable("com.other/.Reader", "1", port);
+
+        let registry = A11yServiceRegistry::new();
+        registry
+            .ensure(fake.adb(), "/opt/glass/glass-a11y.apk")
+            .expect("the service is installed, enabled and serving");
+
+        assert_eq!(
+            enabled_list_written(&fake),
+            format!("com.other/.Reader:{SERVICE_COMPONENT}"),
+            "{:?}",
+            fake.calls()
+        );
+        assert!(
+            fake.called("settings put secure accessibility_enabled 1"),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn enabling_a_service_the_device_already_lists_does_not_list_it_twice() {
+        let (port, _ops) = fake_service(vec![compose_like()], OnAction::Ok);
+        let already = format!("com.other/.Reader:{SERVICE_COMPONENT}");
+        let fake = a_device_ready_to_enable(&already, "1", port);
+
+        let registry = A11yServiceRegistry::new();
+        registry
+            .ensure(fake.adb(), "/opt/glass/glass-a11y.apk")
+            .expect("the service is already listed");
+
+        assert_eq!(enabled_list_written(&fake), already, "{:?}", fake.calls());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_device_with_no_accessibility_at_all_is_restored_to_exactly_that() {
+        // `settings get` prints the string "null" for an unset key. Carrying that through as a
+        // value would enable a service literally named `null` and restore one on teardown.
+        let (port, _ops) = fake_service(vec![compose_like()], OnAction::Ok);
+        let fake = a_device_ready_to_enable("null", "null", port);
+
+        let registry = A11yServiceRegistry::new();
+        registry
+            .ensure(fake.adb(), "/opt/glass/glass-a11y.apk")
+            .expect("the service comes up on a device with none enabled");
+        assert_eq!(
+            enabled_list_written(&fake),
+            SERVICE_COMPONENT,
+            "{:?}",
+            fake.calls()
+        );
+
+        registry.shutdown();
+
+        // An empty list is a `delete`, and the global flag goes back to off rather than to "null".
+        assert!(
+            fake.called("settings delete secure enabled_accessibility_services"),
+            "{:?}",
+            fake.calls()
+        );
+        assert!(
+            fake.called("settings put secure accessibility_enabled 0"),
+            "{:?}",
+            fake.calls()
+        );
+        assert!(
+            fake.called(&format!("forward --remove tcp:{port}")),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shutting_down_restores_what_the_device_had_and_only_once() {
+        let (port, _ops) = fake_service(vec![compose_like()], OnAction::Ok);
+        let fake = a_device_ready_to_enable("com.other/.Reader", "1", port);
+
+        let registry = A11yServiceRegistry::new();
+        registry
+            .ensure(fake.adb(), "/opt/glass/glass-a11y.apk")
+            .expect("the service comes up");
+        registry.shutdown();
+
+        assert_eq!(
+            enabled_list_written(&fake),
+            "com.other/.Reader",
+            "the device's own service is put back, without glass's"
+        );
+
+        let after = fake.calls().len();
+        registry.shutdown();
+        assert_eq!(
+            fake.calls().len(),
+            after,
+            "a second shutdown must not touch a device glass no longer owns"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_rebind_reinstalls_only_as_a_last_resort() {
+        // The reinstall is what SIGKILLs the service and starts the binding race, so trying it
+        // first would restart the very thing being waited on.
+        use crate::adb::{Answer, FakeAdb};
+        let want = format!("com.other/.Reader:{SERVICE_COMPONENT}");
+
+        let early = FakeAdb::new(&[("*", Answer::Silent)]);
+        escalate(early.adb(), "/opt/glass/glass-a11y.apk", &want, 0, 3)
+            .expect("a rebind on its own");
+        assert!(!early.called("install"), "{:?}", early.calls());
+        // It disables and re-enables, which is what makes the platform rebuild the binding.
+        assert!(
+            early.called("settings put secure accessibility_enabled 0"),
+            "{:?}",
+            early.calls()
+        );
+        assert!(
+            early.called("settings put secure accessibility_enabled 1"),
+            "{:?}",
+            early.calls()
+        );
+
+        let last = FakeAdb::new(&[("*", Answer::Silent)]);
+        escalate(last.adb(), "/opt/glass/glass-a11y.apk", &want, 2, 3)
+            .expect("the last attempt reinstalls first");
+        assert!(last.called("install -r"), "{:?}", last.calls());
+    }
+
+    #[test]
+    fn readiness_keeps_trying_a_socket_that_is_not_answering_yet() {
+        // Between the reinstall's SIGKILL and the rebind the service accepts and then drops the
+        // connection. Taking that first refusal as the answer would fail a launch that is a
+        // fraction of a second from working.
+        let (port, ops) = fake_service_stumbling(
+            vec![compose_like()],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+            vec![OnTree::Serve],
+            2,
+        );
+        wait_for_ready(port, READY_ATTEMPT).expect("the third connection is greeted");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:dropped".to_string(),
+                "conn2:dropped".to_string(),
+                "conn3:tree".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn readiness_gives_up_on_a_socket_that_never_greets() {
+        // The other side of the case above: a service that never comes back has to end the
+        // attempt, or `ensure` waits on it for as long as the process lives.
+        let (port, _ops) = fake_service_stumbling(
+            vec![compose_like()],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+            vec![OnTree::Serve],
+            usize::MAX,
+        );
+        let started = std::time::Instant::now();
+        let Err(err) = wait_for_ready(port, std::time::Duration::from_millis(300)) else {
+            panic!("a socket that never answers cannot become ready");
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "waited {:?} — the deadline never ended the wait",
+            started.elapsed()
+        );
+        assert!(err.contains("never accepted a connection"), "{err}");
+    }
+
+    #[test]
+    fn a_bounded_read_does_not_leave_its_bound_on_the_connection() {
+        // The socket outlives any one request, so a bound left behind would apply to a later
+        // call that never agreed to it — including a snapshot with no deadline at all, which
+        // would then give up in whatever time the last bounded caller happened to name.
+        let (port, _ops) = fake_service(vec![compose_like()], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let mut bounded = ctx();
+        bounded.deadline = AxDeadline::from_millis(500);
+        a.snapshot(&bounded).expect("a bounded snapshot");
+
+        let left = a
+            .client
+            .conn
+            .lock()
+            .expect("conn lock")
+            .writer
+            .read_timeout()
+            .expect("the socket has a read timeout");
+        assert!(
+            left.is_none_or(|d| d > std::time::Duration::from_secs(5)),
+            "the next call would inherit {left:?} from this one"
+        );
+    }
+
+    #[test]
+    fn a_toggle_that_flips_a_beat_later_is_waited_for() {
+        // The toolkit updates its UI, and only then does the accessibility tree catch up, so the
+        // first read back after the click legitimately still shows the old state.
+        let (port, ops) = fake_service(
+            vec![
+                one_checkable("android.widget.CheckBox", false),
+                one_checkable("android.widget.CheckBox", false),
+                one_checkable("android.widget.CheckBox", true),
+            ],
+            OnAction::Ok,
+        );
+        let mut a = reader(port, std::time::Duration::from_secs(2));
+        let t = built(&one_checkable("android.widget.CheckBox", false));
+        a.invoke(&ctx(), &target_for(&t, AxNodeId(1)))
+            .expect("the state moves on the second read-back");
+        assert_eq!(
+            ops_of(&ops).iter().filter(|o| o.ends_with(":tree")).count(),
+            3,
+            "the plan's read plus two read-backs: {:?}",
+            ops_of(&ops)
         );
     }
 
@@ -3388,6 +3814,50 @@ mod tests {
             vec!["conn1:tree".to_string()],
             "nothing may be dispatched"
         );
+    }
+
+    #[test]
+    fn a_node_is_placed_relative_to_a_window_that_is_not_at_the_origin() {
+        // A window inset on both axes — the split-screen and freeform cases. With either offset
+        // at zero the arithmetic reads the same whichever way round it is, so both are non-zero.
+        let inset = WindowGeometry {
+            x: 40,
+            y: 100,
+            width: 600,
+            height: 800,
+        };
+        let node = json_to_node(
+            &with_refs(&json!({
+                "class": "android.widget.Button",
+                "bounds": {"x": 140, "y": 300, "w": 10, "h": 10},
+                "enabled": true,
+            })),
+            &inset,
+            0,
+            &mut Walk::new(WalkLimits::DEFAULT),
+        )
+        .expect("maps");
+        let bounds = node.bounds.expect("the device always sends bounds");
+        assert_eq!((bounds.x, bounds.y), (100, 200));
+    }
+
+    #[test]
+    fn a_value_that_lands_a_beat_later_is_waited_for_rather_than_called_a_failure() {
+        // ACTION_SET_TEXT is async — Compose recomposes, then the accessibility tree catches up
+        // — so the first read-back legitimately still shows the old text. Reporting that would
+        // send a caller to clear a field that is about to be right.
+        let (port, _ops) = fake_service(
+            vec![
+                editable_field("old"),
+                editable_field("old"),
+                editable_field("new"),
+            ],
+            OnAction::Ok,
+        );
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let seen = built(&editable_field("old"));
+        a.set_value(&ctx(), &target_for(&seen, AxNodeId(1)), "new")
+            .expect("the value lands on the second read-back");
     }
 
     #[test]
