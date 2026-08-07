@@ -176,9 +176,8 @@ impl EmulatorRegistry {
 
     /// Record an emulator glass booted, along with the adb client that reaches it.
     ///
-    /// The client is kept rather than resolved again at shutdown: `Adb::from_env` reads
-    /// `GLASS_ADB` and the SDK layout as they are *then*, which need not be what booted the
-    /// device — and the kill would go to a different adb than the boot did.
+    /// Do not resolve one at shutdown instead: `Adb::from_env` reads `GLASS_ADB` and the SDK
+    /// layout as they are *then*, so the kill could go to a different adb than the boot did.
     pub fn register(&self, adb: &Adb, serial: String) {
         if let Ok(mut g) = self.booted.lock() {
             g.push(adb.with_serial(serial));
@@ -412,8 +411,8 @@ mod tests {
 
     #[test]
     fn a_noise_line_is_dropped_for_whichever_reason_gives_it_away() {
-        // The line above carries a pipe AND spaces, so it cannot show which rule did the work.
-        // An AVD name has neither, and each of these has exactly one.
+        // `list_avds_parses_names_only`'s noise line carries a pipe AND spaces, so it cannot
+        // show which rule did the work. Each of these has exactly one.
         assert_eq!(parse_list_avds("INFO|crashdata\nglass\n"), ["glass"]);
         assert_eq!(parse_list_avds("Storing crashdata\nglass\n"), ["glass"]);
         assert_eq!(parse_list_avds("\n\nglass\n"), ["glass"]);

@@ -132,11 +132,9 @@ pub(crate) fn parse_forward_port(out: &str) -> Option<u16> {
 /// matching `responses[i]`, the request's own id spliced in. Returns the port and the requests it
 /// read.
 ///
-/// The requests are the point. The companion is an APK on an emulator, so a unit test can only
-/// reach this protocol — and a client method that returns `Ok(())` having sent nothing looks
-/// exactly like one that worked until something reads back what went out.
-///
-/// Lives beside the code rather than in `mod tests` so `input`'s injector tests can reach it too.
+/// Records the requests because a client method that returns `Ok(())` having sent nothing is
+/// otherwise indistinguishable from one that worked. Lives outside `mod tests` so `input`'s
+/// injector tests can reach it.
 #[cfg(test)]
 pub(crate) fn fake_agent(
     hello: &'static str,
@@ -219,8 +217,8 @@ pub struct AgentRegistry {
 /// A launched agent: the backgrounded `adb shell` child (killing it SIGHUPs the device
 /// process — no `pkill`), the forwarded local port, and the adb client it was reached through.
 ///
-/// The client is kept rather than resolved again at teardown: `Adb::from_env` reads the
-/// environment as it is *then*, which need not be what launched the agent.
+/// Do not resolve a client at teardown instead: `Adb::from_env` reads the environment as it is
+/// *then*, which need not be what launched the agent.
 struct AgentProc {
     child: Child,
     port: u16,
@@ -485,8 +483,7 @@ mod tests {
     #[test]
     fn a_call_whose_socket_dropped_is_retried_on_a_fresh_connection() {
         // The device's accept loop takes a new connection after a drop, so a dead socket is not
-        // a dead agent. Reporting one as a failed input would surface a transport hiccup as a
-        // tap that did not happen.
+        // a dead agent — reporting one would surface a hiccup as a tap that never happened.
         let (port, seen) = fake_agent_sessions(HELLO, vec![vec![], vec![OK]]);
         let c = AgentClient::connect(port).unwrap();
         c.ping()
@@ -515,9 +512,8 @@ mod tests {
 
     #[test]
     fn an_agent_that_is_not_answering_yet_is_retried_rather_than_given_up_on() {
-        // The device takes about a second to bind, so a first attempt that fails is the ordinary
-        // case rather than the failure. A deadline computed backwards — or a comparison the
-        // wrong way round — makes that first attempt the answer.
+        // The device takes about a second to bind, so a failed first attempt is the ordinary
+        // case; a backwards deadline makes it the answer instead.
         let port = agent_that_answers_after(1);
         wait_for_agent(port).expect("an agent that answers on the second try must be waited for");
     }

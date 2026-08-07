@@ -24,9 +24,8 @@ pub struct SdkRoot {
 /// An environment variable with something in it. A variable set to the empty string counts as
 /// unset: an empty path would otherwise be probed as the root of the filesystem.
 ///
-/// Shared by every branch below rather than repeated inside each one. The per-OS branches are
-/// compiled only on the targets they select, so a check written inside them is one no other
-/// target's test run can reach — and the mutation gate runs on one.
+/// Do not push this check back inside the per-OS branches: they compile only on the target they
+/// select, and the mutation gate runs on one, so no test there could reach it.
 fn non_empty(get: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<String> {
     get(key).filter(|s| !s.is_empty())
 }

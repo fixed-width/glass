@@ -592,9 +592,8 @@ mod agent_inject_tests {
 
     #[test]
     fn a_scroll_that_overshoots_stops_at_the_window_far_edge_in_both_mappings() {
-        // Every scroll case above runs downward, which clamps at the window's origin — the near
-        // edge, where the window's own size never enters the arithmetic. Only an overshoot the
-        // other way reaches the far edge, and the two mappings compute it separately.
+        // A downward scroll clamps at the window's origin, where its size never enters the
+        // arithmetic. Only an overshoot the other way reaches the far edge.
         let o = origin(); // 500x800 at (100, 200) → far edges 599 and 999
         let up_and_left = PointerEvent::Scroll {
             x: 250,
@@ -614,10 +613,8 @@ mod agent_inject_tests {
 
     #[test]
     fn a_drag_takes_its_sample_count_from_its_longer_axis() {
-        // The count is what makes a drag a drag rather than the DOWN/UP pair touch-slop
-        // swallows, and the cases above only assert it clears the floor of 8. Each of these
-        // travels 500px on one axis, so the sample count is pinned exactly — and each leaves
-        // the other axis short, where a distance taken from the wrong one would show.
+        // Each travels 500px on ONE axis and leaves the other short, so a distance taken from
+        // the wrong axis changes the count. Below the floor of 8 the clamp would hide it.
         for (to_x, to_y, longer) in [(500, 300, "x"), (100, 500, "y")] {
             let ev = PointerEvent::Drag {
                 from_x: 0,
@@ -639,7 +636,7 @@ mod agent_inject_tests {
 
     #[test]
     fn a_gesture_paces_its_samples_by_the_longest_segment_on_either_axis() {
-        // As above, on the multi-touch path: 160px of travel, on one axis at a time.
+        // The same on the multi-touch path: 160px of travel, one axis at a time.
         for (segment, longer) in [
             (
                 Segment {

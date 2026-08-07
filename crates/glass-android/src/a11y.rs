@@ -2138,9 +2138,8 @@ mod tests {
 
     #[test]
     fn an_unreadable_subtree_cannot_confirm_a_write_against_its_one_match() {
-        // The twin of the truncation case above: a subtree the walk could not read is the other
-        // place a second match can be hiding, and it needs a different remedy from a raised cap,
-        // so the message must not collapse into the drifted-element one.
+        // An unreadable subtree is the other place a second match can hide, and its remedy is
+        // not a raised cap, so its message must not collapse into the drifted-element one.
         let mut after = under_a_container(tree_holding(Some("world")));
         after.unreadable = 1;
         let t = target(0, Some("Search"), Some(BOUNDS));
@@ -2151,8 +2150,8 @@ mod tests {
 
     #[test]
     fn a_dump_path_names_this_process_and_never_repeats() {
-        // Two hosts can drive one device, and a retry must not read the file a previous attempt
-        // wrote — the file is the only signal that a dump succeeded at all.
+        // Two hosts can drive one device, and the file is the only signal a dump succeeded, so
+        // a retry must not read one a previous attempt wrote.
         let tag = super::process_tag();
         assert!(
             tag.starts_with(&format!("{}_", std::process::id())),
@@ -2201,8 +2200,7 @@ mod tests {
     #[cfg(unix)]
     fn a_dump_that_exits_zero_and_explains_itself_on_stderr_is_read_as_a_failure() {
         // `uiautomator dump` reports failure by exiting 0 with its reason on stderr and no file
-        // written. Judging it by exit status alone would take it for a tree that arrived, and the
-        // read that follows would be blamed for the emptiness instead.
+        // written, so its exit status alone reads as a tree that arrived.
         use super::AndroidA11y;
         use crate::adb::{Answer, FakeAdb};
         use glass_core::Accessibility;
@@ -2314,9 +2312,8 @@ mod tests {
         use crate::adb::{Answer, FakeAdb};
         use glass_core::Accessibility;
 
-        // The field still reads as the old text on the first read-back and as the new one on the
-        // second: the IME and its suggestion strip are still settling, which is exactly the
-        // moment a single read would call a good write failed.
+        // Old text on the first read-back, new on the second: the IME is still settling, which
+        // is when a single read would call a good write failed.
         let before = Answer::says(one_field_holding("hello"));
         let after = Answer::says(one_field_holding("world"));
         let fake = FakeAdb::scripted(&[

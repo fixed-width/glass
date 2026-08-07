@@ -79,10 +79,7 @@ mod tests {
     use glass_core::Stream;
 
     /// A `LogcatStream` over a stand-in child that prints `lines` and then stays up until killed,
-    /// plus its pid and the sink it drains into. `adb logcat` itself needs a device; this is the
-    /// same child shape, built through the same drain the real spawn uses.
-    ///
-    /// `lines` must carry no single quote — they are the test's own literals.
+    /// plus its pid and the sink it drains into. `lines` must carry no single quote.
     #[cfg(unix)]
     fn stream_over_a_child_printing(lines: &[&str]) -> (LogcatStream, u32, LogSink) {
         let sink: LogSink = Arc::new(Mutex::new(Vec::new()));

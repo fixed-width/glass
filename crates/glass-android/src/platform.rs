@@ -380,8 +380,8 @@ impl Platform for AndroidPlatform {
     }
 }
 
-// Unix-gated as a whole: `FakeAdb` is a `/bin/sh` script, so every test here needs one and the
-// import cannot be resolved on Windows.
+// Unix-gated as a whole: `FakeAdb` is a `/bin/sh` script, so this import breaks the Windows
+// build without it.
 #[cfg(test)]
 #[cfg(unix)]
 mod platform_tests {

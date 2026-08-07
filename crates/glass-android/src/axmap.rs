@@ -537,7 +537,7 @@ mod tests {
             Some(TruncationLimit::Depth)
         );
 
-        // The same cap over a tree that fits, so the case above is not simply always-truncating.
+        // The same cap over a tree that fits, which would otherwise pass if it always truncated.
         let shallow = build_tree(&deep_hierarchy_xml(2), &win(), limits).unwrap();
         assert_eq!(shallow.truncated, None);
     }

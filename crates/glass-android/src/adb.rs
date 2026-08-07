@@ -300,13 +300,8 @@ impl Answer {
 /// An `adb` that is a shell script rather than the real tool: it answers the first rule whose
 /// glob matches the argv and records every invocation.
 ///
-/// The seam is the one production already has — [`Adb`] runs whatever `bin` names — so nothing is
-/// stubbed out and the argv under test is the argv that would reach a device. What a call *did*
-/// is otherwise invisible: a backend method replaced by `Ok(Default::default())` returns the same
-/// shape as one that ran, and only the reply it parsed or the call it made tells them apart.
-///
-/// Unix-only: it is a `/bin/sh` script. The mutation gate and the coverage run are Linux, and
-/// `adb.rs` already gates its process-level tests this way.
+/// Records the argv because a method stubbed to `Ok(Default::default())` is otherwise
+/// indistinguishable from one that ran. Unix-only: it is a `/bin/sh` script.
 #[cfg(test)]
 #[cfg(unix)]
 pub(crate) struct FakeAdb {
@@ -314,10 +309,9 @@ pub(crate) struct FakeAdb {
     adb: Adb,
 }
 
-/// Each answer lives in files rather than inline in the rules line: `adb devices` prints
-/// tab-separated rows and `exec-out screencap` prints raw bytes, and a line read into a shell
-/// variable can carry neither — a run of tabs folds into one delimiter, and a newline or a NUL
-/// cannot survive the variable at all.
+/// Do not move an answer inline into the rules line: a line read into a shell variable folds a
+/// run of tabs into one delimiter and carries neither a newline nor a NUL, and `adb devices`
+/// prints tab-separated rows while `exec-out screencap` prints raw bytes.
 #[cfg(test)]
 #[cfg(unix)]
 const FAKE_ADB_SCRIPT: &str = "\
@@ -365,11 +359,7 @@ impl FakeAdb {
     }
 
     /// [`FakeAdb::new`], but each rule steps through a sequence: the k'th call matching that glob
-    /// gets the k'th answer, and the last answer repeats.
-    ///
-    /// A device changes under the caller — an emulator that was not in `adb devices` a moment ago
-    /// is there now — and a fake that answers the same thing forever can only model a device that
-    /// never does.
+    /// gets the k'th answer, and the last answer repeats — a device changes under the caller.
     pub(crate) fn scripted(rules: &[(&str, Vec<&Answer>)]) -> FakeAdb {
         use std::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -434,9 +424,7 @@ impl FakeAdb {
     /// [`FakeAdb::called`], waiting up to `within` for the call to arrive.
     ///
     /// A call production *spawned* rather than waited for — `adb logcat`, the agent's
-    /// `app_process` — has not necessarily reached the log by the time the spawning function
-    /// returns, so asserting on it immediately is a race that fails in whichever direction the
-    /// scheduler picks.
+    /// `app_process` — may not have reached the log when the spawning function returns.
     pub(crate) fn wait_called(&self, needle: &str, within: Duration) -> bool {
         self.wait_until(within, || self.called(needle))
     }
@@ -472,22 +460,11 @@ impl FakeAdb {
     }
 }
 
-/// Write `script` into `dir` as an executable `name`, and return its path — runnable, which is
-/// the part that takes work.
+/// Write `script` into `dir` as an executable `name`, and return its path, runnable.
 ///
-/// These tests run in parallel, and `ETXTBSY` is raised on the INODE of a file some process holds
-/// open for writing, not on its path: a `Command::spawn` on one thread forks while another is
-/// mid-write here, and the child inherits the write handle until it execs. Staging under another
-/// name and renaming does NOT help — `rename` carries the same inode to the new name.
-///
-/// So this does what glass-ios does for its own fixtures (`doctor.rs`, `idb/companion.rs`):
-/// retries past the transient error. Retried HERE rather than at the call sites, because the exec
-/// under test happens inside `Adb::output`, which is production code and must not learn about it.
-/// Once a probe run succeeds, the inherited fd is gone and this inode is safe for good — nothing
-/// opens it for writing again.
-///
-/// The rename is kept for a smaller reason: the final name never exists half-written or not yet
-/// executable.
+/// Do not swap the retry for a staged write and a rename: `ETXTBSY` is raised on the inode, which
+/// `rename` carries to the new name, so a sibling thread's fork still holding the write fd blocks
+/// the exec anyway. The rename stays only so the final name is never half-written.
 #[cfg(test)]
 #[cfg(unix)]
 fn write_executable(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
@@ -527,10 +504,8 @@ impl Drop for FakeAdb {
 /// directory; anything else records its argv in `boots` and then stays up, which is what a boot
 /// waits on.
 ///
-/// It stays up for seconds rather than minutes because `boot_avd` deliberately does not kill the
-/// emulator it started — on a device that is the point, but here it would leave one stand-in per
-/// test run idling, and a mutation shard runs the suite hundreds of times. A boot poll settles
-/// well inside this.
+/// Seconds, not minutes: `boot_avd` never kills the emulator it started, so each run leaves one
+/// idling and a mutation shard runs the suite hundreds of times.
 #[cfg(test)]
 #[cfg(unix)]
 pub(crate) const FAKE_EMULATOR_SCRIPT: &str = r#"#!/bin/sh

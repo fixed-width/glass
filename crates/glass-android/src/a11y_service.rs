@@ -684,12 +684,10 @@ impl A11yServiceRegistry {
     }
 }
 
-/// The recovery for the `step`th readiness attempt that was refused for its whole budget: force
-/// the service's binding to be rebuilt, and on the LAST attempt reinstall the APK first.
+/// The recovery for the `step`th readiness attempt refused for its whole budget.
 ///
-/// The reinstall is what SIGKILLs the service and starts this race in the first place, and also
-/// the only step observed to bring a stuck binding back — so it is the last resort rather than
-/// the first move.
+/// The reinstall is last, not first: it is what SIGKILLs the service and starts this race, and
+/// also the only step observed to bring a stuck binding back.
 fn escalate(adb: &Adb, apk: &str, want: &str, step: u32, attempts: u32) -> Result<()> {
     if step + 1 == attempts {
         install_service(adb, apk)?;
@@ -1253,9 +1251,8 @@ mod tests {
 
     #[test]
     fn a_node_is_placed_relative_to_the_window_and_reported_visible() {
-        // The device sends screen-absolute bounds and the window here starts at y=100, so an
-        // offset applied the wrong way puts every node twice the status bar's height down the
-        // screen — and a click lands there.
+        // The device sends screen-absolute bounds, so an offset applied the wrong way puts
+        // every node twice the window's inset down the screen, and a click lands there.
         let node = mapped(Some("Save"), None);
         let bounds = node.bounds.expect("the device always sends bounds");
         assert_eq!(
@@ -1270,8 +1267,6 @@ mod tests {
 
     #[test]
     fn a_child_list_stops_at_the_node_budget_and_says_so() {
-        // The cap is checked before each child rather than after, so the child that merely
-        // completes the tree is not mistaken for one the walk declined to visit.
         let wide = json!({
             "class": "android.widget.FrameLayout",
             "bounds": {"x": 0, "y": 100, "w": 100, "h": 100},
@@ -1334,7 +1329,7 @@ mod tests {
 
     #[test]
     fn a_node_whose_children_are_past_the_depth_cap_does_report_truncation() {
-        // The other side of it, so the case above is not simply asserting the cap never fires.
+        // Paired with the case above, which would otherwise pass if the cap never fired.
         let child_at_the_cap = json!({
             "class": "android.widget.FrameLayout",
             "bounds": {"x": 0, "y": 100, "w": 100, "h": 100},
@@ -2945,9 +2940,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn enabling_the_service_adds_it_to_whatever_the_device_already_had() {
-        // The device's other accessibility services must survive: dropping them would turn off
-        // a screen reader for the duration of a glass session and leave it off if teardown is
-        // missed.
+        // Dropping the device's other services would turn off a screen reader for the session,
+        // and leave it off if teardown is missed.
         let (port, _ops) = fake_service(vec![compose_like()], OnAction::Ok);
         let fake = a_device_ready_to_enable("com.other/.Reader", "1", port);
 
@@ -3054,7 +3048,7 @@ mod tests {
     #[cfg(unix)]
     fn a_rebind_reinstalls_only_as_a_last_resort() {
         // The reinstall is what SIGKILLs the service and starts the binding race, so trying it
-        // first would restart the very thing being waited on.
+        // first restarts the thing being waited on.
         use crate::adb::{Answer, FakeAdb};
         let want = format!("com.other/.Reader:{SERVICE_COMPONENT}");
 
@@ -3105,8 +3099,8 @@ mod tests {
 
     #[test]
     fn readiness_gives_up_on_a_socket_that_never_greets() {
-        // The other side of the case above: a service that never comes back has to end the
-        // attempt, or `ensure` waits on it for as long as the process lives.
+        // A service that never comes back has to end the attempt, or `ensure` waits on it for
+        // as long as the process lives.
         let (port, _ops) = fake_service_stumbling(
             vec![compose_like()],
             vec![OnAction::Ok],
@@ -3128,9 +3122,8 @@ mod tests {
 
     #[test]
     fn a_bounded_read_does_not_leave_its_bound_on_the_connection() {
-        // The socket outlives any one request, so a bound left behind would apply to a later
-        // call that never agreed to it — including a snapshot with no deadline at all, which
-        // would then give up in whatever time the last bounded caller happened to name.
+        // The socket outlives any one request, so a bound left behind applies to a later call
+        // that never agreed to it — including a snapshot with no deadline at all.
         let (port, _ops) = fake_service(vec![compose_like()], OnAction::Ok);
         let mut a = reader(port, std::time::Duration::ZERO);
         let mut bounded = ctx();
@@ -3153,8 +3146,8 @@ mod tests {
 
     #[test]
     fn a_toggle_that_flips_a_beat_later_is_waited_for() {
-        // The toolkit updates its UI, and only then does the accessibility tree catch up, so the
-        // first read back after the click legitimately still shows the old state.
+        // The accessibility tree catches up after the toolkit's own UI, so the first read back
+        // legitimately still shows the old state.
         let (port, ops) = fake_service(
             vec![
                 one_checkable("android.widget.CheckBox", false),
@@ -3884,8 +3877,8 @@ mod tests {
 
     #[test]
     fn a_node_is_placed_relative_to_a_window_that_is_not_at_the_origin() {
-        // A window inset on both axes — the split-screen and freeform cases. With either offset
-        // at zero the arithmetic reads the same whichever way round it is, so both are non-zero.
+        // Both offsets non-zero: at zero the arithmetic reads the same whichever way round it
+        // is combined.
         let inset = WindowGeometry {
             x: 40,
             y: 100,

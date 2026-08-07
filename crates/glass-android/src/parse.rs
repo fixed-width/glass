@@ -237,9 +237,8 @@ mod tests {
 
     #[test]
     fn either_marker_alone_still_picks_the_reason_out_of_the_progress_lines() {
-        // The line above carries one marker and not the other. Requiring both would find no
-        // line at all and fall back to the whole output, burying the reason in the noise —
-        // which the case above cannot show, its line carrying both.
+        // Each line here carries one marker and not the other; requiring both would find none
+        // and fall back to the whole output, burying the reason in the progress lines.
         for (output, reason) in [
             (
                 "Performing Streamed Install\nFailure [INSTALL_PARSE_FAILED_NO_CERTIFICATES]\n",
