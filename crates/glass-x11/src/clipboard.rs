@@ -497,8 +497,7 @@ mod tests {
     use super::*;
     use crate::testx::TestX;
 
-    /// Long enough that a truncated read is visibly short: the property read asks for a
-    /// length in 4-byte units, and a slip there caps the text at a handful of bytes.
+    /// Long enough that a truncated read comes back visibly short.
     const LONG_TEXT: &str = "the quick brown fox jumps over the lazy dog";
 
     /// Wait for `f` to hold, up to `within`. The owner thread runs on its own connection, so

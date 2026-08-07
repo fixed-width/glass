@@ -299,11 +299,9 @@ impl Drop for Xvfb {
         // Fallback: Xvfb removes its own lock/socket on SIGTERM, but if it had to be
         // SIGKILLed (ignored SIGTERM) they linger.
         //
-        // Only when the lock still names OUR server. The display number is free the moment
-        // the process dies, so by the time this runs another Xvfb can already hold it, and
-        // removing unconditionally deletes a live server's socket — after which a start that
-        // reported ready refuses the very next connection. Socket first: nobody else can take
-        // the number while the lock we own is still there.
+        // Do not remove these unconditionally: the display number is free the moment the
+        // process dies, so another Xvfb can already hold it and the removal deletes a live
+        // server's socket. Socket first — nobody can take the number while our lock is there.
         if let Some(num) = self.display.strip_prefix(':')
             && lock_holder(num) == Some(pid)
         {
@@ -455,9 +453,8 @@ mod tests {
 
     #[test]
     fn tearing_down_a_departed_server_leaves_its_reused_display_number_alone() {
-        // A display number is free the moment its server's process dies, so the next Xvfb can
-        // hold it before the previous one's cleanup runs. `departed` stands in for that
-        // previous server: same number, process already on its way out.
+        // `departed` stands in for a server that held this number first: same display,
+        // process already on its way out.
         let live = Xvfb::start("640x480x24").expect("a server should start");
         let display = live.display.clone();
 

@@ -254,8 +254,6 @@ mod tests {
 
     #[test]
     fn the_probe_budget_outlasts_the_start_it_wraps() {
-        // Shorter than `Xvfb::start`'s own worst case and the probe reports Fail for the
-        // wedge-and-retry the start path recovers from, with a remedy for the wrong problem.
         assert!(
             probe_budget() > crate::xvfb::start_deadline(),
             "probe budget {:?} must exceed the start deadline {:?}",

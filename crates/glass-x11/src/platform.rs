@@ -876,10 +876,7 @@ impl X11Platform {
 }
 
 /// The diagnostic for a capture that was clipped to the display, or `None` when the whole
-/// requested rectangle was read — so the smaller-than-requested frame the caller receives
-/// isn't a silent surprise. glass's own stderr is its diagnostic channel (same as the
-/// focus-on-launch warning); the MCP `screenshot` result additionally reports the true
-/// (clipped) dimensions, so a frame smaller than the window/region signals the clip.
+/// requested rectangle was read.
 fn clip_note(rect: &crate::coords::ClippedRect) -> Option<String> {
     rect.clipped.then(|| {
         format!(
@@ -1361,11 +1358,10 @@ impl Drop for X11Platform {
 }
 
 /// Why a launch cannot go ahead under the requested containment, or `None` when it can.
-/// A `sandbox:"off"` launch never consults availability — bubblewrap being absent is not a
-/// reason to refuse a launch that was never going to use it.
+/// A `sandbox:"off"` launch never consults availability.
 ///
-/// Split from the probe so both answers are reachable from a test: whether bubblewrap works
-/// is a property of the machine the tests run on, not something they can choose.
+/// Do not fold this back into the probe: whether bubblewrap works is a property of the
+/// machine, so in place only one of the two answers is ever reachable from a test.
 fn sandbox_refusal(
     level: glass_core::SandboxLevel,
     availability: glass_sandbox_linux::Availability,
@@ -1384,9 +1380,9 @@ fn sandbox_refusal(
 /// Search a `GetKeyboardMapping` table for `keysym`, returning the keycode that produces it
 /// and whether Shift is needed — column 0 is the unshifted keysym, column 1 the shifted one.
 ///
-/// `keysyms` is the flat table for keycodes `min..=max`, `per` entries each. Split out from
-/// the request around it so the indexing is reachable from a test with a table it chose:
-/// against a live server every arithmetic slip here still lands on *some* real key.
+/// `keysyms` is the flat table for keycodes `min..=max`, `per` entries each. Do not fold this
+/// back into the request around it: against a live server every arithmetic slip here still
+/// lands on *some* real key.
 fn keycode_in(keysyms: &[u32], per: usize, min: u8, max: u8, keysym: u32) -> Option<(u8, bool)> {
     for kc in min..=max {
         let base = (kc as usize - min as usize) * per;
@@ -2755,9 +2751,8 @@ mod display_tests {
 
     #[test]
     fn a_launch_waits_out_its_timeout_before_giving_up() {
-        // A deadline computed backwards, or a comparison the wrong way round, still reports a
-        // Timeout — it just reports it immediately, turning the caller's budget into nothing
-        // and failing every app slower than instant.
+        // The budget has to be spent, not just reported: a launch that gives up at once
+        // fails every app slower than instant.
         let x = TestX::start();
         let mut plat = x.platform();
         let spec = AppSpec {
