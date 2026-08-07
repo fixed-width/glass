@@ -3135,12 +3135,14 @@ mod tests {
             .conn
             .lock()
             .expect("conn lock")
-            .writer
+            .reader
+            .get_ref()
             .read_timeout()
             .expect("the socket has a read timeout");
-        assert!(
-            left.is_none_or(|d| d > std::time::Duration::from_secs(5)),
-            "the next call would inherit {left:?} from this one"
+        assert_eq!(
+            left,
+            Some(crate::conn::STANDING_TIMEOUT),
+            "the next call would inherit this one's bound"
         );
     }
 

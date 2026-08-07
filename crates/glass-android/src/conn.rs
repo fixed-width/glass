@@ -58,7 +58,7 @@ impl CallFailure {
 /// How long a read blocks for the companion when no caller named a bound — long enough that a
 /// stalled agent surfaces as a transport error the reconnect path handles, rather than hanging the
 /// single-threaded MCP loop forever.
-const STANDING_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const STANDING_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct Conn {
     pub(crate) writer: TcpStream,
@@ -71,15 +71,15 @@ impl Conn {
     pub(crate) fn open(port: u16) -> glass_core::Result<Conn> {
         let stream = TcpStream::connect(("127.0.0.1", port))
             .map_err(|e| GlassError::Backend(format!("agent connect :{port}: {e}")))?;
-        // Set read/write timeouts so a stalled agent surfaces as a transport error (which
-        // the existing reconnect path handles) rather than hanging the MCP thread forever.
-        stream.set_read_timeout(Some(STANDING_TIMEOUT)).ok();
+        // Timeouts so a stalled agent surfaces as a transport error the reconnect path handles,
+        // rather than hanging the MCP thread forever. Each goes on the handle that does that
+        // half's work — see `read_within` for what puts the read one on the reader.
         stream.set_write_timeout(Some(STANDING_TIMEOUT)).ok();
-        let reader = BufReader::new(
-            stream
-                .try_clone()
-                .map_err(|e| GlassError::Backend(format!("agent clone: {e}")))?,
-        );
+        let read_half = stream
+            .try_clone()
+            .map_err(|e| GlassError::Backend(format!("agent clone: {e}")))?;
+        read_half.set_read_timeout(Some(STANDING_TIMEOUT)).ok();
+        let reader = BufReader::new(read_half);
         let mut c = Conn {
             writer: stream,
             reader,
@@ -117,8 +117,12 @@ impl Conn {
     ///
     /// Per-call rather than per-connection: the socket outlives any one request, so a bound left
     /// behind would be applied to a later call that never agreed to it.
+    ///
+    /// Do not set this on `writer`: a read timeout does not carry across `try_clone` on Windows,
+    /// where a bound set there left the read on the 30s standing one instead.
     pub(crate) fn read_within(&mut self, wait: Option<Duration>) {
-        self.writer
+        self.reader
+            .get_ref()
             .set_read_timeout(Some(wait.unwrap_or(STANDING_TIMEOUT)))
             .ok();
     }
