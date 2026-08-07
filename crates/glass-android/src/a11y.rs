@@ -505,8 +505,9 @@ pub struct AndroidA11y {
     resolved: bool,
     /// Set once a dump has succeeded, after which snapshots stop waiting for readiness.
     warmed: bool,
-    /// `GLASS_ANDROID_SERIAL` as it stood when this reader was made. Read once rather than at
-    /// resolution, so the device a session is reading cannot change under it midway.
+    /// `GLASS_ANDROID_SERIAL` as it stood when `new` was called — `for_adb` is already resolved
+    /// and leaves it unset. Read once rather than at resolution, so the device a session is
+    /// reading cannot change under it midway.
     want_serial: Option<String>,
 }
 
@@ -2198,6 +2199,40 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn a_reader_binds_to_the_serial_it_was_asked_for_when_several_are_online() {
+        // Two online devices is ambiguous on its own; `GLASS_ANDROID_SERIAL` is what resolves it,
+        // and it is read when the reader is made rather than when it resolves.
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::new(&[(
+            "devices",
+            Answer::says(
+                "List of devices attached\nemulator-5554\tdevice\nemulator-5556\tdevice\n",
+            ),
+        )]);
+        let mut reader = AndroidA11y {
+            adb: fake.adb().clone(),
+            resolved: false,
+            warmed: false,
+            want_serial: Some("emulator-5556".to_string()),
+        };
+
+        let bound = reader.ensure_adb().expect("the named device is online");
+        assert_eq!(bound.serial(), Some("emulator-5556"));
+
+        // Without the preference the same listing is refused rather than guessed at.
+        let mut blind = AndroidA11y {
+            adb: fake.adb().clone(),
+            resolved: false,
+            warmed: false,
+            want_serial: None,
+        };
+        assert!(blind.ensure_adb().is_err(), "two devices cannot be guessed");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_reader_handed_a_resolved_client_does_not_go_looking_for_a_device() {
         // The platform has already chosen — possibly a freshly booted AVD that `choose_serial`
         // could not have disambiguated — so asking again could land on a different device.
@@ -2276,7 +2311,8 @@ mod tests {
             .set_value(&ctx, &field, "world")
             .expect("the value lands on the second read-back");
 
-        // Tapped at the field's centre, then cleared, then typed — in that order.
+        // Tapped at the field's centre, cleared, and typed. Order is not asserted here; the
+        // read-back below is what proves the field ended up holding the new text and not both.
         assert!(fake.called("input tap 300 250"), "{:?}", fake.calls());
         assert!(fake.called("input text"), "{:?}", fake.calls());
         let cleared = fake

@@ -179,7 +179,12 @@ pub(crate) fn fake_agent_sessions(
                 let id = req["id"].as_i64().expect("request id");
                 recorded.lock().expect("seen lock").push(req);
                 let mut out: Value = serde_json::from_str(resp).expect("response json");
-                out["id"] = json!(id);
+                // A scripted response that names its own id keeps it. Otherwise it answers the
+                // request it was sent, which is the ordinary case — but leaves no way to model
+                // an answer addressed to a *different* request, which the client must refuse.
+                if out.get("id").is_none() {
+                    out["id"] = json!(id);
+                }
                 if writeln!(w, "{out}").is_err() {
                     break;
                 }
@@ -237,7 +242,6 @@ impl AgentRegistry {
     /// Ensure the agent server is running on `adb`'s device and return the forwarded local
     /// port. Idempotent: a second call returns the cached port when the device serial matches.
     /// If the serial changed (a different device), the stale agent is torn down first.
-    /// The jar is resolved from env.
     ///
     /// `get` reads the environment — the jar's location is all it needs from there — passed in
     /// rather than read here, so a test can point it at a jar without touching the environment
@@ -339,7 +343,6 @@ impl AgentRegistry {
 /// How long the agent gets to bind its socket and start answering. It takes ~1s in practice.
 const AGENT_BIND_BUDGET: Duration = Duration::from_secs(5);
 
-/// How long to leave the agent alone between attempts.
 const AGENT_RETRY_PAUSE: Duration = Duration::from_millis(200);
 
 /// Poll until the agent accepts a connection (it takes ~1s to bind).
@@ -533,7 +536,7 @@ mod tests {
             ("shell CLASSPATH=*", vec![&lingers]),
             ("*", vec![&silent]),
         ]);
-        // The jar has to be a file on disk, and the fake adb's own script is one.
+        // Any path will do: nothing checks the jar exists before pushing it.
         let jar = fake.adb().bin().to_string();
         let get = move |k: &str| match k {
             "GLASS_ANDROID_AGENT_JAR" => Some(jar.clone()),
@@ -563,7 +566,7 @@ mod tests {
         );
 
         // The launch is a child that stays up; killing it is what SIGHUPs the device process.
-        let child = fake.read("linger.pid");
+        let child = fake.wait_read("linger.pid", Duration::from_secs(5));
         assert!(!child.is_empty(), "the launch should still be running");
         assert!(still_running(&child));
 
@@ -601,7 +604,7 @@ mod tests {
             .expect_err("a forward that names no port cannot be connected to");
         assert!(err.to_string().contains("no port"), "{err}");
 
-        let child = fake.read("linger.pid");
+        let child = fake.wait_read("linger.pid", Duration::from_secs(5));
         assert!(!child.is_empty(), "the launch should have happened");
         assert!(!still_running(&child), "the failed launch leaked its child");
     }

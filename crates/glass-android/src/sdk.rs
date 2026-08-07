@@ -25,8 +25,8 @@ pub struct SdkRoot {
 /// unset: an empty path would otherwise be probed as the root of the filesystem.
 ///
 /// Shared by every branch below rather than repeated inside each one. The per-OS branches are
-/// compiled only on the OS they name, so a check written inside them is a check no other target's
-/// test run can reach — and the mutation gate runs on one.
+/// compiled only on the targets they select, so a check written inside them is one no other
+/// target's test run can reach — and the mutation gate runs on one.
 fn non_empty(get: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<String> {
     get(key).filter(|s| !s.is_empty())
 }

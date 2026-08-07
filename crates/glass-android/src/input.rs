@@ -708,8 +708,10 @@ mod agent_inject_tests {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod injector_tests {
     use super::*;
+    use crate::adb::{Answer, FakeAdb};
     use crate::agent::{fake_agent, ops_seen};
     use glass_core::{KeyEvent, MouseButton, PointerEvent, Segment, WindowGeometry};
 
@@ -743,13 +745,20 @@ mod injector_tests {
         let injector = AgentInjector {
             agent: Arc::new(AgentClient::connect(port).expect("connect to the fake agent")),
         };
-        let adb = Adb::from_env(); // unused by this injector — it reaches the agent's socket
+        // A fake rather than `Adb::from_env()`: this injector should never reach adb at all,
+        // and a real client would send taps to whatever device the developer has attached.
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
 
-        injector.pointer(&adb, &origin(), &click()).unwrap();
-        injector.key(&adb, &KeyEvent::Text("hi".into())).unwrap();
-        injector.key(&adb, &KeyEvent::Text(String::new())).unwrap();
+        injector.pointer(fake.adb(), &origin(), &click()).unwrap();
+        injector
+            .key(fake.adb(), &KeyEvent::Text("hi".into()))
+            .unwrap();
+        injector
+            .key(fake.adb(), &KeyEvent::Text(String::new()))
+            .unwrap();
 
         assert_eq!(ops_seen(&seen), ["pointer", "text"]);
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     }
 
     #[test]
@@ -765,18 +774,24 @@ mod injector_tests {
             }],
             duration_ms: 100,
         };
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
         let err = ShellInjector
-            .pointer(&Adb::from_env(), &origin(), &gesture)
+            .pointer(fake.adb(), &origin(), &gesture)
             .unwrap_err();
         assert!(matches!(err, GlassError::Unsupported(_)), "{err}");
+        // Refused BEFORE anything reached the device — otherwise this "unsupported" gesture
+        // would have half-happened.
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     }
 
     #[test]
     fn the_shell_injector_reports_a_chord_it_cannot_map() {
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
         let err = ShellInjector
-            .key(&Adb::from_env(), &KeyEvent::Chord("ctrl+/".into()))
+            .key(fake.adb(), &KeyEvent::Chord("ctrl+/".into()))
             .unwrap_err();
         assert!(matches!(err, GlassError::InvalidKey(_)), "{err}");
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     }
 }
 

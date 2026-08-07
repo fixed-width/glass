@@ -85,7 +85,9 @@ mod tests {
     fn stream_over_a_sleeping_child() -> (LogcatStream, u32) {
         let sink: LogSink = Arc::new(Mutex::new(Vec::new()));
         let mut child = Command::new("/bin/sh")
-            .args(["-c", "sleep 30"])
+            // `exec` so the shell becomes the sleep: the kill under test reaches the process
+            // whose pid this returns, with no grandchild left orphaned behind it.
+            .args(["-c", "exec sleep 30"])
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn the stand-in");

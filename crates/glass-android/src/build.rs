@@ -61,6 +61,7 @@ fn push_lines(sink: &LogSink, stream: Stream, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::{Arc, Mutex};
 
     /// A spec whose only interesting field is the build command — the rest is what the launch

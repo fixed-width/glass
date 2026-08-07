@@ -93,7 +93,7 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
     let (x, y, w, h) = (bi("x"), bi("y"), bu("w"), bu("h"));
     // Recursion is bounded by `budget` (depth, node count, siblings per level), so a
     // pathologically deep or wide device tree cannot blow the stack or the token budget.
-    // The child array is resolved before either bound is consulted: a childless node must
+    // The child array is resolved before any bound is consulted: a childless node must
     // never be reported truncated for declining to explore a list that was already empty.
     let children = match v.get("children").and_then(Value::as_array) {
         None => vec![],
@@ -1289,7 +1289,11 @@ mod tests {
         });
         let root = json_to_node(&with_refs(&wide), &win(), 0, &mut walk).expect("maps");
 
-        assert!(root.children.len() < 8, "the cap must stop the walk");
+        assert!(
+            (1..8).contains(&root.children.len()),
+            "the cap must stop the walk part-way, not before it starts: {}",
+            root.children.len()
+        );
         assert_eq!(
             walk.budget.truncation().map(|t| t.limit),
             Some(TruncationLimit::Nodes),

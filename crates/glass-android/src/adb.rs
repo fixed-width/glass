@@ -205,7 +205,8 @@ fn with_adb_hint(mut e: GlassError) -> GlassError {
 #[cfg(test)]
 pub(crate) fn a_real_timeout() -> GlassError {
     #[cfg(unix)]
-    let (bin, args): (&str, &[&str]) = ("/bin/sh", &["-c", "sleep 30"]);
+    // `exec` so the shell becomes the sleep rather than forking one that outlives the kill.
+    let (bin, args): (&str, &[&str]) = ("/bin/sh", &["-c", "exec sleep 30"]);
     #[cfg(windows)]
     let (bin, args): (&str, &[&str]) = ("ping", &["-n", "31", "127.0.0.1"]);
 
@@ -261,7 +262,8 @@ pub(crate) fn a_failed_call(argv: &[&str], said: &str) -> GlassError {
 }
 
 /// What the fake adb does for one invocation it matches.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 pub(crate) enum Answer {
     /// Exit 0, writing these bytes on stdout.
     Says(Vec<u8>),
@@ -275,7 +277,8 @@ pub(crate) enum Answer {
     Lingers,
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 impl Answer {
     pub(crate) fn says(s: impl AsRef<[u8]>) -> Answer {
         Answer::Says(s.as_ref().to_vec())
@@ -295,22 +298,25 @@ impl Answer {
 ///
 /// Unix-only: it is a `/bin/sh` script. The mutation gate and the coverage run are Linux, and
 /// `adb.rs` already gates its process-level tests this way.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 pub(crate) struct FakeAdb {
     dir: std::path::PathBuf,
     adb: Adb,
 }
 
 /// Each answer lives in files rather than inline in the rules line: `adb devices` prints
-/// tab-separated rows and `exec-out screencap` prints raw bytes, and a tab-separated line can
-/// express neither — POSIX `read` folds repeated tabs together, and `printf %b` has no way to
-/// write an arbitrary byte.
-#[cfg(all(test, unix))]
+/// tab-separated rows and `exec-out screencap` prints raw bytes, and a line read into a shell
+/// variable can carry neither — a run of tabs folds into one delimiter, and a newline or a NUL
+/// cannot survive the variable at all.
+#[cfg(test)]
+#[cfg(unix)]
 const FAKE_ADB_SCRIPT: &str = "\
 #!/bin/sh
 # Stand-in for the adb binary; see FakeAdb in adb.rs. Records the argv, then answers the first
 # rule whose glob matches it, stepping through that rule's answers and repeating the last. An
 # unmatched call exits 0 saying nothing.
+[ \"$1\" = --glass-probe ] && exit 0
 dir=$(dirname \"$0\")
 printf '%s\\n' \"$*\" >> \"$dir/calls\"
 while IFS='\t' read -r glob answers stem; do
@@ -323,8 +329,9 @@ while IFS='\t' read -r glob answers stem; do
             code=$(cat \"$dir/${stem}_$n.code\")
             if [ \"$code\" = linger ]; then
                 printf '%s' \"$$\" > \"$dir/linger.pid\"
-                sleep 30
-                exit 0
+                # `exec` so the shell BECOMES the sleep: `$$` then names the process that is
+                # actually killed, and there is no grandchild to outlive it.
+                exec sleep 30
             fi
             cat \"$dir/${stem}_$n.out\"
             cat \"$dir/${stem}_$n.err\" >&2
@@ -335,7 +342,8 @@ done < \"$dir/rules\"
 exit 0
 ";
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 impl FakeAdb {
     /// Serve `rules` — an argv glob and what to answer — tried in order.
     ///
@@ -413,6 +421,35 @@ impl FakeAdb {
         self.calls().iter().any(|c| c.contains(needle))
     }
 
+    /// [`FakeAdb::called`], waiting up to `within` for the call to arrive.
+    ///
+    /// A call production *spawned* rather than waited for — `adb logcat`, the agent's
+    /// `app_process` — has not necessarily reached the log by the time the spawning function
+    /// returns, so asserting on it immediately is a race that fails in whichever direction the
+    /// scheduler picks.
+    pub(crate) fn wait_called(&self, needle: &str, within: Duration) -> bool {
+        self.wait_until(within, || self.called(needle))
+    }
+
+    /// The contents of `name` once it is non-empty, waiting up to `within`. Empty if it never is.
+    pub(crate) fn wait_read(&self, name: &str, within: Duration) -> String {
+        self.wait_until(within, || !self.read(name).is_empty());
+        self.read(name)
+    }
+
+    fn wait_until(&self, within: Duration, ready: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if ready() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Write another executable script into this fake's directory and return its path — an
     /// `emulator` to stand beside the `adb`, cleaned up with it.
     pub(crate) fn alongside(&self, name: &str, script: &str) -> std::path::PathBuf {
@@ -425,13 +462,24 @@ impl FakeAdb {
     }
 }
 
-/// Write `script` into `dir` as an executable `name`, and return its path.
+/// Write `script` into `dir` as an executable `name`, and return its path — runnable, which is
+/// the part that takes work.
 ///
-/// Written under a temporary name and renamed into place, never opened for writing at its final
-/// path: these tests run in parallel, and a `Command::spawn` on one thread forks while another is
-/// mid-write, so the child inherits the write handle. Executing a file some process holds open
-/// for writing is `ETXTBSY`, which surfaces as an unrelated test failing to run its adb at all.
-#[cfg(all(test, unix))]
+/// These tests run in parallel, and `ETXTBSY` is raised on the INODE of a file some process holds
+/// open for writing, not on its path: a `Command::spawn` on one thread forks while another is
+/// mid-write here, and the child inherits the write handle until it execs. Staging under another
+/// name and renaming does NOT help — `rename` carries the same inode to the new name.
+///
+/// So this does what glass-ios does for its own fixtures (`doctor.rs`, `idb/companion.rs`):
+/// retries past the transient error. Retried HERE rather than at the call sites, because the exec
+/// under test happens inside `Adb::output`, which is production code and must not learn about it.
+/// Once a probe run succeeds, the inherited fd is gone and this inode is safe for good — nothing
+/// opens it for writing again.
+///
+/// The rename is kept for a smaller reason: the final name never exists half-written or not yet
+/// executable.
+#[cfg(test)]
+#[cfg(unix)]
 fn write_executable(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
@@ -441,10 +489,23 @@ fn write_executable(dir: &std::path::Path, name: &str, script: &str) -> std::pat
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
         .expect("make the stand-in tool executable");
     std::fs::rename(&staged, &path).expect("move the stand-in tool into place");
-    path
+
+    // `--glass-probe` is the one argument both stand-ins answer by exiting immediately, so this
+    // costs nothing and records nothing.
+    for _ in 0..100 {
+        match Command::new(&path).arg("--glass-probe").status() {
+            Ok(_) => return path,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("the stand-in {name} is not runnable: {e}"),
+        }
+    }
+    panic!("{name} was still ETXTBSY after 100 retries");
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 impl Drop for FakeAdb {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -455,20 +516,28 @@ impl Drop for FakeAdb {
 /// [`FakeAdb::alongside`]. `-list-avds` prints the contents of an `avds` file in the same
 /// directory; anything else records its argv in `boots` and then stays up, which is what a boot
 /// waits on.
-#[cfg(all(test, unix))]
+///
+/// It stays up for seconds rather than minutes because `boot_avd` deliberately does not kill the
+/// emulator it started — on a device that is the point, but here it would leave one stand-in per
+/// test run idling, and a mutation shard runs the suite hundreds of times. A boot poll settles
+/// well inside this.
+#[cfg(test)]
+#[cfg(unix)]
 pub(crate) const FAKE_EMULATOR_SCRIPT: &str = r#"#!/bin/sh
+[ "$1" = --glass-probe ] && exit 0
 dir=$(dirname "$0")
 if [ "$1" = "-list-avds" ]; then
     cat "$dir/avds"
     exit 0
 fi
 printf '%s\n' "$*" >> "$dir/boots"
-sleep 30
+exec sleep 5
 "#;
 
 /// Whether `pid` is still a live process. A child that was killed *and reaped* is gone rather
 /// than left as a zombie, which would still answer here.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 pub(crate) fn still_running(pid: &str) -> bool {
     Command::new("kill")
         .args(["-0", pid])
@@ -566,7 +635,9 @@ mod tests {
         let started = std::time::Instant::now();
         let err = adb
             .run_streams_until(
-                ["-c", "sleep 30"],
+                // `exec` so the bound kills the sleep itself; without it the shell is what dies
+                // and the sleep is orphaned for its full thirty seconds.
+                ["-c", "exec sleep 30"],
                 std::time::Instant::now() + Duration::from_millis(300),
             )
             .expect_err("a step must not outlive the deadline it serves");

@@ -380,7 +380,10 @@ impl Platform for AndroidPlatform {
     }
 }
 
+// Unix-gated as a whole: `FakeAdb` is a `/bin/sh` script, so every test here needs one and the
+// import cannot be resolved on Windows.
 #[cfg(test)]
+#[cfg(unix)]
 mod platform_tests {
     use super::*;
     use crate::adb::{Answer, FakeAdb};
@@ -479,6 +482,13 @@ mod platform_tests {
         assert_eq!((window.width, window.height), (800, 800));
         assert!(fake.called("am start -W -n com.example.app/.MainActivity"));
         assert_eq!(platform.app_pid(), Some(4321), "logcat needs the app's pid");
+        // Scoped to the app: without `--pid` this streams the whole device's log, which is
+        // every other app's output presented as this session's.
+        assert!(
+            fake.wait_called("logcat -v threadtime --pid=4321", Duration::from_secs(5)),
+            "{:?}",
+            fake.calls()
+        );
     }
 
     #[test]
@@ -550,7 +560,9 @@ mod platform_tests {
 
         platform
             .stop_app()
-            .expect("stop is best-effort but reports");
+            // A failed force-stop is NOT surfaced — `stop_app` discards it — so this asserts
+            // only that the call was made and the session ended, not that the app died.
+            .expect("ending a session reports");
 
         assert!(
             fake.called("am force-stop com.example.app"),

@@ -208,6 +208,28 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_addressed_to_another_request_is_refused_rather_than_retried() {
+        // The id is what matches an answer to its question, and a mismatch must classify as
+        // `Refused`: `is_transport` is what decides whether the caller re-sends, and re-sending
+        // an `ACTION_CLICK` whose answer merely went astray taps the control a second time.
+        let (port, _seen) = fake_agent(HELLO, vec![r#"{"id":999,"ok":true}"#]);
+        let mut conn = Conn::open(port).expect("the hello arrives");
+
+        let Err(failure) = conn.call(json!({"op": "ping"})) else {
+            panic!("an answer to a different request is not an answer to this one");
+        };
+        assert!(
+            !failure.is_transport(),
+            "a device that answered is not a transport failure, and must not be re-sent to"
+        );
+        assert!(!failure.nothing_sent());
+        assert!(
+            failure.into_error().to_string().contains("id mismatch"),
+            "the error must say what did not line up"
+        );
+    }
+
+    #[test]
     fn every_request_carries_an_id_of_its_own() {
         // The id is what matches an answer to its question. Ids that repeat — or that run
         // backwards into one already used — let a late answer satisfy a later call, and on this

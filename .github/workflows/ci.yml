@@ -287,9 +287,9 @@ jobs:
           # `:(glob)` so `**` spans directories, matching scripts/mutants.sh's --file; without
           # it git reads `**` as an ordinary fnmatch pattern and selects nothing at all.
           #
-          # Keep these pathspecs in step with the --package list below: a crate mutated without
-          # its files in the diff draws no mutants and gates nothing, and one diffed without
-          # being named as a package is mutated under the other's --file glob.
+          # Keep these pathspecs in step with the --package list below. --package is what sets
+          # the --file glob, so a crate named there but absent here draws no mutants and gates
+          # nothing, and one present here but not named there is never mutated at all.
           git diff "origin/$BASE_REF...HEAD" \
             -- ':(glob)crates/glass-core/src/**/*.rs' \
                ':(glob)crates/glass-android/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
@@ -326,9 +326,8 @@ jobs:
   # A matrix job's checks are named per shard, so the branch ruleset has nothing stable
   # to require. This one has a fixed name and fails if any shard did.
   #
-  # That name is what the ruleset's required check matches on, so it is frozen: renaming it
-  # leaves the ruleset waiting on a check that never reports, and every pull request blocks.
-  # It now gates glass-android too — rename it only together with the ruleset entry.
+  # The ruleset's required check matches this name, so it is frozen — renaming it blocks every
+  # pull request. It gates glass-android too despite the name; rename only with the ruleset.
   mutants-gate:
     name: Mutation gate (glass-core)
     runs-on: ubuntu-latest

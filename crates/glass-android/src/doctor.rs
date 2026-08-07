@@ -83,8 +83,10 @@ fn probe(deep_requested: bool) -> Probe {
 }
 
 /// [`probe`] against a given adb and environment, so the whole probe can be exercised without a
-/// device: what it reports is read back out of the tools it ran, and every branch here turns on
-/// what they said.
+/// device.
+///
+/// `exists` covers the SDK lookups only — the jar and the APK are still checked against the real
+/// filesystem, so a test that needs one present has to point at a file that is.
 fn probe_with(
     deep_requested: bool,
     adb: &Adb,
@@ -505,7 +507,7 @@ mod tests {
 
     /// A probe run against a fake adb and a chosen environment.
     ///
-    /// The device tools all fail here, deliberately: the guards under test decide *whether* a
+    /// The two deep companions fail here, deliberately: the guards under test decide *whether* a
     /// deep probe runs, and a probe that ran and failed is `Some` just as one that succeeded is.
     #[cfg(unix)]
     fn probe_against_a_fake(deep: bool, env: &[(&str, &str)]) -> Probe {
