@@ -200,18 +200,22 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
-- On the iOS Simulator, a `glass_set_value` that cannot confirm its write now distinguishes an
-  element that moved from one that is no longer there. Both used to come back as `element #N changed
-  since the snapshot; re-snapshot`, which tells you to re-address that id — the wrong advice when
-  the screen the element was on has been replaced, because the id now belongs to something else and
-  the write it would repeat has already landed. Where nothing in the tree still carries the
-  element's role and name, glass now says the element is gone and to look at where the app is now.
-  Android has answered this way since it learned the same lesson.
-- An accessibility read that stopped early can no longer report an element as gone. "Gone" states
-  that nothing carries the element's role and name any more, which a tree cut short by the element
-  cap — or missing a subtree a failed child read dropped — only shows for the part it covered. Such
-  a read now reports the element as changed, which sends you to re-snapshot rather than to conclude
-  the screen was replaced. Affects Android as well as iOS.
+- `glass_set_value` now confirms a write into a field that was not already focused, instead of
+  reporting it as an element that had changed or gone missing. Both mobile backends confirm a write
+  by re-reading the element afterwards, and they used to re-find it by its position in the
+  accessibility tree — which the write itself moves: typing into an unfocused field raises the
+  keyboard, and on the iOS Simulator that inserts elements ahead of the field. A landed write could
+  not be confirmed, on the ordinary path of writing into a field you have not touched yet. The
+  read-back now re-finds the element by its role and name wherever it moved to, and refuses if more
+  than one element now matches, since then which one holds the text cannot be told.
+- A `glass_set_value` that cannot confirm its write — the element is gone, several now match it, the
+  read stopped early, or it is no longer editable to read back — now says the text was typed and
+  names what to re-snapshot for, instead of reporting only that the element could not be
+  re-addressed, which reads as an instruction to write again when the write has already gone out. A
+  read cut short by the node cap still names the cap, so raising `max_nodes` is the fix when that's
+  the reason. Writing an empty value to clear a field is the one case re-finding the element isn't
+  enough to confirm: an empty field alone isn't evidence it's the right one, so a clear whose element
+  had to be re-found by role and name reports unconfirmed rather than a success it cannot prove.
 - A native Android click or `set_value` through the optional on-device companion no longer acts on a
   different element than the one you named when the snapshot was truncated. glass numbered elements
   by their position in the tree it kept and dispatched the action by that number, but the companion
@@ -232,13 +236,16 @@ internal refactors, CI, or test-only changes.
   before. The same defect could send an unrelated install failure down the reinstall-on-signature-
   mismatch path, because the message names the caller's own `GLASS_ANDROID_A11Y_APK` argument: an
   APK kept under a directory whose name quoted the phrase changed what any install failure did.
-- Android now says when the element you addressed is gone, instead of reporting it as changed. Every
-  disagreement between your snapshot and the tree at write time came back as `element … changed
-  since the snapshot; re-snapshot`, including the case where the screen the element was on had been
-  destroyed — so the advice was to re-snapshot a screen that no longer exists. glass now asks
-  whether anything in the tree still carries that element's role and name: if so the refusal reads
-  as before, and if not it reports the element as gone, which re-snapshotting will not fix. When a
-  refusal happens is unchanged.
+- Android's check before it acts on an addressed element — the guard a click or `set_value` makes to
+  confirm the id still names what the caller thinks it does — tells two disagreements apart. Every
+  mismatch used to come back as `element … changed since the snapshot; re-snapshot`, including when
+  the screen the element was on had been replaced entirely, so the advice was to re-snapshot a screen
+  that no longer exists. It now asks whether anything in the tree still carries that element's role
+  and name: if something might, the refusal still reads as before; if nothing does, and the read
+  covered the whole tree, it reports the element as gone instead, which re-snapshotting the same
+  screen will not fix. A read cut short by the node cap, or missing a subtree a failed child read
+  dropped, only shows absence for the part it covered, so that weaker read still answers changed
+  rather than gone.
 - The accessibility tree now discloses subtrees it could not read. A child read that fails drops
   everything beneath it, and the tree came back looking complete — indistinguishable from one where
   there was genuinely nothing there, so an agent concludes an element does not exist and routes
