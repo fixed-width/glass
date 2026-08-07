@@ -224,6 +224,26 @@ internal refactors, CI, or test-only changes.
   the reason. Writing an empty value to clear a field needs the element to have a name: an empty
   field is not by itself evidence the clear landed on the element you meant, so a nameless one
   reports unconfirmed rather than a success it cannot prove.
+- `glass_set_value` on the iOS Simulator no longer refuses a write because the accessibility tree
+  was renumbered between the snapshot you read and the write itself. The check that runs before a
+  write re-walked to the element's position in the tree and refused when something else was there —
+  and on the Simulator a soft keyboard raised by an earlier interaction inserts elements ahead of a
+  field, which is enough to move it. The write now re-finds the element by its role and name and
+  acts on it wherever it now is, so a field that shifted is written where it is rather than refused.
+  Role and name alone do not decide it — they repeat across a form's rows and are both absent on an
+  unlabelled field, so the element must also still be drawn overlapping where you saw it and still
+  hold the value you saw, which is what stops a write landing on a neighbouring row. The refusals it
+  does make now say which happened — the element is gone, several now match it, it no longer looks
+  like what you addressed, the read covered only part of the tree, it is not editable, or it reports
+  no on-screen geometry — where before every one of them was the same "re-snapshot" sentence.
+- A `glass_set_value` on the iOS Simulator no longer intermittently leaves the field without the
+  text it was given. Clearing the field and typing the new text went to the device as separate
+  calls, and the field stops accepting typed input within a fraction of a second of the clear:
+  measured against [`examples/ios-role-fixture`](examples/ios-role-fixture/), text sent straight
+  after the clear lands every time, and text sent a third of a second later never does. A single
+  slow call was enough to open that gap, and the write then reported — correctly — that the element
+  did not hold the requested value. The clear and the text now go to the device together, so no call
+  can open a gap between them.
 - A native Android click or `set_value` through the optional on-device companion no longer acts on a
   different element than the one you named when the snapshot was truncated. glass numbered elements
   by their position in the tree it kept and dispatched the action by that number, but the companion

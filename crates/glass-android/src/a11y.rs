@@ -373,6 +373,14 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
             return Err(GlassError::AxWriteUnconfirmed(target.id.0, why));
         }
     };
+    if !target.bounds_overlap(node.bounds) {
+        return Err(GlassError::AxWriteUnconfirmed(
+            target.id.0,
+            "the element carrying its role and name is drawn clear of where this one was, so the \
+             text may have gone to a different one"
+                .into(),
+        ));
+    }
     if !node.states.editable {
         return Err(GlassError::AxWriteUnconfirmed(
             target.id.0,
