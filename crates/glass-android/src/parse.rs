@@ -236,6 +236,30 @@ mod tests {
     }
 
     #[test]
+    fn either_marker_alone_still_picks_the_reason_out_of_the_progress_lines() {
+        // The line above carries one marker and not the other. Requiring both would find no
+        // line at all and fall back to the whole output, burying the reason in the noise —
+        // which the case above cannot show, its line carrying both.
+        for (output, reason) in [
+            (
+                "Performing Streamed Install\nFailure [INSTALL_PARSE_FAILED_NO_CERTIFICATES]\n",
+                "Failure [INSTALL_PARSE_FAILED_NO_CERTIFICATES]",
+            ),
+            (
+                "Performing Streamed Install\nError [INSTALL_FAILED_INSUFFICIENT_STORAGE]\n",
+                "Error [INSTALL_FAILED_INSUFFICIENT_STORAGE]",
+            ),
+        ] {
+            let message = check_install(output).unwrap_err().to_string();
+            assert!(message.contains(reason), "got: {message}");
+            assert!(
+                !message.contains("Performing Streamed Install"),
+                "the reason must be the failing line, not the whole output: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn am_start_error_is_detected() {
         assert!(check_am_start("Starting: Intent {...}\nStatus: ok\n").is_ok());
         let err =

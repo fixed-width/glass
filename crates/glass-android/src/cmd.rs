@@ -258,4 +258,48 @@ mod tests {
         let run = vec!["com.example.app/.Main/extra".to_string()];
         assert!(parse_launch(&run).is_err());
     }
+
+    #[test]
+    fn a_slash_with_nothing_after_it_is_not_a_component() {
+        // The charset check passes vacuously on an empty activity, so this is the one part of
+        // the shape that only the emptiness guard rules out. Admitting it would run
+        // `am start -n com.example/`, which names no activity at all.
+        let run = vec!["com.example/".to_string()];
+        let message = parse_launch(&run).unwrap_err().to_string();
+        assert!(message.contains("com.example/"), "got: {message}");
+    }
+
+    #[test]
+    fn a_package_that_does_not_begin_with_a_letter_is_not_a_component() {
+        // The charset alone would admit this: `1abc` is entirely alphanumeric. A Java package
+        // cannot start with a digit, and only the leading-letter check says so.
+        let run = vec!["1abc/.Main".to_string()];
+        let message = parse_launch(&run).unwrap_err().to_string();
+        assert!(message.contains("1abc/.Main"), "got: {message}");
+    }
+
+    #[test]
+    fn underscores_belong_to_both_halves_of_a_component() {
+        let run = vec!["com.my_app/.My_Activity".to_string()];
+        let target = parse_launch(&run).expect("underscores are legal Java identifiers");
+        assert_eq!(target.package, "com.my_app");
+        assert_eq!(target.component, "com.my_app/.My_Activity");
+    }
+
+    #[test]
+    fn an_inner_class_activity_keeps_its_dollar_sign() {
+        // `pkg/.Outer$Inner` is how an activity declared as an inner class is named.
+        let run = vec!["com.example/.Outer$Inner".to_string()];
+        let target = parse_launch(&run).expect("an inner class is a legal activity");
+        assert_eq!(target.component, "com.example/.Outer$Inner");
+    }
+
+    #[test]
+    fn a_hyphen_keeps_an_element_out_of_both_halves() {
+        // A hyphen is legal in neither, and it is what the flags a caller might pass carry.
+        for stray in ["com.my-app/.Main", "com.example/.My-Activity"] {
+            let message = parse_launch(&[stray.to_string()]).unwrap_err().to_string();
+            assert!(message.contains(stray), "got: {message}");
+        }
+    }
 }

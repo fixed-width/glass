@@ -97,4 +97,17 @@ mod tests {
             Err(GlassError::CaptureFailed(_))
         ));
     }
+
+    #[test]
+    fn twelve_bytes_is_a_whole_header_and_reads_as_a_missing_payload() {
+        // The boundary the length check sits on: twelve bytes carry width, height and format
+        // and nothing else, so what did not arrive is the pixels. Blaming the header instead
+        // sends whoever reads it to the wrong end of the capture.
+        let err = decode_screencap(&buf(4, 4, 1, false, &[])).unwrap_err();
+        let GlassError::CaptureFailed(message) = err else {
+            panic!("a short capture is a CaptureFailed: {err}");
+        };
+        assert!(message.contains("payload bytes"), "got: {message}");
+        assert!(!message.contains("no header"), "got: {message}");
+    }
 }
