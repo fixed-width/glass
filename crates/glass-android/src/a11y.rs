@@ -505,6 +505,9 @@ pub struct AndroidA11y {
     resolved: bool,
     /// Set once a dump has succeeded, after which snapshots stop waiting for readiness.
     warmed: bool,
+    /// `GLASS_ANDROID_SERIAL` as it stood when this reader was made. Read once rather than at
+    /// resolution, so the device a session is reading cannot change under it midway.
+    want_serial: Option<String>,
 }
 
 impl AndroidA11y {
@@ -513,6 +516,7 @@ impl AndroidA11y {
             adb: Adb::from_env(),
             resolved: false,
             warmed: false,
+            want_serial: std::env::var("GLASS_ANDROID_SERIAL").ok(),
         }
     }
 
@@ -535,6 +539,7 @@ impl AndroidA11y {
             adb,
             resolved: true,
             warmed: false,
+            want_serial: None,
         }
     }
 
@@ -555,10 +560,7 @@ impl AndroidA11y {
                 .into_iter()
                 .filter(|d| d.state == "device")
                 .collect();
-            let serial = choose_serial(
-                std::env::var("GLASS_ANDROID_SERIAL").ok().as_deref(),
-                &online,
-            )?;
+            let serial = choose_serial(self.want_serial.as_deref(), &online)?;
             self.adb = self.adb.with_serial(serial);
             self.resolved = true;
         }
@@ -2131,6 +2133,205 @@ mod tests {
         let err = verify_write(&after, &t, "world").unwrap_err();
         assert!(matches!(err, GlassError::AxWriteUnconfirmed(0, _)), "{err}");
         assert!(err.to_string().contains("truncated at 2 nodes"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_subtree_cannot_confirm_a_write_against_its_one_match() {
+        // The twin of the truncation case above: a subtree the walk could not read is the other
+        // place a second match can be hiding, and it needs a different remedy from a raised cap,
+        // so the message must not collapse into the drifted-element one.
+        let mut after = under_a_container(tree_holding(Some("world")));
+        after.unreadable = 1;
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        let err = verify_write(&after, &t, "world").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(0, _)), "{err}");
+        assert!(err.to_string().contains("could not be read"), "{err}");
+    }
+
+    #[test]
+    fn a_dump_path_names_this_process_and_never_repeats() {
+        // Two hosts can drive one device, and a retry must not read the file a previous attempt
+        // wrote — the file is the only signal that a dump succeeded at all.
+        let tag = super::process_tag();
+        assert!(
+            tag.starts_with(&format!("{}_", std::process::id())),
+            "the tag must identify this process, got {tag:?}"
+        );
+        let first = super::attempt_path("/sdcard/glass_dump");
+        assert!(first.contains(tag), "{first}");
+        assert_ne!(first, super::attempt_path("/sdcard/glass_dump"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_reader_resolves_its_device_once_and_only_among_the_online_ones() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::new(&[(
+            "devices",
+            Answer::says(
+                "List of devices attached\nemulator-5554\tdevice\nemulator-5556\toffline\n",
+            ),
+        )]);
+        let mut reader = AndroidA11y {
+            adb: fake.adb().clone(),
+            resolved: false,
+            warmed: false,
+            want_serial: None,
+        };
+
+        let bound = reader.ensure_adb().expect("one device is online");
+        assert_eq!(bound.serial(), Some("emulator-5554"));
+
+        // Resolved once: a session's reads must not re-ask, or a device appearing mid-session
+        // could move the reader to a different one than the platform is driving.
+        let again = reader.ensure_adb().expect("already resolved");
+        assert_eq!(again.serial(), Some("emulator-5554"));
+        assert_eq!(
+            fake.calls().iter().filter(|c| *c == "devices").count(),
+            1,
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_reader_handed_a_resolved_client_does_not_go_looking_for_a_device() {
+        // The platform has already chosen — possibly a freshly booted AVD that `choose_serial`
+        // could not have disambiguated — so asking again could land on a different device.
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::new(&[("*", Answer::says(""))]);
+        let mut reader = AndroidA11y::for_adb(fake.adb().with_serial("emulator-5556"));
+
+        let bound = reader.ensure_adb().expect("already resolved");
+        assert_eq!(bound.serial(), Some("emulator-5556"));
+        assert!(!fake.called("devices"), "{:?}", fake.calls());
+    }
+
+    /// A uiautomator dump of one editable field holding `text`.
+    #[cfg(unix)]
+    fn one_field_holding(text: &str) -> String {
+        format!(
+            concat!(
+                "<?xml version='1.0'?><hierarchy rotation=\"0\">",
+                "<node index=\"0\" text=\"{}\" class=\"android.widget.EditText\" ",
+                "package=\"com.example.app\" content-desc=\"Search\" enabled=\"true\" ",
+                "focusable=\"true\" focused=\"true\" bounds=\"[100,200][500,300]\" />",
+                "</hierarchy>"
+            ),
+            text
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_write_taps_the_field_clears_it_types_and_waits_for_the_value_to_land() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        // The field still reads as the old text on the first read-back and as the new one on the
+        // second: the IME and its suggestion strip are still settling, which is exactly the
+        // moment a single read would call a good write failed.
+        let before = Answer::says(one_field_holding("hello"));
+        let after = Answer::says(one_field_holding("world"));
+        let fake = FakeAdb::scripted(&[
+            ("*shell cat*", vec![&before, &before, &after]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+        let ctx = AxContext {
+            pids: vec![],
+            window: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 2400,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::from_millis(30_000),
+        };
+        // The synthetic Window root is id 0, so the field is id 1.
+        let field = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: Some(AxRect {
+                x: 100,
+                y: 200,
+                width: 400,
+                height: 100,
+            }),
+            value: None,
+        };
+
+        reader
+            .set_value(&ctx, &field, "world")
+            .expect("the value lands on the second read-back");
+
+        // Tapped at the field's centre, then cleared, then typed — in that order.
+        assert!(fake.called("input tap 300 250"), "{:?}", fake.calls());
+        assert!(fake.called("input text"), "{:?}", fake.calls());
+        let cleared = fake
+            .calls()
+            .iter()
+            .any(|c| c.contains("input keyevent") || c.contains("keycombination"));
+        assert!(
+            cleared,
+            "the field must be cleared first: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_write_that_never_lands_is_reported_rather_than_assumed() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let stuck = Answer::says(one_field_holding("hello"));
+        let fake =
+            FakeAdb::scripted(&[("*shell cat*", vec![&stuck]), ("*", vec![&Answer::Silent])]);
+
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+        let ctx = AxContext {
+            pids: vec![],
+            window: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 2400,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::from_millis(30_000),
+        };
+        let field = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: Some(AxRect {
+                x: 100,
+                y: 200,
+                width: 400,
+                height: 100,
+            }),
+            value: None,
+        };
+
+        let err = reader
+            .set_value(&ctx, &field, "world")
+            .expect_err("a field still holding the old text has not taken the write");
+        assert!(matches!(err, GlassError::AxValueNotApplied(1)), "{err}");
     }
 
     #[test]
