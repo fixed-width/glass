@@ -410,14 +410,16 @@ mod tests {
 
     #[test]
     fn bounds_become_window_relative() {
+        // Both offsets are non-zero: an `x` of 0 subtracts and adds alike, so the x path would
+        // report clean however it combined the two.
         let win = WindowGeometry {
-            x: 0,
+            x: 24,
             y: 63,
             width: 1080,
             height: 2337,
         };
         let r = parse_bounds("[40,100][300,160]", &win).unwrap();
-        assert_eq!((r.x, r.y, r.width, r.height), (40, 37, 260, 60));
+        assert_eq!((r.x, r.y, r.width, r.height), (16, 37, 260, 60));
         assert!(parse_bounds("garbage", &win).is_none());
     }
 
@@ -507,6 +509,61 @@ mod tests {
         assert_eq!(
             tree.truncated.map(|t| t.limit),
             Some(TruncationLimit::Nodes)
+        );
+    }
+
+    /// `levels` nested `<node>` elements, each the only child of the one above it.
+    fn deep_hierarchy_xml(levels: usize) -> String {
+        let open = r#"<node class="android.widget.FrameLayout" bounds="[0,0][100,100]">"#;
+        format!(
+            "<?xml version='1.0'?><hierarchy rotation=\"0\">{}{}</hierarchy>",
+            open.repeat(levels),
+            "</node>".repeat(levels)
+        )
+    }
+
+    #[test]
+    fn a_tree_deeper_than_the_depth_cap_reports_depth_truncation() {
+        // Each level is walked at one deeper than its parent. A recursion that handed the
+        // parent's own depth back down would never reach the cap at all, and the depth cap is
+        // the rail that keeps a pathological tree off the stack.
+        let limits = WalkLimits {
+            depth: 3,
+            ..WalkLimits::DEFAULT
+        };
+        let deep = build_tree(&deep_hierarchy_xml(8), &win(), limits).unwrap();
+        assert_eq!(
+            deep.truncated.map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+
+        // The same cap over a tree that fits, which would otherwise pass if it always truncated.
+        let shallow = build_tree(&deep_hierarchy_xml(2), &win(), limits).unwrap();
+        assert_eq!(shallow.truncated, None);
+    }
+
+    #[test]
+    fn the_walk_maps_node_elements_and_leaves_every_other_element_out() {
+        // Only `<node>` describes a UI element. Matching on the tag OR on being an element —
+        // rather than both — would map whatever else the document carries as a node, at the
+        // root and at every level below it.
+        let xml = concat!(
+            r#"<?xml version='1.0'?><hierarchy rotation="0">"#,
+            r#"<other/>"#,
+            r#"<node class="android.widget.FrameLayout" bounds="[0,0][100,100]">"#,
+            r#"<decoration/>"#,
+            r#"</node>"#,
+            "</hierarchy>",
+        );
+        let tree = build_tree(xml, &win(), WalkLimits::DEFAULT).unwrap();
+        assert_eq!(
+            tree.root.children.len(),
+            1,
+            "<other/> is not a node, so the root has one child"
+        );
+        assert!(
+            tree.root.children[0].children.is_empty(),
+            "<decoration/> is not a node either"
         );
     }
 

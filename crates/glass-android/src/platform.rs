@@ -50,13 +50,16 @@ impl AndroidPlatform {
         emulators: &crate::avd::EmulatorRegistry,
         agents: &AgentRegistry,
     ) -> Result<Self> {
+        let get = |k: &str| std::env::var(k).ok();
         let base = Adb::from_env();
-        let target = crate::target::resolve(base, emulators)?;
+        let target = crate::target::resolve(base, emulators, &get)?;
 
         // Best-effort: use the agent when enabled; on any failure, fall back to adb paths.
-        let get = |k: &str| std::env::var(k).ok();
         let agent = if crate::agent::agent_enabled(&get) {
-            match agents.ensure(target.adb()).and_then(AgentClient::connect) {
+            match agents
+                .ensure(target.adb(), &get)
+                .and_then(AgentClient::connect)
+            {
                 Ok(client) => Some(Arc::new(client)),
                 Err(e) => {
                     eprintln!("glass-android: agent unavailable, using adb fallback: {e}");
@@ -374,6 +377,452 @@ impl Platform for AndroidPlatform {
             }
         }
         self.app_pid().into_iter().collect()
+    }
+}
+
+// Unix-gated as a whole: `FakeAdb` is a `/bin/sh` script, so this import breaks the Windows
+// build without it.
+#[cfg(test)]
+#[cfg(unix)]
+mod platform_tests {
+    use super::*;
+    use crate::adb::{Answer, FakeAdb};
+    use crate::target::AttachedDevice;
+    use glass_core::{MouseButton, SandboxLevel};
+
+    /// Two on-screen windows for the app — a dialog on top of its main activity — plus windows
+    /// owned by other packages, as `dumpsys window windows` really lays them out.
+    const WINDOWS: &str = concat!(
+        "  Window #0 Window{aaa111 u0 StatusBar}:\n",
+        "    mOwnerUid=10168 showForAllUsers=true package=com.android.systemui appop=NONE\n",
+        "    mFrame=[0,0][1080,80] isOnScreen=true\n",
+        "  Window #1 Window{bbb222 u0 com.example.app/com.example.app.MyDialog}:\n",
+        "    mOwnerUid=1000 showForAllUsers=false package=com.example.app appop=NONE\n",
+        "    mFrame=[140,800][940,1600] isOnScreen=true\n",
+        "  Window #2 Window{ddd444 u0 com.example.app/com.example.app.MainActivity}:\n",
+        "    mOwnerUid=1000 showForAllUsers=false package=com.example.app appop=NONE\n",
+        "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
+    );
+
+    /// The same dump with the dialog gone — the app's window list after it is dismissed.
+    const WINDOWS_WITHOUT_THE_DIALOG: &str = concat!(
+        "  Window #0 Window{aaa111 u0 StatusBar}:\n",
+        "    mOwnerUid=10168 showForAllUsers=true package=com.android.systemui appop=NONE\n",
+        "    mFrame=[0,0][1080,80] isOnScreen=true\n",
+        "  Window #2 Window{ddd444 u0 com.example.app/com.example.app.MainActivity}:\n",
+        "    mOwnerUid=1000 showForAllUsers=false package=com.example.app appop=NONE\n",
+        "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
+    );
+
+    fn spec() -> AppSpec {
+        AppSpec {
+            build: None,
+            run: vec!["com.example.app/.MainActivity".to_string()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 2_000,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        }
+    }
+
+    /// A screencap of `w`x`h` opaque pixels, as `exec-out screencap` returns one.
+    fn frame_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&w.to_le_bytes());
+        v.extend_from_slice(&h.to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend(std::iter::repeat_n(0xffu8, (w * h * 4) as usize));
+        v
+    }
+
+    /// A platform bound to `fake`, with no on-device companion — the adb fallback paths.
+    fn platform_over(fake: &FakeAdb) -> AndroidPlatform {
+        AndroidPlatform {
+            target: Box::new(AttachedDevice::from_adb(fake.adb().clone())),
+            injector: Box::new(ShellInjector),
+            agent: None,
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app: None,
+        }
+    }
+
+    /// A device that answers everything a healthy launch asks of it.
+    fn launchable() -> FakeAdb {
+        FakeAdb::new(&[
+            (
+                "shell am start *",
+                Answer::says("Starting: Intent {...}\nStatus: ok\n"),
+            ),
+            ("shell dumpsys window windows", Answer::says(WINDOWS)),
+            ("shell pidof *", Answer::says("4321\n")),
+            ("exec-out screencap", Answer::says(frame_bytes(1080, 2400))),
+            ("*", Answer::Silent),
+        ])
+    }
+
+    /// A launched app on a fake device, ready for the calls that need a session.
+    fn started(fake: &FakeAdb) -> AndroidPlatform {
+        let mut platform = platform_over(fake);
+        platform.start_app(&spec()).expect("the launch succeeds");
+        platform
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn starting_an_app_launches_it_and_reports_its_topmost_window() {
+        let fake = launchable();
+        let mut platform = platform_over(&fake);
+
+        let window = platform.start_app(&spec()).expect("the launch succeeds");
+
+        // The dialog is topmost, so that is the window the session drives.
+        assert_eq!((window.x, window.y), (140, 800));
+        assert_eq!((window.width, window.height), (800, 800));
+        assert!(fake.called("am start -W -n com.example.app/.MainActivity"));
+        assert_eq!(platform.app_pid(), Some(4321), "logcat needs the app's pid");
+        // Scoped to the app: without `--pid` this streams the whole device's log, which is
+        // every other app's output presented as this session's.
+        assert!(
+            fake.wait_called("logcat -v threadtime --pid=4321", Duration::from_secs(5)),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_launch_that_the_device_refuses_is_not_reported_as_started() {
+        let fake = FakeAdb::new(&[(
+            "shell am start *",
+            Answer::says("Starting: Intent {...}\nError: Activity not started\n"),
+        )]);
+        let mut platform = platform_over(&fake);
+        assert!(platform.start_app(&spec()).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_window_that_takes_a_moment_to_appear_is_waited_for() {
+        // The activity is up before its window is laid out, so the first dump legitimately
+        // shows nothing. A deadline computed backwards makes that first look the answer.
+        let empty = Answer::says("");
+        let windows = Answer::says(WINDOWS);
+        let started = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let pid = Answer::says("4321\n");
+        let silent = Answer::Silent;
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&started]),
+            (
+                "shell dumpsys window windows",
+                vec![&empty, &empty, &windows],
+            ),
+            ("shell pidof *", vec![&pid]),
+            ("*", vec![&silent]),
+        ]);
+
+        let mut platform = platform_over(&fake);
+        let window = platform
+            .start_app(&spec())
+            .expect("the window arrives on the third look");
+        assert_eq!((window.x, window.y), (140, 800));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_window_that_never_appears_ends_the_launch_rather_than_the_wait_going_on() {
+        let empty = Answer::says("");
+        let started = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&started]),
+            ("shell dumpsys window windows", vec![&empty]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+
+        let mut platform = platform_over(&fake);
+        let mut spec = spec();
+        spec.timeout_ms = 300;
+        let at = Instant::now();
+        assert!(platform.start_app(&spec).is_err());
+        assert!(
+            at.elapsed() < Duration::from_secs(20),
+            "waited {:?}",
+            at.elapsed()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stopping_an_app_force_stops_its_package_and_ends_the_session() {
+        let fake = launchable();
+        let mut platform = started(&fake);
+
+        platform
+            .stop_app()
+            // A failed force-stop is NOT surfaced — `stop_app` discards it — so this asserts
+            // only that the call was made and the session ended, not that the app died.
+            .expect("ending a session reports");
+
+        assert!(
+            fake.called("am force-stop com.example.app"),
+            "{:?}",
+            fake.calls()
+        );
+        assert!(matches!(
+            platform.window(&WindowOp::Geometry),
+            Err(GlassError::NoActiveSession)
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_capture_is_cropped_to_the_window_rather_than_the_display() {
+        let fake = launchable();
+        let mut platform = started(&fake);
+
+        let frame = platform.capture_frame(None).expect("the device captures");
+
+        // The dialog's frame, not the 1080x2400 display behind it.
+        assert_eq!((frame.width, frame.height), (800, 800));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_window_is_re_read_before_a_capture_so_a_move_is_not_missed() {
+        // The cached geometry is from launch; a rotation or a layout change moves the window
+        // under it, and cropping to a stale rect captures the wrong pixels.
+        let windows = Answer::says(WINDOWS);
+        let moved = Answer::says(concat!(
+            "  Window #1 Window{bbb222 u0 com.example.app/com.example.app.MyDialog}:
+",
+            "    mOwnerUid=1000 showForAllUsers=false package=com.example.app appop=NONE
+",
+            "    mFrame=[0,0][600,400] isOnScreen=true
+",
+        ));
+        let started_ok = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let pid = Answer::says("4321\n");
+        let shot = Answer::says(frame_bytes(1080, 2400));
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&started_ok]),
+            ("shell dumpsys window windows", vec![&windows, &moved]),
+            ("shell pidof *", vec![&pid]),
+            ("exec-out screencap", vec![&shot]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+
+        let mut platform = platform_over(&fake);
+        platform.start_app(&spec()).expect("the launch succeeds");
+        let frame = platform.capture_frame(None).expect("the device captures");
+        assert_eq!(
+            (frame.width, frame.height),
+            (600, 400),
+            "the capture used the window's current frame"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pointer_and_key_events_reach_the_device() {
+        let fake = launchable();
+        let mut platform = started(&fake);
+
+        platform
+            .send_pointer(&PointerEvent::Click {
+                x: 10,
+                y: 20,
+                button: MouseButton::Left,
+                count: 1,
+                modifiers: vec![],
+            })
+            .expect("a tap is sent");
+        platform
+            .send_key(&KeyEvent::Text("hi".into()))
+            .expect("text is sent");
+
+        // Window-relative (10,20) inside a window at (140,800) is absolute (150,820).
+        assert!(fake.called("input tap 150 820"), "{:?}", fake.calls());
+        assert!(fake.called("input text"), "{:?}", fake.calls());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn input_without_a_session_is_refused_rather_than_sent_nowhere() {
+        let fake = launchable();
+        let mut platform = platform_over(&fake);
+        assert!(platform.send_key(&KeyEvent::Text("hi".into())).is_err());
+        assert!(!fake.called("input text"), "{:?}", fake.calls());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn focusing_relaunches_the_activity_and_re_reads_the_window() {
+        let fake = launchable();
+        let mut platform = started(&fake);
+
+        let window = platform.window(&WindowOp::Focus).expect("focus succeeds");
+
+        assert_eq!((window.x, window.y), (140, 800));
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|c| c.contains("am start"))
+                .count(),
+            2,
+            "focus re-issues the launch intent"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn moving_or_resizing_a_window_is_refused_on_this_platform() {
+        let fake = launchable();
+        let mut platform = started(&fake);
+        assert!(matches!(
+            platform.window(&WindowOp::Resize {
+                width: 100,
+                height: 100
+            }),
+            Err(GlassError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn listing_windows_marks_the_selected_one_active() {
+        let fake = launchable();
+        let mut platform = started(&fake);
+
+        let windows = platform.list_windows().expect("the app has windows");
+
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        assert_eq!(windows[0].geometry.x, 140, "topmost first");
+        assert!(windows[0].active, "the session drives the topmost window");
+        assert!(!windows[1].active);
+        assert_eq!(windows[0].class.as_deref(), Some("com.example.app"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_list_whose_selected_window_is_gone_falls_back_to_the_topmost() {
+        // The dialog the session was driving has been dismissed. Marking nothing active would
+        // leave the caller with a list it cannot act on.
+        let windows = Answer::says(WINDOWS);
+        let without = Answer::says(WINDOWS_WITHOUT_THE_DIALOG);
+        let started_ok = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let pid = Answer::says("4321\n");
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&started_ok]),
+            ("shell dumpsys window windows", vec![&windows, &without]),
+            ("shell pidof *", vec![&pid]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+
+        let mut platform = platform_over(&fake);
+        platform.start_app(&spec()).expect("the launch succeeds");
+        let listed = platform.list_windows().expect("the app still has a window");
+
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert!(
+            listed[0].active,
+            "with the selection gone, the topmost window is the active one"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn selecting_a_window_switches_to_it_and_an_unknown_id_is_refused() {
+        let fake = launchable();
+        let mut platform = started(&fake);
+
+        let main = platform
+            .list_windows()
+            .expect("windows")
+            .into_iter()
+            .find(|w| w.geometry.x == 0)
+            .expect("the main activity is listed");
+
+        let geometry = platform.select_window(main.id).expect("it is one of ours");
+        assert_eq!((geometry.width, geometry.height), (1080, 2400));
+        // The selection sticks: the session now drives the main activity.
+        assert_eq!(platform.window(&WindowOp::Geometry).unwrap().x, 0);
+
+        assert!(matches!(
+            platform.select_window(WindowId(0xdead_beef)),
+            Err(GlassError::WindowNotFound)
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn logs_are_handed_over_once_and_then_gone() {
+        let fake = launchable();
+        let mut platform = started(&fake);
+        platform
+            .logs
+            .lock()
+            .unwrap()
+            .push((Stream::Stdout, "hello".to_string()));
+
+        assert_eq!(
+            platform.drain_logs(),
+            [(Stream::Stdout, "hello".to_string())]
+        );
+        assert!(
+            platform.drain_logs().is_empty(),
+            "a drained line must not be handed out twice"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_clipboard_says_it_needs_the_companion_rather_than_answering_emptily() {
+        // An empty string would read as an empty clipboard, and a silent `set` as one that
+        // worked — neither is true without the agent.
+        let fake = launchable();
+        let mut platform = started(&fake);
+
+        let read = platform
+            .get_clipboard()
+            .expect_err("no agent, no clipboard");
+        assert!(matches!(read, GlassError::Unsupported(_)), "{read}");
+        assert!(read.to_string().contains("agent"), "{read}");
+
+        let written = platform
+            .set_clipboard("x")
+            .expect_err("no agent, no clipboard");
+        assert!(matches!(written, GlassError::Unsupported(_)), "{written}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_app_pids_are_re_read_from_the_device_and_fall_back_to_the_known_one() {
+        let fake = launchable();
+        let platform = started(&fake);
+        // `pidof` lists every process of the package; the launch recorded only the first.
+        assert_eq!(platform.app_pid(), Some(4321));
+
+        let started_ok = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let windows = Answer::says(WINDOWS);
+        let one = Answer::says("4321\n");
+        let many = Answer::says("4321 4322 4323\n");
+        let none = Answer::says("\n");
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&started_ok]),
+            ("shell dumpsys window windows", vec![&windows]),
+            ("shell pidof *", vec![&one, &many, &none]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+        let mut platform = platform_over(&fake);
+        platform.start_app(&spec()).expect("the launch succeeds");
+
+        assert_eq!(platform.app_pids(), [4321, 4322, 4323], "a live re-scan");
+        assert_eq!(
+            platform.app_pids(),
+            [4321],
+            "a scan that finds nothing falls back to the pid the launch recorded"
+        );
     }
 }
 

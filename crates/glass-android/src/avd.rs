@@ -166,7 +166,7 @@ pub fn decide(online: &[Device], serial_env: Option<&str>, lifecycle: Lifecycle)
 /// factory (to register boots) and another into the `Glass` shutdown hook (to kill).
 #[derive(Clone, Default)]
 pub struct EmulatorRegistry {
-    booted: Arc<Mutex<Vec<String>>>,
+    booted: Arc<Mutex<Vec<Adb>>>,
 }
 
 impl EmulatorRegistry {
@@ -174,30 +174,39 @@ impl EmulatorRegistry {
         Self::default()
     }
 
-    /// Record an emulator serial glass booted.
-    pub fn register(&self, serial: String) {
+    /// Record an emulator glass booted, along with the adb client that reaches it.
+    ///
+    /// Do not resolve one at shutdown instead: `Adb::from_env` reads `GLASS_ADB` and the SDK
+    /// layout as they are *then*, so the kill could go to a different adb than the boot did.
+    pub fn register(&self, adb: &Adb, serial: String) {
         if let Ok(mut g) = self.booted.lock() {
-            g.push(serial);
+            g.push(adb.with_serial(serial));
         }
     }
 
     /// Stop every registered emulator (`adb -s <serial> emu kill`) and clear the list.
-    /// Best-effort: a device already gone is fine. Resolves adb from env.
+    /// Best-effort: a device already gone is fine.
     pub fn kill_all(&self) {
-        let adb = Adb::from_env();
-        let serials = self
+        let clients = self
             .booted
             .lock()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
-        for s in serials {
-            let _ = adb.with_serial(s).run(["emu", "kill"]);
+        for adb in clients {
+            let _ = adb.run(["emu", "kill"]);
         }
     }
 
     #[cfg(test)]
     pub fn serials(&self) -> Vec<String> {
-        self.booted.lock().map(|g| g.clone()).unwrap_or_default()
+        self.booted
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .filter_map(|a| a.serial().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -401,6 +410,15 @@ mod tests {
     }
 
     #[test]
+    fn a_noise_line_is_dropped_for_whichever_reason_gives_it_away() {
+        // `list_avds_parses_names_only`'s noise line carries a pipe AND spaces, so it cannot
+        // show which rule did the work. Each of these has exactly one.
+        assert_eq!(parse_list_avds("INFO|crashdata\nglass\n"), ["glass"]);
+        assert_eq!(parse_list_avds("Storing crashdata\nglass\n"), ["glass"]);
+        assert_eq!(parse_list_avds("\n\nglass\n"), ["glass"]);
+    }
+
+    #[test]
     fn choose_avd_sole_or_named_or_errors() {
         assert_eq!(choose_avd(None, &["glass".into()]).unwrap(), "glass");
         assert_eq!(
@@ -467,14 +485,127 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn registry_records_serials() {
+        use crate::adb::{Answer, FakeAdb};
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
         let r = EmulatorRegistry::new();
         let r2 = r.clone();
-        r.register("emulator-5554".into());
-        r2.register("emulator-5556".into());
+        r.register(fake.adb(), "emulator-5554".into());
+        r2.register(fake.adb(), "emulator-5556".into());
         assert_eq!(
             r.serials(),
             vec!["emulator-5554".to_string(), "emulator-5556".to_string()]
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn killing_them_all_stops_each_registered_emulator_and_forgets_it() {
+        // The shutdown hook calls this once. An emulator it fails to stop holds its AVD lock,
+        // and the next run cannot boot the same one — the failure lands a session later, on
+        // work that did nothing wrong.
+        use crate::adb::{Answer, FakeAdb};
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let registry = EmulatorRegistry::new();
+        registry.register(fake.adb(), "emulator-5554".into());
+        registry.register(fake.adb(), "emulator-5556".into());
+
+        registry.kill_all();
+
+        assert_eq!(
+            fake.calls(),
+            ["-s emulator-5554 emu kill", "-s emulator-5556 emu kill",]
+        );
+        // Cleared, so a second shutdown does not kill a device someone has since started.
+        assert!(registry.serials().is_empty());
+        registry.kill_all();
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn booting_waits_for_the_device_to_appear_and_finish_booting() {
+        use crate::adb::{Answer, FakeAdb};
+
+        // `devices` is asked repeatedly: once for the "before" snapshot, then in the poll loop.
+        // The emulator is not there for the first two, so the boot is genuinely waited out
+        // rather than answered by the very first look.
+        let none = Answer::says("List of devices attached\n\n");
+        let up = Answer::says("List of devices attached\nemulator-5554\tdevice\n\n");
+        let booted = Answer::says("1\n");
+        let fake = FakeAdb::scripted(&[
+            ("devices", vec![&none, &none, &up]),
+            (
+                "-s emulator-5554 shell getprop sys.boot_completed",
+                vec![&booted],
+            ),
+        ]);
+        let emulator = fake.alongside("emulator", crate::adb::FAKE_EMULATOR_SCRIPT);
+        std::fs::write(emulator.parent().unwrap().join("avds"), "Pixel_6\nglass\n").unwrap();
+
+        let get = |k: &str| match k {
+            "GLASS_EMULATOR" => Some(emulator.to_string_lossy().into_owned()),
+            "GLASS_AVD" => Some("glass".to_string()),
+            _ => None,
+        };
+
+        let serial = boot_avd(fake.adb(), &get).expect("the emulator comes up on the third look");
+        assert_eq!(serial, "emulator-5554");
+        // The AVD it was told to boot, not whichever one came first out of `-list-avds`.
+        assert!(
+            fake.read("boots").contains("-avd glass"),
+            "{:?}",
+            fake.read("boots")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn booting_gives_up_when_the_device_never_appears() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let none = Answer::says("List of devices attached\n\n");
+        let fake = FakeAdb::scripted(&[("devices", vec![&none])]);
+        let emulator = fake.alongside("emulator", crate::adb::FAKE_EMULATOR_SCRIPT);
+        std::fs::write(emulator.parent().unwrap().join("avds"), "glass\n").unwrap();
+
+        let get = |k: &str| match k {
+            "GLASS_EMULATOR" => Some(emulator.to_string_lossy().into_owned()),
+            "GLASS_EMULATOR_BOOT_TIMEOUT_MS" => Some("600".to_string()),
+            _ => None,
+        };
+
+        let started = std::time::Instant::now();
+        let err = boot_avd(fake.adb(), &get).expect_err("a device that never appears is a failure");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "waited {:?} — the deadline never ended the wait",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains("sys.boot_completed"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_named_avd_that_the_sdk_does_not_have_is_refused_before_anything_boots() {
+        // The listing is what `run_emulator_list` returns; an empty or invented one would send
+        // `emulator -avd` after a device that does not exist.
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::new(&[("devices", Answer::says("List of devices attached\n\n"))]);
+        let emulator = fake.alongside("emulator", crate::adb::FAKE_EMULATOR_SCRIPT);
+        std::fs::write(emulator.parent().unwrap().join("avds"), "Pixel_6\nglass\n").unwrap();
+
+        let get = |k: &str| match k {
+            "GLASS_EMULATOR" => Some(emulator.to_string_lossy().into_owned()),
+            "GLASS_AVD" => Some("not_an_avd".to_string()),
+            _ => None,
+        };
+
+        let err = boot_avd(fake.adb(), &get).expect_err("an unknown AVD cannot be booted");
+        assert!(err.to_string().contains("not_an_avd"), "{err}");
+        // It never got as far as spawning one.
+        assert_eq!(fake.read("boots"), "");
     }
 }

@@ -258,7 +258,7 @@ jobs:
           if-no-files-found: warn
 
   mutants:
-    name: Mutation shard ${{ matrix.shard }} (glass-core)
+    name: Mutation shard ${{ matrix.shard }} (glass-core, glass-android)
     runs-on: ubuntu-latest
     # A push carries no base ref to diff against; this gate is a pull-request check.
     if: github.event_name == 'pull_request'
@@ -273,7 +273,7 @@ jobs:
           # `--in-diff` needs a merge base to diff against; the default depth-1 checkout has
           # none, which would yield an empty diff, mutate nothing, and pass green.
           fetch-depth: 0
-      - name: Diff glass-core against the merge base
+      - name: Diff the gated crates against the merge base
         id: diff
         # A ref name may contain `;`, `` ` ``, `$` and more, so it reaches the shell as data.
         env:
@@ -286,14 +286,19 @@ jobs:
           }
           # `:(glob)` so `**` spans directories, matching scripts/mutants.sh's --file; without
           # it git reads `**` as an ordinary fnmatch pattern and selects nothing at all.
+          #
+          # Keep these pathspecs in step with the --package list below. --package is what sets
+          # the --file glob, so a crate named there but absent here draws no mutants and gates
+          # nothing, and one present here but not named there is never mutated at all.
           git diff "origin/$BASE_REF...HEAD" \
-            -- ':(glob)crates/glass-core/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
+            -- ':(glob)crates/glass-core/src/**/*.rs' \
+               ':(glob)crates/glass-android/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
           wc -l "$RUNNER_TEMP/pr.diff"
           if [ -s "$RUNNER_TEMP/pr.diff" ]; then
             echo "touched=true" >> "$GITHUB_OUTPUT"
           else
             echo "touched=false" >> "$GITHUB_OUTPUT"
-            echo "this PR changes no .rs file under crates/glass-core/src/ — nothing to mutate"
+            echo "this PR changes no .rs file under the gated crates' src/ — nothing to mutate"
           fi
       # Installing a toolchain and two cargo tools costs more than the check itself,
       # so a PR that touches no smoke file skips straight past them.
@@ -314,11 +319,15 @@ jobs:
         run: |
           scripts/mutants.sh "$RUNNER_TEMP/mutants" \
             --test-tool nextest \
+            --package glass-core --package glass-android \
             --shard ${{ matrix.shard }}/8 --sharding round-robin \
             --in-diff "$RUNNER_TEMP/pr.diff"
 
   # A matrix job's checks are named per shard, so the branch ruleset has nothing stable
   # to require. This one has a fixed name and fails if any shard did.
+  #
+  # The ruleset's required check matches this name, so it is frozen — renaming it blocks every
+  # pull request. It gates glass-android too despite the name; rename only with the ruleset.
   mutants-gate:
     name: Mutation gate (glass-core)
     runs-on: ubuntu-latest

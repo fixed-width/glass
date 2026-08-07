@@ -15,7 +15,7 @@ env:
 
 jobs:
   sweep:
-    name: Mutation sweep shard ${{ matrix.shard }} (glass-core)
+    name: Mutation sweep shard ${{ matrix.shard }} (glass-core, glass-android)
     runs-on: ubuntu-latest
     strategy:
       # Every shard reports: one red shard must not hide a second one.
@@ -37,6 +37,7 @@ jobs:
         run: |
           scripts/mutants.sh "$RUNNER_TEMP/mutants" \
             --test-tool nextest \
+            --package glass-core --package glass-android \
             --shard ${{ matrix.shard }}/8 --sharding round-robin
       - name: Upload the outcome
         if: always()

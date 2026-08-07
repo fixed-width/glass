@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mutation-test glass-core with cargo-mutants and grade the outcome.
+# Mutation-test one or more crates with cargo-mutants and grade the outcome.
 #
 # Why this wrapper rather than a bare `cargo mutants`: its exit code alone cannot
 # tell a clean run from one that gated nothing.
@@ -49,8 +49,8 @@ shift
 
 # glass-core is the platform-agnostic heart — the Platform/Accessibility seams, session,
 # frame diffing, stability, the log buffer — so it is pure logic that mutates meaningfully and
-# tests without a display. Changing this default changes what CI gates — `--package` scopes a
-# run to another crate without touching it.
+# tests without a display. CI names its packages explicitly, so this default now covers only a
+# bare local run — `--package` scopes a run to other crates.
 readonly DEFAULT_PACKAGE='glass-core'
 
 # A package's own sources. `**` so a file moved into a subdirectory stays covered; keep this in

@@ -58,7 +58,7 @@ impl CallFailure {
 /// How long a read blocks for the companion when no caller named a bound — long enough that a
 /// stalled agent surfaces as a transport error the reconnect path handles, rather than hanging the
 /// single-threaded MCP loop forever.
-const STANDING_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const STANDING_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct Conn {
     pub(crate) writer: TcpStream,
@@ -71,15 +71,15 @@ impl Conn {
     pub(crate) fn open(port: u16) -> glass_core::Result<Conn> {
         let stream = TcpStream::connect(("127.0.0.1", port))
             .map_err(|e| GlassError::Backend(format!("agent connect :{port}: {e}")))?;
-        // Set read/write timeouts so a stalled agent surfaces as a transport error (which
-        // the existing reconnect path handles) rather than hanging the MCP thread forever.
-        stream.set_read_timeout(Some(STANDING_TIMEOUT)).ok();
+        // Timeouts so a stalled agent surfaces as a transport error the reconnect path handles,
+        // rather than hanging the MCP thread forever. Each goes on the handle that does that
+        // half's work — see `read_within` for what puts the read one on the reader.
         stream.set_write_timeout(Some(STANDING_TIMEOUT)).ok();
-        let reader = BufReader::new(
-            stream
-                .try_clone()
-                .map_err(|e| GlassError::Backend(format!("agent clone: {e}")))?,
-        );
+        let read_half = stream
+            .try_clone()
+            .map_err(|e| GlassError::Backend(format!("agent clone: {e}")))?;
+        read_half.set_read_timeout(Some(STANDING_TIMEOUT)).ok();
+        let reader = BufReader::new(read_half);
         let mut c = Conn {
             writer: stream,
             reader,
@@ -117,8 +117,12 @@ impl Conn {
     ///
     /// Per-call rather than per-connection: the socket outlives any one request, so a bound left
     /// behind would be applied to a later call that never agreed to it.
+    ///
+    /// Do not set this on `writer`: a read timeout does not carry across `try_clone` on Windows,
+    /// where a bound set there left the read on the 30s standing one instead.
     pub(crate) fn read_within(&mut self, wait: Option<Duration>) {
-        self.writer
+        self.reader
+            .get_ref()
             .set_read_timeout(Some(wait.unwrap_or(STANDING_TIMEOUT)))
             .ok();
     }
@@ -155,5 +159,99 @@ impl Conn {
             ))));
         }
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::fake_agent;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::time::Instant;
+
+    const HELLO: &str = r#"{"hello":{"proto":1}}"#;
+    const OK: &str = r#"{"ok":true}"#;
+
+    /// A listener that says hello and then answers nothing, holding the connection open — a
+    /// companion that stopped responding without dropping the socket, which is the only case a
+    /// read timeout is there for. A closed socket ends the read on its own.
+    fn silent_after_hello() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = writeln!(stream, "{HELLO}");
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_bounded_read_gives_up_at_the_bound_and_not_at_the_standing_timeout() {
+        // A caller that named a deadline gets it. Without this the wait is the 30s standing
+        // timeout, which is the single-threaded MCP loop blocked for half a minute on a
+        // companion that has already stopped talking.
+        let mut conn = Conn::open(silent_after_hello()).expect("the hello arrives");
+        conn.read_within(Some(Duration::from_millis(200)));
+
+        let started = Instant::now();
+        let Err(failure) = conn.call(json!({"op": "ping"})) else {
+            panic!("a companion that answers nothing cannot have answered");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?} — the bound never reached the socket",
+            started.elapsed()
+        );
+        assert!(
+            failure.is_transport(),
+            "a read that ran out of time is a transport failure, not a refusal"
+        );
+    }
+
+    #[test]
+    fn an_answer_addressed_to_another_request_is_refused_rather_than_retried() {
+        // The id is what matches an answer to its question, and a mismatch must classify as
+        // `Refused`: `is_transport` is what decides whether the caller re-sends, and re-sending
+        // an `ACTION_CLICK` whose answer merely went astray taps the control a second time.
+        let (port, _seen) = fake_agent(HELLO, vec![r#"{"id":999,"ok":true}"#]);
+        let mut conn = Conn::open(port).expect("the hello arrives");
+
+        let Err(failure) = conn.call(json!({"op": "ping"})) else {
+            panic!("an answer to a different request is not an answer to this one");
+        };
+        assert!(
+            !failure.is_transport(),
+            "a device that answered is not a transport failure, and must not be re-sent to"
+        );
+        assert!(!failure.nothing_sent());
+        assert!(
+            failure.into_error().to_string().contains("id mismatch"),
+            "the error must say what did not line up"
+        );
+    }
+
+    #[test]
+    fn every_request_carries_an_id_of_its_own() {
+        // The id is what matches an answer to its question. Ids that repeat — or that run
+        // backwards into one already used — let a late answer satisfy a later call, and on this
+        // protocol that means one tap's reply standing in for another's.
+        let (port, seen) = fake_agent(HELLO, vec![OK, OK, OK]);
+        let mut conn = Conn::open(port).expect("the hello arrives");
+        for _ in 0..3 {
+            conn.call(json!({"op": "ping"}))
+                .map_err(CallFailure::into_error)
+                .expect("the fake answers every ping");
+        }
+
+        let ids: Vec<i64> = seen
+            .lock()
+            .expect("seen lock")
+            .iter()
+            .filter_map(|r| r.get("id").and_then(Value::as_i64))
+            .collect();
+        assert_eq!(ids, [1, 2, 3]);
     }
 }

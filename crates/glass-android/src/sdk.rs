@@ -21,21 +21,30 @@ pub struct SdkRoot {
     pub source: SdkSource,
 }
 
+/// An environment variable with something in it. A variable set to the empty string counts as
+/// unset: an empty path would otherwise be probed as the root of the filesystem.
+///
+/// Do not push this check back inside the per-OS branches: they compile only on the target they
+/// select, and the mutation gate runs on one, so no test there could reach it.
+fn non_empty(get: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<String> {
+    get(key).filter(|s| !s.is_empty())
+}
+
 /// Default SDK install locations to probe for the current OS, given `$HOME`
 /// (and `%LOCALAPPDATA%` on Windows) read via `get`.
 fn default_locations(get: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
     let mut v = Vec::new();
     #[cfg(target_os = "windows")]
-    if let Some(la) = get("LOCALAPPDATA").filter(|s| !s.is_empty()) {
+    if let Some(la) = non_empty(get, "LOCALAPPDATA") {
         v.push(PathBuf::from(format!(r"{la}\Android\Sdk")));
     }
     #[cfg(target_os = "macos")]
-    if let Some(h) = get("HOME").filter(|s| !s.is_empty()) {
+    if let Some(h) = non_empty(get, "HOME") {
         v.push(PathBuf::from(format!("{h}/Library/Android/sdk")));
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        if let Some(h) = get("HOME").filter(|s| !s.is_empty()) {
+        if let Some(h) = non_empty(get, "HOME") {
             v.push(PathBuf::from(format!("{h}/Android/Sdk")));
             v.push(PathBuf::from(format!("{h}/android-sdk")));
         }
@@ -164,21 +173,21 @@ pub fn artifact_data_dirs(get: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> 
     let mut v = Vec::new();
     #[cfg(target_os = "windows")]
     for var in ["APPDATA", "LOCALAPPDATA"] {
-        if let Some(d) = get(var).filter(|s| !s.is_empty()) {
+        if let Some(d) = non_empty(get, var) {
             v.push(PathBuf::from(d).join("glass"));
         }
     }
     #[cfg(target_os = "macos")]
-    if let Some(h) = get("HOME").filter(|s| !s.is_empty()) {
+    if let Some(h) = non_empty(get, "HOME") {
         v.push(PathBuf::from(format!(
             "{h}/Library/Application Support/glass"
         )));
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        if let Some(x) = get("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
+        if let Some(x) = non_empty(get, "XDG_DATA_HOME") {
             v.push(PathBuf::from(x).join("glass"));
-        } else if let Some(h) = get("HOME").filter(|s| !s.is_empty()) {
+        } else if let Some(h) = non_empty(get, "HOME") {
             v.push(PathBuf::from(format!("{h}/.local/share/glass")));
         }
     }
@@ -507,5 +516,28 @@ mod tests {
     fn none_when_nothing_exists() {
         let get = getter(&[("HOME", "/home/u")]);
         assert!(resolve_sdk_root(&get, &|_| false).is_none());
+    }
+
+    #[test]
+    fn an_env_var_set_to_nothing_counts_as_unset() {
+        // An empty value would otherwise be joined into a path and probed as the filesystem
+        // root — every relative lookup below it silently answering about the wrong tree.
+        let get = getter(&[("HOME", "")]);
+        assert_eq!(non_empty(&get, "HOME"), None);
+        assert_eq!(non_empty(&get, "ABSENT"), None);
+        assert_eq!(
+            non_empty(&getter(&[("HOME", "/home/u")]), "HOME").as_deref(),
+            Some("/home/u")
+        );
+    }
+
+    #[test]
+    fn the_executable_directory_is_the_one_the_running_binary_sits_in() {
+        // Artifacts dropped beside `glass-mcp` are found through this, so a `None` — or an
+        // empty path, which joins into a bare relative name — drops that lookup entirely.
+        let dir = exe_dir().expect("a running test binary has a directory");
+        assert!(dir.is_dir(), "{dir:?} is not a directory");
+        let exe = std::env::current_exe().expect("current exe");
+        assert_eq!(exe.parent(), Some(dir.as_path()));
     }
 }
