@@ -270,6 +270,12 @@ pub(crate) enum Answer {
     /// Exit non-zero, writing these bytes on stderr — what [`Adb::output`] turns into
     /// `ToolFailed`, and the stream `a11y` reads a device's reason from.
     Fails(Vec<u8>),
+    /// Exit 0, writing these bytes on stderr and nothing on stdout.
+    ///
+    /// The shape [`Adb::run_streams_until`] exists for: `uiautomator dump` reports failure by
+    /// exiting 0 and explaining itself on stderr, so a caller that read only the exit status
+    /// would take it for a dump that worked.
+    Warns(Vec<u8>),
     /// Exit 0 having said nothing, like `am force-stop` on success.
     Silent,
     /// Stay up rather than returning, like the backgrounded `adb shell` that holds the on-device
@@ -285,6 +291,9 @@ impl Answer {
     }
     pub(crate) fn fails(s: impl AsRef<[u8]>) -> Answer {
         Answer::Fails(s.as_ref().to_vec())
+    }
+    pub(crate) fn warns(s: impl AsRef<[u8]>) -> Answer {
+        Answer::Warns(s.as_ref().to_vec())
     }
 }
 
@@ -380,6 +389,7 @@ impl FakeAdb {
                 let (code, out, err): (&str, &[u8], &[u8]) = match answer {
                     Answer::Says(s) => ("0", s, b""),
                     Answer::Fails(s) => ("1", b"", s),
+                    Answer::Warns(s) => ("0", b"", s),
                     Answer::Silent => ("0", b"", b""),
                     Answer::Lingers => ("linger", b"", b""),
                 };

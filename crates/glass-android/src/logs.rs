@@ -78,16 +78,20 @@ mod tests {
     use super::*;
     use glass_core::Stream;
 
-    /// A `LogcatStream` over a stand-in child that will outlive the test unless something kills
-    /// it. `adb logcat` itself needs a device; what these pin is the killing, built through the
-    /// same drain the real spawn uses.
+    /// A `LogcatStream` over a stand-in child that prints `lines` and then stays up until killed,
+    /// plus its pid and the sink it drains into. `adb logcat` itself needs a device; this is the
+    /// same child shape, built through the same drain the real spawn uses.
+    ///
+    /// `lines` must carry no single quote — they are the test's own literals.
     #[cfg(unix)]
-    fn stream_over_a_sleeping_child() -> (LogcatStream, u32) {
+    fn stream_over_a_child_printing(lines: &[&str]) -> (LogcatStream, u32, LogSink) {
         let sink: LogSink = Arc::new(Mutex::new(Vec::new()));
+        let said: Vec<String> = lines.iter().map(|l| format!("'{l}'")).collect();
+        // `exec` so the shell becomes the sleep: the kill under test reaches the process whose
+        // pid this returns, with no grandchild left orphaned behind it.
+        let script = format!("printf '%s\\n' {}; exec sleep 30", said.join(" "));
         let mut child = Command::new("/bin/sh")
-            // `exec` so the shell becomes the sleep: the kill under test reaches the process
-            // whose pid this returns, with no grandchild left orphaned behind it.
-            .args(["-c", "exec sleep 30"])
+            .args(["-c", &script])
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn the stand-in");
@@ -95,9 +99,44 @@ mod tests {
         let stdout = child.stdout.take().expect("piped stdout");
         let stream = LogcatStream {
             child,
-            _reader: drain_into(stdout, sink),
+            _reader: drain_into(stdout, Arc::clone(&sink)),
         };
+        (stream, pid, sink)
+    }
+
+    #[cfg(unix)]
+    fn stream_over_a_sleeping_child() -> (LogcatStream, u32) {
+        let (stream, pid, _) = stream_over_a_child_printing(&[]);
         (stream, pid)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn each_line_reaches_the_sink_classified_by_its_priority() {
+        // What `glass_logs` hands the caller. An error line arriving as stdout sends whoever
+        // reads it straight past the thing that broke — and until now the drain was built by
+        // every test here and run by none of them.
+        let (_stream, _pid, sink) = stream_over_a_child_printing(&[
+            "06-15 12:00:00.0  1 1 I Tag: starting up",
+            "06-15 12:00:00.0  1 1 E Tag: boom",
+        ]);
+
+        // The drain reads on its own thread, so wait for it rather than racing it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sink.lock().expect("sink").len() < 2 && std::time::Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let lines = sink.lock().expect("sink").clone();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0].0, Stream::Stdout);
+        assert!(lines[0].1.contains("starting up"), "{lines:?}");
+        assert_eq!(
+            lines[1].0,
+            Stream::Stderr,
+            "an E line is the app's error output: {lines:?}"
+        );
+        assert!(lines[1].1.contains("boom"), "{lines:?}");
     }
 
     /// Whether `pid` is still a live process — `stop` reaps what it kills, so a stopped child's

@@ -2199,6 +2199,51 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn a_dump_that_exits_zero_and_explains_itself_on_stderr_is_read_as_a_failure() {
+        // `uiautomator dump` reports failure by exiting 0 with its reason on stderr and no file
+        // written. Judging it by exit status alone would take it for a tree that arrived, and the
+        // read that follows would be blamed for the emptiness instead.
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let fake = FakeAdb::new(&[
+            (
+                "*uiautomator dump*",
+                Answer::warns("ERROR: could not get idle state.\n"),
+            ),
+            // No file was written, so the read that follows finds nothing.
+            ("*shell cat*", Answer::fails("No such file or directory")),
+            ("*", Answer::Silent),
+        ]);
+
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+        let ctx = AxContext {
+            pids: vec![],
+            window: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 2400,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::from_millis(300),
+        };
+
+        let err = reader
+            .snapshot(&ctx)
+            .expect_err("a dump that wrote no tree did not serve one");
+        // The device's own words, not a complaint about the read that came up empty.
+        assert!(
+            err.to_string().contains("could not get idle state"),
+            "the reason must come from the dump: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_reader_binds_to_the_serial_it_was_asked_for_when_several_are_online() {
         // Two online devices is ambiguous on its own; `GLASS_ANDROID_SERIAL` is what resolves it,
         // and it is read when the reader is made rather than when it resolves.
