@@ -550,9 +550,6 @@ pub struct AxTree {
 impl AxTree {
     /// Whether this tree describes everything the backend walked — no bound stopped it early and
     /// no child read dropped a subtree.
-    ///
-    /// Both fields, because they are independent: a tree can hit no cap at all and still be missing
-    /// a subtree.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.truncated.is_none() && self.unreadable == 0
@@ -809,14 +806,14 @@ impl AxTarget {
         self.role == role && self.name.as_deref() == name
     }
 
-    /// Whether any node in `tree` carries this target's role and name, wherever it sits. Says
-    /// nothing about visibility: a scrolled-away row counts.
+    /// Whether any node in `tree` carries this target's role and name, wherever it sits.
     ///
     /// Do not tighten this to include bounds or value: both move under a live app without the
     /// control going anywhere, and Android's service reader relaxes a moved control back into a
     /// write, which needs [`Self::drift_error`] to answer `AxElementChanged` in every case it can
-    /// relax. Pinned by `a_relaxable_move_is_never_reported_as_gone` below, and from the other side
-    /// by `a11y_service`'s `a_target_that_only_moved_is_actuated_where_it_now_is`.
+    /// relax. Pinned by `a_relaxable_move_is_never_reported_as_gone` below and, across the crate
+    /// boundary the rule actually spans, by `a11y_service`'s
+    /// `a_target_that_only_moved_is_actuated_where_it_now_is`.
     fn still_present(&self, tree: &AxTree) -> bool {
         fn walk(node: &AxNode, target: &AxTarget) -> bool {
             target.matches(node.role, node.name.as_deref())
@@ -2020,7 +2017,7 @@ mod tests {
         }
     }
 
-    /// A target naming the `TextField "Note"` that `drift_tree` puts on screen.
+    /// A target naming a `TextField "Note"` — in some `drift_tree` trees below, absent from others.
     fn drift_target() -> AxTarget {
         AxTarget {
             id: AxNodeId(1),
@@ -2041,7 +2038,7 @@ mod tests {
 
     #[test]
     fn a_target_still_present_is_changed_not_gone() {
-        // Renumbered, not removed — re-snapshotting finds it again.
+        // Renumbered, not removed.
         let tree = drift_tree(vec![
             leaf(AxRole::Label, "Heading"),
             leaf(AxRole::TextField, "Note"),

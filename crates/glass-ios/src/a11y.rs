@@ -102,10 +102,11 @@ const VERIFY_ATTEMPTS: usize = 3;
 /// `glass_core::typed_clear_landed` carry the rules and the cost of them. Twin of `verify_write` in
 /// `glass-android/src/a11y.rs` — keep the two in step.
 ///
-/// The element is re-resolved by its pre-order id, which the write itself can perturb (a tap that
-/// navigates renumbers everything after it), so a mismatch is a claim about the tree rather than
-/// about the write; [`AxTarget::drift_error`] decides which of the two. A tree cut short by the walk
-/// caps explains an absent element better than either, so that case says so instead.
+/// The element is re-resolved by its pre-order id, which the write itself perturbs: measured on the
+/// Simulator, the focusing tap raises the soft keyboard and inserts two nodes ahead of the field
+/// (glass#359). So a mismatch is a claim about the tree rather than about the write, and
+/// [`AxTarget::drift_error`] decides which of the two. A tree cut short by the walk caps explains an
+/// absent element better than either, so that case says so instead.
 ///
 /// The node must also still be editable: for a non-editable node `axmap` puts the element's AXLabel
 /// in `value`, so a label that changed inside the settle window would otherwise read as a successful
@@ -329,9 +330,8 @@ mod tests {
 
     #[test]
     fn a_target_that_moved_is_reported_as_changed_not_as_a_failed_write() {
-        // A genuine move: something else now occupies the target's id, but the field itself is
-        // still on screen further down. Renumbering is recoverable by re-snapshotting, which is
-        // what `AxElementChanged` tells the caller to do.
+        // A genuine move: something else now occupies the target's id, and the field is further
+        // down the tree.
         let mut root_field = leaf(0, AxRole::Label, "Heading", FIELD);
         let mut moved = leaf(0, AxRole::TextField, "Note", FIELD);
         moved.value = Some("world".into());
@@ -377,10 +377,8 @@ mod tests {
 
     #[test]
     fn an_id_past_the_end_of_a_replaced_tree_says_gone_not_changed() {
-        // The arm the measured case actually takes, and the one the test above does not reach: on
-        // the Simulator the target was #15 against a tree the write had cut to five nodes, so the
-        // id resolves to nothing rather than to something unrelated. `tree_with` roots at a Window,
-        // so an id inside the tree still resolves and exercises the other refusal site.
+        // The arm the measured case takes, and the one the test above cannot reach: `tree_with`
+        // roots at a Window, so an id inside the tree resolves and lands on the other refusal site.
         let replaced = tree_with(leaf(0, AxRole::Label, "No Results", FIELD));
         let mut t = matching_target();
         t.id = AxNodeId(15);
