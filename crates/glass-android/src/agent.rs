@@ -5,6 +5,7 @@
 
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use glass_core::{GlassError, Result};
 use serde_json::{Value, json};
@@ -120,12 +121,82 @@ pub fn agent_enabled(get: &dyn Fn(&str) -> Option<String>) -> bool {
 }
 
 /// Parse the local port `adb forward tcp:0 …` prints on stdout.
-/// Skips blank lines and `* daemon …` noise that adb emits on a cold start.
+///
+/// The first line that reads as a port is it: the blank lines and the `* daemon …` noise adb
+/// emits on a cold start read as no port at all, so neither needs a rule of its own.
 pub(crate) fn parse_forward_port(out: &str) -> Option<u16> {
-    out.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('*'))
-        .find_map(|l| l.parse().ok())
+    out.lines().map(str::trim).find_map(|l| l.parse().ok())
+}
+
+/// A fake agent on a loopback socket: sends `hello`, then answers each request line with the
+/// matching `responses[i]`, the request's own id spliced in. Returns the port and the requests it
+/// read.
+///
+/// The requests are the point. The companion is an APK on an emulator, so a unit test can only
+/// reach this protocol — and a client method that returns `Ok(())` having sent nothing looks
+/// exactly like one that worked until something reads back what went out.
+///
+/// Lives beside the code rather than in `mod tests` so `input`'s injector tests can reach it too.
+#[cfg(test)]
+pub(crate) fn fake_agent(
+    hello: &'static str,
+    responses: Vec<&'static str>,
+) -> (u16, Arc<Mutex<Vec<Value>>>) {
+    fake_agent_sessions(hello, vec![responses])
+}
+
+/// [`fake_agent`] across successive connections: `sessions[i]` scripts the i'th connection, whose
+/// socket closes once its answers run out. Two sessions is what a dropped-socket reconnect needs.
+#[cfg(test)]
+pub(crate) fn fake_agent_sessions(
+    hello: &'static str,
+    sessions: Vec<Vec<&'static str>>,
+) -> (u16, Arc<Mutex<Vec<Value>>>) {
+    use std::io::{BufRead, BufReader, Write};
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+
+    let recorded = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for session in sessions {
+            let Some(sock) = listener.incoming().flatten().next() else {
+                return;
+            };
+            let mut w = sock.try_clone().expect("clone socket");
+            let mut r = BufReader::new(sock);
+            if writeln!(w, "{hello}").is_err() {
+                return;
+            }
+            for resp in session {
+                let mut line = String::new();
+                match r.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let req: Value = serde_json::from_str(&line).expect("request json");
+                let id = req["id"].as_i64().expect("request id");
+                recorded.lock().expect("seen lock").push(req);
+                let mut out: Value = serde_json::from_str(resp).expect("response json");
+                out["id"] = json!(id);
+                if writeln!(w, "{out}").is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    (port, seen)
+}
+
+/// The `op` of each request the fake agent read, in order.
+#[cfg(test)]
+pub(crate) fn ops_seen(seen: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
+    seen.lock()
+        .expect("seen lock")
+        .iter()
+        .filter_map(|r| r.get("op").and_then(Value::as_str).map(str::to_string))
+        .collect()
 }
 
 const REMOTE_JAR: &str = "/data/local/tmp/glass-agent.jar";
@@ -265,10 +336,20 @@ impl AgentRegistry {
     }
 }
 
-/// Poll until the agent accepts a connection (it takes ~1s to bind), up to ~5s.
+/// How long the agent gets to bind its socket and start answering. It takes ~1s in practice.
+const AGENT_BIND_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long to leave the agent alone between attempts.
+const AGENT_RETRY_PAUSE: Duration = Duration::from_millis(200);
+
+/// Poll until the agent accepts a connection (it takes ~1s to bind).
 fn wait_for_agent(port: u16) -> Result<AgentClient> {
-    use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(5);
+    wait_for_agent_until(port, Instant::now() + AGENT_BIND_BUDGET)
+}
+
+/// [`wait_for_agent`] against a deadline the caller names, so a test can watch it give up without
+/// waiting out the production budget.
+fn wait_for_agent_until(port: u16, deadline: Instant) -> Result<AgentClient> {
     loop {
         match AgentClient::connect(port) {
             Ok(c) => return Ok(c),
@@ -277,7 +358,7 @@ fn wait_for_agent(port: u16) -> Result<AgentClient> {
                     "agent never came up on :{port}: {e}"
                 )));
             }
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+            Err(_) => std::thread::sleep(AGENT_RETRY_PAUSE),
         }
     }
 }
@@ -285,7 +366,7 @@ fn wait_for_agent(port: u16) -> Result<AgentClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::Write;
     use std::net::TcpListener;
 
     #[test]
@@ -317,57 +398,27 @@ mod tests {
         );
     }
 
-    /// Spawn a one-shot fake agent that sends `hello`, then for each request line writes
-    /// the matching `responses[i]` (with the request's id spliced in). Returns the port.
-    fn fake_agent(hello: &'static str, responses: Vec<&'static str>) -> u16 {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let (sock, _) = listener.accept().unwrap();
-            let mut w = sock.try_clone().unwrap();
-            let mut r = BufReader::new(sock);
-            writeln!(w, "{hello}").unwrap();
-            w.flush().unwrap();
-            for resp in responses {
-                let mut line = String::new();
-                if r.read_line(&mut line).unwrap() == 0 {
-                    break;
-                }
-                let id = serde_json::from_str::<Value>(&line).unwrap()["id"]
-                    .as_i64()
-                    .unwrap();
-                let mut out: Value = serde_json::from_str(resp).unwrap();
-                out["id"] = json!(id);
-                writeln!(w, "{out}").unwrap();
-                w.flush().unwrap();
-            }
-        });
-        port
-    }
+    const HELLO: &str = r#"{"hello":{"proto":1}}"#;
+    const OK: &str = r#"{"ok":true}"#;
 
     #[test]
     fn connect_checks_proto() {
-        let bad = fake_agent(r#"{"hello":{"proto":99}}"#, vec![]);
+        let (bad, _) = fake_agent(r#"{"hello":{"proto":99}}"#, vec![]);
         assert!(AgentClient::connect(bad).is_err());
     }
 
     #[test]
     fn clipboard_roundtrip_and_ok() {
-        let port = fake_agent(
-            r#"{"hello":{"proto":1}}"#,
-            vec![r#"{"ok":true}"#, r#"{"ok":true,"text":"hey"}"#],
-        );
+        let (port, seen) = fake_agent(HELLO, vec![OK, r#"{"ok":true,"text":"hey"}"#]);
         let c = AgentClient::connect(port).unwrap();
         c.clipboard_set("hey").unwrap();
         assert_eq!(c.clipboard_get().unwrap(), "hey");
+        assert_eq!(ops_seen(&seen), ["clipboard_set", "clipboard_get"]);
     }
 
     #[test]
     fn error_response_becomes_backend_error() {
-        let port = fake_agent(
-            r#"{"hello":{"proto":1}}"#,
-            vec![r#"{"ok":false,"error":"nope"}"#],
-        );
+        let (port, _) = fake_agent(HELLO, vec![r#"{"ok":false,"error":"nope"}"#]);
         let c = AgentClient::connect(port).unwrap();
         let e = c.ping().unwrap_err();
         assert!(e.to_string().contains("nope"));
@@ -375,35 +426,115 @@ mod tests {
 
     #[test]
     fn clipboard_get_missing_text_errors() {
-        let port = fake_agent(r#"{"hello":{"proto":1}}"#, vec![r#"{"ok":true}"#]);
+        let (port, _) = fake_agent(HELLO, vec![OK]);
         let c = AgentClient::connect(port).unwrap();
         assert!(c.clipboard_get().is_err());
     }
 
     #[test]
     fn clipboard_get_empty_is_ok() {
-        let port = fake_agent(r#"{"hello":{"proto":1}}"#, vec![r#"{"ok":true,"text":""}"#]);
+        let (port, _) = fake_agent(HELLO, vec![r#"{"ok":true,"text":""}"#]);
         let c = AgentClient::connect(port).unwrap();
         assert_eq!(c.clipboard_get().unwrap(), "");
     }
 
+    /// Every input method, checked by what reached the wire rather than by its return value.
+    ///
+    /// The device is what carries these out, so one that answered `Ok` having sent nothing would
+    /// be indistinguishable here until something reads the request back.
     #[test]
-    fn pointer_and_key_send_ok() {
-        let port = fake_agent(
-            r#"{"hello":{"proto":1}}"#,
-            vec![r#"{"ok":true}"#, r#"{"ok":true}"#, r#"{"ok":true}"#],
-        );
+    fn each_input_method_sends_its_own_request() {
+        let (port, seen) = fake_agent(HELLO, vec![OK, OK, OK, OK]);
         let c = AgentClient::connect(port).unwrap();
-        c.pointer(
-            &[Pt {
+        let path = vec![
+            Pt {
                 x: 5,
                 y: 10,
                 t_ms: 0,
-            }],
-            "left",
-        )
-        .unwrap();
+            },
+            Pt {
+                x: 7,
+                y: 12,
+                t_ms: 40,
+            },
+        ];
+
+        c.pointer(&path, "left").unwrap();
+        c.gesture(&[path.clone(), path]).unwrap();
         c.key("ctrl+a").unwrap();
         c.text("hi").unwrap();
+
+        assert_eq!(ops_seen(&seen), ["pointer", "gesture", "key", "text"]);
+        let sent = seen.lock().unwrap();
+        assert_eq!(
+            sent[0]["gesture"],
+            json!([{"x": 5, "y": 10, "t_ms": 0}, {"x": 7, "y": 12, "t_ms": 40}])
+        );
+        assert_eq!(sent[0]["button"], "left");
+        // One array per pointer, each carrying that pointer's whole path — the shape
+        // multi-touch needs, and the one a flattened list would quietly lose.
+        assert_eq!(sent[1]["pointers"].as_array().map(Vec::len), Some(2));
+        assert_eq!(sent[1]["pointers"][1][1]["x"], 7);
+        assert_eq!(sent[2]["chord"], "ctrl+a");
+        assert_eq!(sent[3]["text"], "hi");
+    }
+
+    #[test]
+    fn a_call_whose_socket_dropped_is_retried_on_a_fresh_connection() {
+        // The device's accept loop takes a new connection after a drop, so a dead socket is not
+        // a dead agent. Reporting one as a failed input would surface a transport hiccup as a
+        // tap that did not happen.
+        let (port, seen) = fake_agent_sessions(HELLO, vec![vec![], vec![OK]]);
+        let c = AgentClient::connect(port).unwrap();
+        c.ping()
+            .expect("a dropped socket must be reconnected, not reported");
+        assert_eq!(ops_seen(&seen), ["ping"]);
+    }
+
+    /// A listener that closes the first `stumbles` connections without a hello — an agent whose
+    /// socket is up but which is not answering yet — and then serves one properly.
+    fn agent_that_answers_after(stumbles: usize) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let mut closed = 0;
+            for mut stream in listener.incoming().flatten() {
+                if closed < stumbles {
+                    closed += 1;
+                    continue; // dropping the stream closes it, having said nothing
+                }
+                let _ = writeln!(stream, "{HELLO}");
+                return;
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn an_agent_that_is_not_answering_yet_is_retried_rather_than_given_up_on() {
+        // The device takes about a second to bind, so a first attempt that fails is the ordinary
+        // case rather than the failure. A deadline computed backwards — or a comparison the
+        // wrong way round — makes that first attempt the answer.
+        let port = agent_that_answers_after(1);
+        wait_for_agent(port).expect("an agent that answers on the second try must be waited for");
+    }
+
+    #[test]
+    fn an_agent_that_never_answers_is_given_up_on_at_the_deadline() {
+        let port = agent_that_answers_after(usize::MAX);
+        let started = Instant::now();
+        let Err(err) = wait_for_agent_until(port, Instant::now() + Duration::from_millis(300))
+        else {
+            panic!("an agent that never answers must not be waited on forever");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?} — the deadline never ended the loop",
+            started.elapsed()
+        );
+        assert!(
+            err.to_string().contains(&port.to_string()),
+            "the error must name the port: {err}"
+        );
     }
 }

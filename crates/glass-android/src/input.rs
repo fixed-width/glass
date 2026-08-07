@@ -589,6 +589,195 @@ mod agent_inject_tests {
         let end = spath[0].last().unwrap();
         assert_eq!((end.x, end.y), (350, 480));
     }
+
+    #[test]
+    fn a_scroll_that_overshoots_stops_at_the_window_far_edge_in_both_mappings() {
+        // Every scroll case above runs downward, which clamps at the window's origin — the near
+        // edge, where the window's own size never enters the arithmetic. Only an overshoot the
+        // other way reaches the far edge, and the two mappings compute it separately.
+        let o = origin(); // 500x800 at (100, 200) → far edges 599 and 999
+        let up_and_left = PointerEvent::Scroll {
+            x: 250,
+            y: 400,
+            dx: -100,
+            dy: -100,
+            modifiers: vec![],
+        };
+
+        let argv = pointer_commands(&o, &up_and_left);
+        assert_eq!((argv[0][5].as_str(), argv[0][6].as_str()), ("599", "999"));
+
+        let path = agent_pointer(&o, &up_and_left);
+        let end = path[0].last().copied().unwrap();
+        assert_eq!((end.x, end.y), (599, 999));
+    }
+
+    #[test]
+    fn a_drag_takes_its_sample_count_from_its_longer_axis() {
+        // The count is what makes a drag a drag rather than the DOWN/UP pair touch-slop
+        // swallows, and the cases above only assert it clears the floor of 8. Each of these
+        // travels 500px on one axis, so the sample count is pinned exactly — and each leaves
+        // the other axis short, where a distance taken from the wrong one would show.
+        for (to_x, to_y, longer) in [(500, 300, "x"), (100, 500, "y")] {
+            let ev = PointerEvent::Drag {
+                from_x: 0,
+                from_y: 0,
+                to_x,
+                to_y,
+                duration_ms: 250,
+                button: MouseButton::Left,
+                modifiers: vec![],
+            };
+            let path = &agent_pointer(&origin(), &ev)[0];
+            assert_eq!(
+                path.len(),
+                32,
+                "500px at {AGENT_STEP_PX}px a sample, {longer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gesture_paces_its_samples_by_the_longest_segment_on_either_axis() {
+        // As above, on the multi-touch path: 160px of travel, on one axis at a time.
+        for (segment, longer) in [
+            (
+                Segment {
+                    from_x: 30,
+                    from_y: 0,
+                    to_x: 190,
+                    to_y: 0,
+                },
+                "x",
+            ),
+            (
+                Segment {
+                    from_x: 10,
+                    from_y: 40,
+                    to_x: 10,
+                    to_y: 200,
+                },
+                "y",
+            ),
+        ] {
+            let paths = agent_gesture_paths(&origin(), &[segment], 200);
+            assert_eq!(
+                paths[0].len(),
+                11,
+                "160px at {AGENT_STEP_PX}px a sample, {longer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vertical_gesture_interpolates_its_y_the_way_a_horizontal_one_does_its_x() {
+        // Every segment in `gesture_builds_time_aligned_absolute_paths` is horizontal or held,
+        // so a gesture path's y was never once asserted to move.
+        let segments = [Segment {
+            from_x: 10,
+            from_y: 40,
+            to_x: 10,
+            to_y: 200,
+        }];
+        let path = &agent_gesture_paths(&origin(), &segments, 200)[0];
+        assert_eq!(
+            path.first().copied().unwrap(),
+            Pt {
+                x: 110,
+                y: 240,
+                t_ms: 0
+            }
+        );
+        assert_eq!(
+            path[path.len() / 2],
+            Pt {
+                x: 110,
+                y: 320,
+                t_ms: 100
+            }
+        );
+        assert_eq!(
+            path.last().copied().unwrap(),
+            Pt {
+                x: 110,
+                y: 400,
+                t_ms: 200
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod injector_tests {
+    use super::*;
+    use crate::agent::{fake_agent, ops_seen};
+    use glass_core::{KeyEvent, MouseButton, PointerEvent, Segment, WindowGeometry};
+
+    const HELLO: &str = r#"{"hello":{"proto":1}}"#;
+    const OK: &str = r#"{"ok":true}"#;
+
+    fn origin() -> WindowGeometry {
+        WindowGeometry {
+            x: 100,
+            y: 200,
+            width: 500,
+            height: 800,
+        }
+    }
+
+    fn click() -> PointerEvent {
+        PointerEvent::Click {
+            x: 10,
+            y: 20,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        }
+    }
+
+    #[test]
+    fn the_agent_injector_asks_the_device_for_each_event_but_not_for_an_empty_write() {
+        // A third answer is scripted so that an injector which sends the empty write anyway is
+        // answered and fails on the count, rather than blocking on a reply that never comes.
+        let (port, seen) = fake_agent(HELLO, vec![OK, OK, OK]);
+        let injector = AgentInjector {
+            agent: Arc::new(AgentClient::connect(port).expect("connect to the fake agent")),
+        };
+        let adb = Adb::from_env(); // unused by this injector — it reaches the agent's socket
+
+        injector.pointer(&adb, &origin(), &click()).unwrap();
+        injector.key(&adb, &KeyEvent::Text("hi".into())).unwrap();
+        injector.key(&adb, &KeyEvent::Text(String::new())).unwrap();
+
+        assert_eq!(ops_seen(&seen), ["pointer", "text"]);
+    }
+
+    #[test]
+    fn the_shell_injector_refuses_multi_touch_rather_than_reporting_it_done() {
+        // `adb shell input` has no multi-touch at all, so a silent success here would be a
+        // gesture the caller believes happened.
+        let gesture = PointerEvent::Gesture {
+            pointers: vec![Segment {
+                from_x: 0,
+                from_y: 0,
+                to_x: 10,
+                to_y: 10,
+            }],
+            duration_ms: 100,
+        };
+        let err = ShellInjector
+            .pointer(&Adb::from_env(), &origin(), &gesture)
+            .unwrap_err();
+        assert!(matches!(err, GlassError::Unsupported(_)), "{err}");
+    }
+
+    #[test]
+    fn the_shell_injector_reports_a_chord_it_cannot_map() {
+        let err = ShellInjector
+            .key(&Adb::from_env(), &KeyEvent::Chord("ctrl+/".into()))
+            .unwrap_err();
+        assert!(matches!(err, GlassError::InvalidKey(_)), "{err}");
+    }
 }
 
 #[cfg(test)]
