@@ -166,7 +166,7 @@ impl TestX {
     pub(crate) fn request_selection(&self, target: Atom, within: Duration) -> Option<Atom> {
         let requestor = self.window().unmapped().create();
         let clipboard = self.intern(b"CLIPBOARD");
-        let into = self.intern(b"GLASS_TEST_CLIP");
+        let into = self.intern(b"TEST_CLIP_TRANSFER");
         self.conn
             .convert_selection(requestor, clipboard, target, into, x11rb::CURRENT_TIME)
             .expect("convert_selection");
