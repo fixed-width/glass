@@ -1,7 +1,8 @@
-//! iOS accessibility reader over idb's `accessibility_info`. Snapshot maps the
-//! nested JSON to an AxTree; set_value re-verifies the target element (guarding
-//! against a stale id landing on a different element), focuses it, clears it, and
-//! types the new text via synthetic HID input, then reads the element back and reports the write as not applied if it does not hold it.
+//! iOS accessibility reader over idb's `accessibility_info`. Snapshot maps the nested JSON to an
+//! AxTree; set_value re-finds the target element by identity (guarding against a stale id landing
+//! on a different element), focuses it, then clears and types it in one batch of synthetic HID
+//! input, and finally reads the element back and reports the write as not applied if it does not
+//! hold the text.
 use glass_core::accessibility::{Accessibility, AxContext, AxRect, AxTarget, AxTree, Located};
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use glass_core::{
 
 use crate::axmap;
 use crate::idb::client::IdbClient;
+use crate::idb::proto;
 use crate::injector::IdbInjector;
 
 /// Reads and writes the accessibility tree of the app under test in the
@@ -122,8 +124,8 @@ const VERIFY_ATTEMPTS: usize = 3;
 /// write into a Label. [`Located::AtId`] and [`Located::Moved`] both already carry the target's role
 /// and name, so a node reached here that is not editable is not a neighbour that inherited the id —
 /// it is the identified element having lost editability. Every refusal here is post-dispatch, hence
-/// [`GlassError::AxWriteUnconfirmed`] throughout; the pre-write guard is `verify` above, which still
-/// answers in `Backend` strings (glass#361).
+/// [`GlassError::AxWriteUnconfirmed`] throughout, where `verify` above refuses before the write goes
+/// out and answers in drift verdicts.
 ///
 /// A clear (`text` empty) is confirmed only for a target that carries a name. An empty read-back is
 /// what any untouched same-role, same-name field would also show, so it is evidence of the write
@@ -201,6 +203,21 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     }
 }
 
+/// The whole write as one batch of HID events: select-all, delete, then the text.
+///
+/// One batch because each `IdbClient::hid` is its own RPC, and a pause between the delete and the
+/// text loses the text. Measured on the Simulator against `examples/ios-role-fixture`: back to
+/// back it lands 12/12, and with a pause in between 2/4 at 0.14s, 0/4 at 0.34s and 0/4 at 2s
+/// (glass#363). Sending them a call each let one slow round-trip open that window, which is what
+/// made the write fail roughly one run in six. Do not split this back into a call per keystroke
+/// for readability — the failure it prevents is invisible on a fast, idle host.
+fn clear_and_type_keys(injector: &IdbInjector, text: &str) -> Result<Vec<proto::HidEvent>> {
+    let mut events = injector.key_events(&KeyEvent::Chord("super+a".into()))?;
+    events.extend(injector.key_events(&KeyEvent::Chord("Delete".into()))?);
+    events.extend(injector.key_events(&KeyEvent::Text(text.to_string()))?);
+    Ok(events)
+}
+
 /// The read-back's own failure, reported as an unconfirmed write.
 ///
 /// Post-dispatch by construction: its only caller is the loop that runs after the keystrokes went
@@ -234,12 +251,10 @@ impl Accessibility for IosA11y {
             modifiers: vec![],
         };
         self.client.hid(injector.pointer_events(&tap)?)?;
-        self.client
-            .hid(injector.key_events(&KeyEvent::Chord("super+a".into()))?)?;
-        self.client
-            .hid(injector.key_events(&KeyEvent::Chord("Delete".into()))?)?;
-        self.client
-            .hid(injector.key_events(&KeyEvent::Text(text.to_string()))?)?;
+        // A gap before the keystrokes is harmless, so the tap stays its own call — the field has
+        // to become first responder before they arrive. A gap *within* them is not: see
+        // `clear_and_type_keys`.
+        self.client.hid(clear_and_type_keys(&injector, text)?)?;
 
         // A failure of this read is not a failure of the write — the field has already been cleared
         // and typed into — so it says so rather than letting a caller retry blindly and type twice.
@@ -633,6 +648,53 @@ mod tests {
             !err.to_string().contains("replaced"),
             "an incomplete read must not assert the screen changed: {err}"
         );
+    }
+
+    #[test]
+    fn the_clear_and_the_text_go_out_as_one_batch() {
+        // What makes the single `hid` call possible, and the thing a later refactor would undo:
+        // the three keystroke groups have to arrive concatenated, in order, in one vector. A
+        // pause between the delete and the text loses the text on the Simulator (glass#363), and
+        // nothing downstream of here can tell that it happened.
+        let injector = IdbInjector::new(2.0);
+        let select_all = injector
+            .key_events(&KeyEvent::Chord("super+a".into()))
+            .unwrap();
+        let delete = injector
+            .key_events(&KeyEvent::Chord("Delete".into()))
+            .unwrap();
+        let text = injector.key_events(&KeyEvent::Text("hi".into())).unwrap();
+
+        let batch = clear_and_type_keys(&injector, "hi").unwrap();
+
+        assert_eq!(
+            batch.len(),
+            select_all.len() + delete.len() + text.len(),
+            "every keystroke of all three groups travels in the one batch"
+        );
+        assert_eq!(batch[..select_all.len()], select_all[..]);
+        assert_eq!(
+            batch[select_all.len()..select_all.len() + delete.len()],
+            delete[..]
+        );
+        assert_eq!(batch[select_all.len() + delete.len()..], text[..]);
+    }
+
+    #[test]
+    fn a_clear_still_sends_the_keystrokes_that_empty_the_field() {
+        // `set_value(id, "")` types nothing, so the batch is select-all + delete alone — and it
+        // must still be non-empty, or a clear would dispatch no keystrokes at all.
+        let injector = IdbInjector::new(2.0);
+        let batch = clear_and_type_keys(&injector, "").unwrap();
+        let cleared = injector
+            .key_events(&KeyEvent::Chord("super+a".into()))
+            .unwrap()
+            .len()
+            + injector
+                .key_events(&KeyEvent::Chord("Delete".into()))
+                .unwrap()
+                .len();
+        assert_eq!(batch.len(), cleared);
     }
 
     #[test]
