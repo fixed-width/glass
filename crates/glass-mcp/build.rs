@@ -7,6 +7,8 @@
 //! Mirrors the validated probe at tools/windows-validation/build.rs.
 use embed_manifest::manifest::{DpiAwareness, Setting};
 use embed_manifest::{embed_manifest, new_manifest};
+use std::path::Path;
+use std::process::Command;
 
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
@@ -31,6 +33,50 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
     println!("cargo:rerun-if-changed=build.rs");
+    watch_git_head();
+}
+
+/// Declare the git files a local build's version is derived from, so cargo re-runs this script when
+/// the commit moves.
+///
+/// Without them the only triggers are `build.rs` and the two env vars above, so a rebuild after
+/// committing keeps an older commit's version — observed reporting `1.1.0-84-g96fac4f` from a tree
+/// 17 commits further on. A CI tag build reads `GITHUB_REF_NAME` and none of this.
+///
+/// `-dirty` reflects the working tree, which no declared path stands in for, so an uncommitted edit
+/// still needs this file touched to surface.
+fn watch_git_head() {
+    // HEAD moves on checkout, the ref it names moves on commit, and a gc'd branch or tag moves into
+    // `packed-refs`, where `describe` reads it instead.
+    watch_git_path("HEAD");
+    watch_git_path("packed-refs");
+    // A detached HEAD names no ref, and HEAD alone already covers it.
+    if let Some(head_ref) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
+        watch_git_path(&head_ref);
+    }
+}
+
+/// Declare one path inside the git directory, if it is there.
+///
+/// Resolve with `--git-path`, not by joining onto `.git/`: a worktree keeps its refs in the common
+/// directory. Skip a path that does not exist — cargo re-runs a build script unconditionally when a
+/// declared path is missing, so a checkout with no VCS would rebuild every time.
+fn watch_git_path(name: &str) {
+    let Some(path) = git_output(&["rev-parse", "--git-path", name]) else {
+        return;
+    };
+    if Path::new(&path).exists() {
+        println!("cargo:rerun-if-changed={path}");
+    }
+}
+
+/// Run a git command and return its trimmed stdout, or `None` if git is absent or the command
+/// failed.
+fn git_output(args: &[&str]) -> Option<String> {
+    let out = Command::new("git").args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Resolve the version string embedded at build time. Strips a leading `v` so `v1.0.1` → `1.0.1`.
@@ -47,16 +93,12 @@ fn glass_version() -> String {
         }
     }
     // Local builds: derive from the nearest tag (with a `-dirty` / commit suffix when not exactly
-    // on a tag), so a dev binary reports an honest version rather than 0.0.0.
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["describe", "--tags", "--always", "--dirty"])
-        .output()
-        && out.status.success()
+    // on a tag), so a dev binary reports an honest version rather than 0.0.0. `watch_git_head`
+    // declares the files this reads.
+    if let Some(d) = git_output(&["describe", "--tags", "--always", "--dirty"])
+        && !d.is_empty()
     {
-        let d = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !d.is_empty() {
-            return d.strip_prefix('v').unwrap_or(&d).to_string();
-        }
+        return d.strip_prefix('v').unwrap_or(&d).to_string();
     }
     // No tag and no git (e.g. a source tarball with no VCS): fall back to the crate version.
     env!("CARGO_PKG_VERSION").to_string()
