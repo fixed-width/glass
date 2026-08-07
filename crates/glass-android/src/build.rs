@@ -61,6 +61,62 @@ fn push_lines(sink: &LogSink, stream: Stream, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A spec whose only interesting field is the build command — the rest is what the launch
+    /// would need, and `run_build` never reaches it.
+    #[cfg(unix)]
+    fn spec_that_builds_with(build: &str) -> AppSpec {
+        AppSpec {
+            build: Some(build.to_string()),
+            run: vec!["com.example.app/.MainActivity".to_string()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 15_000,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        }
+    }
+
+    /// Both streams of a build, as `drain_logs` would hand them to the caller.
+    #[cfg(unix)]
+    fn run_and_collect(build: &str) -> (Result<()>, Vec<(Stream, String)>) {
+        let sink: LogSink = Arc::new(Mutex::new(Vec::new()));
+        let outcome = run_build(&spec_that_builds_with(build), &sink);
+        let lines = sink.lock().expect("sink lock").clone();
+        (outcome, lines)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_build_that_fails_says_so_and_keeps_what_it_printed() {
+        // A build that reports success is an app launched against stale artifacts, and the
+        // compiler error explaining why is in the output this folds into the log.
+        let (outcome, lines) =
+            run_and_collect("printf 'made it\\n'; printf 'boom\\n' 1>&2; exit 3");
+        let err = outcome.expect_err("a non-zero build must not read as a launch that can go on");
+        assert!(matches!(err, GlassError::AppNotStarted(_)), "{err}");
+        assert!(
+            lines.contains(&(Stream::Stdout, "made it".to_string())),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&(Stream::Stderr, "boom".to_string())),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_build_that_succeeds_is_ok_and_still_keeps_its_output() {
+        let (outcome, lines) = run_and_collect("printf 'built\\n'");
+        outcome.expect("a zero exit is a build that worked");
+        assert!(
+            lines.contains(&(Stream::Stdout, "built".to_string())),
+            "{lines:?}"
+        );
+    }
 
     #[test]
     fn empty_build_is_a_noop_command() {

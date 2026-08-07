@@ -27,6 +27,18 @@ pub struct LogcatStream {
     _reader: JoinHandle<()>,
 }
 
+/// Classify and file each line of `stdout` into `sink` until the pipe ends.
+fn drain_into(stdout: std::process::ChildStdout, sink: LogSink) -> JoinHandle<()> {
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(|r| r.ok()) {
+            let stream = classify_logcat_line(&line);
+            if let Ok(mut g) = sink.lock() {
+                g.push((stream, line));
+            }
+        }
+    })
+}
+
 impl LogcatStream {
     pub fn spawn(adb: &Adb, pid: u32, sink: LogSink) -> Result<Self> {
         // Build argv via the same serial-prefixing path the Adb client uses.
@@ -42,17 +54,9 @@ impl LogcatStream {
             .stdout
             .take()
             .ok_or_else(|| GlassError::Backend("adb logcat produced no stdout pipe".into()))?;
-        let reader = thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(|r| r.ok()) {
-                let stream = classify_logcat_line(&line);
-                if let Ok(mut g) = sink.lock() {
-                    g.push((stream, line));
-                }
-            }
-        });
         Ok(Self {
             child,
-            _reader: reader,
+            _reader: drain_into(stdout, sink),
         })
     }
 
@@ -73,6 +77,67 @@ impl Drop for LogcatStream {
 mod tests {
     use super::*;
     use glass_core::Stream;
+
+    /// A `LogcatStream` over a stand-in child that will outlive the test unless something kills
+    /// it. `adb logcat` itself needs a device; what these pin is the killing, built through the
+    /// same drain the real spawn uses.
+    #[cfg(unix)]
+    fn stream_over_a_sleeping_child() -> (LogcatStream, u32) {
+        let sink: LogSink = Arc::new(Mutex::new(Vec::new()));
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn the stand-in");
+        let pid = child.id();
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stream = LogcatStream {
+            child,
+            _reader: drain_into(stdout, sink),
+        };
+        (stream, pid)
+    }
+
+    /// Whether `pid` is still a live process. A killed child is reaped by `stop`, so its pid is
+    /// gone rather than left as a zombie that would still answer here.
+    #[cfg(unix)]
+    fn still_running(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            // A gone process is the answer this asks for, not a problem to report on stderr.
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill -0")
+            .success()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stopping_the_stream_kills_the_logcat_process() {
+        let (mut stream, pid) = stream_over_a_sleeping_child();
+        assert!(
+            still_running(pid),
+            "the stand-in should be up to begin with"
+        );
+        stream.stop();
+        assert!(
+            !still_running(pid),
+            "logcat outlived stop(), holding the device's log open behind it"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_the_stream_kills_the_logcat_process() {
+        // Every teardown path reaches this through Drop rather than by calling stop, so a Drop
+        // that does nothing leaks one `adb logcat` per app the session ever started.
+        let (stream, pid) = stream_over_a_sleeping_child();
+        drop(stream);
+        assert!(
+            !still_running(pid),
+            "logcat outlived the stream that owned it"
+        );
+    }
 
     #[test]
     fn error_and_fatal_map_to_stderr() {
