@@ -204,21 +204,26 @@ internal refactors, CI, or test-only changes.
   reporting it as an element that had changed or gone missing. On iOS, and on Android's
   `uiautomator` reader, a write taps the field and types into it, then confirms by re-reading the
   element afterwards — and used to re-find it by its position in the accessibility tree, which the
-  write itself moves: typing into an unfocused field raises the keyboard, and on the iOS Simulator
-  that inserts elements ahead of the field. A landed write could not be confirmed, on the ordinary
-  path of writing into a field you have not touched yet. The read-back now re-finds the element by
-  its role and name wherever it moved to, and refuses if more than one element now matches, since
-  then which one holds the text cannot be told. The optional on-device companion sets a field's
-  value directly rather than typing into it, so it was never affected.
+  write itself moves. On the iOS Simulator, typing into an unfocused field raises the keyboard and
+  that inserts elements ahead of the field, so a landed write could not be confirmed on the ordinary
+  path of writing into a field you have not touched yet. On Android the keyboard leaves the numbering
+  alone; what moves the element there is a tap that navigates, reopening the field inside a different
+  window. The read-back now re-finds the element by its role and name wherever it moved to, and
+  refuses if more than one element now matches, since then which one holds the text cannot be told.
+  An element re-found that way is accepted only from a read that covered the whole tree, and only
+  while it is still drawn overlapping where it was — so a same-named field on a screen the tap
+  navigated to is reported as unconfirmed instead of confirming a write that landed elsewhere. The
+  optional on-device companion sets a field's value directly rather than typing into it, so it was
+  never affected.
 - A `glass_set_value` that cannot confirm its write on either of those two readers — the element is
-  gone, several now match it, the read stopped early, or it is no longer editable to read back — now
-  says the text was typed and names what to re-snapshot for, instead of reporting only that the
-  element could not be re-addressed, which reads as an instruction to write again when the write has
-  already gone out. A read cut short by the node cap still names the cap, so raising `max_nodes` is
-  the fix when that's the reason. Writing an empty value to clear a field is the one case re-finding
-  the element isn't enough to confirm: an empty field alone isn't evidence it's the right one, so a
-  clear whose element had to be re-found by role and name reports unconfirmed rather than a success
-  it cannot prove.
+  gone, several now match it, the read stopped early or covered only part of the tree, it is no
+  longer editable to read back, or the read-back itself failed — now says the text was typed and
+  names what to re-snapshot for, instead of reporting only that the element could not be
+  re-addressed, which reads as an instruction to write again when the write has already gone out. A
+  read cut short by the node cap still names the cap, so raising `max_nodes` is the fix when that's
+  the reason. Writing an empty value to clear a field needs the element to have a name: an empty
+  field is not by itself evidence the clear landed on the element you meant, so a nameless one
+  reports unconfirmed rather than a success it cannot prove.
 - A native Android click or `set_value` through the optional on-device companion no longer acts on a
   different element than the one you named when the snapshot was truncated. glass numbered elements
   by their position in the tree it kept and dispatched the action by that number, but the companion

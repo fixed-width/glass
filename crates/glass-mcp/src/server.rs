@@ -467,7 +467,11 @@ impl GlassServer {
                        three accessibility reads, since a field may commit a frame or two later. \
                        Errors if the element isn't editable, if it changed \
                        since the snapshot (re-snapshot), if the element does not hold the requested \
-                       value afterwards, or if the app exposes no accessibility tree. \
+                       value afterwards, or if the app exposes no accessibility tree. A separate \
+                       error says the text WAS typed but the write could not be confirmed — the \
+                       read-back failed, or could not tell which element now holds it. Do NOT write \
+                       again on that one: the keystrokes already went out, and re-snapshotting is \
+                       how you see where they landed. \
                        Optional `return`: \"snapshot\" settles the UI then folds a fresh a11y \
                        tree into the result (and refreshes the snapshot cache); \"settle\" waits \
                        for the UI to stop \
