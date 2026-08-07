@@ -135,6 +135,14 @@ pub enum GlassError {
     )]
     AxElementGone(u32),
 
+    /// A write that went out and could not then be confirmed. Distinct from the pre-write
+    /// refusals because only this one has dispatched — see `set_value_failed_after_writing`.
+    #[error(
+        "element #{0}: the text was typed, but the write could not be confirmed — {1}. Re-snapshot \
+         to see where it landed rather than typing it again"
+    )]
+    AxWriteUnconfirmed(u32, String),
+
     #[error(
         "set_value on element #{0} did not take — the element does not hold the requested value. On \
          a desktop backend this usually means a read-only accessibility projection, so try \
@@ -242,9 +250,10 @@ impl GlassError {
     }
 
     /// Whether a failed value-write is **proven** to have gone out before failing — the only case
-    /// where the session's captured value is stale and must be dropped. True for the read-back
-    /// verdict [`GlassError::AxValueNotApplied`], raised only after a write was dispatched; false
-    /// for everything else, including variants added later.
+    /// where the session's captured value is stale and must be dropped. True for two post-dispatch
+    /// verdicts: [`GlassError::AxValueNotApplied`] and [`GlassError::AxWriteUnconfirmed`], both
+    /// raised only after a write was dispatched; false for everything else, including variants
+    /// added later.
     ///
     /// Same "did anything dispatch?" question as [`Self::invoke_fallback_eligible`], but decided by
     /// an allowlist, because the two mistakes are not symmetric. Keeping the value can only make
@@ -257,7 +266,10 @@ impl GlassError {
     /// adb handshake fail the same way its post-write read-back does — so no variant-level split
     /// separates them, and the recoverable answer has to win.
     pub fn set_value_failed_after_writing(&self) -> bool {
-        matches!(self, GlassError::AxValueNotApplied(_))
+        matches!(
+            self,
+            GlassError::AxValueNotApplied(_) | GlassError::AxWriteUnconfirmed(..)
+        )
     }
 
     /// Which of glass's own bounds ended this call, if one did rather than the tool answering.
@@ -553,6 +565,37 @@ mod tests {
         ] {
             assert!(!e.set_value_failed_after_writing(), "{e}");
         }
+    }
+
+    #[test]
+    fn an_unconfirmed_write_says_the_text_was_typed() {
+        let e = GlassError::AxWriteUnconfirmed(
+            7,
+            "nothing in the tree carries its role and name".into(),
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("the text was typed"), "{msg}");
+        assert!(
+            msg.contains("nothing in the tree carries its role and name"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("rather than"),
+            "names what to do instead of retyping: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_write_counts_as_dispatched() {
+        // The session must drop its cached value: the write went out, so the value it holds is stale.
+        assert!(GlassError::AxWriteUnconfirmed(7, "x".into()).set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn a_pre_write_refusal_still_counts_as_not_dispatched() {
+        // AxElementGone is raised on both sides of the write on Android, so it must stay out.
+        assert!(!GlassError::AxElementGone(7).set_value_failed_after_writing());
+        assert!(!GlassError::AxElementChanged(7).set_value_failed_after_writing());
     }
 
     #[test]
