@@ -184,14 +184,18 @@ graded=$out
 # number, and once 33 are gone no session can start Xwayland at all: later mutants then fail for
 # an environmental reason and are graded on it.
 #
-# Matched by glass's own tempdir prefixes, so a developer's real sway session is never a
-# candidate. TERM only: a KILL would leave behind the sockets and children that this process's own
-# teardown is what removes.
+# Matched on the private runtime directory glass names for each session, which appears on the
+# compositor's own command line and belongs to no one else. Deliberately NOT matched on `Xvfb
+# -displayfd`: glass-x11 spawns its servers with nothing glass-specific in the argv, and its own
+# docs tell a developer to run that exact command, so an orphaned one may well be theirs.
+#
+# Only orphans, so a session whose parent is alive belongs to a running test. TERM only: a KILL
+# leaves behind the sockets and children that this process's own teardown is what removes.
 reap_strays() {
     local pids
-    pids=$(ps -eo pid,ppid,args --no-headers |
-        awk '$2 == 1 && (/glass-wl\./ || /glass-doctor-wl\./ || /Xvfb .*-displayfd/) {print $1}')
-    [ -z "$pids" ] && return 0
+    if ! pids=$(pgrep -P 1 -f 'glass-wl\.|glass-doctor-wl\.'); then
+        return 0 # pgrep exits 1 for no match
+    fi
     echo "mutants: reaping $(echo "$pids" | wc -w) session(s) a timed-out mutant left running"
     # shellcheck disable=SC2086 # deliberate word splitting: one signal per pid
     kill -TERM $pids 2>/dev/null || true

@@ -121,20 +121,25 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
     )
 }
 
-/// Ask the kernel to signal the compositor if the process that launched it dies — this crate's
+/// Ask the kernel to signal the compositor if the *thread* that launched it dies — this crate's
 /// own unit tests only.
 ///
-/// Those tests are run under `cargo mutants`, which SIGKILLs the test process when a mutant
-/// exceeds its timeout. Sixteen mutations here remove a *bound* (a discovery deadline, a
-/// screencopy event arm, `Drop`), so the run hangs holding live sessions and no teardown ever
-/// runs. Each orphaned compositor keeps an X display number, and once 33 are gone no session can
-/// start Xwayland at all — later mutants then fail for an environmental reason and are graded on
-/// it. One sweep left 608 of them.
+/// Those tests run under `cargo mutants`, which SIGKILLs the test process when a mutant exceeds
+/// its timeout. Mutations that remove a bound (a discovery deadline, a screencopy event arm,
+/// `Drop`) hang the run while it holds live sessions, so no teardown runs and every compositor in
+/// flight is orphaned. Each one keeps an X display number for as long as it lives, and a host that
+/// runs out of them cannot start Xwayland at all — after which later mutants fail for an
+/// environmental reason and are graded on it.
 ///
-/// **Not production behaviour, deliberately.** `PR_SET_PDEATHSIG` is scoped to the *thread* that
-/// forked, not the process. glass-mcp launches from a pooled `spawn_blocking` thread that retires
-/// while the session is still in use, which would tear down a working session. The signal is TERM
-/// rather than KILL so sway still removes its sockets and reaps its own Xwayland and client.
+/// **Not production behaviour, deliberately** — but not for the reason it is tempting to give.
+/// `PR_SET_PDEATHSIG` is scoped to the thread that forked, and glass-mcp already accounts for
+/// that: it runs every tool body on one long-lived thread precisely so a sandboxed app's
+/// `--die-with-parent` fires only when glass exits (see `glass-mcp/src/server.rs`). The reason to
+/// keep this out of production is narrower: this crate is a library, its caller's threading is not
+/// its to assume, and no production caller needs it.
+///
+/// TERM rather than KILL, so sway still runs its own teardown — removing its sockets and reaping
+/// its Xwayland and client — rather than leaving all three behind.
 #[cfg(test)]
 fn die_with_launcher(cmd: &mut Command) {
     // SAFETY: the closure runs in the forked child before exec. `prctl` is a bare syscall — it

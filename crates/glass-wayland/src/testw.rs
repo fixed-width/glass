@@ -31,6 +31,9 @@ const IGNORES_CLOSE: &str = "GLASS_TESTW_IGNORES_CLOSE";
 const USE_X11: &str = "GLASS_TESTW_X11";
 /// Printed by the fixture once every window is mapped, so a log test has a line it can wait for.
 pub(crate) const READY_LINE: &str = "testw: windows mapped";
+/// Printed by the fixture the moment it reaches the compositor, before it maps anything. One per
+/// launched process, so a test can count attempts without waiting for a window.
+pub(crate) const CONNECTED_LINE: &str = "testw: connected";
 /// Printed by the fixture when it acts on a close request, rather than being signalled.
 pub(crate) const CLOSING_LINE: &str = "testw: closing";
 
@@ -138,7 +141,7 @@ impl Launch {
         let spec = self.spec();
         let mut platform = WaylandPlatform::new().expect("a sway should be discoverable");
         if let Err(e) = platform.start_app(&spec) {
-            // What the compositor and the app said on the way down. A bare `Timeout(15000)` says
+            // What the compositor and the app said on the way down. A bare `Timeout(..)` says
             // only that no window arrived, which is the one thing already known.
             let said: Vec<String> = platform.drain_logs().into_iter().map(|(_, l)| l).collect();
             panic!("the fixture app should start: {e}\nthe session said: {said:#?}");
@@ -275,6 +278,8 @@ mod x11_app {
 
     pub(super) fn run(specs: &[Spec]) {
         let (conn, screen_num) = x11rb::connect(None).expect("the app should reach Xwayland");
+        println!("{}", super::CONNECTED_LINE);
+        std::io::stdout().flush().expect("flush");
         let screen = &conn.setup().roots[screen_num];
         for s in specs {
             let win = conn.generate_id().expect("id");
@@ -542,10 +547,10 @@ mod app {
     /// An shm buffer of `w`x`h` solid `argb`, backed by a memfd written as an ordinary file (no
     /// mmap, so no `unsafe`).
     ///
-    /// The file comes back with the buffer and has to outlive it. `create_pool` sends the fd with
-    /// the request, and requests are only written to the socket on flush — closing it first hands
-    /// the compositor a closed descriptor, which it answers with a surface that is mapped, black,
-    /// and takes no pointer input.
+    /// The file comes back with the buffer and is held for the process's lifetime. The pure-Rust
+    /// wayland backend `dup()`s the fd into the message at request time, so this is belt and
+    /// braces rather than load-bearing — but the memfd is the buffer's pixels, and nothing else
+    /// owns it.
     fn buffer(
         shm: &wl_shm::WlShm,
         qh: &QueueHandle<App>,
@@ -571,6 +576,7 @@ mod app {
 
     pub(super) fn run(specs: &[Spec]) {
         let conn = Connection::connect_to_env().expect("the app should reach the compositor");
+        echo(super::CONNECTED_LINE.to_string());
         let (globals, mut queue) = registry_queue_init::<App>(&conn).expect("registry");
         let qh = queue.handle();
         let compositor: wl_compositor::WlCompositor =

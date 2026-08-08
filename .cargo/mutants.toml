@@ -11,17 +11,24 @@
 # One list rather than `#[mutants::skip]` attributes, so every exclusion is reviewed together and
 # neither public crate takes a dependency to carry them.
 exclude_re = [
-    # Empty match arms: deleting one falls through to the `_ => {}` beside it, which does exactly
-    # what the arm did. They are written out to record that the event was considered.
-    'delete match arm zwlr_data_control_device_v1::Event::Finished',
-    'delete match arm zwlr_data_control_device_v1::Event::PrimarySelection',
+    # Empty match arms in the *reading* device dispatcher: deleting one falls through to the
+    # `_ => {}` beside it, which does exactly what the arm did. They are written out to record
+    # that the event was considered.
+    #
+    # Scoped to `ClipState`. The same two event names appear on `ServeState`, where `Finished`
+    # sets `cancelled` — the mechanism by which the serving thread learns it lost the selection.
+    # An unscoped pattern reads as two exclusions and would become four the moment that `if let`
+    # is tidied into a `match`, taking the cancellation mutant with it.
+    'delete match arm zwlr_data_control_device_v1::Event::Finished in <impl Dispatch<ZwlrDataControlDeviceV1, \(\)> for ClipState>::event',
+    'delete match arm zwlr_data_control_device_v1::Event::PrimarySelection\{\.\.\} in <impl Dispatch<ZwlrDataControlDeviceV1, \(\)> for ClipState>::event',
 
     # `start_app`'s retry guard, in the three forms that make it true on the last attempt as well.
     # Both routes out of that attempt return the same error and reap the private bus — the arm
     # does it before returning, and the line after the loop does it for an exhausted ladder — so
-    # the programs are identical. The fourth form, `< with ==`, does change behaviour (it stops
-    # the retry happening at all) and is caught by the launch test that measures the ladder.
+    # the programs are identical. The fourth form, `< with ==`, does change behaviour: it stops the
+    # retry happening at all. It is NOT excluded and NOT currently caught — nothing observes the
+    # retry from outside `start_app`, which is #382.
     'replace < with <= in <impl Platform for WaylandPlatform>::start_app',
     'replace \+ with \* in <impl Platform for WaylandPlatform>::start_app',
-    'replace match guard attempt \+ 1 < ATTEMPTS with true',
+    'replace match guard attempt \+ 1 < ATTEMPTS with true in <impl Platform for WaylandPlatform>::start_app',
 ]

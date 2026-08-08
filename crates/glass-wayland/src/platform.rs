@@ -838,8 +838,9 @@ fn ensure_sandbox_available(
 /// XKB real-modifier mask for a chord's modifiers (standard `include "complete"`
 /// order: Shift, Lock, Control, Mod1=Alt, ..., Mod4=Super).
 ///
-/// The bits are written out rather than shifted. `1 << 0` and `1 >> 0` are the same number, so a
-/// shift here is a place the code can be changed without any test being able to notice.
+/// Shift-free on purpose: `1 << 0` and `1 >> 0` are the same number, so writing Shift's bit as a
+/// shift left a place the code could be changed with nothing able to notice. The other three were
+/// always killable (`1 >> 2` is 0); they are literals for consistency with it.
 fn modifier_mask(mods: &[glass_core::keys::Modifier]) -> u32 {
     use glass_core::keys::Modifier;
     mods.iter().fold(0, |m, x| {
@@ -1866,7 +1867,8 @@ mod session_tests {
         );
     }
 
-    /// Logs are the app's stdout and stderr as the launch captured them, not the compositor's.
+    /// The sink is sway's piped stdout and stderr, which the app inherits — so both streams
+    /// arrive intermixed, and a line the app printed is the only proof the launch captured it.
     #[test]
     fn the_apps_output_reaches_the_log_sink() {
         let mut s = Launch::new().start();
@@ -2305,22 +2307,20 @@ mod session_tests {
         );
     }
 
-    /// An app that never maps a window is retried before the launch gives up: the compositor
-    /// bring-up is the flaky part, and one attempt would surface that as the app's fault.
+    /// An app that never maps a window fails the launch with a timeout rather than hanging.
+    ///
+    /// It does NOT show that the bring-up was retried, and no test currently does. Two attempts
+    /// were confirmed by instrumenting the arms, but neither is observable from outside: both
+    /// return the same `Timeout`, and elapsed time cannot separate them because one attempt already
+    /// spends the budget twice — once waiting for the socket, once for a window. See #382.
     #[test]
-    fn a_launch_that_finds_no_window_is_retried_before_it_gives_up() {
+    fn a_launch_that_finds_no_window_times_out() {
         let mut platform = WaylandPlatform::new().expect("sway");
-        let spec = Launch::new().windows(&[]).timeout_ms(700).spec();
-        let start = Instant::now();
+        let spec = Launch::new().windows(&[]).timeout_ms(1500).spec();
         let err = platform
             .start_app(&spec)
             .expect_err("an app with no window cannot start");
-        let elapsed = start.elapsed();
         assert!(matches!(err, GlassError::Timeout(_)), "{err}");
-        assert!(
-            elapsed >= Duration::from_millis(1400),
-            "one 700ms budget was spent, not two — the launch was not retried ({elapsed:?})"
-        );
     }
 
     /// Teardown has to happen even when nobody called `stop_app` — a panicking test or an early
