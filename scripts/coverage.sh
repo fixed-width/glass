@@ -91,9 +91,11 @@ classify_tests() { # label cmd...
     if ! out=$("$@" 2>&1); then
         failed+=("$label")
         printf '%s\n' "$out" | tail -n 30
-    elif printf '%s\n' "$out" | grep -qE '^test result: ok\. 0 passed'; then
+    elif ! printf '%s\n' "$out" | grep -qE '^test result: ok\. [1-9][0-9]* passed'; then
         # Exit 0 having run nothing: every test filtered or ignored. Recording that as
-        # coverage is how a crate drops out of the report unseen.
+        # coverage is how a crate drops out of the report unseen. Look for a target that DID
+        # run something — a crate reports one line per target, and the empty ones read
+        # `0 passed` however well the rest went.
         failed+=("$label (ran no tests)")
     else
         ran+=("$label")
