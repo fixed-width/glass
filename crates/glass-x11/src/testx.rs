@@ -1,11 +1,13 @@
 //! A private X server and real client windows, for the tests that need actual X protocol.
 //!
 //! The backend's methods talk to a display, so most of them have no seam to fake at: there is
-//! no subprocess to stand in for and no trait to implement. An `Xvfb` starts in ~45ms, though,
-//! so the tests drive a real server and put real windows in front of the code instead.
+//! no subprocess to stand in for and no trait to implement. Starting a server per test is
+//! cheap enough, so the tests drive a real one and put real windows in front of the code.
 //!
-//! The windows belong to a *second* connection. A window the backend created itself would be
-//! matched by ids it already holds, which is not what enumeration has to do.
+//! The windows belong to a *second* connection, for two reasons: the X server delivers a
+//! window's input events to the client that created it, so the harness needs an event queue
+//! of its own; and two connections have no ordering between them, which is why every read of
+//! the server's state goes through a round trip ([`TestX::flush`]).
 
 use std::time::{Duration, Instant};
 
@@ -161,9 +163,14 @@ impl TestX {
         win
     }
 
-    /// Ask the current CLIPBOARD owner to convert the selection to `target`, and return the
-    /// property named in the reply — `x11rb::NONE` when the owner refuses.
-    pub(crate) fn request_selection(&self, target: Atom, within: Duration) -> Option<Atom> {
+    /// Ask the current CLIPBOARD owner to convert the selection to `target`. Returns the
+    /// requestor window and the property named in the reply — `x11rb::NONE` when the owner
+    /// refuses. The window comes back because that is where the converted value was written.
+    pub(crate) fn request_selection(
+        &self,
+        target: Atom,
+        within: Duration,
+    ) -> Option<(Window, Atom)> {
         let requestor = self.window().unmapped().create();
         let clipboard = self.intern(b"CLIPBOARD");
         let into = self.intern(b"TEST_CLIP_TRANSFER");
@@ -177,11 +184,23 @@ impl TestX {
                 self.conn.poll_for_event().expect("poll_for_event")
                 && n.requestor == requestor
             {
-                return Some(n.property);
+                return Some((requestor, n.property));
             }
             std::thread::sleep(Duration::from_millis(5));
         }
         None
+    }
+
+    /// The atoms stored in `prop` on `win` — how a requestor reads a TARGETS reply.
+    pub(crate) fn property_atoms(&self, win: Window, prop: Atom) -> Vec<Atom> {
+        self.conn
+            .get_property(false, win, prop, AtomEnum::ATOM, 0, 64)
+            .expect("get_property")
+            .reply()
+            .expect("get_property reply")
+            .value32()
+            .map(|it| it.collect())
+            .unwrap_or_default()
     }
 
     /// The window currently holding the CLIPBOARD selection, or `x11rb::NONE`.

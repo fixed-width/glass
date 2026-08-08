@@ -41,6 +41,11 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
+      - name: Install the X and a11y stack glass-x11's unit tests need
+        # `cargo test --workspace` now covers glass-x11's Xvfb-backed tests — they start a
+        # private display each, and one starts a private a11y bus. Neither package ships on
+        # the runner, and these are not `#[ignore]`d because the mutation gate has to run them.
+        run: sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core
       - run: cargo build --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -247,7 +252,7 @@ jobs:
         # them for bubblewrap (no-op on images without the knob).
         # python3-gi + gir1.2-gtk-4.0: the software_render integration test drives a real GTK4 app.
         run: |
-          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0
+          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 at-spi2-core
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Measure coverage (unit + X11; Wayland/AT-SPI self-skip)
         run: ./scripts/coverage.sh --lcov
@@ -258,7 +263,7 @@ jobs:
           if-no-files-found: warn
 
   mutants:
-    name: Mutation shard ${{ matrix.shard }} (glass-core, glass-android)
+    name: Mutation shard ${{ matrix.shard }} (glass-core, glass-android, glass-x11)
     runs-on: ubuntu-latest
     # A push carries no base ref to diff against; this gate is a pull-request check.
     if: github.event_name == 'pull_request'
@@ -317,8 +322,8 @@ jobs:
       - name: Install the X and a11y stack glass-x11's tests drive
         if: steps.diff.outputs.touched == 'true'
         # xvfb for the private headless displays those tests start; at-spi2-core for the one
-        # that starts a private a11y bus. Absent either they all fail, and a failing suite
-        # reads as every mutant caught.
+        # that starts a private a11y bus. Absent either, cargo-mutants' unmutated baseline
+        # fails and the run grades nothing.
         run: sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core
       - name: Mutation gate
         if: steps.diff.outputs.touched == 'true'

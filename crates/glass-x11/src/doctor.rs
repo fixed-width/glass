@@ -189,6 +189,7 @@ mod tests {
     /// a `PATH`-style list with the empty one first — so a hit proves the search walked on
     /// rather than stopping at the head.
     fn path_containing(name: &str) -> (tempfile::TempDir, std::ffi::OsString, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("temp dir");
         let empty = dir.path().join("empty");
         let holding = dir.path().join("holding");
@@ -196,6 +197,9 @@ mod tests {
         std::fs::create_dir_all(&holding).unwrap();
         let bin = holding.join(name);
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        // Executable, so the test is about the search and not about accepting a file that
+        // could never be spawned.
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let list = std::env::join_paths([&empty, &holding]).expect("join paths");
         (dir, list, bin)
     }

@@ -1019,9 +1019,7 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
 
 impl Platform for X11Platform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        if let Some(e) = sandbox_refusal(spec.sandbox, glass_sandbox_linux::availability()) {
-            return Err(e);
-        }
+        ensure_sandbox_available(spec.sandbox, glass_sandbox_linux::availability)?;
         glass_sandbox_linux::run_build(spec)?;
         // Opt-in private, isolated a11y bus (its own XDG_RUNTIME_DIR — never the host
         // /run/user/UID/at-spi/) so the launched app publishes an AT-SPI tree. The caller
@@ -1249,9 +1247,7 @@ impl Platform for X11Platform {
             }
             WindowOp::Geometry => {}
         }
-        self.conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+        self.commit()?;
         self.window_geometry()
     }
 
@@ -1350,26 +1346,26 @@ impl Drop for X11Platform {
     /// `self.child.take()`, so this is idempotent with `stop_app`. Field order then
     /// drops `xvfb`, tearing down any private display we spawned.
     fn drop(&mut self) {
-        self.kill_child(); // also drops clipboard_owner
-        // Redundant safety: kill_child already clears it, but be explicit in case
-        // clipboard_owner was set after the last kill_child call.
-        self.clipboard_owner = None;
+        self.kill_child(); // takes the child, and drops the clipboard owner with it
     }
 }
 
-/// Why a launch cannot go ahead under the requested containment, or `None` when it can.
-/// A `sandbox:"off"` launch never consults availability.
+/// Fail a launch that asked for containment this machine cannot provide.
 ///
-/// Do not fold this back into the probe: whether bubblewrap works is a property of the
-/// machine, so in place only one of the two answers is ever reachable from a test.
-fn sandbox_refusal(
+/// `probe` is a thunk because it forks bubblewrap, and `sandbox:"off"` is the escape hatch
+/// for machines where that is exactly what does not work. Kept out of `start_app` so both
+/// answers are reachable from a test.
+fn ensure_sandbox_available(
     level: glass_core::SandboxLevel,
-    availability: glass_sandbox_linux::Availability,
-) -> Option<GlassError> {
-    match (level, availability) {
-        (glass_core::SandboxLevel::Off, _) | (_, glass_sandbox_linux::Availability::Ok) => None,
-        (_, glass_sandbox_linux::Availability::Unavailable(why)) => {
-            Some(GlassError::SandboxUnavailable(format!(
+    probe: impl FnOnce() -> glass_sandbox_linux::Availability,
+) -> Result<()> {
+    if level == glass_core::SandboxLevel::Off {
+        return Ok(());
+    }
+    match probe() {
+        glass_sandbox_linux::Availability::Ok => Ok(()),
+        glass_sandbox_linux::Availability::Unavailable(why) => {
+            Err(GlassError::SandboxUnavailable(format!(
                 "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
                  sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
             )))
@@ -1513,37 +1509,30 @@ mod tests {
     }
 
     #[test]
-    fn an_unconfined_launch_does_not_need_bubblewrap() {
+    fn an_unconfined_launch_never_runs_the_bubblewrap_probe() {
+        // A panicking probe is the only way to assert the probe is never called.
         use glass_core::SandboxLevel;
-        use glass_sandbox_linux::Availability;
-        assert!(
-            super::sandbox_refusal(
-                SandboxLevel::Off,
-                Availability::Unavailable("no bwrap".into())
-            )
-            .is_none(),
-            "sandbox:off never uses bubblewrap, so its absence cannot refuse the launch"
-        );
+        super::ensure_sandbox_available(SandboxLevel::Off, || {
+            panic!("sandbox:off must not probe for bubblewrap")
+        })
+        .expect("an unconfined launch is always allowed");
     }
 
     #[test]
     fn a_contained_launch_is_refused_when_bubblewrap_cannot_work() {
         use glass_core::{GlassError, SandboxLevel};
         use glass_sandbox_linux::Availability;
-        let err = super::sandbox_refusal(
-            SandboxLevel::Default,
-            Availability::Unavailable("no user namespaces".into()),
-        )
-        .expect("a contained launch cannot proceed without containment");
+        let err = super::ensure_sandbox_available(SandboxLevel::Default, || {
+            Availability::Unavailable("no user namespaces".into())
+        })
+        .expect_err("a contained launch cannot proceed without containment");
         assert!(matches!(err, GlassError::SandboxUnavailable(_)), "{err:?}");
         assert!(
             err.to_string().contains("no user namespaces"),
             "the real cause must survive into the message: {err}"
         );
-        assert!(
-            super::sandbox_refusal(SandboxLevel::Default, Availability::Ok).is_none(),
-            "a working bubblewrap refuses nothing"
-        );
+        super::ensure_sandbox_available(SandboxLevel::Default, || Availability::Ok)
+            .expect("a working bubblewrap refuses nothing");
     }
 
     #[test]
@@ -1809,9 +1798,8 @@ mod display_tests {
     const KEYSYM_SHIFT_L: u32 = 0xffe1;
 
     /// Push the backend's buffered requests and wait for the server to have processed them.
-    /// The input primitives do not flush — the sinks above them commit a whole gesture at
-    /// once — and a flush alone would not be enough here anyway: these tests read the result
-    /// over a *second* connection, which is ordered against the first only by a round trip.
+    /// The input primitives do not flush, and a flush would not be enough anyway: these tests
+    /// read the result over a *second* connection, ordered against the first only by a reply.
     fn commit(plat: &X11Platform) {
         plat.conn.sync().expect("sync");
     }
@@ -2095,10 +2083,14 @@ mod display_tests {
     /// that is genuinely in `/proc`. `sleep` leaves on its own, so a test that panics before
     /// its teardown cannot strand it.
     fn spawn_stand_in() -> std::process::Child {
-        std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("the stand-in app should spawn")
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        // As production spawns an app (`command.rs`). `reap_launch` signals `child.id()` as a
+        // process GROUP; on a child that is not a group leader that pgid belongs to somebody
+        // else, and teardown SIGKILLs an unrelated group.
+        cmd.process_group(0);
+        cmd.spawn().expect("the stand-in app should spawn")
     }
 
     /// The buttons and their positions a watching window saw, as `(detail, x, y)`.
@@ -2527,6 +2519,11 @@ mod display_tests {
             ),
             "a window outside the launched process tree is not selectable"
         );
+        assert_eq!(
+            plat.window,
+            Some(mine),
+            "a refused selection must leave the active window where it was"
+        );
     }
 
     #[test]
@@ -2536,10 +2533,12 @@ mod display_tests {
         let child = spawn_stand_in();
         let pid = child.id();
         plat.child = Some(child);
+        // Away from the origin, and filled: a capture that ignored the window's position would
+        // read the root's black from (0,0) and still be the right size.
         let win = x
             .window()
             .owned_by(pid)
-            .at(0, 0)
+            .at(120, 60)
             .sized(48, 32)
             .filled_with(0x0000_00ff)
             .create();
@@ -2550,6 +2549,12 @@ mod display_tests {
             .capture_window(WindowId(win as u64), None)
             .expect("capture");
         assert_eq!((frame.width, frame.height), (48, 32));
+        let px = &frame.pixels[..4];
+        assert_eq!(
+            (px[0], px[1], px[2]),
+            (0x00, 0x00, 0xff),
+            "should read the window's own pixels, got {px:?}"
+        );
 
         let stranger = x.window().owned_by(999_999).create();
         assert!(
@@ -2605,8 +2610,22 @@ mod display_tests {
         plat.set_clipboard("ours").expect("set");
         assert_eq!(plat.get_clipboard().expect("get"), "ours");
 
-        x.take_clipboard();
-        std::thread::sleep(Duration::from_millis(200));
+        let thief = x.take_clipboard();
+        assert_eq!(
+            x.clipboard_owner(),
+            thief,
+            "the test client should hold it now"
+        );
+
+        // Wait for glass's owner to RETIRE, not merely for the selection to change hands: it
+        // notices SelectionClear on its own 10ms loop, and copying before it does hands the
+        // text to an owner that no longer serves anything.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && plat.clipboard_owner.as_ref().is_some_and(|o| o.is_alive())
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         plat.set_clipboard("ours again")
             .expect("set after losing it");

@@ -282,42 +282,18 @@ fn read_displayfd(
     }
 }
 
-fn socket_path(num: &str) -> String {
-    format!("/tmp/.X11-unix/X{num}")
-}
-
-/// Whether display `num`'s socket exists with nothing listening on it. Do not tell a
-/// leftover from a live server by inode instead: an inode is recycled onto whatever binds
-/// the path next.
-fn socket_is_stale(num: &str) -> bool {
-    matches!(
-        std::os::unix::net::UnixStream::connect(socket_path(num)),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused
-    )
-}
-
 impl Drop for Xvfb {
+    /// Reaping is the whole teardown. Do not add back a sweep of `/tmp/.X11-unix/X{N}`: the
+    /// next Xvfb connect-probes that path and rebinds a refusing one, so a SIGKILLed server's
+    /// leftover costs nothing — while unlinking it cuts off whoever reclaimed the number.
     fn drop(&mut self) {
         glass_proc_linux::reap_graceful(&mut self.child, glass_proc_linux::REAP_GRACE);
-        // Fallback for a server that had to be SIGKILLed: SIGTERM makes Xvfb remove its own
-        // socket, SIGKILL leaves it behind. (`-displayfd` mode takes no `/tmp/.X{N}-lock`,
-        // so there is never one of those to clean up.)
-        //
-        // Do not remove it unconditionally: the display number is free the moment the
-        // process dies, so another Xvfb can already have bound that path. Nor skip the
-        // cleanup — Xvfb passes over a number whose socket is present, so each leftover
-        // costs one.
-        if let Some(num) = self.display.strip_prefix(':')
-            && socket_is_stale(num)
-        {
-            let _ = std::fs::remove_file(socket_path(num));
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadErr, Xvfb, read_displayfd, socket_path, start_binary};
+    use super::{ReadErr, Xvfb, read_displayfd, start_binary};
     use glass_core::{GlassError, Result};
     use std::process::{Command, Stdio};
     use std::time::Duration;
@@ -365,32 +341,6 @@ mod tests {
 
     fn running(pid: u32) -> bool {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
-    }
-
-    fn exists(path: &str) -> bool {
-        std::path::Path::new(path).exists()
-    }
-
-    /// A signalled child stays in `/proc` as a zombie until its parent reaps it, so "gone"
-    /// here means gone or dead-but-unreaped.
-    fn dead(pid: u32) -> bool {
-        match std::fs::read_to_string(format!("/proc/{pid}/status")) {
-            Err(_) => true,
-            Ok(status) => status
-                .lines()
-                .any(|l| l.starts_with("State:") && l.contains('Z')),
-        }
-    }
-
-    /// Wait up to a second for `f` to hold.
-    fn eventually(mut f: impl FnMut() -> bool) -> bool {
-        for _ in 0..100 {
-            if f() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        f()
     }
 
     /// Write an executable fake-Xvfb shell script into a unique temp dir and
@@ -479,66 +429,6 @@ mod tests {
             std::process::id().to_string(),
             "the reported pid must be the server this test spawned, not another process"
         );
-    }
-
-    #[test]
-    fn tearing_down_a_departed_server_leaves_its_reused_display_number_alone() {
-        // `departed` stands in for a server that held this number first: same display,
-        // process already on its way out.
-        let live = Xvfb::start("640x480x24").expect("a server should start");
-        let display = live.display.clone();
-        let num = display.trim_start_matches(':').to_string();
-
-        let mut placeholder = Command::new("sleep")
-            .arg("30")
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn the placeholder");
-        let displayfd = placeholder.stdout.take().expect("piped stdout");
-        drop(Xvfb {
-            child: placeholder,
-            display: display.clone(),
-            displayfd,
-        });
-        assert!(
-            exists(&socket_path(&num)),
-            "{display}\'s socket was deleted"
-        );
-
-        assert!(
-            x11rb::connect(Some(&display)).is_ok(),
-            "{display} stopped answering when a server that no longer owned it was torn down"
-        );
-    }
-
-    #[test]
-    fn a_server_that_had_to_be_killed_has_its_socket_removed() {
-        // The only case that reaches the fallback: a server sent SIGTERM removes its own
-        // socket, leaving nothing to clean up.
-        let server = Xvfb::start("640x480x24").expect("a server should start");
-        let num = server
-            .display
-            .strip_prefix(':')
-            .expect("a display is :N")
-            .to_string();
-        let socket = socket_path(&num);
-        assert!(exists(&socket), "a live server holds {socket}");
-
-        Command::new("kill")
-            .args(["-9", &server.pid().to_string()])
-            .status()
-            .expect("kill");
-        assert!(
-            eventually(|| dead(server.pid())),
-            "the server should be gone after SIGKILL"
-        );
-        assert!(
-            exists(&socket),
-            "a killed server cannot have removed {socket} itself"
-        );
-
-        drop(server);
-        assert!(!exists(&socket), "{socket} was left behind");
     }
 
     #[test]

@@ -180,7 +180,7 @@ enum ReadyState {
 }
 
 /// A background thread that owns the X11 CLIPBOARD selection and serves paste
-/// requests.  Created by `ClipboardOwner::spawn`; torn down by `stop()`/`Drop`.
+/// requests. Created by `ClipboardOwner::spawn`; torn down by dropping it.
 pub struct ClipboardOwner {
     text: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
@@ -531,10 +531,13 @@ mod tests {
         for _ in 0..5 {
             get(x.display()).expect("get");
         }
-        assert_eq!(
-            x.root_child_count(),
-            before,
-            "five reads should leave the window tree as they found it"
+        // Polled, not asserted outright: each temp window dies when the server processes its
+        // own connection closing, and no request this connection can send is ordered against
+        // that.
+        assert!(
+            eventually(Duration::from_secs(3), || x.root_child_count() == before),
+            "five reads left {} windows behind",
+            x.root_child_count() - before
         );
     }
 
@@ -592,13 +595,19 @@ mod tests {
         let _owner =
             ClipboardOwner::spawn(x.display().to_string(), "text".to_string()).expect("spawn");
         let targets = x.intern(b"TARGETS");
-        let granted = x
+        let utf8 = x.intern(b"UTF8_STRING");
+        let (requestor, granted) = x
             .request_selection(targets, Duration::from_secs(2))
             .expect("the owner should answer a TARGETS request");
         assert_ne!(
             granted,
             x11rb::NONE,
             "TARGETS is a request every selection owner must answer"
+        );
+        assert!(
+            x.property_atoms(requestor, granted).contains(&utf8),
+            "a requestor branches on this list, so it has to name the target glass can \
+             actually convert to"
         );
     }
 
@@ -609,8 +618,14 @@ mod tests {
         let x = TestX::start();
         let _owner =
             ClipboardOwner::spawn(x.display().to_string(), "text".to_string()).expect("spawn");
+        assert_ne!(
+            x.clipboard_owner(),
+            x11rb::NONE,
+            "with nobody owning the selection the SERVER replies NONE, and this test would \
+             pass without glass having refused anything"
+        );
         let png = x.intern(b"image/png");
-        let granted = x
+        let (_requestor, granted) = x
             .request_selection(png, Duration::from_secs(2))
             .expect("the owner should still reply");
         assert_eq!(granted, x11rb::NONE);
