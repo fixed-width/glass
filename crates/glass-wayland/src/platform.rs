@@ -222,18 +222,8 @@ impl Drop for WaylandPlatform {
 /// data dir (where the build tool installs the bundle) → next to this executable.
 /// No silent fallback — a clear error if none qualifies.
 pub(crate) fn resolve_sway() -> Result<PathBuf> {
-    // Explicit override wins and is trusted (skips the PATH version gate). Fail closed if it
-    // is not an executable file rather than silently falling back to discovery.
-    if let Some(p) = std::env::var_os("GLASS_SWAY").filter(|s| !s.is_empty()) {
-        let p = PathBuf::from(p);
-        return if p.is_file() {
-            Ok(p)
-        } else {
-            Err(GlassError::Backend(format!(
-                "GLASS_SWAY={} is not an executable file",
-                p.display()
-            )))
-        };
+    if let Some(overridden) = sway_override(std::env::var_os("GLASS_SWAY")) {
+        return overridden;
     }
     if let Some(p) = sway_on_path_if_recent() {
         return Ok(p);
@@ -262,10 +252,36 @@ pub(crate) fn resolve_sway() -> Result<PathBuf> {
     ))
 }
 
+/// What `GLASS_SWAY` decides, or `None` when it is unset or empty and discovery should run.
+///
+/// An explicit override wins and is trusted — it skips the version gate. It fails closed when it
+/// names something that is not a file, rather than falling back to discovery: a caller who named
+/// a path wants *that* sway, and silently running a different one is how a version-specific bug
+/// gets chased in the wrong binary.
+fn sway_override(value: Option<std::ffi::OsString>) -> Option<Result<PathBuf>> {
+    let p = PathBuf::from(value.filter(|s| !s.is_empty())?);
+    Some(if p.is_file() {
+        Ok(p)
+    } else {
+        Err(GlassError::Backend(format!(
+            "GLASS_SWAY={} is not an executable file",
+            p.display()
+        )))
+    })
+}
+
 /// The first `sway` on `PATH`, but only if `sway --version` reports >= 1.12.
 fn sway_on_path_if_recent() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    sway_in_dirs(std::env::split_paths(&std::env::var_os("PATH")?))
+}
+
+/// The first `sway` in `dirs` whose `--version` reports >= 1.12.
+///
+/// Only the first `sway` found is considered. A too-old or unparseable one is not skipped over in
+/// favour of a later directory: `PATH` order is the user's own precedence, and walking past their
+/// choice to run a different sway is the same silent substitution [`sway_override`] refuses.
+fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+    for dir in dirs {
         let cand = dir.join("sway");
         if !cand.is_file() {
             continue;
@@ -796,6 +812,31 @@ fn tap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, kc: u32) -> Result<()> 
     Ok(())
 }
 
+/// Fail closed: a launch that asked for a sandbox errors rather than running unconfined.
+///
+/// `probe` is a thunk, not a value. Rust evaluates arguments before the call, so passing
+/// `availability()` directly would fork `bwrap --unshare-user` on *every* launch — including
+/// `sandbox:"off"`, the one setting that exists for machines where bubblewrap does not work.
+/// glass-x11 has the same helper for the same reason; keeping a copy in each backend keeps both
+/// inside the mutation gate's `--package` list.
+fn ensure_sandbox_available(
+    level: glass_core::SandboxLevel,
+    probe: impl FnOnce() -> glass_sandbox_linux::Availability,
+) -> Result<()> {
+    if level == glass_core::SandboxLevel::Off {
+        return Ok(());
+    }
+    match probe() {
+        glass_sandbox_linux::Availability::Ok => Ok(()),
+        glass_sandbox_linux::Availability::Unavailable(why) => {
+            Err(GlassError::SandboxUnavailable(format!(
+                "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
+                 sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
+            )))
+        }
+    }
+}
+
 /// XKB real-modifier mask for a chord's modifiers (standard `include "complete"`
 /// order: Shift, Lock, Control, Mod1=Alt, ..., Mod4=Super).
 fn modifier_mask(mods: &[glass_core::keys::Modifier]) -> u32 {
@@ -1029,17 +1070,7 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
 
 impl Platform for WaylandPlatform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        // Fail-closed: if a sandbox was requested but bwrap is unavailable, error
-        // immediately rather than launching unconfined.
-        if spec.sandbox != glass_core::SandboxLevel::Off
-            && let glass_sandbox_linux::Availability::Unavailable(why) =
-                glass_sandbox_linux::availability()
-        {
-            return Err(GlassError::SandboxUnavailable(format!(
-                "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
-                     sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
-            )));
-        }
+        ensure_sandbox_available(spec.sandbox, glass_sandbox_linux::availability)?;
 
         // Run the build step (if any) before the compositor starts. The build is
         // sandboxed (bwrap) when sandbox != Off — same semantics as the X11 backend.
@@ -1581,6 +1612,109 @@ mod pure_tests {
         assert_eq!(next, 2, "re-fetching must not consume an id");
     }
 
+    /// A directory holding a `sway` that answers `--version` with `reply`.
+    fn fake_sway(reply: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("sway");
+        std::fs::write(&bin, format!("#!/bin/sh\necho '{reply}'\n")).expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        dir
+    }
+
+    #[test]
+    fn a_recent_sway_on_the_path_is_used() {
+        let dir = fake_sway("sway version 1.12-abc (Jun 3 2026)");
+        assert_eq!(
+            sway_in_dirs([dir.path().to_path_buf()].into_iter()),
+            Some(dir.path().join("sway"))
+        );
+    }
+
+    /// Too old, or a version this cannot read, means fall through to the bundle — glass drives
+    /// sway through IPC and protocol surface it only has from 1.12.
+    #[test]
+    fn an_old_or_unreadable_sway_on_the_path_is_not_used() {
+        for reply in ["sway version 1.9", "sway version 1.11-x", "wat"] {
+            let dir = fake_sway(reply);
+            assert_eq!(
+                sway_in_dirs([dir.path().to_path_buf()].into_iter()),
+                None,
+                "{reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_with_no_sway_on_it_finds_nothing() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(sway_in_dirs([empty.path().to_path_buf()].into_iter()), None);
+    }
+
+    /// An unset or empty override is not a choice; discovery runs.
+    #[test]
+    fn no_override_leaves_discovery_to_run() {
+        assert!(sway_override(None).is_none());
+        assert!(sway_override(Some(std::ffi::OsString::new())).is_none());
+    }
+
+    #[test]
+    fn an_override_naming_a_real_file_is_trusted_without_a_version_check() {
+        // Deliberately not a sway: an explicit path skips the version gate.
+        let dir = fake_sway("wat");
+        let bin = dir.path().join("sway");
+        let chosen = sway_override(Some(bin.clone().into_os_string()))
+            .expect("a choice was made")
+            .expect("a real file is trusted");
+        assert_eq!(chosen, bin);
+    }
+
+    /// Fail closed. Falling back to discovery would run a different sway than the one named,
+    /// which is how a version-specific bug gets chased in the wrong binary.
+    #[test]
+    fn an_override_naming_nothing_is_an_error_not_a_fallback() {
+        let err = sway_override(Some("/nonexistent/sway".into()))
+            .expect("a choice was made")
+            .expect_err("a named path that is not there must not fall back");
+        assert!(err.to_string().contains("/nonexistent/sway"), "{err}");
+    }
+
+    #[test]
+    fn discovery_finds_a_real_sway_on_this_machine() {
+        let found = resolve_sway().expect("a discoverable sway");
+        assert!(found.is_file(), "{}", found.display());
+    }
+
+    /// The only way to assert something is *not* called: a probe that panics if it is. Testing
+    /// the extracted function alone proves nothing about the call site, which is where an eager
+    /// argument would change the behaviour.
+    #[test]
+    fn a_launch_with_the_sandbox_off_never_probes_for_bubblewrap() {
+        ensure_sandbox_available(glass_core::SandboxLevel::Off, || {
+            panic!("sandbox:\"off\" must not fork bwrap")
+        })
+        .expect("an unconfined launch is always allowed");
+    }
+
+    #[test]
+    fn a_sandboxed_launch_is_refused_when_bubblewrap_is_unavailable() {
+        let err = ensure_sandbox_available(glass_core::SandboxLevel::Default, || {
+            glass_sandbox_linux::Availability::Unavailable("no bwrap here".into())
+        })
+        .expect_err("fail closed rather than launching unconfined");
+        assert!(matches!(err, GlassError::SandboxUnavailable(_)), "{err}");
+        assert!(err.to_string().contains("no bwrap here"), "{err}");
+        assert!(err.to_string().contains("sandbox:\"off\""), "{err}");
+    }
+
+    #[test]
+    fn a_sandboxed_launch_proceeds_when_bubblewrap_is_available() {
+        ensure_sandbox_available(glass_core::SandboxLevel::Default, || {
+            glass_sandbox_linux::Availability::Ok
+        })
+        .expect("an available sandbox allows the launch");
+    }
+
     /// sway's own socket sits in the same directory as its IPC socket and the lock file.
     #[test]
     fn the_wayland_socket_is_picked_out_of_the_runtime_dir() {
@@ -1942,6 +2076,133 @@ mod session_tests {
     fn a_session_with_nothing_on_the_clipboard_reads_empty() {
         let mut s = Launch::new().start();
         assert_eq!(s.platform().get_clipboard().expect("get"), "");
+    }
+
+    #[test]
+    fn a_drag_presses_moves_and_releases_over_the_window() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        s.platform()
+            .send_pointer(&PointerEvent::Drag {
+                from_x: 20,
+                from_y: 20,
+                to_x: 90,
+                to_y: 70,
+                button: glass_core::MouseButton::Left,
+                modifiers: vec![],
+                duration_ms: 40,
+            })
+            .expect("drag");
+        let lines = s.wait_for_log("input: button 272 0");
+        let order: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("input: button") || l.contains("input: motion"))
+            .collect();
+        let down = order
+            .iter()
+            .position(|l| l.contains("button 272 1"))
+            .expect("pressed");
+        let up = order
+            .iter()
+            .position(|l| l.contains("button 272 0"))
+            .expect("released");
+        assert!(down < up, "pressed before released: {order:?}");
+        assert!(
+            order[down..up].iter().any(|l| l.contains("motion")),
+            "the pointer must move while the button is held: {order:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.ends_with("90 70")),
+            "and end where it was asked to: {lines:#?}"
+        );
+    }
+
+    /// A modifier is held across the wheel, not sent alongside it: an app reads ctrl+scroll as
+    /// zoom only if control is down when the axis arrives.
+    #[test]
+    fn a_modified_scroll_holds_the_modifier_and_releases_it() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        s.platform()
+            .send_pointer(&PointerEvent::Scroll {
+                x: 20,
+                y: 20,
+                dx: 0,
+                dy: -1,
+                modifiers: vec![glass_core::keys::Modifier::Control],
+            })
+            .expect("scroll");
+        let lines = s.wait_for_log("input: axis");
+        let mods: Vec<&String> = lines.iter().filter(|l| l.contains("input: mods")).collect();
+        assert!(
+            mods.iter().any(|l| l.ends_with("mods 4")),
+            "control down (XKB bit 2): {lines:#?}"
+        );
+        assert!(
+            mods.last().is_some_and(|l| l.ends_with("mods 0")),
+            "and released again: {mods:?}"
+        );
+    }
+
+    /// An unmodified scroll must not upload a keymap or touch the modifier state at all — that
+    /// is what the `mask == 0` short circuit is for.
+    #[test]
+    fn an_unmodified_scroll_does_not_touch_the_modifiers() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        let before = s
+            .platform()
+            .drain_logs()
+            .into_iter()
+            .filter(|(_, l)| l.contains("input: mods"))
+            .count();
+        s.platform()
+            .send_pointer(&PointerEvent::Scroll {
+                x: 20,
+                y: 20,
+                dx: 0,
+                dy: -1,
+                modifiers: vec![],
+            })
+            .expect("scroll");
+        let lines = s.wait_for_log("input: axis");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("input: mods")).count(),
+            0,
+            "no modifier traffic for an unmodified scroll (before: {before}): {lines:#?}"
+        );
+    }
+
+    /// An app that never maps a window is retried before the launch gives up: the compositor
+    /// bring-up is the flaky part, and one attempt would surface that as the app's fault.
+    #[test]
+    fn a_launch_that_finds_no_window_is_retried_before_it_gives_up() {
+        let mut platform = WaylandPlatform::new().expect("sway");
+        let spec = Launch::new().windows(&[]).timeout_ms(700).spec();
+        let start = Instant::now();
+        let err = platform
+            .start_app(&spec)
+            .expect_err("an app with no window cannot start");
+        let elapsed = start.elapsed();
+        assert!(matches!(err, GlassError::Timeout(_)), "{err}");
+        assert!(
+            elapsed >= Duration::from_millis(1400),
+            "one 700ms budget was spent, not two — the launch was not retried ({elapsed:?})"
+        );
+    }
+
+    /// Teardown has to happen even when nobody called `stop_app` — a panicking test or an early
+    /// return would otherwise leak sway, its Xwayland and the app.
+    #[test]
+    fn dropping_the_backend_reaps_a_session_that_was_never_stopped() {
+        let mut s = Launch::new().start();
+        let pids = s.platform().app_pids();
+        assert!(!pids.is_empty());
+        drop(s);
+        assert!(
+            !glass_proc_linux::any_alive(&pids),
+            "the compositor subtree outlived the backend: {pids:?}"
+        );
     }
 
     /// Stopping ends the session: what follows has no compositor to talk to and must say so

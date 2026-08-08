@@ -65,6 +65,11 @@ impl Launch {
         self
     }
 
+    pub(crate) fn timeout_ms(mut self, ms: u64) -> Launch {
+        self.timeout_ms = ms;
+        self
+    }
+
     pub(crate) fn env(mut self, k: &str, v: &str) -> Launch {
         self.env.push((k.to_string(), v.to_string()));
         self
