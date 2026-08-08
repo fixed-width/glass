@@ -72,7 +72,9 @@ classify_suite() {  # label cmd...
     local label="$1"; shift
     local out
     if out=$("$@" 2>&1); then
-        if printf '%s\n' "$out" | grep -qi 'skipping'; then
+        # Here-string, not `printf | grep -q`: under `pipefail` the early-exiting grep SIGPIPEs
+        # the printf, and the pipeline reports 141 on a MATCH. Only bites past a pipe buffer.
+        if grep -qi 'skipping' <<<"$out"; then
             skipped+=("$label")
         else
             ran+=("$label")
@@ -90,8 +92,8 @@ classify_tests() { # label cmd...
     shift
     if ! out=$("$@" 2>&1); then
         failed+=("$label")
-        printf '%s\n' "$out" | tail -n 30
-    elif ! printf '%s\n' "$out" | grep -qE '^test result: ok\. [1-9][0-9]* passed'; then
+        tail -n 30 <<<"$out"
+    elif ! grep -qE '^test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
         # Exit 0 having run nothing: every test filtered or ignored. Recording that as
         # coverage is how a crate drops out of the report unseen. Look for a target that DID
         # run something — a crate reports one line per target, and the empty ones read
