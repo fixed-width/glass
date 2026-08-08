@@ -413,6 +413,12 @@ pub fn get(socket: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Whether a failed read should be retried — a signal arrived and nothing was lost. Retrying
+/// anything else spins to the deadline and reports a timeout, hiding the real failure.
+fn is_retryable(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Interrupted
+}
+
 /// Read `fd` to EOF, but give up after `timeout`. The selection owner is an
 /// arbitrary external app; one that opens the transfer but never finishes
 /// writing (or never closes its write end) would otherwise block this read —
@@ -448,13 +454,15 @@ fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
             Ok(_) => match file.read(&mut chunk) {
                 Ok(0) => return Ok(buf), // EOF
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if is_retryable(&e) => continue,
                 Err(e) => {
                     return Err(GlassError::Backend(format!(
                         "clipboard get: read pipe: {e}"
                     )));
                 }
             },
+            // The poll's half of the rule `is_retryable` names for the read: a signal arrived
+            // and nothing was lost. Same judgement, different error type.
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => return Err(GlassError::Backend(format!("clipboard get: poll: {e}"))),
         }
@@ -556,17 +564,11 @@ impl ClipboardOwner {
     pub fn is_alive(&self) -> bool {
         !self.stop.load(Ordering::Relaxed)
     }
-
-    /// Signal the thread to stop and join it.
-    pub fn stop(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
 }
 
 impl Drop for ClipboardOwner {
+    /// Do not add back an inherent `stop(self)` alongside this: taking `self` by value runs the
+    /// drop glue anyway, so the two had identical bodies and emptying `stop` changed nothing.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
@@ -663,9 +665,9 @@ fn serve_loop(
     // stop flag without blocking indefinitely.
     use std::os::fd::AsFd as _;
     loop {
-        if stop.load(Ordering::Relaxed) || state.cancelled {
-            break;
-        }
+        // One stop check per iteration, after `dispatch_pending` where a `Cancelled` becomes
+        // visible. A second copy at the top made both unkillable — a mutation to either was
+        // masked by the other still breaking.
 
         // Flush any pending outgoing requests.
         if let Err(e) = conn.flush() {
@@ -734,9 +736,115 @@ fn serve_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{CLIP_READ_TIMEOUT, read_to_eof_bounded};
+    use super::{CLIP_READ_TIMEOUT, ClipboardOwner, get, is_retryable, read_to_eof_bounded};
+    use crate::testw::Launch;
     use glass_core::GlassError;
     use std::io::Write;
+
+    /// The serving thread is the clipboard — it holds the selection while it runs, and a pasting
+    /// app reads from it over a pipe. Nothing under that is fakeable, so these use a real one.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn an_owner_serves_its_text_and_reports_itself_alive() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let owner = ClipboardOwner::spawn(socket.clone(), "served".into()).expect("spawn");
+        assert!(owner.is_alive(), "a freshly spawned owner is serving");
+        assert_eq!(get(&socket).expect("get"), "served");
+    }
+
+    /// Another client taking the selection stops this thread. Reporting itself alive afterwards
+    /// makes `set_clipboard` update a thread serving nothing, and the next paste reads the other
+    /// client's text.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn an_owner_that_lost_the_selection_stops_reporting_itself_alive() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let first = ClipboardOwner::spawn(socket.clone(), "mine".into()).expect("spawn");
+        let _second = ClipboardOwner::spawn(socket.clone(), "theirs".into()).expect("spawn");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while first.is_alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !first.is_alive(),
+            "an owner the compositor cancelled is not still serving"
+        );
+        assert_eq!(get(&socket).expect("get"), "theirs");
+    }
+
+    /// Updating in place is what lets a second write reuse the thread. If `set_text` did nothing
+    /// the old value would keep being served, with nothing to say it had gone stale.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn updating_an_owners_text_changes_what_a_paste_reads() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let owner = ClipboardOwner::spawn(socket.clone(), "before".into()).expect("spawn");
+        assert_eq!(get(&socket).expect("get"), "before");
+        owner.set_text("after");
+        assert_eq!(get(&socket).expect("get"), "after");
+    }
+
+    /// Dropping an owner has to *return*. `Drop` joins the serving thread, so a loop that stops
+    /// noticing the stop flag does not fail a test — it wedges it, and takes teardown with it.
+    /// Bounded from another thread, because a blocking drop cannot time itself.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn dropping_an_owner_does_not_block() {
+        let s = Launch::new().start();
+        let owner = ClipboardOwner::spawn(s.wayland_socket(), "held".into()).expect("spawn");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(owner);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("dropping an owner must stop its thread, not wait on it forever");
+    }
+
+    /// Dropping gives up the selection. A thread that kept running would keep answering pastes
+    /// after glass believed the clipboard was released — and would still be holding the wayland
+    /// socket when the session tore down around it.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn dropping_an_owner_gives_up_the_selection() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let owner = ClipboardOwner::spawn(socket.clone(), "transient".into()).expect("spawn");
+        assert_eq!(get(&socket).expect("get"), "transient");
+        drop(owner);
+        assert_eq!(get(&socket).expect("get"), "");
+    }
+
+    /// A compositor that is gone cannot be served. Reporting success would leave the caller
+    /// believing the clipboard holds text no app can ever read.
+    #[test]
+    fn an_owner_cannot_be_spawned_against_a_socket_that_is_not_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = match ClipboardOwner::spawn(dir.path().join("wayland-9"), "text".into()) {
+            Ok(_) => panic!("a socket with no compositor behind it must not read as served"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, GlassError::Backend(_)), "{err}");
+    }
+
+    /// A signal arriving mid-read costs nothing and the read resumes. Every other failure is a
+    /// failure: retrying one spins out the deadline and reports a timeout, which sends the reader
+    /// looking for a slow app instead of at the error that actually happened.
+    #[test]
+    fn only_an_interrupted_read_is_retried() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_retryable(&Error::from(ErrorKind::Interrupted)));
+        for other in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::PermissionDenied,
+            ErrorKind::WouldBlock,
+        ] {
+            assert!(!is_retryable(&Error::from(other)), "{other:?}");
+        }
+    }
     use std::time::Duration;
 
     #[test]

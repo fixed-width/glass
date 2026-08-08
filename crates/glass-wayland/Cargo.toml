@@ -36,6 +36,9 @@ rustix.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 criterion = { workspace = true }
+# xdg-shell, for the native-Wayland fixture app the unit tests launch (src/testw.rs). Already in
+# the tree as wayland-protocols-wlr's own dependency, so this builds nothing new.
+wayland-protocols = { version = "0.32", features = ["client"] }
 
 [[bench]]
 name = "pixels"

@@ -121,6 +121,36 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
     )
 }
 
+/// Ask the kernel to signal the compositor if the *thread* that launched it dies — this crate's
+/// own unit tests only.
+///
+/// `cargo mutants` SIGKILLs the test process when a mutant exceeds its timeout, so a mutation
+/// that removes a bound hangs the run holding live sessions and orphans every compositor in
+/// flight. Each holds an X display number, and wlroots searches only a bounded range for a free
+/// one — leak enough and no session can start Xwayland, after which mutants are graded on that.
+///
+/// Not production, and not for the tempting reason: `PR_SET_PDEATHSIG` is thread-scoped, but
+/// glass-mcp already runs every tool body on one long-lived thread for exactly that
+/// (`glass-mcp/src/server.rs`). It is out because this crate is a library and its caller's
+/// threading is not its to assume.
+///
+/// TERM rather than KILL, so sway still removes its sockets and reaps its Xwayland and client.
+#[cfg(test)]
+fn die_with_launcher(cmd: &mut Command) {
+    // SAFETY: the closure runs in the forked child before exec. `prctl` is a bare syscall — it
+    // allocates nothing and takes no lock, so it is safe in that window.
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(|| {
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))
+                .map_err(std::io::Error::from)
+        });
+    }
+}
+
+#[cfg(not(test))]
+fn die_with_launcher(_: &mut Command) {}
+
 /// Single-quote a string for a `/bin/sh` command line (escape embedded quotes).
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -142,6 +172,7 @@ pub fn build_sway_command(
     // it spawns (Xwayland + the exec'd app) can be torn down as a group on stop;
     // a bare SIGKILL of just the sway pid would orphan those children.
     cmd.process_group(0);
+    die_with_launcher(&mut cmd);
     cmd.arg("--unsupported-gpu");
     cmd.arg("-c").arg(config);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);

@@ -14,6 +14,10 @@ pub mod keyboard;
 pub mod pixels;
 pub mod platform;
 pub mod swayipc;
+// A separate file, declared `#[cfg(test)]`: cargo-mutants stops at an excluded `mod` before it
+// records the external file, so the harness itself never gets mutated.
+#[cfg(test)]
+mod testw;
 pub mod xwayland;
 
 pub use platform::WaylandPlatform;

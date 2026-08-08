@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
 use wayland_client::protocol::{wl_buffer, wl_output, wl_seat, wl_shm};
-use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{
@@ -106,9 +106,7 @@ impl WaylandPlatform {
     /// not a display client would be left running.
     fn kill_session(&mut self) {
         // Tear down the clipboard owner thread before the wayland socket disappears.
-        if let Some(owner) = self.clipboard_owner.take() {
-            owner.stop();
-        }
+        drop(self.clipboard_owner.take());
         if let Some(mut s) = self.active.take() {
             // Snapshot the launch (sway, Xwayland, the app and anything it forked) before any of
             // it exits: once sway is reaped its descendants are reparented to init and can no
@@ -131,6 +129,15 @@ impl WaylandPlatform {
             glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
         }
         self.dbus = None;
+    }
+}
+
+#[cfg(test)]
+impl WaylandPlatform {
+    /// The active session's private runtime dir — where sway put both its wayland socket and its
+    /// IPC socket. Lets a test observe the session over a connection this backend does not own.
+    pub(crate) fn session_runtime_dir(&self) -> Option<&Path> {
+        self.active.as_ref()?.socket_path.parent()
     }
 }
 
@@ -213,20 +220,15 @@ impl Drop for WaylandPlatform {
 /// data dir (where the build tool installs the bundle) → next to this executable.
 /// No silent fallback — a clear error if none qualifies.
 pub(crate) fn resolve_sway() -> Result<PathBuf> {
-    // Explicit override wins and is trusted (skips the PATH version gate). Fail closed if it
-    // is not an executable file rather than silently falling back to discovery.
-    if let Some(p) = std::env::var_os("GLASS_SWAY").filter(|s| !s.is_empty()) {
-        let p = PathBuf::from(p);
-        return if p.is_file() {
-            Ok(p)
-        } else {
-            Err(GlassError::Backend(format!(
-                "GLASS_SWAY={} is not an executable file",
-                p.display()
-            )))
-        };
+    if let Some(overridden) = sway_override(std::env::var_os("GLASS_SWAY")) {
+        return overridden;
     }
-    if let Some(p) = sway_on_path_if_recent() {
+    // Inlined rather than wrapped: a `fn` that only splits PATH and delegates has a
+    // constant-return mutation nothing can kill on a host where the true answer is that constant
+    // — here, any machine with no sway on PATH.
+    if let Some(p) =
+        std::env::var_os("PATH").and_then(|path| sway_in_dirs(std::env::split_paths(&path)))
+    {
         return Ok(p);
     }
     let data = std::env::var_os("XDG_DATA_HOME")
@@ -253,10 +255,28 @@ pub(crate) fn resolve_sway() -> Result<PathBuf> {
     ))
 }
 
-/// The first `sway` on `PATH`, but only if `sway --version` reports >= 1.12.
-fn sway_on_path_if_recent() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+/// What `GLASS_SWAY` decides, or `None` when it is unset or empty and discovery should run.
+///
+/// An override skips the version gate, and fails closed when it names something that is not a
+/// file — falling back to discovery would chase a version-specific bug in a different binary.
+fn sway_override(value: Option<std::ffi::OsString>) -> Option<Result<PathBuf>> {
+    let p = PathBuf::from(value.filter(|s| !s.is_empty())?);
+    Some(if p.is_file() {
+        Ok(p)
+    } else {
+        Err(GlassError::Backend(format!(
+            "GLASS_SWAY={} is not an executable file",
+            p.display()
+        )))
+    })
+}
+
+/// The first `sway` in `dirs` whose `--version` reports >= 1.12.
+///
+/// A too-old one is not skipped in favour of a later directory: `PATH` order is the user's own
+/// precedence, and walking past it is the substitution [`sway_override`] refuses.
+fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+    for dir in dirs {
         let cand = dir.join("sway");
         if !cand.is_file() {
             continue;
@@ -300,7 +320,7 @@ fn nudge_x(axx: u32, w: u32) -> u32 {
 
 /// Find sway's `wayland-N` socket in the private runtime dir (sway uses
 /// `wayland-1`, not cage's `wayland-0`). Ignores `wayland-N.lock` and `sway-ipc.*`.
-fn find_wayland_socket(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_wayland_socket(dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
         let name = e.file_name();
         let n = name.to_string_lossy();
@@ -533,9 +553,11 @@ fn open_session(
         buffer_done: false,
         capture_done: None,
     };
+    // v3 exactly, not 1..=3: capture waits for `buffer_done`, which only v3 sends. The v1/v2
+    // branch that waited differently was unreachable — glass only talks to the sway it launched.
     let manager: ZwlrScreencopyManagerV1 = globals
-        .bind(&qh, 1..=3, ())
-        .map_err(|e| GlassError::Backend(format!("bind screencopy: {e}")))?;
+        .bind(&qh, 3..=3, ())
+        .map_err(|e| GlassError::Backend(format!("bind screencopy v3: {e}")))?;
     let seat: wl_seat::WlSeat = globals
         .bind(&qh, 1..=8, ())
         .map_err(|e| GlassError::Backend(format!("bind seat: {e}")))?;
@@ -787,16 +809,43 @@ fn tap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, kc: u32) -> Result<()> 
     Ok(())
 }
 
+/// Fail closed: a launch that asked for a sandbox errors rather than running unconfined.
+///
+/// `probe` is a thunk, not a value: Rust evaluates arguments before the call, so passing
+/// `availability()` would fork `bwrap --unshare-user` even for `sandbox:"off"` — the setting that
+/// exists for hosts where bubblewrap does not work. glass-x11 keeps its own copy so both stay in
+/// the mutation gate's `--package` list.
+fn ensure_sandbox_available(
+    level: glass_core::SandboxLevel,
+    probe: impl FnOnce() -> glass_sandbox_linux::Availability,
+) -> Result<()> {
+    if level == glass_core::SandboxLevel::Off {
+        return Ok(());
+    }
+    match probe() {
+        glass_sandbox_linux::Availability::Ok => Ok(()),
+        glass_sandbox_linux::Availability::Unavailable(why) => {
+            Err(GlassError::SandboxUnavailable(format!(
+                "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
+                 sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
+            )))
+        }
+    }
+}
+
 /// XKB real-modifier mask for a chord's modifiers (standard `include "complete"`
 /// order: Shift, Lock, Control, Mod1=Alt, ..., Mod4=Super).
+///
+/// Shift-free on purpose: `1 << 0` and `1 >> 0` are the same number, so Shift's bit as a shift
+/// was a place the code could change with nothing able to notice.
 fn modifier_mask(mods: &[glass_core::keys::Modifier]) -> u32 {
     use glass_core::keys::Modifier;
     mods.iter().fold(0, |m, x| {
         m | match x {
-            Modifier::Shift => 1 << 0,
-            Modifier::Control => 1 << 2,
-            Modifier::Alt => 1 << 3,
-            Modifier::Super => 1 << 6,
+            Modifier::Shift => 0b1,
+            Modifier::Control => 0b100,
+            Modifier::Alt => 0b1000,
+            Modifier::Super => 0b100_0000,
         }
     })
 }
@@ -975,10 +1024,9 @@ impl WaylandScrollSink<'_> {
 }
 
 impl glass_core::ScrollSink for WaylandScrollSink<'_> {
+    /// No `mask == 0` guard, unlike the drag sink: `glass_core::run_scroll` returns `wheel()`
+    /// directly when there are no modifiers, and every `Modifier` is a non-zero bit.
     fn modifiers(&mut self, down: bool) -> Result<()> {
-        if self.mask == 0 {
-            return Ok(());
-        }
         let kb = self.s.keyboard.clone();
         if down {
             upload_keymap(&mut *self.s, &kb, &crate::keyboard::build_keymap(&[]))?;
@@ -1020,17 +1068,7 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
 
 impl Platform for WaylandPlatform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        // Fail-closed: if a sandbox was requested but bwrap is unavailable, error
-        // immediately rather than launching unconfined.
-        if spec.sandbox != glass_core::SandboxLevel::Off
-            && let glass_sandbox_linux::Availability::Unavailable(why) =
-                glass_sandbox_linux::availability()
-        {
-            return Err(GlassError::SandboxUnavailable(format!(
-                "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
-                     sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
-            )));
-        }
+        ensure_sandbox_available(spec.sandbox, glass_sandbox_linux::availability)?;
 
         // Run the build step (if any) before the compositor starts. The build is
         // sandboxed (bwrap) when sandbox != Off — same semantics as the X11 backend.
@@ -1148,22 +1186,15 @@ impl Platform for WaylandPlatform {
 
         let deadline = Instant::now() + Duration::from_millis(5000);
 
-        // Phase 1: dispatch until the compositor has advertised its buffer formats, then pick
-        // one we can convert (preferring 32-bit). v3 marks the end of the format list with
-        // `buffer_done`; v1/v2 advertise a single format and never send it, so there we proceed
-        // as soon as one arrives.
-        let manager_v3 = session.manager.version() >= 3;
+        // Phase 1: dispatch until the compositor has advertised its buffer formats, then pick one
+        // we can convert (preferring 32-bit). `buffer_done` marks the end of the list — a v3
+        // event, which is why the manager is bound at v3 exactly.
         let (format, w, h, stride) = loop {
             session
                 .queue
                 .blocking_dispatch(&mut session.state)
                 .map_err(|e| GlassError::CaptureFailed(format!("dispatch: {e}")))?;
-            let advertised = if manager_v3 {
-                session.state.buffer_done
-            } else {
-                !session.state.shm_buffers.is_empty()
-            };
-            if advertised {
+            if session.state.buffer_done {
                 break crate::pixels::pick_shm_format(&session.state.shm_buffers).ok_or_else(
                     || GlassError::CaptureFailed("screencopy: no shm format advertised".into()),
                 )?;
@@ -1488,6 +1519,993 @@ impl Platform for WaylandPlatform {
 
     fn a11y_bus_addr(&self) -> Option<String> {
         self.dbus.as_ref().map(|b| b.a11y_bus_address().to_string())
+    }
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+
+    fn win(identifier: &str, x11: Option<u32>) -> SwayWindow {
+        SwayWindow {
+            con_id: 1,
+            title: None,
+            class: None,
+            rect: crate::swayipc::Rect {
+                x: 1,
+                y: 2,
+                width: 30,
+                height: 40,
+            },
+            focused: false,
+            identifier: identifier.into(),
+            x11_window: x11,
+        }
+    }
+
+    /// A native Wayland view must be absent rather than carry a placeholder id, which could
+    /// collide with a real X window in the cross-check.
+    #[test]
+    fn only_xwayland_views_contribute_an_x11_id() {
+        let wins = [win("a", Some(0x40_0001)), win("b", None), win("c", Some(7))];
+        assert_eq!(x11_ids(&wins), vec![0x40_0001, 7]);
+        assert!(x11_ids(&[win("native", None)]).is_empty());
+    }
+
+    /// Teardown waits on the app's own processes. Waiting on the compositor as well would mean
+    /// waiting for something that only exits after glass reaps it.
+    #[test]
+    fn the_apps_processes_are_the_tree_without_the_compositor() {
+        let me = std::process::id();
+        // 1 is init, which is neither this process nor an Xwayland — a stand-in for the app.
+        assert_eq!(app_pids(&[me, 1], me), vec![1]);
+        assert!(
+            app_pids(&[me], me).is_empty(),
+            "a tree holding only the compositor has no app to wait on"
+        );
+    }
+
+    #[test]
+    fn a_sway_rect_becomes_window_geometry() {
+        let g = rect_to_geom(&crate::swayipc::Rect {
+            x: 12,
+            y: 34,
+            width: 300,
+            height: 200,
+        });
+        assert_eq!((g.x, g.y, g.width, g.height), (12, 34, 300, 200));
+    }
+
+    /// sway reports an i32 rect. A negative extent is not a window one pixel wide the wrong way
+    /// round; it clamps to nothing.
+    #[test]
+    fn a_negative_extent_clamps_to_zero() {
+        let g = rect_to_geom(&crate::swayipc::Rect {
+            x: -5,
+            y: -6,
+            width: -1,
+            height: -2,
+        });
+        assert_eq!((g.x, g.y, g.width, g.height), (-5, -6, 0, 0));
+    }
+
+    /// Ids are minted once per toplevel and handed back on every later sighting: a caller that
+    /// selected a window by id must still reach the same window after the next enumeration.
+    #[test]
+    fn a_window_id_is_minted_once_and_reused() {
+        let mut ids = HashMap::new();
+        let mut next = 0u64;
+        let first = mint_id(&mut ids, &mut next, "ftid-a");
+        let second = mint_id(&mut ids, &mut next, "ftid-b");
+        assert_ne!(first, second, "different toplevels get different ids");
+        assert_eq!(mint_id(&mut ids, &mut next, "ftid-a"), first, "stable");
+        assert_eq!(next, 2, "re-fetching must not consume an id");
+    }
+
+    /// A directory holding a `sway` that answers `--version` with `reply`.
+    fn fake_sway(reply: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("sway");
+        std::fs::write(&bin, format!("#!/bin/sh\necho '{reply}'\n")).expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        dir
+    }
+
+    #[test]
+    fn a_recent_sway_on_the_path_is_used() {
+        let dir = fake_sway("sway version 1.12-abc (Jun 3 2026)");
+        assert_eq!(
+            sway_in_dirs([dir.path().to_path_buf()].into_iter()),
+            Some(dir.path().join("sway"))
+        );
+    }
+
+    /// Too old, or a version this cannot read, means fall through to the bundle — glass drives
+    /// sway through IPC and protocol surface it only has from 1.12.
+    #[test]
+    fn an_old_or_unreadable_sway_on_the_path_is_not_used() {
+        for reply in ["sway version 1.9", "sway version 1.11-x", "wat"] {
+            let dir = fake_sway(reply);
+            assert_eq!(
+                sway_in_dirs([dir.path().to_path_buf()].into_iter()),
+                None,
+                "{reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_with_no_sway_on_it_finds_nothing() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(sway_in_dirs([empty.path().to_path_buf()].into_iter()), None);
+    }
+
+    /// An unset or empty override is not a choice; discovery runs.
+    #[test]
+    fn no_override_leaves_discovery_to_run() {
+        assert!(sway_override(None).is_none());
+        assert!(sway_override(Some(std::ffi::OsString::new())).is_none());
+    }
+
+    #[test]
+    fn an_override_naming_a_real_file_is_trusted_without_a_version_check() {
+        // Deliberately not a sway: an explicit path skips the version gate.
+        let dir = fake_sway("wat");
+        let bin = dir.path().join("sway");
+        let chosen = sway_override(Some(bin.clone().into_os_string()))
+            .expect("a choice was made")
+            .expect("a real file is trusted");
+        assert_eq!(chosen, bin);
+    }
+
+    /// Fail closed. Falling back to discovery would run a different sway than the one named,
+    /// which is how a version-specific bug gets chased in the wrong binary.
+    #[test]
+    fn an_override_naming_nothing_is_an_error_not_a_fallback() {
+        let err = sway_override(Some("/nonexistent/sway".into()))
+            .expect("a choice was made")
+            .expect_err("a named path that is not there must not fall back");
+        assert!(err.to_string().contains("/nonexistent/sway"), "{err}");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn discovery_finds_a_real_sway_on_this_machine() {
+        let found = resolve_sway().expect("a discoverable sway");
+        assert!(found.is_file(), "{}", found.display());
+    }
+
+    /// A probe that panics is the only way to assert something is *not* called. Note this drives
+    /// the helper, not `start_app`'s call site, which is where an eager argument would bite.
+    #[test]
+    fn a_launch_with_the_sandbox_off_never_probes_for_bubblewrap() {
+        ensure_sandbox_available(glass_core::SandboxLevel::Off, || {
+            panic!("sandbox:\"off\" must not fork bwrap")
+        })
+        .expect("an unconfined launch is always allowed");
+    }
+
+    #[test]
+    fn a_sandboxed_launch_is_refused_when_bubblewrap_is_unavailable() {
+        let err = ensure_sandbox_available(glass_core::SandboxLevel::Default, || {
+            glass_sandbox_linux::Availability::Unavailable("no bwrap here".into())
+        })
+        .expect_err("fail closed rather than launching unconfined");
+        assert!(matches!(err, GlassError::SandboxUnavailable(_)), "{err}");
+        assert!(err.to_string().contains("no bwrap here"), "{err}");
+        assert!(err.to_string().contains("sandbox:\"off\""), "{err}");
+    }
+
+    #[test]
+    fn a_sandboxed_launch_proceeds_when_bubblewrap_is_available() {
+        ensure_sandbox_available(glass_core::SandboxLevel::Default, || {
+            glass_sandbox_linux::Availability::Ok
+        })
+        .expect("an available sandbox allows the launch");
+    }
+
+    /// sway's own socket sits in the same directory as its IPC socket and the lock file.
+    #[test]
+    fn the_wayland_socket_is_picked_out_of_the_runtime_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for decoy in ["wayland-1.lock", "sway-ipc.1000.9.sock", "wayland-"] {
+            std::fs::write(dir.path().join(decoy), b"").expect("decoy");
+        }
+        let real = dir.path().join("wayland-1");
+        std::fs::write(&real, b"").expect("socket");
+        assert_eq!(find_wayland_socket(dir.path()), Some(real));
+    }
+
+    #[test]
+    fn a_runtime_dir_with_no_wayland_socket_finds_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sway-ipc.1000.9.sock"), b"").expect("decoy");
+        assert_eq!(find_wayland_socket(dir.path()), None);
+    }
+
+    /// The XKB real-modifier bits, in the order `include "complete"` assigns them.
+    #[test]
+    fn each_modifier_is_its_own_xkb_bit() {
+        use glass_core::keys::Modifier;
+        assert_eq!(modifier_mask(&[]), 0);
+        assert_eq!(modifier_mask(&[Modifier::Shift]), 0b1);
+        assert_eq!(modifier_mask(&[Modifier::Control]), 0b100);
+        assert_eq!(modifier_mask(&[Modifier::Alt]), 0b1000);
+        assert_eq!(modifier_mask(&[Modifier::Super]), 0b100_0000);
+        assert_eq!(
+            modifier_mask(&[Modifier::Shift, Modifier::Control, Modifier::Super]),
+            0b100_0101,
+            "a chord's modifiers are the union of their bits"
+        );
+        // A repeat discriminates a union from an exclusive-or, which agree on every set of
+        // distinct modifiers and so on every other case here.
+        assert_eq!(
+            modifier_mask(&[Modifier::Shift, Modifier::Shift]),
+            0b1,
+            "naming a modifier twice still holds it down"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    //! The backend against a real compositor. Every method below talks to sway or to the wayland
+    //! connection, so there is nothing underneath them to fake; [`crate::testw`] launches a
+    //! private session and observes it over a connection the backend does not own.
+    use super::*;
+    use crate::testw::{Launch, READY_LINE};
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_launch_reports_the_window_the_app_actually_mapped() {
+        let mut s = Launch::new().windows(&["solo:solo:300x200"]).start();
+        let geo = s.platform().window(&WindowOp::Geometry).expect("geometry");
+        let wins = s.windows();
+        assert_eq!(wins.len(), 1);
+        let rect = &wins[0].rect;
+        assert_eq!(
+            (geo.width, geo.height),
+            (rect.width as u32, rect.height as u32),
+            "the session contract must match what sway reports"
+        );
+        assert_eq!((geo.width, geo.height), (300, 200));
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn enumeration_reports_every_window_with_a_stable_id() {
+        let mut s = Launch::new()
+            .windows(&["one:app-one:200x100", "two:app-two:150x120"])
+            .start();
+        s.until("both windows to map", |s| s.windows().len() == 2);
+        let first = s.platform().list_windows().expect("list");
+        assert_eq!(first.len(), 2);
+        let titles: Vec<&str> = first.iter().filter_map(|w| w.title.as_deref()).collect();
+        assert!(
+            titles.contains(&"one") && titles.contains(&"two"),
+            "{titles:?}"
+        );
+        assert_eq!(
+            first.iter().filter(|w| w.active).count(),
+            1,
+            "exactly one window is focused"
+        );
+        let again = s.platform().list_windows().expect("list again");
+        let ids = |ws: &[WindowInfo]| {
+            let mut v: Vec<(u64, Option<String>)> =
+                ws.iter().map(|w| (w.id.0, w.title.clone())).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids(&first), ids(&again), "ids must survive re-enumeration");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn selecting_a_window_focuses_it_and_reports_its_geometry() {
+        let mut s = Launch::new()
+            .windows(&["one:app-one:200x100", "two:app-two:150x120"])
+            .start();
+        s.until("both windows to map", |s| s.windows().len() == 2);
+        let wins = s.platform().list_windows().expect("list");
+        let target = wins
+            .iter()
+            .find(|w| !w.active)
+            .expect("one window is not focused");
+        let geo = s.platform().select_window(target.id).expect("select");
+        assert_eq!(geo, target.geometry);
+        assert_eq!(
+            s.focused_title().as_deref(),
+            target.title.as_deref(),
+            "the compositor must actually have moved focus"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn selecting_a_window_that_is_not_there_reports_it_not_found() {
+        let mut s = Launch::new().start();
+        let err = s
+            .platform()
+            .select_window(WindowId(4242))
+            .expect_err("no such window");
+        assert!(matches!(err, GlassError::WindowNotFound), "{err}");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn moving_and_resizing_change_what_the_compositor_reports() {
+        let mut s = Launch::new().start();
+        let resized = s
+            .platform()
+            .window(&WindowOp::Resize {
+                width: 260,
+                height: 180,
+            })
+            .expect("resize");
+        assert_eq!((resized.width, resized.height), (260, 180));
+        let moved = s
+            .platform()
+            .window(&WindowOp::Move { x: 40, y: 30 })
+            .expect("move");
+        assert_eq!((moved.x, moved.y), (40, 30));
+        let observed = s.windows();
+        let rect = &observed[0].rect;
+        assert_eq!(
+            (rect.x, rect.y, rect.width, rect.height),
+            (40, 30, 260, 180),
+            "the reported geometry must be the compositor's, not glass's own idea of it"
+        );
+    }
+
+    /// The sink is sway's piped stdout and stderr, which the app inherits — so both streams
+    /// arrive intermixed, and a line the app printed is the only proof the launch captured it.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn the_apps_output_reaches_the_log_sink() {
+        let mut s = Launch::new().start();
+        // `wait_for_log` is the assertion: it panics unless the line arrives.
+        s.wait_for_log(READY_LINE);
+    }
+
+    /// The a11y reader correlates an AT-SPI connection against this set, so it has to reach past
+    /// the compositor to the app: sway's pid is not the app's.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn the_process_set_reaches_past_the_compositor_to_the_app() {
+        let mut s = Launch::new().start();
+        let pids = s.platform().app_pids();
+        assert!(
+            pids.len() >= 2,
+            "the compositor alone is not the app's process set: {pids:?}"
+        );
+        assert!(pids.iter().all(|p| *p > 1), "no placeholder pids: {pids:?}");
+    }
+
+    /// No a11y bus was asked for, so there is no address to hand out. Inventing one would send
+    /// the reader at the user's own desktop bus.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_session_launched_without_accessibility_has_no_bus_address() {
+        let mut s = Launch::new().start();
+        assert_eq!(s.platform().a11y_bus_addr(), None);
+    }
+
+    /// Coordinates are window-relative at glass's boundary and the backend maps them to the
+    /// output. The app is the only witness: Wayland has no way to ask where the pointer is, so
+    /// the fixture echoes the surface-local point it was given back through its own stdout.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_pointer_move_arrives_at_the_requested_window_relative_point() {
+        let mut s = Launch::new().start_mapped();
+        s.platform()
+            .send_pointer(&PointerEvent::Move { x: 40, y: 30 })
+            .expect("move");
+        let lines = s.wait_for_log("input: ");
+        assert!(
+            lines.iter().any(|l| l.ends_with("40 30")),
+            "the app should have been pointed at its own (40, 30): {lines:#?}"
+        );
+    }
+
+    /// A window away from the output origin is the case an origin mix-up survives: with the
+    /// window at (0, 0) a window-relative and an output-absolute point are the same number.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_pointer_move_is_relative_to_a_window_that_is_not_at_the_origin() {
+        let mut s = Launch::new().start_mapped();
+        s.platform()
+            .window(&WindowOp::Move { x: 100, y: 80 })
+            .expect("move the window");
+        s.platform()
+            .send_pointer(&PointerEvent::Move { x: 25, y: 15 })
+            .expect("move the pointer");
+        let lines = s.wait_for_log("input: ");
+        assert!(
+            lines.iter().any(|l| l.ends_with("25 15")),
+            "the point must be relative to the window, not the output: {lines:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_click_presses_and_releases_the_button_over_the_window() {
+        let mut s = Launch::new().start_mapped();
+        s.platform()
+            .send_pointer(&PointerEvent::Click {
+                x: 20,
+                y: 20,
+                button: glass_core::MouseButton::Left,
+                count: 1,
+                modifiers: vec![],
+            })
+            .expect("click");
+        let lines = s.wait_for_log("input: button");
+        let buttons: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("input: button"))
+            .collect();
+        assert!(
+            buttons.iter().any(|l| l.ends_with(" 272 1")),
+            "left button pressed: {buttons:?}"
+        );
+        assert!(
+            buttons.iter().any(|l| l.ends_with(" 272 0")),
+            "and released: {buttons:?}"
+        );
+    }
+
+    /// A modified click holds the modifier across the press and releases it after, and a plain
+    /// one sends no modifier traffic at all. Both directions, because a single one cannot tell
+    /// the guard from its inverse — and an app reads ctrl+click as ctrl+click only if control is
+    /// already down when the button arrives.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_click_carries_its_modifiers_and_a_plain_one_sends_none() {
+        let mut s = Launch::new().start_mapped();
+        let click = |modifiers: Vec<glass_core::keys::Modifier>| PointerEvent::Click {
+            x: 20,
+            y: 20,
+            button: glass_core::MouseButton::Left,
+            count: 1,
+            modifiers,
+        };
+        s.platform().send_pointer(&click(vec![])).expect("plain");
+        let plain = s.wait_for_log(" 272 0");
+        assert!(
+            !plain.iter().any(|l| l.contains("input: mods")),
+            "a plain click must send no modifier traffic: {plain:#?}"
+        );
+        s.platform()
+            .send_pointer(&click(vec![glass_core::keys::Modifier::Control]))
+            .expect("modified");
+        let modified = s.wait_for_log("mods 0");
+        let at = |needle: &str| modified.iter().position(|l| l.contains(needle));
+        let (down, press, up) = (
+            at("mods 4").expect("control down"),
+            at(" 272 1").expect("pressed"),
+            at("mods 0").expect("control released"),
+        );
+        assert!(
+            down < press && press < up,
+            "control must be held across the click: {modified:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_scroll_reaches_the_window_as_an_axis_event() {
+        let mut s = Launch::new().start_mapped();
+        s.platform()
+            .send_pointer(&PointerEvent::Scroll {
+                x: 20,
+                y: 20,
+                dx: 0,
+                dy: -2,
+                modifiers: vec![],
+            })
+            .expect("scroll");
+        let lines = s.wait_for_log("input: axis");
+        let axis = lines
+            .iter()
+            .find(|l| l.contains("input: axis"))
+            .expect("a vertical wheel");
+        // `axis 0` is the vertical axis; the value is the wheel delta scaled to surface units.
+        // Asserting the number, not just that one arrived: a delta computed by adding or
+        // dividing instead of scaling still produces an axis event, just the wrong distance.
+        let value: f64 = axis
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no axis value in {axis:?}"));
+        assert!(axis.contains(" 0 "), "the vertical axis: {axis}");
+        assert!(
+            (value - -30.0).abs() < 0.01,
+            "two notches up is -30 surface units, got {value} in {axis:?}"
+        );
+        // The scroll sink keeps its own clock, and a compositor drops an event whose time did
+        // not move — so a stuck clock here loses the wheel, not just its ordering.
+        let times = crate::testw::event_times(&lines);
+        assert!(
+            times.last() > times.first(),
+            "the clock must advance across the scroll: {times:?}"
+        );
+    }
+
+    /// Once another client takes the selection this owner's thread is done, and a second write
+    /// has to start a fresh one. Updating the dead thread's text instead leaves the other
+    /// client's value on the clipboard while glass reports the write as done.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn writing_the_clipboard_after_losing_it_starts_a_new_owner() {
+        let mut s = Launch::new().start();
+        s.platform().set_clipboard("ours").expect("set");
+        assert_eq!(s.platform().get_clipboard().expect("get"), "ours");
+        // A second client takes the selection out from under the backend's owner.
+        let socket = s.wayland_socket();
+        let thief =
+            crate::clipboard::ClipboardOwner::spawn(socket, "theirs".into()).expect("spawn");
+        s.until("the backend's owner to be cancelled", |s| {
+            s.platform().get_clipboard().expect("get") == "theirs"
+        });
+        s.platform().set_clipboard("ours again").expect("re-set");
+        assert_eq!(
+            s.platform().get_clipboard().expect("get"),
+            "ours again",
+            "a write after losing the selection must take it back"
+        );
+        drop(thief);
+    }
+
+    /// The compositor drops a pointer event whose timestamp did not move, so the session clock
+    /// has to advance per event. A stuck clock looks like nothing at all from the outside — the
+    /// events are sent, and simply do not arrive.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn the_event_clock_advances_across_a_drag() {
+        let mut s = Launch::new().start_mapped();
+        s.platform()
+            .send_pointer(&PointerEvent::Drag {
+                from_x: 20,
+                from_y: 20,
+                to_x: 80,
+                to_y: 60,
+                button: glass_core::MouseButton::Left,
+                modifiers: vec![],
+                duration_ms: 40,
+            })
+            .expect("drag");
+        let lines = s.wait_for_log("input: button t");
+        let times = crate::testw::event_times(&lines);
+        assert!(times.len() >= 3, "several events: {lines:#?}");
+        assert!(
+            times.windows(2).all(|w| w[1] >= w[0]),
+            "the clock must never go backwards: {times:?}"
+        );
+        assert!(
+            times.last() > times.first(),
+            "and must actually advance: {times:?}"
+        );
+    }
+
+    /// A launch that runs out of attempts reaps the private bus it brought up. Leaving it running
+    /// leaks a dbus-daemon per failed launch, and leaves `a11y_bus_addr` handing out the address
+    /// of a session that no longer exists.
+    ///
+    /// Not a test of the retry guard, though it looks like one: the bus is reaped whether or not
+    /// the last attempt takes the retry arm, so relaxing that guard leaves this passing.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_launch_that_runs_out_of_attempts_reaps_its_private_bus() {
+        let mut platform = WaylandPlatform::new().expect("sway");
+        let spec = Launch::new()
+            .windows(&[])
+            .with_a11y()
+            .timeout_ms(700)
+            .spec();
+        platform
+            .start_app(&spec)
+            .expect_err("an app with no window cannot start");
+        assert_eq!(
+            platform.a11y_bus_addr(),
+            None,
+            "the private bus outlived the launch that started it"
+        );
+    }
+
+    /// A launch that asked for accessibility gets a private bus, and its address is what the
+    /// reader connects to. Answering `None` sends the reader at the user's own desktop bus.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_session_launched_with_accessibility_hands_out_its_private_bus() {
+        let mut s = Launch::new().with_a11y().start();
+        let addr = s
+            .platform()
+            .a11y_bus_addr()
+            .expect("an a11y launch has a bus");
+        assert!(addr.contains("unix:"), "{addr}");
+        assert_ne!(
+            Some(addr.as_str()),
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(),
+            "the session's own bus, not the developer's"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_gesture_is_refused_by_this_backend() {
+        let mut s = Launch::new().start();
+        let err = s
+            .platform()
+            .send_pointer(&PointerEvent::Gesture {
+                pointers: vec![],
+                duration_ms: 10,
+            })
+            .expect_err("no multi-touch on a desktop compositor");
+        assert!(err.to_string().contains("multi_touch"), "{err}");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn typed_text_reaches_the_window_as_key_events() {
+        let mut s = Launch::new().start_mapped();
+        s.platform()
+            .send_key(&KeyEvent::Text("hi".into()))
+            .expect("type");
+        let lines = s.wait_for_log("input: key");
+        let presses = lines.iter().filter(|l| l.ends_with(" 1")).count();
+        assert!(presses >= 2, "one press per character: {lines:#?}");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_chord_holds_its_modifier_across_the_key() {
+        let mut s = Launch::new().start_mapped();
+        s.platform()
+            .send_key(&KeyEvent::Chord("ctrl+a".into()))
+            .expect("chord");
+        // An app reads ctrl+a as ctrl+a only if control is already down when the key arrives, so
+        // the ordering is the claim: down, key, released.
+        let lines = s.wait_for_log("input: mods 0");
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle:?} in {lines:#?}"))
+        };
+        let (down, key, up) = (at("input: mods 4"), at("input: key"), at("input: mods 0"));
+        assert!(
+            down < key && key < up,
+            "control must be held before the key and released after it: {lines:#?}"
+        );
+    }
+
+    /// The fixture fills its surface with one known colour, so this checks pixels rather than
+    /// only dimensions.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_capture_reads_the_active_windows_own_pixels() {
+        let mut s = Launch::new().windows(&["cap:cap:200x160"]).start_mapped();
+        let frame = s.platform().capture_frame(None).expect("capture");
+        assert_eq!((frame.width, frame.height), (200, 160));
+        let px = &frame.pixels[..4];
+        assert_eq!(
+            (px[0], px[1], px[2]),
+            crate::testw::window_fill_rgb(0),
+            "the window's own fill colour, not the compositor's background"
+        );
+        assert_eq!(px[3], 255, "opaque");
+    }
+
+    /// A refused capture must surface as an error: a caller cannot tell a blank frame from a
+    /// black window.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_capture_the_compositor_refuses_is_reported_as_a_failure() {
+        let mut s = Launch::new().start_mapped();
+        // Far outside the 1280x800 output, so there is nothing for screencopy to copy.
+        let err = s
+            .platform()
+            .capture_frame(Some(&Region {
+                x: 100_000,
+                y: 100_000,
+                width: 64,
+                height: 64,
+            }))
+            .expect_err("a region off the output cannot be captured");
+        // The message, not the variant: without the `Failed` arm this reports a timeout, which is
+        // the same `CaptureFailed` and a different fault.
+        assert!(
+            err.to_string().contains("screencopy failed"),
+            "the refusal should be reported as one, not as a timeout: {err}"
+        );
+    }
+
+    /// A region is window-relative too, and it is cropped at the source: the compositor is asked
+    /// for exactly that rectangle of the output.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_capture_region_is_relative_to_the_window() {
+        let mut s = Launch::new().windows(&["cap:cap:200x160"]).start_mapped();
+        s.platform()
+            .window(&WindowOp::Move { x: 60, y: 40 })
+            .expect("move");
+        let frame = s
+            .platform()
+            .capture_frame(Some(&Region {
+                x: 10,
+                y: 10,
+                width: 50,
+                height: 40,
+            }))
+            .expect("capture");
+        assert_eq!((frame.width, frame.height), (50, 40));
+        let px = &frame.pixels[..4];
+        assert_eq!(
+            (px[0], px[1], px[2]),
+            crate::testw::window_fill_rgb(0),
+            "10px into a moved window is still inside it"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn the_clipboard_round_trips_through_the_compositor() {
+        let mut s = Launch::new().start();
+        s.platform().set_clipboard("glass wayland").expect("set");
+        assert_eq!(s.platform().get_clipboard().expect("get"), "glass wayland");
+    }
+
+    /// A re-set that started a second owner without stopping the first would race it for the
+    /// selection.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn writing_the_clipboard_twice_leaves_the_second_value() {
+        let mut s = Launch::new().start();
+        s.platform().set_clipboard("first").expect("set");
+        s.platform().set_clipboard("second").expect("re-set");
+        assert_eq!(s.platform().get_clipboard().expect("get"), "second");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_session_with_nothing_on_the_clipboard_reads_empty() {
+        let mut s = Launch::new().start();
+        assert_eq!(s.platform().get_clipboard().expect("get"), "");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_drag_presses_moves_and_releases_over_the_window() {
+        let mut s = Launch::new().start_mapped();
+        s.platform()
+            .send_pointer(&PointerEvent::Drag {
+                from_x: 20,
+                from_y: 20,
+                to_x: 90,
+                to_y: 70,
+                button: glass_core::MouseButton::Left,
+                modifiers: vec![],
+                duration_ms: 40,
+            })
+            .expect("drag");
+        let lines = s.wait_for_log("272 0");
+        let order: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("input: button") || l.contains("input: motion"))
+            .collect();
+        let down = order
+            .iter()
+            .position(|l| l.contains("272 1"))
+            .unwrap_or_else(|| panic!("no press in {order:#?}"));
+        let up = order
+            .iter()
+            .position(|l| l.contains("272 0"))
+            .unwrap_or_else(|| panic!("no release in {order:#?}"));
+        assert!(down < up, "pressed before released: {order:?}");
+        assert!(
+            order[down..up].iter().any(|l| l.contains("motion")),
+            "the pointer must move while the button is held: {order:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.ends_with("90 70")),
+            "and end where it was asked to: {lines:#?}"
+        );
+    }
+
+    /// `glass_core::run_drag` calls `modifiers()` on every drag, so unlike the scroll sink the
+    /// drag sink's `mask == 0` guard is live. Inverting it makes a *modified* drag skip its
+    /// modifiers, which is what this catches.
+    ///
+    /// The other direction — a plain drag sending no modifier traffic — is not asserted and
+    /// cannot be. The compositor emits an unsolicited `modifiers` event when the window takes
+    /// keyboard focus, indistinguishable from one the sink sent, and whether it lands before or
+    /// after the ready line depends on how fast the machine is.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_modified_drag_carries_its_modifiers() {
+        let mut s = Launch::new().start_mapped();
+        let drag = |modifiers: Vec<glass_core::keys::Modifier>| PointerEvent::Drag {
+            from_x: 20,
+            from_y: 20,
+            to_x: 70,
+            to_y: 50,
+            button: glass_core::MouseButton::Left,
+            modifiers,
+            duration_ms: 30,
+        };
+        s.platform()
+            .send_pointer(&drag(vec![glass_core::keys::Modifier::Control]))
+            .expect("modified drag");
+        let modified = s.wait_for_log("mods 0");
+        assert!(
+            modified.iter().any(|l| l.ends_with("mods 4")),
+            "control down for a ctrl-drag: {modified:#?}"
+        );
+    }
+
+    /// The horizontal axis, which every other scroll test leaves at zero — a separate branch with
+    /// its own scale.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_horizontal_scroll_reaches_the_window_on_the_other_axis() {
+        let mut s = Launch::new().start_mapped();
+        s.platform()
+            .send_pointer(&PointerEvent::Scroll {
+                x: 20,
+                y: 20,
+                dx: 3,
+                dy: 0,
+                modifiers: vec![],
+            })
+            .expect("scroll");
+        let lines = s.wait_for_log("input: axis");
+        let axis = lines
+            .iter()
+            .find(|l| l.contains("input: axis"))
+            .expect("an axis event");
+        assert!(axis.contains(" 1 "), "the horizontal axis: {axis}");
+        let value: f64 = axis
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no axis value in {axis:?}"));
+        assert!(
+            (value - 45.0).abs() < 0.01,
+            "three notches right is 45 surface units, got {value} in {axis:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("input: axis 0 ")),
+            "a purely horizontal scroll must not emit a vertical axis: {lines:#?}"
+        );
+    }
+
+    /// An app reads ctrl+scroll as zoom only if control is down when the axis arrives.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_modified_scroll_holds_the_modifier_and_releases_it() {
+        let mut s = Launch::new().start_mapped();
+        s.platform()
+            .send_pointer(&PointerEvent::Scroll {
+                x: 20,
+                y: 20,
+                dx: 0,
+                dy: -1,
+                modifiers: vec![glass_core::keys::Modifier::Control],
+            })
+            .expect("scroll");
+        // Waits for the *release*, which the sink emits after the wheel — waiting for the axis
+        // would assert on a line that had not arrived yet.
+        let lines = s.wait_for_log("mods 0");
+        let mods: Vec<&String> = lines.iter().filter(|l| l.contains("input: mods")).collect();
+        assert!(
+            mods.iter().any(|l| l.ends_with("mods 4")),
+            "control down (XKB bit 2): {lines:#?}"
+        );
+        assert!(
+            mods.last().is_some_and(|l| l.ends_with("mods 0")),
+            "and released again: {mods:?}"
+        );
+    }
+
+    /// An unmodified scroll sends no modifier traffic. `glass_core::run_scroll` is what skips it
+    /// — this pins the wiring end to end, not the sink.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn an_unmodified_scroll_does_not_touch_the_modifiers() {
+        let mut s = Launch::new().start_mapped();
+        let before = s
+            .platform()
+            .drain_logs()
+            .into_iter()
+            .filter(|(_, l)| l.contains("input: mods"))
+            .count();
+        s.platform()
+            .send_pointer(&PointerEvent::Scroll {
+                x: 20,
+                y: 20,
+                dx: 0,
+                dy: -1,
+                modifiers: vec![],
+            })
+            .expect("scroll");
+        let lines = s.wait_for_log("input: axis");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("input: mods")).count(),
+            0,
+            "no modifier traffic for an unmodified scroll (before: {before}): {lines:#?}"
+        );
+    }
+
+    /// An app that never maps a window fails the launch with a timeout rather than hanging.
+    ///
+    /// It does NOT show the bring-up was retried, and nothing does. Both attempts return the same
+    /// `Timeout`, and elapsed time cannot separate them because one attempt already spends the
+    /// budget twice — once for the socket, once for a window. See #382.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_launch_that_finds_no_window_times_out() {
+        let mut platform = WaylandPlatform::new().expect("sway");
+        let spec = Launch::new().windows(&[]).timeout_ms(1500).spec();
+        let err = platform
+            .start_app(&spec)
+            .expect_err("an app with no window cannot start");
+        assert!(matches!(err, GlassError::Timeout(_)), "{err}");
+    }
+
+    /// Teardown has to happen even when nobody called `stop_app` — a panicking test or an early
+    /// return would otherwise leak sway, its Xwayland and the app.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn dropping_the_backend_reaps_a_session_that_was_never_stopped() {
+        let mut s = Launch::new().start();
+        let pids = s.platform().app_pids();
+        assert!(!pids.is_empty());
+        drop(s);
+        assert!(
+            !glass_proc_linux::any_alive(&pids),
+            "the compositor subtree outlived the backend: {pids:?}"
+        );
+    }
+
+    /// After stopping there is no compositor to talk to, and the backend must say so rather than
+    /// answer from what it last saw.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn stopping_ends_the_session() {
+        let mut s = Launch::new().start();
+        s.platform().stop_app().expect("stop");
+        let err = s.platform().list_windows().expect_err("no session");
+        assert!(matches!(err, GlassError::NoActiveSession), "{err}");
+    }
+
+    /// Teardown *asks* before it signals. Both routes end with the app gone, so its own shutdown
+    /// path is the only witness — and a signalled app never reaches it, losing whatever it would
+    /// have flushed.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_cooperative_app_is_asked_to_close_and_runs_its_own_shutdown() {
+        let mut s = Launch::new().start_mapped();
+        s.platform().stop_app().expect("stop");
+        // Bounded rather than a single drain: the readers are separate threads, and the line is
+        // still in flight when `stop_app` returns.
+        s.wait_for_log(crate::testw::CLOSING_LINE);
+    }
+
+    /// An app with no shutdown path still has to be gone afterwards: the ask is followed by a
+    /// signal, and the reap covers the compositor's whole group.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn an_app_that_ignores_the_close_request_is_still_reaped() {
+        let mut s = Launch::new().ignoring_close().start();
+        let pids = s.platform().app_pids();
+        assert!(!pids.is_empty());
+        s.platform().stop_app().expect("stop");
+        assert!(
+            !glass_proc_linux::any_alive(&pids),
+            "the launch outlived its teardown: {pids:?}"
+        );
     }
 }
 

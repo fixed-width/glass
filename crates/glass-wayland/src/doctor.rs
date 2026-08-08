@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glass_core::{AppSpec, Check, CheckStatus};
-use rustix::process::{Pid, Signal, kill_process_group};
 
 use crate::command::{build_sway_command, sway_config};
 use crate::platform::resolve_sway;
@@ -17,7 +16,7 @@ use crate::swayipc::Ipc;
 /// a headless sway to prove it actually starts.
 pub fn checks(deep: bool) -> Vec<Check> {
     let sway = discover_sway();
-    let gl = gl_present();
+    let gl = gl_present_in(EGL_SONAMES, DRI_DIRS);
     let deep_spawn = match (deep, &sway) {
         (true, Ok((path, _))) => Some(probe_sway(path)),
         _ => None,
@@ -92,23 +91,27 @@ fn sway_version(path: &Path) -> String {
         .unwrap_or_else(|| "sway (version unknown)".into())
 }
 
+/// Where a distro puts libEGL.
+const EGL_SONAMES: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu/libEGL.so.1",
+    "/usr/lib/libEGL.so.1",
+    "/lib/x86_64-linux-gnu/libEGL.so.1",
+    "/usr/lib64/libEGL.so.1",
+];
+/// Where a distro puts the Mesa DRI drivers.
+const DRI_DIRS: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu/dri",
+    "/usr/lib/dri",
+    "/usr/lib64/dri",
+];
+
 /// Heuristic check for the host Mesa software-GL stack the headless sway needs.
-fn gl_present() -> bool {
-    let egl = [
-        "/usr/lib/x86_64-linux-gnu/libEGL.so.1",
-        "/usr/lib/libEGL.so.1",
-        "/lib/x86_64-linux-gnu/libEGL.so.1",
-        "/usr/lib64/libEGL.so.1",
-    ]
-    .iter()
-    .any(|p| Path::new(p).exists());
-    let swrast = [
-        "/usr/lib/x86_64-linux-gnu/dri",
-        "/usr/lib/dri",
-        "/usr/lib64/dri",
-    ]
-    .iter()
-    .any(|d| {
+///
+/// Both halves must be present — a loader cannot render without a driver, or a driver be reached
+/// without the loader. Either swrast name counts: a host may carry only one.
+fn gl_present_in(egl_sonames: &[&str], dri_dirs: &[&str]) -> bool {
+    let egl = egl_sonames.iter().any(|p| Path::new(p).exists());
+    let swrast = dri_dirs.iter().any(|d| {
         let d = Path::new(d);
         d.join("swrast_dri.so").exists() || d.join("kms_swrast_dri.so").exists()
     });
@@ -125,7 +128,10 @@ fn probe_sway(sway: &Path) -> Result<(), String> {
     let config = rt.path().join("sway.cfg");
     let spec = AppSpec {
         build: None,
-        run: vec!["sleep".into(), "3600".into()],
+        // Exits immediately, on purpose: the readiness loop breaks as soon as IPC answers, which
+        // is before sway has finished `exec`ing its client, so a tree snapshot can miss one that
+        // outlives it. A client already gone cannot be leaked by losing that race.
+        run: vec!["true".into()],
         cwd: None,
         env: vec![],
         window_hint: None,
@@ -150,11 +156,13 @@ fn probe_sway(sway: &Path) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Tear down the whole compositor group (sway is its own group leader).
-    if let Some(pgid) = Pid::from_raw(child.id() as i32) {
-        let _ = kill_process_group(pgid, Signal::TERM);
-    }
-    let _ = child.wait();
+    // Snapshot the launch before any of it exits: once sway is reaped its descendants are
+    // reparented to init and can no longer be found from its pid.
+    //
+    // A group signal is not enough: sway `setsid`s every app it `exec`s, so the client is in
+    // neither its group nor its session and the signal reaches the compositor alone.
+    let tree = glass_proc_linux::proc_tree_pids(child.id());
+    glass_proc_linux::reap_launch(&mut child, &tree, glass_proc_linux::APP_REAP_GRACE);
 
     if up {
         Ok(())
@@ -191,6 +199,130 @@ mod tests {
         let gl = cs.iter().find(|c| c.name == "software GL (Mesa)").unwrap();
         assert_eq!(gl.status, CheckStatus::Warn);
         assert!(gl.remedy.as_deref().unwrap().contains("libgl1-mesa-dri"));
+    }
+
+    /// Everything below drives the real environment rather than the pure mapper — the gathering
+    /// half is where doctor goes quietly wrong.
+    ///
+    /// A private tree per case, so the answer comes from the files named rather than this host's
+    /// `/usr/lib`.
+    fn gl_tree(egl: bool, dri: Option<&str>) -> (tempfile::TempDir, Vec<String>, Vec<String>) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let so = root.path().join("libEGL.so.1");
+        if egl {
+            std::fs::write(&so, b"").expect("write libEGL");
+        }
+        let dir = root.path().join("dri");
+        std::fs::create_dir(&dir).expect("mkdir dri");
+        if let Some(name) = dri {
+            std::fs::write(dir.join(name), b"").expect("write driver");
+        }
+        let egls = vec![so.to_string_lossy().into_owned()];
+        let dris = vec![dir.to_string_lossy().into_owned()];
+        (root, egls, dris)
+    }
+
+    fn gl_present_for(egl: bool, dri: Option<&str>) -> bool {
+        let (_root, egls, dris) = gl_tree(egl, dri);
+        let egls: Vec<&str> = egls.iter().map(String::as_str).collect();
+        let dris: Vec<&str> = dris.iter().map(String::as_str).collect();
+        gl_present_in(&egls, &dris)
+    }
+
+    #[test]
+    fn gl_is_present_only_with_both_the_loader_and_a_driver() {
+        assert!(gl_present_for(true, Some("swrast_dri.so")));
+        assert!(!gl_present_for(true, None), "no driver");
+        assert!(!gl_present_for(false, Some("swrast_dri.so")), "no libEGL");
+        assert!(!gl_present_for(false, None));
+    }
+
+    #[test]
+    fn either_swrast_driver_name_counts() {
+        assert!(gl_present_for(true, Some("kms_swrast_dri.so")));
+        assert!(!gl_present_for(true, Some("nouveau_dri.so")), "not swrast");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn discover_sway_reports_the_real_binary_and_its_version() {
+        let (path, ver) = discover_sway().expect("this box has a discoverable sway");
+        assert!(path.is_file(), "{}", path.display());
+        assert!(ver.contains("sway version"), "{ver}");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn sway_version_reads_the_binarys_own_output() {
+        let (path, _) = discover_sway().expect("sway");
+        assert!(sway_version(&path).contains("sway version"));
+    }
+
+    /// A binary that prints nothing is not a version, and doctor's job is to say what it found.
+    ///
+    /// Not `/bin/true`: GNU coreutils answers `--version` with its own version string.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_silent_binary_reports_an_unknown_version_not_an_empty_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("mute");
+        std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(sway_version(&bin), "sway (version unknown)");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn the_shallow_checks_cover_sway_and_gl_and_stop_there() {
+        let cs = checks(false);
+        let names: Vec<&str> = cs.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"sway >=1.12"), "{names:?}");
+        assert!(names.contains(&"software GL (Mesa)"), "{names:?}");
+        assert!(
+            !names.contains(&"sway spawn (deep)"),
+            "the deep probe must not run unasked: {names:?}"
+        );
+    }
+
+    /// A `deep: true` that quietly skipped the spawn reports the same clean bill of health as one
+    /// that ran it.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn the_deep_check_really_starts_and_stops_a_compositor() {
+        let before = compositors_running();
+        let deep = checks(true)
+            .into_iter()
+            .find(|c| c.name == "sway spawn (deep)")
+            .expect("deep asks for the spawn check");
+        assert_eq!(deep.status, CheckStatus::Ok, "{}", deep.detail);
+        // The detail claims "started and stopped" and nothing else asserts the second half: a
+        // probe that leaks its compositor still answers Ok, and each survivor holds a display.
+        assert_eq!(
+            compositors_running(),
+            before,
+            "the deep probe left a compositor behind"
+        );
+    }
+
+    /// How many of the deep probe's own compositors are running, matched on its private
+    /// runtime-dir prefix so another test's session or a real sway is never counted.
+    fn compositors_running() -> usize {
+        let out = std::process::Command::new("ps")
+            .args(["-eo", "args"])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains("glass-doctor-wl."))
+            .count()
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn probing_something_that_is_not_a_compositor_fails() {
+        let err = probe_sway(Path::new("/bin/false")).expect_err("no IPC ever appears");
+        assert!(err.contains("did not come up"), "{err}");
     }
 
     #[test]

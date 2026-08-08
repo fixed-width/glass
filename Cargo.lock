@@ -1259,6 +1259,7 @@ dependencies = [
  "smithay-client-toolkit",
  "tempfile",
  "wayland-client",
+ "wayland-protocols",
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
  "x11rb",
