@@ -41,22 +41,9 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      - name: Install the display stack the Linux backends' unit tests need
-        # `cargo test --workspace` covers glass-x11's Xvfb-backed tests and glass-wayland's
-        # sway-backed ones — they start a private display or compositor each, and one starts a
-        # private a11y bus. None of it ships on the runner. These tests are not `#[ignore]`d:
-        # the mutation gate runs nextest, which skips ignored tests, so ignoring them would grade
-        # every mutant as caught. (`testw::fixture` is ignored, but it is the app the harness
-        # re-executes, not a test.)
-        run: |
-          sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core \
-            xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri
-      - name: Fetch the prebuilt sway bundle
-        # Into the location glass's own discovery looks in, so nothing needs configuring.
-        run: |
-          mkdir -p ~/.local/share/glass/sway
-          curl -fsSL https://github.com/fixed-width/sway-build/releases/download/bundle-latest/sway-bundle-linux-x86_64.tar.gz \
-            | tar -C ~/.local/share/glass/sway -xz
+      # `cargo test --workspace` covers glass-x11's Xvfb-backed tests and glass-wayland's
+      # sway-backed ones; neither the display stack nor the compositor ships on the runner.
+      - run: ./scripts/ci/install-display-stack.sh
       - run: cargo build --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -258,22 +245,14 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      - name: Install system deps
-        # xvfb + bubblewrap so the X11 integration suite (incl. sandbox_*) runs under coverage.
-        # Ubuntu 24.04 runners restrict unprivileged user namespaces via AppArmor; re-enable
-        # them for bubblewrap (no-op on images without the knob).
-        # python3-gi + gir1.2-gtk-4.0: the software_render integration test drives a real GTK4 app.
-        # The Mesa/GL stack + Xwayland and the sway bundle below are for glass-wayland's *unit*
-        # tests, which start a headless compositor each and run under coverage like any other.
+      - run: ./scripts/ci/install-display-stack.sh
+      - name: Install the integration suites' own deps
+        # On top of the unit-test stack above: bubblewrap for the sandbox_* tests, whose
+        # unprivileged user namespaces Ubuntu 24.04 restricts via AppArmor (the sysctl is a no-op
+        # on images without the knob), and GTK4 for the software_render test's real app.
         run: |
-          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 at-spi2-core \
-            xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri
+          sudo apt-get install -y bubblewrap python3-gi gir1.2-gtk-4.0
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-      - name: Fetch the prebuilt sway bundle
-        run: |
-          mkdir -p ~/.local/share/glass/sway
-          curl -fsSL https://github.com/fixed-width/sway-build/releases/download/bundle-latest/sway-bundle-linux-x86_64.tar.gz \
-            | tar -C ~/.local/share/glass/sway -xz
       - name: Measure coverage (unit + X11 + Wayland; AT-SPI self-skips)
         run: ./scripts/coverage.sh --lcov
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -340,21 +319,9 @@ jobs:
         if: steps.diff.outputs.touched == 'true'
         with:
           tool: cargo-mutants,cargo-nextest
-      - name: Install the display stack the gated backends' tests drive
-        if: steps.diff.outputs.touched == 'true'
-        # xvfb for the private headless displays glass-x11's tests start; at-spi2-core for the
-        # one that starts a private a11y bus; the Mesa/GL stack + Xwayland for the headless sway
-        # glass-wayland's tests start. Absent any of it, cargo-mutants' unmutated baseline fails
-        # and the run grades nothing.
-        run: |
-          sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core \
-            xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri
-      - name: Fetch the prebuilt sway bundle
-        if: steps.diff.outputs.touched == 'true'
-        run: |
-          mkdir -p ~/.local/share/glass/sway
-          curl -fsSL https://github.com/fixed-width/sway-build/releases/download/bundle-latest/sway-bundle-linux-x86_64.tar.gz \
-            | tar -C ~/.local/share/glass/sway -xz
+      # Absent any of it the unmutated baseline fails and the run grades nothing.
+      - if: steps.diff.outputs.touched == 'true'
+        run: ./scripts/ci/install-display-stack.sh
       - name: Mutation gate
         if: steps.diff.outputs.touched == 'true'
         # nextest runs each test in its own process, so slow tests overlap rather than sum.
