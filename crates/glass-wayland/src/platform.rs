@@ -2334,6 +2334,41 @@ mod session_tests {
         );
     }
 
+    /// The horizontal axis, which every other scroll test leaves at zero. It is a separate
+    /// branch with its own scale, and `axis 1` is what a compositor routes to a sideways scroll.
+    #[test]
+    fn a_horizontal_scroll_reaches_the_window_on_the_other_axis() {
+        let mut s = Launch::new().start_mapped();
+        s.platform()
+            .send_pointer(&PointerEvent::Scroll {
+                x: 20,
+                y: 20,
+                dx: 3,
+                dy: 0,
+                modifiers: vec![],
+            })
+            .expect("scroll");
+        let lines = s.wait_for_log("input: axis");
+        let axis = lines
+            .iter()
+            .find(|l| l.contains("input: axis"))
+            .expect("an axis event");
+        assert!(axis.contains(" 1 "), "the horizontal axis: {axis}");
+        let value: f64 = axis
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no axis value in {axis:?}"));
+        assert!(
+            (value - 45.0).abs() < 0.01,
+            "three notches right is 45 surface units, got {value} in {axis:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("input: axis 0 ")),
+            "a purely horizontal scroll must not emit a vertical axis: {lines:#?}"
+        );
+    }
+
     /// A modifier is held across the wheel, not sent alongside it: an app reads ctrl+scroll as
     /// zoom only if control is down when the axis arrives.
     #[test]
