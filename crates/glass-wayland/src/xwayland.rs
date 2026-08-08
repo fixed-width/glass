@@ -201,9 +201,7 @@ impl Recovery {
 
 /// What to say about a completed pass, or `None` when it re-mapped nothing.
 ///
-/// Said out loud because it changed the app's windows, not just glass's reading of them: someone
-/// comparing the two deserves to know one needed recovering. A pass that recovered nothing changed
-/// nothing and stays quiet.
+/// Said out loud because it changed the app's windows, not just glass's reading of them.
 fn recovery_notice(count: usize) -> Option<String> {
     (count > 0).then(|| {
         format!(
@@ -293,9 +291,8 @@ impl XProbe {
 /// Whether an attribute read failed because the window is gone — destroyed between the tree read
 /// and this one, and so no longer owed a view.
 ///
-/// The one failure that is not a failure. Anything else, a dead connection above all, must not
-/// read as "this window is fine": a scan that quietly returns fewer windows reads as "nothing was
-/// lost", which is the state recovery exists to react to.
+/// The one failure that is not a failure. Anything else — a dead connection above all — must
+/// error: a scan returning fewer windows reads as "nothing was lost".
 fn window_is_gone(e: &ReplyError) -> bool {
     matches!(e, ReplyError::X11Error(x) if x.error_kind == ErrorKind::Window)
 }
@@ -435,9 +432,8 @@ fn confirmed_lost(missing_now: &[u32], missing_before: &HashSet<u32>) -> Vec<u32
 
 #[cfg(test)]
 mod x_tests {
-    //! [`XProbe`] against a real X server. The probe reads and writes X protocol, so there is
-    //! nothing to fake underneath it; a private Xvfb is markedly cheaper to start than the
-    //! compositor whose Xwayland it stands in for, and speaks the same protocol.
+    //! [`XProbe`] against a real X server — there is nothing to fake under X protocol, and a
+    //! private Xvfb speaks the same one far cheaper than a compositor.
     use super::*;
     use x11rb::protocol::xproto::{CreateWindowAux, WindowClass};
     use x11rb::rust_connection::RustConnection;
@@ -558,9 +554,8 @@ mod x_tests {
             .expect_err("a dead server must not read as an app with no windows");
     }
 
-    /// The re-map is an unmap/map pair, and the window must be viewable again when it ends: a map
-    /// request alone is a no-op on an already-mapped window, so a `remap` that skipped the unmap
-    /// would produce no MapNotify and recover nothing.
+    /// A map request alone is a no-op on an already-mapped window, so only the unmap/map pair
+    /// produces the MapNotify that recovers anything — and it must end viewable.
     #[test]
     fn remapping_leaves_the_window_mapped_again() {
         let x = server();
@@ -607,8 +602,8 @@ mod x_tests {
         assert_eq!(r.unrecovered(), 0);
     }
 
-    /// Checks are throttled: a second pass inside the interval must not spend another `/proc`
-    /// walk, and must not count as one of the two sightings that confirm a loss.
+    /// A second pass inside the interval must not count as one of the two sightings that confirm
+    /// a loss.
     #[test]
     fn a_pass_inside_the_interval_does_nothing() {
         let x = server();
@@ -628,8 +623,8 @@ mod x_tests {
         );
     }
 
-    /// A re-map that did not take is counted, so a launch that gives up can say the recovery ran
-    /// rather than reporting a bare timeout for an app whose window glass could see all along.
+    /// A re-map that did not take is counted, so a launch that gives up says the recovery ran
+    /// rather than reporting a bare timeout.
     #[test]
     fn a_window_still_missing_after_its_remap_is_counted_as_unrecovered() {
         let x = server();
@@ -644,8 +639,8 @@ mod x_tests {
         assert_eq!(r.unrecovered(), 1);
     }
 
-    /// Re-mapping a window that no longer exists has to report the failure: the unmap half can
-    /// have applied already, and a silent `Ok` would leave the caller believing recovery worked.
+    /// The unmap half may already have applied, so a silent `Ok` would leave a window hidden and
+    /// the caller believing recovery worked.
     #[test]
     fn remapping_a_window_that_is_gone_reports_the_failure() {
         let x = server();
@@ -660,9 +655,8 @@ mod x_tests {
 
 #[cfg(test)]
 mod session_tests {
-    //! Finding the session's own Xwayland. The scan reads `/proc`, so it can only be exercised
-    //! against a real one — and only a real session proves the match is by runtime directory
-    //! rather than by whatever `DISPLAY` happens to be set on this machine.
+    //! Finding the session's own Xwayland. The scan reads `/proc`, so only a real session shows
+    //! the match is by runtime directory rather than by whatever `DISPLAY` is set to.
     use super::*;
     use crate::testw::Launch;
 
@@ -691,9 +685,8 @@ mod session_tests {
         );
     }
 
-    /// A runtime dir no Xwayland holds has no X11 side — a native Wayland session, which never
-    /// takes the path recovery exists for. Answering with some other session's display would
-    /// point the probe at windows this session does not own.
+    /// A runtime dir no Xwayland holds has no X11 side. Answering with another session's display
+    /// would point the probe at windows this one does not own.
     #[test]
     fn a_runtime_dir_no_xwayland_holds_has_no_display() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -703,10 +696,9 @@ mod session_tests {
     /// The scan has to find the session's *own* Xwayland. An empty list reads as "no X11 side",
     /// which switches recovery off for the session.
     ///
-    /// Tied to this session rather than to the machine: `xwayland_pids` scans all of `/proc`, so a
-    /// bare "some Xwayland exists" holds on any desktop and on any run with a sibling session in
-    /// flight, whether or not this launch started one. Asserting `is_xwayland` over what the scan
-    /// returned would be a tautology besides — that is the predicate it filters on.
+    /// Tied to this session, not the machine: `xwayland_pids` scans all of `/proc`, so "some
+    /// Xwayland exists" holds whenever a sibling test has one in flight. Asserting `is_xwayland`
+    /// over what the scan returned would restate the predicate it filters on.
     #[test]
     fn the_scan_finds_this_sessions_own_xwayland() {
         let s = Launch::new().through_xwayland().start();
@@ -773,8 +765,8 @@ mod tests {
         );
     }
 
-    /// A bare `:N` and nothing else. `:` alone is not a display, and accepting it would send the
-    /// probe at whatever `x11rb` makes of an empty number.
+    /// A bare `:N` and nothing else — accepting `:` sends the probe at whatever `x11rb` makes of
+    /// an empty number.
     #[test]
     fn a_colon_with_no_number_is_not_a_display() {
         assert!(is_display_arg(":0"));
@@ -792,8 +784,8 @@ mod tests {
         assert!(!window_is_gone(&x11_error(ErrorKind::Access)));
     }
 
-    /// A dead connection is not a window that went away. Skipping it would turn an Xwayland that
-    /// stopped answering into "the app has no windows" — the state recovery reacts to.
+    /// Skipping a dead connection would turn an Xwayland that stopped answering into "the app has
+    /// no windows" — the state recovery reacts to.
     #[test]
     fn a_connection_failure_is_not_a_window_that_went_away() {
         assert!(!window_is_gone(&ReplyError::ConnectionError(

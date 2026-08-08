@@ -1,19 +1,15 @@
 //! A private headless sway, and a real client on it, for the tests that need an actual compositor.
 //!
-//! The backend owns the compositor's whole lifecycle — `start_app` spawns sway, connects to it and
-//! waits for the app's first window — so unlike the X11 harness there is no server someone else
-//! started to attach to. Tests therefore drive the production path, and this module supplies the
-//! two things that path needs: an app for sway to launch, and a view of the session that is not
-//! the code under test.
+//! `start_app` spawns the compositor itself, so unlike the X11 harness there is no server to
+//! attach to. Tests drive the production path; this supplies what it needs — an app for sway to
+//! launch, and a view of the session that is not the code under test.
 //!
-//! The app is this test binary re-executed (`--exact testw::fixture --ignored`). That makes it a
-//! real external process, launched by sway's own `exec`, exactly as production launches one — and
-//! a *native Wayland* one, which nothing else in the repo covers: `glass-testapp` is an X11 client
-//! that reaches the compositor through Xwayland.
+//! The app is this test binary re-executed (`--exact testw::fixture --ignored`), so sway `exec`s a
+//! real external process as production does — and a *native Wayland* one, which nothing else here
+//! covers: `glass-testapp` depends only on x11rb and arrives through Xwayland.
 //!
-//! The observer is a second sway IPC connection ([`Session::ipc`]). Reading the session's state
-//! through the backend's own connection would let a mutant that breaks a read hide behind the
-//! matching broken write.
+//! The observer is a second sway IPC connection. Reading state back through the backend's own
+//! connection would let a mutant that breaks a read hide behind the matching broken write.
 
 use std::time::{Duration, Instant};
 
@@ -41,17 +37,10 @@ pub(crate) const CLOSING_LINE: &str = "testw: closing";
 /// the compositor. Both bound a hang; neither paces anything, and a passing test on an idle
 /// machine reaches neither.
 ///
-/// Generous on purpose, and that is a reversal. They were briefly cut to 5s/8s so that a mutation
-/// which stops a window appearing would fail the suite quickly rather than be graded a timeout.
-/// It worked, and it cost far more than it bought: under the load of a mutation sweep — two jobs,
-/// each running this suite at full parallelism, every test starting its own compositor — tests
-/// began missing the budget for no reason but contention. A spurious failure is recorded by
-/// cargo-mutants as a *kill*, so tight budgets do not merely flake, they silently inflate the
-/// caught count and make consecutive sweeps of identical code disagree about which mutants
-/// survived.
-///
-/// A slow sweep is the better trade. A mutation that hangs the suite is graded a timeout, which
-/// this repo already treats as a detection.
+/// Do not cut these to make mutants fail faster. At 5s/8s, tests began missing the budget under
+/// the load of a sweep through contention alone — and cargo-mutants records a spurious failure as
+/// a *kill*, so tight budgets inflate the caught count and make consecutive sweeps of identical
+/// code disagree. A hang is graded a timeout, which this repo already treats as a detection.
 const SETTLE_BUDGET: Duration = Duration::from_secs(20);
 
 /// See [`SETTLE_BUDGET`]. `start_app` retries the bring-up, and spends this twice per attempt —
@@ -60,8 +49,8 @@ const LAUNCH_BUDGET_MS: u64 = 20_000;
 
 /// A launched session: the backend under test, plus an independent view of the same compositor.
 ///
-/// `#[must_use]`: dropping it immediately tears the compositor down, and a test that meant to hold
-/// one then fails for a reason unrelated to what it was checking.
+/// `#[must_use]`: dropping it tears the compositor down at once, so a test that meant to hold one
+/// fails for an unrelated reason.
 #[must_use]
 pub(crate) struct Session {
     platform: WaylandPlatform,
@@ -89,8 +78,8 @@ impl Launch {
     }
 
     /// Replace the window list. Each entry is `title:app_id:WxH`.
-    /// Replace the window list. Each entry is `title:app_id:WxH`, and is parsed here so a
-    /// malformed one fails on this line rather than inside the launched fixture.
+    /// Replace the window list. Parsed here, so a malformed `title:app_id:WxH` fails on this line
+    /// rather than inside the launched fixture.
     pub(crate) fn windows(mut self, windows: &[&str]) -> Launch {
         self.windows = windows.iter().map(|w| Spec::parse(w).to_entry()).collect();
         self
@@ -117,8 +106,8 @@ impl Launch {
         self.env(IGNORES_CLOSE, "1")
     }
 
-    /// Reach the compositor through Xwayland instead of natively. sway starts Xwayland lazily —
-    /// no X client, no process — so this is what puts an X11 side on the session at all.
+    /// Reach the compositor through Xwayland. sway starts it lazily, so without an X client the
+    /// session has no X11 side at all.
     pub(crate) fn through_xwayland(self) -> Launch {
         self.env(USE_X11, "1")
     }
@@ -437,9 +426,8 @@ mod app {
     delegate_noop!(App: ignore wl_buffer::WlBuffer);
 
     /// A seat only has a pointer or a keyboard once it says so. Asking for one before the
-    /// capability is advertised is a protocol error, and the compositor answers a protocol error
-    /// by disconnecting the client — which looks from the outside like input that never arrives
-    /// and a window that captures black.
+    /// capability is advertised is a protocol error, and the compositor answers by disconnecting
+    /// — which looks from outside like input that never arrives and a window that captures black.
     impl Dispatch<wl_seat::WlSeat, ()> for App {
         fn event(
             state: &mut Self,
@@ -464,9 +452,8 @@ mod app {
         }
     }
 
-    /// Every input event the app receives, on stdout — which sway passes through to glass's log
-    /// sink. Under Wayland a client is the only thing that can say what input arrived: there is no
-    /// `query_pointer`, and the compositor will not tell a bystander where the pointer is.
+    /// Every input event the app receives, on stdout. Under Wayland the client is the only thing
+    /// that can say what input arrived — there is no `query_pointer`.
     fn echo(line: String) {
         println!("{line}");
         let _ = std::io::stdout().flush();
@@ -509,10 +496,8 @@ mod app {
                     surface_y,
                     ..
                 } => echo(format!("input: enter {surface_x:.0} {surface_y:.0}")),
-                // The event clock goes out with each line. It is the only way a test can see that
-                // the backend advances its timestamp per event: a compositor drops a pointer
-                // event whose time did not move, so a stuck clock is a real defect that looks
-                // like nothing at all from the outside.
+                // The clock goes out with each line: a compositor drops a pointer event whose
+                // timestamp did not move, so a stuck clock loses input silently.
                 wl_pointer::Event::Motion {
                     time,
                     surface_x,
@@ -547,13 +532,11 @@ mod app {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            // A compositor-side close request (sway's `kill`). Exiting here is what makes the
-            // fixture behave like an app with a shutdown path, so teardown reports a clean close
-            // instead of spending the whole close grace and then signalling.
+            // sway's `kill`. Exiting here gives the fixture a shutdown path, so teardown reports
+            // a clean close instead of spending the close grace and signalling.
             if matches!(event, xdg_toplevel::Event::Close) && !state.ignores_close {
-                // Said before exiting, so a test can tell an app that was *asked* to close from
-                // one that was signalled. The end state is identical either way — the app is
-                // gone — so its own shutdown path is the only witness.
+                // The end state is identical either way, so this line is the only way a test can
+                // tell an app that was asked to close from one that was signalled.
                 echo(super::CLOSING_LINE.to_string());
                 std::process::exit(0);
             }
@@ -599,9 +582,8 @@ mod app {
             if let xdg_surface::Event::Configure { serial } = event {
                 surface.ack_configure(serial);
                 state.configured += 1;
-                // A configure is only applied by the commit that answers it. Acking and going
-                // quiet leaves the compositor with a surface it has agreed a size for and no
-                // content to show for it.
+                // A configure is only applied by the commit that answers it: ack and go quiet,
+                // and the surface is mapped at an agreed size with nothing to show.
                 state.redraw = true;
             }
         }
@@ -610,10 +592,8 @@ mod app {
     /// An shm buffer of `w`x`h` solid `argb`, backed by a memfd written as an ordinary file (no
     /// mmap, so no `unsafe`).
     ///
-    /// The file comes back with the buffer and is held for the process's lifetime. The pure-Rust
-    /// wayland backend `dup()`s the fd into the message at request time, so this is belt and
-    /// braces rather than load-bearing — but the memfd is the buffer's pixels, and nothing else
-    /// owns it.
+    /// The file comes back with the buffer and is held for the process's lifetime: it is the
+    /// buffer's pixels, and nothing else owns it.
     fn buffer(
         shm: &wl_shm::WlShm,
         qh: &QueueHandle<App>,
@@ -697,8 +677,7 @@ mod app {
         queue.roundtrip(&mut app).expect("present");
         println!("{READY_LINE}");
         std::io::stdout().flush().expect("flush");
-        // Stay up, answering pings and re-committing on every configure, until the compositor
-        // goes away or glass reaps us.
+        // Answer pings and re-commit on every configure until the compositor goes away.
         loop {
             if queue.blocking_dispatch(&mut app).is_err() {
                 return;
@@ -728,9 +707,8 @@ mod harness_tests {
         assert_eq!(Spec::parse(entry).to_entry(), entry);
     }
 
-    /// Every field is required and every extent positive. Silently defaulting a missing one
-    /// launches a window of the wrong size, and the test that follows fails on dimensions with
-    /// nothing to say the spec was the problem.
+    /// Every field required, every extent positive. A silently defaulted field launches a window
+    /// of the wrong size, and the test then fails on dimensions with nothing naming the spec.
     #[test]
     fn a_malformed_window_spec_is_rejected_where_it_is_written() {
         for bad in [
@@ -748,8 +726,7 @@ mod harness_tests {
         }
     }
 
-    /// The harness is only worth anything if the fixture really maps a window the backend can
-    /// see — everything else in the suite assumes it.
+    /// Everything else in the suite assumes the fixture really maps a window the backend sees.
     #[test]
     fn the_fixture_app_maps_a_window_the_backend_reports() {
         let mut s = Launch::new().start();

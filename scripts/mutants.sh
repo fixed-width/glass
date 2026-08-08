@@ -178,13 +178,12 @@ graded=$out
 
 # Reap the compositors and X servers a timed-out mutant left behind.
 #
-# The mutation runner SIGKILLs the test process when a mutant exceeds --timeout, so a mutation
-# that removes a *bound* — a discovery deadline, a screencopy event arm, a Drop impl — hangs the
-# run while holding live sessions and none of their teardown ever runs. Each orphan holds an X
-# display number until it dies, and a host with none left cannot start Xwayland at all.
+# The runner SIGKILLs the test process when a mutant exceeds --timeout, so a mutation that removes
+# a bound hangs the run holding live sessions and no teardown runs. Each orphan holds an X display
+# number until it dies.
 #
-# This is cleanup after the fact. What stops the orphans accumulating mid-run is the pdeathsig in
-# glass-wayland's `build_sway_command`; this catches what escapes it.
+# Cleanup after the fact — the pdeathsig in glass-wayland's `build_sway_command` is what stops them
+# accumulating mid-run.
 #
 # Matched on the private runtime directory glass names for each session, which appears on the
 # compositor's own command line and belongs to no one else. Deliberately NOT matched on `Xvfb
@@ -210,32 +209,27 @@ echo "mutants: $total generated, $caught caught, $missed missed, $timed_out time
 
 # Grade survivors against a recorded set rather than against zero.
 #
-# Without this, a survivor on a line nobody has touched is invisible — until someone edits that
-# line for an unrelated reason and the in-diff gate hands them a mutant they did not write. Their
-# choices are then to do deep unrelated work, add an exclusion under deadline pressure, or turn
-# the gate off. That is how gates get turned off.
+# A survivor on an untouched line is invisible to the in-diff gate until someone edits that line
+# for an unrelated reason and inherits a mutant they did not write. Their options are then deep
+# unrelated work, an exclusion under deadline pressure, or turning the gate off.
 #
-# So the record applies to BOTH gates: a recorded survivor never fails anyone, a new one always
-# does, and one that has become killable says so. This is a ratchet, not an amnesty — the bar is
-# "no new survivors", and adding to the record is a reviewed diff that has to carry a reason.
+# So the record applies to BOTH gates: recorded never fails anyone, new always does, and one that
+# became killable says so. A ratchet, not an amnesty — adding to it is a reviewed diff carrying a
+# reason.
 #
-# Deliberately not `exclude_re` in mutants.toml: an exclusion stops the mutant being generated, so
-# it can never be re-graded and never reports that it has become killable. These are still
-# generated, still run, and still printed every time.
+# Not `exclude_re`, which stops the mutant being generated and so can never report that it became
+# killable. These still run and are printed every time.
 #
-# Per crate, so a crate at zero stays at zero: a record exists only for the crates that have one,
-# and a crate with no file has no slot to record into.
+# Per crate, so a crate with no record file has no slot to record into and stays at zero.
 record_for() { echo ".cargo/mutants-known/$1.txt"; }
 
 # A survivor keyed by its description alone, with `line:col` dropped — the line moves whenever
 # anything above it does. Renaming the function a survivor names DOES change its key,
 # deliberately: its recorded reason may no longer fit the code.
 #
-# Deduplicated rather than counted. A count would catch one of a duplicate pair being fixed
-# unnoticed, which is real but small; against that, mutants on timing constructs are legitimately
-# non-deterministic — a deadline mutation is caught only when timing happens to break something —
-# so the same code yields two instances one run and none the next. Under counts that is a build
-# failure for no change at all, which is the worse trade.
+# Deduplicated rather than counted. A count catches one of a duplicate pair being fixed unnoticed,
+# but mutants on timing constructs are legitimately non-deterministic — the same code yields two
+# instances one run and none the next — and under counts that is a build failure for no change.
 survivor_keys() {
     sed -E 's/^([^:]+):[0-9]+:[0-9]+: /\1: /' "$1" | sort -u
 }
@@ -288,10 +282,8 @@ grade_survivors() {
 if ! grade_survivors; then
     exit 1
 fi
-# Every survivor was recorded, so cargo-mutants' own "found problems" status must not fail the run
-# — otherwise the record grades nothing and the exit code decides after all. Exit 2 is exactly
-# that outcome (`ExitCode::FoundProblems`); a usage error, a failing baseline or a bad filter diff
-# all have their own codes and still stand.
+# Every survivor was recorded, so cargo-mutants' own exit 2 (`ExitCode::FoundProblems`) must not
+# fail the run — otherwise the exit code decides and the record grades nothing. Other codes stand.
 if [ "$missed" -gt 0 ] && [ "$status" -eq 2 ]; then
     status=0
 fi

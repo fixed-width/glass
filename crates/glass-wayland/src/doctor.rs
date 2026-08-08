@@ -107,9 +107,8 @@ const DRI_DIRS: &[&str] = &[
 
 /// Heuristic check for the host Mesa software-GL stack the headless sway needs.
 ///
-/// Both halves must be present: libEGL alone cannot render without a software DRI driver, and a
-/// driver is unreachable without the loader. Either swrast name counts — Mesa ships `swrast_dri`
-/// and `kms_swrast_dri` and a host may carry only one.
+/// Both halves must be present — a loader cannot render without a driver, or a driver be reached
+/// without the loader. Either swrast name counts: a host may carry only one.
 fn gl_present_in(egl_sonames: &[&str], dri_dirs: &[&str]) -> bool {
     let egl = egl_sonames.iter().any(|p| Path::new(p).exists());
     let swrast = dri_dirs.iter().any(|d| {
@@ -129,10 +128,9 @@ fn probe_sway(sway: &Path) -> Result<(), String> {
     let config = rt.path().join("sway.cfg");
     let spec = AppSpec {
         build: None,
-        // Exits immediately, on purpose. The probe only needs sway's IPC to answer, and the
-        // readiness loop breaks as soon as it does — which is before sway has finished `exec`ing
-        // its client, so a snapshot of sway's process tree can miss one that outlives it. A
-        // client that has already exited cannot be leaked by losing that race.
+        // Exits immediately, on purpose: the readiness loop breaks as soon as IPC answers, which
+        // is before sway has finished `exec`ing its client, so a tree snapshot can miss one that
+        // outlives it. A client already gone cannot be leaked by losing that race.
         run: vec!["true".into()],
         cwd: None,
         env: vec![],
@@ -161,10 +159,8 @@ fn probe_sway(sway: &Path) -> Result<(), String> {
     // Snapshot the launch before any of it exits: once sway is reaped its descendants are
     // reparented to init and can no longer be found from its pid.
     //
-    // Signalling sway's process group is not enough. sway calls `setsid` for every app it
-    // `exec`s, so the probe's own client is in neither sway's group nor its session, and a
-    // group signal reaches the compositor and nothing else — leaving the client running. This
-    // reaps the tree, exactly as `WaylandPlatform::kill_session` does.
+    // A group signal is not enough: sway `setsid`s every app it `exec`s, so the client is in
+    // neither its group nor its session and the signal reaches the compositor alone.
     let tree = glass_proc_linux::proc_tree_pids(child.id());
     glass_proc_linux::reap_launch(&mut child, &tree, glass_proc_linux::APP_REAP_GRACE);
 
@@ -205,12 +201,11 @@ mod tests {
         assert!(gl.remedy.as_deref().unwrap().contains("libgl1-mesa-dri"));
     }
 
-    /// Everything below drives the real environment rather than the pure mapper: the gathering
-    /// half is where doctor can go quietly wrong, and it reports what a user's machine actually
-    /// has.
+    /// Everything below drives the real environment rather than the pure mapper — the gathering
+    /// half is where doctor goes quietly wrong.
     ///
-    /// A private tree per case, so the answer comes from the files named and not from whatever
-    /// this host happens to have in `/usr/lib`.
+    /// A private tree per case, so the answer comes from the files named rather than this host's
+    /// `/usr/lib`.
     fn gl_tree(egl: bool, dri: Option<&str>) -> (tempfile::TempDir, Vec<String>, Vec<String>) {
         let root = tempfile::tempdir().expect("tempdir");
         let so = root.path().join("libEGL.so.1");
@@ -261,8 +256,7 @@ mod tests {
         assert!(sway_version(&path).contains("sway version"));
     }
 
-    /// A binary that prints nothing is not a version. Reporting its empty output as the version
-    /// would put a blank where doctor's whole job is to say what it found.
+    /// A binary that prints nothing is not a version, and doctor's job is to say what it found.
     ///
     /// Not `/bin/true`: GNU coreutils answers `--version` with its own version string.
     #[test]
@@ -287,8 +281,8 @@ mod tests {
         );
     }
 
-    /// The deep check has to actually start a compositor. A `deep: true` that quietly skipped the
-    /// spawn would report the same clean bill of health as one that ran it.
+    /// A `deep: true` that quietly skipped the spawn reports the same clean bill of health as one
+    /// that ran it.
     #[test]
     fn the_deep_check_really_starts_and_stops_a_compositor() {
         let before = compositors_running();
@@ -297,9 +291,8 @@ mod tests {
             .find(|c| c.name == "sway spawn (deep)")
             .expect("deep asks for the spawn check");
         assert_eq!(deep.status, CheckStatus::Ok, "{}", deep.detail);
-        // The check's own detail says "started and stopped", and nothing else asserts the second
-        // half. A probe that leaks its compositor still answers Ok, and each survivor holds an X
-        // display number for as long as it lives.
+        // The detail claims "started and stopped" and nothing else asserts the second half: a
+        // probe that leaks its compositor still answers Ok, and each survivor holds a display.
         assert_eq!(
             compositors_running(),
             before,
@@ -307,9 +300,8 @@ mod tests {
         );
     }
 
-    /// How many of the deep probe's own compositors are running. Matched on the probe's private
-    /// runtime-dir prefix, so a session from another test — or a developer's real sway — is never
-    /// counted.
+    /// How many of the deep probe's own compositors are running, matched on its private
+    /// runtime-dir prefix so another test's session or a real sway is never counted.
     fn compositors_running() -> usize {
         let out = std::process::Command::new("ps")
             .args(["-eo", "args"])

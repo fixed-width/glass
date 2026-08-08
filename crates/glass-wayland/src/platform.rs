@@ -257,10 +257,8 @@ pub(crate) fn resolve_sway() -> Result<PathBuf> {
 
 /// What `GLASS_SWAY` decides, or `None` when it is unset or empty and discovery should run.
 ///
-/// An explicit override wins and is trusted — it skips the version gate. It fails closed when it
-/// names something that is not a file, rather than falling back to discovery: a caller who named
-/// a path wants *that* sway, and silently running a different one is how a version-specific bug
-/// gets chased in the wrong binary.
+/// An override skips the version gate, and fails closed when it names something that is not a
+/// file — falling back to discovery would chase a version-specific bug in a different binary.
 fn sway_override(value: Option<std::ffi::OsString>) -> Option<Result<PathBuf>> {
     let p = PathBuf::from(value.filter(|s| !s.is_empty())?);
     Some(if p.is_file() {
@@ -275,9 +273,8 @@ fn sway_override(value: Option<std::ffi::OsString>) -> Option<Result<PathBuf>> {
 
 /// The first `sway` in `dirs` whose `--version` reports >= 1.12.
 ///
-/// Only the first `sway` found is considered. A too-old or unparseable one is not skipped over in
-/// favour of a later directory: `PATH` order is the user's own precedence, and walking past their
-/// choice to run a different sway is the same silent substitution [`sway_override`] refuses.
+/// A too-old one is not skipped in favour of a later directory: `PATH` order is the user's own
+/// precedence, and walking past it is the substitution [`sway_override`] refuses.
 fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
     for dir in dirs {
         let cand = dir.join("sway");
@@ -556,11 +553,8 @@ fn open_session(
         buffer_done: false,
         capture_done: None,
     };
-    // v3 exactly, not 1..=3. glass captures by waiting for `buffer_done`, which only v3 sends;
-    // under v1/v2 that wait would need a different rule, and the branch for it was unreachable
-    // dead code — glass only ever talks to the sway it launched itself, which is v3. Binding the
-    // version it actually requires turns "capture silently takes an untested path" into a bind
-    // that fails saying so.
+    // v3 exactly, not 1..=3: capture waits for `buffer_done`, which only v3 sends. The v1/v2
+    // branch that waited differently was unreachable — glass only talks to the sway it launched.
     let manager: ZwlrScreencopyManagerV1 = globals
         .bind(&qh, 3..=3, ())
         .map_err(|e| GlassError::Backend(format!("bind screencopy v3: {e}")))?;
@@ -817,11 +811,10 @@ fn tap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, kc: u32) -> Result<()> 
 
 /// Fail closed: a launch that asked for a sandbox errors rather than running unconfined.
 ///
-/// `probe` is a thunk, not a value. Rust evaluates arguments before the call, so passing
-/// `availability()` directly would fork `bwrap --unshare-user` on *every* launch — including
-/// `sandbox:"off"`, the one setting that exists for machines where bubblewrap does not work.
-/// glass-x11 has the same helper for the same reason; keeping a copy in each backend keeps both
-/// inside the mutation gate's `--package` list.
+/// `probe` is a thunk, not a value: Rust evaluates arguments before the call, so passing
+/// `availability()` would fork `bwrap --unshare-user` even for `sandbox:"off"` — the setting that
+/// exists for hosts where bubblewrap does not work. glass-x11 keeps its own copy so both stay in
+/// the mutation gate's `--package` list.
 fn ensure_sandbox_available(
     level: glass_core::SandboxLevel,
     probe: impl FnOnce() -> glass_sandbox_linux::Availability,
@@ -843,9 +836,8 @@ fn ensure_sandbox_available(
 /// XKB real-modifier mask for a chord's modifiers (standard `include "complete"`
 /// order: Shift, Lock, Control, Mod1=Alt, ..., Mod4=Super).
 ///
-/// Shift-free on purpose: `1 << 0` and `1 >> 0` are the same number, so writing Shift's bit as a
-/// shift left a place the code could be changed with nothing able to notice. The other three were
-/// always killable (`1 >> 2` is 0); they are literals for consistency with it.
+/// Shift-free on purpose: `1 << 0` and `1 >> 0` are the same number, so Shift's bit as a shift
+/// was a place the code could change with nothing able to notice.
 fn modifier_mask(mods: &[glass_core::keys::Modifier]) -> u32 {
     use glass_core::keys::Modifier;
     mods.iter().fold(0, |m, x| {
@@ -1033,8 +1025,7 @@ impl WaylandScrollSink<'_> {
 
 impl glass_core::ScrollSink for WaylandScrollSink<'_> {
     /// No `mask == 0` guard, unlike the drag sink: `glass_core::run_scroll` returns `wheel()`
-    /// directly when the scroll carries no modifiers, so this is only ever reached with a mask —
-    /// and every `Modifier` maps to a non-zero bit. A guard here would be unreachable both ways.
+    /// directly when there are no modifiers, and every `Modifier` is a non-zero bit.
     fn modifiers(&mut self, down: bool) -> Result<()> {
         let kb = self.s.keyboard.clone();
         if down {
@@ -1552,9 +1543,8 @@ mod pure_tests {
         }
     }
 
-    /// The cross-check compares the X server's toplevels against these, so a native Wayland view
-    /// must be absent rather than present as some placeholder id that could collide with a real
-    /// X window.
+    /// A native Wayland view must be absent rather than carry a placeholder id, which could
+    /// collide with a real X window in the cross-check.
     #[test]
     fn only_xwayland_views_contribute_an_x11_id() {
         let wins = [win("a", Some(0x40_0001)), win("b", None), win("c", Some(7))];
@@ -1685,9 +1675,8 @@ mod pure_tests {
         assert!(found.is_file(), "{}", found.display());
     }
 
-    /// The only way to assert something is *not* called: a probe that panics if it is. Testing
-    /// the extracted function alone proves nothing about the call site, which is where an eager
-    /// argument would change the behaviour.
+    /// A probe that panics is the only way to assert something is *not* called. Note this drives
+    /// the helper, not `start_app`'s call site, which is where an eager argument would bite.
     #[test]
     fn a_launch_with_the_sandbox_off_never_probes_for_bubblewrap() {
         ensure_sandbox_available(glass_core::SandboxLevel::Off, || {
@@ -1734,8 +1723,7 @@ mod pure_tests {
         assert_eq!(find_wayland_socket(dir.path()), None);
     }
 
-    /// The XKB real-modifier bits, in the order `include "complete"` assigns them. Each is a
-    /// distinct bit: an `&`/`^` fold or a shift the wrong way would collapse or move them.
+    /// The XKB real-modifier bits, in the order `include "complete"` assigns them.
     #[test]
     fn each_modifier_is_its_own_xkb_bit() {
         use glass_core::keys::Modifier;
@@ -2156,9 +2144,8 @@ mod session_tests {
         s.platform()
             .send_key(&KeyEvent::Chord("ctrl+a".into()))
             .expect("chord");
-        // "Across" is the whole claim, so it is the ordering that gets asserted: control down,
-        // then the key, then control released. An app reads ctrl+a as ctrl+a only if the modifier
-        // is already held when the key arrives.
+        // An app reads ctrl+a as ctrl+a only if control is already down when the key arrives, so
+        // the ordering is the claim: down, key, released.
         let lines = s.wait_for_log("input: mods 0");
         let at = |needle: &str| {
             lines
@@ -2173,8 +2160,8 @@ mod session_tests {
         );
     }
 
-    /// The fixture fills its surface with one known colour, so the capture can be checked pixel
-    /// for pixel rather than only for its dimensions.
+    /// The fixture fills its surface with one known colour, so this checks pixels rather than
+    /// only dimensions.
     #[test]
     fn a_capture_reads_the_active_windows_own_pixels() {
         let mut s = Launch::new().windows(&["cap:cap:200x160"]).start_mapped();
@@ -2189,9 +2176,8 @@ mod session_tests {
         assert_eq!(px[3], 255, "opaque");
     }
 
-    /// A capture the compositor refuses has to surface as an error, not as a blank frame. This is
-    /// the one path where a silent fallback would be invisible — a caller cannot tell an empty
-    /// image from a black window.
+    /// A refused capture must surface as an error: a caller cannot tell a blank frame from a
+    /// black window.
     #[test]
     fn a_capture_the_compositor_refuses_is_reported_as_a_failure() {
         let mut s = Launch::new().start_mapped();
@@ -2205,8 +2191,8 @@ mod session_tests {
                 height: 64,
             }))
             .expect_err("a region off the output cannot be captured");
-        // The message, not just the variant: without the `Failed` arm the capture would spin to
-        // its own deadline and report a timeout, which is the same variant and a different fault.
+        // The message, not the variant: without the `Failed` arm this reports a timeout, which is
+        // the same `CaptureFailed` and a different fault.
         assert!(
             err.to_string().contains("screencopy failed"),
             "the refusal should be reported as one, not as a timeout: {err}"
@@ -2246,8 +2232,8 @@ mod session_tests {
         assert_eq!(s.platform().get_clipboard().expect("get"), "glass wayland");
     }
 
-    /// A second write replaces the first. The owner is a live thread serving the selection, so a
-    /// re-set that started a second owner without stopping the first would race.
+    /// A re-set that started a second owner without stopping the first would race it for the
+    /// selection.
     #[test]
     fn writing_the_clipboard_twice_leaves_the_second_value() {
         let mut s = Launch::new().start();
@@ -2300,10 +2286,9 @@ mod session_tests {
         );
     }
 
-    /// Unlike the scroll sink, `glass_core::run_drag` calls `modifiers()` on every drag, so the
-    /// drag sink's `mask == 0` short circuit is live: without it an *unmodified* drag uploads a
-    /// keymap and sends a modifier frame the app never asked for. Both directions are asserted,
-    /// because only the pair distinguishes the guard from its inverse.
+    /// `glass_core::run_drag` calls `modifiers()` on every drag, so unlike the scroll sink this
+    /// guard is live — without it an unmodified drag sends a modifier frame the app never asked
+    /// for. Both directions, because only the pair distinguishes the guard from its inverse.
     #[test]
     fn a_drag_carries_its_modifiers_and_an_unmodified_one_sends_none() {
         let mut s = Launch::new().start_mapped();
@@ -2334,8 +2319,8 @@ mod session_tests {
         );
     }
 
-    /// The horizontal axis, which every other scroll test leaves at zero. It is a separate
-    /// branch with its own scale, and `axis 1` is what a compositor routes to a sideways scroll.
+    /// The horizontal axis, which every other scroll test leaves at zero — a separate branch with
+    /// its own scale.
     #[test]
     fn a_horizontal_scroll_reaches_the_window_on_the_other_axis() {
         let mut s = Launch::new().start_mapped();
@@ -2369,8 +2354,7 @@ mod session_tests {
         );
     }
 
-    /// A modifier is held across the wheel, not sent alongside it: an app reads ctrl+scroll as
-    /// zoom only if control is down when the axis arrives.
+    /// An app reads ctrl+scroll as zoom only if control is down when the axis arrives.
     #[test]
     fn a_modified_scroll_holds_the_modifier_and_releases_it() {
         let mut s = Launch::new().start_mapped();
@@ -2397,8 +2381,8 @@ mod session_tests {
         );
     }
 
-    /// An unmodified scroll must not upload a keymap or touch the modifier state at all — that
-    /// is what the `mask == 0` short circuit is for.
+    /// An unmodified scroll sends no modifier traffic. `glass_core::run_scroll` is what skips it
+    /// — this pins the wiring end to end, not the sink.
     #[test]
     fn an_unmodified_scroll_does_not_touch_the_modifiers() {
         let mut s = Launch::new().start_mapped();
@@ -2427,10 +2411,9 @@ mod session_tests {
 
     /// An app that never maps a window fails the launch with a timeout rather than hanging.
     ///
-    /// It does NOT show that the bring-up was retried, and no test currently does. Two attempts
-    /// were confirmed by instrumenting the arms, but neither is observable from outside: both
-    /// return the same `Timeout`, and elapsed time cannot separate them because one attempt already
-    /// spends the budget twice — once waiting for the socket, once for a window. See #382.
+    /// It does NOT show the bring-up was retried, and nothing does. Both attempts return the same
+    /// `Timeout`, and elapsed time cannot separate them because one attempt already spends the
+    /// budget twice — once for the socket, once for a window. See #382.
     #[test]
     fn a_launch_that_finds_no_window_times_out() {
         let mut platform = WaylandPlatform::new().expect("sway");
@@ -2455,8 +2438,8 @@ mod session_tests {
         );
     }
 
-    /// Stopping ends the session: what follows has no compositor to talk to and must say so
-    /// rather than answering from whatever the backend last saw.
+    /// After stopping there is no compositor to talk to, and the backend must say so rather than
+    /// answer from what it last saw.
     #[test]
     fn stopping_ends_the_session() {
         let mut s = Launch::new().start();
@@ -2465,10 +2448,9 @@ mod session_tests {
         assert!(matches!(err, GlassError::NoActiveSession), "{err}");
     }
 
-    /// Teardown *asks* the app to close before it signals anything. Both routes end with the app
-    /// gone, so the end state cannot tell them apart — the app's own shutdown path is the only
-    /// witness, and a signalled app never reaches it. This is the difference between an app that
-    /// flushes its state on the way out and one that reports a crash on its next launch.
+    /// Teardown *asks* before it signals. Both routes end with the app gone, so its own shutdown
+    /// path is the only witness — and a signalled app never reaches it, losing whatever it would
+    /// have flushed.
     #[test]
     fn a_cooperative_app_is_asked_to_close_and_runs_its_own_shutdown() {
         let mut s = Launch::new().start_mapped();

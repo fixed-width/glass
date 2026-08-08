@@ -413,9 +413,8 @@ pub fn get(socket: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Whether a failed read should simply be retried: a signal arrived mid-read and nothing was
-/// lost. Retrying anything else spins until the deadline and then reports a timeout, hiding the
-/// real failure behind a wait.
+/// Whether a failed read should be retried — a signal arrived and nothing was lost. Retrying
+/// anything else spins to the deadline and reports a timeout, hiding the real failure.
 fn is_retryable(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::Interrupted
 }
@@ -568,9 +567,8 @@ impl ClipboardOwner {
 }
 
 impl Drop for ClipboardOwner {
-    /// Signalling and joining the serving thread is the whole teardown. Do not add back an
-    /// inherent `stop(self)` alongside it: taking `self` by value runs this anyway, so the two
-    /// were byte-identical and a mutation that emptied `stop` changed nothing.
+    /// Do not add back an inherent `stop(self)` alongside this: taking `self` by value runs the
+    /// drop glue anyway, so the two had identical bodies and emptying `stop` changed nothing.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
@@ -667,10 +665,9 @@ fn serve_loop(
     // stop flag without blocking indefinitely.
     use std::os::fd::AsFd as _;
     loop {
-        // One stop check per iteration, after `dispatch_pending` — that is where a `Cancelled`
-        // becomes visible, and the poll below is bounded so `stop` is seen within one tick either
-        // way. A second copy at the top of the loop bought nothing and made both unkillable: a
-        // mutation to either was masked by the other still breaking.
+        // One stop check per iteration, after `dispatch_pending` where a `Cancelled` becomes
+        // visible. A second copy at the top made both unkillable — a mutation to either was
+        // masked by the other still breaking.
 
         // Flush any pending outgoing requests.
         if let Err(e) = conn.flush() {
@@ -744,9 +741,8 @@ mod tests {
     use glass_core::GlassError;
     use std::io::Write;
 
-    /// The serving thread is the clipboard: it holds the selection for as long as it runs, and
-    /// any app that pastes reads from it over a pipe. Nothing about that is fakeable below the
-    /// compositor, so these run against a real one.
+    /// The serving thread is the clipboard — it holds the selection while it runs, and a pasting
+    /// app reads from it over a pipe. Nothing under that is fakeable, so these use a real one.
     #[test]
     fn an_owner_serves_its_text_and_reports_itself_alive() {
         let s = Launch::new().start();
@@ -756,10 +752,9 @@ mod tests {
         assert_eq!(get(&socket).expect("get"), "served");
     }
 
-    /// Another client taking the selection ends this owner's job — the compositor sends it
-    /// `Cancelled` and the thread stops. Reporting itself alive afterwards is what makes
-    /// `set_clipboard` update a thread that is no longer serving anything, so the next paste
-    /// reads the other client's text.
+    /// Another client taking the selection stops this thread. Reporting itself alive afterwards
+    /// makes `set_clipboard` update a thread serving nothing, and the next paste reads the other
+    /// client's text.
     #[test]
     fn an_owner_that_lost_the_selection_stops_reporting_itself_alive() {
         let s = Launch::new().start();

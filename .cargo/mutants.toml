@@ -4,12 +4,11 @@
 # behaviour*. "Hard to test" is not enough: a deadline that only fires when the compositor is slow
 # is reachable with fault injection, and stays gated.
 #
-# Match on the whole mutant description, so a pattern must name the function it belongs to.
-# Anything broader silently takes real mutants with it — `replace >= with < in ...capture_frame`
-# reads as one exclusion and is three, two of them genuine.
+# A pattern must name the function it belongs to. Anything broader silently takes real mutants
+# with it — `replace >= with < in ...capture_frame` reads as one exclusion and is three.
 #
-# One list rather than `#[mutants::skip]` attributes, so every exclusion is reviewed together and
-# neither public crate takes a dependency to carry them.
+# One list rather than `#[mutants::skip]`, so exclusions are reviewed together and no public crate
+# takes a dependency to carry them.
 exclude_re = [
     # Empty match arms in the *reading* device dispatcher: deleting one falls through to the
     # `_ => {}` beside it, which does exactly what the arm did. They are written out to record
