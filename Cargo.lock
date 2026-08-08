@@ -1115,6 +1115,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass-exec-unix"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "glass-ios"
 version = "0.0.0"
 dependencies = [
@@ -1204,6 +1211,7 @@ name = "glass-sandbox-linux"
 version = "0.0.0"
 dependencies = [
  "glass-core",
+ "glass-exec-unix",
  "glass-sandbox-unix",
  "tempfile",
 ]
@@ -1213,6 +1221,7 @@ name = "glass-sandbox-macos"
 version = "0.0.0"
 dependencies = [
  "glass-core",
+ "glass-exec-unix",
  "glass-sandbox-unix",
  "tempfile",
 ]
