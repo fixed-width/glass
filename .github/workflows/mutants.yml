@@ -33,7 +33,8 @@ jobs:
         with:
           tool: cargo-mutants,cargo-nextest
       - name: Install the X and a11y stack glass-x11's tests drive
-        # Absent either, the unmutated baseline fails and the run grades nothing.
+        # The mutation wrapper runs the `#[ignore]`d tests (see its header); absent either
+        # package the unmutated baseline fails and the run grades nothing.
         run: sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core
       - name: Sweep
         # nextest runs each test in its own process, so slow tests overlap rather than sum.

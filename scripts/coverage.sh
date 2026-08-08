@@ -25,7 +25,8 @@
 #   scripts/coverage.sh --lcov          # also write target/llvm-cov/glass.lcov (for CI upload)
 # Extra args after a `--` are passed to the final `cargo llvm-cov report`.
 set -uo pipefail
-cd "$(dirname "$0")/.."   # -> rust/
+cd "$(dirname "$0")/.." || exit 1 # the workspace root
+. scripts/lib/have-sway.sh
 
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
     echo "coverage: cargo-llvm-cov is not installed." >&2
@@ -81,10 +82,28 @@ classify_suite() {  # label cmd...
     fi
 }
 
+# A plain `cargo test` run rather than a harness. Its output must NOT be grepped for the skip
+# sentinel the way `classify_suite` does — a self-skipping test prints "skipping" too, and one
+# of them would file the whole run as skipped.
+classify_tests() { # label cmd...
+    local label="$1" out
+    shift
+    if ! out=$("$@" 2>&1); then
+        failed+=("$label")
+        printf '%s\n' "$out" | tail -n 30
+    elif printf '%s\n' "$out" | grep -qE '^test result: ok\. 0 passed'; then
+        # Exit 0 having run nothing: every test filtered or ignored. Recording that as
+        # coverage is how a crate drops out of the report unseen.
+        failed+=("$label (ran no tests)")
+    else
+        ran+=("$label")
+    fi
+}
+
 # Always: the workspace unit tests (and the always-on integration tests). Keep
 # going on failure so a single failing test still yields a coverage report.
 echo "coverage: running workspace unit tests…"
-if cargo test --workspace --no-fail-fast >/dev/null; then ran+=("unit"); else failed+=("unit"); fi
+classify_tests unit cargo test --workspace --no-fail-fast
 
 if [ "$unit_only" -eq 0 ]; then
     # Each harness exits 0 and self-skips when its prerequisites are missing, so we
@@ -92,12 +111,20 @@ if [ "$unit_only" -eq 0 ]; then
     # test-x11.sh does NOT self-skip (it errors if Xvfb is absent), so probe first.
     echo "coverage: running X11 integration suite (needs Xvfb; sandbox_* need bubblewrap)…"
     if command -v Xvfb >/dev/null 2>&1; then
+        # The workspace run above skipped glass-x11's `#[ignore]`d display tests — half the
+        # crate's coverage.
+        classify_tests x11-unit cargo test -p glass-x11 --no-fail-fast -- --include-ignored
         classify_suite x11 ./scripts/test-x11.sh
     else
-        skipped+=("x11 (no Xvfb)")
+        skipped+=("x11-unit (no Xvfb)" "x11 (no Xvfb)")
     fi
 
     echo "coverage: running Wayland integration suite (needs sway >=1.12)…"
+    if have_sway; then
+        classify_tests wayland-unit cargo test -p glass-wayland --no-fail-fast -- --include-ignored
+    else
+        skipped+=("wayland-unit (no sway)")
+    fi
     classify_suite wayland ./scripts/test-wayland.sh
 
     echo "coverage: running AT-SPI integration suite (needs dbus/at-spi2/GTK4)…"

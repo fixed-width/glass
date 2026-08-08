@@ -41,9 +41,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      # glass-x11's Xvfb-backed tests still run here; glass-wayland's are `#[ignore]`d and run
-      # only under the mutation gate and the Wayland job.
-      - run: sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core
+      # No display stack: every test that wants one is `#[ignore]`d, here and on a bare checkout.
       - run: cargo build --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -89,6 +87,8 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 zenity at-spi2-core
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # glass-x11's display-backed unit tests are `#[ignore]`d; this is the job with a display.
+      - run: cargo test -p glass-x11 --locked -- --include-ignored
       - run: ./scripts/test-x11.sh
 
   a11y:
@@ -248,8 +248,8 @@ jobs:
         with:
           workspaces: .
       - name: Install system deps
-        # xvfb + at-spi2-core: glass-x11's unit tests start a private display each, and one starts
-        # a private a11y bus — needed by `cargo test --workspace` here, not only by the X11 suite.
+        # xvfb + at-spi2-core: the X11 suite, plus the `#[ignore]`d glass-x11 unit tests
+        # coverage.sh runs once it sees a display — absent, half the crate reports uncovered.
         # bubblewrap for the sandbox_* tests, whose unprivileged user namespaces Ubuntu 24.04
         # restricts via AppArmor (the sysctl is a no-op on images without the knob), and GTK4 for
         # the software_render test's real app.
@@ -324,7 +324,8 @@ jobs:
           tool: cargo-mutants,cargo-nextest
       - name: Install the X and a11y stack glass-x11's tests drive
         if: steps.diff.outputs.touched == 'true'
-        # Absent either, the unmutated baseline fails and the run grades nothing.
+        # The mutation wrapper runs the `#[ignore]`d tests (see its header); absent either
+        # package the unmutated baseline fails and the run grades nothing.
         run: sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core
       - name: Mutation gate
         if: steps.diff.outputs.touched == 'true'

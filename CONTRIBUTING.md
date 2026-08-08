@@ -13,6 +13,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
+Those three need nothing installed: every test wanting a display, a compositor or a device is
+`#[ignore]`d.
+
 **If you changed platform code, those three are not enough.** `cargo test --workspace` on Linux does
 not compile `cfg(target_os = "macos")` or `cfg(windows)` modules at all — it reports clean without
 having looked at them. [Verify a change](docs/how-to/verify-a-change.md) gives the per-target

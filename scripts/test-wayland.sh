@@ -12,8 +12,8 @@
 # sandbox level explicitly in the AppSpec.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-SWAY_BUNDLE="${XDG_DATA_HOME:-$HOME/.local/share}/glass/sway/bin/sway"
-if [ ! -x "$SWAY_BUNDLE" ] && ! { command -v sway >/dev/null 2>&1 && sway --version 2>/dev/null | grep -qE 'version 1\.(1[2-9]|[2-9][0-9])'; }; then
+. scripts/lib/have-sway.sh
+if ! have_sway; then
     echo "no glass-discoverable sway >=1.12; build+install via https://github.com/fixed-width/sway-build. Skipping Wayland tests."
     exit 0
 fi
