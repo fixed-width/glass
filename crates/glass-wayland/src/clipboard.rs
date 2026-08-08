@@ -462,6 +462,8 @@ fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
                     )));
                 }
             },
+            // The poll's half of the rule `is_retryable` names for the read: a signal arrived
+            // and nothing was lost. Same judgement, different error type.
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => return Err(GlassError::Backend(format!("clipboard get: poll: {e}"))),
         }

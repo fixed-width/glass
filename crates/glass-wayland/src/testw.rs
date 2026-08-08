@@ -142,6 +142,17 @@ impl Launch {
         }
     }
 
+    /// Bring the session up and wait until the fixture has mapped every window.
+    ///
+    /// A precondition, not a convenience: input delivered before a surface is mapped goes
+    /// nowhere, and the wait also clears the ready line from the sink so a later `wait_for_log`
+    /// sees only what the test itself caused.
+    pub(crate) fn start_mapped(self) -> Session {
+        let mut s = self.start();
+        s.wait_for_log(READY_LINE);
+        s
+    }
+
     /// Bring the session up. Panics if it does not start — a test that wants the failure calls
     /// `start_app` itself with [`Launch::spec`].
     pub(crate) fn start(self) -> Session {
@@ -183,11 +194,8 @@ impl Session {
 
     /// The session's wayland socket — what the clipboard opens its own connection to.
     pub(crate) fn wayland_socket(&self) -> std::path::PathBuf {
-        let dir = self
-            .platform
-            .session_runtime_dir()
-            .expect("a started session has a runtime dir");
-        crate::platform::find_wayland_socket(dir).expect("the session has a wayland socket")
+        crate::platform::find_wayland_socket(&self.runtime_dir())
+            .expect("the session has a wayland socket")
     }
 
     /// The title of the window sway currently reports as focused.

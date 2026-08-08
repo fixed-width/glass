@@ -1902,8 +1902,7 @@ mod session_tests {
     /// the fixture echoes the surface-local point it was given back through its own stdout.
     #[test]
     fn a_pointer_move_arrives_at_the_requested_window_relative_point() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         s.platform()
             .send_pointer(&PointerEvent::Move { x: 40, y: 30 })
             .expect("move");
@@ -1918,8 +1917,7 @@ mod session_tests {
     /// window at (0, 0) a window-relative and an output-absolute point are the same number.
     #[test]
     fn a_pointer_move_is_relative_to_a_window_that_is_not_at_the_origin() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         s.platform()
             .window(&WindowOp::Move { x: 100, y: 80 })
             .expect("move the window");
@@ -1935,8 +1933,7 @@ mod session_tests {
 
     #[test]
     fn a_click_presses_and_releases_the_button_over_the_window() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         s.platform()
             .send_pointer(&PointerEvent::Click {
                 x: 20,
@@ -1963,8 +1960,7 @@ mod session_tests {
 
     #[test]
     fn a_scroll_reaches_the_window_as_an_axis_event() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         s.platform()
             .send_pointer(&PointerEvent::Scroll {
                 x: 20,
@@ -2030,8 +2026,7 @@ mod session_tests {
     /// events are sent, and simply do not arrive.
     #[test]
     fn the_event_clock_advances_across_a_drag() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         s.platform()
             .send_pointer(&PointerEvent::Drag {
                 from_x: 20,
@@ -2112,8 +2107,7 @@ mod session_tests {
 
     #[test]
     fn typed_text_reaches_the_window_as_key_events() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         s.platform()
             .send_key(&KeyEvent::Text("hi".into()))
             .expect("type");
@@ -2124,8 +2118,7 @@ mod session_tests {
 
     #[test]
     fn a_chord_holds_its_modifier_across_the_key() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         s.platform()
             .send_key(&KeyEvent::Chord("ctrl+a".into()))
             .expect("chord");
@@ -2150,8 +2143,7 @@ mod session_tests {
     /// for pixel rather than only for its dimensions.
     #[test]
     fn a_capture_reads_the_active_windows_own_pixels() {
-        let mut s = Launch::new().windows(&["cap:cap:200x160"]).start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().windows(&["cap:cap:200x160"]).start_mapped();
         let frame = s.platform().capture_frame(None).expect("capture");
         assert_eq!((frame.width, frame.height), (200, 160));
         let px = &frame.pixels[..4];
@@ -2167,8 +2159,7 @@ mod session_tests {
     /// for exactly that rectangle of the output.
     #[test]
     fn a_capture_region_is_relative_to_the_window() {
-        let mut s = Launch::new().windows(&["cap:cap:200x160"]).start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().windows(&["cap:cap:200x160"]).start_mapped();
         s.platform()
             .window(&WindowOp::Move { x: 60, y: 40 })
             .expect("move");
@@ -2215,8 +2206,7 @@ mod session_tests {
 
     #[test]
     fn a_drag_presses_moves_and_releases_over_the_window() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         s.platform()
             .send_pointer(&PointerEvent::Drag {
                 from_x: 20,
@@ -2258,8 +2248,7 @@ mod session_tests {
     /// because only the pair distinguishes the guard from its inverse.
     #[test]
     fn a_drag_carries_its_modifiers_and_an_unmodified_one_sends_none() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         let drag = |modifiers: Vec<glass_core::keys::Modifier>| PointerEvent::Drag {
             from_x: 20,
             from_y: 20,
@@ -2291,8 +2280,7 @@ mod session_tests {
     /// zoom only if control is down when the axis arrives.
     #[test]
     fn a_modified_scroll_holds_the_modifier_and_releases_it() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         s.platform()
             .send_pointer(&PointerEvent::Scroll {
                 x: 20,
@@ -2320,8 +2308,7 @@ mod session_tests {
     /// is what the `mask == 0` short circuit is for.
     #[test]
     fn an_unmodified_scroll_does_not_touch_the_modifiers() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         let before = s
             .platform()
             .drain_logs()
@@ -2391,8 +2378,7 @@ mod session_tests {
     /// flushes its state on the way out and one that reports a crash on its next launch.
     #[test]
     fn a_cooperative_app_is_asked_to_close_and_runs_its_own_shutdown() {
-        let mut s = Launch::new().start();
-        s.wait_for_log(READY_LINE);
+        let mut s = Launch::new().start_mapped();
         s.platform().stop_app().expect("stop");
         // Bounded rather than a single drain: the readers are separate threads, and the line is
         // still in flight when `stop_app` returns.
