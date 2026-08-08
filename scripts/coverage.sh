@@ -25,7 +25,8 @@
 #   scripts/coverage.sh --lcov          # also write target/llvm-cov/glass.lcov (for CI upload)
 # Extra args after a `--` are passed to the final `cargo llvm-cov report`.
 set -uo pipefail
-cd "$(dirname "$0")/.."   # -> rust/
+cd "$(dirname "$0")/.." || exit 1 # the workspace root
+. scripts/lib/have-sway.sh
 
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
     echo "coverage: cargo-llvm-cov is not installed." >&2
@@ -81,15 +82,21 @@ classify_suite() {  # label cmd...
     fi
 }
 
-# A plain `cargo test` run rather than a harness: no skip sentinel to read, so the exit
-# status is the whole story.
+# A plain `cargo test` run rather than a harness. Its output must NOT be grepped for the skip
+# sentinel the way `classify_suite` does — a self-skipping test prints "skipping" too, and one
+# of them would file the whole run as skipped.
 classify_tests() { # label cmd...
-    local label="$1"
+    local label="$1" out
     shift
-    if "$@" >/dev/null; then
-        ran+=("$label")
-    else
+    if ! out=$("$@" 2>&1); then
         failed+=("$label")
+        printf '%s\n' "$out" | tail -n 30
+    elif printf '%s\n' "$out" | grep -qE '^test result: ok\. 0 passed'; then
+        # Exit 0 having run nothing: every test filtered or ignored. Recording that as coverage
+        # is how a crate drops out of the report without anyone seeing it go.
+        failed+=("$label (ran no tests)")
+    else
+        ran+=("$label")
     fi
 }
 
@@ -109,11 +116,11 @@ if [ "$unit_only" -eq 0 ]; then
         classify_tests x11-unit cargo test -p glass-x11 --no-fail-fast -- --include-ignored
         classify_suite x11 ./scripts/test-x11.sh
     else
-        skipped+=("x11 (no Xvfb)")
+        skipped+=("x11-unit (no Xvfb)" "x11 (no Xvfb)")
     fi
 
     echo "coverage: running Wayland integration suite (needs sway >=1.12)…"
-    if command -v sway >/dev/null 2>&1; then
+    if have_sway; then
         classify_tests wayland-unit cargo test -p glass-wayland --no-fail-fast -- --include-ignored
     else
         skipped+=("wayland-unit (no sway)")

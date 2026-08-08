@@ -3,8 +3,11 @@
 //! Half this backend's coverage lives elsewhere: the `#[ignore]`d X11 suite in
 //! `crates/glass-testapp/tests/integration.rs` drives it end to end against a real app
 //! (`scripts/test-x11.sh`). Do not read "no test here" as untested. The two halves do not
-//! substitute for each other — that suite cannot kill a mutant, because the gate's test run is
-//! scoped to the gated packages and that suite is in another one.
+//! substitute for each other — that suite cannot kill a mutant, because cargo-mutants scopes
+//! each mutant's test run to the package the mutant is in, and `glass-testapp` is not gated.
+//!
+//! This crate's own display-backed tests are `#[ignore]`d so a bare checkout can run the suite;
+//! `cargo test -p glass-x11 -- --include-ignored` runs them.
 
 #![cfg(target_os = "linux")]
 

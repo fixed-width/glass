@@ -29,17 +29,23 @@
 #
 #   scripts/mutants.sh target/mutants                      # the whole default crate
 #   scripts/mutants.sh target/mutants --in-diff pr.diff    # only what a diff touched
-#   scripts/mutants.sh target/mutants --package glass-android
-#   scripts/mutants.sh target/mutants --package glass-core --package glass-android
+#   scripts/mutants.sh target/mutants --package glass-android --test-tool nextest
+#   scripts/mutants.sh target/mutants --package glass-core --package glass-x11
 #
 # `--package` is read here, not forwarded: it sets the `--file` glob too, and forwarding it
 # alone would mutate only the default package's files under a widened package set — a clean
 # run over a crate that was never in scope. Repeat it for more.
 #
-# Ignored tests are run, and that is set here rather than left to the caller: both test runners
-# skip `#[ignore]` by default, and a mutant no test ran against is graded caught, so a crate
-# whose display-dependent tests are ignored would sweep clean having tested nothing. A caller
-# who forgets the flag would see that as a pass.
+# Ignored tests are run, and that is set here rather than left to the caller: a crate whose
+# display-backed tests are `#[ignore]`d would otherwise have every mutant those tests cover come
+# back a survivor, failing the run over code that is in fact tested.
+#
+# The hazard in the other direction is narrower than it looks, and worth stating exactly, because
+# the obvious guess is wrong. cargo-mutants grades a mutant caught when the test command exits
+# NON-ZERO (`outcome.rs`), so a run that tests nothing and exits 0 is a survivor — loud. Only one
+# shape is silent: nextest exits 4 when no test matched, and cargo-mutants lists that among its
+# allowed nextest codes, so a package left with zero tests grades every mutant caught with no
+# warning. Keep every gated package's test set non-empty (see the filterset below).
 #
 # MUTANTS_JOBS sets concurrency (default 2); `--jobs` cannot be passed through,
 # because cargo-mutants rejects it twice over.
@@ -104,22 +110,30 @@ for p in "${packages[@]}"; do
     pkg_args+=(--package "$p")
 done
 
-# glass-android's integration binaries are all AVD loops, and there is no device here — every
-# test in them is `#[ignore]`d, so excluding them costs the run nothing today. Getting this
-# wrong fails loudly: an excluded test kills no mutant and a survivor fails the run, which is
-# the opposite of what a missing `--run-ignored` does.
-readonly NO_DEVICE='not (package(glass-android) and kind(test))'
+# Running the ignored tests reaches glass-android's device tests, which have no device here.
+# Excluded rather than made to self-skip: a hardware test that passes without its hardware
+# asserts nothing and says so nowhere (the same reasoning as glass-macos `process.rs`).
+#
+# This filterset must leave at least one test in every gated package — empty is the one input
+# nextest reports in a way cargo-mutants reads as every mutant caught (see the header).
+readonly NEEDS_A_DEVICE='(package(glass-android) and kind(test))
+    or test(=adb::tests::a_shell_call_that_never_answers_dies_at_its_budget)'
 
 # Run the `#[ignore]`d tests too (see the header). cargo-mutants appends these to the end of the
 # test command and to the test phase only, so the nextest flag needs no `--` and the cargo one
-# does. A test ignored because it needs hardware must self-skip when that hardware is absent —
-# `#[ignore]` no longer keeps it from running here.
+# does.
 case " ${passthrough[*]-} " in
     *" --test-tool nextest "* | *" --test-tool=nextest "*)
         run_ignored=(--cargo-test-arg=--run-ignored=all
-            --cargo-test-arg=-E --cargo-test-arg="$NO_DEVICE")
+            --cargo-test-arg=-E --cargo-test-arg="not ($NEEDS_A_DEVICE)")
         ;;
     *)
+        # `cargo test` takes no filterset, so the device tests cannot be excluded here.
+        if printf '%s\n' "${packages[@]}" | grep -qx glass-android; then
+            echo "glass-android's tests need a device, and only the nextest path can filter" >&2
+            echo "them out — re-run with --test-tool nextest." >&2
+            exit 2
+        fi
         run_ignored=(--cargo-test-arg=-- --cargo-test-arg=--include-ignored)
         ;;
 esac
@@ -129,8 +143,24 @@ esac
 # question is answered before a single mutant is compiled — and answered for the whole
 # run rather than for one shard, which may legitimately receive none.
 list_count() {
-    cargo mutants --list "${pkg_args[@]}" "$@" \
-        ${diff_file:+--in-diff "$diff_file"} 2>/dev/null | wc -l
+    # stderr to a file, not into stdout: it is the count of the lines below, and a cargo
+    # warning merged in would inflate it. Discarding it instead — what this used to do — makes
+    # a failed `--list` take the whole script down under `set -e` with an empty log, never
+    # reaching the "gated nothing" message.
+    local out err rc=0
+    err=$(mktemp)
+    out=$(cargo mutants --list "${pkg_args[@]}" "$@" \
+        ${diff_file:+--in-diff "$diff_file"} 2>"$err") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "cargo mutants --list failed, so whether this run would gate anything is unknown:" >&2
+        cat "$err" >&2
+        rm -f "$err"
+        exit 2
+    fi
+    rm -f "$err"
+    # `printf` on an empty string still emits a newline, which `wc -l` would count as one mutant.
+    [ -z "$out" ] && { echo 0; return; }
+    printf '%s\n' "$out" | wc -l
 }
 
 total=0 caught=0 missed=0 timed_out=0 unviable=0 status=0

@@ -16,7 +16,8 @@ cargo test --workspace --locked
 `--workspace` resolves on Linux, macOS and Windows alike: the platform crates gate themselves, so
 the ones that do not apply to your host compile to nothing rather than failing.
 
-Integration tests are `#[ignore]`d and do not run here — see [below](#integration-suites-linux).
+They need nothing installed. Anything wanting a display, a compositor or a device is
+`#[ignore]`d and does not run here — see [below](#integration-suites-linux).
 
 ## The gap this guide exists for
 
@@ -91,6 +92,15 @@ command from Linux.
 ```
 
 Pass a substring to run one test.
+
+The X11 and Wayland **backend crates** also keep their display-backed unit tests behind
+`#[ignore]`, and no harness script runs those — if you changed `glass-x11` or `glass-wayland`,
+the command above covers the end-to-end suite but not them:
+
+```bash
+cargo test -p glass-x11 -- --include-ignored       # 73 tests; needs xvfb + at-spi2-core
+cargo test -p glass-wayland -- --include-ignored   # 61 tests; needs sway >= 1.12, Mesa, Xwayland
+```
 
 ## What only CI or a real host can do
 

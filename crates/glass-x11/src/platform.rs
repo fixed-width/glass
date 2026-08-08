@@ -1540,10 +1540,33 @@ mod tests {
         let h = hint(None, None);
         assert!(!hint_matches(Some("anything"), Some(("a", "b")), &h));
     }
+
+    #[test]
+    fn a_clip_note_is_produced_only_when_the_capture_was_clipped() {
+        use crate::coords::ClippedRect;
+        let clipped = ClippedRect {
+            sx: 0,
+            sy: 0,
+            w: 320,
+            h: 200,
+            clipped: true,
+        };
+        let note = super::clip_note(&clipped).expect("a clipped capture must say so");
+        assert!(note.contains("320x200"), "{note}");
+        assert!(
+            super::clip_note(&ClippedRect {
+                clipped: false,
+                ..clipped
+            })
+            .is_none(),
+            "an unclipped capture has nothing to report"
+        );
+    }
 }
 
 /// Everything the backend can only do against a real display: enumerating windows, reading
-/// their properties, translating the server's errors, and driving XTEST.
+/// their properties, translating the server's errors, and driving XTEST. Every test here is
+/// `#[ignore]`d — that is what the module is for, so a display-free test does not belong in it.
 #[cfg(test)]
 mod display_tests {
     use super::*;
@@ -3044,28 +3067,6 @@ mod display_tests {
             (px[0], px[1], px[2]),
             (0xff, 0x00, 0x00),
             "the red window should read back as red, got {px:?}"
-        );
-    }
-
-    #[test]
-    fn a_clip_note_is_produced_only_when_the_capture_was_clipped() {
-        use crate::coords::ClippedRect;
-        let clipped = ClippedRect {
-            sx: 0,
-            sy: 0,
-            w: 320,
-            h: 200,
-            clipped: true,
-        };
-        let note = clip_note(&clipped).expect("a clipped capture must say so");
-        assert!(note.contains("320x200"), "{note}");
-        assert!(
-            clip_note(&ClippedRect {
-                clipped: false,
-                ..clipped
-            })
-            .is_none(),
-            "an unclipped capture has nothing to report"
         );
     }
 
