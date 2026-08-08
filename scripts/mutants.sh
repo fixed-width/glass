@@ -40,12 +40,11 @@
 # display-backed tests are `#[ignore]`d would otherwise have every mutant those tests cover come
 # back a survivor, failing the run over code that is in fact tested.
 #
-# The hazard in the other direction is narrower than it looks, and worth stating exactly, because
-# the obvious guess is wrong. cargo-mutants grades a mutant caught when the test command exits
-# NON-ZERO (`outcome.rs`), so a run that tests nothing and exits 0 is a survivor — loud. Only one
-# shape is silent: nextest exits 4 when no test matched, and cargo-mutants lists that among its
-# allowed nextest codes, so a package left with zero tests grades every mutant caught with no
-# warning. Keep every gated package's test set non-empty (see the filterset below).
+# The silent direction is narrower than the obvious guess. cargo-mutants grades a mutant caught
+# when the test command exits NON-ZERO (`outcome.rs`), so a run that tests nothing and exits 0 is
+# a survivor — loud. Only nextest is quiet: it exits 4 when no test matched, and cargo-mutants
+# lists that among its allowed codes, so a package left with zero tests grades every mutant
+# caught with no warning. Keep every gated package's test set non-empty.
 #
 # MUTANTS_JOBS sets concurrency (default 2); `--jobs` cannot be passed through,
 # because cargo-mutants rejects it twice over.
@@ -112,10 +111,10 @@ done
 
 # Running the ignored tests reaches glass-android's device tests, which have no device here.
 # Excluded rather than made to self-skip: a hardware test that passes without its hardware
-# asserts nothing and says so nowhere (the same reasoning as glass-macos `process.rs`).
+# asserts nothing and says so nowhere — same reasoning as glass-macos `process.rs`.
 #
-# This filterset must leave at least one test in every gated package — empty is the one input
-# nextest reports in a way cargo-mutants reads as every mutant caught (see the header).
+# This filterset must leave at least one test in every gated package: empty is the one input
+# nextest reports in a way cargo-mutants reads as every mutant caught.
 readonly NEEDS_A_DEVICE='(package(glass-android) and kind(test))
     or test(=adb::tests::a_shell_call_that_never_answers_dies_at_its_budget)'
 
@@ -143,10 +142,9 @@ esac
 # question is answered before a single mutant is compiled — and answered for the whole
 # run rather than for one shard, which may legitimately receive none.
 list_count() {
-    # stderr to a file, not into stdout: it is the count of the lines below, and a cargo
-    # warning merged in would inflate it. Discarding it instead — what this used to do — makes
-    # a failed `--list` take the whole script down under `set -e` with an empty log, never
-    # reaching the "gated nothing" message.
+    # stderr to a file, not into stdout, which is counted below — a cargo warning merged in
+    # would inflate the count. Do not discard it either: a failed `--list` then takes the whole
+    # script down under `set -e` with an empty log, never reaching the "gated nothing" message.
     local out err rc=0
     err=$(mktemp)
     out=$(cargo mutants --list "${pkg_args[@]}" "$@" \

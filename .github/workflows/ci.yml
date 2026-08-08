@@ -41,8 +41,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      # No display stack: every test that wants one is `#[ignore]`d, so this job — and a
-      # contributor's bare checkout — needs nothing installed.
+      # No display stack: every test that wants one is `#[ignore]`d, here and on a bare checkout.
       - run: cargo build --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -88,8 +87,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 zenity at-spi2-core
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-      # glass-x11's display-backed unit tests are `#[ignore]`d so a bare checkout can run the
-      # suite; this is the job with the display, so it is where they run.
+      # glass-x11's display-backed unit tests are `#[ignore]`d; this is the job with a display.
       - run: cargo test -p glass-x11 --locked -- --include-ignored
       - run: ./scripts/test-x11.sh
 
@@ -250,9 +248,8 @@ jobs:
         with:
           workspaces: .
       - name: Install system deps
-        # xvfb + at-spi2-core: the X11 suite, and the `#[ignore]`d glass-x11 unit tests
-        # coverage.sh runs explicitly once it sees a display — without them that half of the
-        # crate reports uncovered rather than skipped.
+        # xvfb + at-spi2-core: the X11 suite, plus the `#[ignore]`d glass-x11 unit tests
+        # coverage.sh runs once it sees a display — absent, half the crate reports uncovered.
         # bubblewrap for the sandbox_* tests, whose unprivileged user namespaces Ubuntu 24.04
         # restricts via AppArmor (the sysctl is a no-op on images without the knob), and GTK4 for
         # the software_render test's real app.

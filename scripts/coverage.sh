@@ -92,8 +92,8 @@ classify_tests() { # label cmd...
         failed+=("$label")
         printf '%s\n' "$out" | tail -n 30
     elif printf '%s\n' "$out" | grep -qE '^test result: ok\. 0 passed'; then
-        # Exit 0 having run nothing: every test filtered or ignored. Recording that as coverage
-        # is how a crate drops out of the report without anyone seeing it go.
+        # Exit 0 having run nothing: every test filtered or ignored. Recording that as
+        # coverage is how a crate drops out of the report unseen.
         failed+=("$label (ran no tests)")
     else
         ran+=("$label")
@@ -111,8 +111,8 @@ if [ "$unit_only" -eq 0 ]; then
     # test-x11.sh does NOT self-skip (it errors if Xvfb is absent), so probe first.
     echo "coverage: running X11 integration suite (needs Xvfb; sandbox_* need bubblewrap)…"
     if command -v Xvfb >/dev/null 2>&1; then
-        # The workspace run above skipped glass-x11's display-backed unit tests, which are
-        # `#[ignore]`d — half the crate's coverage, and this host has the display they want.
+        # The workspace run above skipped glass-x11's `#[ignore]`d display tests — half the
+        # crate's coverage.
         classify_tests x11-unit cargo test -p glass-x11 --no-fail-fast -- --include-ignored
         classify_suite x11 ./scripts/test-x11.sh
     else
