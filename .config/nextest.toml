@@ -1,0 +1,9 @@
+# A mutation that stops the code terminating is graded "timeout" rather than caught: the run
+# spends the whole mutation budget and nothing says whether a test would have caught it. A per-test
+# bound turns the hang into an ordinary failure, which is what a caught mutant looks like.
+#
+# The period is far above anything real here. The slowest unit test in the workspace starts a
+# headless compositor and finishes in a few seconds; integration suites are `#[ignore]`d and do not
+# run under this profile. Raise it rather than removing it if a legitimate test ever approaches it.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 2 }

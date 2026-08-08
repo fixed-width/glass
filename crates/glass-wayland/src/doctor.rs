@@ -17,7 +17,7 @@ use crate::swayipc::Ipc;
 /// a headless sway to prove it actually starts.
 pub fn checks(deep: bool) -> Vec<Check> {
     let sway = discover_sway();
-    let gl = gl_present();
+    let gl = gl_present_in(EGL_SONAMES, DRI_DIRS);
     let deep_spawn = match (deep, &sway) {
         (true, Ok((path, _))) => Some(probe_sway(path)),
         _ => None,
@@ -107,10 +107,7 @@ const DRI_DIRS: &[&str] = &[
 ];
 
 /// Heuristic check for the host Mesa software-GL stack the headless sway needs.
-fn gl_present() -> bool {
-    gl_present_in(EGL_SONAMES, DRI_DIRS)
-}
-
+///
 /// Both halves must be present: libEGL alone cannot render without a software DRI driver, and a
 /// driver is unreachable without the loader. Either swrast name counts — Mesa ships `swrast_dri`
 /// and `kms_swrast_dri` and a host may carry only one.

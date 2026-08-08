@@ -27,6 +27,8 @@ const WINDOWS: &str = "GLASS_TESTW_WINDOWS";
 /// Set to make the fixture ignore `xdg_toplevel.close` — an app with no shutdown path, which
 /// teardown has to fall back to signalling.
 const IGNORES_CLOSE: &str = "GLASS_TESTW_IGNORES_CLOSE";
+/// Set to make the fixture an X11 client, reaching the compositor through Xwayland.
+const USE_X11: &str = "GLASS_TESTW_X11";
 /// Printed by the fixture once every window is mapped, so a log test has a line it can wait for.
 pub(crate) const READY_LINE: &str = "testw: windows mapped";
 
@@ -80,6 +82,12 @@ impl Launch {
         self.env(IGNORES_CLOSE, "1")
     }
 
+    /// Reach the compositor through Xwayland instead of natively. sway starts Xwayland lazily —
+    /// no X client, no process — so this is what puts an X11 side on the session at all.
+    pub(crate) fn through_xwayland(self) -> Launch {
+        self.env(USE_X11, "1")
+    }
+
     /// The `AppSpec` this launch describes, without starting anything — for the tests that drive
     /// `start_app` themselves.
     pub(crate) fn spec(&self) -> AppSpec {
@@ -109,9 +117,12 @@ impl Launch {
     pub(crate) fn start(self) -> Session {
         let spec = self.spec();
         let mut platform = WaylandPlatform::new().expect("a sway should be discoverable");
-        platform
-            .start_app(&spec)
-            .expect("the fixture app should start");
+        if let Err(e) = platform.start_app(&spec) {
+            // What the compositor and the app said on the way down. A bare `Timeout(15000)` says
+            // only that no window arrived, which is the one thing already known.
+            let said: Vec<String> = platform.drain_logs().into_iter().map(|(_, l)| l).collect();
+            panic!("the fixture app should start: {e}\nthe session said: {said:#?}");
+        }
         let dir = platform
             .session_runtime_dir()
             .expect("a started session has a runtime dir")
@@ -129,6 +140,15 @@ impl Session {
     /// The compositor's window list, read over a connection the backend does not own.
     pub(crate) fn windows(&mut self) -> Vec<SwayWindow> {
         self.ipc.windows().expect("the observer should reach sway")
+    }
+
+    /// The session's private runtime dir — what identifies its own Xwayland among any other X
+    /// servers on this machine.
+    pub(crate) fn runtime_dir(&self) -> std::path::PathBuf {
+        self.platform
+            .session_runtime_dir()
+            .expect("a started session has a runtime dir")
+            .to_path_buf()
     }
 
     /// The session's wayland socket — what the clipboard opens its own connection to.
@@ -217,7 +237,65 @@ fn parse_specs(s: &str) -> Vec<Spec> {
 #[ignore = "the fixture app sway launches, not a test"]
 fn fixture() {
     let specs = parse_specs(&std::env::var(WINDOWS).expect("the launcher sets the window list"));
-    app::run(&specs);
+    if std::env::var_os(USE_X11).is_some() {
+        x11_app::run(&specs);
+    } else {
+        app::run(&specs);
+    }
+}
+
+/// The same windows, as an X11 client. Connecting is what makes sway spawn the session's
+/// Xwayland, so this is the only way a test reaches the recovery machinery at all.
+mod x11_app {
+    use super::{READY_LINE, Spec};
+    use std::io::Write as _;
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+    use x11rb::wrapper::ConnectionExt as _;
+
+    pub(super) fn run(specs: &[Spec]) {
+        let (conn, screen_num) = x11rb::connect(None).expect("the app should reach Xwayland");
+        let screen = &conn.setup().roots[screen_num];
+        for s in specs {
+            let win = conn.generate_id().expect("id");
+            conn.create_window(
+                screen.root_depth,
+                win,
+                screen.root,
+                0,
+                0,
+                s.width as u16,
+                s.height as u16,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                screen.root_visual,
+                // As glass-testapp does. A window with no background and no event mask is one
+                // wlroots' xwayland never gives a view — it reaches the X server and sway never
+                // lists it, which reads as the lost-toplevel bug rather than as a bare fixture.
+                &CreateWindowAux::new()
+                    .background_pixel(screen.black_pixel)
+                    .event_mask(
+                        x11rb::protocol::xproto::EventMask::EXPOSURE
+                            | x11rb::protocol::xproto::EventMask::STRUCTURE_NOTIFY,
+                    ),
+            )
+            .expect("create_window");
+            conn.change_property8(
+                x11rb::protocol::xproto::PropMode::REPLACE,
+                win,
+                x11rb::protocol::xproto::AtomEnum::WM_NAME,
+                x11rb::protocol::xproto::AtomEnum::STRING,
+                s.title.as_bytes(),
+            )
+            .expect("WM_NAME");
+            conn.map_window(win).expect("map_window");
+        }
+        conn.sync().expect("sync");
+        println!("{READY_LINE}");
+        std::io::stdout().flush().expect("flush");
+        // Stay up until the connection goes away with the compositor.
+        while conn.wait_for_event().is_ok() {}
+    }
 }
 
 mod app {

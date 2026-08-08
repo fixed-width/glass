@@ -563,17 +563,12 @@ impl ClipboardOwner {
     pub fn is_alive(&self) -> bool {
         !self.stop.load(Ordering::Relaxed)
     }
-
-    /// Signal the thread to stop and join it.
-    pub fn stop(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
 }
 
 impl Drop for ClipboardOwner {
+    /// Signalling and joining the serving thread is the whole teardown. Do not add back an
+    /// inherent `stop(self)` alongside it: taking `self` by value runs this anyway, so the two
+    /// were byte-identical and a mutation that emptied `stop` changed nothing.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
@@ -758,6 +753,27 @@ mod tests {
         assert_eq!(get(&socket).expect("get"), "served");
     }
 
+    /// Another client taking the selection ends this owner's job — the compositor sends it
+    /// `Cancelled` and the thread stops. Reporting itself alive afterwards is what makes
+    /// `set_clipboard` update a thread that is no longer serving anything, so the next paste
+    /// reads the other client's text.
+    #[test]
+    fn an_owner_that_lost_the_selection_stops_reporting_itself_alive() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let first = ClipboardOwner::spawn(socket.clone(), "mine".into()).expect("spawn");
+        let _second = ClipboardOwner::spawn(socket.clone(), "theirs".into()).expect("spawn");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while first.is_alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !first.is_alive(),
+            "an owner the compositor cancelled is not still serving"
+        );
+        assert_eq!(get(&socket).expect("get"), "theirs");
+    }
+
     /// Updating in place is what lets a second write reuse the thread. If `set_text` did nothing
     /// the old value would keep being served, with nothing to say it had gone stale.
     #[test]
@@ -770,21 +786,9 @@ mod tests {
         assert_eq!(get(&socket).expect("get"), "after");
     }
 
-    /// Stopping gives up the selection. A thread that kept running would keep answering pastes
+    /// Dropping gives up the selection. A thread that kept running would keep answering pastes
     /// after glass believed the clipboard was released — and would still be holding the wayland
     /// socket when the session tore down around it.
-    #[test]
-    fn stopping_an_owner_gives_up_the_selection() {
-        let s = Launch::new().start();
-        let socket = s.wayland_socket();
-        let owner = ClipboardOwner::spawn(socket.clone(), "transient".into()).expect("spawn");
-        assert_eq!(get(&socket).expect("get"), "transient");
-        owner.stop();
-        assert_eq!(get(&socket).expect("get"), "", "the selection is released");
-    }
-
-    /// Dropping is the same teardown by another route — the one that runs when a session ends
-    /// without anyone calling `stop`.
     #[test]
     fn dropping_an_owner_gives_up_the_selection() {
         let s = Launch::new().start();

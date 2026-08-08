@@ -106,9 +106,7 @@ impl WaylandPlatform {
     /// not a display client would be left running.
     fn kill_session(&mut self) {
         // Tear down the clipboard owner thread before the wayland socket disappears.
-        if let Some(owner) = self.clipboard_owner.take() {
-            owner.stop();
-        }
+        drop(self.clipboard_owner.take());
         if let Some(mut s) = self.active.take() {
             // Snapshot the launch (sway, Xwayland, the app and anything it forked) before any of
             // it exits: once sway is reaped its descendants are reparented to init and can no

@@ -659,6 +659,60 @@ mod x_tests {
 }
 
 #[cfg(test)]
+mod session_tests {
+    //! Finding the session's own Xwayland. The scan reads `/proc`, so it can only be exercised
+    //! against a real one — and only a real session proves the match is by runtime directory
+    //! rather than by whatever `DISPLAY` happens to be set on this machine.
+    use super::*;
+    use crate::testw::Launch;
+
+    #[test]
+    fn the_sessions_own_xwayland_is_found_by_its_runtime_dir() {
+        let s = Launch::new().through_xwayland().start();
+        let display = session_display(&s.runtime_dir()).expect("sway starts an Xwayland");
+        assert!(
+            is_display_arg(&display),
+            "a bare display token: {display:?}"
+        );
+        // The whole point of matching on the runtime dir: never the user's own desktop.
+        assert_ne!(
+            Some(display.as_str()),
+            std::env::var("DISPLAY").ok().as_deref(),
+            "the session's Xwayland must not be the host's X server"
+        );
+    }
+
+    /// A runtime dir no Xwayland holds has no X11 side — a native Wayland session, which never
+    /// takes the path recovery exists for. Answering with some other session's display would
+    /// point the probe at windows this session does not own.
+    #[test]
+    fn a_runtime_dir_no_xwayland_holds_has_no_display() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(session_display(dir.path()), None);
+    }
+
+    /// The scan has to find real Xwayland processes: an empty list reads as "no X11 side" and
+    /// a placeholder pid would send `is_xwayland` and teardown at whatever process holds it.
+    #[test]
+    fn the_scan_finds_real_xwayland_processes() {
+        let _s = Launch::new().through_xwayland().start();
+        let pids = xwayland_pids();
+        assert!(!pids.is_empty(), "the session's own Xwayland is running");
+        for pid in &pids {
+            assert!(*pid > 1, "no placeholder pids: {pids:?}");
+            assert!(is_xwayland(*pid), "pid {pid} was reported as Xwayland");
+        }
+    }
+
+    /// Teardown uses this to tell the compositor's own plumbing from the app's processes, so a
+    /// blanket `true` would make it stop waiting on the app entirely.
+    #[test]
+    fn this_test_process_is_not_an_xwayland() {
+        assert!(!is_xwayland(std::process::id()));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -700,6 +754,18 @@ mod tests {
             r.warned,
             "a warning that never arms the flag repeats forever"
         );
+    }
+
+    /// A bare `:N` and nothing else. `:` alone is not a display, and accepting it would send the
+    /// probe at whatever `x11rb` makes of an empty number.
+    #[test]
+    fn a_colon_with_no_number_is_not_a_display() {
+        assert!(is_display_arg(":0"));
+        assert!(is_display_arg(":12"));
+        assert!(!is_display_arg(":"), "no number");
+        assert!(!is_display_arg(":0.0"), "screen-qualified");
+        assert!(!is_display_arg("host:0"), "host-qualified");
+        assert!(!is_display_arg("-rootless"));
     }
 
     #[test]
