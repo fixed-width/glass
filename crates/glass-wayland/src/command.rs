@@ -127,9 +127,9 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
 /// Those tests run under `cargo mutants`, which SIGKILLs the test process when a mutant exceeds
 /// its timeout. Mutations that remove a bound (a discovery deadline, a screencopy event arm,
 /// `Drop`) hang the run while it holds live sessions, so no teardown runs and every compositor in
-/// flight is orphaned. Each one keeps an X display number for as long as it lives, and a host that
-/// runs out of them cannot start Xwayland at all — after which later mutants fail for an
-/// environmental reason and are graded on it.
+/// flight is orphaned. Each one holds an X display number for as long as it lives, and wlroots
+/// gives up after a bounded search for a free one — so a sweep that leaks enough of them reaches a
+/// point where no session can start Xwayland, and later mutants are graded on that instead.
 ///
 /// **Not production behaviour, deliberately** — but not for the reason it is tempting to give.
 /// `PR_SET_PDEATHSIG` is scoped to the thread that forked, and glass-mcp already accounts for

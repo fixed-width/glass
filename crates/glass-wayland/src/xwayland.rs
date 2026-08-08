@@ -436,8 +436,8 @@ fn confirmed_lost(missing_now: &[u32], missing_before: &HashSet<u32>) -> Vec<u32
 #[cfg(test)]
 mod x_tests {
     //! [`XProbe`] against a real X server. The probe reads and writes X protocol, so there is
-    //! nothing to fake underneath it; a private Xvfb is an order of magnitude cheaper to start
-    //! than the compositor whose Xwayland it stands in for, and the protocol is the same.
+    //! nothing to fake underneath it; a private Xvfb is markedly cheaper to start than the
+    //! compositor whose Xwayland it stands in for, and speaks the same protocol.
     use super::*;
     use x11rb::protocol::xproto::{CreateWindowAux, WindowClass};
     use x11rb::rust_connection::RustConnection;

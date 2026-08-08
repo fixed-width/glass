@@ -38,12 +38,12 @@ pub(crate) const CONNECTED_LINE: &str = "testw: connected";
 pub(crate) const CLOSING_LINE: &str = "testw: closing";
 
 /// How long a harness wait may spin before the test fails outright. It bounds a hang; it does not
-/// pace anything, and a passing test never reaches it (a session comes up in about a second).
+/// pace anything, and a passing test never reaches it.
 ///
-/// Kept short on purpose. Under `cargo mutants` every mutation that stops a window appearing or a
-/// log arriving pays this budget in *every* session test, and a suite that takes minutes to fail
-/// is graded "timeout" rather than caught — the mutant survives, and the test runner is killed
-/// mid-session, which orphans the compositor.
+/// Kept short on purpose. Under `cargo mutants` every mutation that stops a log arriving pays
+/// this budget in *every* session test, and a suite that takes minutes to fail is graded "timeout"
+/// rather than caught — the mutant survives, and the runner is killed mid-session. A window that
+/// never appears is bounded by [`LAUNCH_BUDGET_MS`] instead.
 const SETTLE_BUDGET: Duration = Duration::from_secs(5);
 
 /// The launch budget a test gives the compositor, for the same reason as [`SETTLE_BUDGET`]:

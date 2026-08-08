@@ -178,11 +178,13 @@ graded=$out
 
 # Reap the compositors and X servers a timed-out mutant left behind.
 #
-# cargo-mutants SIGKILLs the test process when a mutant exceeds --timeout, so a mutation that
-# removes a *bound* — a discovery deadline, a screencopy event arm, a Drop impl — hangs the run
-# while holding live sessions and none of their teardown ever runs. Each orphan keeps an X display
-# number, and once 33 are gone no session can start Xwayland at all: later mutants then fail for
-# an environmental reason and are graded on it.
+# The mutation runner SIGKILLs the test process when a mutant exceeds --timeout, so a mutation
+# that removes a *bound* — a discovery deadline, a screencopy event arm, a Drop impl — hangs the
+# run while holding live sessions and none of their teardown ever runs. Each orphan holds an X
+# display number until it dies, and a host with none left cannot start Xwayland at all.
+#
+# This is cleanup after the fact. What stops the orphans accumulating mid-run is the pdeathsig in
+# glass-wayland's `build_sway_command`; this catches what escapes it.
 #
 # Matched on the private runtime directory glass names for each session, which appears on the
 # compositor's own command line and belongs to no one else. Deliberately NOT matched on `Xvfb
