@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn found_exposes_the_path_and_the_other_states_do_not() {
+    fn a_found_result_exposes_its_path() {
         let dir = dir_with("Xvfb", 0o755);
         let bin = dir.path().join("Xvfb");
         assert_eq!(Resolved::Found(bin.clone()).found(), Some(bin.as_path()));
@@ -301,5 +301,11 @@ mod tests {
     fn a_non_executable_result_does_not_read_as_found() {
         let dir = dir_with("Xvfb", 0o644);
         assert!(!Resolved::NotExecutable(dir.path().join("Xvfb")).is_found());
+    }
+
+    #[test]
+    fn an_absent_result_exposes_no_path_and_does_not_read_as_found() {
+        assert_eq!(Resolved::Absent.found(), None);
+        assert!(!Resolved::Absent.is_found());
     }
 }
