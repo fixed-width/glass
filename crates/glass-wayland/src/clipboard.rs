@@ -667,9 +667,10 @@ fn serve_loop(
     // stop flag without blocking indefinitely.
     use std::os::fd::AsFd as _;
     loop {
-        if stop.load(Ordering::Relaxed) || state.cancelled {
-            break;
-        }
+        // One stop check per iteration, after `dispatch_pending` — that is where a `Cancelled`
+        // becomes visible, and the poll below is bounded so `stop` is seen within one tick either
+        // way. A second copy at the top of the loop bought nothing and made both unkillable: a
+        // mutation to either was masked by the other still breaking.
 
         // Flush any pending outgoing requests.
         if let Err(e) = conn.flush() {
@@ -786,6 +787,22 @@ mod tests {
         assert_eq!(get(&socket).expect("get"), "before");
         owner.set_text("after");
         assert_eq!(get(&socket).expect("get"), "after");
+    }
+
+    /// Dropping an owner has to *return*. `Drop` joins the serving thread, so a loop that stops
+    /// noticing the stop flag does not fail a test — it wedges it, and takes teardown with it.
+    /// Bounded from another thread, because a blocking drop cannot time itself.
+    #[test]
+    fn dropping_an_owner_does_not_block() {
+        let s = Launch::new().start();
+        let owner = ClipboardOwner::spawn(s.wayland_socket(), "held".into()).expect("spawn");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(owner);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("dropping an owner must stop its thread, not wait on it forever");
     }
 
     /// Dropping gives up the selection. A thread that kept running would keep answering pastes
