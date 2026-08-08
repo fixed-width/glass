@@ -85,7 +85,7 @@ fn display_target(glass_display: Option<&str>) -> DisplayTarget {
 }
 
 /// Accept both `:42` and bare `42`.
-fn normalize_display(d: &str) -> String {
+pub(crate) fn normalize_display(d: &str) -> String {
     if d.starts_with(':') {
         d.to_string()
     } else {
@@ -230,6 +230,15 @@ impl X11Platform {
             width: geo.width as u32,
             height: geo.height as u32,
         })
+    }
+
+    /// Send everything buffered so far, without waiting for a reply. The input sinks commit
+    /// each step this way: a client that renders per frame sees a gesture unfold, where one
+    /// flush at the end delivers it as a single jump.
+    fn commit(&self) -> Result<()> {
+        self.conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
     }
 
     /// Intern an atom by name (small helper for the multi-window scans).
@@ -474,9 +483,8 @@ impl X11Platform {
         // covers `start_app`'s failure path (which calls `kill_child`), so a launch
         // that never finds a window doesn't leave the bus running until Drop.
         self.dbus = None;
-        if let Some(owner) = self.clipboard_owner.take() {
-            owner.stop();
-        }
+        // Dropping the owner stops its thread and releases the CLIPBOARD selection.
+        self.clipboard_owner = None;
     }
 
     /// Poll the window tree until a top-level window matches a pid in the process
@@ -688,19 +696,14 @@ impl X11Platform {
             .map_err(|e| GlassError::Backend(format!("get_keyboard_mapping: {e}")))?
             .reply()
             .map_err(|e| GlassError::Backend(format!("keyboard mapping reply: {e}")))?;
-        let per = mapping.keysyms_per_keycode as usize;
-        for kc in min..=max {
-            let base = (kc as usize - min as usize) * per;
-            if mapping.keysyms.get(base) == Some(&keysym) {
-                return Ok((kc, false));
-            }
-            if per > 1 && mapping.keysyms.get(base + 1) == Some(&keysym) {
-                return Ok((kc, true));
-            }
-        }
-        Err(GlassError::InvalidKey(format!(
-            "no keycode for keysym 0x{keysym:x}"
-        )))
+        keycode_in(
+            &mapping.keysyms,
+            mapping.keysyms_per_keycode as usize,
+            min,
+            max,
+            keysym,
+        )
+        .ok_or_else(|| GlassError::InvalidKey(format!("no keycode for keysym 0x{keysym:x}")))
     }
 
     fn modifier_keycode(&self, m: glass_core::keys::Modifier) -> Result<u8> {
@@ -804,10 +807,7 @@ impl X11Platform {
         self.conn
             .set_input_focus(InputFocus::PARENT, win, x11rb::CURRENT_TIME)
             .map_err(|e| GlassError::Backend(format!("set_input_focus: {e}")))?;
-        self.conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-        Ok(())
+        self.commit()
     }
 
     /// Resolve a window-relative `region` (or the whole window) against `geo`
@@ -875,19 +875,16 @@ impl X11Platform {
     }
 }
 
-/// Emit a one-line diagnostic when a capture was clipped to the display, so the
-/// smaller-than-requested frame the caller receives isn't a silent surprise.
-/// glass's own stderr is its diagnostic channel (same as the focus-on-launch
-/// warning); the MCP `screenshot` result additionally reports the true (clipped)
-/// dimensions, so a frame smaller than the window/region signals the clip.
-fn note_if_clipped(rect: &crate::coords::ClippedRect) {
-    if rect.clipped {
-        eprintln!(
+/// The diagnostic for a capture that was clipped to the display, or `None` when the whole
+/// requested rectangle was read.
+fn clip_note(rect: &crate::coords::ClippedRect) -> Option<String> {
+    rect.clipped.then(|| {
+        format!(
             "glass: capture reached past the headless display and was clipped to the visible \
              {}x{} region at ({},{}); returning a partial frame",
             rect.w, rect.h, rect.sx, rect.sy
-        );
-    }
+        )
+    })
 }
 
 // The process-tree walk (`/proc`-based) that maps the spawned child to the
@@ -906,27 +903,18 @@ struct X11DragSink<'a> {
     kcs: Vec<u8>,
 }
 
-impl X11DragSink<'_> {
-    fn flush(&self) -> Result<()> {
-        self.p
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
-    }
-}
-
 impl glass_core::DragSink for X11DragSink<'_> {
     fn place(&mut self, x: i32, y: i32) -> Result<()> {
         self.move_to(x, y)
     }
     fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
         self.p.warp(self.ox, self.oy, x, y)?;
-        self.flush()
+        self.p.commit()
     }
     fn button(&mut self, down: bool) -> Result<()> {
         let kind = if down { XT_BTN_PRESS } else { XT_BTN_RELEASE };
         self.p.button(kind, self.b)?;
-        self.flush()
+        self.p.commit()
     }
     fn modifiers(&mut self, down: bool) -> Result<()> {
         if down {
@@ -934,7 +922,7 @@ impl glass_core::DragSink for X11DragSink<'_> {
         } else {
             self.p.release_mods(&self.kcs)?;
         }
-        self.flush()
+        self.p.commit()
     }
 }
 
@@ -955,10 +943,7 @@ impl glass_core::TypeSink for X11TypeSink<'_> {
         })?;
         self.idx += 1;
         self.p.key_with_mods(keysym, false, &[])?;
-        self.p
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
+        self.p.commit()
     }
 }
 
@@ -972,15 +957,6 @@ struct X11ChordSink<'a> {
     kcs: Vec<u8>,
 }
 
-impl X11ChordSink<'_> {
-    fn flush(&self) -> Result<()> {
-        self.p
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
-    }
-}
-
 impl glass_core::ChordSink for X11ChordSink<'_> {
     fn modifiers(&mut self, down: bool) -> Result<()> {
         if down {
@@ -988,7 +964,7 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
         } else {
             self.p.release_mods(&self.kcs)?;
         }
-        self.flush()
+        self.p.commit()
     }
     fn key(&mut self, down: bool) -> Result<()> {
         let kind = if down { XT_KEY_PRESS } else { XT_KEY_RELEASE };
@@ -1004,7 +980,7 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
                 0,
             )
             .map_err(|e| GlassError::Backend(format!("xtest key: {e}")))?;
-        self.flush()
+        self.p.commit()
     }
 }
 
@@ -1023,15 +999,6 @@ struct X11ScrollSink<'a> {
     kcs: Vec<u8>,
 }
 
-impl X11ScrollSink<'_> {
-    fn flush(&self) -> Result<()> {
-        self.p
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
-    }
-}
-
 impl glass_core::ScrollSink for X11ScrollSink<'_> {
     fn modifiers(&mut self, down: bool) -> Result<()> {
         if down {
@@ -1039,28 +1006,20 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
         } else {
             self.p.release_mods(&self.kcs)?;
         }
-        self.flush()
+        self.p.commit()
     }
     fn wheel(&mut self) -> Result<()> {
         self.p.warp(self.ox, self.oy, self.x, self.y)?;
         // 4=up,5=down,6=left,7=right; click |delta| times.
         self.p.scroll_button(5, 4, self.dy)?;
         self.p.scroll_button(7, 6, self.dx)?;
-        self.flush()
+        self.p.commit()
     }
 }
 
 impl Platform for X11Platform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        if spec.sandbox != glass_core::SandboxLevel::Off
-            && let glass_sandbox_linux::Availability::Unavailable(why) =
-                glass_sandbox_linux::availability()
-        {
-            return Err(GlassError::SandboxUnavailable(format!(
-                "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
-                     sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
-            )));
-        }
+        ensure_sandbox_available(spec.sandbox, glass_sandbox_linux::availability)?;
         glass_sandbox_linux::run_build(spec)?;
         // Opt-in private, isolated a11y bus (its own XDG_RUNTIME_DIR — never the host
         // /run/user/UID/at-spi/) so the launched app publishes an AT-SPI tree. The caller
@@ -1114,7 +1073,9 @@ impl Platform for X11Platform {
         // the "is there an active window" guard — no separate binding needed.
         let geo = self.window_geometry()?;
         let rect = self.resolve_capture_rect(&geo, region)?;
-        note_if_clipped(&rect);
+        if let Some(note) = clip_note(&rect) {
+            eprintln!("{note}");
+        }
         // Capture from ROOT over the window's screen region so overlapping popovers
         // (separate override-redirect top-levels) are included, not just this window's
         // own (possibly-obscured) drawable.
@@ -1142,7 +1103,9 @@ impl Platform for X11Platform {
             r.check_fits(geo.width, geo.height)?;
         }
         let rect = self.resolve_capture_rect(&geo, region)?;
-        note_if_clipped(&rect);
+        if let Some(note) = clip_note(&rect) {
+            eprintln!("{note}");
+        }
         self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
     }
 
@@ -1214,10 +1177,7 @@ impl Platform for X11Platform {
                 return Err(crate::unsupported_multi_touch());
             }
         }
-        self.conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-        Ok(())
+        self.commit()
     }
 
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
@@ -1246,10 +1206,7 @@ impl Platform for X11Platform {
                 glass_core::run_chord(&mut sink)?;
             }
         }
-        self.conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-        Ok(())
+        self.commit()
     }
 
     fn get_clipboard(&mut self) -> Result<String> {
@@ -1290,9 +1247,7 @@ impl Platform for X11Platform {
             }
             WindowOp::Geometry => {}
         }
-        self.conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+        self.commit()?;
         self.window_geometry()
     }
 
@@ -1391,13 +1346,50 @@ impl Drop for X11Platform {
     /// `self.child.take()`, so this is idempotent with `stop_app`. Field order then
     /// drops `xvfb`, tearing down any private display we spawned.
     fn drop(&mut self) {
-        self.kill_child(); // also stops clipboard_owner
-        // Redundant safety: kill_child already calls take(), but be explicit
-        // in case clipboard_owner was set after the last kill_child call.
-        if let Some(owner) = self.clipboard_owner.take() {
-            owner.stop();
+        self.kill_child(); // takes the child, and drops the clipboard owner with it
+    }
+}
+
+/// Fail a launch that asked for containment this machine cannot provide.
+///
+/// `probe` is a thunk because it forks bubblewrap, and `sandbox:"off"` is the escape hatch
+/// for machines where that is exactly what does not work. Kept out of `start_app` so both
+/// answers are reachable from a test.
+fn ensure_sandbox_available(
+    level: glass_core::SandboxLevel,
+    probe: impl FnOnce() -> glass_sandbox_linux::Availability,
+) -> Result<()> {
+    if level == glass_core::SandboxLevel::Off {
+        return Ok(());
+    }
+    match probe() {
+        glass_sandbox_linux::Availability::Ok => Ok(()),
+        glass_sandbox_linux::Availability::Unavailable(why) => {
+            Err(GlassError::SandboxUnavailable(format!(
+                "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
+                 sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
+            )))
         }
     }
+}
+
+/// Search a `GetKeyboardMapping` table for `keysym`, returning the keycode that produces it
+/// and whether Shift is needed — column 0 is the unshifted keysym, column 1 the shifted one.
+///
+/// `keysyms` is the flat table for keycodes `min..=max`, `per` entries each. Do not fold this
+/// back into the request around it: against a live server every arithmetic slip here still
+/// lands on *some* real key.
+fn keycode_in(keysyms: &[u32], per: usize, min: u8, max: u8, keysym: u32) -> Option<(u8, bool)> {
+    for kc in min..=max {
+        let base = (kc as usize - min as usize) * per;
+        if keysyms.get(base) == Some(&keysym) {
+            return Some((kc, false));
+        }
+        if per > 1 && keysyms.get(base + 1) == Some(&keysym) {
+            return Some((kc, true));
+        }
+    }
+    None
 }
 
 fn button_number(button: glass_core::MouseButton) -> u8 {
@@ -1473,10 +1465,1565 @@ mod tests {
         ));
     }
 
+    /// Keycodes 8, 9, 10 with two columns each: unshifted then shifted.
+    fn two_column_map() -> Vec<u32> {
+        vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+    }
+
+    #[test]
+    fn a_keysym_in_the_unshifted_column_needs_no_shift() {
+        let map = two_column_map();
+        assert_eq!(
+            super::keycode_in(&map, 2, 8, 10, 0xcc),
+            Some((9, false)),
+            "0xcc is keycode 9's unshifted keysym"
+        );
+    }
+
+    #[test]
+    fn a_keysym_in_the_shifted_column_reports_that_shift_is_needed() {
+        let map = two_column_map();
+        assert_eq!(super::keycode_in(&map, 2, 8, 10, 0xbb), Some((8, true)));
+    }
+
+    #[test]
+    fn the_last_keycode_in_the_range_is_still_searched() {
+        let map = two_column_map();
+        assert_eq!(super::keycode_in(&map, 2, 8, 10, 0xee), Some((10, false)));
+        assert_eq!(super::keycode_in(&map, 2, 8, 10, 0xff), Some((10, true)));
+    }
+
+    #[test]
+    fn a_keysym_the_map_does_not_carry_is_not_found() {
+        let map = two_column_map();
+        assert_eq!(super::keycode_in(&map, 2, 8, 10, 0x99), None);
+    }
+
+    #[test]
+    fn a_single_column_map_never_reads_into_the_next_keycode() {
+        // With one keysym per keycode there is no shifted column, and index `base + 1` is
+        // already the *next* key — reading it would report the wrong keycode entirely.
+        let map = vec![0xaa, 0xbb, 0xcc];
+        assert_eq!(super::keycode_in(&map, 1, 8, 10, 0xbb), Some((9, false)));
+        assert_eq!(super::keycode_in(&map, 1, 8, 10, 0xcc), Some((10, false)));
+    }
+
+    #[test]
+    fn an_unconfined_launch_never_runs_the_bubblewrap_probe() {
+        // A panicking probe is the only way to assert the probe is never called.
+        use glass_core::SandboxLevel;
+        super::ensure_sandbox_available(SandboxLevel::Off, || {
+            panic!("sandbox:off must not probe for bubblewrap")
+        })
+        .expect("an unconfined launch is always allowed");
+    }
+
+    #[test]
+    fn a_contained_launch_is_refused_when_bubblewrap_cannot_work() {
+        use glass_core::{GlassError, SandboxLevel};
+        use glass_sandbox_linux::Availability;
+        let err = super::ensure_sandbox_available(SandboxLevel::Default, || {
+            Availability::Unavailable("no user namespaces".into())
+        })
+        .expect_err("a contained launch cannot proceed without containment");
+        assert!(matches!(err, GlassError::SandboxUnavailable(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("no user namespaces"),
+            "the real cause must survive into the message: {err}"
+        );
+        super::ensure_sandbox_available(SandboxLevel::Default, || Availability::Ok)
+            .expect("a working bubblewrap refuses nothing");
+    }
+
     #[test]
     fn empty_hint_never_matches() {
         let h = hint(None, None);
         assert!(!hint_matches(Some("anything"), Some(("a", "b")), &h));
+    }
+}
+
+/// Everything the backend can only do against a real display: enumerating windows, reading
+/// their properties, translating the server's errors, and driving XTEST.
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use crate::testx::TestX;
+
+    /// A pid no window on a fresh private display can be carrying.
+    const OTHER_PID: u32 = 999_999;
+
+    #[test]
+    fn interning_is_stable_per_name_and_distinct_across_names() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let pid = plat.intern(b"_NET_WM_PID").expect("intern");
+        assert_ne!(pid, 0, "an interned atom is never the null atom");
+        assert_eq!(pid, plat.intern(b"_NET_WM_PID").expect("intern"));
+        assert_ne!(pid, plat.intern(b"_NET_CLIENT_LIST").expect("intern"));
+    }
+
+    #[test]
+    fn there_is_no_active_window_until_one_is_selected() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        assert!(matches!(
+            plat.require_window(),
+            Err(GlassError::WindowNotFound)
+        ));
+        let win = x.window().create();
+        plat.window = Some(win);
+        assert_eq!(plat.require_window().expect("now set"), win);
+    }
+
+    #[test]
+    fn a_windows_name_is_read_back_and_absence_is_not_an_empty_string() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let named = x.window().named("Calculator").create();
+        let anonymous = x.window().create();
+        assert_eq!(plat.window_name(named).as_deref(), Some("Calculator"));
+        assert_eq!(
+            plat.window_name(anonymous),
+            None,
+            "a window with no WM_NAME has no name, rather than an empty one"
+        );
+    }
+
+    #[test]
+    fn a_windows_class_is_read_back_as_the_instance_class_pair() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let win = x.window().classed("xcalc", "XCalc").create();
+        assert_eq!(
+            plat.window_class(win),
+            Some(("xcalc".to_string(), "XCalc".to_string()))
+        );
+        assert_eq!(plat.window_class(x.window().create()), None);
+    }
+
+    #[test]
+    fn a_single_component_class_stands_for_both_halves() {
+        // ICCCM wants `instance\0class\0`; some apps write only one string, and dropping the
+        // pair rather than doubling it would make their windows unmatchable by class.
+        let x = TestX::start();
+        let plat = x.platform();
+        let win = x.window().classed("solo", "").create();
+        assert_eq!(
+            plat.window_class(win),
+            Some(("solo".to_string(), "solo".to_string()))
+        );
+    }
+
+    #[test]
+    fn geometry_is_reported_in_root_coordinates() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let win = x.window().at(37, 53).sized(321, 211).create();
+        assert_eq!(
+            plat.geometry_of(win).expect("geometry"),
+            WindowGeometry {
+                x: 37,
+                y: 53,
+                width: 321,
+                height: 211
+            }
+        );
+    }
+
+    #[test]
+    fn the_active_windows_geometry_is_its_own() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().at(11, 22).sized(133, 144).create();
+        plat.window = Some(win);
+        assert_eq!(
+            plat.window_geometry().expect("geometry"),
+            WindowGeometry {
+                x: 11,
+                y: 22,
+                width: 133,
+                height: 144
+            }
+        );
+    }
+
+    #[test]
+    fn an_op_on_a_destroyed_window_reports_it_gone_and_forgets_it() {
+        // The stale id must not come back on the next call as a raw protocol error — the
+        // caller gets one actionable WindowNotFound either way.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().create();
+        plat.window = Some(win);
+        x.destroy(win);
+        assert!(matches!(
+            plat.window_geometry(),
+            Err(GlassError::WindowNotFound)
+        ));
+        assert_eq!(plat.window, None, "the stale id must be forgotten");
+    }
+
+    #[test]
+    fn a_dead_display_is_a_backend_failure_not_a_closed_window() {
+        // Only `BadWindow`/`BadDrawable` mean the window went away. Reporting a lost
+        // connection as WindowNotFound would send the caller looking for an app that closed,
+        // when the whole display is gone — and would drop the window id it can still use.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().create();
+        plat.window = Some(win);
+        drop(x);
+
+        let err = plat
+            .window_geometry()
+            .expect_err("a request on a dead display cannot succeed");
+        assert!(
+            matches!(err, GlassError::Backend(_)),
+            "expected a backend failure, got {err:?}"
+        );
+        assert_eq!(
+            plat.window,
+            Some(win),
+            "a dead display must not make glass forget which window it was driving"
+        );
+    }
+
+    #[test]
+    fn the_client_list_is_read_from_the_root_and_empty_when_unset() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let atom = plat.intern(b"_NET_CLIENT_LIST").expect("intern");
+        assert!(
+            plat.client_list_windows(atom).is_empty(),
+            "a bare Xvfb has no window manager and so no client list"
+        );
+        let (a, b) = (x.window().create(), x.window().create());
+        x.set_client_list(&[a, b]);
+        assert_eq!(plat.client_list_windows(atom), vec![a, b]);
+    }
+
+    #[test]
+    fn a_mapped_window_owned_by_the_app_matches() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let pid_atom = plat.intern(b"_NET_WM_PID").expect("intern");
+        let win = x.window().owned_by(4242).create();
+        assert!(
+            plat.window_matches(win, &[4242], pid_atom, None)
+                .expect("match")
+        );
+        assert!(
+            !plat
+                .window_matches(win, &[OTHER_PID], pid_atom, None)
+                .expect("match"),
+            "another process's window is not the app's"
+        );
+    }
+
+    #[test]
+    fn an_unmapped_window_never_matches() {
+        // Windows exist in the tree before they are shown; treating one as the app's window
+        // hands back a target with nothing on screen.
+        let x = TestX::start();
+        let plat = x.platform();
+        let pid_atom = plat.intern(b"_NET_WM_PID").expect("intern");
+        let hidden = x.window().owned_by(4242).unmapped().create();
+        assert!(
+            !plat
+                .window_matches(hidden, &[4242], pid_atom, None)
+                .expect("match")
+        );
+    }
+
+    #[test]
+    fn a_window_hint_matches_a_window_outside_the_pid_set() {
+        // The fallback for apps that never set _NET_WM_PID.
+        let x = TestX::start();
+        let plat = x.platform();
+        let pid_atom = plat.intern(b"_NET_WM_PID").expect("intern");
+        let win = x.window().named("Calculator").create();
+        let hint = WindowHint {
+            title: Some("Calculator".into()),
+            class: None,
+        };
+        assert!(
+            plat.window_matches(win, &[], pid_atom, Some(&hint))
+                .expect("match")
+        );
+        let wrong = WindowHint {
+            title: Some("Spreadsheet".into()),
+            class: None,
+        };
+        assert!(
+            !plat
+                .window_matches(win, &[], pid_atom, Some(&wrong))
+                .expect("match")
+        );
+    }
+
+    #[test]
+    fn scanning_returns_every_window_the_app_owns_and_nothing_else() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let main = x.window().owned_by(4242).named("main").create();
+        let dialog = x.window().owned_by(4242).named("dialog").create();
+        let _stranger = x.window().owned_by(OTHER_PID).named("stranger").create();
+        let mut found = plat.scan_all_windows(&[4242]).expect("scan");
+        found.sort_unstable();
+        let mut want = vec![main, dialog];
+        want.sort_unstable();
+        assert_eq!(found, want);
+    }
+
+    #[test]
+    fn a_window_listed_twice_is_returned_once() {
+        // `_NET_CLIENT_LIST` and the root's children overlap whenever a window is not
+        // reparented, which is every window under a bare Xvfb.
+        let x = TestX::start();
+        let plat = x.platform();
+        let win = x.window().owned_by(4242).create();
+        x.set_client_list(&[win]);
+        assert_eq!(plat.scan_all_windows(&[4242]).expect("scan"), vec![win]);
+    }
+
+    // --- XTEST input -----------------------------------------------------------------
+    //
+    // Every assertion here reads the server's own state or the events a watching window
+    // received. `Ok(())` from an input call means the request was written, not that anything
+    // moved — which is exactly what the mutants replacing these bodies return.
+
+    /// The keysym for a plain lowercase `a`, and for the shifted `A` on the same key.
+    const KEYSYM_A: u32 = 0x61;
+    const KEYSYM_SHIFT_A: u32 = 0x41;
+    const KEYSYM_SHIFT_L: u32 = 0xffe1;
+
+    /// Push the backend's buffered requests and wait for the server to have processed them.
+    /// The input primitives do not flush, and a flush would not be enough anyway: these tests
+    /// read the result over a *second* connection, ordered against the first only by a reply.
+    fn commit(plat: &X11Platform) {
+        plat.conn.sync().expect("sync");
+    }
+
+    #[test]
+    fn a_warp_moves_the_pointer_to_the_windows_origin_plus_the_offset() {
+        let x = TestX::start();
+        let plat = x.platform();
+        plat.warp(100, 50, 7, 9).expect("warp");
+        commit(&plat);
+        let (px, py, _) = x.pointer();
+        assert_eq!((px, py), (107, 59));
+    }
+
+    #[test]
+    fn a_button_press_is_held_until_it_is_released() {
+        let x = TestX::start();
+        let plat = x.platform();
+        plat.button(XT_BTN_PRESS, 1).expect("press");
+        commit(&plat);
+        assert!(
+            x.pointer().2.contains(KeyButMask::BUTTON1),
+            "button 1 should read as down between press and release"
+        );
+        plat.button(XT_BTN_RELEASE, 1).expect("release");
+        commit(&plat);
+        assert!(!x.pointer().2.contains(KeyButMask::BUTTON1));
+    }
+
+    /// The buttons a window watching input saw pressed, in order.
+    fn buttons_pressed(x: &TestX) -> Vec<u8> {
+        x.drain_events(Duration::from_millis(50))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::ButtonPress(b) => Some(b.detail),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_positive_scroll_clicks_the_positive_button_once_per_step() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.warp(0, 0, 10, 10).expect("warp into the window");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.scroll_button(4, 5, 3).expect("scroll");
+        commit(&plat);
+        assert_eq!(buttons_pressed(&x), vec![4, 4, 4], "window {win}");
+    }
+
+    #[test]
+    fn a_negative_scroll_clicks_the_negative_button_that_many_times() {
+        // The magnitude, not the signed value: a step count that stayed negative would
+        // produce an empty range and scroll nothing at all.
+        let x = TestX::start();
+        let plat = x.platform();
+        x.window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.warp(0, 0, 10, 10).expect("warp into the window");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.scroll_button(4, 5, -2).expect("scroll");
+        commit(&plat);
+        assert_eq!(buttons_pressed(&x), vec![5, 5]);
+    }
+
+    #[test]
+    fn an_unmapped_keysym_is_an_invalid_key_not_some_other_keycode() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let err = plat
+            .keycode_for(0x00ff_fffe)
+            .expect_err("a keysym no key produces has no keycode");
+        assert!(matches!(err, GlassError::InvalidKey(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_keysym_resolves_to_a_keycode_that_really_carries_it() {
+        // Checked against the server's own table rather than a hardcoded keycode, which
+        // varies with the keymap the runner happens to load.
+        let x = TestX::start();
+        let plat = x.platform();
+        let (min, _max, per, keysyms) = x.keymap();
+
+        let (kc, shifted) = plat.keycode_for(KEYSYM_A).expect("`a` must be typeable");
+        let base = (kc as usize - min as usize) * per;
+        assert!(!shifted, "plain `a` needs no Shift");
+        assert_eq!(keysyms.get(base), Some(&KEYSYM_A));
+
+        let (kc_upper, shifted_upper) = plat
+            .keycode_for(KEYSYM_SHIFT_A)
+            .expect("`A` must be typeable");
+        assert!(shifted_upper, "`A` is the shifted column of its key");
+        let base_upper = (kc_upper as usize - min as usize) * per;
+        assert_eq!(keysyms.get(base_upper + 1), Some(&KEYSYM_SHIFT_A));
+    }
+
+    #[test]
+    fn every_keysym_the_server_maps_can_be_resolved() {
+        // A mapping request one keycode short still resolves nearly everything; only the
+        // keys at the very end of the range go missing.
+        let x = TestX::start();
+        let plat = x.platform();
+        let (min, max, per, keysyms) = x.keymap();
+        let mut checked = 0;
+        for kc in min..=max {
+            let base = (kc as usize - min as usize) * per;
+            for col in 0..per.min(2) {
+                match keysyms.get(base + col) {
+                    Some(&sym) if sym != 0 => {
+                        assert!(
+                            plat.keycode_for(sym).is_ok(),
+                            "keysym 0x{sym:x} is on keycode {kc} but did not resolve"
+                        );
+                        checked += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(checked > 20, "the keymap looks empty ({checked} keysyms)");
+    }
+
+    #[test]
+    fn each_modifier_resolves_to_its_own_real_keycode() {
+        let x = TestX::start();
+        let plat = x.platform();
+        use glass_core::keys::Modifier;
+        let shift = plat.modifier_keycode(Modifier::Shift).expect("shift");
+        let control = plat.modifier_keycode(Modifier::Control).expect("control");
+        assert_eq!(
+            shift,
+            plat.keycode_for(KEYSYM_SHIFT_L).expect("shift sym").0
+        );
+        assert_ne!(
+            shift, control,
+            "distinct modifiers cannot share one keycode"
+        );
+    }
+
+    #[test]
+    fn tapping_a_keycode_presses_and_releases_it_at_the_focused_window() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().watching_input().create();
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        let (kc, _) = plat.keycode_for(KEYSYM_A).expect("keycode");
+        plat.tap_keycode(kc).expect("tap");
+        commit(&plat);
+
+        let events = x.drain_events(Duration::from_millis(50));
+        let presses: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        let releases: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyRelease(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(presses, vec![kc], "{events:?}");
+        assert_eq!(releases, vec![kc], "a tap must not leave the key down");
+    }
+
+    #[test]
+    fn pressing_modifiers_holds_them_down_and_releasing_lets_them_go() {
+        let x = TestX::start();
+        let plat = x.platform();
+        use glass_core::keys::Modifier;
+        let held = plat
+            .press_mods(&[Modifier::Shift, Modifier::Control])
+            .expect("press");
+        commit(&plat);
+        assert_eq!(
+            held,
+            vec![
+                plat.modifier_keycode(Modifier::Shift).unwrap(),
+                plat.modifier_keycode(Modifier::Control).unwrap()
+            ],
+            "the returned keycodes are what release_mods is given"
+        );
+        for kc in &held {
+            assert!(x.key_is_down(*kc), "keycode {kc} should be held down");
+        }
+        plat.release_mods(&held).expect("release");
+        commit(&plat);
+        for kc in &held {
+            assert!(!x.key_is_down(*kc), "keycode {kc} was left down");
+        }
+    }
+
+    /// The keycodes a watching window saw pressed while `f` ran, with focus already on it.
+    fn keys_pressed_during(
+        x: &TestX,
+        plat: &mut X11Platform,
+        f: impl FnOnce(&mut X11Platform),
+    ) -> Vec<u8> {
+        let win = x.window().watching_input().create();
+        plat.focus_window(win).expect("focus");
+        commit(plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+        f(plat);
+        commit(plat);
+        x.drain_events(Duration::from_millis(50))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_uppercase_letter_is_typed_with_shift_held() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let shift = plat
+            .modifier_keycode(glass_core::keys::Modifier::Shift)
+            .expect("shift");
+        let pressed = keys_pressed_during(&x, &mut plat, |p| {
+            p.key_with_mods(KEYSYM_SHIFT_A, false, &[]).expect("type A");
+        });
+        assert!(
+            pressed.contains(&shift),
+            "`A` lives in the shifted column, so Shift must go down first: {pressed:?}"
+        );
+    }
+
+    #[test]
+    fn a_lowercase_letter_is_typed_without_shift() {
+        // Holding Shift for an unshifted key turns `a` into `A` at the application.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let shift = plat
+            .modifier_keycode(glass_core::keys::Modifier::Shift)
+            .expect("shift");
+        let pressed = keys_pressed_during(&x, &mut plat, |p| {
+            p.key_with_mods(KEYSYM_A, false, &[]).expect("type a");
+        });
+        assert!(
+            !pressed.contains(&shift),
+            "Shift must not be pressed for a plain `a`: {pressed:?}"
+        );
+    }
+
+    #[test]
+    fn focusing_a_window_makes_the_server_route_keys_to_it() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().create();
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        assert_eq!(x.focused(), win);
+    }
+
+    // --- the Platform surface --------------------------------------------------------
+
+    /// A real child to stand in for a launched app. The pid accessors, window enumeration
+    /// and the close ladder all read `self.child`, and `_NET_WM_PID` matching needs a pid
+    /// that is genuinely in `/proc`. `sleep` leaves on its own, so a test that panics before
+    /// its teardown cannot strand it.
+    fn spawn_stand_in() -> std::process::Child {
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        // As production spawns an app (`command.rs`). `reap_launch` signals `child.id()` as a
+        // process GROUP; on a child that is not a group leader that pgid belongs to somebody
+        // else, and teardown SIGKILLs an unrelated group.
+        cmd.process_group(0);
+        cmd.spawn().expect("the stand-in app should spawn")
+    }
+
+    /// The buttons and their positions a watching window saw, as `(detail, x, y)`.
+    fn clicks_seen(x: &TestX) -> Vec<(u8, i16, i16)> {
+        x.drain_events(Duration::from_millis(80))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::ButtonPress(b) => Some((b.detail, b.event_x, b.event_y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_app_pid_and_its_tree_are_empty_until_something_is_launched() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        assert_eq!(plat.app_pid(), None);
+        assert!(plat.app_pids().is_empty());
+
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        assert_eq!(plat.app_pid(), Some(pid));
+        assert!(
+            plat.app_pids().contains(&pid),
+            "the process tree must include the launched child itself"
+        );
+    }
+
+    #[test]
+    fn the_a11y_bus_address_is_the_private_buss_own_and_absent_without_one() {
+        // The a11y reader connects to whatever this returns. Reporting nothing for a launch
+        // that did start a bus leaves the tree unreadable; reporting something for one that
+        // did not points the reader at the host's bus.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        assert_eq!(plat.a11y_bus_addr(), None);
+
+        let bus = glass_dbus_linux::PrivateBus::start().expect("a private a11y bus should start");
+        let expected = bus.a11y_bus_address().to_string();
+        plat.dbus = Some(bus);
+        assert_eq!(plat.a11y_bus_addr().as_deref(), Some(expected.as_str()));
+        assert!(
+            !expected.is_empty(),
+            "an address that is blank reaches nothing"
+        );
+    }
+
+    #[test]
+    fn draining_logs_hands_over_the_buffer_and_leaves_it_empty() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        plat.logs
+            .lock()
+            .expect("log buffer")
+            .push((Stream::Stdout, "hello".to_string()));
+        assert_eq!(
+            plat.drain_logs(),
+            vec![(Stream::Stdout, "hello".to_string())]
+        );
+        assert!(
+            plat.drain_logs().is_empty(),
+            "a drain must not hand back what it already returned"
+        );
+    }
+
+    #[test]
+    fn a_click_presses_the_mapped_button_at_the_requested_point() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_pointer(&PointerEvent::Click {
+            x: 30,
+            y: 40,
+            button: glass_core::MouseButton::Right,
+            count: 2,
+            modifiers: vec![],
+        })
+        .expect("click");
+
+        assert_eq!(
+            clicks_seen(&x),
+            vec![(3, 30, 40), (3, 30, 40)],
+            "a double right-click is button 3 twice, at the point asked for"
+        );
+    }
+
+    #[test]
+    fn a_scroll_clicks_the_wheel_buttons_for_each_axis() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_pointer(&PointerEvent::Scroll {
+            x: 5,
+            y: 5,
+            dx: 0,
+            dy: -2,
+            modifiers: vec![],
+        })
+        .expect("scroll");
+
+        let buttons: Vec<u8> = clicks_seen(&x).into_iter().map(|(b, _, _)| b).collect();
+        assert_eq!(buttons, vec![4, 4], "scrolling up twice is button 4 twice");
+    }
+
+    #[test]
+    fn a_drag_presses_at_the_start_and_releases_at_the_end() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_pointer(&PointerEvent::Drag {
+            from_x: 10,
+            from_y: 10,
+            to_x: 200,
+            to_y: 150,
+            button: glass_core::MouseButton::Left,
+            modifiers: vec![],
+            duration_ms: 40,
+        })
+        .expect("drag");
+
+        let events = x.drain_events(Duration::from_millis(80));
+        let press = events.iter().find_map(|e| match e {
+            x11rb::protocol::Event::ButtonPress(b) => Some((b.event_x, b.event_y)),
+            _ => None,
+        });
+        let release = events.iter().find_map(|e| match e {
+            x11rb::protocol::Event::ButtonRelease(b) => Some((b.event_x, b.event_y)),
+            _ => None,
+        });
+        assert_eq!(press, Some((10, 10)), "the button goes down at the start");
+        assert_eq!(release, Some((200, 150)), "and comes up at the end");
+    }
+
+    #[test]
+    fn a_drag_with_a_modifier_holds_it_from_before_the_press_to_after_the_release() {
+        // A constrained drag (shift to snap an axis, ctrl to copy) is a different gesture
+        // from the same drag unmodified.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_pointer(&PointerEvent::Drag {
+            from_x: 10,
+            from_y: 10,
+            to_x: 80,
+            to_y: 80,
+            button: glass_core::MouseButton::Left,
+            modifiers: vec![glass_core::keys::Modifier::Shift],
+            duration_ms: 40,
+        })
+        .expect("drag");
+
+        let shift = plat
+            .modifier_keycode(glass_core::keys::Modifier::Shift)
+            .expect("shift");
+        let events = x.drain_events(Duration::from_millis(120));
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                x11rb::protocol::Event::KeyPress(k) if k.detail == shift
+            )),
+            "the modifier must go down for a modified drag: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                x11rb::protocol::Event::KeyRelease(k) if k.detail == shift
+            )),
+            "and must not be left held afterwards: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_drag_reaches_the_window_while_it_is_still_running() {
+        // Each step commits on its own. Held to one flush at the end, a client that renders
+        // per frame — a browser — sees the pointer jump rather than drag.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        let arrived_early = std::thread::scope(|s| {
+            s.spawn(|| {
+                plat.send_pointer(&PointerEvent::Drag {
+                    from_x: 10,
+                    from_y: 10,
+                    to_x: 300,
+                    to_y: 300,
+                    button: glass_core::MouseButton::Left,
+                    modifiers: vec![],
+                    duration_ms: 600,
+                })
+                .expect("drag");
+            });
+            // A third of the way in: far enough that the press and several motions are due,
+            // far enough from the end that a loaded machine cannot blur the two.
+            std::thread::sleep(Duration::from_millis(200));
+            !x.drain_events(Duration::ZERO).is_empty()
+        });
+
+        assert!(
+            arrived_early,
+            "nothing had reached the window 200ms into a 600ms drag"
+        );
+    }
+
+    #[test]
+    fn a_multi_touch_gesture_is_refused_by_this_backend() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().create();
+        plat.window = Some(win);
+        let err = plat
+            .send_pointer(&PointerEvent::Gesture {
+                pointers: vec![glass_core::Segment {
+                    from_x: 0,
+                    from_y: 0,
+                    to_x: 10,
+                    to_y: 10,
+                }],
+                duration_ms: 10,
+            })
+            .expect_err("X11 has no multi-touch");
+        assert!(err.to_string().contains("multi_touch"), "{err}");
+    }
+
+    #[test]
+    fn typed_text_sends_one_key_per_character() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().watching_input().create();
+        plat.window = Some(win);
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_key(&KeyEvent::Text("ab".to_string()))
+            .expect("type");
+
+        let pressed: Vec<u8> = x
+            .drain_events(Duration::from_millis(120))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        let a = plat.keycode_for(KEYSYM_A).expect("a").0;
+        let b = plat.keycode_for(0x62).expect("b").0;
+        assert_eq!(pressed, vec![a, b], "each character in order");
+    }
+
+    #[test]
+    fn a_chord_holds_its_modifier_across_the_key() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().watching_input().create();
+        plat.window = Some(win);
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_key(&KeyEvent::Chord("ctrl+a".to_string()))
+            .expect("chord");
+
+        let control = plat
+            .modifier_keycode(glass_core::keys::Modifier::Control)
+            .expect("control");
+        let a = plat.keycode_for(KEYSYM_A).expect("a").0;
+        let pressed: Vec<u8> = x
+            .drain_events(Duration::from_millis(80))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pressed,
+            vec![control, a],
+            "the modifier goes down before the key it modifies"
+        );
+    }
+
+    #[test]
+    fn a_window_op_moves_and_resizes_and_reports_the_result() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().at(5, 5).sized(100, 80).create();
+        plat.window = Some(win);
+
+        let resized = plat
+            .window(&WindowOp::Resize {
+                width: 321,
+                height: 211,
+            })
+            .expect("resize");
+        assert_eq!((resized.width, resized.height), (321, 211));
+
+        let moved = plat.window(&WindowOp::Move { x: 40, y: 60 }).expect("move");
+        assert_eq!((moved.x, moved.y), (40, 60));
+        assert_eq!(
+            (moved.width, moved.height),
+            (321, 211),
+            "a move must not resize"
+        );
+
+        let same = plat.window(&WindowOp::Geometry).expect("geometry");
+        assert_eq!(same, moved, "a bare geometry read changes nothing");
+    }
+
+    #[test]
+    fn listing_windows_reports_the_apps_windows_and_marks_the_active_one() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let main = x
+            .window()
+            .owned_by(pid)
+            .named("main")
+            .classed("app", "App")
+            .at(3, 4)
+            .sized(150, 120)
+            .create();
+        let other = x.window().owned_by(pid).named("other").create();
+        plat.window = Some(main);
+
+        let listed = plat.list_windows().expect("list");
+        let entry = listed
+            .iter()
+            .find(|w| w.id == WindowId(main as u64))
+            .expect("the active window must be listed");
+        assert_eq!(entry.title.as_deref(), Some("main"));
+        assert_eq!(entry.class.as_deref(), Some("App"));
+        assert_eq!(
+            entry.geometry,
+            WindowGeometry {
+                x: 3,
+                y: 4,
+                width: 150,
+                height: 120
+            }
+        );
+        assert!(entry.active, "the active window must be flagged as active");
+        let sibling = listed
+            .iter()
+            .find(|w| w.id == WindowId(other as u64))
+            .expect("the app's other window must be listed too");
+        assert!(!sibling.active, "only one window is the active one");
+    }
+
+    #[test]
+    fn listing_windows_without_an_active_one_is_an_error_not_an_empty_list() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        assert!(matches!(
+            plat.list_windows(),
+            Err(GlassError::WindowNotFound)
+        ));
+    }
+
+    #[test]
+    fn selecting_a_window_makes_it_active_and_refuses_one_that_is_not_the_apps() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let mine = x.window().owned_by(pid).at(9, 8).sized(70, 60).create();
+        let stranger = x.window().owned_by(999_999).create();
+        plat.window = Some(mine);
+
+        let geo = plat
+            .select_window(WindowId(mine as u64))
+            .expect("selecting the app's own window");
+        assert_eq!((geo.x, geo.y, geo.width, geo.height), (9, 8, 70, 60));
+        assert_eq!(plat.window, Some(mine));
+
+        assert!(
+            matches!(
+                plat.select_window(WindowId(stranger as u64)),
+                Err(GlassError::WindowNotFound)
+            ),
+            "a window outside the launched process tree is not selectable"
+        );
+        assert_eq!(
+            plat.window,
+            Some(mine),
+            "a refused selection must leave the active window where it was"
+        );
+    }
+
+    #[test]
+    fn capturing_a_named_window_reads_that_windows_own_area() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        // Away from the origin, and filled: a capture that ignored the window's position would
+        // read the root's black from (0,0) and still be the right size.
+        let win = x
+            .window()
+            .owned_by(pid)
+            .at(120, 60)
+            .sized(48, 32)
+            .filled_with(0x0000_00ff)
+            .create();
+        plat.window = Some(win);
+        x.flush();
+
+        let frame = plat
+            .capture_window(WindowId(win as u64), None)
+            .expect("capture");
+        assert_eq!((frame.width, frame.height), (48, 32));
+        let px = &frame.pixels[..4];
+        assert_eq!(
+            (px[0], px[1], px[2]),
+            (0x00, 0x00, 0xff),
+            "should read the window's own pixels, got {px:?}"
+        );
+
+        let stranger = x.window().owned_by(999_999).create();
+        assert!(
+            matches!(
+                plat.capture_window(WindowId(stranger as u64), None),
+                Err(GlassError::WindowNotFound)
+            ),
+            "a window the app does not own is not capturable"
+        );
+    }
+
+    #[test]
+    fn the_clipboard_round_trips_through_the_backend() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        assert_eq!(
+            plat.get_clipboard().expect("get"),
+            "",
+            "nothing has been copied on this display yet"
+        );
+        plat.set_clipboard("copied text").expect("set");
+        assert_eq!(plat.get_clipboard().expect("get"), "copied text");
+        plat.set_clipboard("replaced").expect("set again");
+        assert_eq!(plat.get_clipboard().expect("get"), "replaced");
+    }
+
+    #[test]
+    fn a_second_copy_updates_the_owner_it_already_has() {
+        // Re-taking the selection for every copy is visible to every other client on the
+        // display: a clipboard manager watching ownership sees churn that did not happen.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        plat.set_clipboard("first").expect("set");
+        let owner = x.clipboard_owner();
+        assert_ne!(owner, x11rb::NONE, "the first copy takes the selection");
+
+        plat.set_clipboard("second").expect("set again");
+        assert_eq!(
+            x.clipboard_owner(),
+            owner,
+            "a live owner should be handed the new text, not replaced"
+        );
+        assert_eq!(plat.get_clipboard().expect("get"), "second");
+    }
+
+    #[test]
+    fn a_copy_after_another_client_took_the_selection_starts_a_fresh_owner() {
+        // glass's owner retires when something else takes CLIPBOARD. Handing the next copy to
+        // that retired owner puts the text somewhere nothing serves it, and the paste that
+        // follows returns the other application's clipboard instead.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        plat.set_clipboard("ours").expect("set");
+        assert_eq!(plat.get_clipboard().expect("get"), "ours");
+
+        let thief = x.take_clipboard();
+        assert_eq!(
+            x.clipboard_owner(),
+            thief,
+            "the test client should hold it now"
+        );
+
+        // Wait for glass's owner to RETIRE, not merely for the selection to change hands: it
+        // notices SelectionClear on its own 10ms loop, and copying before it does hands the
+        // text to an owner that no longer serves anything.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && plat.clipboard_owner.as_ref().is_some_and(|o| o.is_alive())
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        plat.set_clipboard("ours again")
+            .expect("set after losing it");
+        assert_eq!(plat.get_clipboard().expect("get"), "ours again");
+    }
+
+    // --- the close ladder ------------------------------------------------------------
+
+    #[test]
+    fn only_a_window_advertising_wm_delete_window_can_be_asked_to_close() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let protocols = plat.intern(b"WM_PROTOCOLS").expect("intern");
+        let delete = plat.intern(b"WM_DELETE_WINDOW").expect("intern");
+
+        let polite = x.window().accepting_delete().create();
+        let silent = x.window().create();
+        assert!(plat.accepts_delete(polite, protocols, delete));
+        assert!(
+            !plat.accepts_delete(silent, protocols, delete),
+            "a window with no WM_PROTOCOLS cannot be asked, and must not be counted as asked"
+        );
+    }
+
+    #[test]
+    fn a_close_request_arrives_as_the_delete_client_message() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let protocols = plat.intern(b"WM_PROTOCOLS").expect("intern");
+        let delete = plat.intern(b"WM_DELETE_WINDOW").expect("intern");
+        let win = x.window().accepting_delete().create();
+
+        plat.send_delete(win, protocols, delete).expect("send");
+        commit(&plat);
+
+        let message = x
+            .next_event(Duration::from_secs(2))
+            .expect("the window's owner should receive the request");
+        match message {
+            x11rb::protocol::Event::ClientMessage(m) => {
+                assert_eq!(m.window, win);
+                assert_eq!(m.type_, protocols);
+                assert_eq!(
+                    m.data.as_data32()[0],
+                    delete,
+                    "the protocol atom comes first, as ICCCM 4.2.8 specifies"
+                );
+            }
+            other => panic!("expected a ClientMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn asking_the_app_to_close_reaches_every_window_that_accepts_it() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let polite = x.window().owned_by(pid).accepting_delete().create();
+        plat.window = Some(polite);
+
+        let asked = plat.request_close(pid);
+        assert!(asked.any(), "the app's window should have been asked");
+        assert!(
+            x.next_event(Duration::from_secs(2)).is_some(),
+            "the request must actually reach the window"
+        );
+    }
+
+    #[test]
+    fn an_app_with_no_window_is_not_reported_as_asked() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        assert!(
+            !plat.request_close(pid).any(),
+            "there was no window to ask, so nothing was asked"
+        );
+    }
+
+    #[test]
+    fn the_bounded_ask_reaches_the_window_through_its_own_connection() {
+        // The ask runs on a second connection so the caller can abandon it without leaving
+        // this backend's connection stopped mid-request.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let polite = x.window().owned_by(pid).accepting_delete().create();
+        plat.window = Some(polite);
+
+        assert!(plat.request_close_bounded(pid).any());
+        assert!(
+            x.next_event(Duration::from_secs(2)).is_some(),
+            "the bounded ask must deliver the same request"
+        );
+    }
+
+    #[test]
+    fn stopping_the_app_reaps_the_child_and_forgets_it() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+
+        plat.stop_app().expect("stop");
+        assert_eq!(plat.app_pid(), None, "the child must be forgotten");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "pid {pid} outlived the stop that was supposed to reap it"
+        );
+    }
+
+    #[test]
+    fn dropping_the_backend_reaps_an_app_that_was_never_stopped() {
+        // Parity with the other backends: a panic-unwind or the process-exit backstop must
+        // not leave the launched app running.
+        let x = TestX::start();
+        let pid = {
+            let mut plat = x.platform();
+            let child = spawn_stand_in();
+            let pid = child.id();
+            plat.child = Some(child);
+            pid
+        };
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "pid {pid} outlived the backend that launched it"
+        );
+    }
+
+    #[test]
+    fn a_launch_whose_app_never_appears_is_a_timeout_and_leaves_nothing_running() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let spec = AppSpec {
+            build: None,
+            run: vec!["sleep".to_string(), "30".to_string()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 250,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
+        };
+        let err = plat
+            .start_app(&spec)
+            .expect_err("a command that maps no window cannot be launched");
+        assert!(matches!(err, GlassError::Timeout(250)), "{err:?}");
+        assert_eq!(
+            plat.app_pid(),
+            None,
+            "a launch that failed must not leave its child behind"
+        );
+    }
+
+    #[test]
+    fn discovery_waits_out_its_timeout_before_giving_up() {
+        // The budget has to be spent, not just reported: giving up at once fails every app
+        // slower than instant. Timed around `discover_window`, so a spawn that fails under
+        // load cannot read as a deadline that was not honoured.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        plat.child = Some(spawn_stand_in());
+        let spec = AppSpec {
+            build: None,
+            run: vec!["sleep".to_string(), "30".to_string()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 400,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
+        };
+        let started = Instant::now();
+        let err = plat
+            .discover_window(&spec)
+            .expect_err("the stand-in never maps a window");
+        let waited = started.elapsed();
+        assert!(matches!(err, GlassError::Timeout(400)), "{err:?}");
+        assert!(
+            waited >= Duration::from_millis(350),
+            "gave up after {waited:?}, which is not the 400ms budget it was given"
+        );
+    }
+
+    #[test]
+    fn an_untypable_character_is_reported_at_its_own_index() {
+        // The index is all the error may carry — naming the character would put typed
+        // content into the unredacted audit log — so it has to advance per character.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().create();
+        plat.window = Some(win);
+        let err = plat
+            .send_key(&KeyEvent::Text("a€".to_string()))
+            .expect_err("€ has no X11 keysym");
+        assert!(err.to_string().contains("index 1"), "{err}");
+    }
+
+    #[test]
+    fn a_scroll_with_a_modifier_holds_it_across_the_wheel() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_pointer(&PointerEvent::Scroll {
+            x: 5,
+            y: 5,
+            dx: 0,
+            dy: -1,
+            modifiers: vec![glass_core::keys::Modifier::Control],
+        })
+        .expect("scroll");
+
+        let control = plat
+            .modifier_keycode(glass_core::keys::Modifier::Control)
+            .expect("control");
+        let keys: Vec<u8> = x
+            .drain_events(Duration::from_millis(150))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            keys.contains(&control),
+            "a modified scroll must hold the modifier down: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_chord_whose_key_needs_shift_gets_shift_as_well_as_its_own_modifiers() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().watching_input().create();
+        plat.window = Some(win);
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_key(&KeyEvent::Chord("ctrl+A".to_string()))
+            .expect("chord");
+
+        let shift = plat
+            .modifier_keycode(glass_core::keys::Modifier::Shift)
+            .expect("shift");
+        let keys: Vec<u8> = x
+            .drain_events(Duration::from_millis(100))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            keys.contains(&shift),
+            "`A` sits in the shifted column, so ctrl+A is ctrl+shift+a: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_launch_whose_command_does_not_exist_reports_the_spawn_failure() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let spec = AppSpec {
+            build: None,
+            run: vec!["/nonexistent/glass-test-binary".to_string()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 250,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
+        };
+        let err = plat.start_app(&spec).expect_err("nothing to spawn");
+        assert!(matches!(err, GlassError::AppNotStarted(_)), "{err:?}");
+    }
+
+    // --- capture ---------------------------------------------------------------------
+
+    #[test]
+    fn a_zero_area_region_is_rejected_before_a_doomed_get_image() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let geo = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+        };
+        let flat = Region {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 40,
+        };
+        // Asserting the message, not just an error: clipping rejects an empty rectangle too,
+        // so "it failed" would pass even if the zero-area check had stopped running.
+        let flat_err = plat
+            .resolve_capture_rect(&geo, Some(&flat))
+            .expect_err("a region with no width has no pixels to read")
+            .to_string();
+        assert!(flat_err.contains("zero area"), "{flat_err}");
+        let thin = Region {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 0,
+        };
+        let thin_err = plat
+            .resolve_capture_rect(&geo, Some(&thin))
+            .expect_err("a region with no height has no pixels to read")
+            .to_string();
+        assert!(thin_err.contains("zero area"), "{thin_err}");
+        assert!(
+            plat.resolve_capture_rect(&geo, None).is_ok(),
+            "a window with area must still resolve"
+        );
+    }
+
+    #[test]
+    fn a_capture_reads_the_pixels_that_are_actually_on_screen() {
+        // Everything in the decode path — the plane mask, the depth lookup and the
+        // bytes-per-pixel it yields — is only observable in the pixels that come back.
+        let x = TestX::start();
+        let plat = x.platform();
+        x.window()
+            .at(0, 0)
+            .sized(64, 64)
+            .filled_with(0x00ff_0000)
+            .create();
+        x.flush();
+
+        let frame = plat.capture_screen_rect(0, 0, 64, 64).expect("capture");
+        assert_eq!((frame.width, frame.height), (64, 64));
+        let px = &frame.pixels[..4];
+        assert_eq!(
+            (px[0], px[1], px[2]),
+            (0xff, 0x00, 0x00),
+            "the red window should read back as red, got {px:?}"
+        );
+    }
+
+    #[test]
+    fn a_clip_note_is_produced_only_when_the_capture_was_clipped() {
+        use crate::coords::ClippedRect;
+        let clipped = ClippedRect {
+            sx: 0,
+            sy: 0,
+            w: 320,
+            h: 200,
+            clipped: true,
+        };
+        let note = clip_note(&clipped).expect("a clipped capture must say so");
+        assert!(note.contains("320x200"), "{note}");
+        assert!(
+            clip_note(&ClippedRect {
+                clipped: false,
+                ..clipped
+            })
+            .is_none(),
+            "an unclipped capture has nothing to report"
+        );
+    }
+
+    #[test]
+    fn scanning_for_one_window_finds_a_match_and_reports_none_otherwise() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let pid_atom = plat.intern(b"_NET_WM_PID").expect("intern");
+        let list_atom = plat.intern(b"_NET_CLIENT_LIST").expect("intern");
+        let win = x.window().owned_by(4242).create();
+        assert_eq!(
+            plat.scan_for_window(&[4242], pid_atom, list_atom, None)
+                .expect("scan"),
+            Some(win)
+        );
+        assert_eq!(
+            plat.scan_for_window(&[OTHER_PID], pid_atom, list_atom, None)
+                .expect("scan"),
+            None
+        );
     }
 }
 

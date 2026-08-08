@@ -71,7 +71,9 @@ pub(crate) fn clip_capture_to_display(
              via GLASS_XVFB_SCREEN={need_w}x{need_h}x24."
         )));
     }
-    let clipped = ix != rx || iy != ry || iw != w || ih != h;
+    // Size alone: a shifted origin cannot leave the size intact, since `ix` only moves when
+    // `rx` is negative, which shortens `iw` by the same amount.
+    let clipped = iw != w || ih != h;
     Ok(ClippedRect {
         sx: ix as i32,
         sy: iy as i32,
@@ -247,6 +249,94 @@ mod tests {
         assert!(
             msg.to_lowercase().contains("outside"),
             "explains nothing is on-screen: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_region_offsets_the_window_origin_on_both_axes() {
+        // Both coordinates are non-zero and differ, so an axis that dropped its region
+        // offset — or applied the other axis's — lands somewhere else.
+        let geo = WindowGeometry {
+            x: 100,
+            y: 50,
+            width: 800,
+            height: 600,
+        };
+        let region = Region {
+            x: 30,
+            y: 20,
+            width: 100,
+            height: 100,
+        };
+        let r = clip_capture_to_display(&geo, Some(&region), (1280, 800)).unwrap();
+        assert_eq!(
+            r,
+            ClippedRect {
+                sx: 130,
+                sy: 70,
+                w: 100,
+                h: 100,
+                clipped: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_window_off_only_the_right_edge_is_clipped() {
+        // Clipped on one axis only, and by a shrunk width rather than a moved origin —
+        // the case that separates "the size changed" from "the origin moved".
+        let geo = WindowGeometry {
+            x: 1000,
+            y: 10,
+            width: 500,
+            height: 100,
+        };
+        let r = clip_capture_to_display(&geo, None, (1280, 800)).unwrap();
+        assert_eq!(
+            r,
+            ClippedRect {
+                sx: 1000,
+                sy: 10,
+                w: 280,
+                h: 100,
+                clipped: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_offscreen_error_sizes_a_display_that_would_reach_the_window() {
+        // The suggested screen must actually contain the window: 2000+100 across, and the
+        // display's own height where the window is already within it.
+        let geo = WindowGeometry {
+            x: 2000,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let msg = clip_capture_to_display(&geo, None, (1280, 800))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("GLASS_XVFB_SCREEN=2100x800x24"),
+            "should suggest a display reaching the window's right edge: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_offscreen_error_sizes_the_vertical_axis_too() {
+        let geo = WindowGeometry {
+            x: 0,
+            y: 2000,
+            width: 100,
+            height: 100,
+        };
+        let msg = clip_capture_to_display(&geo, None, (1280, 800))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("GLASS_XVFB_SCREEN=1280x2100x24"),
+            "should suggest a display reaching the window's bottom edge: {msg}"
         );
     }
 

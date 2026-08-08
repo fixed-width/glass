@@ -3,6 +3,7 @@
 //! [`checks`] gathers the real environment; the pure [`x11_checks`] maps gathered
 //! facts to [`Check`]s and is unit-tested without a display.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -14,13 +15,19 @@ use crate::xvfb::Xvfb;
 /// Probe the X11 backend's environment. `deep` additionally spawns and tears down a
 /// private Xvfb (when in self-spawn mode) to prove it actually starts.
 pub fn checks(deep: bool) -> Vec<Check> {
-    let glass_display = std::env::var("GLASS_DISPLAY").ok();
-    let gd = glass_display
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let xvfb = resolve_bin(&glass_core::tool_path("GLASS_XVFB", "Xvfb"));
-    let attach_reachable = gd.map(|d| can_connect(&normalize_display(d)));
+    checks_for(std::env::var("GLASS_DISPLAY").ok().as_deref(), deep)
+}
+
+/// The gathering layer, with the one value that selects between attach and self-spawn mode
+/// passed in — mutating `GLASS_DISPLAY` to reach the other mode is `unsafe` under edition
+/// 2024, and process-global besides.
+fn checks_for(glass_display: Option<&str>, deep: bool) -> Vec<Check> {
+    let gd = glass_display.map(str::trim).filter(|s| !s.is_empty());
+    let xvfb = resolve_bin(
+        &glass_core::tool_path("GLASS_XVFB", "Xvfb"),
+        std::env::var_os("PATH").as_deref(),
+    );
+    let attach_reachable = gd.map(|d| can_connect(&crate::platform::normalize_display(d)));
     let deep_spawn = (deep && gd.is_none()).then(probe_xvfb);
     x11_checks(gd, xvfb.as_deref(), attach_reachable, deep_spawn)
 }
@@ -84,30 +91,21 @@ fn x11_checks(
     checks
 }
 
-/// First executable named `name` on `PATH`.
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+/// First existing file named `name` in `path`, a `PATH`-style separated list.
+fn which_in(path: &OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
         .map(|d| d.join(name))
         .find(|p| p.is_file())
 }
 
 /// Resolve a configured binary to an existing path: an explicit path (contains `/`) must
-/// be an existing file; a bare name is looked up on `PATH`.
-fn resolve_bin(bin: &str) -> Option<PathBuf> {
+/// be an existing file; a bare name is looked up in `path`.
+fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     if bin.contains('/') {
         let p = PathBuf::from(bin);
         p.is_file().then_some(p)
     } else {
-        which(bin)
-    }
-}
-
-fn normalize_display(d: &str) -> String {
-    if d.starts_with(':') {
-        d.to_string()
-    } else {
-        format!(":{d}")
+        which_in(path?, bin)
     }
 }
 
@@ -115,17 +113,22 @@ fn can_connect(display: &str) -> bool {
     x11rb::connect(Some(display)).is_ok()
 }
 
+/// Margin over `Xvfb::start`'s own worst case, so the backstop effectively never fires and
+/// the probe thread always finishes and reaps its child.
+const PROBE_MARGIN: Duration = Duration::from_secs(2);
+
+/// How long the deep probe waits. Must exceed `Xvfb::start`'s OWN worst case, which
+/// includes one retry of a wedged server: a shorter budget reports Fail for the exact
+/// transient class the start path survives, with a wrong remedy.
+fn probe_budget() -> Duration {
+    crate::xvfb::start_deadline() + PROBE_MARGIN
+}
+
 /// Spawn a private Xvfb and tear it down, with a timeout so a wedged Xvfb can't hang
 /// doctor. Returns the display it came up on, or an error string.
-///
-/// The budget must cover `Xvfb::start`'s OWN worst case (which includes one
-/// retry of a wedged server) plus margin — a shorter budget here would report
-/// Fail for the exact transient class the start path survives, with a wrong
-/// remedy. Sized that way, the backstop effectively never fires and the probe
-/// thread always finishes and reaps its child (no orphan).
 fn probe_xvfb() -> Result<String, String> {
     let screen = std::env::var("GLASS_XVFB_SCREEN").unwrap_or_else(|_| "1280x800x24".into());
-    let budget = crate::xvfb::start_deadline() + Duration::from_secs(2);
+    let budget = probe_budget();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         // The Xvfb is dropped at the end of `map` (after we read its display),
@@ -180,6 +183,128 @@ mod tests {
         let bad = x11_checks(Some(":42"), None, Some(false), None);
         assert_eq!(bad[0].status, CheckStatus::Fail);
         assert!(bad[0].remedy.is_some());
+    }
+
+    /// A directory holding an executable `name`, plus a second empty directory, returned as
+    /// a `PATH`-style list with the empty one first — so a hit proves the search walked on
+    /// rather than stopping at the head.
+    fn path_containing(name: &str) -> (tempfile::TempDir, std::ffi::OsString, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let empty = dir.path().join("empty");
+        let holding = dir.path().join("holding");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&holding).unwrap();
+        let bin = holding.join(name);
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        // Executable, so the test is about the search and not about accepting a file that
+        // could never be spawned.
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let list = std::env::join_paths([&empty, &holding]).expect("join paths");
+        (dir, list, bin)
+    }
+
+    #[test]
+    fn a_bare_name_resolves_to_the_first_directory_holding_it() {
+        let (_dir, path, bin) = path_containing("Xvfb");
+        assert_eq!(resolve_bin("Xvfb", Some(&path)), Some(bin));
+    }
+
+    #[test]
+    fn a_bare_name_absent_from_the_path_resolves_to_nothing() {
+        let (_dir, path, _bin) = path_containing("Xvfb");
+        assert_eq!(resolve_bin("Xorg", Some(&path)), None);
+    }
+
+    #[test]
+    fn an_explicit_path_is_taken_as_given_and_must_exist() {
+        let (_dir, _path, bin) = path_containing("Xvfb");
+        // A configured GLASS_XVFB is a path, not a name to search for — resolving it
+        // through the search list would silently run a different binary.
+        assert_eq!(resolve_bin(bin.to_str().unwrap(), None), Some(bin.clone()));
+        assert_eq!(resolve_bin("/nonexistent/Xvfb", None), None);
+    }
+
+    #[test]
+    fn a_bare_name_with_no_search_list_resolves_to_nothing() {
+        assert_eq!(resolve_bin("Xvfb", None), None);
+    }
+
+    #[test]
+    fn a_live_display_is_reachable_and_an_unused_number_is_not() {
+        let server = Xvfb::start("640x480x24").expect("Xvfb should start");
+        assert!(
+            can_connect(&server.display),
+            "the display we just started must be reachable"
+        );
+        drop(server);
+        assert!(
+            !can_connect(":9999"),
+            "an unused display number must not read as reachable"
+        );
+    }
+
+    #[test]
+    fn the_deep_probe_starts_a_real_display_and_takes_it_back_down() {
+        let display = probe_xvfb().expect("the deep probe should start a display");
+        // Only the report is asserted. Whether the number still answers is not this test's
+        // to check: display numbers are a machine-wide namespace, and the next server to
+        // start — in this suite or outside it — takes the one the probe just released.
+        assert!(
+            display.starts_with(':'),
+            "must report the display it came up on, got {display:?}"
+        );
+    }
+
+    #[test]
+    fn the_probe_budget_outlasts_the_start_it_wraps() {
+        assert!(
+            probe_budget() > crate::xvfb::start_deadline(),
+            "probe budget {:?} must exceed the start deadline {:?}",
+            probe_budget(),
+            crate::xvfb::start_deadline()
+        );
+    }
+
+    #[test]
+    fn a_blank_glass_display_is_treated_as_unset() {
+        // Blank means "self-spawn", so it must not be carried into attach mode and
+        // reported as an unreachable display named "".
+        let cs = checks_for(Some("   "), false);
+        assert!(
+            cs.iter().any(|c| c.name == "Xvfb"),
+            "blank should select self-spawn mode, which checks for Xvfb: {cs:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_glass_display_selects_attach_mode() {
+        let cs = checks_for(Some(":9999"), false);
+        assert!(
+            cs.iter().all(|c| c.name != "Xvfb"),
+            "attach mode must not require Xvfb: {cs:?}"
+        );
+        assert_eq!(cs[0].status, CheckStatus::Fail, "{cs:?}");
+    }
+
+    #[test]
+    fn a_shallow_check_never_spawns_a_display() {
+        // The deep probe costs a real Xvfb start; running it on a shallow check makes
+        // `glass doctor` spawn a server nobody asked for.
+        let cs = checks_for(None, false);
+        assert!(
+            cs.iter().all(|c| c.name != "Xvfb spawn (deep)"),
+            "shallow mode must not run the deep probe: {cs:?}"
+        );
+    }
+
+    #[test]
+    fn the_public_entry_point_reports_the_display_mode() {
+        let cs = checks(false);
+        assert!(
+            cs.iter().any(|c| c.name == "GLASS_DISPLAY"),
+            "doctor must always say which display mode it is in: {cs:?}"
+        );
     }
 
     #[test]

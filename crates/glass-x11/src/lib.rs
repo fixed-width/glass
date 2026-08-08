@@ -1,4 +1,10 @@
 //! glass-x11: the Linux/X11 `glass_core::Platform` backend.
+//!
+//! Half this backend's coverage lives elsewhere: the `#[ignore]`d X11 suite in
+//! `crates/glass-testapp/tests/integration.rs` drives it end to end against a real app
+//! (`scripts/test-x11.sh`). Do not read "no test here" as untested. The two halves do not
+//! substitute for each other — that suite cannot kill a mutant, because the gate runs
+//! `cargo nextest run -p glass-x11` and skips `#[ignore]`d tests in another package.
 
 #![cfg(target_os = "linux")]
 
@@ -12,6 +18,10 @@ pub mod coords;
 pub mod doctor;
 pub mod pixels;
 pub mod platform;
+// A separate file, declared `#[cfg(test)]`: cargo-mutants stops at an excluded `mod` before
+// it records the external file, so the harness itself never gets mutated.
+#[cfg(test)]
+mod testx;
 pub mod xvfb;
 pub use platform::X11Platform;
 pub use xvfb::Xvfb;
