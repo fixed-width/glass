@@ -1956,6 +1956,42 @@ mod session_tests {
         );
     }
 
+    /// A modified click holds the modifier across the press and releases it after, and a plain
+    /// one sends no modifier traffic at all. Both directions, because a single one cannot tell
+    /// the guard from its inverse — and an app reads ctrl+click as ctrl+click only if control is
+    /// already down when the button arrives.
+    #[test]
+    fn a_click_carries_its_modifiers_and_a_plain_one_sends_none() {
+        let mut s = Launch::new().start_mapped();
+        let click = |modifiers: Vec<glass_core::keys::Modifier>| PointerEvent::Click {
+            x: 20,
+            y: 20,
+            button: glass_core::MouseButton::Left,
+            count: 1,
+            modifiers,
+        };
+        s.platform().send_pointer(&click(vec![])).expect("plain");
+        let plain = s.wait_for_log(" 272 0");
+        assert!(
+            !plain.iter().any(|l| l.contains("input: mods")),
+            "a plain click must send no modifier traffic: {plain:#?}"
+        );
+        s.platform()
+            .send_pointer(&click(vec![glass_core::keys::Modifier::Control]))
+            .expect("modified");
+        let modified = s.wait_for_log("mods 0");
+        let at = |needle: &str| modified.iter().position(|l| l.contains(needle));
+        let (down, press, up) = (
+            at("mods 4").expect("control down"),
+            at(" 272 1").expect("pressed"),
+            at("mods 0").expect("control released"),
+        );
+        assert!(
+            down < press && press < up,
+            "control must be held across the click: {modified:#?}"
+        );
+    }
+
     #[test]
     fn a_scroll_reaches_the_window_as_an_axis_event() {
         let mut s = Launch::new().start_mapped();

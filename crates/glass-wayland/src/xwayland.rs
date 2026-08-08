@@ -669,16 +669,25 @@ mod session_tests {
     #[test]
     fn the_sessions_own_xwayland_is_found_by_its_runtime_dir() {
         let s = Launch::new().through_xwayland().start();
-        let display = session_display(&s.runtime_dir()).expect("sway starts an Xwayland");
-        assert!(
-            is_display_arg(&display),
-            "a bare display token: {display:?}"
-        );
-        // The whole point of matching on the runtime dir: never the user's own desktop.
-        assert_ne!(
-            Some(display.as_str()),
-            std::env::var("DISPLAY").ok().as_deref(),
-            "the session's Xwayland must not be the host's X server"
+        let dir = s.runtime_dir();
+        // Computed here rather than trusted from the lookup: sibling tests run their own sessions
+        // in parallel, so a lookup that ignored the runtime dir would still find one of theirs and
+        // answer with a perfectly plausible display.
+        let mine: Vec<String> = xwayland_pids()
+            .into_iter()
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/environ"))
+                    .is_ok_and(|env| serves_session(&env, &dir))
+            })
+            .filter_map(|pid| {
+                display_from_cmdline(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
+            })
+            .collect();
+        assert_eq!(mine.len(), 1, "one Xwayland serves this session: {mine:?}");
+        assert_eq!(
+            session_display(&dir).as_deref(),
+            Some(mine[0].as_str()),
+            "the lookup answered with an X server this session does not own"
         );
     }
 
