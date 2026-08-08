@@ -230,6 +230,34 @@ impl Session {
     }
 }
 
+/// The event-clock stamps the fixture echoed, in arrival order.
+///
+/// Each input line carries the compositor timestamp as a `t<N>` word (see the fixture's
+/// `echo`); a line without one carried no event. The format is the harness's business, so the
+/// parse lives here and the tests keep their own assertions about what the numbers must do.
+pub(crate) fn event_times(lines: &[String]) -> Vec<u32> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            l.split_whitespace()
+                .find_map(|w| w.strip_prefix('t')?.parse().ok())
+        })
+        .collect()
+}
+
+/// The fill the fixture paints window `i`, as the RGB a capture reports. A distinct colour per
+/// window, so a capture test can tell them apart — and derived from the same expression the
+/// fixture uses, so the two cannot drift.
+pub(crate) fn window_fill_argb(i: usize) -> u32 {
+    0x00_11_22 + (i as u32 + 1) * 0x33_00_00
+}
+
+/// [`window_fill_argb`] as the `(r, g, b)` a captured frame carries.
+pub(crate) fn window_fill_rgb(i: usize) -> (u8, u8, u8) {
+    let [_, r, g, b] = window_fill_argb(i).to_be_bytes();
+    (r, g, b)
+}
+
 // ---------------------------------------------------------------------------
 // The fixture app: a native Wayland client, re-executed as this test binary.
 // ---------------------------------------------------------------------------
@@ -366,7 +394,9 @@ mod app {
         wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
         wl_shm_pool, wl_surface,
     };
-    use wayland_client::{Connection, Dispatch, QueueHandle, globals::registry_queue_init};
+    use wayland_client::{
+        Connection, Dispatch, QueueHandle, delegate_noop, globals::registry_queue_init,
+    };
     use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
     struct App {
@@ -378,34 +408,18 @@ mod app {
         redraw: bool,
     }
 
-    /// Every global the fixture binds is request-only from here on, so most events are simply
-    /// not interesting. The two that are: `xdg_wm_base.ping` (a compositor kills a client that
-    /// stops answering) and `xdg_surface.configure` (a surface is not mapped until its first
-    /// configure is acked and a buffer committed).
-    macro_rules! ignore_events {
-        ($($t:ty),* $(,)?) => {$(
-            impl Dispatch<$t, ()> for App {
-                fn event(
-                    _: &mut Self,
-                    _: &$t,
-                    _: <$t as wayland_client::Proxy>::Event,
-                    _: &(),
-                    _: &Connection,
-                    _: &QueueHandle<Self>,
-                ) {
-                }
-            }
-        )*};
-    }
-
-    ignore_events!(
-        wl_registry::WlRegistry,
-        wl_compositor::WlCompositor,
-        wl_surface::WlSurface,
-        wl_shm::WlShm,
-        wl_shm_pool::WlShmPool,
-        wl_buffer::WlBuffer,
-    );
+    // Every global the fixture binds is request-only from here on, so most events are simply not
+    // interesting. `delegate_noop!` is wayland-client's own spelling of that; a hand-rolled macro
+    // here expanded to the identical impls.
+    //
+    // The two events that ARE interesting get real impls below: `xdg_wm_base.ping` (a compositor
+    // kills a client that stops answering) and `xdg_surface.configure` (a surface is not mapped
+    // until its first configure is acked and a buffer committed).
+    delegate_noop!(App: ignore wl_compositor::WlCompositor);
+    delegate_noop!(App: ignore wl_surface::WlSurface);
+    delegate_noop!(App: ignore wl_shm::WlShm);
+    delegate_noop!(App: ignore wl_shm_pool::WlShmPool);
+    delegate_noop!(App: ignore wl_buffer::WlBuffer);
 
     /// A seat only has a pointer or a keyboard once it says so. Asking for one before the
     /// capability is advertised is a protocol error, and the compositor answers a protocol error
@@ -641,7 +655,7 @@ mod app {
             surface.commit(); // no buffer yet: the compositor answers with the first configure
             queue.roundtrip(&mut app).expect("configure");
             // A distinct colour per window, so a capture test can tell them apart.
-            let argb = 0x00_11_22u32 + (i as u32 + 1) * 0x33_00_00;
+            let argb = super::window_fill_argb(i);
             let (buf, backing) = buffer(&shm, &qh, s.width, s.height, argb);
             surface.attach(Some(&buf), 0, 0);
             surface.damage(0, 0, s.width, s.height);

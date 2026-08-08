@@ -1994,11 +1994,7 @@ mod session_tests {
         );
         // The scroll sink keeps its own clock, and a compositor drops an event whose time did
         // not move — so a stuck clock here loses the wheel, not just its ordering.
-        let times: Vec<u32> = lines
-            .iter()
-            .filter_map(|l| l.split_whitespace().find(|w| w.starts_with('t')))
-            .filter_map(|t| t[1..].parse().ok())
-            .collect();
+        let times = crate::testw::event_times(&lines);
         assert!(
             times.last() > times.first(),
             "the clock must advance across the scroll: {times:?}"
@@ -2048,11 +2044,7 @@ mod session_tests {
             })
             .expect("drag");
         let lines = s.wait_for_log("input: button t");
-        let times: Vec<u32> = lines
-            .iter()
-            .filter_map(|l| l.split_whitespace().find(|w| w.starts_with('t')))
-            .filter_map(|t| t[1..].parse().ok())
-            .collect();
+        let times = crate::testw::event_times(&lines);
         assert!(times.len() >= 3, "several events: {lines:#?}");
         assert!(
             times.windows(2).all(|w| w[1] >= w[0]),
@@ -2165,7 +2157,7 @@ mod session_tests {
         let px = &frame.pixels[..4];
         assert_eq!(
             (px[0], px[1], px[2]),
-            (0x33, 0x11, 0x22),
+            crate::testw::window_fill_rgb(0),
             "the window's own fill colour, not the compositor's background"
         );
         assert_eq!(px[3], 255, "opaque");
@@ -2193,7 +2185,7 @@ mod session_tests {
         let px = &frame.pixels[..4];
         assert_eq!(
             (px[0], px[1], px[2]),
-            (0x33, 0x11, 0x22),
+            crate::testw::window_fill_rgb(0),
             "10px into a moved window is still inside it"
         );
     }
