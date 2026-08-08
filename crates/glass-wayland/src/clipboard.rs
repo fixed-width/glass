@@ -413,6 +413,13 @@ pub fn get(socket: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Whether a failed read should simply be retried: a signal arrived mid-read and nothing was
+/// lost. Retrying anything else spins until the deadline and then reports a timeout, hiding the
+/// real failure behind a wait.
+fn is_retryable(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Interrupted
+}
+
 /// Read `fd` to EOF, but give up after `timeout`. The selection owner is an
 /// arbitrary external app; one that opens the transfer but never finishes
 /// writing (or never closes its write end) would otherwise block this read —
@@ -448,7 +455,7 @@ fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
             Ok(_) => match file.read(&mut chunk) {
                 Ok(0) => return Ok(buf), // EOF
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if is_retryable(&e) => continue,
                 Err(e) => {
                     return Err(GlassError::Backend(format!(
                         "clipboard get: read pipe: {e}"
@@ -734,9 +741,25 @@ fn serve_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{CLIP_READ_TIMEOUT, read_to_eof_bounded};
+    use super::{CLIP_READ_TIMEOUT, is_retryable, read_to_eof_bounded};
     use glass_core::GlassError;
     use std::io::Write;
+
+    /// A signal arriving mid-read costs nothing and the read resumes. Every other failure is a
+    /// failure: retrying one spins out the deadline and reports a timeout, which sends the reader
+    /// looking for a slow app instead of at the error that actually happened.
+    #[test]
+    fn only_an_interrupted_read_is_retried() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_retryable(&Error::from(ErrorKind::Interrupted)));
+        for other in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::PermissionDenied,
+            ErrorKind::WouldBlock,
+        ] {
+            assert!(!is_retryable(&Error::from(other)), "{other:?}");
+        }
+    }
     use std::time::Duration;
 
     #[test]

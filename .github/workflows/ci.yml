@@ -41,11 +41,20 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      - name: Install the X and a11y stack glass-x11's unit tests need
-        # `cargo test --workspace` now covers glass-x11's Xvfb-backed tests — they start a
-        # private display each, and one starts a private a11y bus. Neither package ships on
-        # the runner, and these are not `#[ignore]`d because the mutation gate has to run them.
-        run: sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core
+      - name: Install the display stack the Linux backends' unit tests need
+        # `cargo test --workspace` covers glass-x11's Xvfb-backed tests and glass-wayland's
+        # sway-backed ones — they start a private display or compositor each, and one starts a
+        # private a11y bus. None of it ships on the runner, and none of it is `#[ignore]`d,
+        # because the mutation gate has to run these tests.
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core \
+            xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri
+      - name: Fetch the prebuilt sway bundle
+        # Into the location glass's own discovery looks in, so nothing needs configuring.
+        run: |
+          mkdir -p ~/.local/share/glass/sway
+          curl -fsSL https://github.com/fixed-width/sway-build/releases/download/bundle-latest/sway-bundle-linux-x86_64.tar.gz \
+            | tar -C ~/.local/share/glass/sway -xz
       - run: cargo build --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -251,10 +260,18 @@ jobs:
         # Ubuntu 24.04 runners restrict unprivileged user namespaces via AppArmor; re-enable
         # them for bubblewrap (no-op on images without the knob).
         # python3-gi + gir1.2-gtk-4.0: the software_render integration test drives a real GTK4 app.
+        # The Mesa/GL stack + Xwayland and the sway bundle below are for glass-wayland's *unit*
+        # tests, which start a headless compositor each and run under coverage like any other.
         run: |
-          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 at-spi2-core
+          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 at-spi2-core \
+            xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-      - name: Measure coverage (unit + X11; Wayland/AT-SPI self-skip)
+      - name: Fetch the prebuilt sway bundle
+        run: |
+          mkdir -p ~/.local/share/glass/sway
+          curl -fsSL https://github.com/fixed-width/sway-build/releases/download/bundle-latest/sway-bundle-linux-x86_64.tar.gz \
+            | tar -C ~/.local/share/glass/sway -xz
+      - name: Measure coverage (unit + X11; Wayland/AT-SPI suites self-skip)
         run: ./scripts/coverage.sh --lcov
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -263,7 +280,7 @@ jobs:
           if-no-files-found: warn
 
   mutants:
-    name: Mutation shard ${{ matrix.shard }} (glass-core, glass-android, glass-x11)
+    name: Mutation shard ${{ matrix.shard }} (glass-core, glass-android, glass-x11, glass-wayland)
     runs-on: ubuntu-latest
     # A push carries no base ref to diff against; this gate is a pull-request check.
     if: github.event_name == 'pull_request'
@@ -298,7 +315,8 @@ jobs:
           git diff "origin/$BASE_REF...HEAD" \
             -- ':(glob)crates/glass-core/src/**/*.rs' \
                ':(glob)crates/glass-android/src/**/*.rs' \
-               ':(glob)crates/glass-x11/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
+               ':(glob)crates/glass-x11/src/**/*.rs' \
+               ':(glob)crates/glass-wayland/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
           wc -l "$RUNNER_TEMP/pr.diff"
           if [ -s "$RUNNER_TEMP/pr.diff" ]; then
             echo "touched=true" >> "$GITHUB_OUTPUT"
@@ -319,12 +337,21 @@ jobs:
         if: steps.diff.outputs.touched == 'true'
         with:
           tool: cargo-mutants,cargo-nextest
-      - name: Install the X and a11y stack glass-x11's tests drive
+      - name: Install the display stack the gated backends' tests drive
         if: steps.diff.outputs.touched == 'true'
-        # xvfb for the private headless displays those tests start; at-spi2-core for the one
-        # that starts a private a11y bus. Absent either, cargo-mutants' unmutated baseline
-        # fails and the run grades nothing.
-        run: sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core
+        # xvfb for the private headless displays glass-x11's tests start; at-spi2-core for the
+        # one that starts a private a11y bus; the Mesa/GL stack + Xwayland for the headless sway
+        # glass-wayland's tests start. Absent any of it, cargo-mutants' unmutated baseline fails
+        # and the run grades nothing.
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core \
+            xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri
+      - name: Fetch the prebuilt sway bundle
+        if: steps.diff.outputs.touched == 'true'
+        run: |
+          mkdir -p ~/.local/share/glass/sway
+          curl -fsSL https://github.com/fixed-width/sway-build/releases/download/bundle-latest/sway-bundle-linux-x86_64.tar.gz \
+            | tar -C ~/.local/share/glass/sway -xz
       - name: Mutation gate
         if: steps.diff.outputs.touched == 'true'
         # nextest runs each test in its own process, so slow tests overlap rather than sum.
@@ -332,6 +359,7 @@ jobs:
           scripts/mutants.sh "$RUNNER_TEMP/mutants" \
             --test-tool nextest \
             --package glass-core --package glass-android --package glass-x11 \
+            --package glass-wayland \
             --shard ${{ matrix.shard }}/8 --sharding round-robin \
             --in-diff "$RUNNER_TEMP/pr.diff"
 
@@ -339,8 +367,8 @@ jobs:
   # to require. This one has a fixed name and fails if any shard did.
   #
   # The ruleset's required check matches this name, so it is frozen — renaming it blocks every
-  # pull request. It gates glass-android and glass-x11 too despite the name; rename only with
-  # the ruleset.
+  # pull request. It gates glass-android, glass-x11 and glass-wayland too despite the name;
+  # rename only with the ruleset.
   mutants-gate:
     name: Mutation gate (glass-core)
     runs-on: ubuntu-latest
