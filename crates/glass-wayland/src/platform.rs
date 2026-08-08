@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
 use wayland_client::protocol::{wl_buffer, wl_output, wl_seat, wl_shm};
-use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{
@@ -556,9 +556,14 @@ fn open_session(
         buffer_done: false,
         capture_done: None,
     };
+    // v3 exactly, not 1..=3. glass captures by waiting for `buffer_done`, which only v3 sends;
+    // under v1/v2 that wait would need a different rule, and the branch for it was unreachable
+    // dead code — glass only ever talks to the sway it launched itself, which is v3. Binding the
+    // version it actually requires turns "capture silently takes an untested path" into a bind
+    // that fails saying so.
     let manager: ZwlrScreencopyManagerV1 = globals
-        .bind(&qh, 1..=3, ())
-        .map_err(|e| GlassError::Backend(format!("bind screencopy: {e}")))?;
+        .bind(&qh, 3..=3, ())
+        .map_err(|e| GlassError::Backend(format!("bind screencopy v3: {e}")))?;
     let seat: wl_seat::WlSeat = globals
         .bind(&qh, 1..=8, ())
         .map_err(|e| GlassError::Backend(format!("bind seat: {e}")))?;
@@ -1190,22 +1195,15 @@ impl Platform for WaylandPlatform {
 
         let deadline = Instant::now() + Duration::from_millis(5000);
 
-        // Phase 1: dispatch until the compositor has advertised its buffer formats, then pick
-        // one we can convert (preferring 32-bit). v3 marks the end of the format list with
-        // `buffer_done`; v1/v2 advertise a single format and never send it, so there we proceed
-        // as soon as one arrives.
-        let manager_v3 = session.manager.version() >= 3;
+        // Phase 1: dispatch until the compositor has advertised its buffer formats, then pick one
+        // we can convert (preferring 32-bit). `buffer_done` marks the end of the list — a v3
+        // event, which is why the manager is bound at v3 exactly.
         let (format, w, h, stride) = loop {
             session
                 .queue
                 .blocking_dispatch(&mut session.state)
                 .map_err(|e| GlassError::CaptureFailed(format!("dispatch: {e}")))?;
-            let advertised = if manager_v3 {
-                session.state.buffer_done
-            } else {
-                !session.state.shm_buffers.is_empty()
-            };
-            if advertised {
+            if session.state.buffer_done {
                 break crate::pixels::pick_shm_format(&session.state.shm_buffers).ok_or_else(
                     || GlassError::CaptureFailed("screencopy: no shm format advertised".into()),
                 )?;
