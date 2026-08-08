@@ -325,7 +325,7 @@ fn nudge_x(axx: u32, w: u32) -> u32 {
 
 /// Find sway's `wayland-N` socket in the private runtime dir (sway uses
 /// `wayland-1`, not cage's `wayland-0`). Ignores `wayland-N.lock` and `sway-ipc.*`.
-fn find_wayland_socket(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_wayland_socket(dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
         let name = e.file_name();
         let n = name.to_string_lossy();

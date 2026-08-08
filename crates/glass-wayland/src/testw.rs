@@ -131,6 +131,15 @@ impl Session {
         self.ipc.windows().expect("the observer should reach sway")
     }
 
+    /// The session's wayland socket — what the clipboard opens its own connection to.
+    pub(crate) fn wayland_socket(&self) -> std::path::PathBuf {
+        let dir = self
+            .platform
+            .session_runtime_dir()
+            .expect("a started session has a runtime dir");
+        crate::platform::find_wayland_socket(dir).expect("the session has a wayland socket")
+    }
+
     /// The title of the window sway currently reports as focused.
     pub(crate) fn focused_title(&mut self) -> Option<String> {
         self.windows()

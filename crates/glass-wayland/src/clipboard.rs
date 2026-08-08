@@ -741,9 +741,71 @@ fn serve_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{CLIP_READ_TIMEOUT, is_retryable, read_to_eof_bounded};
+    use super::{CLIP_READ_TIMEOUT, ClipboardOwner, get, is_retryable, read_to_eof_bounded};
+    use crate::testw::Launch;
     use glass_core::GlassError;
     use std::io::Write;
+
+    /// The serving thread is the clipboard: it holds the selection for as long as it runs, and
+    /// any app that pastes reads from it over a pipe. Nothing about that is fakeable below the
+    /// compositor, so these run against a real one.
+    #[test]
+    fn an_owner_serves_its_text_and_reports_itself_alive() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let owner = ClipboardOwner::spawn(socket.clone(), "served".into()).expect("spawn");
+        assert!(owner.is_alive(), "a freshly spawned owner is serving");
+        assert_eq!(get(&socket).expect("get"), "served");
+    }
+
+    /// Updating in place is what lets a second write reuse the thread. If `set_text` did nothing
+    /// the old value would keep being served, with nothing to say it had gone stale.
+    #[test]
+    fn updating_an_owners_text_changes_what_a_paste_reads() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let owner = ClipboardOwner::spawn(socket.clone(), "before".into()).expect("spawn");
+        assert_eq!(get(&socket).expect("get"), "before");
+        owner.set_text("after");
+        assert_eq!(get(&socket).expect("get"), "after");
+    }
+
+    /// Stopping gives up the selection. A thread that kept running would keep answering pastes
+    /// after glass believed the clipboard was released — and would still be holding the wayland
+    /// socket when the session tore down around it.
+    #[test]
+    fn stopping_an_owner_gives_up_the_selection() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let owner = ClipboardOwner::spawn(socket.clone(), "transient".into()).expect("spawn");
+        assert_eq!(get(&socket).expect("get"), "transient");
+        owner.stop();
+        assert_eq!(get(&socket).expect("get"), "", "the selection is released");
+    }
+
+    /// Dropping is the same teardown by another route — the one that runs when a session ends
+    /// without anyone calling `stop`.
+    #[test]
+    fn dropping_an_owner_gives_up_the_selection() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let owner = ClipboardOwner::spawn(socket.clone(), "transient".into()).expect("spawn");
+        assert_eq!(get(&socket).expect("get"), "transient");
+        drop(owner);
+        assert_eq!(get(&socket).expect("get"), "");
+    }
+
+    /// A compositor that is gone cannot be served. Reporting success would leave the caller
+    /// believing the clipboard holds text no app can ever read.
+    #[test]
+    fn an_owner_cannot_be_spawned_against_a_socket_that_is_not_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = match ClipboardOwner::spawn(dir.path().join("wayland-9"), "text".into()) {
+            Ok(_) => panic!("a socket with no compositor behind it must not read as served"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, GlassError::Backend(_)), "{err}");
+    }
 
     /// A signal arriving mid-read costs nothing and the read resumes. Every other failure is a
     /// failure: retrying one spins out the deadline and reports a timeout, which sends the reader
