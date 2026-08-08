@@ -254,6 +254,19 @@ mod tests {
         );
     }
 
+    /// Distinct from the non-executable case above: here the earlier `PATH` entry has no
+    /// candidate at all, not one it can't run.
+    #[test]
+    fn the_search_walks_past_an_entry_lacking_the_binary_to_a_later_match() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let holding = dir_with("Xvfb", 0o755);
+        let path = std::env::join_paths([empty.path(), holding.path()]).expect("join paths");
+        assert_eq!(
+            resolve_bin("Xvfb", Some(&path)),
+            Resolved::Found(holding.path().join("Xvfb"))
+        );
+    }
+
     /// When the walk finds nothing runnable, the non-executable it passed is the actionable
     /// fact — reporting `Absent` would send the user to install what is already installed.
     #[test]
