@@ -514,6 +514,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn an_unowned_clipboard_reads_as_empty_rather_than_failing() {
         // A display where nothing has ever copied is the normal starting state, not an error.
         let x = TestX::start();
@@ -521,6 +522,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn repeated_reads_leave_no_windows_behind() {
         // Each read creates a temporary window to receive the SelectionNotify on. An agent
         // polls the clipboard, so one leaked window per read accumulates for the session.
@@ -542,6 +544,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn text_handed_to_the_owner_reads_back_whole() {
         let x = TestX::start();
         let _owner = ClipboardOwner::spawn(x.display().to_string(), LONG_TEXT.to_string())
@@ -550,6 +553,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_later_copy_replaces_what_the_owner_serves() {
         let x = TestX::start();
         let owner =
@@ -560,6 +564,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn the_owner_is_alive_until_it_is_dropped_and_then_serves_nothing() {
         let x = TestX::start();
         let owner =
@@ -574,6 +579,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn another_client_taking_the_selection_retires_the_owner() {
         // The server sends SelectionClear; ignoring it leaves a thread that believes it still
         // owns a selection it does not, so the next copy is served by nobody.
@@ -590,6 +596,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn the_owner_advertises_the_targets_it_can_convert_to() {
         let x = TestX::start();
         let _owner =
@@ -612,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_target_the_owner_cannot_produce_is_refused_rather_than_answered_wrongly() {
         // Refusal is `property = NONE`. Answering with the text regardless would hand a
         // requestor asking for an image a string it cannot use.

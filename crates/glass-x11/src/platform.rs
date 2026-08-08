@@ -1553,6 +1553,7 @@ mod display_tests {
     const OTHER_PID: u32 = 999_999;
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn interning_is_stable_per_name_and_distinct_across_names() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1563,6 +1564,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn there_is_no_active_window_until_one_is_selected() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -1576,6 +1578,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_windows_name_is_read_back_and_absence_is_not_an_empty_string() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1590,6 +1593,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_windows_class_is_read_back_as_the_instance_class_pair() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1602,6 +1606,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_single_component_class_stands_for_both_halves() {
         // ICCCM wants `instance\0class\0`; some apps write only one string, and dropping the
         // pair rather than doubling it would make their windows unmatchable by class.
@@ -1615,6 +1620,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn geometry_is_reported_in_root_coordinates() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1631,6 +1637,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn the_active_windows_geometry_is_its_own() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -1648,6 +1655,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn an_op_on_a_destroyed_window_reports_it_gone_and_forgets_it() {
         // The stale id must not come back on the next call as a raw protocol error — the
         // caller gets one actionable WindowNotFound either way.
@@ -1664,6 +1672,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_dead_display_is_a_backend_failure_not_a_closed_window() {
         // Only `BadWindow`/`BadDrawable` mean the window went away. Reporting a lost
         // connection as WindowNotFound would send the caller looking for an app that closed,
@@ -1689,6 +1698,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn the_client_list_is_read_from_the_root_and_empty_when_unset() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1703,6 +1713,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_mapped_window_owned_by_the_app_matches() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1721,6 +1732,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn an_unmapped_window_never_matches() {
         // Windows exist in the tree before they are shown; treating one as the app's window
         // hands back a target with nothing on screen.
@@ -1736,6 +1748,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_window_hint_matches_a_window_outside_the_pid_set() {
         // The fallback for apps that never set _NET_WM_PID.
         let x = TestX::start();
@@ -1762,6 +1775,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn scanning_returns_every_window_the_app_owns_and_nothing_else() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1776,6 +1790,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_window_listed_twice_is_returned_once() {
         // `_NET_CLIENT_LIST` and the root's children overlap whenever a window is not
         // reparented, which is every window under a bare Xvfb.
@@ -1805,6 +1820,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_warp_moves_the_pointer_to_the_windows_origin_plus_the_offset() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1815,6 +1831,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_button_press_is_held_until_it_is_released() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1841,6 +1858,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_positive_scroll_clicks_the_positive_button_once_per_step() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1860,6 +1878,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_negative_scroll_clicks_the_negative_button_that_many_times() {
         // The magnitude, not the signed value: a step count that stayed negative would
         // produce an empty range and scroll nothing at all.
@@ -1880,6 +1899,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn an_unmapped_keysym_is_an_invalid_key_not_some_other_keycode() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1890,6 +1910,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_keysym_resolves_to_a_keycode_that_really_carries_it() {
         // Checked against the server's own table rather than a hardcoded keycode, which
         // varies with the keymap the runner happens to load.
@@ -1911,6 +1932,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn every_keysym_the_server_maps_can_be_resolved() {
         // A mapping request one keycode short still resolves nearly everything; only the
         // keys at the very end of the range go missing.
@@ -1937,6 +1959,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn each_modifier_resolves_to_its_own_real_keycode() {
         let x = TestX::start();
         let plat = x.platform();
@@ -1954,6 +1977,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn tapping_a_keycode_presses_and_releases_it_at_the_focused_window() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -1986,6 +2010,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn pressing_modifiers_holds_them_down_and_releasing_lets_them_go() {
         let x = TestX::start();
         let plat = x.platform();
@@ -2034,6 +2059,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn an_uppercase_letter_is_typed_with_shift_held() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2050,6 +2076,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_lowercase_letter_is_typed_without_shift() {
         // Holding Shift for an unshifted key turns `a` into `A` at the application.
         let x = TestX::start();
@@ -2067,6 +2094,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn focusing_a_window_makes_the_server_route_keys_to_it() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2105,6 +2133,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn the_app_pid_and_its_tree_are_empty_until_something_is_launched() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2122,6 +2151,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server and a private AT-SPI bus; needs Xvfb and at-spi2-core"]
     fn the_a11y_bus_address_is_the_private_buss_own_and_absent_without_one() {
         // The a11y reader connects to whatever this returns. Reporting nothing for a launch
         // that did start a bus leaves the tree unreadable; reporting something for one that
@@ -2141,6 +2171,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn draining_logs_hands_over_the_buffer_and_leaves_it_empty() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2159,6 +2190,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_click_presses_the_mapped_button_at_the_requested_point() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2188,6 +2220,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_scroll_clicks_the_wheel_buttons_for_each_axis() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2214,6 +2247,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_drag_presses_at_the_start_and_releases_at_the_end() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2251,6 +2285,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_drag_with_a_modifier_holds_it_from_before_the_press_to_after_the_release() {
         // A constrained drag (shift to snap an axis, ctrl to copy) is a different gesture
         // from the same drag unmodified.
@@ -2299,6 +2334,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_long_drag_reaches_the_window_while_it_is_still_running() {
         // Each step commits on its own. Held to one flush at the end, a client that renders
         // per frame — a browser — sees the pointer jump rather than drag.
@@ -2339,6 +2375,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_multi_touch_gesture_is_refused_by_this_backend() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2359,6 +2396,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn typed_text_sends_one_key_per_character() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2385,6 +2423,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_chord_holds_its_modifier_across_the_key() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2417,6 +2456,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_window_op_moves_and_resizes_and_reports_the_result() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2444,6 +2484,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn listing_windows_reports_the_apps_windows_and_marks_the_active_one() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2486,6 +2527,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn listing_windows_without_an_active_one_is_an_error_not_an_empty_list() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2496,6 +2538,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn selecting_a_window_makes_it_active_and_refuses_one_that_is_not_the_apps() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2527,6 +2570,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn capturing_a_named_window_reads_that_windows_own_area() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2567,6 +2611,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn the_clipboard_round_trips_through_the_backend() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2582,6 +2627,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_second_copy_updates_the_owner_it_already_has() {
         // Re-taking the selection for every copy is visible to every other client on the
         // display: a clipboard manager watching ownership sees churn that did not happen.
@@ -2601,6 +2647,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_copy_after_another_client_took_the_selection_starts_a_fresh_owner() {
         // glass's owner retires when something else takes CLIPBOARD. Handing the next copy to
         // that retired owner puts the text somewhere nothing serves it, and the paste that
@@ -2635,6 +2682,7 @@ mod display_tests {
     // --- the close ladder ------------------------------------------------------------
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn only_a_window_advertising_wm_delete_window_can_be_asked_to_close() {
         let x = TestX::start();
         let plat = x.platform();
@@ -2651,6 +2699,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_close_request_arrives_as_the_delete_client_message() {
         let x = TestX::start();
         let plat = x.platform();
@@ -2679,6 +2728,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn asking_the_app_to_close_reaches_every_window_that_accepts_it() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2697,6 +2747,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn an_app_with_no_window_is_not_reported_as_asked() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2710,6 +2761,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn the_bounded_ask_reaches_the_window_through_its_own_connection() {
         // The ask runs on a second connection so the caller can abandon it without leaving
         // this backend's connection stopped mid-request.
@@ -2729,6 +2781,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn stopping_the_app_reaps_the_child_and_forgets_it() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2745,6 +2798,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn dropping_the_backend_reaps_an_app_that_was_never_stopped() {
         // Parity with the other backends: a panic-unwind or the process-exit backstop must
         // not leave the launched app running.
@@ -2763,6 +2817,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_launch_whose_app_never_appears_is_a_timeout_and_leaves_nothing_running() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2788,6 +2843,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn discovery_waits_out_its_timeout_before_giving_up() {
         // The budget has to be spent, not just reported: giving up at once fails every app
         // slower than instant. Timed around `discover_window`, so a spawn that fails under
@@ -2818,6 +2874,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn an_untypable_character_is_reported_at_its_own_index() {
         // The index is all the error may carry — naming the character would put typed
         // content into the unredacted audit log — so it has to advance per character.
@@ -2832,6 +2889,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_scroll_with_a_modifier_holds_it_across_the_wheel() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2873,6 +2931,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_chord_whose_key_needs_shift_gets_shift_as_well_as_its_own_modifiers() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2903,6 +2962,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_launch_whose_command_does_not_exist_reports_the_spawn_failure() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2923,6 +2983,7 @@ mod display_tests {
     // --- capture ---------------------------------------------------------------------
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_zero_area_region_is_rejected_before_a_doomed_get_image() {
         let x = TestX::start();
         let plat = x.platform();
@@ -2963,6 +3024,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_capture_reads_the_pixels_that_are_actually_on_screen() {
         // Everything in the decode path — the plane mask, the depth lookup and the
         // bytes-per-pixel it yields — is only observable in the pixels that come back.
@@ -3008,6 +3070,7 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn scanning_for_one_window_finds_a_match_and_reports_none_otherwise() {
         let x = TestX::start();
         let plat = x.platform();

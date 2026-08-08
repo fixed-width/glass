@@ -231,6 +231,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn a_live_display_is_reachable_and_an_unused_number_is_not() {
         let server = Xvfb::start("640x480x24").expect("Xvfb should start");
         assert!(
@@ -245,6 +246,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn the_deep_probe_starts_a_real_display_and_takes_it_back_down() {
         let display = probe_xvfb().expect("the deep probe should start a display");
         // Only the report is asserted. Whether the number still answers is not this test's

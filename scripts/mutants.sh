@@ -36,6 +36,11 @@
 # alone would mutate only the default package's files under a widened package set — a clean
 # run over a crate that was never in scope. Repeat it for more.
 #
+# Ignored tests are run, and that is set here rather than left to the caller: both test runners
+# skip `#[ignore]` by default, and a mutant no test ran against is graded caught, so a crate
+# whose display-dependent tests are ignored would sweep clean having tested nothing. A caller
+# who forgets the flag would see that as a pass.
+#
 # MUTANTS_JOBS sets concurrency (default 2); `--jobs` cannot be passed through,
 # because cargo-mutants rejects it twice over.
 set -euo pipefail
@@ -99,6 +104,26 @@ for p in "${packages[@]}"; do
     pkg_args+=(--package "$p")
 done
 
+# glass-android's integration binaries are all AVD loops, and there is no device here — every
+# test in them is `#[ignore]`d, so excluding them costs the run nothing today. Getting this
+# wrong fails loudly: an excluded test kills no mutant and a survivor fails the run, which is
+# the opposite of what a missing `--run-ignored` does.
+readonly NO_DEVICE='not (package(glass-android) and kind(test))'
+
+# Run the `#[ignore]`d tests too (see the header). cargo-mutants appends these to the end of the
+# test command and to the test phase only, so the nextest flag needs no `--` and the cargo one
+# does. A test ignored because it needs hardware must self-skip when that hardware is absent —
+# `#[ignore]` no longer keeps it from running here.
+case " ${passthrough[*]-} " in
+    *" --test-tool nextest "* | *" --test-tool=nextest "*)
+        run_ignored=(--cargo-test-arg=--run-ignored=all
+            --cargo-test-arg=-E --cargo-test-arg="$NO_DEVICE")
+        ;;
+    *)
+        run_ignored=(--cargo-test-arg=-- --cargo-test-arg=--include-ignored)
+        ;;
+esac
+
 # How many mutants a set of scope arguments yields, ignoring any `--shard` the caller
 # passed. Listing costs ~0.1s and builds nothing, so the "did this gate anything"
 # question is answered before a single mutant is compiled — and answered for the whole
@@ -119,6 +144,7 @@ attempt() {
     cargo mutants \
         "${pkg_args[@]}" \
         --cargo-arg=--locked \
+        "${run_ignored[@]}" \
         --timeout "$MUTANT_TIMEOUT" \
         -j "${MUTANTS_JOBS:-2}" \
         --output "$dir" \

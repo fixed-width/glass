@@ -81,10 +81,22 @@ classify_suite() {  # label cmd...
     fi
 }
 
+# A plain `cargo test` run rather than a harness: no skip sentinel to read, so the exit
+# status is the whole story.
+classify_tests() { # label cmd...
+    local label="$1"
+    shift
+    if "$@" >/dev/null; then
+        ran+=("$label")
+    else
+        failed+=("$label")
+    fi
+}
+
 # Always: the workspace unit tests (and the always-on integration tests). Keep
 # going on failure so a single failing test still yields a coverage report.
 echo "coverage: running workspace unit tests…"
-if cargo test --workspace --no-fail-fast >/dev/null; then ran+=("unit"); else failed+=("unit"); fi
+classify_tests unit cargo test --workspace --no-fail-fast
 
 if [ "$unit_only" -eq 0 ]; then
     # Each harness exits 0 and self-skips when its prerequisites are missing, so we
@@ -92,12 +104,20 @@ if [ "$unit_only" -eq 0 ]; then
     # test-x11.sh does NOT self-skip (it errors if Xvfb is absent), so probe first.
     echo "coverage: running X11 integration suite (needs Xvfb; sandbox_* need bubblewrap)…"
     if command -v Xvfb >/dev/null 2>&1; then
+        # The workspace run above skipped glass-x11's display-backed unit tests, which are
+        # `#[ignore]`d — half the crate's coverage, and this host has the display they want.
+        classify_tests x11-unit cargo test -p glass-x11 --no-fail-fast -- --include-ignored
         classify_suite x11 ./scripts/test-x11.sh
     else
         skipped+=("x11 (no Xvfb)")
     fi
 
     echo "coverage: running Wayland integration suite (needs sway >=1.12)…"
+    if command -v sway >/dev/null 2>&1; then
+        classify_tests wayland-unit cargo test -p glass-wayland --no-fail-fast -- --include-ignored
+    else
+        skipped+=("wayland-unit (no sway)")
+    fi
     classify_suite wayland ./scripts/test-wayland.sh
 
     echo "coverage: running AT-SPI integration suite (needs dbus/at-spi2/GTK4)…"

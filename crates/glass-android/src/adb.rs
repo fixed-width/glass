@@ -571,6 +571,12 @@ mod tests {
     #[test]
     #[ignore = "requires a booted AVD + GLASS_ADB"]
     fn a_shell_call_that_never_answers_dies_at_its_budget() {
+        // `#[ignore]` is not enough on its own: the mutation gate runs the ignored tests too
+        // (scripts/mutants.sh), and there is no AVD there.
+        if std::env::var("GLASS_ADB").is_err() {
+            println!("no GLASS_ADB, so no AVD to wedge a call against — skipping");
+            return;
+        }
         let adb = Adb::from_env();
         let budget = AdbOp::Shell.budget();
 

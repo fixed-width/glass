@@ -3,8 +3,8 @@
 //! Half this backend's coverage lives elsewhere: the `#[ignore]`d X11 suite in
 //! `crates/glass-testapp/tests/integration.rs` drives it end to end against a real app
 //! (`scripts/test-x11.sh`). Do not read "no test here" as untested. The two halves do not
-//! substitute for each other — that suite cannot kill a mutant, because the gate runs
-//! `cargo nextest run -p glass-x11` and skips `#[ignore]`d tests in another package.
+//! substitute for each other — that suite cannot kill a mutant, because the gate's test run is
+//! scoped to the gated packages and that suite is in another one.
 
 #![cfg(target_os = "linux")]
 
