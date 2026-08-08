@@ -15,4 +15,13 @@ exclude_re = [
     # what the arm did. They are written out to record that the event was considered.
     'delete match arm zwlr_data_control_device_v1::Event::Finished',
     'delete match arm zwlr_data_control_device_v1::Event::PrimarySelection',
+
+    # `start_app`'s retry guard, in the three forms that make it true on the last attempt as well.
+    # Both routes out of that attempt return the same error and reap the private bus — the arm
+    # does it before returning, and the line after the loop does it for an exhausted ladder — so
+    # the programs are identical. The fourth form, `< with ==`, does change behaviour (it stops
+    # the retry happening at all) and is caught by the launch test that measures the ladder.
+    'replace < with <= in <impl Platform for WaylandPlatform>::start_app',
+    'replace \+ with \* in <impl Platform for WaylandPlatform>::start_app',
+    'replace match guard attempt \+ 1 < ATTEMPTS with true',
 ]
