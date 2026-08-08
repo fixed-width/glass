@@ -57,6 +57,7 @@ pub(crate) struct Launch {
     windows: Vec<String>,
     timeout_ms: u64,
     sandbox: SandboxLevel,
+    a11y: bool,
     env: Vec<(String, String)>,
 }
 
@@ -67,6 +68,7 @@ impl Launch {
             windows: vec!["glass-testw:glass-testw:320x240".into()],
             timeout_ms: LAUNCH_BUDGET_MS,
             sandbox: SandboxLevel::Off,
+            a11y: false,
             env: Vec::new(),
         }
     }
@@ -84,6 +86,12 @@ impl Launch {
 
     pub(crate) fn env(mut self, k: &str, v: &str) -> Launch {
         self.env.push((k.to_string(), v.to_string()));
+        self
+    }
+
+    /// Launch with accessibility, so the session brings up its own private bus.
+    pub(crate) fn with_a11y(mut self) -> Launch {
+        self.a11y = true;
         self
     }
 
@@ -118,7 +126,7 @@ impl Launch {
             window_hint: None,
             timeout_ms: self.timeout_ms,
             sandbox: self.sandbox,
-            a11y: false,
+            a11y: self.a11y,
         }
     }
 
@@ -431,17 +439,28 @@ mod app {
                     surface_y,
                     ..
                 } => echo(format!("input: enter {surface_x:.0} {surface_y:.0}")),
+                // The event clock goes out with each line. It is the only way a test can see that
+                // the backend advances its timestamp per event: a compositor drops a pointer
+                // event whose time did not move, so a stuck clock is a real defect that looks
+                // like nothing at all from the outside.
                 wl_pointer::Event::Motion {
+                    time,
                     surface_x,
                     surface_y,
+                } => echo(format!(
+                    "input: motion t{time} {surface_x:.0} {surface_y:.0}"
+                )),
+                wl_pointer::Event::Button {
+                    time,
+                    button,
+                    state,
                     ..
-                } => echo(format!("input: motion {surface_x:.0} {surface_y:.0}")),
-                wl_pointer::Event::Button { button, state, .. } => echo(format!(
-                    "input: button {button} {}",
+                } => echo(format!(
+                    "input: button t{time} {button} {}",
                     state.into_result().map(|s| s as u32).unwrap_or(0)
                 )),
-                wl_pointer::Event::Axis { axis, value, .. } => echo(format!(
-                    "input: axis {} {value:.0}",
+                wl_pointer::Event::Axis { time, axis, value } => echo(format!(
+                    "input: axis t{time} {} {value:.2}",
                     axis.into_result().map(|a| a as u32).unwrap_or(0)
                 )),
                 _ => {}

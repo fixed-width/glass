@@ -223,7 +223,12 @@ pub(crate) fn resolve_sway() -> Result<PathBuf> {
     if let Some(overridden) = sway_override(std::env::var_os("GLASS_SWAY")) {
         return overridden;
     }
-    if let Some(p) = sway_on_path_if_recent() {
+    // Inlined rather than wrapped: a `fn` that only splits PATH and delegates has a
+    // constant-return mutation nothing can kill on a host where the true answer is that constant
+    // — here, any machine with no sway on PATH.
+    if let Some(p) =
+        std::env::var_os("PATH").and_then(|path| sway_in_dirs(std::env::split_paths(&path)))
+    {
         return Ok(p);
     }
     let data = std::env::var_os("XDG_DATA_HOME")
@@ -266,11 +271,6 @@ fn sway_override(value: Option<std::ffi::OsString>) -> Option<Result<PathBuf>> {
             p.display()
         )))
     })
-}
-
-/// The first `sway` on `PATH`, but only if `sway --version` reports >= 1.12.
-fn sway_on_path_if_recent() -> Option<PathBuf> {
-    sway_in_dirs(std::env::split_paths(&std::env::var_os("PATH")?))
 }
 
 /// The first `sway` in `dirs` whose `--version` reports >= 1.12.
@@ -837,14 +837,17 @@ fn ensure_sandbox_available(
 
 /// XKB real-modifier mask for a chord's modifiers (standard `include "complete"`
 /// order: Shift, Lock, Control, Mod1=Alt, ..., Mod4=Super).
+///
+/// The bits are written out rather than shifted. `1 << 0` and `1 >> 0` are the same number, so a
+/// shift here is a place the code can be changed without any test being able to notice.
 fn modifier_mask(mods: &[glass_core::keys::Modifier]) -> u32 {
     use glass_core::keys::Modifier;
     mods.iter().fold(0, |m, x| {
         m | match x {
-            Modifier::Shift => 1 << 0,
-            Modifier::Control => 1 << 2,
-            Modifier::Alt => 1 << 3,
-            Modifier::Super => 1 << 6,
+            Modifier::Shift => 0b1,
+            Modifier::Control => 0b100,
+            Modifier::Alt => 0b1000,
+            Modifier::Super => 0b100_0000,
         }
     })
 }
@@ -1747,6 +1750,13 @@ mod pure_tests {
             0b100_0101,
             "a chord's modifiers are the union of their bits"
         );
+        // A repeat discriminates a union from an exclusive-or, which agree on every set of
+        // distinct modifiers and so on every other case here.
+        assert_eq!(
+            modifier_mask(&[Modifier::Shift, Modifier::Shift]),
+            0b1,
+            "naming a modifier twice still holds it down"
+        );
     }
 }
 
@@ -1963,9 +1973,74 @@ mod session_tests {
             })
             .expect("scroll");
         let lines = s.wait_for_log("input: axis");
+        let axis = lines
+            .iter()
+            .find(|l| l.contains("input: axis"))
+            .expect("a vertical wheel");
+        // `axis 0` is the vertical axis; the value is the wheel delta scaled to surface units.
+        // Asserting the number, not just that one arrived: a delta computed by adding or
+        // dividing instead of scaling still produces an axis event, just the wrong distance.
+        let value: f64 = axis
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no axis value in {axis:?}"));
+        assert!(axis.contains(" 0 "), "the vertical axis: {axis}");
         assert!(
-            lines.iter().any(|l| l.contains("input: axis 0 ")),
-            "a vertical wheel: {lines:#?}"
+            (value - -30.0).abs() < 0.01,
+            "two notches up is -30 surface units, got {value} in {axis:?}"
+        );
+    }
+
+    /// The compositor drops a pointer event whose timestamp did not move, so the session clock
+    /// has to advance per event. A stuck clock looks like nothing at all from the outside — the
+    /// events are sent, and simply do not arrive.
+    #[test]
+    fn the_event_clock_advances_across_a_drag() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        s.platform()
+            .send_pointer(&PointerEvent::Drag {
+                from_x: 20,
+                from_y: 20,
+                to_x: 80,
+                to_y: 60,
+                button: glass_core::MouseButton::Left,
+                modifiers: vec![],
+                duration_ms: 40,
+            })
+            .expect("drag");
+        let lines = s.wait_for_log("input: button t");
+        let times: Vec<u32> = lines
+            .iter()
+            .filter_map(|l| l.split_whitespace().find(|w| w.starts_with('t')))
+            .filter_map(|t| t[1..].parse().ok())
+            .collect();
+        assert!(times.len() >= 3, "several events: {lines:#?}");
+        assert!(
+            times.windows(2).all(|w| w[1] >= w[0]),
+            "the clock must never go backwards: {times:?}"
+        );
+        assert!(
+            times.last() > times.first(),
+            "and must actually advance: {times:?}"
+        );
+    }
+
+    /// A launch that asked for accessibility gets a private bus, and its address is what the
+    /// reader connects to. Answering `None` sends the reader at the user's own desktop bus.
+    #[test]
+    fn a_session_launched_with_accessibility_hands_out_its_private_bus() {
+        let mut s = Launch::new().with_a11y().start();
+        let addr = s
+            .platform()
+            .a11y_bus_addr()
+            .expect("an a11y launch has a bus");
+        assert!(addr.contains("unix:"), "{addr}");
+        assert_ne!(
+            Some(addr.as_str()),
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(),
+            "the session's own bus, not the developer's"
         );
     }
 
@@ -2091,19 +2166,19 @@ mod session_tests {
                 duration_ms: 40,
             })
             .expect("drag");
-        let lines = s.wait_for_log("input: button 272 0");
+        let lines = s.wait_for_log("272 0");
         let order: Vec<&String> = lines
             .iter()
             .filter(|l| l.contains("input: button") || l.contains("input: motion"))
             .collect();
         let down = order
             .iter()
-            .position(|l| l.contains("button 272 1"))
-            .expect("pressed");
+            .position(|l| l.contains("272 1"))
+            .unwrap_or_else(|| panic!("no press in {order:#?}"));
         let up = order
             .iter()
-            .position(|l| l.contains("button 272 0"))
-            .expect("released");
+            .position(|l| l.contains("272 0"))
+            .unwrap_or_else(|| panic!("no release in {order:#?}"));
         assert!(down < up, "pressed before released: {order:?}");
         assert!(
             order[down..up].iter().any(|l| l.contains("motion")),
