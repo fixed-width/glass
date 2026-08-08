@@ -32,9 +32,19 @@ const USE_X11: &str = "GLASS_TESTW_X11";
 /// Printed by the fixture once every window is mapped, so a log test has a line it can wait for.
 pub(crate) const READY_LINE: &str = "testw: windows mapped";
 
-/// How long a harness wait may spin before the test fails outright. Generous: it bounds a hang,
-/// it does not pace anything.
-const SETTLE_BUDGET: Duration = Duration::from_secs(10);
+/// How long a harness wait may spin before the test fails outright. It bounds a hang; it does not
+/// pace anything, and a passing test never reaches it (a session comes up in about a second).
+///
+/// Kept short on purpose. Under `cargo mutants` every mutation that stops a window appearing or a
+/// log arriving pays this budget in *every* session test, and a suite that takes minutes to fail
+/// is graded "timeout" rather than caught — the mutant survives, and the test runner is killed
+/// mid-session, which orphans the compositor.
+const SETTLE_BUDGET: Duration = Duration::from_secs(5);
+
+/// The launch budget a test gives the compositor, for the same reason as [`SETTLE_BUDGET`]:
+/// `start_app` retries the bring-up, so a mutation that stops discovery finding a window costs
+/// twice this in every test that launches one.
+const LAUNCH_BUDGET_MS: u64 = 8_000;
 
 /// A launched session: the backend under test, plus an independent view of the same compositor.
 pub(crate) struct Session {
@@ -55,7 +65,7 @@ impl Launch {
     pub(crate) fn new() -> Launch {
         Launch {
             windows: vec!["glass-testw:glass-testw:320x240".into()],
-            timeout_ms: 15_000,
+            timeout_ms: LAUNCH_BUDGET_MS,
             sandbox: SandboxLevel::Off,
             env: Vec::new(),
         }

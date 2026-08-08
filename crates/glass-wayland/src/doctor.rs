@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glass_core::{AppSpec, Check, CheckStatus};
-use rustix::process::{Pid, Signal, kill_process_group};
 
 use crate::command::{build_sway_command, sway_config};
 use crate::platform::resolve_sway;
@@ -130,7 +129,11 @@ fn probe_sway(sway: &Path) -> Result<(), String> {
     let config = rt.path().join("sway.cfg");
     let spec = AppSpec {
         build: None,
-        run: vec!["sleep".into(), "3600".into()],
+        // Exits immediately, on purpose. The probe only needs sway's IPC to answer, and the
+        // readiness loop breaks as soon as it does — which is before sway has finished `exec`ing
+        // its client, so a snapshot of sway's process tree can miss one that outlives it. A
+        // client that has already exited cannot be leaked by losing that race.
+        run: vec!["true".into()],
         cwd: None,
         env: vec![],
         window_hint: None,
@@ -155,11 +158,15 @@ fn probe_sway(sway: &Path) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Tear down the whole compositor group (sway is its own group leader).
-    if let Some(pgid) = Pid::from_raw(child.id() as i32) {
-        let _ = kill_process_group(pgid, Signal::TERM);
-    }
-    let _ = child.wait();
+    // Snapshot the launch before any of it exits: once sway is reaped its descendants are
+    // reparented to init and can no longer be found from its pid.
+    //
+    // Signalling sway's process group is not enough. sway calls `setsid` for every app it
+    // `exec`s, so the probe's own client is in neither sway's group nor its session, and a
+    // group signal reaches the compositor and nothing else — leaving the client running. This
+    // reaps the tree, exactly as `WaylandPlatform::kill_session` does.
+    let tree = glass_proc_linux::proc_tree_pids(child.id());
+    glass_proc_linux::reap_launch(&mut child, &tree, glass_proc_linux::APP_REAP_GRACE);
 
     if up {
         Ok(())
