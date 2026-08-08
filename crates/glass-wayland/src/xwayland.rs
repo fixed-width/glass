@@ -432,22 +432,24 @@ fn confirmed_lost(missing_now: &[u32], missing_before: &HashSet<u32>) -> Vec<u32
 
 #[cfg(test)]
 mod x_tests {
-    //! [`XProbe`] against a real X server — there is nothing to fake under X protocol, and a
-    //! private Xvfb speaks the same one far cheaper than a compositor.
+    //! [`XProbe`] against a real X server — there is nothing to fake under X protocol. A private
+    //! Xvfb rather than the session's own Xwayland: that server already has the fixture's window
+    //! on it, which every recovery test below would have to account for and none are about.
     use super::*;
+    use crate::testw::Xvfb;
     use x11rb::protocol::xproto::{CreateWindowAux, WindowClass};
     use x11rb::rust_connection::RustConnection;
     use x11rb::wrapper::ConnectionExt as _; // sync(): a round trip, so the server has applied it
 
     struct X {
-        _server: glass_x11::Xvfb,
+        _server: Xvfb,
         conn: RustConnection,
         root: u32,
         display: String,
     }
 
     fn server() -> X {
-        let server = glass_x11::Xvfb::start("400x300x24").expect("a private Xvfb should start");
+        let server = Xvfb::start();
         let display = server.display.clone();
         let (conn, screen) =
             x11rb::connect(Some(&display)).expect("the test client should connect");

@@ -39,10 +39,6 @@ criterion = { workspace = true }
 # xdg-shell, for the native-Wayland fixture app the unit tests launch (src/testw.rs). Already in
 # the tree as wayland-protocols-wlr's own dependency, so this builds nothing new.
 wayland-protocols = { version = "0.32", features = ["client"] }
-# `Xvfb`, for the XProbe tests: they need an X server, not this session's own Xwayland, and a
-# private Xvfb is much cheaper to start than a compositor. Test-only and acyclic — glass-x11 does
-# not depend on this crate.
-glass-x11 = { path = "../glass-x11" }
 
 [[bench]]
 name = "pixels"

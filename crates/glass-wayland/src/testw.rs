@@ -262,6 +262,51 @@ pub(crate) fn window_fill_rgb(i: usize) -> (u8, u8, u8) {
     (r, g, b)
 }
 
+/// A private X server for the tests that need one without a compositor.
+///
+/// Not glass-x11's `Xvfb`: reaching into a sibling backend for a test helper reads as a
+/// dependency between the two, and this needs none of what that one carries. Not the session's
+/// own Xwayland either — that server already has the fixture's window on it, which every recovery
+/// test would then have to account for and none of them are about.
+pub(crate) struct Xvfb {
+    child: std::process::Child,
+    pub(crate) display: String,
+}
+
+impl Xvfb {
+    /// `-displayfd` has the server pick a free display and write it back, so concurrent tests
+    /// never race for a number. It creates no lock file, and a leftover socket costs nothing: the
+    /// next server connect-probes the path and rebinds a refusing one.
+    pub(crate) fn start() -> Xvfb {
+        use std::io::{BufRead as _, BufReader};
+        let mut child = std::process::Command::new("Xvfb")
+            .args(["-displayfd", "1", "-screen", "0", "400x300x24"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("Xvfb should start");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().expect("piped"))
+            .read_line(&mut line)
+            .expect("Xvfb should report its display");
+        Xvfb {
+            child,
+            display: format!(":{}", line.trim()),
+        }
+    }
+}
+
+impl Drop for Xvfb {
+    /// TERM, so the server removes its own socket. Do not add a sweep of `/tmp/.X11-unix` here:
+    /// unlinking one cuts off whoever has since reclaimed the number.
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status();
+        let _ = self.child.wait();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The fixture app: a native Wayland client, re-executed as this test binary.
 // ---------------------------------------------------------------------------
