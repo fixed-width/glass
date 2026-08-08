@@ -176,6 +176,28 @@ attempt "$out" "${scope[@]}" ${diff_file:+--in-diff "$diff_file"} \
     ${passthrough[@]+"${passthrough[@]}"}
 graded=$out
 
+# Reap the compositors and X servers a timed-out mutant left behind.
+#
+# cargo-mutants SIGKILLs the test process when a mutant exceeds --timeout, so a mutation that
+# removes a *bound* — a discovery deadline, a screencopy event arm, a Drop impl — hangs the run
+# while holding live sessions and none of their teardown ever runs. Each orphan keeps an X display
+# number, and once 33 are gone no session can start Xwayland at all: later mutants then fail for
+# an environmental reason and are graded on it.
+#
+# Matched by glass's own tempdir prefixes, so a developer's real sway session is never a
+# candidate. TERM only: a KILL would leave behind the sockets and children that this process's own
+# teardown is what removes.
+reap_strays() {
+    local pids
+    pids=$(ps -eo pid,ppid,args --no-headers |
+        awk '$2 == 1 && (/glass-wl\./ || /glass-doctor-wl\./ || /Xvfb .*-displayfd/) {print $1}')
+    [ -z "$pids" ] && return 0
+    echo "mutants: reaping $(echo "$pids" | wc -w) session(s) a timed-out mutant left running"
+    # shellcheck disable=SC2086 # deliberate word splitting: one signal per pid
+    kill -TERM $pids 2>/dev/null || true
+}
+reap_strays
+
 # A shard may legitimately draw none of the planned mutants; the count above is what
 # proves the run as a whole gated something.
 echo "mutants: $total generated, $caught caught, $missed missed, $timed_out timed out, $unviable unviable"
