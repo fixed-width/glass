@@ -691,17 +691,25 @@ mod session_tests {
         assert_eq!(session_display(dir.path()), None);
     }
 
-    /// The scan has to find real Xwayland processes: an empty list reads as "no X11 side" and
-    /// a placeholder pid would send `is_xwayland` and teardown at whatever process holds it.
+    /// The scan has to find the session's *own* Xwayland. An empty list reads as "no X11 side",
+    /// which switches recovery off for the session.
+    ///
+    /// Tied to this session rather than to the machine: `xwayland_pids` scans all of `/proc`, so a
+    /// bare "some Xwayland exists" holds on any desktop and on any run with a sibling session in
+    /// flight, whether or not this launch started one. Asserting `is_xwayland` over what the scan
+    /// returned would be a tautology besides — that is the predicate it filters on.
     #[test]
-    fn the_scan_finds_real_xwayland_processes() {
-        let _s = Launch::new().through_xwayland().start();
-        let pids = xwayland_pids();
-        assert!(!pids.is_empty(), "the session's own Xwayland is running");
-        for pid in &pids {
-            assert!(*pid > 1, "no placeholder pids: {pids:?}");
-            assert!(is_xwayland(*pid), "pid {pid} was reported as Xwayland");
-        }
+    fn the_scan_finds_this_sessions_own_xwayland() {
+        let s = Launch::new().through_xwayland().start();
+        let dir = s.runtime_dir();
+        let mine: Vec<u32> = xwayland_pids()
+            .into_iter()
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/environ"))
+                    .is_ok_and(|env| serves_session(&env, &dir))
+            })
+            .collect();
+        assert_eq!(mine.len(), 1, "exactly this session's Xwayland: {mine:?}");
     }
 
     /// Teardown uses this to tell the compositor's own plumbing from the app's processes, so a

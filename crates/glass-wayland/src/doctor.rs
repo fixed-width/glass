@@ -291,11 +291,34 @@ mod tests {
     /// spawn would report the same clean bill of health as one that ran it.
     #[test]
     fn the_deep_check_really_starts_and_stops_a_compositor() {
+        let before = compositors_running();
         let deep = checks(true)
             .into_iter()
             .find(|c| c.name == "sway spawn (deep)")
             .expect("deep asks for the spawn check");
         assert_eq!(deep.status, CheckStatus::Ok, "{}", deep.detail);
+        // The check's own detail says "started and stopped", and nothing else asserts the second
+        // half. A probe that leaks its compositor still answers Ok, and each survivor holds an X
+        // display number for as long as it lives.
+        assert_eq!(
+            compositors_running(),
+            before,
+            "the deep probe left a compositor behind"
+        );
+    }
+
+    /// How many of the deep probe's own compositors are running. Matched on the probe's private
+    /// runtime-dir prefix, so a session from another test — or a developer's real sway — is never
+    /// counted.
+    fn compositors_running() -> usize {
+        let out = std::process::Command::new("ps")
+            .args(["-eo", "args"])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains("glass-doctor-wl."))
+            .count()
     }
 
     #[test]

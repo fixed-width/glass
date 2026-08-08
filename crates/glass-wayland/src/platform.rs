@@ -1027,10 +1027,10 @@ impl WaylandScrollSink<'_> {
 }
 
 impl glass_core::ScrollSink for WaylandScrollSink<'_> {
+    /// No `mask == 0` guard, unlike the drag sink: `glass_core::run_scroll` returns `wheel()`
+    /// directly when the scroll carries no modifiers, so this is only ever reached with a mask —
+    /// and every `Modifier` maps to a non-zero bit. A guard here would be unreachable both ways.
     fn modifiers(&mut self, down: bool) -> Result<()> {
-        if self.mask == 0 {
-            return Ok(());
-        }
         let kb = self.s.keyboard.clone();
         if down {
             upload_keymap(&mut *self.s, &kb, &crate::keyboard::build_keymap(&[]))?;
@@ -1872,8 +1872,8 @@ mod session_tests {
     #[test]
     fn the_apps_output_reaches_the_log_sink() {
         let mut s = Launch::new().start();
-        let lines = s.wait_for_log(READY_LINE);
-        assert!(lines.iter().any(|l| l.contains(READY_LINE)), "{lines:#?}");
+        // `wait_for_log` is the assertion: it panics unless the line arrives.
+        s.wait_for_log(READY_LINE);
     }
 
     /// The a11y reader correlates an AT-SPI connection against this set, so it has to reach past
@@ -1952,11 +1952,11 @@ mod session_tests {
             .filter(|l| l.contains("input: button"))
             .collect();
         assert!(
-            buttons.iter().any(|l| l.contains("272 1")),
+            buttons.iter().any(|l| l.ends_with(" 272 1")),
             "left button pressed: {buttons:?}"
         );
         assert!(
-            buttons.iter().any(|l| l.contains("272 0")),
+            buttons.iter().any(|l| l.ends_with(" 272 0")),
             "and released: {buttons:?}"
         );
     }
@@ -2137,12 +2137,21 @@ mod session_tests {
         s.platform()
             .send_key(&KeyEvent::Chord("ctrl+a".into()))
             .expect("chord");
-        let lines = s.wait_for_log("input: key");
+        // "Across" is the whole claim, so it is the ordering that gets asserted: control down,
+        // then the key, then control released. An app reads ctrl+a as ctrl+a only if the modifier
+        // is already held when the key arrives.
+        let lines = s.wait_for_log("input: mods 0");
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle:?} in {lines:#?}"))
+        };
+        let (down, key, up) = (at("input: mods 4"), at("input: key"), at("input: mods 0"));
         assert!(
-            lines.iter().any(|l| l.contains("input: mods 4")),
-            "control held (XKB bit 2): {lines:#?}"
+            down < key && key < up,
+            "control must be held before the key and released after it: {lines:#?}"
         );
-        assert!(lines.iter().any(|l| l.contains("input: key")), "{lines:#?}");
     }
 
     /// The fixture fills its surface with one known colour, so the capture can be checked pixel
@@ -2251,6 +2260,41 @@ mod session_tests {
         );
     }
 
+    /// Unlike the scroll sink, `glass_core::run_drag` calls `modifiers()` on every drag, so the
+    /// drag sink's `mask == 0` short circuit is live: without it an *unmodified* drag uploads a
+    /// keymap and sends a modifier frame the app never asked for. Both directions are asserted,
+    /// because only the pair distinguishes the guard from its inverse.
+    #[test]
+    fn a_drag_carries_its_modifiers_and_an_unmodified_one_sends_none() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        let drag = |modifiers: Vec<glass_core::keys::Modifier>| PointerEvent::Drag {
+            from_x: 20,
+            from_y: 20,
+            to_x: 70,
+            to_y: 50,
+            button: glass_core::MouseButton::Left,
+            modifiers,
+            duration_ms: 30,
+        };
+        s.platform()
+            .send_pointer(&drag(vec![]))
+            .expect("plain drag");
+        let plain = s.wait_for_log(" 272 0");
+        assert!(
+            !plain.iter().any(|l| l.contains("input: mods")),
+            "an unmodified drag must send no modifier traffic: {plain:#?}"
+        );
+        s.platform()
+            .send_pointer(&drag(vec![glass_core::keys::Modifier::Control]))
+            .expect("modified drag");
+        let modified = s.wait_for_log("mods 0");
+        assert!(
+            modified.iter().any(|l| l.ends_with("mods 4")),
+            "control down for a ctrl-drag: {modified:#?}"
+        );
+    }
+
     /// A modifier is held across the wheel, not sent alongside it: an app reads ctrl+scroll as
     /// zoom only if control is down when the axis arrives.
     #[test]
@@ -2266,7 +2310,9 @@ mod session_tests {
                 modifiers: vec![glass_core::keys::Modifier::Control],
             })
             .expect("scroll");
-        let lines = s.wait_for_log("input: axis");
+        // Waits for the *release*, which the sink emits after the wheel — waiting for the axis
+        // would assert on a line that had not arrived yet.
+        let lines = s.wait_for_log("mods 0");
         let mods: Vec<&String> = lines.iter().filter(|l| l.contains("input: mods")).collect();
         assert!(
             mods.iter().any(|l| l.ends_with("mods 4")),
@@ -2356,16 +2402,9 @@ mod session_tests {
         let mut s = Launch::new().start();
         s.wait_for_log(READY_LINE);
         s.platform().stop_app().expect("stop");
-        let said: Vec<String> = s
-            .platform()
-            .drain_logs()
-            .into_iter()
-            .map(|(_, l)| l)
-            .collect();
-        assert!(
-            said.iter().any(|l| l.contains(crate::testw::CLOSING_LINE)),
-            "the app was signalled, not asked: {said:#?}"
-        );
+        // Bounded rather than a single drain: the readers are separate threads, and the line is
+        // still in flight when `stop_app` returns.
+        s.wait_for_log(crate::testw::CLOSING_LINE);
     }
 
     /// An app with no shutdown path still has to be gone afterwards: the ask is followed by a

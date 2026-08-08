@@ -34,8 +34,9 @@ jobs:
           tool: cargo-mutants,cargo-nextest
       - name: Install the display stack the swept backends' tests drive
         # xvfb for the private headless displays glass-x11's tests start; at-spi2-core for the one
-        # that starts a private a11y bus. Absent either, cargo-mutants' unmutated baseline
-        # fails and the run grades nothing.
+        # that starts a private a11y bus; the Mesa/GL stack, Xwayland and the sway bundle below
+        # for the headless compositor glass-wayland's tests start. Absent any of it, the
+        # unmutated baseline fails and the run grades nothing.
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core \
             xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri

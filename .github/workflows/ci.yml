@@ -44,8 +44,10 @@ jobs:
       - name: Install the display stack the Linux backends' unit tests need
         # `cargo test --workspace` covers glass-x11's Xvfb-backed tests and glass-wayland's
         # sway-backed ones — they start a private display or compositor each, and one starts a
-        # private a11y bus. None of it ships on the runner, and none of it is `#[ignore]`d,
-        # because the mutation gate has to run these tests.
+        # private a11y bus. None of it ships on the runner. These tests are not `#[ignore]`d:
+        # the mutation gate runs nextest, which skips ignored tests, so ignoring them would grade
+        # every mutant as caught. (`testw::fixture` is ignored, but it is the app the harness
+        # re-executes, not a test.)
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core \
             xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri
@@ -240,8 +242,9 @@ jobs:
     runs-on: ubuntu-latest
     # Non-gating: a coverage report, never a merge blocker. The number undercounts
     # by design (see scripts/coverage.sh): glass-windows Win32 FFI is
-    # cfg(windows) so it isn't measured here, and the Wayland suite needs sway >=1.12
-    # (not packaged on the runner) so it self-skips. Unit + X11 are measured.
+    # cfg(windows) so it isn't measured here. The Wayland suite no longer self-skips: this
+    # job now fetches the same sway bundle glass-wayland's unit tests need, which is what
+    # scripts/test-wayland.sh looks for.
     continue-on-error: true
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -271,7 +274,7 @@ jobs:
           mkdir -p ~/.local/share/glass/sway
           curl -fsSL https://github.com/fixed-width/sway-build/releases/download/bundle-latest/sway-bundle-linux-x86_64.tar.gz \
             | tar -C ~/.local/share/glass/sway -xz
-      - name: Measure coverage (unit + X11; Wayland/AT-SPI suites self-skip)
+      - name: Measure coverage (unit + X11 + Wayland; AT-SPI self-skips)
         run: ./scripts/coverage.sh --lcov
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
