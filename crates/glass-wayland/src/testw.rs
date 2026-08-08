@@ -52,16 +52,20 @@ const SETTLE_BUDGET: Duration = Duration::from_secs(5);
 const LAUNCH_BUDGET_MS: u64 = 8_000;
 
 /// A launched session: the backend under test, plus an independent view of the same compositor.
+///
+/// `#[must_use]`: dropping it immediately tears the compositor down, and a test that meant to hold
+/// one then fails for a reason unrelated to what it was checking.
+#[must_use]
 pub(crate) struct Session {
     platform: WaylandPlatform,
     ipc: Ipc,
 }
 
 /// Describes the session to launch. Nothing runs until [`Launch::start`].
+#[must_use]
 pub(crate) struct Launch {
     windows: Vec<String>,
     timeout_ms: u64,
-    sandbox: SandboxLevel,
     a11y: bool,
     env: Vec<(String, String)>,
 }
@@ -72,15 +76,16 @@ impl Launch {
         Launch {
             windows: vec!["glass-testw:glass-testw:320x240".into()],
             timeout_ms: LAUNCH_BUDGET_MS,
-            sandbox: SandboxLevel::Off,
             a11y: false,
             env: Vec::new(),
         }
     }
 
     /// Replace the window list. Each entry is `title:app_id:WxH`.
+    /// Replace the window list. Each entry is `title:app_id:WxH`, and is parsed here so a
+    /// malformed one fails on this line rather than inside the launched fixture.
     pub(crate) fn windows(mut self, windows: &[&str]) -> Launch {
-        self.windows = windows.iter().map(|w| (*w).to_string()).collect();
+        self.windows = windows.iter().map(|w| Spec::parse(w).to_entry()).collect();
         self
     }
 
@@ -130,7 +135,9 @@ impl Launch {
             env,
             window_hint: None,
             timeout_ms: self.timeout_ms,
-            sandbox: self.sandbox,
+            // Every session test launches unconfined. `ensure_sandbox_available` is covered
+            // directly, with a probe that panics if it is called.
+            sandbox: SandboxLevel::Off,
             a11y: self.a11y,
         }
     }
@@ -227,7 +234,12 @@ impl Session {
 // The fixture app: a native Wayland client, re-executed as this test binary.
 // ---------------------------------------------------------------------------
 
-/// One `title:app_id:WxH` entry.
+/// One window the fixture should map.
+///
+/// Parsed in the *launcher*, serialized over the env var, and re-parsed in the fixture. The wire
+/// format is forced by the process boundary; parsing on the way in is not, and it is what puts a
+/// malformed spec's panic on the line that wrote it. Left to the child, a typo is a launch that
+/// maps nothing, which surfaces as a timeout attributed to the compositor two budgets later.
 struct Spec {
     title: String,
     app_id: String,
@@ -235,22 +247,44 @@ struct Spec {
     height: i32,
 }
 
+impl Spec {
+    /// `title:app_id:WxH`, all three required. Panics with the offending entry — these are test
+    /// literals, so a bad one is a bug in the test, not an input to handle.
+    fn parse(entry: &str) -> Spec {
+        let bad = || panic!("window spec must be `title:app_id:WxH`, got {entry:?}");
+        let parts: Vec<&str> = entry.split(':').collect();
+        let [title, app_id, size] = parts.as_slice() else {
+            bad()
+        };
+        let Some((w, h)) = size.split_once('x') else {
+            bad()
+        };
+        let (Ok(width), Ok(height)) = (w.parse::<i32>(), h.parse::<i32>()) else {
+            bad()
+        };
+        if width <= 0 || height <= 0 {
+            bad()
+        }
+        Spec {
+            title: (*title).to_string(),
+            app_id: (*app_id).to_string(),
+            width,
+            height,
+        }
+    }
+
+    fn to_entry(&self) -> String {
+        format!(
+            "{}:{}:{}x{}",
+            self.title, self.app_id, self.width, self.height
+        )
+    }
+}
+
 fn parse_specs(s: &str) -> Vec<Spec> {
     s.split(',')
         .filter(|e| !e.is_empty())
-        .map(|e| {
-            let mut parts = e.split(':');
-            let title = parts.next().unwrap_or_default().to_string();
-            let app_id = parts.next().unwrap_or_default().to_string();
-            let size = parts.next().unwrap_or("320x240");
-            let (w, h) = size.split_once('x').expect("size is WxH");
-            Spec {
-                title,
-                app_id,
-                width: w.parse().expect("width"),
-                height: h.parse().expect("height"),
-            }
-        })
+        .map(Spec::parse)
         .collect()
 }
 
@@ -655,6 +689,34 @@ mod harness_tests {
         assert_eq!(specs[0].title, "a");
         assert_eq!(specs[0].app_id, "app-a");
         assert_eq!((specs[1].width, specs[1].height), (320, 240));
+    }
+
+    /// The wire format survives the round trip, which is what lets the launcher parse and the
+    /// fixture re-parse the same entry.
+    #[test]
+    fn a_spec_round_trips_through_its_wire_form() {
+        let entry = "title:app-id:640x480";
+        assert_eq!(Spec::parse(entry).to_entry(), entry);
+    }
+
+    /// Every field is required and every extent positive. Silently defaulting a missing one
+    /// launches a window of the wrong size, and the test that follows fails on dimensions with
+    /// nothing to say the spec was the problem.
+    #[test]
+    fn a_malformed_window_spec_is_rejected_where_it_is_written() {
+        for bad in [
+            "solo",               // no app_id, no size
+            "t:app",              // no size
+            "t:app:640",          // no `x`
+            "t:app:640x",         // no height
+            "t:app:axb",          // not numeric
+            "t:app:0x480",        // zero extent
+            "t:app:640x-1",       // negative extent
+            "t:app:640x480:oops", // a field too many
+        ] {
+            let caught = std::panic::catch_unwind(|| Spec::parse(bad));
+            assert!(caught.is_err(), "{bad:?} should be rejected");
+        }
     }
 
     /// The harness is only worth anything if the fixture really maps a window the backend can
