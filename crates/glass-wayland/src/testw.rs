@@ -31,6 +31,8 @@ const IGNORES_CLOSE: &str = "GLASS_TESTW_IGNORES_CLOSE";
 const USE_X11: &str = "GLASS_TESTW_X11";
 /// Printed by the fixture once every window is mapped, so a log test has a line it can wait for.
 pub(crate) const READY_LINE: &str = "testw: windows mapped";
+/// Printed by the fixture when it acts on a close request, rather than being signalled.
+pub(crate) const CLOSING_LINE: &str = "testw: closing";
 
 /// How long a harness wait may spin before the test fails outright. It bounds a hang; it does not
 /// pace anything, and a passing test never reaches it (a session comes up in about a second).
@@ -481,6 +483,10 @@ mod app {
             // fixture behave like an app with a shutdown path, so teardown reports a clean close
             // instead of spending the whole close grace and then signalling.
             if matches!(event, xdg_toplevel::Event::Close) && !state.ignores_close {
+                // Said before exiting, so a test can tell an app that was *asked* to close from
+                // one that was signalled. The end state is identical either way — the app is
+                // gone — so its own shutdown path is the only witness.
+                echo(super::CLOSING_LINE.to_string());
                 std::process::exit(0);
             }
         }

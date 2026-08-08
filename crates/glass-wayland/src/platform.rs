@@ -2288,6 +2288,27 @@ mod session_tests {
         assert!(matches!(err, GlassError::NoActiveSession), "{err}");
     }
 
+    /// Teardown *asks* the app to close before it signals anything. Both routes end with the app
+    /// gone, so the end state cannot tell them apart — the app's own shutdown path is the only
+    /// witness, and a signalled app never reaches it. This is the difference between an app that
+    /// flushes its state on the way out and one that reports a crash on its next launch.
+    #[test]
+    fn a_cooperative_app_is_asked_to_close_and_runs_its_own_shutdown() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        s.platform().stop_app().expect("stop");
+        let said: Vec<String> = s
+            .platform()
+            .drain_logs()
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        assert!(
+            said.iter().any(|l| l.contains(crate::testw::CLOSING_LINE)),
+            "the app was signalled, not asked: {said:#?}"
+        );
+    }
+
     /// An app with no shutdown path still has to be gone afterwards: the ask is followed by a
     /// signal, and the reap covers the compositor's whole group.
     #[test]
