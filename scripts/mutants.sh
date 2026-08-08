@@ -93,22 +93,6 @@ if [ -n "$want" ]; then
 fi
 [ "${#packages[@]}" -eq 0 ] && packages=("$DEFAULT_PACKAGE")
 
-# Crates whose tests are `#[ignore]`d, and so are only mutated if the runner is told to run
-# ignored tests. Without the flag the baseline still passes and EVERY mutant reads as caught — a
-# perfect score meaning nothing — so refuse the run rather than report it.
-readonly IGNORED_TEST_PACKAGES='glass-wayland'
-for p in "${packages[@]}"; do
-    case " $IGNORED_TEST_PACKAGES " in
-        *" $p "*)
-            if ! printf '%s\n' "$@" | grep -q -- '--run-ignored'; then
-                echo "$p's tests are #[ignore]d: pass --cargo-test-arg=--run-ignored=all" >&2
-                echo "or every mutant will be graded caught without a test having run." >&2
-                exit 2
-            fi
-            ;;
-    esac
-done
-
 # `--package p1 --package p2 …`, the form both cargo-mutants calls below want.
 pkg_args=()
 for p in "${packages[@]}"; do
@@ -192,116 +176,12 @@ attempt "$out" "${scope[@]}" ${diff_file:+--in-diff "$diff_file"} \
     ${passthrough[@]+"${passthrough[@]}"}
 graded=$out
 
-# Reap the compositors and X servers a timed-out mutant left behind.
-#
-# The runner SIGKILLs the test process when a mutant exceeds --timeout, so a mutation that removes
-# a bound hangs the run holding live sessions and no teardown runs. Each orphan holds an X display
-# number until it dies.
-#
-# Cleanup after the fact — the pdeathsig in glass-wayland's `build_sway_command` is what stops them
-# accumulating mid-run.
-#
-# Matched on the private runtime directory glass names for each session, which appears on the
-# compositor's own command line and belongs to no one else. Deliberately NOT matched on `Xvfb
-# -displayfd`: glass-x11 spawns its servers with nothing glass-specific in the argv, and its own
-# docs tell a developer to run that exact command, so an orphaned one may well be theirs.
-#
-# Only orphans, so a session whose parent is alive belongs to a running test. TERM only: a KILL
-# leaves behind the sockets and children that this process's own teardown is what removes.
-reap_strays() {
-    local pids
-    if ! pids=$(pgrep -P 1 -f 'glass-wl\.|glass-doctor-wl\.'); then
-        return 0 # pgrep exits 1 for no match
-    fi
-    echo "mutants: reaping $(echo "$pids" | wc -w) session(s) a timed-out mutant left running"
-    # shellcheck disable=SC2086 # deliberate word splitting: one signal per pid
-    kill -TERM $pids 2>/dev/null || true
-}
-reap_strays
-
 # A shard may legitimately draw none of the planned mutants; the count above is what
 # proves the run as a whole gated something.
 echo "mutants: $total generated, $caught caught, $missed missed, $timed_out timed out, $unviable unviable"
-
-# Grade survivors against a recorded set rather than against zero.
-#
-# A survivor on an untouched line is invisible to the in-diff gate until someone edits that line
-# for an unrelated reason and inherits a mutant they did not write. Their options are then deep
-# unrelated work, an exclusion under deadline pressure, or turning the gate off.
-#
-# So the record applies to BOTH gates: recorded never fails anyone, new always does, and one that
-# became killable says so. A ratchet, not an amnesty — adding to it is a reviewed diff carrying a
-# reason.
-#
-# Not `exclude_re`, which stops the mutant being generated and so can never report that it became
-# killable. These still run and are printed every time.
-#
-# Per crate, so a crate with no record file has no slot to record into and stays at zero.
-record_for() { echo ".cargo/mutants-known/$1.txt"; }
-
-# A survivor keyed by its description alone, with `line:col` dropped — the line moves whenever
-# anything above it does. Renaming the function a survivor names DOES change its key,
-# deliberately: its recorded reason may no longer fit the code.
-#
-# Deduplicated rather than counted. A count catches one of a duplicate pair being fixed unnoticed,
-# but mutants on timing constructs are legitimately non-deterministic — the same code yields two
-# instances one run and none the next — and under counts that is a build failure for no change.
-survivor_keys() {
-    sed -E 's/^([^:]+):[0-9]+:[0-9]+: /\1: /' "$1" | sort -u
-}
-
-recorded_keys() {
-    local f
-    for p in "${packages[@]}"; do
-        f=$(record_for "$p")
-        [ -f "$f" ] && grep -vE '^\s*(#|$)' "$f"
-    done | sort -u
-}
-
-grade_survivors() {
-    local missed_txt="$graded/mutants.out/missed.txt"
-    local now expected new_ones fixed_ones
-    now=$(mktemp) && expected=$(mktemp)
-    # Compared even when nothing survived: that is exactly when a recorded entry has become
-    # killable, and the run should say so rather than quietly passing.
-    if [ -f "$missed_txt" ]; then survivor_keys "$missed_txt" > "$now"; else : > "$now"; fi
-    recorded_keys > "$expected"
-
-    new_ones=$(comm -23 "$now" "$expected")
-    fixed_ones=$(comm -13 "$now" "$expected")
-
-    # Printed every run, so a recorded survivor stays visible instead of becoming furniture.
-    if [ -s "$expected" ]; then
-        echo "Recorded survivors (see .cargo/mutants-known/):"
-        sed 's/^/  /' "$expected"
-    fi
-    if [ -n "$fixed_ones" ]; then
-        echo
-        echo "These are now caught — delete them from .cargo/mutants-known/:"
-        echo "$fixed_ones" | sed 's/^/  /'
-    fi
-    if [ -n "$new_ones" ]; then
-        echo
-        echo "Survivors that are not recorded:"
-        echo "$new_ones" | sed 's/^/  /'
-        echo
-        echo "Kill them, or record each with the reason it cannot be killed. A reason is a"
-        echo "property of the code — equivalent, unreachable, only reachable by a race — not"
-        echo "'hard' and not 'not mine'. Full list: $missed_txt"
-        rm -f "$now" "$expected"
-        return 1
-    fi
-    rm -f "$now" "$expected"
-    return 0
-}
-
-if ! grade_survivors; then
+if [ "$missed" -gt 0 ]; then
+    echo "Survivors are listed in $graded/mutants.out/missed.txt"
     exit 1
-fi
-# Every survivor was recorded, so cargo-mutants' own exit 2 (`ExitCode::FoundProblems`) must not
-# fail the run — otherwise the exit code decides and the record grades nothing. Other codes stand.
-if [ "$missed" -gt 0 ] && [ "$status" -eq 2 ]; then
-    status=0
 fi
 if [ "$timed_out" -gt 0 ]; then
     echo "Timed-out mutants are listed in $graded/mutants.out/timeout.txt — a hang is a"

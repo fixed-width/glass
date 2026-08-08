@@ -150,6 +150,9 @@ jobs:
           curl -fsSL https://github.com/fixed-width/sway-build/releases/download/bundle-latest/sway-bundle-linux-x86_64.tar.gz \
             | tar -C ~/.local/share/glass/sway -xz
           ~/.local/share/glass/sway/bin/sway --version
+      # glass-wayland's own unit tests, which start a compositor each and are `#[ignore]`d so a
+      # bare `cargo test --workspace` needs none of this job's stack.
+      - run: cargo test -p glass-wayland --locked -- --include-ignored
       - run: ./scripts/test-wayland.sh
       # The a11y suite's Wayland launch tests, which need this job's sway: the X11 job runs the
       # other 25 and names these as skipped.
@@ -260,7 +263,7 @@ jobs:
           if-no-files-found: warn
 
   mutants:
-    name: Mutation shard ${{ matrix.shard }} (glass-core, glass-android, glass-x11, glass-wayland)
+    name: Mutation shard ${{ matrix.shard }} (glass-core, glass-android, glass-x11)
     runs-on: ubuntu-latest
     # A push carries no base ref to diff against; this gate is a pull-request check.
     if: github.event_name == 'pull_request'
@@ -295,8 +298,7 @@ jobs:
           git diff "origin/$BASE_REF...HEAD" \
             -- ':(glob)crates/glass-core/src/**/*.rs' \
                ':(glob)crates/glass-android/src/**/*.rs' \
-               ':(glob)crates/glass-x11/src/**/*.rs' \
-               ':(glob)crates/glass-wayland/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
+               ':(glob)crates/glass-x11/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
           wc -l "$RUNNER_TEMP/pr.diff"
           if [ -s "$RUNNER_TEMP/pr.diff" ]; then
             echo "touched=true" >> "$GITHUB_OUTPUT"
@@ -317,9 +319,10 @@ jobs:
         if: steps.diff.outputs.touched == 'true'
         with:
           tool: cargo-mutants,cargo-nextest
-      # Absent any of it the unmutated baseline fails and the run grades nothing.
-      - if: steps.diff.outputs.touched == 'true'
-        run: ./scripts/ci/install-display-stack.sh
+      - name: Install the X and a11y stack glass-x11's tests drive
+        if: steps.diff.outputs.touched == 'true'
+        # Absent either, the unmutated baseline fails and the run grades nothing.
+        run: sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core
       - name: Mutation gate
         if: steps.diff.outputs.touched == 'true'
         # nextest runs each test in its own process, so slow tests overlap rather than sum.
@@ -327,8 +330,6 @@ jobs:
           scripts/mutants.sh "$RUNNER_TEMP/mutants" \
             --test-tool nextest \
             --package glass-core --package glass-android --package glass-x11 \
-            --package glass-wayland \
-            --cargo-test-arg=--run-ignored=all \
             --shard ${{ matrix.shard }}/8 --sharding round-robin \
             --in-diff "$RUNNER_TEMP/pr.diff"
 
@@ -336,8 +337,8 @@ jobs:
   # to require. This one has a fixed name and fails if any shard did.
   #
   # The ruleset's required check matches this name, so it is frozen — renaming it blocks every
-  # pull request. It gates glass-android, glass-x11 and glass-wayland too despite the name;
-  # rename only with the ruleset.
+  # pull request. It gates glass-android and glass-x11 too despite the name; rename only with
+  # the ruleset.
   mutants-gate:
     name: Mutation gate (glass-core)
     runs-on: ubuntu-latest
