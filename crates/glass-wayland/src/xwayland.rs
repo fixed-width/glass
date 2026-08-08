@@ -192,16 +192,22 @@ impl Recovery {
         }
         self.missing_before = missing;
         self.probe = Some(probe);
-        if count > 0 {
-            // Said out loud because it changed the app's windows, not just glass's reading of
-            // them: someone comparing the two deserves to know one needed recovering.
-            eprintln!(
-                "glass: {count} window(s) the app mapped never reached the compositor; \
-                 re-mapped them"
-            );
+        if let Some(notice) = recovery_notice(count) {
+            eprintln!("{notice}");
         }
         count
     }
+}
+
+/// What to say about a completed pass, or `None` when it re-mapped nothing.
+///
+/// Said out loud because it changed the app's windows, not just glass's reading of them: someone
+/// comparing the two deserves to know one needed recovering. A pass that recovered nothing changed
+/// nothing and stays quiet.
+fn recovery_notice(count: usize) -> Option<String> {
+    (count > 0).then(|| {
+        format!("glass: {count} window(s) the app mapped never reached the compositor; re-mapped them")
+    })
 }
 
 /// An X11 connection to the session's own Xwayland, used to see the windows the app really has
@@ -238,11 +244,7 @@ impl XProbe {
                 .reply()
             {
                 Ok(a) => a,
-                // The one failure that is not a failure: a window destroyed between the tree read
-                // and this one no longer needs a view. Anything else — a dead connection above
-                // all — must not read as "this window is fine", because a scan that quietly
-                // returns fewer windows reads as "nothing was lost".
-                Err(ReplyError::X11Error(e)) if e.error_kind == ErrorKind::Window => continue,
+                Err(e) if window_is_gone(&e) => continue,
                 Err(e) => {
                     return Err(GlassError::Backend(format!(
                         "read Xwayland window {win:#x}: {e}"
@@ -284,6 +286,16 @@ impl XProbe {
             .check()
             .map_err(|e| GlassError::Backend(format!("re-map Xwayland window {win:#x}: {e}")))
     }
+}
+
+/// Whether an attribute read failed because the window is gone — destroyed between the tree read
+/// and this one, and so no longer owed a view.
+///
+/// The one failure that is not a failure. Anything else, a dead connection above all, must not
+/// read as "this window is fine": a scan that quietly returns fewer windows reads as "nothing was
+/// lost", which is the state recovery exists to react to.
+fn window_is_gone(e: &ReplyError) -> bool {
+    matches!(e, ReplyError::X11Error(x) if x.error_kind == ErrorKind::Window)
 }
 
 /// The display served by *this session's* Xwayland, or `None` when the session has no X11 side
@@ -420,6 +432,222 @@ fn confirmed_lost(missing_now: &[u32], missing_before: &HashSet<u32>) -> Vec<u32
 }
 
 #[cfg(test)]
+mod x_tests {
+    //! [`XProbe`] against a real X server. The probe reads and writes X protocol, so there is
+    //! nothing to fake underneath it; a private Xvfb is an order of magnitude cheaper to start
+    //! than the compositor whose Xwayland it stands in for, and the protocol is the same.
+    use super::*;
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+    use x11rb::rust_connection::RustConnection;
+    use x11rb::wrapper::ConnectionExt as _; // sync(): a round trip, so the server has applied it
+
+    struct X {
+        _server: glass_x11::Xvfb,
+        conn: RustConnection,
+        root: u32,
+        display: String,
+    }
+
+    fn server() -> X {
+        let server = glass_x11::Xvfb::start("400x300x24").expect("a private Xvfb should start");
+        let display = server.display.clone();
+        let (conn, screen) = x11rb::connect(Some(&display)).expect("the test client should connect");
+        let root = conn.setup().roots[screen].root;
+        X {
+            _server: server,
+            conn,
+            root,
+            display,
+        }
+    }
+
+    impl X {
+        /// A window of the given shape, mapped unless `map` is false.
+        fn window(&self, class: WindowClass, override_redirect: bool, map: bool) -> u32 {
+            let win = self.conn.generate_id().expect("id");
+            let depth = if class == WindowClass::INPUT_ONLY { 0 } else { 24 };
+            self.conn
+                .create_window(
+                    depth,
+                    win,
+                    self.root,
+                    0,
+                    0,
+                    50,
+                    40,
+                    0,
+                    class,
+                    x11rb::COPY_FROM_PARENT,
+                    &CreateWindowAux::new().override_redirect(u32::from(override_redirect)),
+                )
+                .expect("create_window");
+            if map {
+                self.conn.map_window(win).expect("map_window");
+            }
+            self.conn.sync().expect("sync");
+            win
+        }
+
+        fn probe(&self) -> XProbe {
+            XProbe::connect(&self.display).expect("the probe should connect")
+        }
+
+        fn is_viewable(&self, win: u32) -> bool {
+            let attrs = self
+                .conn
+                .get_window_attributes(win)
+                .expect("get_window_attributes")
+                .reply()
+                .expect("attributes reply");
+            attrs.map_state == MapState::VIEWABLE
+        }
+    }
+
+    /// The scan reports exactly the windows the compositor owes a view, read from the server's
+    /// own attributes rather than from what the test asked for.
+    #[test]
+    fn the_scan_reports_mapped_app_windows_and_nothing_else() {
+        let x = server();
+        let wanted = x.window(WindowClass::INPUT_OUTPUT, false, true);
+        let unmapped = x.window(WindowClass::INPUT_OUTPUT, false, false);
+        let menu = x.window(WindowClass::INPUT_OUTPUT, true, true);
+        let input_only = x.window(WindowClass::INPUT_ONLY, false, true);
+        let found = x.probe().mapped_toplevels().expect("scan");
+        assert!(found.contains(&wanted), "the app's window: {found:?}");
+        for (name, win) in [
+            ("an unmapped window", unmapped),
+            ("an override-redirect menu", menu),
+            ("an InputOnly window", input_only),
+        ] {
+            assert!(!found.contains(&win), "{name} is not owed a view: {found:?}");
+        }
+    }
+
+    #[test]
+    fn a_destroyed_window_is_not_reported() {
+        let x = server();
+        let keep = x.window(WindowClass::INPUT_OUTPUT, false, true);
+        let doomed = x.window(WindowClass::INPUT_OUTPUT, false, true);
+        x.conn.destroy_window(doomed).expect("destroy");
+        x.conn.sync().expect("sync");
+        let found = x.probe().mapped_toplevels().expect("scan");
+        assert!(found.contains(&keep));
+        assert!(!found.contains(&doomed));
+    }
+
+    /// A scan cannot answer for a server that is gone. Returning an empty list there would say
+    /// "the app has no windows", which is exactly the state recovery reacts to.
+    #[test]
+    fn a_scan_against_a_dead_server_errors_rather_than_reporting_no_windows() {
+        let x = server();
+        x.window(WindowClass::INPUT_OUTPUT, false, true);
+        let probe = x.probe();
+        drop(x);
+        probe
+            .mapped_toplevels()
+            .expect_err("a dead server must not read as an app with no windows");
+    }
+
+    /// The re-map is an unmap/map pair, and the window must be viewable again when it ends: a map
+    /// request alone is a no-op on an already-mapped window, so a `remap` that skipped the unmap
+    /// would produce no MapNotify and recover nothing.
+    #[test]
+    fn remapping_leaves_the_window_mapped_again() {
+        let x = server();
+        let win = x.window(WindowClass::INPUT_OUTPUT, false, true);
+        assert!(x.is_viewable(win));
+        x.probe().remap(win).expect("remap");
+        x.conn.sync().expect("sync");
+        assert!(x.is_viewable(win), "the window must not be left hidden");
+    }
+
+    /// A `Recovery` already holding a probe, so the pass runs against this X server instead of
+    /// going looking for a session Xwayland.
+    fn recovery_on(x: &X) -> Recovery {
+        let mut r = Recovery::new(std::path::Path::new("/nonexistent"));
+        r.probe = Some(x.probe());
+        r
+    }
+
+    /// The whole point of the machinery: a window the app really mapped, absent from the
+    /// compositor on two consecutive checks, gets re-mapped — and only then.
+    #[test]
+    fn a_window_missing_from_the_compositor_twice_is_remapped() {
+        let x = server();
+        x.window(WindowClass::INPUT_OUTPUT, false, true);
+        let mut r = recovery_on(&x);
+        let now = std::time::Instant::now();
+        assert_eq!(
+            r.recover_if_due(now, &[]),
+            0,
+            "one sighting is not yet a loss"
+        );
+        assert_eq!(r.recover_if_due(now + CHECK_INTERVAL, &[]), 1, "re-mapped");
+    }
+
+    /// A window sway already shows is not lost, however often it is checked.
+    #[test]
+    fn a_window_the_compositor_shows_is_never_remapped() {
+        let x = server();
+        let win = x.window(WindowClass::INPUT_OUTPUT, false, true);
+        let mut r = recovery_on(&x);
+        let now = std::time::Instant::now();
+        assert_eq!(r.recover_if_due(now, &[win]), 0);
+        assert_eq!(r.recover_if_due(now + CHECK_INTERVAL, &[win]), 0);
+        assert_eq!(r.unrecovered(), 0);
+    }
+
+    /// Checks are throttled: a second pass inside the interval must not spend another `/proc`
+    /// walk, and must not count as one of the two sightings that confirm a loss.
+    #[test]
+    fn a_pass_inside_the_interval_does_nothing() {
+        let x = server();
+        x.window(WindowClass::INPUT_OUTPUT, false, true);
+        let mut r = recovery_on(&x);
+        let now = std::time::Instant::now();
+        assert_eq!(r.recover_if_due(now, &[]), 0);
+        assert_eq!(
+            r.recover_if_due(now + CHECK_INTERVAL / 2, &[]),
+            0,
+            "not due yet"
+        );
+        assert_eq!(
+            r.recover_if_due(now + CHECK_INTERVAL, &[]),
+            1,
+            "the skipped pass must not have counted as a sighting"
+        );
+    }
+
+    /// A re-map that did not take is counted, so a launch that gives up can say the recovery ran
+    /// rather than reporting a bare timeout for an app whose window glass could see all along.
+    #[test]
+    fn a_window_still_missing_after_its_remap_is_counted_as_unrecovered() {
+        let x = server();
+        x.window(WindowClass::INPUT_OUTPUT, false, true);
+        let mut r = recovery_on(&x);
+        let now = std::time::Instant::now();
+        r.recover_if_due(now, &[]);
+        assert_eq!(r.recover_if_due(now + CHECK_INTERVAL, &[]), 1);
+        assert_eq!(r.unrecovered(), 0, "not yet judged — it was just re-mapped");
+        // Still absent from the compositor on the next pass: the re-map did not take.
+        r.recover_if_due(now + CHECK_INTERVAL * 2, &[]);
+        assert_eq!(r.unrecovered(), 1);
+    }
+
+    /// Re-mapping a window that no longer exists has to report the failure: the unmap half can
+    /// have applied already, and a silent `Ok` would leave the caller believing recovery worked.
+    #[test]
+    fn remapping_a_window_that_is_gone_reports_the_failure() {
+        let x = server();
+        let win = x.window(WindowClass::INPUT_OUTPUT, false, true);
+        x.conn.destroy_window(win).expect("destroy");
+        x.conn.sync().expect("sync");
+        x.probe().remap(win).expect_err("a destroyed window cannot be re-mapped");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -429,6 +657,51 @@ mod tests {
             override_redirect: false,
             drawable: true,
         }
+    }
+
+    fn x11_error(kind: ErrorKind) -> ReplyError {
+        ReplyError::X11Error(x11rb::x11_utils::X11Error {
+            error_kind: kind,
+            error_code: 3,
+            sequence: 1,
+            bad_value: 0,
+            minor_opcode: 0,
+            major_opcode: 3,
+            extension_name: None,
+            request_name: None,
+        })
+    }
+
+    #[test]
+    fn a_pass_that_recovered_nothing_says_nothing() {
+        assert_eq!(recovery_notice(0), None);
+        assert!(recovery_notice(2).expect("said").contains("2 window(s)"));
+    }
+
+    /// The flag is the once-ness: `warn_once` is only quiet the second time because the first
+    /// call set it.
+    #[test]
+    fn the_first_warning_is_said_and_arms_the_silence() {
+        let mut r = Recovery::new(std::path::Path::new("/nonexistent"));
+        assert!(!r.warned);
+        r.warn_once("glass: test warning".into());
+        assert!(r.warned, "a warning that never arms the flag repeats forever");
+    }
+
+    #[test]
+    fn only_a_bad_window_reads_as_a_window_that_went_away() {
+        assert!(window_is_gone(&x11_error(ErrorKind::Window)));
+        assert!(!window_is_gone(&x11_error(ErrorKind::Value)));
+        assert!(!window_is_gone(&x11_error(ErrorKind::Access)));
+    }
+
+    /// A dead connection is not a window that went away. Skipping it would turn an Xwayland that
+    /// stopped answering into "the app has no windows" — the state recovery reacts to.
+    #[test]
+    fn a_connection_failure_is_not_a_window_that_went_away() {
+        assert!(!window_is_gone(&ReplyError::ConnectionError(
+            x11rb::errors::ConnectionError::UnknownError
+        )));
     }
 
     #[test]

@@ -54,6 +54,7 @@ pub struct WindowProperties {
 }
 
 /// A flattened app window: any node with a foreign-toplevel identifier.
+#[derive(Debug)]
 pub struct Window {
     pub con_id: i64,
     pub title: Option<String>,
@@ -263,6 +264,78 @@ fn find_ipc_socket(dir: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Frame a reply the way sway does, so a test peer is indistinguishable from the compositor.
+    fn frame(msg_type: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+        out.extend_from_slice(&msg_type.to_ne_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A client wired to a peer that answers the next request with `reply`, then goes quiet.
+    fn served(msg_type: u32, payload: &[u8]) -> (Ipc, UnixStream) {
+        let (ours, mut theirs) = UnixStream::pair().expect("socketpair");
+        theirs.write_all(&frame(msg_type, payload)).expect("reply");
+        (Ipc::from_stream(ours).expect("wrap"), theirs)
+    }
+
+    /// The happy path over a real socket. Also the only thing that catches a `read`/`write` whose
+    /// failures are dropped, or a magic check inverted into accepting garbage: both leave the
+    /// reply buffer unread, and the parse then fails on bytes that never arrived.
+    #[test]
+    fn a_well_framed_reply_is_read_off_the_socket_and_parsed() {
+        let json = br#"{"id":1,"name":"root","rect":{"x":0,"y":0,"width":1,"height":1},
+          "nodes":[{"id":7,"name":"app","app_id":"app","focused":true,
+            "rect":{"x":1,"y":2,"width":3,"height":4},
+            "foreign_toplevel_identifier":"ftid"}],"floating_nodes":[]}"#;
+        let (mut ipc, _peer) = served(MSG_GET_TREE, json);
+        let wins = ipc.windows().expect("a framed reply should parse");
+        assert_eq!(wins.len(), 1);
+        assert_eq!(wins[0].identifier, "ftid");
+    }
+
+    /// Anything that is not a reply header is a desync, not a reply to interpret: the bytes in the
+    /// stream belong to something else, and reading on would parse the next request's reply from
+    /// the wrong offset.
+    #[test]
+    fn a_reply_with_the_wrong_magic_is_rejected() {
+        let (ours, mut theirs) = UnixStream::pair().expect("socketpair");
+        let mut bad = frame(MSG_GET_TREE, b"{}");
+        bad[0..6].copy_from_slice(b"NOTi3!");
+        theirs.write_all(&bad).expect("reply");
+        let mut ipc = Ipc::from_stream(ours).expect("wrap");
+        let err = ipc.windows().expect_err("garbage must not read as a tree");
+        assert!(err.to_string().contains("bad magic"), "{err}");
+    }
+
+    #[test]
+    fn run_command_reports_success_from_a_real_reply() {
+        let (mut ipc, _peer) = served(MSG_RUN_COMMAND, br#"[{"success":true}]"#);
+        ipc.run_command("[con_id=1] focus").expect("accepted");
+    }
+
+    /// `sway-ipc.<uid>.<pid>.sock` and nothing else in the same directory: the wayland socket, a
+    /// half-matching name, and sway's own lock all sit alongside it.
+    #[test]
+    fn the_ipc_socket_is_picked_out_of_the_runtime_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for decoy in ["wayland-1", "wayland-1.lock", "sway-ipc.partial", "other.sock"] {
+            std::fs::write(dir.path().join(decoy), b"").expect("decoy");
+        }
+        let real = dir.path().join("sway-ipc.1000.42.sock");
+        std::fs::write(&real, b"").expect("socket");
+        assert_eq!(find_ipc_socket(dir.path()), Some(real));
+    }
+
+    #[test]
+    fn a_runtime_dir_with_no_ipc_socket_finds_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("wayland-1"), b"").expect("decoy");
+        assert_eq!(find_ipc_socket(dir.path()), None);
+    }
+
     #[test]
     fn parses_get_tree_and_flattens_app_windows() {
         let json = r#"{"id":1,"name":"root","rect":{"x":0,"y":0,"width":1280,"height":720},
@@ -332,19 +405,21 @@ mod tests {
     /// Xwayland and the app alive past the point glass gave up and exited.
     #[test]
     fn a_compositor_that_never_answers_times_out_instead_of_hanging() {
-        let (ours, _theirs) = UnixStream::pair().expect("socketpair");
-        let mut ipc = Ipc::from_stream(ours).expect("wrap");
-        let t = std::time::Instant::now();
-        let err = match ipc.windows() {
-            Ok(_) => panic!("a silent peer must not produce a window list"),
-            Err(e) => e,
-        };
-        let elapsed = t.elapsed();
-        assert!(
-            elapsed < IPC_TIMEOUT * 4,
-            "the request should give up near the timeout, not hang (took {elapsed:?})"
-        );
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ipc = Ipc::from_stream(ours).expect("wrap");
+            let _ = tx.send(ipc.windows().err());
+        });
+        // Bounded from outside the request, on purpose. An unbounded read does not take too long,
+        // it never returns — so a `t.elapsed()` assertion written after the call is never reached,
+        // and the whole suite hangs instead of reporting the missing timeout.
+        let outcome = rx
+            .recv_timeout(IPC_TIMEOUT * 4)
+            .expect("the request should give up on its own rather than block forever");
+        let err = outcome.expect("a silent peer must not produce a window list");
         assert!(err.to_string().contains("sway IPC"), "{err}");
+        drop(theirs); // held open until now: an EOF would end the read without a timeout
     }
 
     /// After a failed read the stream is no longer at a message boundary: the reply glass gave up
