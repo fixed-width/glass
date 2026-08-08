@@ -37,19 +37,26 @@ pub(crate) const CONNECTED_LINE: &str = "testw: connected";
 /// Printed by the fixture when it acts on a close request, rather than being signalled.
 pub(crate) const CLOSING_LINE: &str = "testw: closing";
 
-/// How long a harness wait may spin before the test fails outright. It bounds a hang; it does not
-/// pace anything, and a passing test never reaches it.
+/// How long a harness wait may spin before the test fails outright, and how long a launch gives
+/// the compositor. Both bound a hang; neither paces anything, and a passing test on an idle
+/// machine reaches neither.
 ///
-/// Kept short on purpose. Under `cargo mutants` every mutation that stops a log arriving pays
-/// this budget in *every* session test, and a suite that takes minutes to fail is graded "timeout"
-/// rather than caught — the mutant survives, and the runner is killed mid-session. A window that
-/// never appears is bounded by [`LAUNCH_BUDGET_MS`] instead.
-const SETTLE_BUDGET: Duration = Duration::from_secs(5);
+/// Generous on purpose, and that is a reversal. They were briefly cut to 5s/8s so that a mutation
+/// which stops a window appearing would fail the suite quickly rather than be graded a timeout.
+/// It worked, and it cost far more than it bought: under the load of a mutation sweep — two jobs,
+/// each running this suite at full parallelism, every test starting its own compositor — tests
+/// began missing the budget for no reason but contention. A spurious failure is recorded by
+/// cargo-mutants as a *kill*, so tight budgets do not merely flake, they silently inflate the
+/// caught count and make consecutive sweeps of identical code disagree about which mutants
+/// survived.
+///
+/// A slow sweep is the better trade. A mutation that hangs the suite is graded a timeout, which
+/// this repo already treats as a detection.
+const SETTLE_BUDGET: Duration = Duration::from_secs(20);
 
-/// The launch budget a test gives the compositor, for the same reason as [`SETTLE_BUDGET`]:
-/// `start_app` retries the bring-up, so a mutation that stops discovery finding a window costs
-/// twice this in every test that launches one.
-const LAUNCH_BUDGET_MS: u64 = 8_000;
+/// See [`SETTLE_BUDGET`]. `start_app` retries the bring-up, and spends this twice per attempt —
+/// once waiting for the socket, once for a window — so a failing launch costs four times it.
+const LAUNCH_BUDGET_MS: u64 = 20_000;
 
 /// A launched session: the backend under test, plus an independent view of the same compositor.
 ///
