@@ -1,0 +1,60 @@
+# Survivors this crate carries knowingly: one line per mutation cargo-mutants generates and no
+# test kills, with the reason it cannot be killed rather than the reason nobody got to it.
+#
+# A reason is a property of the code — equivalent, unreachable, only reachable by a race, or
+# observable only through timing. "Hard" is not a reason and neither is "not mine". Everything
+# here was attempted, and how it was attempted is written down so the next person does not repeat
+# it. Delete an entry the moment a run reports it caught.
+#
+# Format: <path>: <description>, as missed.txt prints it minus the line:col.
+#
+# Built from two consecutive sweeps of the same commit. Thirteen entries appeared in both; the
+# rest appeared in one. That is expected rather than alarming — see "timing" below — and it is why
+# the list is the union of the two runs rather than either one.
+
+# --- Only reachable through timing -------------------------------------------------------------
+# A mutation to a deadline or a self-commit changes no result, only how long something waits or
+# whether an event survives contention. It is caught when timing happens to break something and
+# missed when it does not, so these move between runs of identical code. A test for them would
+# assert on load, which is how flaky tests get built.
+crates/glass-wayland/src/platform.rs: replace WaylandChordSink<'_>::settle -> Result<()> with Ok(())
+crates/glass-wayland/src/platform.rs: replace WaylandDragSink<'_>::settle -> Result<()> with Ok(())
+crates/glass-wayland/src/platform.rs: replace WaylandScrollSink<'_>::settle -> Result<()> with Ok(())
+crates/glass-wayland/src/platform.rs: replace match guard Instant::now() < deadline with true in open_session
+crates/glass-wayland/src/platform.rs: replace match guard Instant::now() < deadline with false in open_session
+crates/glass-wayland/src/platform.rs: replace + with - in open_session
+crates/glass-wayland/src/platform.rs: replace < with == in open_session
+crates/glass-wayland/src/platform.rs: replace + with - in <impl Platform for WaylandPlatform>::capture_frame
+crates/glass-wayland/src/platform.rs: replace >= with < in <impl Platform for WaylandPlatform>::capture_frame
+crates/glass-wayland/src/clipboard.rs: replace > with >= in serve_loop
+
+# --- Only reachable with a window the compositor lost ------------------------------------------
+# The cross-check needs a window mapped in X and absent from sway's tree: the race this module
+# exists to repair, which cannot be produced on demand. A slow window is not a substitute — while
+# it is slow it is not mapped at all, so nothing is owed a view. Tried, measured, withdrawn.
+crates/glass-wayland/src/platform.rs: replace && with || in bring_up_session
+crates/glass-wayland/src/platform.rs: replace + with - in bring_up_session
+crates/glass-wayland/src/platform.rs: replace > with < in bring_up_session
+crates/glass-wayland/src/platform.rs: replace >= with < in bring_up_session
+crates/glass-wayland/src/platform.rs: replace > with < in <impl Platform for WaylandPlatform>::list_windows
+crates/glass-wayland/src/platform.rs: replace > with == in <impl Platform for WaylandPlatform>::list_windows
+crates/glass-wayland/src/platform.rs: replace > with >= in <impl Platform for WaylandPlatform>::list_windows
+
+# --- Only reachable by a race inside one scan --------------------------------------------------
+# Needs a window destroyed between the tree read and the attribute read that follows it, or an
+# attribute failure that is not BadWindow. Both arms are covered directly by unit tests on
+# `window_is_gone`; it is the call site that cannot be driven into either state on purpose.
+crates/glass-wayland/src/xwayland.rs: replace match guard window_is_gone(&e) with true in XProbe::mapped_toplevels
+crates/glass-wayland/src/xwayland.rs: replace match guard window_is_gone(&e) with false in XProbe::mapped_toplevels
+
+# --- Not yet demonstrated equivalent -----------------------------------------------------------
+# ServeState's device dispatch sets `cancelled` on `Finished`, which the compositor sends as it
+# invalidates the device — at which point the connection dies and the loop exits on the read error
+# regardless. Ablating it leaves the whole suite green, which is consistent with equivalence but
+# does not establish it, so it is recorded rather than excluded.
+crates/glass-wayland/src/clipboard.rs: replace <impl Dispatch<ZwlrDataControlDeviceV1, ()> for ServeState>::event with ()
+
+# `set_clipboard` reuses a live owner and re-spawns a dead one. Forcing the guard false always
+# re-spawns, which produces the same observable clipboard by a wasteful route. The `true`
+# direction IS caught, by the test that steals the selection with a second client.
+crates/glass-wayland/src/platform.rs: replace match guard owner.is_alive() with false in <impl Platform for WaylandPlatform>::set_clipboard

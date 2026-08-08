@@ -227,22 +227,25 @@ echo "mutants: $total generated, $caught caught, $missed missed, $timed_out time
 # and a crate with no file has no slot to record into.
 record_for() { echo ".cargo/mutants-known/$1.txt"; }
 
-# A survivor keyed by its description and how many share it, with `line:col` dropped — the line
-# moves whenever anything above it does. Two mutants can share a description at different lines,
-# so the count is what stops one of a pair being fixed unnoticed. Renaming the function a survivor
-# names DOES change its key, deliberately: its recorded reason may no longer fit the code.
+# A survivor keyed by its description alone, with `line:col` dropped — the line moves whenever
+# anything above it does. Renaming the function a survivor names DOES change its key,
+# deliberately: its recorded reason may no longer fit the code.
+#
+# Deduplicated rather than counted. A count would catch one of a duplicate pair being fixed
+# unnoticed, which is real but small; against that, mutants on timing constructs are legitimately
+# non-deterministic — a deadline mutation is caught only when timing happens to break something —
+# so the same code yields two instances one run and none the next. Under counts that is a build
+# failure for no change at all, which is the worse trade.
 survivor_keys() {
-    # The trailing sort is not redundant: `uniq -c` prefixes a count, which reorders the lines,
-    # and `comm` silently mis-compares unsorted input.
-    sed -E 's/^([^:]+):[0-9]+:[0-9]+: /\1: /' "$1" | sort | uniq -c | sed -E 's/^ +//' | sort
+    sed -E 's/^([^:]+):[0-9]+:[0-9]+: /\1: /' "$1" | sort -u
 }
 
 recorded_keys() {
     local f
     for p in "${packages[@]}"; do
         f=$(record_for "$p")
-        [ -f "$f" ] && grep -vE '^\s*(#|$)' "$f" | sed -E 's/^ +//'
-    done | sort
+        [ -f "$f" ] && grep -vE '^\s*(#|$)' "$f"
+    done | sort -u
 }
 
 grade_survivors() {
