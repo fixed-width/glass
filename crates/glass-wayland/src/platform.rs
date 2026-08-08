@@ -1990,6 +1990,41 @@ mod session_tests {
             (value - -30.0).abs() < 0.01,
             "two notches up is -30 surface units, got {value} in {axis:?}"
         );
+        // The scroll sink keeps its own clock, and a compositor drops an event whose time did
+        // not move — so a stuck clock here loses the wheel, not just its ordering.
+        let times: Vec<u32> = lines
+            .iter()
+            .filter_map(|l| l.split_whitespace().find(|w| w.starts_with('t')))
+            .filter_map(|t| t[1..].parse().ok())
+            .collect();
+        assert!(
+            times.last() > times.first(),
+            "the clock must advance across the scroll: {times:?}"
+        );
+    }
+
+    /// Once another client takes the selection this owner's thread is done, and a second write
+    /// has to start a fresh one. Updating the dead thread's text instead leaves the other
+    /// client's value on the clipboard while glass reports the write as done.
+    #[test]
+    fn writing_the_clipboard_after_losing_it_starts_a_new_owner() {
+        let mut s = Launch::new().start();
+        s.platform().set_clipboard("ours").expect("set");
+        assert_eq!(s.platform().get_clipboard().expect("get"), "ours");
+        // A second client takes the selection out from under the backend's owner.
+        let socket = s.wayland_socket();
+        let thief =
+            crate::clipboard::ClipboardOwner::spawn(socket, "theirs".into()).expect("spawn");
+        s.until("the backend's owner to be cancelled", |s| {
+            s.platform().get_clipboard().expect("get") == "theirs"
+        });
+        s.platform().set_clipboard("ours again").expect("re-set");
+        assert_eq!(
+            s.platform().get_clipboard().expect("get"),
+            "ours again",
+            "a write after losing the selection must take it back"
+        );
+        drop(thief);
     }
 
     /// The compositor drops a pointer event whose timestamp did not move, so the session clock
@@ -2024,6 +2059,30 @@ mod session_tests {
         assert!(
             times.last() > times.first(),
             "and must actually advance: {times:?}"
+        );
+    }
+
+    /// A launch that runs out of attempts reaps the private bus it brought up. Leaving it running
+    /// leaks a dbus-daemon per failed launch, and leaves `a11y_bus_addr` handing out the address
+    /// of a session that no longer exists.
+    ///
+    /// Not a test of the retry guard, though it looks like one: the bus is reaped whether or not
+    /// the last attempt takes the retry arm, so relaxing that guard leaves this passing.
+    #[test]
+    fn a_launch_that_runs_out_of_attempts_reaps_its_private_bus() {
+        let mut platform = WaylandPlatform::new().expect("sway");
+        let spec = Launch::new()
+            .windows(&[])
+            .with_a11y()
+            .timeout_ms(700)
+            .spec();
+        platform
+            .start_app(&spec)
+            .expect_err("an app with no window cannot start");
+        assert_eq!(
+            platform.a11y_bus_addr(),
+            None,
+            "the private bus outlived the launch that started it"
         );
     }
 
