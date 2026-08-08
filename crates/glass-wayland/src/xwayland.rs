@@ -511,7 +511,7 @@ mod x_tests {
     /// The scan reports exactly the windows the compositor owes a view, read from the server's
     /// own attributes rather than from what the test asked for.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn the_scan_reports_mapped_app_windows_and_nothing_else() {
         let x = server();
         let wanted = x.window(WindowClass::INPUT_OUTPUT, false, true);
@@ -533,7 +533,7 @@ mod x_tests {
     }
 
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn a_destroyed_window_is_not_reported() {
         let x = server();
         let keep = x.window(WindowClass::INPUT_OUTPUT, false, true);
@@ -548,7 +548,7 @@ mod x_tests {
     /// A scan cannot answer for a server that is gone. Returning an empty list there would say
     /// "the app has no windows", which is exactly the state recovery reacts to.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn a_scan_against_a_dead_server_errors_rather_than_reporting_no_windows() {
         let x = server();
         x.window(WindowClass::INPUT_OUTPUT, false, true);
@@ -562,7 +562,7 @@ mod x_tests {
     /// A map request alone is a no-op on an already-mapped window, so only the unmap/map pair
     /// produces the MapNotify that recovers anything — and it must end viewable.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn remapping_leaves_the_window_mapped_again() {
         let x = server();
         let win = x.window(WindowClass::INPUT_OUTPUT, false, true);
@@ -583,7 +583,7 @@ mod x_tests {
     /// The whole point of the machinery: a window the app really mapped, absent from the
     /// compositor on two consecutive checks, gets re-mapped — and only then.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn a_window_missing_from_the_compositor_twice_is_remapped() {
         let x = server();
         x.window(WindowClass::INPUT_OUTPUT, false, true);
@@ -599,7 +599,7 @@ mod x_tests {
 
     /// A window sway already shows is not lost, however often it is checked.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn a_window_the_compositor_shows_is_never_remapped() {
         let x = server();
         let win = x.window(WindowClass::INPUT_OUTPUT, false, true);
@@ -613,7 +613,7 @@ mod x_tests {
     /// A second pass inside the interval must not count as one of the two sightings that confirm
     /// a loss.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn a_pass_inside_the_interval_does_nothing() {
         let x = server();
         x.window(WindowClass::INPUT_OUTPUT, false, true);
@@ -635,7 +635,7 @@ mod x_tests {
     /// A re-map that did not take is counted, so a launch that gives up says the recovery ran
     /// rather than reporting a bare timeout.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn a_window_still_missing_after_its_remap_is_counted_as_unrecovered() {
         let x = server();
         x.window(WindowClass::INPUT_OUTPUT, false, true);
@@ -652,7 +652,7 @@ mod x_tests {
     /// The unmap half may already have applied, so a silent `Ok` would leave a window hidden and
     /// the caller believing recovery worked.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn remapping_a_window_that_is_gone_reports_the_failure() {
         let x = server();
         let win = x.window(WindowClass::INPUT_OUTPUT, false, true);
@@ -672,7 +672,7 @@ mod session_tests {
     use crate::testw::Launch;
 
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn the_sessions_own_xwayland_is_found_by_its_runtime_dir() {
         let s = Launch::new().through_xwayland().start();
         let dir = s.runtime_dir();
@@ -712,7 +712,7 @@ mod session_tests {
     /// Xwayland exists" holds whenever a sibling test has one in flight. Asserting `is_xwayland`
     /// over what the scan returned would restate the predicate it filters on.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn the_scan_finds_this_sessions_own_xwayland() {
         let s = Launch::new().through_xwayland().start();
         let dir = s.runtime_dir();

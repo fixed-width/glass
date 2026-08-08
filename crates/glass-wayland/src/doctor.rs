@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn discover_sway_reports_the_real_binary_and_its_version() {
         let (path, ver) = discover_sway().expect("this box has a discoverable sway");
         assert!(path.is_file(), "{}", path.display());
@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn sway_version_reads_the_binarys_own_output() {
         let (path, _) = discover_sway().expect("sway");
         assert!(sway_version(&path).contains("sway version"));
@@ -262,7 +262,7 @@ mod tests {
     ///
     /// Not `/bin/true`: GNU coreutils answers `--version` with its own version string.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn a_silent_binary_reports_an_unknown_version_not_an_empty_one() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("tempdir");
@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn the_shallow_checks_cover_sway_and_gl_and_stop_there() {
         let cs = checks(false);
         let names: Vec<&str> = cs.iter().map(|c| c.name.as_str()).collect();
@@ -288,7 +288,7 @@ mod tests {
     /// A `deep: true` that quietly skipped the spawn reports the same clean bill of health as one
     /// that ran it.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn the_deep_check_really_starts_and_stops_a_compositor() {
         let before = compositors_running();
         let deep = checks(true)
@@ -319,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn probing_something_that_is_not_a_compositor_fails() {
         let err = probe_sway(Path::new("/bin/false")).expect_err("no IPC ever appears");
         assert!(err.contains("did not come up"), "{err}");

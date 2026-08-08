@@ -744,7 +744,7 @@ mod tests {
     /// The serving thread is the clipboard — it holds the selection while it runs, and a pasting
     /// app reads from it over a pipe. Nothing under that is fakeable, so these use a real one.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn an_owner_serves_its_text_and_reports_itself_alive() {
         let s = Launch::new().start();
         let socket = s.wayland_socket();
@@ -757,7 +757,7 @@ mod tests {
     /// makes `set_clipboard` update a thread serving nothing, and the next paste reads the other
     /// client's text.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn an_owner_that_lost_the_selection_stops_reporting_itself_alive() {
         let s = Launch::new().start();
         let socket = s.wayland_socket();
@@ -777,7 +777,7 @@ mod tests {
     /// Updating in place is what lets a second write reuse the thread. If `set_text` did nothing
     /// the old value would keep being served, with nothing to say it had gone stale.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn updating_an_owners_text_changes_what_a_paste_reads() {
         let s = Launch::new().start();
         let socket = s.wayland_socket();
@@ -791,7 +791,7 @@ mod tests {
     /// noticing the stop flag does not fail a test — it wedges it, and takes teardown with it.
     /// Bounded from another thread, because a blocking drop cannot time itself.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn dropping_an_owner_does_not_block() {
         let s = Launch::new().start();
         let owner = ClipboardOwner::spawn(s.wayland_socket(), "held".into()).expect("spawn");
@@ -808,7 +808,7 @@ mod tests {
     /// after glass believed the clipboard was released — and would still be holding the wayland
     /// socket when the session tore down around it.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn dropping_an_owner_gives_up_the_selection() {
         let s = Launch::new().start();
         let socket = s.wayland_socket();

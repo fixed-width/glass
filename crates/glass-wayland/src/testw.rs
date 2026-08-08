@@ -779,7 +779,7 @@ mod harness_tests {
 
     /// Everything else in the suite assumes the fixture really maps a window the backend sees.
     #[test]
-    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn the_fixture_app_maps_a_window_the_backend_reports() {
         let mut s = Launch::new().start();
         let wins = s.windows();
