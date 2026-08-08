@@ -207,9 +207,90 @@ reap_strays
 # A shard may legitimately draw none of the planned mutants; the count above is what
 # proves the run as a whole gated something.
 echo "mutants: $total generated, $caught caught, $missed missed, $timed_out timed out, $unviable unviable"
-if [ "$missed" -gt 0 ]; then
-    echo "Survivors are listed in $graded/mutants.out/missed.txt"
+
+# Grade survivors against a recorded set rather than against zero.
+#
+# Without this, a survivor on a line nobody has touched is invisible — until someone edits that
+# line for an unrelated reason and the in-diff gate hands them a mutant they did not write. Their
+# choices are then to do deep unrelated work, add an exclusion under deadline pressure, or turn
+# the gate off. That is how gates get turned off.
+#
+# So the record applies to BOTH gates: a recorded survivor never fails anyone, a new one always
+# does, and one that has become killable says so. This is a ratchet, not an amnesty — the bar is
+# "no new survivors", and adding to the record is a reviewed diff that has to carry a reason.
+#
+# Deliberately not `exclude_re` in mutants.toml: an exclusion stops the mutant being generated, so
+# it can never be re-graded and never reports that it has become killable. These are still
+# generated, still run, and still printed every time.
+#
+# Per crate, so a crate at zero stays at zero: a record exists only for the crates that have one,
+# and a crate with no file has no slot to record into.
+record_for() { echo ".cargo/mutants-known/$1.txt"; }
+
+# A survivor keyed by its description and how many share it, with `line:col` dropped — the line
+# moves whenever anything above it does. Two mutants can share a description at different lines,
+# so the count is what stops one of a pair being fixed unnoticed. Renaming the function a survivor
+# names DOES change its key, deliberately: its recorded reason may no longer fit the code.
+survivor_keys() {
+    # The trailing sort is not redundant: `uniq -c` prefixes a count, which reorders the lines,
+    # and `comm` silently mis-compares unsorted input.
+    sed -E 's/^([^:]+):[0-9]+:[0-9]+: /\1: /' "$1" | sort | uniq -c | sed -E 's/^ +//' | sort
+}
+
+recorded_keys() {
+    local f
+    for p in "${packages[@]}"; do
+        f=$(record_for "$p")
+        [ -f "$f" ] && grep -vE '^\s*(#|$)' "$f" | sed -E 's/^ +//'
+    done | sort
+}
+
+grade_survivors() {
+    local missed_txt="$graded/mutants.out/missed.txt"
+    local now expected new_ones fixed_ones
+    now=$(mktemp) && expected=$(mktemp)
+    # Compared even when nothing survived: that is exactly when a recorded entry has become
+    # killable, and the run should say so rather than quietly passing.
+    if [ -f "$missed_txt" ]; then survivor_keys "$missed_txt" > "$now"; else : > "$now"; fi
+    recorded_keys > "$expected"
+
+    new_ones=$(comm -23 "$now" "$expected")
+    fixed_ones=$(comm -13 "$now" "$expected")
+
+    # Printed every run, so a recorded survivor stays visible instead of becoming furniture.
+    if [ -s "$expected" ]; then
+        echo "Recorded survivors (see .cargo/mutants-known/):"
+        sed 's/^/  /' "$expected"
+    fi
+    if [ -n "$fixed_ones" ]; then
+        echo
+        echo "These are now caught — delete them from .cargo/mutants-known/:"
+        echo "$fixed_ones" | sed 's/^/  /'
+    fi
+    if [ -n "$new_ones" ]; then
+        echo
+        echo "Survivors that are not recorded:"
+        echo "$new_ones" | sed 's/^/  /'
+        echo
+        echo "Kill them, or record each with the reason it cannot be killed. A reason is a"
+        echo "property of the code — equivalent, unreachable, only reachable by a race — not"
+        echo "'hard' and not 'not mine'. Full list: $missed_txt"
+        rm -f "$now" "$expected"
+        return 1
+    fi
+    rm -f "$now" "$expected"
+    return 0
+}
+
+if ! grade_survivors; then
     exit 1
+fi
+# Every survivor was recorded, so cargo-mutants' own "found problems" status must not fail the run
+# — otherwise the record grades nothing and the exit code decides after all. Exit 2 is exactly
+# that outcome (`ExitCode::FoundProblems`); a usage error, a failing baseline or a bad filter diff
+# all have their own codes and still stand.
+if [ "$missed" -gt 0 ] && [ "$status" -eq 2 ]; then
+    status=0
 fi
 if [ "$timed_out" -gt 0 ]; then
     echo "Timed-out mutants are listed in $graded/mutants.out/timeout.txt — a hang is a"

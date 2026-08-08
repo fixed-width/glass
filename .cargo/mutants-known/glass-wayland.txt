@@ -1,0 +1,42 @@
+# Survivors this crate carries knowingly. One entry per mutation cargo-mutants generates and no
+# test kills, with the reason it cannot be killed rather than the reason nobody got to it.
+#
+# A reason is a property of the code — equivalent, unreachable, only reachable by a race. "Hard"
+# is not a reason, and neither is "not mine": everything here was tried, and the way it was tried
+# is written down so the next person does not repeat it.
+#
+# Format: <count> <path>: <mutant description>, as cargo-mutants prints it in missed.txt minus the
+# line:col. Delete an entry the moment the run says it is caught.
+
+# start_app's bring-up retry. It fires — confirmed by instrumenting the arms — but nothing outside
+# `start_app` can observe which path ran: both return the same Timeout, and elapsed time cannot
+# separate them because a single attempt already spends the budget twice (once waiting for the
+# socket, once for a window). A test asserting `elapsed >= 2 x budget` passed with the retry
+# suppressed, and was withdrawn. Tracked as #382, which also notes `last_err` is written and never
+# read.
+1 crates/glass-wayland/src/platform.rs: replace match guard attempt + 1 < ATTEMPTS with false in <impl Platform for WaylandPlatform>::start_app
+1 crates/glass-wayland/src/platform.rs: replace < with == in <impl Platform for WaylandPlatform>::start_app
+1 crates/glass-wayland/src/platform.rs: replace < with > in <impl Platform for WaylandPlatform>::start_app
+
+# The lost-toplevel cross-check. Reaching these needs a window mapped in X and absent from sway's
+# tree — the race the module exists to repair, which cannot be produced on demand. A slow window
+# is not a substitute: while it is slow it is not mapped at all, so nothing is owed a view and the
+# check has nothing to react to. Tried and measured; the test was withdrawn.
+1 crates/glass-wayland/src/platform.rs: replace + with - in bring_up_session
+1 crates/glass-wayland/src/platform.rs: replace && with || in bring_up_session
+1 crates/glass-wayland/src/platform.rs: replace >= with < in bring_up_session
+
+# The sinks' self-commit. Removing the roundtrip and the 8ms pace changes no assertion — it
+# changes whether events survive under load. Any test for it would pass or fail by timing, which
+# is how flaky tests are built.
+1 crates/glass-wayland/src/platform.rs: replace WaylandDragSink<'_>::settle -> Result<()> with Ok(())
+1 crates/glass-wayland/src/platform.rs: replace WaylandScrollSink<'_>::settle -> Result<()> with Ok(())
+
+# Two clipboard arms that look equivalent and are not proven so. `pending_mimes.clear()` on
+# DataOffer has nothing to clear: the vec starts empty and each `get` uses a fresh connection with
+# one selection offer. ServeState's `Finished` sets `cancelled` when the compositor invalidates the
+# device, which happens as sway goes away — at which point the connection dies and the loop exits
+# on the read error regardless. Ablating both leaves the whole suite green, which is consistent
+# with equivalence but does not demonstrate it; recorded rather than excluded for that reason.
+1 crates/glass-wayland/src/clipboard.rs: delete match arm zwlr_data_control_device_v1::Event::DataOffer{id} in <impl Dispatch<ZwlrDataControlDeviceV1, ()> for ClipState>::event
+1 crates/glass-wayland/src/clipboard.rs: replace <impl Dispatch<ZwlrDataControlDeviceV1, ()> for ServeState>::event with ()
