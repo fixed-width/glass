@@ -346,6 +346,12 @@ pub(crate) const INTERNAL_ENV: &[&str] = &[
     // the guard test scans for, so it needs an entry here even though `std::env::var` never
     // touches it.
     "GLASS_CLIP",
+    // The three the glass-wayland test harness passes to the app it launches
+    // (glass-wayland/src/testw.rs): which windows to map, whether to ignore a close request, and
+    // whether to be an X11 client. Read only by that fixture, never by glass.
+    "GLASS_TESTW_WINDOWS",
+    "GLASS_TESTW_IGNORES_CLOSE",
+    "GLASS_TESTW_X11",
     // Per-launch named-pasteboard name: glass sets this on the injected app's env
     // (glass-macos/src/process.rs) for the clip shim (glass-clip-shim-macos) to read; not an
     // operator-facing override.
