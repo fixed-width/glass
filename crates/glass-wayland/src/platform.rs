@@ -2189,6 +2189,30 @@ mod session_tests {
         assert_eq!(px[3], 255, "opaque");
     }
 
+    /// A capture the compositor refuses has to surface as an error, not as a blank frame. This is
+    /// the one path where a silent fallback would be invisible — a caller cannot tell an empty
+    /// image from a black window.
+    #[test]
+    fn a_capture_the_compositor_refuses_is_reported_as_a_failure() {
+        let mut s = Launch::new().start_mapped();
+        // Far outside the 1280x800 output, so there is nothing for screencopy to copy.
+        let err = s
+            .platform()
+            .capture_frame(Some(&Region {
+                x: 100_000,
+                y: 100_000,
+                width: 64,
+                height: 64,
+            }))
+            .expect_err("a region off the output cannot be captured");
+        // The message, not just the variant: without the `Failed` arm the capture would spin to
+        // its own deadline and report a timeout, which is the same variant and a different fault.
+        assert!(
+            err.to_string().contains("screencopy failed"),
+            "the refusal should be reported as one, not as a timeout: {err}"
+        );
+    }
+
     /// A region is window-relative too, and it is cropped at the source: the compositor is asked
     /// for exactly that rectangle of the output.
     #[test]
