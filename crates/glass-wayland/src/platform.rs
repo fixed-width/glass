@@ -2314,12 +2314,17 @@ mod session_tests {
         );
     }
 
-    /// `glass_core::run_drag` calls `modifiers()` on every drag, so unlike the scroll sink this
-    /// guard is live — without it an unmodified drag sends a modifier frame the app never asked
-    /// for. Both directions, because only the pair distinguishes the guard from its inverse.
+    /// `glass_core::run_drag` calls `modifiers()` on every drag, so unlike the scroll sink the
+    /// drag sink's `mask == 0` guard is live. Inverting it makes a *modified* drag skip its
+    /// modifiers, which is what this catches.
+    ///
+    /// The other direction — a plain drag sending no modifier traffic — is not asserted and
+    /// cannot be. The compositor emits an unsolicited `modifiers` event when the window takes
+    /// keyboard focus, indistinguishable from one the sink sent, and whether it lands before or
+    /// after the ready line depends on how fast the machine is.
     #[test]
     #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
-    fn a_drag_carries_its_modifiers_and_an_unmodified_one_sends_none() {
+    fn a_modified_drag_carries_its_modifiers() {
         let mut s = Launch::new().start_mapped();
         let drag = |modifiers: Vec<glass_core::keys::Modifier>| PointerEvent::Drag {
             from_x: 20,
@@ -2330,14 +2335,6 @@ mod session_tests {
             modifiers,
             duration_ms: 30,
         };
-        s.platform()
-            .send_pointer(&drag(vec![]))
-            .expect("plain drag");
-        let plain = s.wait_for_log(" 272 0");
-        assert!(
-            !plain.iter().any(|l| l.contains("input: mods")),
-            "an unmodified drag must send no modifier traffic: {plain:#?}"
-        );
         s.platform()
             .send_pointer(&drag(vec![glass_core::keys::Modifier::Control]))
             .expect("modified drag");

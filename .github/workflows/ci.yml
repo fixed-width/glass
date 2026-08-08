@@ -247,12 +247,15 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      - name: Install the integration suites' own deps
-        # On top of the unit-test stack above: bubblewrap for the sandbox_* tests, whose
-        # unprivileged user namespaces Ubuntu 24.04 restricts via AppArmor (the sysctl is a no-op
-        # on images without the knob), and GTK4 for the software_render test's real app.
+      - name: Install system deps
+        # xvfb + at-spi2-core: glass-x11's unit tests start a private display each, and one starts
+        # a private a11y bus — needed by `cargo test --workspace` here, not only by the X11 suite.
+        # bubblewrap for the sandbox_* tests, whose unprivileged user namespaces Ubuntu 24.04
+        # restricts via AppArmor (the sysctl is a no-op on images without the knob), and GTK4 for
+        # the software_render test's real app.
         run: |
-          sudo apt-get install -y bubblewrap python3-gi gir1.2-gtk-4.0
+          sudo apt-get update
+          sudo apt-get install -y xvfb at-spi2-core bubblewrap python3-gi gir1.2-gtk-4.0
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Measure coverage (unit + X11; Wayland/AT-SPI self-skip)
         run: ./scripts/coverage.sh --lcov
