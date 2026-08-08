@@ -325,7 +325,13 @@ fn parse_specs(s: &str) -> Vec<Spec> {
 #[test]
 #[ignore = "the fixture app sway launches, not a test"]
 fn fixture() {
-    let specs = parse_specs(&std::env::var(WINDOWS).expect("the launcher sets the window list"));
+    // A no-op unless the harness launched it. `#[ignore]` used to be what kept this from running
+    // as a test, and the mutation gate now passes `--run-ignored all`, so the window list is what
+    // separates "sway exec'd me" from "the runner reached me".
+    let Ok(spec) = std::env::var(WINDOWS) else {
+        return;
+    };
+    let specs = parse_specs(&spec);
     if std::env::var_os(USE_X11).is_some() {
         x11_app::run(&specs);
     } else {
@@ -728,6 +734,7 @@ mod harness_tests {
 
     /// Everything else in the suite assumes the fixture really maps a window the backend sees.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn the_fixture_app_maps_a_window_the_backend_reports() {
         let mut s = Launch::new().start();
         let wins = s.windows();

@@ -1670,6 +1670,7 @@ mod pure_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn discovery_finds_a_real_sway_on_this_machine() {
         let found = resolve_sway().expect("a discoverable sway");
         assert!(found.is_file(), "{}", found.display());
@@ -1756,6 +1757,7 @@ mod session_tests {
     use crate::testw::{Launch, READY_LINE};
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_launch_reports_the_window_the_app_actually_mapped() {
         let mut s = Launch::new().windows(&["solo:solo:300x200"]).start();
         let geo = s.platform().window(&WindowOp::Geometry).expect("geometry");
@@ -1771,6 +1773,7 @@ mod session_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn enumeration_reports_every_window_with_a_stable_id() {
         let mut s = Launch::new()
             .windows(&["one:app-one:200x100", "two:app-two:150x120"])
@@ -1799,6 +1802,7 @@ mod session_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn selecting_a_window_focuses_it_and_reports_its_geometry() {
         let mut s = Launch::new()
             .windows(&["one:app-one:200x100", "two:app-two:150x120"])
@@ -1819,6 +1823,7 @@ mod session_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn selecting_a_window_that_is_not_there_reports_it_not_found() {
         let mut s = Launch::new().start();
         let err = s
@@ -1829,6 +1834,7 @@ mod session_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn moving_and_resizing_change_what_the_compositor_reports() {
         let mut s = Launch::new().start();
         let resized = s
@@ -1856,6 +1862,7 @@ mod session_tests {
     /// The sink is sway's piped stdout and stderr, which the app inherits — so both streams
     /// arrive intermixed, and a line the app printed is the only proof the launch captured it.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn the_apps_output_reaches_the_log_sink() {
         let mut s = Launch::new().start();
         // `wait_for_log` is the assertion: it panics unless the line arrives.
@@ -1865,6 +1872,7 @@ mod session_tests {
     /// The a11y reader correlates an AT-SPI connection against this set, so it has to reach past
     /// the compositor to the app: sway's pid is not the app's.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn the_process_set_reaches_past_the_compositor_to_the_app() {
         let mut s = Launch::new().start();
         let pids = s.platform().app_pids();
@@ -1878,6 +1886,7 @@ mod session_tests {
     /// No a11y bus was asked for, so there is no address to hand out. Inventing one would send
     /// the reader at the user's own desktop bus.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_session_launched_without_accessibility_has_no_bus_address() {
         let mut s = Launch::new().start();
         assert_eq!(s.platform().a11y_bus_addr(), None);
@@ -1887,6 +1896,7 @@ mod session_tests {
     /// output. The app is the only witness: Wayland has no way to ask where the pointer is, so
     /// the fixture echoes the surface-local point it was given back through its own stdout.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_pointer_move_arrives_at_the_requested_window_relative_point() {
         let mut s = Launch::new().start_mapped();
         s.platform()
@@ -1902,6 +1912,7 @@ mod session_tests {
     /// A window away from the output origin is the case an origin mix-up survives: with the
     /// window at (0, 0) a window-relative and an output-absolute point are the same number.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_pointer_move_is_relative_to_a_window_that_is_not_at_the_origin() {
         let mut s = Launch::new().start_mapped();
         s.platform()
@@ -1918,6 +1929,7 @@ mod session_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_click_presses_and_releases_the_button_over_the_window() {
         let mut s = Launch::new().start_mapped();
         s.platform()
@@ -1949,6 +1961,7 @@ mod session_tests {
     /// the guard from its inverse — and an app reads ctrl+click as ctrl+click only if control is
     /// already down when the button arrives.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_click_carries_its_modifiers_and_a_plain_one_sends_none() {
         let mut s = Launch::new().start_mapped();
         let click = |modifiers: Vec<glass_core::keys::Modifier>| PointerEvent::Click {
@@ -1981,6 +1994,7 @@ mod session_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_scroll_reaches_the_window_as_an_axis_event() {
         let mut s = Launch::new().start_mapped();
         s.platform()
@@ -2023,6 +2037,7 @@ mod session_tests {
     /// has to start a fresh one. Updating the dead thread's text instead leaves the other
     /// client's value on the clipboard while glass reports the write as done.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn writing_the_clipboard_after_losing_it_starts_a_new_owner() {
         let mut s = Launch::new().start();
         s.platform().set_clipboard("ours").expect("set");
@@ -2047,6 +2062,7 @@ mod session_tests {
     /// has to advance per event. A stuck clock looks like nothing at all from the outside — the
     /// events are sent, and simply do not arrive.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn the_event_clock_advances_across_a_drag() {
         let mut s = Launch::new().start_mapped();
         s.platform()
@@ -2080,6 +2096,7 @@ mod session_tests {
     /// Not a test of the retry guard, though it looks like one: the bus is reaped whether or not
     /// the last attempt takes the retry arm, so relaxing that guard leaves this passing.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_launch_that_runs_out_of_attempts_reaps_its_private_bus() {
         let mut platform = WaylandPlatform::new().expect("sway");
         let spec = Launch::new()
@@ -2100,6 +2117,7 @@ mod session_tests {
     /// A launch that asked for accessibility gets a private bus, and its address is what the
     /// reader connects to. Answering `None` sends the reader at the user's own desktop bus.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_session_launched_with_accessibility_hands_out_its_private_bus() {
         let mut s = Launch::new().with_a11y().start();
         let addr = s
@@ -2115,6 +2133,7 @@ mod session_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_gesture_is_refused_by_this_backend() {
         let mut s = Launch::new().start();
         let err = s
@@ -2128,6 +2147,7 @@ mod session_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn typed_text_reaches_the_window_as_key_events() {
         let mut s = Launch::new().start_mapped();
         s.platform()
@@ -2139,6 +2159,7 @@ mod session_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_chord_holds_its_modifier_across_the_key() {
         let mut s = Launch::new().start_mapped();
         s.platform()
@@ -2163,6 +2184,7 @@ mod session_tests {
     /// The fixture fills its surface with one known colour, so this checks pixels rather than
     /// only dimensions.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_capture_reads_the_active_windows_own_pixels() {
         let mut s = Launch::new().windows(&["cap:cap:200x160"]).start_mapped();
         let frame = s.platform().capture_frame(None).expect("capture");
@@ -2179,6 +2201,7 @@ mod session_tests {
     /// A refused capture must surface as an error: a caller cannot tell a blank frame from a
     /// black window.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_capture_the_compositor_refuses_is_reported_as_a_failure() {
         let mut s = Launch::new().start_mapped();
         // Far outside the 1280x800 output, so there is nothing for screencopy to copy.
@@ -2202,6 +2225,7 @@ mod session_tests {
     /// A region is window-relative too, and it is cropped at the source: the compositor is asked
     /// for exactly that rectangle of the output.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_capture_region_is_relative_to_the_window() {
         let mut s = Launch::new().windows(&["cap:cap:200x160"]).start_mapped();
         s.platform()
@@ -2226,6 +2250,7 @@ mod session_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn the_clipboard_round_trips_through_the_compositor() {
         let mut s = Launch::new().start();
         s.platform().set_clipboard("glass wayland").expect("set");
@@ -2235,6 +2260,7 @@ mod session_tests {
     /// A re-set that started a second owner without stopping the first would race it for the
     /// selection.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn writing_the_clipboard_twice_leaves_the_second_value() {
         let mut s = Launch::new().start();
         s.platform().set_clipboard("first").expect("set");
@@ -2243,12 +2269,14 @@ mod session_tests {
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_session_with_nothing_on_the_clipboard_reads_empty() {
         let mut s = Launch::new().start();
         assert_eq!(s.platform().get_clipboard().expect("get"), "");
     }
 
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_drag_presses_moves_and_releases_over_the_window() {
         let mut s = Launch::new().start_mapped();
         s.platform()
@@ -2290,6 +2318,7 @@ mod session_tests {
     /// guard is live — without it an unmodified drag sends a modifier frame the app never asked
     /// for. Both directions, because only the pair distinguishes the guard from its inverse.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_drag_carries_its_modifiers_and_an_unmodified_one_sends_none() {
         let mut s = Launch::new().start_mapped();
         let drag = |modifiers: Vec<glass_core::keys::Modifier>| PointerEvent::Drag {
@@ -2322,6 +2351,7 @@ mod session_tests {
     /// The horizontal axis, which every other scroll test leaves at zero — a separate branch with
     /// its own scale.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_horizontal_scroll_reaches_the_window_on_the_other_axis() {
         let mut s = Launch::new().start_mapped();
         s.platform()
@@ -2356,6 +2386,7 @@ mod session_tests {
 
     /// An app reads ctrl+scroll as zoom only if control is down when the axis arrives.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_modified_scroll_holds_the_modifier_and_releases_it() {
         let mut s = Launch::new().start_mapped();
         s.platform()
@@ -2384,6 +2415,7 @@ mod session_tests {
     /// An unmodified scroll sends no modifier traffic. `glass_core::run_scroll` is what skips it
     /// — this pins the wiring end to end, not the sink.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn an_unmodified_scroll_does_not_touch_the_modifiers() {
         let mut s = Launch::new().start_mapped();
         let before = s
@@ -2415,6 +2447,7 @@ mod session_tests {
     /// `Timeout`, and elapsed time cannot separate them because one attempt already spends the
     /// budget twice — once for the socket, once for a window. See #382.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_launch_that_finds_no_window_times_out() {
         let mut platform = WaylandPlatform::new().expect("sway");
         let spec = Launch::new().windows(&[]).timeout_ms(1500).spec();
@@ -2427,6 +2460,7 @@ mod session_tests {
     /// Teardown has to happen even when nobody called `stop_app` — a panicking test or an early
     /// return would otherwise leak sway, its Xwayland and the app.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn dropping_the_backend_reaps_a_session_that_was_never_stopped() {
         let mut s = Launch::new().start();
         let pids = s.platform().app_pids();
@@ -2441,6 +2475,7 @@ mod session_tests {
     /// After stopping there is no compositor to talk to, and the backend must say so rather than
     /// answer from what it last saw.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn stopping_ends_the_session() {
         let mut s = Launch::new().start();
         s.platform().stop_app().expect("stop");
@@ -2452,6 +2487,7 @@ mod session_tests {
     /// path is the only witness — and a signalled app never reaches it, losing whatever it would
     /// have flushed.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn a_cooperative_app_is_asked_to_close_and_runs_its_own_shutdown() {
         let mut s = Launch::new().start_mapped();
         s.platform().stop_app().expect("stop");
@@ -2463,6 +2499,7 @@ mod session_tests {
     /// An app with no shutdown path still has to be gone afterwards: the ask is followed by a
     /// signal, and the reap covers the compositor's whole group.
     #[test]
+    #[ignore = "starts a real compositor or X server; see scripts/ci/install-display-stack.sh"]
     fn an_app_that_ignores_the_close_request_is_still_reaped() {
         let mut s = Launch::new().ignoring_close().start();
         let pids = s.platform().app_pids();

@@ -41,9 +41,9 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      # `cargo test --workspace` covers glass-x11's Xvfb-backed tests and glass-wayland's
-      # sway-backed ones; neither the display stack nor the compositor ships on the runner.
-      - run: ./scripts/ci/install-display-stack.sh
+      # glass-x11's Xvfb-backed tests still run here; glass-wayland's are `#[ignore]`d and run
+      # only under the mutation gate and the Wayland job.
+      - run: sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core
       - run: cargo build --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -229,9 +229,8 @@ jobs:
     runs-on: ubuntu-latest
     # Non-gating: a coverage report, never a merge blocker. The number undercounts
     # by design (see scripts/coverage.sh): glass-windows Win32 FFI is
-    # cfg(windows) so it isn't measured here. The Wayland suite no longer self-skips: this
-    # job now fetches the same sway bundle glass-wayland's unit tests need, which is what
-    # scripts/test-wayland.sh looks for.
+    # cfg(windows) so it isn't measured here; the Wayland suite needs a sway this job does not
+    # fetch, so it self-skips, and glass-wayland's own tests are `#[ignore]`d for the same reason.
     continue-on-error: true
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -245,7 +244,6 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      - run: ./scripts/ci/install-display-stack.sh
       - name: Install the integration suites' own deps
         # On top of the unit-test stack above: bubblewrap for the sandbox_* tests, whose
         # unprivileged user namespaces Ubuntu 24.04 restricts via AppArmor (the sysctl is a no-op
@@ -253,7 +251,7 @@ jobs:
         run: |
           sudo apt-get install -y bubblewrap python3-gi gir1.2-gtk-4.0
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-      - name: Measure coverage (unit + X11 + Wayland; AT-SPI self-skips)
+      - name: Measure coverage (unit + X11; Wayland/AT-SPI self-skip)
         run: ./scripts/coverage.sh --lcov
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -330,6 +328,7 @@ jobs:
             --test-tool nextest \
             --package glass-core --package glass-android --package glass-x11 \
             --package glass-wayland \
+            --cargo-test-arg=--run-ignored=all \
             --shard ${{ matrix.shard }}/8 --sharding round-robin \
             --in-diff "$RUNNER_TEMP/pr.diff"
 

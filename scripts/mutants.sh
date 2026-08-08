@@ -93,6 +93,22 @@ if [ -n "$want" ]; then
 fi
 [ "${#packages[@]}" -eq 0 ] && packages=("$DEFAULT_PACKAGE")
 
+# Crates whose tests are `#[ignore]`d, and so are only mutated if the runner is told to run
+# ignored tests. Without the flag the baseline still passes and EVERY mutant reads as caught — a
+# perfect score meaning nothing — so refuse the run rather than report it.
+readonly IGNORED_TEST_PACKAGES='glass-wayland'
+for p in "${packages[@]}"; do
+    case " $IGNORED_TEST_PACKAGES " in
+        *" $p "*)
+            if ! printf '%s\n' "$@" | grep -q -- '--run-ignored'; then
+                echo "$p's tests are #[ignore]d: pass --cargo-test-arg=--run-ignored=all" >&2
+                echo "or every mutant will be graded caught without a test having run." >&2
+                exit 2
+            fi
+            ;;
+    esac
+done
+
 # `--package p1 --package p2 …`, the form both cargo-mutants calls below want.
 pkg_args=()
 for p in "${packages[@]}"; do

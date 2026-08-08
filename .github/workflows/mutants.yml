@@ -41,6 +41,7 @@ jobs:
             --test-tool nextest \
             --package glass-core --package glass-android --package glass-x11 \
             --package glass-wayland \
+            --cargo-test-arg=--run-ignored=all \
             --shard ${{ matrix.shard }}/8 --sharding round-robin
       - name: Upload the outcome
         if: always()
