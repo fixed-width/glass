@@ -206,7 +206,9 @@ impl Recovery {
 /// nothing and stays quiet.
 fn recovery_notice(count: usize) -> Option<String> {
     (count > 0).then(|| {
-        format!("glass: {count} window(s) the app mapped never reached the compositor; re-mapped them")
+        format!(
+            "glass: {count} window(s) the app mapped never reached the compositor; re-mapped them"
+        )
     })
 }
 
@@ -437,8 +439,7 @@ mod x_tests {
     //! nothing to fake underneath it; a private Xvfb is an order of magnitude cheaper to start
     //! than the compositor whose Xwayland it stands in for, and the protocol is the same.
     use super::*;
-    use x11rb::connection::Connection as _;
-    use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+    use x11rb::protocol::xproto::{CreateWindowAux, WindowClass};
     use x11rb::rust_connection::RustConnection;
     use x11rb::wrapper::ConnectionExt as _; // sync(): a round trip, so the server has applied it
 
@@ -452,7 +453,8 @@ mod x_tests {
     fn server() -> X {
         let server = glass_x11::Xvfb::start("400x300x24").expect("a private Xvfb should start");
         let display = server.display.clone();
-        let (conn, screen) = x11rb::connect(Some(&display)).expect("the test client should connect");
+        let (conn, screen) =
+            x11rb::connect(Some(&display)).expect("the test client should connect");
         let root = conn.setup().roots[screen].root;
         X {
             _server: server,
@@ -466,7 +468,11 @@ mod x_tests {
         /// A window of the given shape, mapped unless `map` is false.
         fn window(&self, class: WindowClass, override_redirect: bool, map: bool) -> u32 {
             let win = self.conn.generate_id().expect("id");
-            let depth = if class == WindowClass::INPUT_ONLY { 0 } else { 24 };
+            let depth = if class == WindowClass::INPUT_ONLY {
+                0
+            } else {
+                24
+            };
             self.conn
                 .create_window(
                     depth,
@@ -520,7 +526,10 @@ mod x_tests {
             ("an override-redirect menu", menu),
             ("an InputOnly window", input_only),
         ] {
-            assert!(!found.contains(&win), "{name} is not owed a view: {found:?}");
+            assert!(
+                !found.contains(&win),
+                "{name} is not owed a view: {found:?}"
+            );
         }
     }
 
@@ -643,7 +652,9 @@ mod x_tests {
         let win = x.window(WindowClass::INPUT_OUTPUT, false, true);
         x.conn.destroy_window(win).expect("destroy");
         x.conn.sync().expect("sync");
-        x.probe().remap(win).expect_err("a destroyed window cannot be re-mapped");
+        x.probe()
+            .remap(win)
+            .expect_err("a destroyed window cannot be re-mapped");
     }
 }
 
@@ -685,7 +696,10 @@ mod tests {
         let mut r = Recovery::new(std::path::Path::new("/nonexistent"));
         assert!(!r.warned);
         r.warn_once("glass: test warning".into());
-        assert!(r.warned, "a warning that never arms the flag repeats forever");
+        assert!(
+            r.warned,
+            "a warning that never arms the flag repeats forever"
+        );
     }
 
     #[test]

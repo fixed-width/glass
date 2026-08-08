@@ -321,7 +321,12 @@ mod tests {
     #[test]
     fn the_ipc_socket_is_picked_out_of_the_runtime_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for decoy in ["wayland-1", "wayland-1.lock", "sway-ipc.partial", "other.sock"] {
+        for decoy in [
+            "wayland-1",
+            "wayland-1.lock",
+            "sway-ipc.partial",
+            "other.sock",
+        ] {
             std::fs::write(dir.path().join(decoy), b"").expect("decoy");
         }
         let real = dir.path().join("sway-ipc.1000.42.sock");

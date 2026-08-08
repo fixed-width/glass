@@ -134,6 +134,15 @@ impl WaylandPlatform {
     }
 }
 
+#[cfg(test)]
+impl WaylandPlatform {
+    /// The active session's private runtime dir — where sway put both its wayland socket and its
+    /// IPC socket. Lets a test observe the session over a connection this backend does not own.
+    pub(crate) fn session_runtime_dir(&self) -> Option<&Path> {
+        self.active.as_ref()?.socket_path.parent()
+    }
+}
+
 /// The X11 window id of each window sway currently reports — what a lost-window cross-check
 /// compares the X server's mapped toplevels against. Native Wayland views have no X11 id and are
 /// simply absent.
@@ -1488,6 +1497,475 @@ impl Platform for WaylandPlatform {
 
     fn a11y_bus_addr(&self) -> Option<String> {
         self.dbus.as_ref().map(|b| b.a11y_bus_address().to_string())
+    }
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+
+    fn win(identifier: &str, x11: Option<u32>) -> SwayWindow {
+        SwayWindow {
+            con_id: 1,
+            title: None,
+            class: None,
+            rect: crate::swayipc::Rect {
+                x: 1,
+                y: 2,
+                width: 30,
+                height: 40,
+            },
+            focused: false,
+            identifier: identifier.into(),
+            x11_window: x11,
+        }
+    }
+
+    /// The cross-check compares the X server's toplevels against these, so a native Wayland view
+    /// must be absent rather than present as some placeholder id that could collide with a real
+    /// X window.
+    #[test]
+    fn only_xwayland_views_contribute_an_x11_id() {
+        let wins = [win("a", Some(0x40_0001)), win("b", None), win("c", Some(7))];
+        assert_eq!(x11_ids(&wins), vec![0x40_0001, 7]);
+        assert!(x11_ids(&[win("native", None)]).is_empty());
+    }
+
+    /// Teardown waits on the app's own processes. Waiting on the compositor as well would mean
+    /// waiting for something that only exits after glass reaps it.
+    #[test]
+    fn the_apps_processes_are_the_tree_without_the_compositor() {
+        let me = std::process::id();
+        // 1 is init, which is neither this process nor an Xwayland — a stand-in for the app.
+        assert_eq!(app_pids(&[me, 1], me), vec![1]);
+        assert!(
+            app_pids(&[me], me).is_empty(),
+            "a tree holding only the compositor has no app to wait on"
+        );
+    }
+
+    #[test]
+    fn a_sway_rect_becomes_window_geometry() {
+        let g = rect_to_geom(&crate::swayipc::Rect {
+            x: 12,
+            y: 34,
+            width: 300,
+            height: 200,
+        });
+        assert_eq!((g.x, g.y, g.width, g.height), (12, 34, 300, 200));
+    }
+
+    /// sway reports an i32 rect. A negative extent is not a window one pixel wide the wrong way
+    /// round; it clamps to nothing.
+    #[test]
+    fn a_negative_extent_clamps_to_zero() {
+        let g = rect_to_geom(&crate::swayipc::Rect {
+            x: -5,
+            y: -6,
+            width: -1,
+            height: -2,
+        });
+        assert_eq!((g.x, g.y, g.width, g.height), (-5, -6, 0, 0));
+    }
+
+    /// Ids are minted once per toplevel and handed back on every later sighting: a caller that
+    /// selected a window by id must still reach the same window after the next enumeration.
+    #[test]
+    fn a_window_id_is_minted_once_and_reused() {
+        let mut ids = HashMap::new();
+        let mut next = 0u64;
+        let first = mint_id(&mut ids, &mut next, "ftid-a");
+        let second = mint_id(&mut ids, &mut next, "ftid-b");
+        assert_ne!(first, second, "different toplevels get different ids");
+        assert_eq!(mint_id(&mut ids, &mut next, "ftid-a"), first, "stable");
+        assert_eq!(next, 2, "re-fetching must not consume an id");
+    }
+
+    /// sway's own socket sits in the same directory as its IPC socket and the lock file.
+    #[test]
+    fn the_wayland_socket_is_picked_out_of_the_runtime_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for decoy in ["wayland-1.lock", "sway-ipc.1000.9.sock", "wayland-"] {
+            std::fs::write(dir.path().join(decoy), b"").expect("decoy");
+        }
+        let real = dir.path().join("wayland-1");
+        std::fs::write(&real, b"").expect("socket");
+        assert_eq!(find_wayland_socket(dir.path()), Some(real));
+    }
+
+    #[test]
+    fn a_runtime_dir_with_no_wayland_socket_finds_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sway-ipc.1000.9.sock"), b"").expect("decoy");
+        assert_eq!(find_wayland_socket(dir.path()), None);
+    }
+
+    /// The XKB real-modifier bits, in the order `include "complete"` assigns them. Each is a
+    /// distinct bit: an `&`/`^` fold or a shift the wrong way would collapse or move them.
+    #[test]
+    fn each_modifier_is_its_own_xkb_bit() {
+        use glass_core::keys::Modifier;
+        assert_eq!(modifier_mask(&[]), 0);
+        assert_eq!(modifier_mask(&[Modifier::Shift]), 0b1);
+        assert_eq!(modifier_mask(&[Modifier::Control]), 0b100);
+        assert_eq!(modifier_mask(&[Modifier::Alt]), 0b1000);
+        assert_eq!(modifier_mask(&[Modifier::Super]), 0b100_0000);
+        assert_eq!(
+            modifier_mask(&[Modifier::Shift, Modifier::Control, Modifier::Super]),
+            0b100_0101,
+            "a chord's modifiers are the union of their bits"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    //! The backend against a real compositor. Every method below talks to sway or to the wayland
+    //! connection, so there is nothing underneath them to fake; [`crate::testw`] launches a
+    //! private session and observes it over a connection the backend does not own.
+    use super::*;
+    use crate::testw::{Launch, READY_LINE};
+
+    #[test]
+    fn a_launch_reports_the_window_the_app_actually_mapped() {
+        let mut s = Launch::new().windows(&["solo:solo:300x200"]).start();
+        let geo = s.platform().window(&WindowOp::Geometry).expect("geometry");
+        let wins = s.windows();
+        assert_eq!(wins.len(), 1);
+        let rect = &wins[0].rect;
+        assert_eq!(
+            (geo.width, geo.height),
+            (rect.width as u32, rect.height as u32),
+            "the session contract must match what sway reports"
+        );
+        assert_eq!((geo.width, geo.height), (300, 200));
+    }
+
+    #[test]
+    fn enumeration_reports_every_window_with_a_stable_id() {
+        let mut s = Launch::new()
+            .windows(&["one:app-one:200x100", "two:app-two:150x120"])
+            .start();
+        s.until("both windows to map", |s| s.windows().len() == 2);
+        let first = s.platform().list_windows().expect("list");
+        assert_eq!(first.len(), 2);
+        let titles: Vec<&str> = first.iter().filter_map(|w| w.title.as_deref()).collect();
+        assert!(
+            titles.contains(&"one") && titles.contains(&"two"),
+            "{titles:?}"
+        );
+        assert_eq!(
+            first.iter().filter(|w| w.active).count(),
+            1,
+            "exactly one window is focused"
+        );
+        let again = s.platform().list_windows().expect("list again");
+        let ids = |ws: &[WindowInfo]| {
+            let mut v: Vec<(u64, Option<String>)> =
+                ws.iter().map(|w| (w.id.0, w.title.clone())).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids(&first), ids(&again), "ids must survive re-enumeration");
+    }
+
+    #[test]
+    fn selecting_a_window_focuses_it_and_reports_its_geometry() {
+        let mut s = Launch::new()
+            .windows(&["one:app-one:200x100", "two:app-two:150x120"])
+            .start();
+        s.until("both windows to map", |s| s.windows().len() == 2);
+        let wins = s.platform().list_windows().expect("list");
+        let target = wins
+            .iter()
+            .find(|w| !w.active)
+            .expect("one window is not focused");
+        let geo = s.platform().select_window(target.id).expect("select");
+        assert_eq!(geo, target.geometry);
+        assert_eq!(
+            s.focused_title().as_deref(),
+            target.title.as_deref(),
+            "the compositor must actually have moved focus"
+        );
+    }
+
+    #[test]
+    fn selecting_a_window_that_is_not_there_reports_it_not_found() {
+        let mut s = Launch::new().start();
+        let err = s
+            .platform()
+            .select_window(WindowId(4242))
+            .expect_err("no such window");
+        assert!(matches!(err, GlassError::WindowNotFound), "{err}");
+    }
+
+    #[test]
+    fn moving_and_resizing_change_what_the_compositor_reports() {
+        let mut s = Launch::new().start();
+        let resized = s
+            .platform()
+            .window(&WindowOp::Resize {
+                width: 260,
+                height: 180,
+            })
+            .expect("resize");
+        assert_eq!((resized.width, resized.height), (260, 180));
+        let moved = s
+            .platform()
+            .window(&WindowOp::Move { x: 40, y: 30 })
+            .expect("move");
+        assert_eq!((moved.x, moved.y), (40, 30));
+        let observed = s.windows();
+        let rect = &observed[0].rect;
+        assert_eq!(
+            (rect.x, rect.y, rect.width, rect.height),
+            (40, 30, 260, 180),
+            "the reported geometry must be the compositor's, not glass's own idea of it"
+        );
+    }
+
+    /// Logs are the app's stdout and stderr as the launch captured them, not the compositor's.
+    #[test]
+    fn the_apps_output_reaches_the_log_sink() {
+        let mut s = Launch::new().start();
+        let lines = s.wait_for_log(READY_LINE);
+        assert!(lines.iter().any(|l| l.contains(READY_LINE)), "{lines:#?}");
+    }
+
+    /// The a11y reader correlates an AT-SPI connection against this set, so it has to reach past
+    /// the compositor to the app: sway's pid is not the app's.
+    #[test]
+    fn the_process_set_reaches_past_the_compositor_to_the_app() {
+        let mut s = Launch::new().start();
+        let pids = s.platform().app_pids();
+        assert!(
+            pids.len() >= 2,
+            "the compositor alone is not the app's process set: {pids:?}"
+        );
+        assert!(pids.iter().all(|p| *p > 1), "no placeholder pids: {pids:?}");
+    }
+
+    /// No a11y bus was asked for, so there is no address to hand out. Inventing one would send
+    /// the reader at the user's own desktop bus.
+    #[test]
+    fn a_session_launched_without_accessibility_has_no_bus_address() {
+        let mut s = Launch::new().start();
+        assert_eq!(s.platform().a11y_bus_addr(), None);
+    }
+
+    /// Coordinates are window-relative at glass's boundary and the backend maps them to the
+    /// output. The app is the only witness: Wayland has no way to ask where the pointer is, so
+    /// the fixture echoes the surface-local point it was given back through its own stdout.
+    #[test]
+    fn a_pointer_move_arrives_at_the_requested_window_relative_point() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        s.platform()
+            .send_pointer(&PointerEvent::Move { x: 40, y: 30 })
+            .expect("move");
+        let lines = s.wait_for_log("input: ");
+        assert!(
+            lines.iter().any(|l| l.ends_with("40 30")),
+            "the app should have been pointed at its own (40, 30): {lines:#?}"
+        );
+    }
+
+    /// A window away from the output origin is the case an origin mix-up survives: with the
+    /// window at (0, 0) a window-relative and an output-absolute point are the same number.
+    #[test]
+    fn a_pointer_move_is_relative_to_a_window_that_is_not_at_the_origin() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        s.platform()
+            .window(&WindowOp::Move { x: 100, y: 80 })
+            .expect("move the window");
+        s.platform()
+            .send_pointer(&PointerEvent::Move { x: 25, y: 15 })
+            .expect("move the pointer");
+        let lines = s.wait_for_log("input: ");
+        assert!(
+            lines.iter().any(|l| l.ends_with("25 15")),
+            "the point must be relative to the window, not the output: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_click_presses_and_releases_the_button_over_the_window() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        s.platform()
+            .send_pointer(&PointerEvent::Click {
+                x: 20,
+                y: 20,
+                button: glass_core::MouseButton::Left,
+                count: 1,
+                modifiers: vec![],
+            })
+            .expect("click");
+        let lines = s.wait_for_log("input: button");
+        let buttons: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("input: button"))
+            .collect();
+        assert!(
+            buttons.iter().any(|l| l.contains("272 1")),
+            "left button pressed: {buttons:?}"
+        );
+        assert!(
+            buttons.iter().any(|l| l.contains("272 0")),
+            "and released: {buttons:?}"
+        );
+    }
+
+    #[test]
+    fn a_scroll_reaches_the_window_as_an_axis_event() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        s.platform()
+            .send_pointer(&PointerEvent::Scroll {
+                x: 20,
+                y: 20,
+                dx: 0,
+                dy: -2,
+                modifiers: vec![],
+            })
+            .expect("scroll");
+        let lines = s.wait_for_log("input: axis");
+        assert!(
+            lines.iter().any(|l| l.contains("input: axis 0 ")),
+            "a vertical wheel: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_gesture_is_refused_by_this_backend() {
+        let mut s = Launch::new().start();
+        let err = s
+            .platform()
+            .send_pointer(&PointerEvent::Gesture {
+                pointers: vec![],
+                duration_ms: 10,
+            })
+            .expect_err("no multi-touch on a desktop compositor");
+        assert!(err.to_string().contains("multi_touch"), "{err}");
+    }
+
+    #[test]
+    fn typed_text_reaches_the_window_as_key_events() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        s.platform()
+            .send_key(&KeyEvent::Text("hi".into()))
+            .expect("type");
+        let lines = s.wait_for_log("input: key");
+        let presses = lines.iter().filter(|l| l.ends_with(" 1")).count();
+        assert!(presses >= 2, "one press per character: {lines:#?}");
+    }
+
+    #[test]
+    fn a_chord_holds_its_modifier_across_the_key() {
+        let mut s = Launch::new().start();
+        s.wait_for_log(READY_LINE);
+        s.platform()
+            .send_key(&KeyEvent::Chord("ctrl+a".into()))
+            .expect("chord");
+        let lines = s.wait_for_log("input: key");
+        assert!(
+            lines.iter().any(|l| l.contains("input: mods 4")),
+            "control held (XKB bit 2): {lines:#?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("input: key")), "{lines:#?}");
+    }
+
+    /// The fixture fills its surface with one known colour, so the capture can be checked pixel
+    /// for pixel rather than only for its dimensions.
+    #[test]
+    fn a_capture_reads_the_active_windows_own_pixels() {
+        let mut s = Launch::new().windows(&["cap:cap:200x160"]).start();
+        s.wait_for_log(READY_LINE);
+        let frame = s.platform().capture_frame(None).expect("capture");
+        assert_eq!((frame.width, frame.height), (200, 160));
+        let px = &frame.pixels[..4];
+        assert_eq!(
+            (px[0], px[1], px[2]),
+            (0x33, 0x11, 0x22),
+            "the window's own fill colour, not the compositor's background"
+        );
+        assert_eq!(px[3], 255, "opaque");
+    }
+
+    /// A region is window-relative too, and it is cropped at the source: the compositor is asked
+    /// for exactly that rectangle of the output.
+    #[test]
+    fn a_capture_region_is_relative_to_the_window() {
+        let mut s = Launch::new().windows(&["cap:cap:200x160"]).start();
+        s.wait_for_log(READY_LINE);
+        s.platform()
+            .window(&WindowOp::Move { x: 60, y: 40 })
+            .expect("move");
+        let frame = s
+            .platform()
+            .capture_frame(Some(&Region {
+                x: 10,
+                y: 10,
+                width: 50,
+                height: 40,
+            }))
+            .expect("capture");
+        assert_eq!((frame.width, frame.height), (50, 40));
+        let px = &frame.pixels[..4];
+        assert_eq!(
+            (px[0], px[1], px[2]),
+            (0x33, 0x11, 0x22),
+            "10px into a moved window is still inside it"
+        );
+    }
+
+    #[test]
+    fn the_clipboard_round_trips_through_the_compositor() {
+        let mut s = Launch::new().start();
+        s.platform().set_clipboard("glass wayland").expect("set");
+        assert_eq!(s.platform().get_clipboard().expect("get"), "glass wayland");
+    }
+
+    /// A second write replaces the first. The owner is a live thread serving the selection, so a
+    /// re-set that started a second owner without stopping the first would race.
+    #[test]
+    fn writing_the_clipboard_twice_leaves_the_second_value() {
+        let mut s = Launch::new().start();
+        s.platform().set_clipboard("first").expect("set");
+        s.platform().set_clipboard("second").expect("re-set");
+        assert_eq!(s.platform().get_clipboard().expect("get"), "second");
+    }
+
+    #[test]
+    fn a_session_with_nothing_on_the_clipboard_reads_empty() {
+        let mut s = Launch::new().start();
+        assert_eq!(s.platform().get_clipboard().expect("get"), "");
+    }
+
+    /// Stopping ends the session: what follows has no compositor to talk to and must say so
+    /// rather than answering from whatever the backend last saw.
+    #[test]
+    fn stopping_ends_the_session() {
+        let mut s = Launch::new().start();
+        s.platform().stop_app().expect("stop");
+        let err = s.platform().list_windows().expect_err("no session");
+        assert!(matches!(err, GlassError::NoActiveSession), "{err}");
+    }
+
+    /// An app with no shutdown path still has to be gone afterwards: the ask is followed by a
+    /// signal, and the reap covers the compositor's whole group.
+    #[test]
+    fn an_app_that_ignores_the_close_request_is_still_reaped() {
+        let mut s = Launch::new().ignoring_close().start();
+        let pids = s.platform().app_pids();
+        assert!(!pids.is_empty());
+        s.platform().stop_app().expect("stop");
+        assert!(
+            !glass_proc_linux::any_alive(&pids),
+            "the launch outlived its teardown: {pids:?}"
+        );
     }
 }
 
