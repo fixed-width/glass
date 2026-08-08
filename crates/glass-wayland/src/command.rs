@@ -121,6 +121,36 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
     )
 }
 
+/// Ask the kernel to signal the compositor if the process that launched it dies — this crate's
+/// own unit tests only.
+///
+/// Those tests are run under `cargo mutants`, which SIGKILLs the test process when a mutant
+/// exceeds its timeout. Sixteen mutations here remove a *bound* (a discovery deadline, a
+/// screencopy event arm, `Drop`), so the run hangs holding live sessions and no teardown ever
+/// runs. Each orphaned compositor keeps an X display number, and once 33 are gone no session can
+/// start Xwayland at all — later mutants then fail for an environmental reason and are graded on
+/// it. One sweep left 608 of them.
+///
+/// **Not production behaviour, deliberately.** `PR_SET_PDEATHSIG` is scoped to the *thread* that
+/// forked, not the process. glass-mcp launches from a pooled `spawn_blocking` thread that retires
+/// while the session is still in use, which would tear down a working session. The signal is TERM
+/// rather than KILL so sway still removes its sockets and reaps its own Xwayland and client.
+#[cfg(test)]
+fn die_with_launcher(cmd: &mut Command) {
+    // SAFETY: the closure runs in the forked child before exec. `prctl` is a bare syscall — it
+    // allocates nothing and takes no lock, so it is safe in that window.
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(|| {
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))
+                .map_err(std::io::Error::from)
+        });
+    }
+}
+
+#[cfg(not(test))]
+fn die_with_launcher(_: &mut Command) {}
+
 /// Single-quote a string for a `/bin/sh` command line (escape embedded quotes).
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -142,6 +172,7 @@ pub fn build_sway_command(
     // it spawns (Xwayland + the exec'd app) can be torn down as a group on stop;
     // a bare SIGKILL of just the sway pid would orphan those children.
     cmd.process_group(0);
+    die_with_launcher(&mut cmd);
     cmd.arg("--unsupported-gpu");
     cmd.arg("-c").arg(config);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
