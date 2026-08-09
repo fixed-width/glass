@@ -103,6 +103,10 @@ const VERIFY_SETTLE: Duration = Duration::from_millis(300);
 /// confirms on the first attempt and pays for one describe; the retries cover a field that commits a
 /// frame or two later.
 const VERIFY_ATTEMPTS: usize = 3;
+const _: () = assert!(
+    VERIFY_ATTEMPTS > 0,
+    "set_value reports the last read-back, so there must be one"
+);
 
 /// Judge a typed `set_value` from a tree described after it. `Ok(())` only when the field holds
 /// exactly what was asked for, or — for a named field — reads back empty after a clear.
@@ -210,7 +214,13 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     if landed {
         Ok(())
     } else {
-        Err(GlassError::AxValueNotApplied(target.id.0))
+        // The mapper drops an empty value, so an empty field arrives as `None` — which the verdict
+        // reserves for a reading nobody took.
+        Err(GlassError::value_not_applied(
+            target.id.0,
+            text,
+            Some(node.value.as_deref().unwrap_or("")),
+        ))
     }
 }
 
@@ -307,11 +317,13 @@ impl Accessibility for IosA11y {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later describe: drift and truncation
                 // are structural, so re-describing for them reaches the same answer more slowly.
-                Err(e @ GlassError::AxValueNotApplied(_)) => last = Some(e),
+                Err(e @ GlassError::AxValueNotApplied { .. }) => last = Some(e),
                 Err(e) => return Err(e),
             }
         }
-        Err(last.unwrap_or(GlassError::AxValueNotApplied(target.id.0)))
+        // The const assert on `VERIFY_ATTEMPTS` is what makes `last` always set; the fallback only
+        // avoids an unwrap.
+        Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
     }
 }
 
@@ -394,6 +406,23 @@ mod tests {
         }
     }
 
+    /// Pin the whole verdict, not the variant: the two values it names are what a caller acts on
+    /// (glass#363). Twin of the helper in `glass-android/src/a11y.rs`.
+    #[track_caller]
+    fn assert_not_applied(outcome: Result<()>, id: u32, requested: &str, observed: Option<&str>) {
+        match outcome {
+            Err(GlassError::AxValueNotApplied {
+                id: got_id,
+                requested: req,
+                observed: obs,
+            }) => assert_eq!(
+                (got_id, req.as_str(), obs.as_deref()),
+                (id, requested, observed)
+            ),
+            other => panic!("expected a not-applied verdict, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_write_that_landed_is_reported_as_success() {
         let after = tree_with_value(Some("world"));
@@ -414,10 +443,12 @@ mod tests {
         // the clear can itself change a field that reformats on focus, and accepting that would
         // confirm a clear whose delete never fired.
         let after = tree_with_value(Some("Search settings"));
-        assert!(matches!(
+        assert_not_applied(
             verify_write(&after, &matching_target(), ""),
-            Err(GlassError::AxValueNotApplied(_))
-        ));
+            1,
+            "",
+            Some("Search settings"),
+        );
     }
 
     #[test]
@@ -439,10 +470,40 @@ mod tests {
     #[test]
     fn a_field_that_never_changed_is_not_a_successful_write() {
         let after = tree_with_value(Some("hello"));
-        assert!(matches!(
+        assert_not_applied(
             verify_write(&after, &matching_target(), "world"),
-            Err(GlassError::AxValueNotApplied(1))
-        ));
+            1,
+            "world",
+            Some("hello"),
+        );
+    }
+
+    #[test]
+    fn an_autocapitalized_first_letter_is_not_a_successful_write() {
+        // glass#363: iOS applies sentence autocapitalization to a value typed into a field it
+        // considers empty, so every keystroke lands and the field holds the request with its first
+        // letter uppercased. Do not relax the match to ignore case — that reports a write as landed
+        // while the field holds different bytes.
+        let after = tree_with_value(Some("Glasssmoke3"));
+        assert_not_applied(
+            verify_write(&after, &matching_target(), "glasssmoke3"),
+            1,
+            "glasssmoke3",
+            Some("Glasssmoke3"),
+        );
+    }
+
+    #[test]
+    fn an_empty_field_reports_an_empty_read_back_not_a_missing_one() {
+        // `axmap` drops an empty value, so an emptied field arrives as `None` — which must still
+        // report as empty, not as a reading nobody took.
+        let after = tree_with_value(None);
+        assert_not_applied(
+            verify_write(&after, &matching_target(), "world"),
+            1,
+            "world",
+            Some(""),
+        );
     }
 
     #[test]
@@ -450,10 +511,12 @@ mod tests {
         // A dropped keystroke: differs from the old value, so "changed from before" would have
         // called it success.
         let after = tree_with_value(Some("worl"));
-        assert!(matches!(
+        assert_not_applied(
             verify_write(&after, &matching_target(), "world"),
-            Err(GlassError::AxValueNotApplied(1))
-        ));
+            1,
+            "world",
+            Some("worl"),
+        );
     }
 
     #[test]
@@ -466,10 +529,12 @@ mod tests {
         moved.value = Some("hello".into());
         root_field.children.push(moved);
         let after = tree_with(vec![root_field]);
-        assert!(matches!(
+        assert_not_applied(
             verify_write(&after, &matching_target(), "world"),
-            Err(GlassError::AxValueNotApplied(1))
-        ));
+            1,
+            "world",
+            Some("hello"),
+        );
     }
 
     #[test]

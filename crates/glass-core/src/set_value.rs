@@ -64,8 +64,8 @@ pub fn read_back_confirms(read_back: Option<&str>, before: Option<&str>, request
 ///
 /// The cost of the strictness: a field that reformats what it is given (a phone number becoming
 /// `"(123) 456-7890"`) reports the write as not applied even though it landed. That is the safer
-/// direction — an agent can re-read the tree and see the value, whereas a false success has it
-/// asserting against a screen that never changed.
+/// direction — [`crate::GlassError::AxValueNotApplied`] names the value it holds, whereas a false
+/// success has an agent asserting against a screen that never changed.
 ///
 /// Not for a clear: see [`typed_clear_landed`].
 pub fn typed_text_landed(read_back: Option<&str>, requested: &str) -> bool {
@@ -80,8 +80,9 @@ pub fn typed_text_landed(read_back: Option<&str>, requested: &str) -> bool {
 ///
 /// The cost is a false *failure*: on the dogfood AVD an emptied `EditText` reports its placeholder as
 /// its text (`text="Search settings"`, and `uiautomator` exposes no separate hint attribute), so a
-/// clear that worked reads as not applied. An agent can read the element and see the placeholder; the
-/// other direction would have it believing an unchanged field was cleared.
+/// clear that worked reads as not applied. [`crate::GlassError::AxValueNotApplied`] names the
+/// placeholder it read back; the other direction would have an agent believing an unchanged field
+/// was cleared.
 pub fn typed_clear_landed(read_back: Option<&str>) -> bool {
     read_back.unwrap_or("").is_empty()
 }

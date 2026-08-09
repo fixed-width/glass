@@ -16,6 +16,17 @@ pub enum BoundKind {
     NotStarted,
 }
 
+/// Render a read-back for [`GlassError::AxValueNotApplied`] as the clause following "the element".
+///
+/// `None` is not an empty element — that reads back as `Some("")` — it is no reading at all: the
+/// platform's read failed, or nothing matching the element was found.
+fn render_observed(observed: &Option<String>) -> String {
+    match observed {
+        Some(v) => format!("holds {v:?}"),
+        None => "could not be read back".to_string(),
+    }
+}
+
 /// All fallible glass-core operations return this error.
 ///
 /// Variants map to the actionable error kinds the MCP layer surfaces to the
@@ -143,13 +154,28 @@ pub enum GlassError {
     )]
     AxWriteUnconfirmed(u32, String),
 
+    /// A dispatched write whose read-back does not hold the request.
+    ///
+    /// Carries both values because three outcomes look alike from the id alone: the element
+    /// transformed the write and holds it in another form (writing again changes nothing), it holds
+    /// part of the request (a keystroke was dropped, so writing again is the fix), or it holds what
+    /// it held before (the write never arrived). Build it with [`GlassError::value_not_applied`].
     #[error(
-        "set_value on element #{0} did not take — the element does not hold the requested value. On \
-         a desktop backend this usually means a read-only accessibility projection, so try \
-         keystrokes; on Android or the iOS Simulator the write already IS keystrokes, so the tap may \
-         have missed or the field rejected the input — re-snapshot to see what it holds"
+        "set_value on element #{id} did not take — asked for {requested:?}, the element {}. \
+         Holding the request in another form means the element transformed it, and writing again \
+         will not change that. Holding part of it, or none of it, means the write did not arrive: \
+         on a desktop backend the value is often a read-only projection, so focus the element and \
+         type into it instead; on Android or the iOS Simulator the tap may have missed, so write \
+         again",
+        render_observed(.observed)
     )]
-    AxValueNotApplied(u32),
+    AxValueNotApplied {
+        id: u32,
+        requested: String,
+        /// What the element reads as now: the text for a field — `Some("")` when it is empty — or
+        /// `"on"` / `"off"` for a boolean control. `None` only when no reading was obtained.
+        observed: Option<String>,
+    },
 
     #[error("element #{0} exposes no native activation action")]
     AxActionUnavailable(u32),
@@ -268,8 +294,21 @@ impl GlassError {
     pub fn set_value_failed_after_writing(&self) -> bool {
         matches!(
             self,
-            GlassError::AxValueNotApplied(_) | GlassError::AxWriteUnconfirmed(..)
+            GlassError::AxValueNotApplied { .. } | GlassError::AxWriteUnconfirmed(..)
         )
+    }
+
+    /// The verdict for a write that dispatched and whose read-back does not hold the request.
+    ///
+    /// Pass the value the verification already read: one taken afterwards can catch a value that
+    /// arrived late and contradict the verdict it explains. A backend whose mapper drops an empty
+    /// value must pass `Some("")` rather than `None`, which says no reading was obtained.
+    pub fn value_not_applied(id: u32, requested: &str, observed: Option<&str>) -> GlassError {
+        GlassError::AxValueNotApplied {
+            id,
+            requested: requested.to_string(),
+            observed: observed.map(str::to_string),
+        }
     }
 
     /// Which of glass's own bounds ended this call, if one did rather than the tool answering.
@@ -539,9 +578,40 @@ mod tests {
     }
 
     #[test]
+    fn a_write_that_did_not_take_names_both_the_request_and_the_read_back() {
+        // glass#363: an iOS field that autocapitalized the first letter took every keystroke. Each
+        // value is asserted with the label that binds it — "contains both" also passes a message
+        // that swapped them, which is the inverted diagnosis.
+        let msg = GlassError::value_not_applied(13, "glasssmoke3", Some("Glasssmoke3")).to_string();
+        assert!(msg.contains("element #13"), "{msg}");
+        assert!(msg.contains("asked for \"glasssmoke3\""), "{msg}");
+        assert!(msg.contains("holds \"Glasssmoke3\""), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_read_back_renders_as_an_empty_value() {
+        // An empty read-back says the write arrived and left nothing — not the same answer as no
+        // reading at all.
+        let msg = GlassError::value_not_applied(13, "hello", Some("")).to_string();
+        assert!(msg.contains("holds \"\""), "{msg}");
+    }
+
+    #[test]
+    fn a_reading_nobody_took_does_not_render_as_a_value() {
+        // `None` is a failed platform read or an element not found; rendering it as `""`, or as
+        // "holds no value", states something about the element that nobody observed.
+        let msg = GlassError::value_not_applied(13, "hello", None).to_string();
+        assert!(msg.contains("could not be read back"), "{msg}");
+        assert!(!msg.contains("holds"), "{msg}");
+    }
+
+    #[test]
     fn only_a_proven_post_dispatch_verdict_invalidates_the_captured_value() {
         // The read-back verdict is reached only after the write went out.
-        assert!(GlassError::AxValueNotApplied(3).set_value_failed_after_writing());
+        assert!(
+            GlassError::value_not_applied(3, "world", Some("hello"))
+                .set_value_failed_after_writing()
+        );
         // Everything else keeps the captured value: the pre-dispatch rejections, the transport
         // errors raised on either side of the dispatch, and any variant not named (the wildcard).
         for e in [

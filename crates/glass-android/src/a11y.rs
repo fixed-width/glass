@@ -404,7 +404,13 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     if landed {
         Ok(())
     } else {
-        Err(GlassError::AxValueNotApplied(target.id.0))
+        // The mapper drops an empty value, so an empty field arrives as `None` — which the verdict
+        // reserves for a reading nobody took.
+        Err(GlassError::value_not_applied(
+            target.id.0,
+            text,
+            Some(node.value.as_deref().unwrap_or("")),
+        ))
     }
 }
 
@@ -422,6 +428,10 @@ fn read_back_failed(target: &AxTarget, e: &GlassError) -> GlassError {
 /// frame or two later — a Compose recompose, a debounced handler — which the on-device service
 /// reader polls two whole seconds for.
 const VERIFY_ATTEMPTS: usize = 3;
+const _: () = assert!(
+    VERIFY_ATTEMPTS > 0,
+    "set_value reports the last read-back, so there must be one"
+);
 
 /// How long to let the toolkit commit typed text before reading it back. Generous relative to a
 /// keystroke and small next to the `uiautomator dump` that follows it.
@@ -705,14 +715,16 @@ impl Accessibility for AndroidA11y {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later read: drift and truncation are
                 // structural, and re-dumping for them costs seconds to reach the same answer.
-                Err(e @ GlassError::AxValueNotApplied(_)) => last = Some(e),
+                Err(e @ GlassError::AxValueNotApplied { .. }) => last = Some(e),
                 Err(e) => return Err(e),
             }
             if Instant::now() >= phase_ends {
                 break;
             }
         }
-        Err(last.unwrap_or(GlassError::AxValueNotApplied(target.id.0)))
+        // The const assert on `VERIFY_ATTEMPTS` is what makes `last` always set; the fallback only
+        // avoids an unwrap.
+        Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
     }
 }
 
@@ -1942,6 +1954,23 @@ mod tests {
         assert!(verify_write(&after, &t, "").is_ok());
     }
 
+    /// Pin the whole verdict, not the variant: the two values it names are what a caller acts on
+    /// (glass#363). Twin of the helper in `glass-ios/src/a11y.rs`.
+    #[track_caller]
+    fn assert_not_applied(outcome: Result<()>, id: u32, requested: &str, observed: Option<&str>) {
+        match outcome {
+            Err(GlassError::AxValueNotApplied {
+                id: got_id,
+                requested: req,
+                observed: obs,
+            }) => assert_eq!(
+                (got_id, req.as_str(), obs.as_deref()),
+                (id, requested, observed)
+            ),
+            other => panic!("expected a not-applied verdict, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_cleared_field_reporting_its_hint_reads_as_not_applied() {
         // The cost of judging a clear by "reads back empty", pinned as a decision: this device does
@@ -1950,10 +1979,7 @@ mod tests {
         // takes focus, which is the false success this check exists to prevent.
         let after = tree_holding(Some("Search settings"));
         let t = target(0, Some("Search"), Some(BOUNDS));
-        assert!(matches!(
-            verify_write(&after, &t, ""),
-            Err(GlassError::AxValueNotApplied(0))
-        ));
+        assert_not_applied(verify_write(&after, &t, ""), 0, "", Some("Search settings"));
     }
 
     #[test]
@@ -1961,10 +1987,16 @@ mod tests {
         // The case `verify_write`'s doc is about: the field still holds the old text.
         let after = tree_holding(Some("hello"));
         let t = target(0, Some("Search"), Some(BOUNDS));
-        assert!(matches!(
-            verify_write(&after, &t, "world"),
-            Err(GlassError::AxValueNotApplied(0))
-        ));
+        assert_not_applied(verify_write(&after, &t, "world"), 0, "world", Some("hello"));
+    }
+
+    #[test]
+    fn an_empty_field_reports_an_empty_read_back_not_a_missing_one() {
+        // `axmap` drops an empty value, so an emptied field arrives as `None` — which must still
+        // report as empty, not as a reading nobody took.
+        let after = tree_holding(None);
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert_not_applied(verify_write(&after, &t, "world"), 0, "world", Some(""));
     }
 
     #[test]
@@ -1972,10 +2004,7 @@ mod tests {
         // The reason the rule is an exact match; `typed_text_landed` carries the argument.
         let after = tree_holding(Some("worl"));
         let t = target(0, Some("Search"), Some(BOUNDS));
-        assert!(matches!(
-            verify_write(&after, &t, "world"),
-            Err(GlassError::AxValueNotApplied(0))
-        ));
+        assert_not_applied(verify_write(&after, &t, "world"), 0, "world", Some("worl"));
     }
 
     #[test]
@@ -1985,10 +2014,12 @@ mod tests {
         // tree and see the value; a false success would have it asserting against the wrong text.
         let after = tree_holding(Some("(123) 456-7890"));
         let t = target(0, Some("Search"), Some(BOUNDS));
-        assert!(matches!(
+        assert_not_applied(
             verify_write(&after, &t, "1234567890"),
-            Err(GlassError::AxValueNotApplied(0))
-        ));
+            0,
+            "1234567890",
+            Some("(123) 456-7890"),
+        );
     }
 
     #[test]
@@ -2006,10 +2037,7 @@ mod tests {
         // Re-finding must not weaken the value check: the field is found, and holds the wrong text.
         let after = under_a_container(tree_holding(Some("worl")));
         let t = target(0, Some("Search"), Some(BOUNDS));
-        assert!(matches!(
-            verify_write(&after, &t, "world"),
-            Err(GlassError::AxValueNotApplied(0))
-        ));
+        assert_not_applied(verify_write(&after, &t, "world"), 0, "world", Some("worl"));
     }
 
     #[test]
@@ -2409,7 +2437,66 @@ mod tests {
         let err = reader
             .set_value(&ctx, &field, "world")
             .expect_err("a field still holding the old text has not taken the write");
-        assert!(matches!(err, GlassError::AxValueNotApplied(1)), "{err}");
+        assert!(
+            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed }
+                if requested == "world" && observed.as_deref() == Some("hello")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_verdict_names_the_last_read_back_not_the_first() {
+        // The retries can disagree — a read caught mid-write, then the value the field settled on
+        // — and reporting the first calls a transformed write a lost one.
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        // Three reads, in order: the pre-write locate, then the two verify attempts that disagree.
+        let locate = Answer::says(one_field_holding("old"));
+        let mid = Answer::says(one_field_holding("hel"));
+        let settled = Answer::says(one_field_holding("Hello"));
+        let fake = FakeAdb::scripted(&[
+            ("*shell cat*", vec![&locate, &mid, &settled]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+        let ctx = AxContext {
+            pids: vec![],
+            window: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 2400,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::from_millis(30_000),
+        };
+        let field = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: Some(AxRect {
+                x: 100,
+                y: 200,
+                width: 400,
+                height: 100,
+            }),
+            value: None,
+        };
+
+        let err = reader
+            .set_value(&ctx, &field, "hello")
+            .expect_err("neither read holds the requested text");
+        assert!(
+            matches!(&err, GlassError::AxValueNotApplied { observed, .. }
+                if observed.as_deref() == Some("Hello")),
+            "{err}"
+        );
     }
 
     #[test]

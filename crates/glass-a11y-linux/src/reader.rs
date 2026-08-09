@@ -256,7 +256,7 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
         if matches!(role, CheckBox | ToggleButton | RadioButton)
             && let Some(on) = parse_bool(text)
         {
-            return set_toggle(&conn, &node, role, on, target.id.0).await;
+            return set_toggle(&conn, &node, role, on, text, target.id.0).await;
         }
     }
 
@@ -594,7 +594,8 @@ const TOGGLE_VERIFY_POLLS: usize = 6;
 /// See [`TOGGLE_VERIFY_POLLS`].
 const TOGGLE_VERIFY_INTERVAL: Duration = Duration::from_millis(120);
 
-/// Set a boolean widget (switch/checkbox/toggle/radio) to `target_on`. Idempotent:
+/// Set a boolean widget (switch/checkbox/toggle/radio) to `target_on`, as the caller spelled it in
+/// `requested`. Idempotent:
 /// only invokes the toggle action when the boolean state differs, then confirms the
 /// state actually changed (the toolkit applies the action on its next loop) — so a
 /// no-op activation (e.g. a radio can't be *un*-selected by clicking it) is reported
@@ -604,6 +605,7 @@ async fn set_toggle(
     node: &AccessibleProxy<'_>,
     role: glass_core::AxRole,
     target_on: bool,
+    requested: &str,
     id: u32,
 ) -> Result<()> {
     let flag = toggle_state_flag(role);
@@ -623,13 +625,28 @@ async fn set_toggle(
         return Err(GlassError::AxElementNotEditable(id));
     }
     // Poll until the toolkit applies it; a no-op activation never converges.
+    let mut last_on = None;
     for _ in 0..TOGGLE_VERIFY_POLLS {
         tokio::time::sleep(TOGGLE_VERIFY_INTERVAL).await;
-        if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
+        let on = node.get_state().await.map_err(bus_err)?.contains(flag);
+        last_on = Some(on);
+        if on == target_on {
             return Ok(());
         }
     }
-    Err(GlassError::AxValueNotApplied(id))
+    // Report the state the last poll read, not `!target_on` derived from the request — the two
+    // agree only while this equality is the loop's sole exit, and nothing holds that.
+    Err(GlassError::value_not_applied(
+        id,
+        requested,
+        last_on.map(toggle_state_label),
+    ))
+}
+
+/// How a boolean control's state is named in a verdict the caller reads — one spelling, where
+/// `set_value` accepts `true`/`on`/`1` for the request alike.
+fn toggle_state_label(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
 }
 
 /// The one AT-SPI action whose meaning is "flip this control's boolean state" — and so the
@@ -791,6 +808,19 @@ async fn read_value(
 
 fn nonempty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
+}
+
+#[cfg(test)]
+mod toggle_label_tests {
+    use super::toggle_state_label;
+
+    #[test]
+    fn a_control_that_stayed_off_is_reported_as_off() {
+        // Inverted, a failed `set_value("true")` reports the control as already on — the state the
+        // caller asked for, alongside "did not take".
+        assert_eq!(toggle_state_label(false), "off");
+        assert_eq!(toggle_state_label(true), "on");
+    }
 }
 
 #[cfg(test)]

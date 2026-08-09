@@ -449,11 +449,16 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     // a failed post-read nor a failed pre-read can masquerade as a successful change.
     let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
     loop {
-        if read_back_confirms(pat.get_value().ok().as_deref(), before.as_deref(), text) {
+        let after = pat.get_value().ok();
+        if read_back_confirms(after.as_deref(), before.as_deref(), text) {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(GlassError::AxValueNotApplied(target.id.0));
+            return Err(GlassError::value_not_applied(
+                target.id.0,
+                text,
+                after.as_deref(),
+            ));
         }
         std::thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
     }

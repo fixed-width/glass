@@ -553,9 +553,20 @@ Where the platform can write the value directly this is instant and takes no key
 backend (Android without the on-device accessibility service, and the iOS Simulator) it taps the
 element, clears it and types, then reads the element back to confirm — up to three reads, since a
 field may commit a frame or two later. Errors if the element isn't editable, changed since the
-snapshot, does not hold the requested value afterwards, or the app exposes no accessibility tree. A
-field that reformats what it is given, and a cleared field that reports its placeholder as its text,
-both read as not applied even though the text arrived — read the element to see what it holds.
+snapshot, does not hold the requested value afterwards, or the app exposes no accessibility tree.
+
+The does-not-hold error names both values — what you asked for and what the element holds — because
+three outcomes look alike without them. An element that **transformed** the write holds your text in
+another form and writing again will not change that: a field that reformats (`"1234567890"` becoming
+`"(123) 456-7890"`), or one that autocapitalizes (an iOS text field returning `"Hello"` for a typed
+`"hello"`, intermittently — it depends on whether the field had finished emptying when the first key
+arrived). An element holding **part** of your text dropped a keystroke, and writing again is the fix.
+An element holding **what it held before** never received the write: on a desktop backend its value
+is usually a read-only projection, so focus it and use `glass_type` instead.
+
+A cleared field (`text: ""`) that reads back holding its placeholder is the one false failure here —
+the clear landed and the accessibility layer substituted the hint. Confirm it with a screenshot
+rather than writing again.
 
 One error is not a refusal: *the text was typed, but the write could not be confirmed*. The
 keystrokes went out and the read-back afterwards could not establish where they landed — it failed
