@@ -469,6 +469,92 @@ fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
     }
 }
 
+/// Cap on how long the serving thread spends handing one paste to a requesting app. Its own
+/// constant rather than a reuse of [`CLIP_READ_TIMEOUT`]: that bounds an app glass reads from,
+/// this bounds an app glass writes to, and moving one should not move the other.
+// The `Send` handler wiring lands separately; until then only the tests below call this.
+#[cfg_attr(not(test), allow(dead_code))]
+const CLIP_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether a failed write should be retried — nothing was lost and the pipe may take more. A
+/// signal arrived (`Interrupted`), or the pipe filled between the poll and the write
+/// (`WouldBlock`, which non-blocking mode reports instead of parking). `WouldBlock` is retryable
+/// here and not in [`is_retryable`] for exactly that reason: only this side sets `O_NONBLOCK`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_write_retryable(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Write `buf` to `fd`, but give up after `timeout`. The mirror of [`read_to_eof_bounded`] on the
+/// serving side: the receiver is an arbitrary external app, and one that opens the transfer but
+/// never reads blocks this write as soon as `buf` passes the pipe buffer (64 KiB by default).
+/// That block lands on the owner thread inside `dispatch_pending`, so its loop never reaches the
+/// stop check — and `ClipboardOwner::drop` joins a thread that can no longer return.
+///
+/// The fd is made non-blocking first. `POLLOUT` promises only that one byte fits, while a
+/// blocking `write` of more than `PIPE_BUF` waits for the whole payload: polling a blocking fd
+/// would leave the same unbounded wait one syscall further down.
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_all_bounded(fd: OwnedFd, buf: &[u8], timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let flags = rustix::fs::fcntl_getfl(&fd)
+        .map_err(|e| GlassError::Backend(format!("clipboard serve: fcntl_getfl: {e}")))?;
+    rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|e| GlassError::Backend(format!("clipboard serve: fcntl_setfl: {e}")))?;
+
+    let mut file = std::fs::File::from(fd);
+    let total = buf.len();
+    let mut written = 0usize;
+    while written < total {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(GlassError::Timeout(timeout.as_millis() as u64));
+        }
+        let remaining = deadline - now;
+        let ts = rustix::event::Timespec {
+            tv_sec: remaining.as_secs() as i64,
+            tv_nsec: remaining.subsec_nanos() as i64,
+        };
+        // The PollFd borrows `file` only for this statement, freeing it before the write below.
+        let ready = rustix::event::poll(
+            &mut [rustix::event::PollFd::new(
+                &file,
+                rustix::event::PollFlags::OUT,
+            )],
+            Some(&ts),
+        );
+        match ready {
+            Ok(0) => return Err(GlassError::Timeout(timeout.as_millis() as u64)),
+            Ok(_) => match file.write(&buf[written..]) {
+                Ok(0) => {
+                    return Err(GlassError::Backend(format!(
+                        "clipboard serve: paste transfer stalled at {written} of {total} bytes"
+                    )));
+                }
+                Ok(n) => written += n,
+                Err(e) if is_write_retryable(&e) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                    return Err(GlassError::Backend(format!(
+                        "clipboard serve: paste receiver closed the transfer after {written} of {total} bytes"
+                    )));
+                }
+                Err(e) => {
+                    return Err(GlassError::Backend(format!(
+                        "clipboard serve: write pipe: {e} after {written} of {total} bytes"
+                    )));
+                }
+            },
+            // The poll's half of the rule `is_write_retryable` names for the write.
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(GlassError::Backend(format!("clipboard serve: poll: {e}"))),
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // `ClipboardOwner` — serving thread for `set`
 // ---------------------------------------------------------------------------
@@ -736,7 +822,10 @@ fn serve_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{CLIP_READ_TIMEOUT, ClipboardOwner, get, is_retryable, read_to_eof_bounded};
+    use super::{
+        CLIP_READ_TIMEOUT, CLIP_WRITE_TIMEOUT, ClipboardOwner, get, is_retryable,
+        read_to_eof_bounded, write_all_bounded,
+    };
     use crate::testw::Launch;
     use glass_core::GlassError;
     use std::io::Write;
@@ -887,5 +976,55 @@ mod tests {
         // No text representation offered -> None (get short-circuits to an empty string).
         assert_eq!(pick_mime(&list(&["image/png", "text/html"])), None);
         assert_eq!(pick_mime(&[]), None);
+    }
+
+    /// A payload past the pipe buffer cannot be handed over in one `write`. An implementation
+    /// that writes once and trusts the count truncates the paste, and the app pasting has no way
+    /// to tell a short clipboard from a short write.
+    #[test]
+    fn a_bounded_write_delivers_a_payload_larger_than_the_pipe_buffer() {
+        use std::io::Read as _;
+        let (read_end, write_end) = rustix::pipe::pipe().expect("pipe");
+        // 256 KiB — four times the default 64 KiB pipe buffer.
+        let payload = vec![b'x'; 256 * 1024];
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            std::fs::File::from(read_end)
+                .read_to_end(&mut got)
+                .expect("read");
+            got
+        });
+        write_all_bounded(write_end, &payload, Duration::from_secs(10)).expect("write ok");
+        let got = reader.join().expect("reader thread");
+        assert_eq!(got.len(), payload.len(), "every byte reaches the reader");
+        assert!(got == payload, "the bytes that arrive are the bytes sent");
+    }
+
+    /// An app that requests a paste and then stops reading is the case this bound exists for:
+    /// the write blocks once the pipe fills, on the thread whose loop honours the stop flag.
+    #[test]
+    fn a_bounded_write_times_out_when_the_reader_never_reads() {
+        let (read_end, write_end) = rustix::pipe::pipe().expect("pipe");
+        let payload = vec![b'x'; 256 * 1024];
+        let r = write_all_bounded(write_end, &payload, Duration::from_millis(200));
+        assert!(
+            matches!(r, Err(GlassError::Timeout(_))),
+            "expected Timeout, got {r:?}"
+        );
+        // read_end stays alive until here: a closed one would fail as EPIPE, not as a timeout.
+        drop(read_end);
+    }
+
+    /// The common real failure: the app took what it wanted and closed the transfer. Silence here
+    /// leaves a truncated paste indistinguishable from an empty clipboard.
+    #[test]
+    fn a_bounded_write_reports_a_receiver_that_closed_the_transfer() {
+        let (read_end, write_end) = rustix::pipe::pipe().expect("pipe");
+        drop(read_end);
+        let err = write_all_bounded(write_end, b"clip!", CLIP_WRITE_TIMEOUT)
+            .expect_err("a closed receiver is not a delivered paste");
+        let msg = err.to_string();
+        assert!(msg.contains("closed the transfer"), "{msg}");
+        assert!(msg.contains("0 of 5 bytes"), "{msg}");
     }
 }
