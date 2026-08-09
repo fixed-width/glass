@@ -2,7 +2,7 @@
 //! set via a dedicated owner thread that serves `SelectionRequest` events.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
@@ -222,16 +222,33 @@ impl ClipboardOwner {
         let (lock, cvar) = &*ready;
         let result = cvar
             .wait_timeout_while(
-                lock.lock().expect("clipboard ready mutex"),
+                lock.lock().unwrap_or_else(PoisonError::into_inner),
                 Duration::from_secs(2),
                 |s| matches!(s, ReadyState::Pending),
             )
-            .unwrap();
+            // A poisoned lock means the owner thread panicked holding it. The state behind it
+            // still says what happened; panicking here turns a reportable clipboard failure into
+            // a crashed tool call.
+            .unwrap_or_else(PoisonError::into_inner);
 
-        if result.1.timed_out() {
-            // Thread still running but didn't signal in time; stop it.
+        let timed_out = result.1.timed_out();
+
+        if timed_out {
+            // Release the ready lock before touching `handle`: a future signal_ready reachable
+            // from a thread-exit path would otherwise deadlock the join below on this thread.
+            drop(result);
             stop.store(true, Ordering::Relaxed);
-            let _ = handle.join();
+            // Deliberately not joined. Timing out means the thread has not reached the loop that
+            // reads `stop`, so a join waits on the wedged X server with no bound — the hang this
+            // 2 s bound exists to prevent. Detaching is self-cleaning: the setup either fails and
+            // the thread exits, or it completes and the first serving iteration stops.
+            if handle.is_finished() && handle.join().is_err() {
+                // Finished without ever signalling: it panicked during setup. Reporting that as a
+                // timeout would send the reader looking for a slow X server.
+                return Err(GlassError::Backend(
+                    "clipboard set: owner thread panicked during setup".into(),
+                ));
+            }
             return Err(GlassError::Backend(
                 "clipboard set: timed out waiting for selection ownership".into(),
             ));
@@ -281,7 +298,7 @@ impl Drop for ClipboardOwner {
 /// Signal the ready condvar from the owner thread. Helper to reduce repetition.
 fn signal_ready(ready: &Arc<(Mutex<ReadyState>, Condvar)>, state: ReadyState) {
     let (lock, cvar) = &**ready;
-    *lock.lock().expect("clipboard ready mutex") = state;
+    *lock.lock().unwrap_or_else(PoisonError::into_inner) = state;
     cvar.notify_one();
 }
 
@@ -382,6 +399,12 @@ fn owner_thread(
         stop.store(true, Ordering::Relaxed);
         msg
     })?;
+
+    // A detached thread (spawn already timed out and returned to the caller) must not take a
+    // selection the caller has already been told it failed to get.
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
 
     // Take ownership of CLIPBOARD.
     conn.set_selection_owner(win, clipboard, x11rb::CURRENT_TIME)
@@ -639,11 +662,115 @@ mod tests {
         assert_eq!(granted, x11rb::NONE);
     }
 
+    /// A detached setup thread that unwedges after `spawn` already gave up is in exactly this
+    /// state: still running, with `stop` already true. Calling `owner_thread` directly with
+    /// `stop` pre-set reproduces it without needing a server that actually stalls — it must
+    /// stand down before `set_selection_owner`, not take the selection from whatever owner is
+    /// now live.
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn a_stopped_owner_thread_does_not_take_the_selection_from_a_live_owner() {
+        let x = TestX::start();
+        let live =
+            ClipboardOwner::spawn(x.display().to_string(), "mine".to_string()).expect("spawn");
+        assert_eq!(get(x.display()).expect("get"), "mine");
+
+        let text = Arc::new(Mutex::new("stolen".to_string()));
+        let stop = Arc::new(AtomicBool::new(true));
+        let ready = Arc::new((Mutex::new(ReadyState::Pending), Condvar::new()));
+
+        // On its own thread: a stalled X server (or, on an ablated build, the trailing
+        // set_selection_owner) would otherwise hang this call forever, and a direct call would
+        // wedge the whole suite instead of failing this test.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let display = x.display().to_string();
+        std::thread::spawn(move || {
+            let outcome = owner_thread(&display, text, stop, ready)
+                .err()
+                .map(|e| e.to_string());
+            let _ = tx.send(outcome);
+        });
+
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a stalled X server must fail this test, not hang the whole suite");
+        if let Some(msg) = outcome {
+            panic!("a detached thread standing down is not an owner error: {msg}");
+        }
+
+        assert!(
+            live.is_alive(),
+            "the live owner must still be serving after a detached thread stands down"
+        );
+        assert_eq!(get(x.display()).expect("get"), "mine");
+    }
+
     #[test]
     fn spawning_against_an_unreachable_display_fails_instead_of_hanging() {
         let Err(err) = ClipboardOwner::spawn(":9999".to_string(), "text".to_string()) else {
             panic!("there is no server on :9999, so no owner can take its selection");
         };
         assert!(matches!(err, GlassError::Backend(_)), "{err:?}");
+    }
+
+    /// Bind the X11 TCP port of the first free display number, returning a listener and the
+    /// display string that reaches it. x11rb maps `host:N` to TCP port 6000+N, and a non-empty
+    /// host means it never looks at /tmp/.X11-unix — so this fakes a server without writing into
+    /// shared host state.
+    fn wedged_x_server() -> (std::net::TcpListener, String) {
+        for n in 40..80 {
+            if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", 6000 + n)) {
+                return (l, format!("127.0.0.1:{n}"));
+            }
+        }
+        panic!("no free X11 TCP port in 6040..6080");
+    }
+
+    /// An X server that accepts the connection and never sends its greeting is what the 2 s
+    /// readiness bound is for. Joining the setup thread there waits on the wedged server with no
+    /// bound at all, so spawn has to return without it — every tool call is behind the session
+    /// lock this holds.
+    #[test]
+    fn an_owner_gives_up_on_a_server_that_accepts_and_never_answers() {
+        let (listener, display) = wedged_x_server();
+        let accepted = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+
+        // On its own thread: pre-fix this call never returns, and a direct call would wedge the
+        // whole suite instead of failing this test.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let outcome = ClipboardOwner::spawn(display, "text".to_string())
+                .err()
+                .map(|e| e.to_string());
+            let _ = tx.send(outcome);
+        });
+
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("spawn must return when its own 2 s bound expires, not wait on the server");
+        // Ties the test to the 2 s bound itself, not just to the 10 s ceiling above: a bound
+        // loosened to e.g. 9 s would still return before the ceiling but fail this, and a bound
+        // shrunk to ~0 (which would also pass the ceiling and still contain "timed out") fails
+        // the lower check below.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "spawn took {elapsed:?}, expected it to give up near its own 2 s bound"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "spawn took only {elapsed:?}, expected it to wait close to its own 2 s bound"
+        );
+        let msg = outcome.expect("a server that never answers is not an owned selection");
+        assert!(msg.contains("timed out"), "{msg}");
+
+        // Closing the server side lets the detached setup thread fail and exit.
+        drop(
+            accepted
+                .join()
+                .expect("accept thread")
+                .expect("accepted stream"),
+        );
     }
 }
