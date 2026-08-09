@@ -13,6 +13,7 @@ bench = false
 
 [target.'cfg(target_os = "linux")'.dependencies]
 glass-core.workspace = true
+glass-exec-unix.workspace = true
 # The desktop-a11y capability signal (AT-SPI launcher present) lives with the a11y reader
 # and its doctor. This backend->a11y-reader direction mirrors glass-windows -> glass-a11y-windows
 # (which is acyclic). Here it forms a Cargo-legal *dev*-dependency cycle: glass-a11y-linux

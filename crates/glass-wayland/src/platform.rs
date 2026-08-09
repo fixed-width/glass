@@ -10,6 +10,7 @@ use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
     TEARDOWN_BUDGET, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
+use glass_exec_unix::{Resolved, is_executable_file, resolve_path};
 use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE};
 use smithay_client_toolkit::delegate_dispatch2;
 use smithay_client_toolkit::delegate_registry;
@@ -216,10 +217,48 @@ impl Drop for WaylandPlatform {
     }
 }
 
+/// Why no sway was resolved. Two fields: doctor prints cause and fix in separate columns, the
+/// launch path joins them into one message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoSway {
+    pub(crate) cause: String,
+    pub(crate) remedy: &'static str,
+}
+
+const BUILD_A_SWAY: &str = "build it with https://github.com/fixed-width/sway-build \
+     (./build.sh && ./build.sh install), or install a distro sway >=1.12";
+const MAKE_IT_RUNNABLE: &str = "chmod +x it, or point GLASS_SWAY at a runnable sway >=1.12";
+
+impl NoSway {
+    fn nothing_qualifies() -> Self {
+        NoSway {
+            cause: "no sway >=1.12 found".into(),
+            remedy: BUILD_A_SWAY,
+        }
+    }
+
+    fn not_runnable(cause: String) -> Self {
+        NoSway {
+            cause,
+            remedy: MAKE_IT_RUNNABLE,
+        }
+    }
+
+    /// Cause and fix in one string, for the launch path's single error message.
+    fn message(&self) -> String {
+        format!("{} — {}", self.cause, self.remedy)
+    }
+}
+
 /// Find a sway ≥1.12 with no env-var config: PATH (if recent enough) → the glass
 /// data dir (where the build tool installs the bundle) → next to this executable.
 /// No silent fallback — a clear error if none qualifies.
 pub(crate) fn resolve_sway() -> Result<PathBuf> {
+    resolve_sway_verdict().map_err(|no| GlassError::Backend(no.message()))
+}
+
+/// [`resolve_sway`] keeping the cause and the fix apart, for doctor.
+pub(crate) fn resolve_sway_verdict() -> std::result::Result<PathBuf, NoSway> {
     if let Some(overridden) = sway_override(std::env::var_os("GLASS_SWAY")) {
         return overridden;
     }
@@ -234,37 +273,56 @@ pub(crate) fn resolve_sway() -> Result<PathBuf> {
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-    if let Some(d) = data {
-        let cand = d.join("glass/sway/bin/sway");
-        if cand.is_file() {
-            return Ok(cand);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    match sway_bundle_in(data, exe_dir) {
+        Resolved::Found(p) => Ok(p),
+        Resolved::NotExecutable(p) => Err(NoSway::not_runnable(format!(
+            "{} is not executable",
+            p.display()
+        ))),
+        Resolved::Absent => Err(NoSway::nothing_qualifies()),
+    }
+}
+
+/// The bundled sway: under the glass data dir, where the build tool installs it, then next to
+/// this executable. The testable seam — both roots come from the environment.
+///
+/// A bundle there but unrunnable is named rather than skipped: a `cp` across machines or an unzip
+/// drops the execute bit, and "no sway found, build one" would send the user to rebuild what they
+/// already have.
+fn sway_bundle_in(data: Option<PathBuf>, exe_dir: Option<PathBuf>) -> Resolved {
+    let candidates = [
+        data.map(|d| d.join("glass/sway/bin/sway")),
+        exe_dir.map(|d| d.join("sway/bin/sway")),
+    ];
+    let mut first_non_executable = None;
+    for cand in candidates.into_iter().flatten() {
+        match resolve_path(&cand) {
+            Resolved::Found(p) => return Resolved::Found(p),
+            Resolved::NotExecutable(p) => {
+                first_non_executable.get_or_insert(p);
+            }
+            Resolved::Absent => {}
         }
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let cand = dir.join("sway/bin/sway");
-        if cand.is_file() {
-            return Ok(cand);
-        }
-    }
-    Err(GlassError::Backend(
-        "no sway >=1.12 found. Build it with https://github.com/fixed-width/sway-build (./build.sh && ./build.sh install), \
-         or install a distro sway >=1.12."
-            .into(),
-    ))
+    first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
 }
 
 /// What `GLASS_SWAY` decides, or `None` when it is unset or empty and discovery should run.
 ///
-/// An override skips the version gate, and fails closed when it names something that is not a
-/// file — falling back to discovery would chase a version-specific bug in a different binary.
-fn sway_override(value: Option<std::ffi::OsString>) -> Option<Result<PathBuf>> {
+/// An override skips the version gate, and fails closed when it names something glass cannot
+/// spawn — whether that is nothing at all or a file without execute permission. Falling back to
+/// discovery would chase a version-specific bug in a different binary.
+fn sway_override(
+    value: Option<std::ffi::OsString>,
+) -> Option<std::result::Result<PathBuf, NoSway>> {
     let p = PathBuf::from(value.filter(|s| !s.is_empty())?);
-    Some(if p.is_file() {
+    Some(if is_executable_file(&p) {
         Ok(p)
     } else {
-        Err(GlassError::Backend(format!(
+        Err(NoSway::not_runnable(format!(
             "GLASS_SWAY={} is not an executable file",
             p.display()
         )))
@@ -273,22 +331,26 @@ fn sway_override(value: Option<std::ffi::OsString>) -> Option<Result<PathBuf>> {
 
 /// The first `sway` in `dirs` whose `--version` reports >= 1.12.
 ///
-/// A too-old one is not skipped in favour of a later directory: `PATH` order is the user's own
-/// precedence, and walking past it is the substitution [`sway_override`] refuses.
+/// Only an answer ends the walk. A candidate that ran decides the outcome even when the version
+/// is too old or unreadable — that means the bundle, never a different sway further along, since
+/// `PATH` order is a precedence the user expressed.
+///
+/// A candidate that never ran expressed nothing, so it is stepped over: no execute permission, or
+/// a spawn that failed outright (`ENOEXEC` for a file that is not a binary, `ETXTBSY` while
+/// something else holds it open for writing).
 fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
     for dir in dirs {
         let cand = dir.join("sway");
-        if !cand.is_file() {
+        if !is_executable_file(&cand) {
             continue;
         }
-        let out = std::process::Command::new(&cand)
-            .arg("--version")
-            .output()
-            .ok()?;
+        let Ok(out) = std::process::Command::new(&cand).arg("--version").output() else {
+            continue;
+        };
         let ver = String::from_utf8_lossy(&out.stdout);
         return match parse_sway_version(&ver) {
             Some((maj, min)) if (maj, min) >= (1, 12) => Some(cand),
-            _ => None, // a sway is on PATH but too old/unparseable -> use the bundle
+            _ => None, // answered, just not usably -> the bundle, not a later sway
         };
     }
     None
@@ -1524,6 +1586,8 @@ impl Platform for WaylandPlatform {
 
 #[cfg(test)]
 mod pure_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
 
     fn win(identifier: &str, x11: Option<u32>) -> SwayWindow {
@@ -1602,6 +1666,21 @@ mod pure_tests {
         assert_eq!(next, 2, "re-fetching must not consume an id");
     }
 
+    /// Serializes the tests that exec a fixture they just wrote.
+    ///
+    /// Another thread's `fork` inherits the write fd `fs::write` holds, until that child execs —
+    /// so a sibling spawning mid-write fails this exec with `ETXTBSY`, and the lock must cover
+    /// the write, not just the exec. Not a product bug: glass never writes a binary it is about
+    /// to probe.
+    ///
+    /// Poison is ignored — one test's panic must not fail its siblings.
+    fn one_spawner_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SPAWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A directory holding a `sway` that answers `--version` with `reply`.
     fn fake_sway(reply: &str) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1614,6 +1693,7 @@ mod pure_tests {
 
     #[test]
     fn a_recent_sway_on_the_path_is_used() {
+        let _guard = one_spawner_at_a_time();
         let dir = fake_sway("sway version 1.12-abc (Jun 3 2026)");
         assert_eq!(
             sway_in_dirs([dir.path().to_path_buf()].into_iter()),
@@ -1625,6 +1705,7 @@ mod pure_tests {
     /// sway through IPC and protocol surface it only has from 1.12.
     #[test]
     fn an_old_or_unreadable_sway_on_the_path_is_not_used() {
+        let _guard = one_spawner_at_a_time();
         for reply in ["sway version 1.9", "sway version 1.11-x", "wat"] {
             let dir = fake_sway(reply);
             assert_eq!(
@@ -1666,14 +1747,142 @@ mod pure_tests {
         let err = sway_override(Some("/nonexistent/sway".into()))
             .expect("a choice was made")
             .expect_err("a named path that is not there must not fall back");
-        assert!(err.to_string().contains("/nonexistent/sway"), "{err}");
+        assert!(err.cause.contains("/nonexistent/sway"), "{err:?}");
+    }
+
+    /// glass#374: the override was checked with `is_file()` while the error it produces has always
+    /// said "is not an executable file".
+    #[test]
+    fn an_override_naming_a_non_executable_file_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("sway");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let err = sway_override(Some(bin.clone().into_os_string()))
+            .expect("a choice was made")
+            .expect_err("a file that cannot be run must not be trusted");
+        assert!(err.cause.contains(&bin.display().to_string()), "{err:?}");
+    }
+
+    /// A non-executable `sway` early on `PATH` used to cost every later `PATH` entry: the
+    /// candidate was accepted on `is_file()`, `--version` then failed to spawn, and
+    /// `.output().ok()?` ended the walk — so a good distro sway further along was never seen.
+    #[test]
+    fn a_non_executable_sway_early_on_the_path_does_not_hide_a_later_one() {
+        let _guard = one_spawner_at_a_time();
+        let broken = tempfile::tempdir().expect("tempdir");
+        let bin = broken.path().join("sway");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
+        assert_eq!(
+            sway_in_dirs([broken.path().to_path_buf(), good.path().to_path_buf()].into_iter()),
+            Some(good.path().join("sway")),
+            "a sway that cannot be run must be skipped, not treated as the answer"
+        );
+    }
+
+    /// An empty file at 0o755 clears the permission check and then fails to exec (`ENOEXEC`) —
+    /// the deterministic twin of the `ETXTBSY` a concurrent write raises. Ending the walk on
+    /// either made glass report no sway on `$PATH` at all.
+    #[test]
+    fn a_sway_that_fails_to_spawn_does_not_hide_a_later_one() {
+        let _guard = one_spawner_at_a_time();
+        let unspawnable = tempfile::tempdir().expect("tempdir");
+        let bin = unspawnable.path().join("sway");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(
+            is_executable_file(&bin),
+            "the fixture must clear the permission check, or this pins the wrong branch"
+        );
+        let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
+        assert_eq!(
+            sway_in_dirs([unspawnable.path().to_path_buf(), good.path().to_path_buf()].into_iter()),
+            Some(good.path().join("sway")),
+            "a candidate that never ran must be stepped over, not end the walk"
+        );
+    }
+
+    /// A bundle root holding `glass/sway/bin/sway` (the data-dir layout) or `sway/bin/sway`
+    /// (next to the executable) at `mode`.
+    fn bundle_at(relative: &str, mode: u32) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("tempdir");
+        let bin = root.path().join(relative);
+        std::fs::create_dir_all(bin.parent().expect("has a parent")).expect("mkdir");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        root
+    }
+
+    #[test]
+    fn a_runnable_bundle_in_the_data_dir_is_found() {
+        let root = bundle_at("glass/sway/bin/sway", 0o755);
+        assert_eq!(
+            sway_bundle_in(Some(root.path().to_path_buf()), None),
+            Resolved::Found(root.path().join("glass/sway/bin/sway"))
+        );
+    }
+
+    /// Skipping it silently is no better than accepting it and failing at spawn: the resulting
+    /// "build a sway" names the path just skipped.
+    #[test]
+    fn a_bundle_that_cannot_be_run_is_named_rather_than_skipped() {
+        let root = bundle_at("glass/sway/bin/sway", 0o644);
+        assert_eq!(
+            sway_bundle_in(Some(root.path().to_path_buf()), None),
+            Resolved::NotExecutable(root.path().join("glass/sway/bin/sway"))
+        );
+    }
+
+    #[test]
+    fn a_runnable_bundle_beside_the_executable_beats_an_unrunnable_data_dir_one() {
+        let data = bundle_at("glass/sway/bin/sway", 0o644);
+        let exe = bundle_at("sway/bin/sway", 0o755);
+        assert_eq!(
+            sway_bundle_in(
+                Some(data.path().to_path_buf()),
+                Some(exe.path().to_path_buf())
+            ),
+            Resolved::Found(exe.path().join("sway/bin/sway"))
+        );
+    }
+
+    #[test]
+    fn no_bundle_in_either_root_is_absent() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            sway_bundle_in(
+                Some(empty.path().to_path_buf()),
+                Some(empty.path().to_path_buf())
+            ),
+            Resolved::Absent
+        );
+        assert_eq!(sway_bundle_in(None, None), Resolved::Absent);
+    }
+
+    /// The launch path gets one string where doctor gets two columns, so it must carry both.
+    #[test]
+    fn a_failure_message_carries_the_cause_and_the_fix() {
+        let msg = NoSway::not_runnable("/opt/sway is not executable".into()).message();
+        assert!(msg.contains("/opt/sway is not executable"), "{msg}");
+        assert!(msg.contains("chmod +x"), "{msg}");
+
+        let msg = NoSway::nothing_qualifies().message();
+        assert!(msg.contains("no sway >=1.12 found"), "{msg}");
+        assert!(msg.contains("sway-build"), "{msg}");
     }
 
     #[test]
     #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn discovery_finds_a_real_sway_on_this_machine() {
         let found = resolve_sway().expect("a discoverable sway");
-        assert!(found.is_file(), "{}", found.display());
+        assert!(
+            is_executable_file(&found),
+            "discovery must yield something glass can spawn: {}",
+            found.display()
+        );
     }
 
     /// A probe that panics is the only way to assert something is *not* called. Note this drives

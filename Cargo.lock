@@ -1036,6 +1036,7 @@ dependencies = [
  "atspi",
  "atspi-common",
  "glass-core",
+ "glass-exec-unix",
  "glass-wayland",
  "glass-x11",
  "tempfile",
@@ -1108,10 +1109,19 @@ version = "0.0.0"
 dependencies = [
  "atspi",
  "glass-core",
+ "glass-exec-unix",
  "glass-proc-linux",
  "tempfile",
  "tokio",
  "zbus",
+]
+
+[[package]]
+name = "glass-exec-unix"
+version = "0.0.0"
+dependencies = [
+ "rustix",
+ "tempfile",
 ]
 
 [[package]]
@@ -1204,6 +1214,7 @@ name = "glass-sandbox-linux"
 version = "0.0.0"
 dependencies = [
  "glass-core",
+ "glass-exec-unix",
  "glass-sandbox-unix",
  "tempfile",
 ]
@@ -1213,6 +1224,7 @@ name = "glass-sandbox-macos"
 version = "0.0.0"
 dependencies = [
  "glass-core",
+ "glass-exec-unix",
  "glass-sandbox-unix",
  "tempfile",
 ]
@@ -1251,6 +1263,7 @@ dependencies = [
  "glass-a11y-linux",
  "glass-core",
  "glass-dbus-linux",
+ "glass-exec-unix",
  "glass-proc-linux",
  "glass-sandbox-linux",
  "rustix",
@@ -1286,6 +1299,7 @@ dependencies = [
  "glass-a11y-linux",
  "glass-core",
  "glass-dbus-linux",
+ "glass-exec-unix",
  "glass-proc-linux",
  "glass-sandbox-linux",
  "tempfile",

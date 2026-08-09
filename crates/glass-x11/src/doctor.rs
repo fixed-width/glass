@@ -3,12 +3,11 @@
 //! [`checks`] gathers the real environment; the pure [`x11_checks`] maps gathered
 //! facts to [`Check`]s and is unit-tested without a display.
 
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use glass_core::{Check, CheckStatus};
+use glass_exec_unix::{Resolved, resolve_bin};
 
 use crate::xvfb::Xvfb;
 
@@ -29,13 +28,13 @@ fn checks_for(glass_display: Option<&str>, deep: bool) -> Vec<Check> {
     );
     let attach_reachable = gd.map(|d| can_connect(&crate::platform::normalize_display(d)));
     let deep_spawn = (deep && gd.is_none()).then(probe_xvfb);
-    x11_checks(gd, xvfb.as_deref(), attach_reachable, deep_spawn)
+    x11_checks(gd, &xvfb, attach_reachable, deep_spawn)
 }
 
 /// Pure: build the X11 checks from gathered facts.
 fn x11_checks(
     glass_display: Option<&str>,
-    xvfb: Option<&Path>,
+    xvfb: &Resolved,
     attach_reachable: Option<bool>,
     deep_spawn: Option<Result<String, String>>,
 ) -> Vec<Check> {
@@ -49,8 +48,17 @@ fn x11_checks(
                 "unset — glass will spawn a private headless Xvfb",
             ));
             checks.push(match xvfb {
-                Some(p) => Check::new("Xvfb", CheckStatus::Ok, p.display().to_string()),
-                None => Check::new("Xvfb", CheckStatus::Fail, "not found").with_remedy(
+                Resolved::Found(p) => Check::new("Xvfb", CheckStatus::Ok, p.display().to_string()),
+                Resolved::NotExecutable(p) => Check::new(
+                    "Xvfb",
+                    CheckStatus::Fail,
+                    format!("{} — not executable", p.display()),
+                )
+                .with_remedy(format!(
+                    "chmod +x {}, or point GLASS_XVFB at a runnable binary",
+                    p.display()
+                )),
+                Resolved::Absent => Check::new("Xvfb", CheckStatus::Fail, "not found").with_remedy(
                     "install it (e.g. `apt install xvfb`), set GLASS_XVFB to its path, or set \
                      GLASS_DISPLAY=:N to attach to an existing display",
                 ),
@@ -89,24 +97,6 @@ fn x11_checks(
         }
     }
     checks
-}
-
-/// First existing file named `name` in `path`, a `PATH`-style separated list.
-fn which_in(path: &OsStr, name: &str) -> Option<PathBuf> {
-    std::env::split_paths(path)
-        .map(|d| d.join(name))
-        .find(|p| p.is_file())
-}
-
-/// Resolve a configured binary to an existing path: an explicit path (contains `/`) must
-/// be an existing file; a bare name is looked up in `path`.
-fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Option<PathBuf> {
-    if bin.contains('/') {
-        let p = PathBuf::from(bin);
-        p.is_file().then_some(p)
-    } else {
-        which_in(path?, bin)
-    }
 }
 
 fn can_connect(display: &str) -> bool {
@@ -150,12 +140,18 @@ fn probe_xvfb() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
     fn self_spawn_with_xvfb_present_is_ok() {
-        let p = PathBuf::from("/usr/bin/Xvfb");
-        let cs = x11_checks(None, Some(&p), None, None);
+        let cs = x11_checks(
+            None,
+            &Resolved::Found(PathBuf::from("/usr/bin/Xvfb")),
+            None,
+            None,
+        );
         assert_eq!(cs[0].name, "GLASS_DISPLAY");
         assert_eq!(cs[0].status, CheckStatus::Ok);
         assert_eq!(cs[1].name, "Xvfb");
@@ -165,7 +161,7 @@ mod tests {
 
     #[test]
     fn self_spawn_without_xvfb_fails_with_remedy() {
-        let cs = x11_checks(None, None, None, None);
+        let cs = x11_checks(None, &Resolved::Absent, None, None);
         let xvfb = cs.iter().find(|c| c.name == "Xvfb").unwrap();
         assert_eq!(xvfb.status, CheckStatus::Fail);
         assert!(xvfb.remedy.as_deref().unwrap().contains("apt install xvfb"));
@@ -173,61 +169,16 @@ mod tests {
 
     #[test]
     fn attach_reachable_is_ok_unreachable_fails() {
-        let ok = x11_checks(Some(":42"), None, Some(true), None);
+        let ok = x11_checks(Some(":42"), &Resolved::Absent, Some(true), None);
         assert_eq!(ok[0].status, CheckStatus::Ok);
         assert!(
             ok.iter().all(|c| c.name != "Xvfb"),
             "attach mode shouldn't require Xvfb"
         );
 
-        let bad = x11_checks(Some(":42"), None, Some(false), None);
+        let bad = x11_checks(Some(":42"), &Resolved::Absent, Some(false), None);
         assert_eq!(bad[0].status, CheckStatus::Fail);
         assert!(bad[0].remedy.is_some());
-    }
-
-    /// A directory holding an executable `name`, plus a second empty directory, returned as
-    /// a `PATH`-style list with the empty one first — so a hit proves the search walked on
-    /// rather than stopping at the head.
-    fn path_containing(name: &str) -> (tempfile::TempDir, std::ffi::OsString, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let empty = dir.path().join("empty");
-        let holding = dir.path().join("holding");
-        std::fs::create_dir_all(&empty).unwrap();
-        std::fs::create_dir_all(&holding).unwrap();
-        let bin = holding.join(name);
-        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
-        // Executable, so the test is about the search and not about accepting a file that
-        // could never be spawned.
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let list = std::env::join_paths([&empty, &holding]).expect("join paths");
-        (dir, list, bin)
-    }
-
-    #[test]
-    fn a_bare_name_resolves_to_the_first_directory_holding_it() {
-        let (_dir, path, bin) = path_containing("Xvfb");
-        assert_eq!(resolve_bin("Xvfb", Some(&path)), Some(bin));
-    }
-
-    #[test]
-    fn a_bare_name_absent_from_the_path_resolves_to_nothing() {
-        let (_dir, path, _bin) = path_containing("Xvfb");
-        assert_eq!(resolve_bin("Xorg", Some(&path)), None);
-    }
-
-    #[test]
-    fn an_explicit_path_is_taken_as_given_and_must_exist() {
-        let (_dir, _path, bin) = path_containing("Xvfb");
-        // A configured GLASS_XVFB is a path, not a name to search for — resolving it
-        // through the search list would silently run a different binary.
-        assert_eq!(resolve_bin(bin.to_str().unwrap(), None), Some(bin.clone()));
-        assert_eq!(resolve_bin("/nonexistent/Xvfb", None), None);
-    }
-
-    #[test]
-    fn a_bare_name_with_no_search_list_resolves_to_nothing() {
-        assert_eq!(resolve_bin("Xvfb", None), None);
     }
 
     #[test]
@@ -309,11 +260,34 @@ mod tests {
         );
     }
 
+    /// glass#374: `GLASS_XVFB` pointing at a file without the execute bit used to report `Ok`,
+    /// and `Xvfb::start` then failed with EACCES — the one outcome doctor exists to prevent.
+    /// "not found" would be wrong too: the file is there, so installing xvfb again cannot help.
+    #[test]
+    fn a_non_executable_xvfb_fails_with_a_chmod_remedy() {
+        let p = PathBuf::from("/opt/x/Xvfb");
+        let cs = x11_checks(None, &Resolved::NotExecutable(p), None, None);
+        let xvfb = cs.iter().find(|c| c.name == "Xvfb").expect("an Xvfb check");
+        assert_eq!(xvfb.status, CheckStatus::Fail);
+        assert!(
+            xvfb.detail.contains("/opt/x/Xvfb") && xvfb.detail.contains("not executable"),
+            "must name the file and say why: {:?}",
+            xvfb.detail
+        );
+        assert!(
+            xvfb.remedy
+                .as_deref()
+                .is_some_and(|r| r.contains("chmod +x")),
+            "the remedy is chmod, not a reinstall: {:?}",
+            xvfb.remedy
+        );
+    }
+
     #[test]
     fn deep_spawn_failure_is_reported() {
         let cs = x11_checks(
             None,
-            Some(Path::new("/usr/bin/Xvfb")),
+            &Resolved::Found(PathBuf::from("/usr/bin/Xvfb")),
             None,
             Some(Err("boom".into())),
         );

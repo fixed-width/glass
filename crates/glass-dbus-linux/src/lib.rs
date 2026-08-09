@@ -6,13 +6,15 @@
 
 #![cfg(target_os = "linux")]
 
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use glass_core::{GlassError, Result};
+use glass_exec_unix::{Resolved, resolve_bin, resolve_path};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard ceiling on the whole a11y-bus resolution (connect → proxy → GetAddress poll). The
@@ -103,14 +105,12 @@ impl PrivateBus {
             }
         };
 
-        let launcher = match find_launcher() {
-            Some(l) => l,
-            None => {
+        let launcher = match launcher_or_reason(find_launcher()) {
+            Ok(l) => l,
+            Err(why) => {
                 let _ = dbus.kill();
                 let _ = dbus.wait();
-                return Err(GlassError::Backend(
-                    "at-spi-bus-launcher not found (install at-spi2-core), or set GLASS_ATSPI_LAUNCHER".into(),
-                ));
+                return Err(GlassError::Backend(why));
             }
         };
 
@@ -229,18 +229,59 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn find_launcher() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("GLASS_ATSPI_LAUNCHER").filter(|s| !s.is_empty()) {
-        let p = PathBuf::from(p);
-        return p.is_file().then_some(p);
+/// The four paths distributions install `at-spi-bus-launcher` to.
+const LAUNCHER_CANDIDATES: &[&str] = &[
+    "/usr/libexec/at-spi-bus-launcher",
+    "/usr/lib/at-spi2-core/at-spi-bus-launcher",
+    "/usr/lib/at-spi2/at-spi-bus-launcher",
+    "/usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher",
+];
+
+fn find_launcher() -> Resolved {
+    find_launcher_with(
+        std::env::var_os("GLASS_ATSPI_LAUNCHER"),
+        LAUNCHER_CANDIDATES,
+    )
+}
+
+/// [`find_launcher`] against explicit inputs — the testable seam (no global env). An override
+/// names the launcher outright and is not searched for among `candidates`.
+///
+/// The scan takes the first runnable candidate and, failing that, reports the first present-but-
+/// unrunnable one it walked past rather than [`Resolved::Absent`] — the rule `resolve_bin`
+/// applies to a `$PATH` walk.
+fn find_launcher_with(override_value: Option<OsString>, candidates: &[&str]) -> Resolved {
+    if let Some(p) = override_value.filter(|s| !s.is_empty()) {
+        return resolve_path(Path::new(&p));
     }
-    const CANDIDATES: &[&str] = &[
-        "/usr/libexec/at-spi-bus-launcher",
-        "/usr/lib/at-spi2-core/at-spi-bus-launcher",
-        "/usr/lib/at-spi2/at-spi-bus-launcher",
-        "/usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher",
-    ];
-    CANDIDATES.iter().map(PathBuf::from).find(|p| p.is_file())
+    let mut first_non_executable = None;
+    for cand in candidates.iter().map(Path::new) {
+        match resolve_path(cand) {
+            Resolved::Found(p) => return Resolved::Found(p),
+            Resolved::NotExecutable(p) => {
+                first_non_executable.get_or_insert(p);
+            }
+            Resolved::Absent => {}
+        }
+    }
+    first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
+}
+
+/// The launcher to spawn, or why there is none — one mapping, so the preflight and the bring-up
+/// cannot disagree. A present-but-unrunnable launcher is named, because "install at-spi2-core"
+/// about a path the user set themselves sends them to fix what is not broken.
+fn launcher_or_reason(resolved: Resolved) -> std::result::Result<PathBuf, String> {
+    match resolved {
+        Resolved::Found(p) => Ok(p),
+        Resolved::NotExecutable(p) => Err(format!(
+            "at-spi-bus-launcher at {} is not executable",
+            p.display()
+        )),
+        Resolved::Absent => Err(
+            "at-spi-bus-launcher not found (install at-spi2-core), or set GLASS_ATSPI_LAUNCHER"
+                .into(),
+        ),
+    }
 }
 
 /// Cheap, non-spawning preflight: are the binaries a private a11y bus needs resolvable on
@@ -250,27 +291,31 @@ fn find_launcher() -> Option<PathBuf> {
 /// resolvable binary can still fail to spawn — but it catches the common "AT-SPI not
 /// installed" and misconfigured-path cases.
 pub fn available() -> std::result::Result<(), String> {
-    // `tool_path` returns an explicit path (from GLASS_DBUS_DAEMON) or the bare "dbus-daemon"
-    // name resolved on PATH at spawn time. Only an explicit path can be checked here.
     available_with(
         find_launcher(),
         &glass_core::tool_path("GLASS_DBUS_DAEMON", "dbus-daemon"),
+        std::env::var_os("PATH").as_deref(),
     )
 }
 
-/// [`available`] against already-resolved inputs — the testable seam (no global env), so a test
-/// can force either branch without `set_var` racing a concurrent env reader.
-fn available_with(launcher: Option<PathBuf>, dbus: &str) -> std::result::Result<(), String> {
-    if launcher.is_none() {
-        return Err(
-            "at-spi-bus-launcher not found (install at-spi2-core), or set GLASS_ATSPI_LAUNCHER"
-                .into(),
-        );
+/// [`available`] against explicit inputs — the testable seam (no global env). `path` is the search
+/// list a bare `dbus-daemon` is looked up in; the bring-up spawns from this same process, so it is
+/// the list the spawn will use.
+fn available_with(
+    launcher: Resolved,
+    dbus: &str,
+    path: Option<&OsStr>,
+) -> std::result::Result<(), String> {
+    launcher_or_reason(launcher)?;
+    match resolve_bin(dbus, path) {
+        Resolved::Found(_) => Ok(()),
+        Resolved::NotExecutable(p) => {
+            Err(format!("dbus-daemon at {} is not executable", p.display()))
+        }
+        Resolved::Absent => Err(format!(
+            "dbus-daemon ({dbus}) not found (install dbus, or set GLASS_DBUS_DAEMON to its path)"
+        )),
     }
-    if dbus.contains('/') && !std::path::Path::new(dbus).is_file() {
-        return Err(format!("dbus-daemon not found at {dbus}"));
-    }
-    Ok(())
 }
 
 #[zbus::proxy(
@@ -388,28 +433,177 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
 
+    /// A directory holding `name` at `mode`.
+    fn dir_with(name: &str, mode: u32) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join(name);
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        dir
+    }
+
+    /// glass#374: the override was accepted on `is_file()`, and reporting a mere `None` let the
+    /// caller say "install at-spi2-core" about a path the user had named themselves.
+    #[test]
+    fn a_non_executable_launcher_override_is_reported_as_present_but_unrunnable() {
+        let dir = dir_with("at-spi-bus-launcher", 0o644);
+        let launcher = dir.path().join("at-spi-bus-launcher");
+        assert_eq!(
+            find_launcher_with(Some(launcher.clone().into_os_string()), &[]),
+            Resolved::NotExecutable(launcher)
+        );
+    }
+
+    #[test]
+    fn an_executable_launcher_override_is_accepted() {
+        let dir = dir_with("at-spi-bus-launcher", 0o755);
+        let launcher = dir.path().join("at-spi-bus-launcher");
+        assert_eq!(
+            find_launcher_with(Some(launcher.clone().into_os_string()), &[]),
+            Resolved::Found(launcher)
+        );
+    }
+
+    #[test]
+    fn the_candidate_scan_walks_past_a_non_executable_one() {
+        let broken = dir_with("at-spi-bus-launcher", 0o644);
+        let working = dir_with("at-spi-bus-launcher", 0o755);
+        let candidates = [
+            broken
+                .path()
+                .join("at-spi-bus-launcher")
+                .to_str()
+                .expect("utf-8 temp path")
+                .to_owned(),
+            working
+                .path()
+                .join("at-spi-bus-launcher")
+                .to_str()
+                .expect("utf-8 temp path")
+                .to_owned(),
+        ];
+        let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        assert_eq!(
+            find_launcher_with(None, &candidates),
+            Resolved::Found(working.path().join("at-spi-bus-launcher"))
+        );
+    }
+
+    /// Nothing runnable in the whole scan still beats `Absent`: an at-spi2-core install whose
+    /// launcher lost its execute bit is a chmod away, not a reinstall.
+    #[test]
+    fn a_scan_finding_only_a_non_executable_candidate_names_it() {
+        let dir = dir_with("at-spi-bus-launcher", 0o644);
+        let launcher = dir.path().join("at-spi-bus-launcher");
+        let candidates = [launcher.to_str().expect("utf-8 temp path")];
+        assert_eq!(
+            find_launcher_with(None, &candidates),
+            Resolved::NotExecutable(launcher)
+        );
+    }
+
+    #[test]
+    fn available_is_ok_when_both_binaries_are_runnable() {
+        let daemon = dir_with("dbus-daemon", 0o755);
+        available_with(
+            Resolved::Found(PathBuf::from("/bin/true")),
+            daemon
+                .path()
+                .join("dbus-daemon")
+                .to_str()
+                .expect("utf-8 temp path"),
+            None,
+        )
+        .expect("two runnable binaries are available");
+    }
+
+    /// The preflight's other half: an explicit `$GLASS_DBUS_DAEMON` that exists but cannot be run.
+    #[test]
+    fn available_errors_when_an_explicit_dbus_daemon_path_is_not_executable() {
+        let dir = dir_with("dbus-daemon", 0o644);
+        let err = available_with(
+            Resolved::Found(PathBuf::from("/bin/true")),
+            dir.path()
+                .join("dbus-daemon")
+                .to_str()
+                .expect("utf-8 temp path"),
+            None,
+        )
+        .expect_err("a dbus-daemon that cannot be run must be reported");
+        assert!(err.contains("not executable"), "actionable: {err}");
+    }
+
+    /// A bare `dbus-daemon` is looked up on the search list, so one that is simply not installed
+    /// is caught by the preflight instead of surfacing as a spawn failure mid-bring-up.
+    #[test]
+    fn available_errors_when_a_bare_dbus_daemon_is_not_on_the_search_list() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let path = std::env::join_paths([empty.path()]).expect("join paths");
+        let err = available_with(
+            Resolved::Found(PathBuf::from("/bin/true")),
+            "dbus-daemon",
+            Some(&path),
+        )
+        .expect_err("a bare name absent from the search list must be reported");
+        assert!(err.contains("not found"), "actionable: {err}");
+    }
+
+    #[test]
+    fn available_finds_a_bare_dbus_daemon_on_the_search_list() {
+        let dir = dir_with("dbus-daemon", 0o755);
+        let path = std::env::join_paths([dir.path()]).expect("join paths");
+        available_with(
+            Resolved::Found(PathBuf::from("/bin/true")),
+            "dbus-daemon",
+            Some(&path),
+        )
+        .expect("a bare name on the search list resolves");
+    }
+
     /// An unresolvable launcher must report unavailable with an actionable message, whether or
-    /// not at-spi2-core is installed on the test host. Drives the seam directly rather than
-    /// pointing `GLASS_ATSPI_LAUNCHER` at a nonexistent path — mutating the process environment
-    /// would race every other test in this binary (and is `unsafe` from edition 2024 on).
+    /// not at-spi2-core is installed on the test host.
     #[test]
     fn available_errors_when_the_atspi_launcher_is_missing() {
-        let err = available_with(None, "dbus-daemon")
+        let err = available_with(Resolved::Absent, "/bin/true", None)
             .expect_err("missing launcher must report unavailable");
         assert!(
-            err.contains("at-spi-bus-launcher"),
+            err.contains("at-spi-bus-launcher") && err.contains("install at-spi2-core"),
             "actionable message: {err}"
+        );
+    }
+
+    #[test]
+    fn available_names_a_launcher_that_is_present_but_not_executable() {
+        let dir = dir_with("at-spi-bus-launcher", 0o644);
+        let launcher = dir.path().join("at-spi-bus-launcher");
+        let err = available_with(Resolved::NotExecutable(launcher.clone()), "/bin/true", None)
+            .expect_err("a launcher that cannot be run must report unavailable");
+        assert!(
+            err.contains(&launcher.display().to_string()) && err.contains("not executable"),
+            "must name the file and say why: {err}"
+        );
+        assert!(
+            !err.contains("install at-spi2-core"),
+            "the package is installed; sending the user to reinstall it is the misdirection: {err}"
         );
     }
 
     /// The other preflight branch: an explicit `$GLASS_DBUS_DAEMON` path that is not a file.
     #[test]
     fn available_errors_when_an_explicit_dbus_daemon_path_is_missing() {
-        let err = available_with(Some(PathBuf::from("/bin/true")), "/nonexistent/dbus-daemon")
-            .expect_err("an explicit dbus-daemon path that is not a file must be reported");
-        assert!(err.contains("dbus-daemon not found"), "actionable: {err}");
+        let err = available_with(
+            Resolved::Found(PathBuf::from("/bin/true")),
+            "/nonexistent/dbus-daemon",
+            None,
+        )
+        .expect_err("an explicit dbus-daemon path that is not a file must be reported");
+        assert!(
+            err.contains("not found") && err.contains("/nonexistent/dbus-daemon"),
+            "actionable: {err}"
+        );
     }
 
     #[test]
