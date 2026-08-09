@@ -267,11 +267,13 @@ fn find_registry() -> Option<std::path::PathBuf> {
 /// `multiarch_root/<triplet>/at-spi2-core/at-spi-bus-launcher`. The triplet directory is
 /// arch-specific (`x86_64-linux-gnu`, `aarch64-linux-gnu`, …), so scanning rather than
 /// hardcoding one arch keeps the AT-SPI-present signal correct on non-x86_64 hosts.
+///
+/// A candidate glass could not spawn is not present: what this feeds says a11y is ready.
 fn find_launcher(fixed: &[&str], multiarch_root: &str) -> Option<std::path::PathBuf> {
     if let Some(p) = fixed
         .iter()
         .map(std::path::PathBuf::from)
-        .find(|p| p.is_file())
+        .find(|p| glass_exec_unix::is_executable_file(p))
     {
         return Some(p);
     }
@@ -279,7 +281,7 @@ fn find_launcher(fixed: &[&str], multiarch_root: &str) -> Option<std::path::Path
         .ok()?
         .flatten()
         .map(|e| e.path().join("at-spi2-core/at-spi-bus-launcher"))
-        .find(|p| p.is_file())
+        .find(|p| glass_exec_unix::is_executable_file(p))
 }
 
 /// Try to reach the accessibility bus exactly the way the reader does — on a private
@@ -336,11 +338,20 @@ mod tests {
     }
 
     // ---- launcher discovery (impure FS scan, driven with a tempdir) ----
+
+    /// Write `path` at `mode`, creating its parents.
+    fn launcher_at(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
     #[test]
     fn find_launcher_prefers_a_present_fixed_candidate() {
         let dir = tempfile::tempdir().unwrap();
         let fixed = dir.path().join("at-spi-bus-launcher");
-        std::fs::write(&fixed, b"").unwrap();
+        launcher_at(&fixed, 0o755);
         let fixed_str = fixed.to_str().unwrap();
         assert_eq!(
             find_launcher(&[fixed_str], "/nonexistent-root"),
@@ -356,8 +367,7 @@ mod tests {
         let launcher = root
             .path()
             .join("aarch64-linux-gnu/at-spi2-core/at-spi-bus-launcher");
-        std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
-        std::fs::write(&launcher, b"").unwrap();
+        launcher_at(&launcher, 0o755);
         assert_eq!(
             find_launcher(&[], root.path().to_str().unwrap()),
             Some(launcher)
@@ -367,6 +377,29 @@ mod tests {
     #[test]
     fn find_launcher_none_when_absent() {
         let root = tempfile::tempdir().unwrap();
+        assert_eq!(find_launcher(&[], root.path().to_str().unwrap()), None);
+    }
+
+    /// This signal is `glass doctor`'s `[a11y]` verdict and the `glass_capabilities`
+    /// accessibility cell. A launcher glass cannot spawn reported as present is the same run
+    /// answering "at-spi-bus-launcher present" and "not found" about one file.
+    #[test]
+    fn find_launcher_does_not_count_a_candidate_it_could_not_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixed = dir.path().join("at-spi-bus-launcher");
+        launcher_at(&fixed, 0o644);
+        assert_eq!(
+            find_launcher(&[fixed.to_str().unwrap()], "/nonexistent-root"),
+            None
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        launcher_at(
+            &root
+                .path()
+                .join("aarch64-linux-gnu/at-spi2-core/at-spi-bus-launcher"),
+            0o644,
+        );
         assert_eq!(find_launcher(&[], root.path().to_str().unwrap()), None);
     }
 

@@ -1036,6 +1036,7 @@ dependencies = [
  "atspi",
  "atspi-common",
  "glass-core",
+ "glass-exec-unix",
  "glass-wayland",
  "glass-x11",
  "tempfile",
