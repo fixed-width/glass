@@ -23,8 +23,8 @@ const CLIP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const SPAWN_READY_BUDGET: Duration = Duration::from_secs(2);
 
 /// What the serving thread's own setup gets. Strictly under [`SPAWN_READY_BUDGET`], so a setup
-/// that cannot finish says so to a caller still listening — tie the two and which of them reports
-/// is decided by a few microseconds of scheduling.
+/// that cannot finish says so to a caller still listening; tie the two and a few microseconds of
+/// scheduling decide which of them reports.
 const SERVE_SETUP_BUDGET: Duration = Duration::from_millis(1750);
 
 const _: () = assert!(
@@ -119,7 +119,6 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for ClipState {
     }
 }
 
-/// The compositor's answer to a `wl_display.sync`, which is what a bounded roundtrip waits for.
 impl Dispatch<wl_callback::WlCallback, crate::platform::SyncDone> for ClipState {
     fn event(
         _: &mut Self,
@@ -274,7 +273,6 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for ServeState {
     }
 }
 
-/// The compositor's answer to a `wl_display.sync`, which is what a bounded roundtrip waits for.
 impl Dispatch<wl_callback::WlCallback, crate::platform::SyncDone> for ServeState {
     fn event(
         _: &mut Self,
@@ -388,9 +386,8 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ServeState {
 /// event queue, does a roundtrip to collect the selection offer, then reads the
 /// pipe transfer.
 pub fn get(socket: &Path) -> Result<String> {
-    // One deadline for the whole paste — connecting, the syncs, and the read from the owner — so
-    // what the session lock is held for is what the constant says, rather than its sum over the
-    // steps.
+    // One deadline for connecting, the syncs and the read, so the session lock is held for what
+    // the constant says rather than its sum over the steps.
     let deadline = Instant::now() + CLIP_READ_TIMEOUT;
     let Some(read_end) = open_transfer(socket, deadline)? else {
         return Ok(String::new());
@@ -1145,11 +1142,10 @@ mod tests {
     }
 
     /// A compositor that accepts the connection and then never answers is what the readiness bound
-    /// is for. Joining the setup thread there waits on the wedged peer with no bound at all, so
-    /// spawn has to return without it — every tool call is behind the session lock this holds.
+    /// is for: joining the setup thread would wait on the wedged peer with no bound at all, and
+    /// every tool call is behind the session lock this holds.
     ///
-    /// The setup's own budget is the shorter of the two, so what the caller hears is the step that
-    /// failed rather than the fact that something did.
+    /// The setup's budget is the shorter of the two, so the caller hears which step failed.
     #[test]
     fn an_owner_gives_up_on_a_peer_that_accepts_and_never_answers() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1194,10 +1190,9 @@ mod tests {
         );
     }
 
-    /// Reading the clipboard opens its own connection, and the compositor's globals arrive over
-    /// an upstream roundtrip that polls with no timeout — so this hung outright until glass#402,
-    /// with the session lock held. No compositor needed: a listener that accepts and answers
-    /// nothing is what a wedged one looks like from this side.
+    /// Reading the clipboard opens its own connection, whose globals arrive over an upstream
+    /// roundtrip that polls with no timeout — so this hung outright until glass#402, session lock
+    /// held. A listener that accepts and answers nothing is a wedged compositor from this side.
     #[test]
     fn a_paste_gives_up_on_a_peer_that_accepts_and_never_answers() {
         let dir = tempfile::tempdir().expect("tempdir");

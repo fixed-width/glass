@@ -510,9 +510,8 @@ const _: () = assert!(
     "the capture budget must leave a loaded compositor time to answer, without holding the session lock for long"
 );
 
-/// Half a message: the front of one arrived and the rest has not. Upstream's own reader returns
-/// this as "nothing happened, ask again" rather than a fault, and so must glass — a split write
-/// means a loaded host.
+/// Half a message: the front arrived and the rest has not. Upstream's own reader returns this as
+/// "nothing happened, ask again" rather than a fault, and a split write means a loaded host.
 pub(crate) fn is_partial_read(e: &wayland_client::backend::WaylandError) -> bool {
     matches!(e, wayland_client::backend::WaylandError::Io(io)
         if io.kind() == std::io::ErrorKind::WouldBlock)
@@ -542,8 +541,8 @@ fn drain<S>(conn: &Connection, queue: &mut EventQueue<S>, state: &mut S, who: &s
 ///
 /// Expiry is not an error here — [`wait_for`] owns the deadline.
 ///
-/// Generic over the queue's state so the bound can be tested with no compositor behind the socket,
-/// and so capture and the sync every other request rides on share one implementation.
+/// Generic over the queue's state so the bound can be tested with no compositor behind the
+/// socket, and so capture and the sync every other request rides on share one implementation.
 fn dispatch_until<S>(
     conn: &Connection,
     queue: &mut EventQueue<S>,
@@ -617,10 +616,10 @@ fn wait_for<S, T>(
 
 /// How long the compositor gets to answer one request.
 ///
-/// One sync, not one tool call, and a tool call can spend it many times over: `glass_type` syncs
-/// twice per character, `glass_drag` once per waypoint. A compositor that has *stopped* answering
-/// costs one budget, since the first failure ends the call; one that answers every sync just
-/// inside the budget can hold the session lock for their sum.
+/// One sync, not one tool call, and a tool call spends it many times over — `glass_type` syncs
+/// twice per character, `glass_drag` once per waypoint. A compositor that has stopped answering
+/// costs one, since the first failure ends the call; one answering just inside the budget every
+/// time can hold the session lock for their sum.
 const COMPOSITOR_SYNC_BUDGET: Duration = Duration::from_secs(5);
 
 /// Only the sway-backed tests assert this live: on every other CI leg this is the whole guard.
@@ -629,13 +628,13 @@ const _: () = assert!(
     "a sync must have time to answer on a loaded host, without holding the session lock for long"
 );
 
-/// What one pass of a discovery loop gives the compositor. Short, because such a loop is also
-/// watching for things the compositor cannot tell it — that sway exited, that a window needs
-/// re-mapping — and one pass that waited out the whole launch would stop it looking.
+/// What one pass of a discovery loop gives the compositor — short, because such a loop is also
+/// watching for what the compositor cannot tell it: that sway exited, that a window needs
+/// re-mapping.
 const COMPOSITOR_SERVICE_SLICE: Duration = Duration::from_millis(250);
 
-/// Short enough that a loop spending one per pass still gets on with its other work, long enough
-/// that a compositor merely busy answers inside it — a slice it misses is discarded, not reported.
+/// A slice a merely-busy compositor answers inside, since one it misses is discarded rather than
+/// reported.
 const _: () = assert!(
     COMPOSITOR_SERVICE_SLICE.as_millis() >= 50 && COMPOSITOR_SERVICE_SLICE.as_millis() <= 1000,
     "a servicing slice must not become a wait in its own right"
@@ -646,9 +645,9 @@ pub(crate) type SyncDone = Arc<std::sync::atomic::AtomicBool>;
 
 /// `EventQueue::roundtrip`, bounded — glass#402.
 ///
-/// The unbounded one loops `blocking_dispatch` until the sync callback returns, so a compositor
-/// that has stopped answering holds the caller forever, exactly as the capture did before
-/// glass#383. This asks the same question and gives it `deadline` to answer.
+/// The unbounded one loops `blocking_dispatch` until the `done` event sets its flag, so a
+/// compositor that has stopped answering holds the caller forever. This asks the same question
+/// and gives it `deadline` to answer.
 ///
 pub(crate) fn roundtrip_until<S>(
     conn: &Connection,
@@ -670,8 +669,8 @@ where
         state,
         deadline,
         who,
-        // Not a bare `GlassError::Timeout`, which names no operation: every request on this
-        // connection ends in a sync, so the caller is the only thing that tells them apart.
+        // Not a bare `GlassError::Timeout`, which names no operation: every request ends in the
+        // same sync, so the caller is all that tells one failure from another.
         |_| {
             GlassError::Backend(format!(
                 "{who}: the compositor did not answer within {} ms",
@@ -687,12 +686,11 @@ where
 
 /// Open a wayland connection and collect the compositor's globals, bounded.
 ///
-/// `registry_queue_init` ends in `Connection::roundtrip`, which polls with no timeout — so every
-/// bound below it is unreachable on a fresh connection: connecting to a compositor that has
-/// stopped answering succeeds (the kernel completes an AF_UNIX connect into the listen backlog)
-/// and the setup then waits forever. Upstream offers no bounded form and `GlobalList` cannot be
-/// built here, so the setup runs on its own thread and the socket is shut down under it when the
-/// budget runs out — the only way to end a poll nothing else can reach.
+/// `registry_queue_init` ends in `Connection::roundtrip`, which polls with no timeout, so every
+/// bound below it is unreachable: an AF_UNIX connect to a compositor that has stopped answering
+/// still succeeds (the kernel completes it into the listen backlog) and the setup then waits
+/// forever. Upstream offers no bounded form and `GlobalList` cannot be built here, so the setup
+/// runs on its own thread and the socket is shut down under it — the only way to end that poll.
 pub(crate) fn connect_bounded<S>(
     socket: &Path,
     budget: Duration,
@@ -707,9 +705,8 @@ where
 {
     let stream = UnixStream::connect(socket)
         .map_err(|e| GlassError::Backend(format!("{who}: connect: {e}")))?;
-    // The same socket, kept back from the thread: shutting this down is what wakes its poll.
-    // `Both`, not `Read`: a setup blocked writing to a compositor that has stopped reading is
-    // just as stuck, and only the write half ends that.
+    // The same socket, kept back from the thread: shutting it down is what wakes its poll, and
+    // `Both` because a setup blocked writing to a compositor that stopped reading is as stuck.
     let watchdog = stream
         .try_clone()
         .map_err(|e| GlassError::Backend(format!("{who}: connect: {e}")))?;
@@ -741,8 +738,7 @@ where
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             let _ = watchdog.shutdown(std::net::Shutdown::Both);
-            // Joined, so the thread is gone before its socket is: a setup still running would
-            // otherwise outlive the call that started it.
+            // Joined, so a setup still running cannot outlive the call that started it.
             let _ = setup.join();
             Err(GlassError::Backend(format!(
                 "{who}: the compositor did not answer within {} ms",
@@ -886,7 +882,6 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for State {
 }
 
 // --- wlr-screencopy (manager has no events; frame events drive a capture) ---
-/// The compositor's answer to a `wl_display.sync`: the whole of what a roundtrip waits for.
 impl Dispatch<wl_callback::WlCallback, SyncDone> for State {
     fn event(
         _: &mut Self,
@@ -1201,14 +1196,9 @@ fn bring_up_session(
         // other half to notice, re-map, and see the window appear.
         let start_grace = Instant::now() + start_recovery_after(spec.timeout_ms);
         loop {
-            // Keep the wayland queue serviced, on the loop's own deadline: a fresh budget here
-            // would be spent again on every pass, so a compositor that stopped answering would
-            // hold the bring-up for the budget times the number of passes.
-            // A slice per pass, not the launch's whole budget: this loop has other work — seeing
-            // that sway exited, re-mapping a window Xwayland lost — and one servicing roundtrip
-            // that waited the budget out would stop all of it. The error is dropped rather than
-            // reported: a slice this short is missed by a compositor that is merely loaded, which
-            // is not the fault a launch timeout should name.
+            // A slice per pass, not the launch's whole budget: this loop is also watching for
+            // sway exiting and for a window Xwayland lost. The error is dropped because a slice
+            // this short is missed by a compositor that is merely loaded.
             let _ = roundtrip_until(
                 &conn,
                 &mut queue,
@@ -1287,15 +1277,12 @@ fn bring_up_session(
 
 /// What a gesture has pressed and not yet put back.
 ///
-/// A press is flushed before the wait it may fail in, so the compositor has it and will act on it
-/// when it recovers. The gesture then unwinds through `?` — `glass_core::run_drag` and its
-/// siblings propagate without cleanup — and every step that would have released it is skipped, so
-/// a button or modifier stays down and the next tool call inherits it. Where the unbounded wait
-/// meant nothing ran again, something now does.
+/// A press is flushed before the wait it may fail in, so the compositor still acts on it, while
+/// the gesture unwinds through `?` past every step that would have released it — leaving a button
+/// or modifier down for the next tool call to inherit.
 ///
-/// Tracked per gesture rather than per settle: the settle that fails is usually not the one that
-/// pressed anything (a drag spends its time in `move_to`), and the release that matters is the one
-/// the gesture never reached.
+/// Per gesture, not per settle: the settle that fails is rarely the one that pressed anything (a
+/// drag spends its time in `move_to`).
 #[derive(Default)]
 struct Held {
     button: Option<u32>,
@@ -1304,8 +1291,8 @@ struct Held {
 }
 
 impl Held {
-    /// Put the seat back. Best effort: what failed is the compositor answering, so there is
-    /// nothing to wait for and nothing to do about a flush that fails too.
+    /// Put the seat back, best effort — what failed is the compositor answering, so there is
+    /// nothing to wait for.
     fn release(&mut self, s: &mut ActiveSession) {
         if self.button.is_none() && self.key.is_none() && !self.modifiers {
             return;
@@ -2262,8 +2249,8 @@ mod pure_tests {
         assert_eq!(answered.expect("the answer, not the expired budget"), 7);
     }
 
-    /// A state that answers nothing but the sync a roundtrip rides on — all a bounded roundtrip
-    /// needs, and constructible with no compositor.
+    /// A state carrying nothing but the sync's `Dispatch` impl, which is all the bound needs and
+    /// is constructible with no compositor.
     struct SyncOnly;
 
     impl Dispatch<wl_callback::WlCallback, SyncDone> for SyncOnly {
@@ -2319,8 +2306,8 @@ mod pure_tests {
         );
     }
 
-    /// The three ways a read ends, and only one of them is a fault. Kept apart from the loops
-    /// that act on them so the judgement can be checked without a compositor.
+    /// Kept apart from the loops that act on it so the judgement can be checked without a
+    /// compositor.
     #[test]
     fn only_a_read_that_lost_nothing_is_asked_again() {
         use wayland_client::backend::WaylandError;
@@ -2333,9 +2320,8 @@ mod pure_tests {
         );
     }
 
-    /// The other half of the roundtrip: nothing on a compositor-less CI leg proves the callback is
-    /// wired to the right queue, and a `Dispatch` impl that never fired would turn every request
-    /// into a five-second timeout — visible only where sway runs.
+    /// Nothing on a compositor-less CI leg proves the callback is wired to the right queue, and a
+    /// `Dispatch` impl that never fired would turn every request into a five-second timeout.
     #[test]
     fn a_roundtrip_returns_when_the_compositor_answers_the_sync() {
         let (ours, mut theirs) = UnixStream::pair().expect("socketpair");
@@ -2343,9 +2329,9 @@ mod pure_tests {
         let mut queue = conn.new_event_queue::<SyncOnly>();
 
         let answer = std::thread::spawn(move || {
-            // `wl_callback.done` for object 2 — the display is 1, and the sync's callback is the
-            // first object this connection creates. Written after a beat so it cannot arrive
-            // before the object it names exists.
+            // `wl_callback.done` for object 2: the display is 1 and the sync's callback is the
+            // first object this connection creates. After a beat, so it cannot precede that
+            // object's creation.
             std::thread::sleep(Duration::from_millis(50));
             let done: [u8; 12] = {
                 let mut m = [0u8; 12];
@@ -3448,9 +3434,8 @@ mod session_tests {
         assert_eq!(px[3], 255, "opaque");
     }
 
-    /// How long a suspended compositor stays suspended if nothing resumes it. The bracket
-    /// assertions cap both `CAPTURE_BUDGET` and `COMPOSITOR_SYNC_BUDGET` at 15s, so anything
-    /// bounded by either is over first.
+    /// How long a suspended compositor stays suspended if nothing resumes it. Both budget
+    /// brackets cap at 15s, so anything bounded by either is over first.
     const SUSPENSION: Duration = Duration::from_secs(30);
 
     /// SIGSTOPs a process until dropped: a compositor holding its connection open and answering
@@ -3556,9 +3541,9 @@ mod session_tests {
         );
     }
 
-    /// A gesture fails between a press and the settle after it — a window no test can hit on
-    /// purpose — but the guard that puts the seat back is a `Drop`, and that can be driven. The
-    /// compositor here is healthy: what is under test is the release, not the bound.
+    /// The window a gesture fails in — between a press and the settle after it — cannot be hit on
+    /// purpose, but the guard that puts the seat back is a `Drop`, which can be driven directly
+    /// against a healthy compositor.
     #[test]
     #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn a_gesture_dropped_after_a_press_releases_the_button() {
@@ -3579,21 +3564,20 @@ mod session_tests {
                 mask: 0,
                 held: Held::default(),
             };
-            // Placed first, as `run_drag` does: sway routes a button only to the surface its
-            // pointer is over, and it evaluates that on motion.
+            // Placed first, as `run_drag` does: sway routes a button to the surface its pointer
+            // is over, and re-evaluates that only on motion.
             sink.place(10, 10).expect("the placement");
             sink.button(true).expect("the press");
             // The sink drops here, as it does when `run_drag` propagates a failure.
         }
 
-        // `272 0` is BTN_LEFT released, so waiting for it is the assertion: a gesture that left
-        // the button down never logs it, and the harness fails the test rather than hanging.
+        // `272 0` is BTN_LEFT released, so the wait is the assertion — a gesture that left the
+        // button down never logs it, and the harness fails rather than hangs.
         s.wait_for_log(" 272 0");
     }
 
-    /// glass#402: every request ends in a sync the compositor answers, and waiting for one was
-    /// unbounded — so `glass_click` on a compositor that had gone quiet held the session lock the
-    /// capture, bounded in glass#383, had just stopped holding.
+    /// glass#402: waiting for the sync every request ends in was unbounded, so `glass_click` on a
+    /// quiet compositor held the session lock that glass#383 had just stopped holding.
     #[test]
     #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn input_gives_up_on_a_compositor_that_stops_answering() {
@@ -3615,9 +3599,8 @@ mod session_tests {
             elapsed < SUSPENSION * 2 / 3,
             "the input waited the compositor out rather than bounding it: {elapsed:?}"
         );
-        // The other end of the bracket: every healthy sync answers in microseconds, so a budget
-        // cut to nothing would leave the suite green while every click on a loaded compositor
-        // failed.
+        // The other end of the bracket: healthy syncs answer in microseconds, so a budget cut to
+        // nothing would leave the suite green.
         assert!(
             elapsed >= Duration::from_secs(2),
             "the sync budget is no longer generous enough for a compositor under load: \
@@ -3629,8 +3612,8 @@ mod session_tests {
         );
     }
 
-    /// The keyboard paths reach the compositor through their own settles, and a bound reverted at
-    /// one of them alone would leave `glass_type` or `glass_key` hanging with the rest green.
+    /// Each path settles through its own site, so a bound reverted at one alone would leave
+    /// `glass_type` or `glass_key` hanging with the rest green.
     #[test]
     #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn the_keyboard_paths_give_up_on_a_compositor_that_stops_answering() {
