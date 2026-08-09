@@ -990,12 +990,43 @@ mod tests {
         );
     }
 
+    /// Both messages name GLASS_BWRAP, so asserting only that cannot tell the two apart.
     #[test]
     fn an_absent_bwrap_is_unavailable_and_points_at_the_override() {
         let Availability::Unavailable(msg) = availability_with("bwrap", Resolved::Absent) else {
             panic!("an absent bwrap must not report available");
         };
-        assert!(msg.contains("GLASS_BWRAP"), "actionable message: {msg}");
+        assert!(
+            msg.contains("GLASS_BWRAP") && msg.contains("not found"),
+            "actionable message: {msg}"
+        );
+    }
+
+    /// The arm no other test reaches. Left unpinned, replacing it with `Unavailable` refuses
+    /// every sandboxed launch on every host with the suite still green — each test that really
+    /// launches under bwrap is `#[ignore]`d.
+    #[test]
+    fn a_runnable_bwrap_clears_the_resolution_stage() {
+        assert!(
+            matches!(
+                availability_with("bwrap", Resolved::Found(PathBuf::from("/usr/bin/bwrap"))),
+                Availability::Ok
+            ),
+            "a runnable bwrap must reach the user-namespace probe"
+        );
+    }
+
+    /// The probe's spawn-failure arm, which needs no bwrap on the host: naming the binary is the
+    /// only way the user learns which one glass tried.
+    #[test]
+    fn a_bwrap_that_cannot_be_spawned_reports_why() {
+        let Availability::Unavailable(msg) = userns_availability("/nonexistent/bwrap") else {
+            panic!("a bwrap that cannot be spawned must not report available");
+        };
+        assert!(
+            msg.contains("could not run") && msg.contains("/nonexistent/bwrap"),
+            "must name what it tried to run: {msg}"
+        );
     }
 
     fn make_spec(build: Option<&str>, sandbox: SandboxLevel) -> AppSpec {
