@@ -36,7 +36,7 @@ use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry};
-use wayland_client::protocol::{wl_buffer, wl_output};
+use wayland_client::protocol::{wl_buffer, wl_callback, wl_output};
 
 // ---- MIME types we offer / accept ----
 pub const MIME_UTF8: &str = "text/plain;charset=utf-8";
@@ -104,6 +104,20 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for ClipState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+/// The compositor's answer to a `wl_display.sync`, which is what a bounded roundtrip waits for.
+impl Dispatch<wl_callback::WlCallback, crate::platform::SyncDone> for ClipState {
+    fn event(
+        _: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        done: &crate::platform::SyncDone,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        done.store(true, Ordering::Relaxed);
     }
 }
 
@@ -245,6 +259,20 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for ServeState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+/// The compositor's answer to a `wl_display.sync`, which is what a bounded roundtrip waits for.
+impl Dispatch<wl_callback::WlCallback, crate::platform::SyncDone> for ServeState {
+    fn event(
+        _: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        done: &crate::platform::SyncDone,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        done.store(true, Ordering::Relaxed);
     }
 }
 
@@ -393,15 +421,10 @@ fn open_transfer(socket: &Path) -> Result<Option<OwnedFd>> {
     // get_data_device triggers `data_offer` + `offer*` + `selection` events.
     let _device = manager.get_data_device(&seat, &qh, ());
 
-    // Roundtrip: collect the initial selection advertisement.
-    queue
-        .roundtrip(&mut state)
-        .map_err(|e| GlassError::Backend(format!("clipboard get: roundtrip: {e}")))?;
-
-    // One more roundtrip to make sure pending_mimes have been accumulated.
-    queue
-        .roundtrip(&mut state)
-        .map_err(|e| GlassError::Backend(format!("clipboard get: roundtrip2: {e}")))?;
+    // Collect the initial selection advertisement, then once more so `pending_mimes` has
+    // accumulated.
+    crate::platform::roundtrip(&conn, &mut queue, &mut state, "clipboard get: selection")?;
+    crate::platform::roundtrip(&conn, &mut queue, &mut state, "clipboard get: mime types")?;
 
     let (offer, mimes) = match state.selection.take() {
         Some(v) => v,
@@ -426,13 +449,9 @@ fn open_transfer(socket: &Path) -> Result<Option<OwnedFd>> {
     conn.flush()
         .map_err(|e| GlassError::Backend(format!("clipboard get: flush: {e}")))?;
 
-    // Roundtrip so the compositor can service our receive request and tell the
-    // source to write data. The source's write happens in a separate connection
-    // (either ours or another client), so we just need to let the compositor
-    // route the fd.
-    queue
-        .roundtrip(&mut state)
-        .map_err(|e| GlassError::Backend(format!("clipboard get: roundtrip3: {e}")))?;
+    // Let the compositor service the receive request and tell the source to write. The source
+    // writes on a separate connection, so all this waits for is the fd being routed.
+    crate::platform::roundtrip(&conn, &mut queue, &mut state, "clipboard get: transfer")?;
 
     // The fd is already with the owner, so destroying the offer and dropping `conn` here cannot
     // cut the read short.
@@ -813,11 +832,8 @@ fn serve_loop(
     // Roundtrip so the compositor registers the selection before we return to
     // the caller. This is what makes set_clipboard synchronous: spawn() blocks
     // on the ready signal below, which is only sent after this roundtrip.
-    queue.roundtrip(&mut state).map_err(|e| {
-        let msg = format!("initial roundtrip: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        GlassError::Backend(format!("clipboard serve: {msg}"))
-    })?;
+    crate::platform::roundtrip(&conn, &mut queue, &mut state, "clipboard serve: selection")
+        .inspect_err(|e| signal_ready(&ready, ReadyState::Err(e.to_string())))?;
 
     // Selection is now registered with the compositor — unblock spawn().
     signal_ready(&ready, ReadyState::Ok);
@@ -871,17 +887,23 @@ fn serve_loop(
             )],
             Some(&timeout),
         ) {
-            Ok(n) if n > 0 => {
-                // Data available: read into the queue.
-                if let Err(e) = guard.read() {
+            Ok(n) if n > 0 => match guard.read() {
+                Ok(_) => {}
+                // Half a message, which upstream's own reader retries rather than fails. Breaking
+                // here drops the selection over a split write (glass#402).
+                Err(wayland_client::backend::WaylandError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => {
                     eprintln!("glass-wayland: clipboard serve: read: {e}");
                     break;
                 }
-            }
+            },
             Ok(_) => {
                 // Timeout — loop back and check the stop flag.
                 drop(guard);
             }
+            // A signal arrived and nothing was lost; the stop flag is checked next pass anyway.
+            Err(rustix::io::Errno::INTR) => drop(guard),
             Err(e) => {
                 eprintln!("glass-wayland: clipboard serve: poll: {e}");
                 drop(guard);

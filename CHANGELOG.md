@@ -80,8 +80,15 @@ internal refactors, CI, or test-only changes.
   on with no limit at all. glass serves one tool call at a time, so every later call queued behind
   it. The 5 seconds are now a real limit: a capture the compositor has not answered by then fails
   and names the event that never arrived, and the capture after it is unaffected by the one that
-  gave up. Other calls on a compositor that stays quiet can still wait on it; only captures are
-  bounded so far.
+  gave up.
+- No tool call on the Wayland backend waits on a quiet compositor indefinitely now. Every request
+  glass sends ends by asking the compositor to confirm it has caught up, and that wait had no
+  limit — so a compositor that stopped answering hung `glass_click`, `glass_type`, `glass_scroll`,
+  `glass_list_windows`, a launch, and reading or writing the clipboard, each holding the session
+  and everything queued behind it. The compositor now gets 5 seconds to answer any one of those,
+  and a request it does not answer fails saying which request it was. A clipboard owner also no
+  longer drops the selection when a message arrives split across two reads, which a loaded machine
+  makes likelier.
 - Accessibility now works on Debian/Ubuntu machines that are not x86-64. `glass doctor` said
   `at-spi-bus-launcher present` while every a11y launch on the same machine failed to find it —
   quietly dropping to pixel-only by default, or failing outright with `a11y: true` — because the
