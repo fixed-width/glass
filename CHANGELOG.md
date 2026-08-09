@@ -52,6 +52,26 @@ internal refactors, CI, or test-only changes.
   `glass doctor` no longer ticks `sway ✓` for a sway it could not get a version out of — a
   `GLASS_SWAY` override and the bundled sway skip the version check when glass resolves them, so
   doctor's probe is the first `--version` either is ever put to.
+- A `bwrap` that never answers no longer hangs `glass_start` and `glass doctor` either. Before a
+  sandboxed launch — the default — glass runs bubblewrap once to prove this machine can create an
+  unprivileged user namespace, and waited for that answer with no time limit. The check read-only
+  binds the whole root, so one mount that has stopped responding (an unreachable network
+  filesystem) was enough to stop every launch, and the doctor with it. Bubblewrap now gets 10
+  seconds — generous, since the check does real kernel work and a working-but-slow bubblewrap
+  reported as broken would send you to fix a sandbox that is fine. One that has not answered by
+  then is sent `SIGKILL` and the sandbox reported unavailable, so the launch fails rather than
+  hanging, and `glass doctor` reports how long a bubblewrap that did answer took, since a machine
+  near that limit can pass the doctor and fail the next launch.
+- The fix `glass` offers for an unusable sandbox now matches what is actually wrong with it. Every
+  cause got the same sentence — "install bubblewrap / enable unprivileged user namespaces" — so a
+  machine whose bubblewrap is installed and wedged, or installed and refused by AppArmor, was told
+  to install it, and one with no bubblewrap at all could be told to change an AppArmor setting that
+  was not the problem. Each cause now carries its own: install it, enable user namespaces (naming
+  the AppArmor knob when that is what is holding them), or go looking for the unresponsive mount.
+  `glass doctor` and a failed launch give the same answer for the same machine, and both still say
+  how to launch unconfined. A bubblewrap that exits without a word — killed by the OOM killer, say
+  — is reported with its exit status rather than as a refusal to create a namespace it never
+  mentioned.
 - Accessibility now works on Debian/Ubuntu machines that are not x86-64. `glass doctor` said
   `at-spi-bus-launcher present` while every a11y launch on the same machine failed to find it —
   quietly dropping to pixel-only by default, or failing outright with `a11y: true` — because the

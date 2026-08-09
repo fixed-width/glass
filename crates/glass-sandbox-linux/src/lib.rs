@@ -10,8 +10,9 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
-use glass_core::{AppSpec, Check, CheckStatus, GlassError, Result, SandboxLevel};
+use glass_core::{AppSpec, BoundKind, Check, CheckStatus, GlassError, Result, SandboxLevel};
 use glass_exec_unix::{Resolved, resolve_bin, resolve_on_path_in};
 use glass_sandbox_unix::{abs_token, canon, dir_of};
 
@@ -330,45 +331,136 @@ pub enum Availability {
 
 /// Probe: the configured `bwrap` reachable and an unprivileged user namespace usable.
 pub fn availability() -> Availability {
-    let bin = bwrap_bin();
-    let resolved = resolve_bin(&bin, std::env::var_os("PATH").as_deref());
-    match availability_with(&bin, resolved) {
-        Availability::Ok => userns_availability(&bin),
-        unavailable => unavailable,
+    availability_of(probe(), apparmor_userns_restricted() == Some(true))
+}
+
+/// Pure: what a probe means to a caller that needs only go/no-go.
+fn availability_of(probe: Probed, apparmor_restricted: bool) -> Availability {
+    match probe {
+        Ok(_) => Availability::Ok,
+        Err(no) => Availability::Unavailable(no.message(apparmor_restricted)),
     }
 }
 
-/// Pure: what resolving `bwrap` alone decides — the testable seam (no global env). `Ok` here means
-/// only that a runnable `bwrap` exists; [`availability`] still has to prove it can create a
-/// namespace.
+/// What the probe answered: how long the namespace took to create, or why it could not be.
+type Probed = std::result::Result<Duration, NoSandbox>;
+
+/// Why the sandbox cannot be used, one variant per remedy — telling causes apart by their message
+/// prose is what glass#348 forbids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+enum NoSandbox {
+    /// Nothing to run: no `bwrap` resolved, or the one that did cannot be executed.
+    Missing(String),
+    /// bwrap ran and exited non-zero, including without saying why.
+    Refused(String),
+    /// bwrap had not exited when its budget ran out, so it was sent SIGKILL — which one wedged in
+    /// the kernel does not take until it surfaces. Only the direct child is signalled; anything it
+    /// had already forked outlives it.
+    TimedOut(String),
+    /// The call could not be completed, so nothing about namespaces was learned. bwrap may well
+    /// have run: one that exited leaving something holding its output pipe lands here too.
+    Unfinished(String),
+}
+
+const INSTALL_BWRAP: &str = "install `bubblewrap`, or point GLASS_BWRAP at a copy this machine can \
+     execute; or run with sandbox:\"off\" (GLASS_SANDBOX=off) to launch unconfined";
+const CHECK_THE_MOUNTS: &str = "the probe read-only-binds the whole root, so a mount that has \
+     stopped responding (an unreachable network filesystem) can hold it there; check for one, or \
+     run with sandbox:\"off\" (GLASS_SANDBOX=off) to launch unconfined";
+const NOTHING_LEARNED: &str = "nothing here says the sandbox is broken — glass could not finish \
+     asking; try again, or run with sandbox:\"off\" (GLASS_SANDBOX=off) to launch unconfined";
+
+impl NoSandbox {
+    fn why(&self) -> &str {
+        match self {
+            NoSandbox::Missing(why)
+            | NoSandbox::Refused(why)
+            | NoSandbox::TimedOut(why)
+            | NoSandbox::Unfinished(why) => why,
+        }
+    }
+
+    /// The fix, tailored to the cause. A bubblewrap that said nothing gets neither stock remedy:
+    /// it is installed, and AppArmor's knob fails `unshare` with EPERM at once.
+    fn remedy(&self, apparmor_restricted: bool) -> &'static str {
+        match self {
+            NoSandbox::Missing(_) => INSTALL_BWRAP,
+            NoSandbox::Refused(_) => refusal_remedy(apparmor_restricted),
+            NoSandbox::TimedOut(_) => CHECK_THE_MOUNTS,
+            NoSandbox::Unfinished(_) => NOTHING_LEARNED,
+        }
+    }
+
+    /// Cause and fix in one string, for the launch path's single error message.
+    fn message(&self, apparmor_restricted: bool) -> String {
+        format!("{} — {}", self.why(), self.remedy(apparmor_restricted))
+    }
+}
+
+/// Resolve `bwrap` and put it to the user-namespace question. The only caller that supplies
+/// [`USERNS_PROBE_BUDGET`]; `tests/bwrap_probe_bound.rs` is what holds that wiring in place.
+fn probe() -> Probed {
+    let bin = bwrap_bin();
+    let resolved = resolve_bin(&bin, std::env::var_os("PATH").as_deref());
+    userns_probe(&resolved_bwrap(&bin, resolved)?, USERNS_PROBE_BUDGET)
+}
+
+/// Pure: what resolving `bwrap` alone decides — the testable seam (no global env). `Ok` carries the
+/// file to probe; that it is runnable is all resolution proves.
 ///
 /// `bin` is the configured name, needed for the [`Resolved::Absent`] message because that variant
 /// carries no path.
-fn availability_with(bin: &str, bwrap: Resolved) -> Availability {
+fn resolved_bwrap(bin: &str, bwrap: Resolved) -> std::result::Result<PathBuf, NoSandbox> {
     match bwrap {
-        Resolved::Found(_) => Availability::Ok,
-        Resolved::NotExecutable(p) => Availability::Unavailable(format!(
-            "bubblewrap ({}) is not executable (chmod +x it, or set GLASS_BWRAP to a runnable binary)",
+        Resolved::Found(p) => Ok(p),
+        Resolved::NotExecutable(p) => Err(NoSandbox::Missing(format!(
+            "bubblewrap ({}) is not executable",
             p.display()
-        )),
-        Resolved::Absent => Availability::Unavailable(format!(
-            "bubblewrap ({bin}) not found (set GLASS_BWRAP to its path)"
-        )),
+        ))),
+        Resolved::Absent => Err(NoSandbox::Missing(format!("bubblewrap ({bin}) not found"))),
     }
 }
 
-/// Run `bwrap` to prove an unprivileged user namespace can actually be created here.
-fn userns_availability(bin: &str) -> Availability {
-    match Command::new(bin)
-        .args(["--unshare-user", "--ro-bind", "/", "/", "--", "true"])
-        .output()
-    {
-        Ok(o) if o.status.success() => Availability::Ok,
-        Ok(o) => Availability::Unavailable(format!(
-            "bubblewrap cannot create a user namespace: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
+/// How long `bwrap` gets to answer the user-namespace question.
+///
+/// The probe does real kernel work: it creates an unprivileged user namespace and `--ro-bind / /`s
+/// the root — the same bind `wrap_argv` emits for a real launch, so a mount that hangs the probe
+/// would have hung the launch.
+const USERNS_PROBE_BUDGET: Duration = Duration::from_secs(10);
+
+/// A shrunken budget is the failure no test can see: every fixture answers in milliseconds, so the
+/// suite stays green while no sandboxed launch on a loaded host works at all. The ceiling keeps
+/// `tests/bwrap_probe_bound.rs`'s 15s bound discriminating.
+const _: () = assert!(USERNS_PROBE_BUDGET.as_secs() >= 5 && USERNS_PROBE_BUDGET.as_secs() <= 15);
+
+/// Run `bwrap` to prove an unprivileged user namespace can actually be created here, returning how
+/// long it took to say so.
+///
+/// A timeout is not stepped over: the launch fails closed rather than hand the app to a bwrap that
+/// never answered.
+fn userns_probe(bwrap: &Path, budget: Duration) -> Probed {
+    let mut cmd = Command::new(bwrap);
+    cmd.args(["--unshare-user", "--ro-bind", "/", "/", "--", "true"]);
+    let at = bwrap.display();
+    let started = Instant::now();
+    match glass_core::run_bounded(&mut cmd, budget, "bwrap:userns") {
+        Ok(o) if o.status.success() => Ok(started.elapsed()),
+        Ok(o) => Err(NoSandbox::Refused(
+            match String::from_utf8_lossy(&o.stderr).trim() {
+                // Nothing said establishes nothing about namespaces — a signal death (the OOM
+                // killer, a segfault) lands here.
+                "" => format!("bubblewrap ({at}) failed without saying why ({})", o.status),
+                said => format!("bubblewrap ({at}) cannot create a user namespace: {said}"),
+            },
         )),
-        Err(e) => Availability::Unavailable(format!("could not run {bin}: {e}")),
+        // The runner's own message carries what bwrap said before it wedged, and whether the kill
+        // was collected — a bwrap that SIGKILL could not reach is itself evidence for the mount the
+        // remedy asks the reader to go find.
+        Err(e) if e.bound() == Some(BoundKind::TimedOut) => {
+            Err(NoSandbox::TimedOut(format!("bubblewrap ({at}): {e}")))
+        }
+        Err(e) => Err(NoSandbox::Unfinished(format!("bubblewrap ({at}): {e}"))),
     }
 }
 
@@ -381,43 +473,35 @@ fn apparmor_userns_restricted() -> Option<bool> {
         .map(|s| s.trim() == "1")
 }
 
-/// Pure: the remedy for an unavailable sandbox, tailored to whether AppArmor's
-/// unprivileged-userns restriction is the likely cause (Ubuntu 23.10+).
-fn unavailable_remedy(apparmor_restricted: bool) -> String {
+/// Pure: the fix for a bwrap that ran and refused, tailored to whether AppArmor's
+/// unprivileged-userns restriction is the likely cause (Ubuntu 23.10+). It never mentions
+/// installing bubblewrap: one that answered is installed.
+fn refusal_remedy(apparmor_restricted: bool) -> &'static str {
     if apparmor_restricted {
         "this system restricts unprivileged user namespaces via AppArmor \
          (kernel.apparmor_restrict_unprivileged_userns=1), which bubblewrap requires. Allow them \
          with `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist via a file \
-         in /etc/sysctl.d/), or run with sandbox:\"off\""
-            .into()
+         in /etc/sysctl.d/), or run with sandbox:\"off\" (GLASS_SANDBOX=off)"
     } else {
-        "install `bubblewrap` (or set GLASS_BWRAP to its path) and enable unprivileged user \
-         namespaces (e.g. `sysctl kernel.unprivileged_userns_clone=1`), or run with sandbox:\"off\""
-            .into()
+        "enable unprivileged user namespaces (e.g. `sysctl kernel.unprivileged_userns_clone=1`), \
+         or run with sandbox:\"off\" (GLASS_SANDBOX=off) to launch unconfined"
     }
 }
 
-/// Pure: map probed facts to a doctor check. `bin` is the resolved bubblewrap binary;
-/// `apparmor_restricted` tailors the remedy to the AppArmor userns restriction.
-fn sandbox_checks(
-    available: bool,
-    bin: &str,
-    why: Option<String>,
-    apparmor_restricted: bool,
-) -> Vec<Check> {
-    let check = if available {
-        Check::new(
-            "sandbox (bubblewrap)",
+/// Pure: map probed facts to a doctor check, which prints cause and fix in separate columns.
+/// `bin` is the configured name, not the resolved path.
+fn sandbox_checks(bin: &str, probe: Probed, apparmor_restricted: bool) -> Vec<Check> {
+    let name = "sandbox (bubblewrap)";
+    let check = match probe {
+        // The elapsed time is the only warning of a host near the budget, where doctor and the next
+        // launch can disagree about the same machine.
+        Ok(took) => Check::new(
+            name,
             CheckStatus::Ok,
-            format!("{bin} present; user namespaces usable"),
-        )
-    } else {
-        Check::new(
-            "sandbox (bubblewrap)",
-            CheckStatus::Fail,
-            why.unwrap_or_else(|| "unavailable".into()),
-        )
-        .with_remedy(unavailable_remedy(apparmor_restricted))
+            format!("{bin} present; user namespaces usable (answered in {took:?})"),
+        ),
+        Err(no) => Check::new(name, CheckStatus::Fail, no.why())
+            .with_remedy(no.remedy(apparmor_restricted)),
     };
     vec![check]
 }
@@ -426,12 +510,7 @@ fn sandbox_checks(
 pub fn checks() -> Vec<Check> {
     let bin = bwrap_bin();
     let apparmor_restricted = apparmor_userns_restricted() == Some(true);
-    match availability() {
-        Availability::Ok => sandbox_checks(true, &bin, None, apparmor_restricted),
-        Availability::Unavailable(why) => {
-            sandbox_checks(false, &bin, Some(why), apparmor_restricted)
-        }
-    }
+    sandbox_checks(&bin, probe(), apparmor_restricted)
 }
 
 #[cfg(test)]
@@ -938,14 +1017,45 @@ mod tests {
         );
     }
 
+    /// Every way the sandbox can turn out unusable, for the properties that hold across all of
+    /// them. Each carries a cause a real probe would produce.
+    fn every_cause() -> Vec<NoSandbox> {
+        vec![
+            NoSandbox::Missing("bubblewrap (bwrap) not found".into()),
+            NoSandbox::Refused(
+                "bubblewrap (/usr/bin/bwrap) cannot create a user namespace: \
+                                setting up uid map: Permission denied"
+                    .into(),
+            ),
+            NoSandbox::TimedOut(
+                "bubblewrap (/usr/bin/bwrap): bwrap:userns: no answer within 10s".into(),
+            ),
+            NoSandbox::Unfinished(
+                "bubblewrap (/usr/bin/bwrap): bwrap:userns: could not check whether the process \
+                 had exited"
+                    .into(),
+            ),
+        ]
+    }
+
     #[test]
     fn doctor_reports_ok_and_failure() {
         use glass_core::CheckStatus;
-        let ok = sandbox_checks(true, "bwrap", None, false);
+        let ok = sandbox_checks("bwrap", Ok(Duration::from_millis(9)), false);
         assert_eq!(ok[0].status, CheckStatus::Ok);
-        let bad = sandbox_checks(false, "bwrap", Some("bwrap not found".into()), false);
-        assert_eq!(bad[0].status, CheckStatus::Fail);
-        assert!(bad[0].remedy.is_some());
+        for no in every_cause() {
+            let bad = sandbox_checks("bwrap", Err(no.clone()), false);
+            assert_eq!(bad[0].status, CheckStatus::Fail, "{no:?}");
+            assert_eq!(bad[0].detail, no.why(), "{no:?}");
+            assert!(bad[0].remedy.is_some(), "{no:?}");
+        }
+    }
+
+    /// The elapsed time is the only sign of a host near the budget.
+    #[test]
+    fn doctor_says_how_long_the_probe_took() {
+        let ok = sandbox_checks("bwrap", Ok(Duration::from_millis(1250)), false);
+        assert!(ok[0].detail.contains("1.25s"), "{:?}", ok[0]);
     }
 
     #[test]
@@ -954,9 +1064,8 @@ mod tests {
         // "setting up uid map: Permission denied"). When that's the cause, the remedy must
         // name the exact knob; otherwise it must not falsely claim AppArmor.
         let restricted = sandbox_checks(
-            false,
             "bwrap",
-            Some("uid map: Permission denied".into()),
+            Err(NoSandbox::Refused("uid map: Permission denied".into())),
             true,
         );
         let r = restricted[0].remedy.clone().unwrap();
@@ -965,11 +1074,92 @@ mod tests {
             "got: {r}"
         );
 
-        let generic = sandbox_checks(false, "bwrap", Some("bwrap not found".into()), false);
+        let generic = sandbox_checks(
+            "bwrap",
+            Err(NoSandbox::Refused("uid map: Permission denied".into())),
+            false,
+        );
         let g = generic[0].remedy.clone().unwrap();
         assert!(
             !g.to_lowercase().contains("apparmor"),
             "generic remedy must not claim AppArmor: {g}"
+        );
+    }
+
+    /// A bubblewrap that answered is installed, whatever it answered.
+    #[test]
+    fn a_refusal_is_never_answered_with_install_it() {
+        for apparmor in [false, true] {
+            let r = refusal_remedy(apparmor);
+            assert!(
+                !r.to_lowercase().contains("install"),
+                "apparmor={apparmor}: {r}"
+            );
+        }
+    }
+
+    /// A bubblewrap that is not there cannot be refusing anything, so AppArmor's knob is not the
+    /// fix — and a restricted host with no bwrap installed is reachable.
+    #[test]
+    fn an_absent_bwrap_is_never_blamed_on_apparmor() {
+        for apparmor in [false, true] {
+            let checks = sandbox_checks(
+                "bwrap",
+                Err(NoSandbox::Missing("bubblewrap (bwrap) not found".into())),
+                apparmor,
+            );
+            let r = checks[0].remedy.clone().unwrap();
+            assert!(
+                !r.to_lowercase().contains("apparmor") && r.contains("install"),
+                "apparmor={apparmor}: {r}"
+            );
+        }
+    }
+
+    /// A bubblewrap that said nothing is installed and may well work, so neither stock remedy fits.
+    /// Asserted as the absence of that advice — a remedy that merely appended a clause to either
+    /// would pass an inequality.
+    #[test]
+    fn a_silent_bwrap_is_answered_with_neither_stock_remedy() {
+        for apparmor in [false, true] {
+            let checks = sandbox_checks(
+                "bwrap",
+                Err(NoSandbox::TimedOut("bwrap: no answer within 10s".into())),
+                apparmor,
+            );
+            assert_eq!(checks[0].status, glass_core::CheckStatus::Fail);
+            let r = checks[0].remedy.clone().unwrap().to_lowercase();
+            assert!(!r.contains("install"), "apparmor={apparmor}: {r}");
+            assert!(!r.contains("apparmor"), "apparmor={apparmor}: {r}");
+            assert!(r.contains("mount"), "must name what to look for: {r}");
+        }
+    }
+
+    /// Whatever is wrong with the sandbox, a launch can decline it — and the launch path can only
+    /// say so if the message it is handed already does.
+    #[test]
+    fn every_unusable_sandbox_reaches_the_launch_path_with_its_own_fix() {
+        for no in every_cause() {
+            for apparmor in [false, true] {
+                let Availability::Unavailable(msg) = availability_of(Err(no.clone()), apparmor)
+                else {
+                    panic!("{no:?} must not clear a sandboxed launch");
+                };
+                assert!(msg.starts_with(no.why()), "the cause is not remade: {msg}");
+                assert!(msg.contains(no.remedy(apparmor)), "no fix travelled: {msg}");
+                assert!(msg.contains("sandbox:\"off\""), "no way to launch: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_proven_namespace_clears_the_launch_path() {
+        assert!(
+            matches!(
+                availability_of(Ok(Duration::from_millis(9)), false),
+                Availability::Ok
+            ),
+            "a bwrap that created a namespace must not refuse the launch"
         );
     }
 
@@ -979,54 +1169,187 @@ mod tests {
     /// stops forking a binary to learn what a `stat` answers.
     #[test]
     fn a_non_executable_bwrap_is_unavailable_and_says_so() {
-        let Availability::Unavailable(msg) = availability_with(
+        let Err(no) = resolved_bwrap(
             "/opt/bin/bwrap",
             Resolved::NotExecutable(PathBuf::from("/opt/bin/bwrap")),
         ) else {
-            panic!("a non-executable bwrap must not report available");
+            panic!("a non-executable bwrap must not be probed");
         };
         assert!(
-            msg.contains("/opt/bin/bwrap") && msg.contains("not executable"),
-            "must name the file and say why: {msg}"
+            no.why().contains("/opt/bin/bwrap") && no.why().contains("not executable"),
+            "must name the file and say why: {no:?}"
+        );
+        assert!(
+            no.remedy(false).contains("GLASS_BWRAP"),
+            "the override is the fix for a bwrap glass cannot run: {no:?}"
         );
     }
 
-    /// Both messages name GLASS_BWRAP, so asserting only that cannot tell the two apart.
+    /// Both causes are a bubblewrap glass has nothing to run, so asserting the variant alone cannot
+    /// tell them apart.
     #[test]
-    fn an_absent_bwrap_is_unavailable_and_points_at_the_override() {
-        let Availability::Unavailable(msg) = availability_with("bwrap", Resolved::Absent) else {
-            panic!("an absent bwrap must not report available");
+    fn an_absent_bwrap_is_unavailable_and_says_so() {
+        let Err(no) = resolved_bwrap("bwrap", Resolved::Absent) else {
+            panic!("an absent bwrap must not be probed");
         };
         assert!(
-            msg.contains("GLASS_BWRAP") && msg.contains("not found"),
-            "actionable message: {msg}"
+            no.why().contains("bwrap") && no.why().contains("not found"),
+            "actionable message: {no:?}"
         );
     }
 
-    /// The arm no other test reaches: replacing it with `Unavailable` refuses every sandboxed
-    /// launch on every host and the suite stays green, since each test that really launches
-    /// under bwrap is `#[ignore]`d.
+    /// The arm no other test reaches: making it an error refuses every sandboxed launch on every
+    /// host and the suite stays green, since each test that really launches under bwrap is
+    /// `#[ignore]`d.
     #[test]
     fn a_runnable_bwrap_clears_the_resolution_stage() {
-        assert!(
-            matches!(
-                availability_with("bwrap", Resolved::Found(PathBuf::from("/usr/bin/bwrap"))),
-                Availability::Ok
-            ),
-            "a runnable bwrap must reach the user-namespace probe"
+        assert_eq!(
+            resolved_bwrap("bwrap", Resolved::Found(PathBuf::from("/usr/bin/bwrap"))),
+            Ok(PathBuf::from("/usr/bin/bwrap")),
+            "a runnable bwrap must reach the user-namespace probe, by its resolved path"
         );
     }
 
     /// The probe's spawn-failure arm, which needs no bwrap on the host: naming the binary is the
-    /// only way the user learns which one glass tried.
+    /// only way the user learns which one glass tried. Not [`NoSandbox::Refused`] — nothing here
+    /// says anything about namespaces, so the remedy must not send the user to enable them.
     #[test]
     fn a_bwrap_that_cannot_be_spawned_reports_why() {
-        let Availability::Unavailable(msg) = userns_availability("/nonexistent/bwrap") else {
+        let Err(no) = userns_probe(Path::new("/nonexistent/bwrap"), USERNS_PROBE_BUDGET) else {
             panic!("a bwrap that cannot be spawned must not report available");
         };
         assert!(
-            msg.contains("could not run") && msg.contains("/nonexistent/bwrap"),
-            "must name what it tried to run: {msg}"
+            matches!(no, NoSandbox::Unfinished(_)),
+            "a call that never happened is not a refusal: {no:?}"
+        );
+        assert!(
+            no.why().contains("/nonexistent/bwrap"),
+            "must name what it tried to run: {no:?}"
+        );
+    }
+
+    /// How long the never-answering fixture lives if nothing kills it. Whole seconds because it is
+    /// interpolated into `sleep`, and far past any budget these tests pass, so a lost bound fails
+    /// them rather than passing.
+    const HUNG_FIXTURE_SECS: u64 = 30;
+
+    /// Budget for the test that wants a timeout. Short enough to keep the suite quick; the elapsed
+    /// assertion allows ten times it, so a loaded machine does not read a bound that fired as one
+    /// that did not.
+    const HUNG_PROBE_BUDGET: Duration = Duration::from_millis(300);
+
+    /// A fake `bwrap` running `body`, which refuses any argv but the probe's own.
+    ///
+    /// Without that guard, dropping the probe's arguments would leave every test here green while
+    /// glass asked a real bubblewrap a different question entirely. `$#` as well as `$*`, which
+    /// cannot tell six arguments from one containing spaces.
+    fn fake_bwrap(dir: &Path, body: &str) -> PathBuf {
+        let bin = dir.join("bwrap");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n[ $# -eq 6 ] || exit 3\n\
+                 [ \"$*\" = '--unshare-user --ro-bind / / -- true' ] || exit 3\n{body}"
+            ),
+        )
+        .expect("write the fake bwrap");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        wait_until_executable(&bin);
+        bin
+    }
+
+    /// `exec` of a just-written file fails ETXTBSY while any process still holds it open for
+    /// writing — including a sibling test's child, which inherits every fd across the fork and
+    /// drops them only at its own exec. This binary spawns constantly, so without this the probe
+    /// tests fail as `Unfinished` about half the time. Spawning is the only way to ask; the argv
+    /// guard rejects this call, which is all this needs.
+    fn wait_until_executable(bin: &Path) {
+        /// ETXTBSY. `ErrorKind::ExecutableFileBusy` would say it, but only on the io_error_more
+        /// nightly feature.
+        const TEXT_FILE_BUSY: i32 = 26;
+        for _ in 0..100 {
+            match Command::new(bin).arg("--ready").output() {
+                Err(e) if e.raw_os_error() == Some(TEXT_FILE_BUSY) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// glass#398: the probe ran through `Command::output()`, which waits for the child however long
+    /// it takes, so a `bwrap` wedged on a mount under `/` hung `glass_start` and `glass doctor`
+    /// with nothing to recover from.
+    #[test]
+    fn a_bwrap_that_never_answers_is_bounded_and_named() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `exec`, so the killed pid is the sleeper: a forked one would be orphaned and hold both
+        // output pipes for the rest of its 30s, past the end of the test.
+        let bin = fake_bwrap(dir.path(), &format!("exec sleep {HUNG_FIXTURE_SECS}\n"));
+
+        let started = Instant::now();
+        let Err(no) = userns_probe(&bin, HUNG_PROBE_BUDGET) else {
+            panic!("a bwrap that never answered has proven no namespace");
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < HUNG_PROBE_BUDGET * 10,
+            "the budget it was passed is not the one it waited: {elapsed:?}"
+        );
+        assert!(
+            matches!(no, NoSandbox::TimedOut(_)),
+            "a bwrap that ran and said nothing has not refused: {no:?}"
+        );
+        assert!(
+            no.why().contains(bin.to_str().unwrap()) && no.why().contains("no answer within"),
+            "must name the binary and what it did: {no:?}"
+        );
+    }
+
+    /// The arm every sandboxed launch on a healthy host takes.
+    #[test]
+    fn a_bwrap_that_answers_clears_the_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = fake_bwrap(dir.path(), "exit 0\n");
+        let took = userns_probe(&bin, USERNS_PROBE_BUDGET)
+            .expect("a bwrap that answered the probe's own question must clear it");
+        assert!(took < USERNS_PROBE_BUDGET, "{took:?}");
+    }
+
+    /// What bubblewrap itself says is the actionable part — "cannot create a user namespace" alone
+    /// does not distinguish an AppArmor refusal from a kernel without the feature.
+    #[test]
+    fn a_bwrap_that_refuses_the_namespace_repeats_what_it_said() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = fake_bwrap(
+            dir.path(),
+            "echo 'setting up uid map: Permission denied' >&2\nexit 1\n",
+        );
+        let Err(no) = userns_probe(&bin, USERNS_PROBE_BUDGET) else {
+            panic!("a bwrap that refused must not report available");
+        };
+        assert!(
+            no.why().contains("cannot create a user namespace") && no.why().contains("uid map"),
+            "must carry bwrap's own words: {no:?}"
+        );
+    }
+
+    /// A bwrap killed by a signal (the OOM killer, a segfault) exits non-zero saying nothing.
+    /// Reporting that as "cannot create a user namespace: " asserts a cause nothing established.
+    #[test]
+    fn a_bwrap_that_dies_without_a_word_is_not_reported_as_a_namespace_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = fake_bwrap(dir.path(), "exit 1\n");
+        let Err(no) = userns_probe(&bin, USERNS_PROBE_BUDGET) else {
+            panic!("a bwrap that exited non-zero must not report available");
+        };
+        assert!(
+            !no.why().contains("cannot create a user namespace"),
+            "silence is not a refusal to create a namespace: {no:?}"
+        );
+        assert!(
+            no.why().contains("exit status: 1"),
+            "the status is all that is left to report: {no:?}"
         );
     }
 

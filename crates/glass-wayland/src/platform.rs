@@ -963,12 +963,12 @@ fn ensure_sandbox_available(
     }
     match probe() {
         glass_sandbox_linux::Availability::Ok => Ok(()),
-        glass_sandbox_linux::Availability::Unavailable(why) => {
-            Err(GlassError::SandboxUnavailable(format!(
-                "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
-                 sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
-            )))
-        }
+        // The fix travels with the cause: only the probe knows whether bubblewrap is missing,
+        // refusing, or wedged. Telling a user to install one that is installed sends them past the
+        // mount holding it.
+        glass_sandbox_linux::Availability::Unavailable(why) => Err(GlassError::SandboxUnavailable(
+            format!("{why}. See `glass-mcp doctor`."),
+        )),
     }
 }
 
@@ -2136,8 +2136,10 @@ mod pure_tests {
         })
         .expect_err("fail closed rather than launching unconfined");
         assert!(matches!(err, GlassError::SandboxUnavailable(_)), "{err}");
+        // The cause and its fix are the probe's to write — glass-sandbox-linux asserts that every
+        // one of them offers `sandbox:"off"`.
         assert!(err.to_string().contains("no bwrap here"), "{err}");
-        assert!(err.to_string().contains("sandbox:\"off\""), "{err}");
+        assert!(err.to_string().contains("glass-mcp doctor"), "{err}");
     }
 
     #[test]
