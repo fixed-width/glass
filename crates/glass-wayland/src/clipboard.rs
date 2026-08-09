@@ -676,11 +676,11 @@ impl ClipboardOwner {
             stop.store(true, Ordering::Relaxed);
             // Deliberately not joined: timing out means the thread hasn't reached the loop that
             // reads `stop`, so a join would wait on the wedged compositor with no bound.
-            // Detaching is self-cleaning in all three of the outcomes left to it: the setup fails
-            // and the thread exits; the setup finishes and the `stop` check `serve_loop` makes
-            // before `create_data_source` returns without ever taking the selection; or `stop`
-            // arrives after that check and the first pump iteration breaks out. Drop that check
-            // and this becomes a thread that unwedges later and steals a live owner's selection.
+            // Detaching is self-cleaning: the setup fails and the thread exits; the setup
+            // finishes and the `stop` check `serve_loop` makes before `create_data_source`
+            // returns without ever taking the selection; or `stop` arrives after that check and
+            // the first pump iteration breaks out. Drop that check and it can unwedge later and
+            // steal a live owner's selection.
             if handle.is_finished() && handle.join().is_err() {
                 // Finished without ever signalling: it panicked during setup. Reporting that as a
                 // timeout would send the reader looking for a slow compositor.
