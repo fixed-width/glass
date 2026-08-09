@@ -507,10 +507,9 @@ mod tests {
 
     #[test]
     fn available_is_ok_when_both_binaries_are_runnable() {
-        let launcher = dir_with("at-spi-bus-launcher", 0o755);
         let daemon = dir_with("dbus-daemon", 0o755);
         available_with(
-            Resolved::Found(launcher.path().join("at-spi-bus-launcher")),
+            Resolved::Found(PathBuf::from("/bin/true")),
             daemon
                 .path()
                 .join("dbus-daemon")

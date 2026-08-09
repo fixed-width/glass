@@ -30,7 +30,8 @@ internal refactors, CI, or test-only changes.
   `at-spi-bus-launcher` you had pointed `GLASS_ATSPI_LAUNCHER` at was reported as an at-spi2-core
   package you needed to install, with accessibility quietly falling back to pixel-only. Each of
   these now names the file and says it is not executable, and the doctor's `[a11y]` check no longer
-  reports a launcher present in the same run that reports it missing. The check is the kernel's own
+  counts a launcher it cannot spawn as present — one cause of a single run reporting that launcher
+  both present and missing. The check is the kernel's own
   — a binary you are not permitted to execute is not runnable even with an execute bit set for
   somebody else. A tool named by a bare name is still searched along `$PATH` and one that cannot be
   run is stepped over, so a good copy later on `$PATH` is used, as your shell would; the private
