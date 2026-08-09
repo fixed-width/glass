@@ -13,16 +13,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-/// Cap on how long `get()` waits for the selection owner to finish writing the
-/// transfer pipe. The owner is an arbitrary external app, so a stuck/slow one
-/// must not hang the server (the X11 backend guards the analogous read with 1s).
+/// Cap on a whole clipboard read: the connection, the compositor's answers, and the transfer from
+/// the owner. The owner is an arbitrary external app, so a stuck or slow one must not hang the
+/// server (the X11 backend guards the analogous read with 1s).
 const CLIP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long `set_clipboard` waits for the serving thread to register the selection — and, since
-/// the thread is detached when it expires, the whole budget that thread's own setup has to fit
-/// inside. A setup allowed longer would answer after the caller had stopped listening, leaving
-/// the named failure on a channel nobody reads.
+/// How long `set_clipboard` waits for the serving thread to register the selection. The thread is
+/// detached when this expires.
 const SPAWN_READY_BUDGET: Duration = Duration::from_secs(2);
+
+/// What the serving thread's own setup gets. Strictly under [`SPAWN_READY_BUDGET`], so a setup
+/// that cannot finish says so to a caller still listening — tie the two and which of them reports
+/// is decided by a few microseconds of scheduling.
+const SERVE_SETUP_BUDGET: Duration = Duration::from_millis(1750);
+
+const _: () = assert!(
+    SERVE_SETUP_BUDGET.as_millis() < SPAWN_READY_BUDGET.as_millis(),
+    "the serving thread's setup must fail while its caller is still waiting to hear about it"
+);
 
 use wayland_client::protocol::wl_seat;
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
@@ -380,12 +388,14 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ServeState {
 /// event queue, does a roundtrip to collect the selection offer, then reads the
 /// pipe transfer.
 pub fn get(socket: &Path) -> Result<String> {
-    let Some(read_end) = open_transfer(socket)? else {
+    // One deadline for the whole paste — connecting, the syncs, and the read from the owner — so
+    // what the session lock is held for is what the constant says, rather than its sum over the
+    // steps.
+    let deadline = Instant::now() + CLIP_READ_TIMEOUT;
+    let Some(read_end) = open_transfer(socket, deadline)? else {
         return Ok(String::new());
     };
-    // Read to EOF from the read end, bounded by a deadline so a misbehaving
-    // selection owner can't hang us forever (see CLIP_READ_TIMEOUT).
-    let buf = read_to_eof_bounded(read_end, CLIP_READ_TIMEOUT)?;
+    let buf = read_to_eof_bounded(read_end, deadline.saturating_duration_since(Instant::now()))?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -395,10 +405,7 @@ pub fn get(socket: &Path) -> Result<String> {
 /// Returning means the transfer has been requested and the compositor has routed the fd, not that
 /// the owner has dispatched the `Send` yet: [`get`] is this plus the bounded read, and a test that
 /// wants the owner stuck mid-write is this plus a wait for the first bytes.
-fn open_transfer(socket: &Path) -> Result<Option<OwnedFd>> {
-    // One deadline for the whole read, not one per step: the point of the bound is what the
-    // session lock is held for, and this holds it from the first connect to the last sync.
-    let deadline = Instant::now() + CLIP_READ_TIMEOUT;
+fn open_transfer(socket: &Path, deadline: Instant) -> Result<Option<OwnedFd>> {
     let (conn, globals, mut queue): (_, _, EventQueue<ClipState>) =
         crate::platform::connect_bounded(
             socket,
@@ -788,9 +795,7 @@ fn serve_loop(
     stop: Arc<AtomicBool>,
     ready: Arc<(Mutex<ReadyState>, Condvar)>,
 ) -> Result<()> {
-    // Inside the readiness wait `spawn` gives this thread: a setup that took longer would have
-    // its answer arrive after the caller had already given up on it.
-    let deadline = Instant::now() + SPAWN_READY_BUDGET;
+    let deadline = Instant::now() + SERVE_SETUP_BUDGET;
     let (conn, globals, mut queue): (_, _, EventQueue<ServeState>) =
         crate::platform::connect_bounded(
             &socket,
@@ -798,7 +803,12 @@ fn serve_loop(
             "clipboard serve: setup",
         )
         .map_err(|e| {
-            let msg = e.to_string();
+            // The bare cause, not the rendered error: `spawn` prefixes its own, and two variant
+            // names in one sentence say nothing the first did not.
+            let msg = match e {
+                GlassError::Backend(m) => m,
+                other => other.to_string(),
+            };
             signal_ready(&ready, ReadyState::Err(msg.clone()));
             GlassError::Backend(msg)
         })?;
@@ -1026,7 +1036,7 @@ mod tests {
         // write that never blocks, so a smaller one would pass with no bound at all.
         let owner = ClipboardOwner::spawn(socket.clone(), "x".repeat(256 * 1024)).expect("spawn");
 
-        let transfer = open_transfer(&socket)
+        let transfer = open_transfer(&socket, std::time::Instant::now() + CLIP_READ_TIMEOUT)
             .expect("open a transfer")
             .expect("a live owner offers text to transfer");
         // Wait for the first bytes: they are what says the serving thread is past its stop check
@@ -1134,10 +1144,12 @@ mod tests {
         assert!(matches!(err, GlassError::Backend(_)), "{err}");
     }
 
-    /// A compositor that accepts the connection and then never answers is what the 2 s readiness
-    /// bound is for. Joining the setup thread there waits on the wedged peer with no bound at
-    /// all, so spawn has to return without it — every tool call is behind the session lock this
-    /// holds.
+    /// A compositor that accepts the connection and then never answers is what the readiness bound
+    /// is for. Joining the setup thread there waits on the wedged peer with no bound at all, so
+    /// spawn has to return without it — every tool call is behind the session lock this holds.
+    ///
+    /// The setup's own budget is the shorter of the two, so what the caller hears is the step that
+    /// failed rather than the fact that something did.
     #[test]
     fn an_owner_gives_up_on_a_peer_that_accepts_and_never_answers() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1171,7 +1183,7 @@ mod tests {
             "spawn took only {elapsed:?}, expected it to wait close to its own 2 s bound"
         );
         let msg = outcome.expect("a peer that never answers is not a served clipboard");
-        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.contains("clipboard serve: setup"), "{msg}");
 
         // Closing the server side lets the detached setup thread fail and exit.
         drop(

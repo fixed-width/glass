@@ -634,6 +634,13 @@ const _: () = assert!(
 /// re-mapping — and one pass that waited out the whole launch would stop it looking.
 const COMPOSITOR_SERVICE_SLICE: Duration = Duration::from_millis(250);
 
+/// Short enough that a loop spending one per pass still gets on with its other work, long enough
+/// that a compositor merely busy answers inside it — a slice it misses is discarded, not reported.
+const _: () = assert!(
+    COMPOSITOR_SERVICE_SLICE.as_millis() >= 50 && COMPOSITOR_SERVICE_SLICE.as_millis() <= 1000,
+    "a servicing slice must not become a wait in its own right"
+);
+
 /// Set by the compositor's answer to `wl_display.sync`, which is what a roundtrip waits for.
 pub(crate) type SyncDone = Arc<std::sync::atomic::AtomicBool>;
 
@@ -701,6 +708,8 @@ where
     let stream = UnixStream::connect(socket)
         .map_err(|e| GlassError::Backend(format!("{who}: connect: {e}")))?;
     // The same socket, kept back from the thread: shutting this down is what wakes its poll.
+    // `Both`, not `Read`: a setup blocked writing to a compositor that has stopped reading is
+    // just as stuck, and only the write half ends that.
     let watchdog = stream
         .try_clone()
         .map_err(|e| GlassError::Backend(format!("{who}: connect: {e}")))?;
@@ -722,7 +731,15 @@ where
             let _ = setup.join();
             outcome.map_err(|e| GlassError::Backend(format!("{who}: {e}")))
         }
-        Err(_) => {
+        // The sender went with the thread, so the thread is gone: a panic, not a slow compositor.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let panicked = setup.join().is_err();
+            Err(GlassError::Backend(format!(
+                "{who}: the wayland setup ended without an answer{}",
+                if panicked { " (it panicked)" } else { "" }
+            )))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             let _ = watchdog.shutdown(std::net::Shutdown::Both);
             // Joined, so the thread is gone before its socket is: a setup still running would
             // otherwise outlive the call that started it.
@@ -1147,12 +1164,16 @@ fn bring_up_session(
     };
 
     let (conn, mut queue, mut state, manager, output, pointer, keyboard, mut ipc, output_size) =
-        // What is left of the launch the caller asked for, not a budget of this function's own:
-        // `timeout_ms` is the knob for a slow machine, and a fixed one here would ignore it.
+        // What is left of the launch the caller asked for — `timeout_ms` is the knob for a slow
+        // machine — but never less than one sync's worth: the socket wait above shares this
+        // deadline, so a compositor slow to create its socket would otherwise leave the setup
+        // that follows a few milliseconds and fail a launch that was merely late.
         match open_session(
             &socket,
             runtime_dir.path(),
-            deadline.saturating_duration_since(Instant::now()),
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(COMPOSITOR_SYNC_BUDGET),
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -1264,20 +1285,45 @@ fn bring_up_session(
     Ok((session, geometry))
 }
 
-/// Emit `undo` and get it on the wire if the settle it follows failed.
+/// What a gesture has pressed and not yet put back.
 ///
-/// A press is flushed before the wait it fails in, so the compositor has it and will act on it
-/// when it recovers. Returning the error without the counterpart leaves a button or a modifier
-/// latched, and the next tool call — which now runs, where the unbounded wait meant nothing ran
-/// again — inherits a seat holding a key down.
-fn undo_if_unsettled(s: &ActiveSession, settled: Result<()>, undo: impl FnOnce()) -> Result<()> {
-    if settled.is_err() {
-        undo();
-        // Best effort: what just failed is the compositor answering, so there is nothing to wait
-        // for and nothing to do about a flush that fails too.
+/// A press is flushed before the wait it may fail in, so the compositor has it and will act on it
+/// when it recovers. The gesture then unwinds through `?` — `glass_core::run_drag` and its
+/// siblings propagate without cleanup — and every step that would have released it is skipped, so
+/// a button or modifier stays down and the next tool call inherits it. Where the unbounded wait
+/// meant nothing ran again, something now does.
+///
+/// Tracked per gesture rather than per settle: the settle that fails is usually not the one that
+/// pressed anything (a drag spends its time in `move_to`), and the release that matters is the one
+/// the gesture never reached.
+#[derive(Default)]
+struct Held {
+    button: Option<u32>,
+    key: Option<u32>,
+    modifiers: bool,
+}
+
+impl Held {
+    /// Put the seat back. Best effort: what failed is the compositor answering, so there is
+    /// nothing to wait for and nothing to do about a flush that fails too.
+    fn release(&mut self, s: &mut ActiveSession) {
+        if self.button.is_none() && self.key.is_none() && !self.modifiers {
+            return;
+        }
+        s.time = s.time.wrapping_add(1);
+        let t = s.time;
+        if let Some(b) = self.button.take() {
+            s.pointer.button(t, b, ButtonState::Released);
+            s.pointer.frame();
+        }
+        if let Some(kc) = self.key.take() {
+            s.keyboard.key(t, kc, 0);
+        }
+        if std::mem::take(&mut self.modifiers) {
+            s.keyboard.modifiers(0, 0, 0, 0);
+        }
         let _ = s.conn.flush();
     }
-    settled
 }
 
 /// Ask the compositor to answer for what this session has just sent, bounded.
@@ -1304,15 +1350,15 @@ fn upload_keymap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, keymap: &str)
 /// press/release individually, like the chord sink. A heavy client (e.g. a browser) ignores
 /// taps that are merely queued and flushed once at the end.
 fn tap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, kc: u32) -> Result<()> {
+    let mut held = Held::default();
     for state in [1u32, 0] {
         s.time = s.time.wrapping_add(1);
         kb.key(s.time, kc, state);
-        let settled = sync_session(s, "key tap");
-        undo_if_unsettled(s, settled, || {
-            if state == 1 {
-                kb.key(s.time, kc, 0);
-            }
-        })?;
+        held.key = (state == 1).then_some(kc);
+        if let Err(e) = sync_session(s, "key tap") {
+            held.release(s);
+            return Err(e);
+        }
         std::thread::sleep(Duration::from_millis(8));
     }
     Ok(())
@@ -1370,6 +1416,15 @@ struct WaylandDragSink<'a> {
     oy: i32,
     b: u32,
     mask: u32,
+    held: Held,
+}
+
+/// A drag that ends early — `run_drag` propagates a failed settle from any of its waypoints —
+/// otherwise leaves the button down.
+impl Drop for WaylandDragSink<'_> {
+    fn drop(&mut self) {
+        self.held.release(self.s);
+    }
 }
 
 impl WaylandDragSink<'_> {
@@ -1425,13 +1480,8 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         };
         vp.button(t, self.b, state);
         vp.frame();
-        let settled = self.settle();
-        undo_if_unsettled(self.s, settled, || {
-            if down {
-                vp.button(t, self.b, ButtonState::Released);
-                vp.frame();
-            }
-        })
+        self.held.button = down.then_some(self.b);
+        self.settle()
     }
     fn modifiers(&mut self, down: bool) -> Result<()> {
         if self.mask == 0 {
@@ -1444,14 +1494,10 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         } else {
             kb.modifiers(0, 0, 0, 0);
         }
+        self.held.modifiers = down;
         // Self-commit so the modifier change reaches the compositor before the
         // press/release that follows it (matches the X11 sink's flush-per-call).
-        let settled = self.settle();
-        undo_if_unsettled(self.s, settled, || {
-            if down {
-                kb.modifiers(0, 0, 0, 0);
-            }
-        })
+        self.settle()
     }
 }
 
@@ -1462,6 +1508,14 @@ struct WaylandChordSink<'a> {
     s: &'a mut ActiveSession,
     mask: u32,
     keysym: u32,
+    held: Held,
+}
+
+/// A chord that ends early otherwise leaves its key or its modifier down.
+impl Drop for WaylandChordSink<'_> {
+    fn drop(&mut self) {
+        self.held.release(self.s);
+    }
 }
 
 impl WaylandChordSink<'_> {
@@ -1488,24 +1542,16 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
         } else if self.mask != 0 {
             kb.modifiers(0, 0, 0, 0);
         }
-        let settled = self.settle();
-        undo_if_unsettled(self.s, settled, || {
-            if down && self.mask != 0 {
-                kb.modifiers(0, 0, 0, 0);
-            }
-        })
+        self.held.modifiers = down && self.mask != 0;
+        self.settle()
     }
     fn key(&mut self, down: bool) -> Result<()> {
         let kb = self.s.keyboard.clone();
         self.s.time = self.s.time.wrapping_add(1);
         let t = self.s.time;
         kb.key(t, 1, u32::from(down)); // keycode 1 = the chord's key; 1=pressed, 0=released
-        let settled = self.settle();
-        undo_if_unsettled(self.s, settled, || {
-            if down {
-                kb.key(t, 1, 0);
-            }
-        })
+        self.held.key = down.then_some(1);
+        self.settle()
     }
 }
 
@@ -1525,6 +1571,15 @@ struct WaylandScrollSink<'a> {
     dx: i32,
     dy: i32,
     mask: u32,
+    held: Held,
+}
+
+/// A scroll that ends early — `wheel` settles three times after the modifier goes down —
+/// otherwise leaves that modifier down.
+impl Drop for WaylandScrollSink<'_> {
+    fn drop(&mut self) {
+        self.held.release(self.s);
+    }
 }
 
 impl WaylandScrollSink<'_> {
@@ -1556,12 +1611,8 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
         } else {
             kb.modifiers(0, 0, 0, 0);
         }
-        let settled = self.settle();
-        undo_if_unsettled(self.s, settled, || {
-            if down {
-                kb.modifiers(0, 0, 0, 0);
-            }
-        })
+        self.held.modifiers = down;
+        self.settle()
     }
     fn wheel(&mut self) -> Result<()> {
         let vp = self.s.pointer.clone();
@@ -1809,22 +1860,29 @@ impl Platform for WaylandPlatform {
                     upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
                     kb.modifiers(mask, 0, 0, 0);
                 }
+                let mut held = Held {
+                    modifiers: mask != 0,
+                    ..Held::default()
+                };
                 let b = evdev_button(button);
-                for _ in 0..count.max(1) {
-                    vp.button(t, b, ButtonState::Pressed);
-                    vp.frame();
-                    let settled = settle(session);
-                    undo_if_unsettled(session, settled, || {
+                let clicks = |session: &mut ActiveSession, held: &mut Held| -> Result<()> {
+                    for _ in 0..count.max(1) {
+                        vp.button(t, b, ButtonState::Pressed);
+                        vp.frame();
+                        held.button = Some(b);
+                        settle(session)?;
                         vp.button(t, b, ButtonState::Released);
                         vp.frame();
-                    })?;
-                    vp.button(t, b, ButtonState::Released);
-                    vp.frame();
-                    settle(session)?;
-                }
-                if mask != 0 {
-                    kb.modifiers(0, 0, 0, 0);
-                }
+                        held.button = None;
+                        settle(session)?;
+                    }
+                    Ok(())
+                };
+                let outcome = clicks(session, &mut held);
+                // The same release on both paths: what ends the modifier on a click that worked is
+                // what has to end it on one that did not.
+                held.release(session);
+                outcome?;
             }
             PointerEvent::Drag {
                 from_x,
@@ -1845,6 +1903,7 @@ impl Platform for WaylandPlatform {
                     oy,
                     b: evdev_button(button),
                     mask: modifier_mask(modifiers),
+                    held: Held::default(),
                 };
                 glass_core::run_drag(&mut sink, &gesture)?;
             }
@@ -1868,6 +1927,7 @@ impl Platform for WaylandPlatform {
                     dx,
                     dy,
                     mask: modifier_mask(modifiers),
+                    held: Held::default(),
                 };
                 glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
             }
@@ -1913,6 +1973,7 @@ impl Platform for WaylandPlatform {
                     s: &mut *session,
                     mask: modifier_mask(&mods),
                     keysym,
+                    held: Held::default(),
                 };
                 glass_core::run_chord(&mut sink)?;
             }
@@ -2298,12 +2359,18 @@ mod pure_tests {
         });
 
         let started = Instant::now();
-        let outcome = roundtrip_until(
-            &conn,
-            &mut queue,
-            &mut SyncOnly,
-            Instant::now() + PROMPT_WAIT_BUDGET,
-            "a caller",
+        let outcome = on_a_thread(
+            PROMPT_WAIT_BUDGET * 20,
+            "the roundtrip never came back from an answered sync",
+            move || {
+                roundtrip_until(
+                    &conn,
+                    &mut queue,
+                    &mut SyncOnly,
+                    Instant::now() + PROMPT_WAIT_BUDGET,
+                    "a caller",
+                )
+            },
         );
         let elapsed = started.elapsed();
         drop(answer.join().expect("the answering thread"));
@@ -3489,6 +3556,41 @@ mod session_tests {
         );
     }
 
+    /// A gesture fails between a press and the settle after it — a window no test can hit on
+    /// purpose — but the guard that puts the seat back is a `Drop`, and that can be driven. The
+    /// compositor here is healthy: what is under test is the release, not the bound.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_gesture_dropped_after_a_press_releases_the_button() {
+        use glass_core::DragSink as _;
+
+        let mut s = Launch::new().start_mapped();
+        {
+            let session = s.platform().active.as_mut().expect("a started session");
+            let (w, h) = session.output_size;
+            let (ox, oy) = (session.active_rect.x, session.active_rect.y);
+            let mut sink = WaylandDragSink {
+                s: session,
+                w,
+                h,
+                ox,
+                oy,
+                b: evdev_button(glass_core::MouseButton::Left),
+                mask: 0,
+                held: Held::default(),
+            };
+            // Placed first, as `run_drag` does: sway routes a button only to the surface its
+            // pointer is over, and it evaluates that on motion.
+            sink.place(10, 10).expect("the placement");
+            sink.button(true).expect("the press");
+            // The sink drops here, as it does when `run_drag` propagates a failure.
+        }
+
+        // `272 0` is BTN_LEFT released, so waiting for it is the assertion: a gesture that left
+        // the button down never logs it, and the harness fails the test rather than hanging.
+        s.wait_for_log(" 272 0");
+    }
+
     /// glass#402: every request ends in a sync the compositor answers, and waiting for one was
     /// unbounded — so `glass_click` on a compositor that had gone quiet held the session lock the
     /// capture, bounded in glass#383, had just stopped holding.
@@ -3524,6 +3626,85 @@ mod session_tests {
         assert!(
             err.to_string().contains("input settle"),
             "the failure should name the request that made it: {err}"
+        );
+    }
+
+    /// The keyboard paths reach the compositor through their own settles, and a bound reverted at
+    /// one of them alone would leave `glass_type` or `glass_key` hanging with the rest green.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn the_keyboard_paths_give_up_on_a_compositor_that_stops_answering() {
+        let mut s = Launch::new().start_mapped();
+        let pid = s
+            .platform()
+            .session_compositor_pid()
+            .expect("a started session has a compositor");
+        let _suspended = Suspended::process(pid);
+
+        let started = Instant::now();
+        for key in [KeyEvent::Text("a".into()), KeyEvent::Chord("ctrl+a".into())] {
+            let err = s
+                .platform()
+                .send_key(&key)
+                .expect_err("a suspended compositor cannot answer");
+            // Both paths upload a keymap before they press anything, so that is the settle they
+            // fail in.
+            assert!(
+                err.to_string().contains("keymap upload"),
+                "the failure should name the request that made it: {err}"
+            );
+        }
+        assert!(
+            started.elapsed() < SUSPENSION * 2 / 3,
+            "a keyboard path waited the compositor out: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// As above for the pointer gestures, which settle through their own sinks.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn the_pointer_gestures_give_up_on_a_compositor_that_stops_answering() {
+        let mut s = Launch::new().start_mapped();
+        let pid = s
+            .platform()
+            .session_compositor_pid()
+            .expect("a started session has a compositor");
+        let _suspended = Suspended::process(pid);
+
+        let started = Instant::now();
+        let gestures = [
+            PointerEvent::Drag {
+                from_x: 10,
+                from_y: 10,
+                to_x: 40,
+                to_y: 40,
+                button: glass_core::MouseButton::Left,
+                modifiers: Vec::new(),
+                duration_ms: 50,
+            },
+            PointerEvent::Scroll {
+                x: 10,
+                y: 10,
+                dx: 0,
+                dy: -1,
+                modifiers: Vec::new(),
+            },
+        ];
+        for gesture in gestures {
+            let err = s
+                .platform()
+                .send_pointer(&gesture)
+                .expect_err("a suspended compositor cannot answer");
+            assert!(
+                err.to_string().contains("input settle"),
+                "the failure should name the request that made it: {err}"
+            );
+        }
+        assert!(
+            started.elapsed() < SUSPENSION * 2 / 3,
+            "a pointer gesture waited the compositor out: {:?}",
+            started.elapsed()
         );
     }
 
