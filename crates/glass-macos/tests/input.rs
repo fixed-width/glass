@@ -40,7 +40,7 @@
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    println!("skipped (not macOS)");
+    println!("skipped (not macOS): test");
 }
 
 #[cfg(target_os = "macos")]
