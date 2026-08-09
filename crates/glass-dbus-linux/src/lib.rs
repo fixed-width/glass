@@ -299,10 +299,9 @@ pub fn available() -> std::result::Result<(), String> {
     )
 }
 
-/// [`available`] against explicit inputs — the testable seam (no global env), so a test can force
-/// any branch without `set_var` racing a concurrent env reader. `path` is the search list a bare
-/// `dbus-daemon` is looked up in; the bring-up spawns from this same process, so it is the list
-/// the spawn will use.
+/// [`available`] against explicit inputs — the testable seam (no global env). `path` is the search
+/// list a bare `dbus-daemon` is looked up in; the bring-up spawns from this same process, so it is
+/// the list the spawn will use.
 fn available_with(
     launcher: Resolved,
     dbus: &str,
@@ -438,9 +437,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
 
-    /// A directory holding `name` at `mode`. Drives the seams with real files rather than setting
-    /// `GLASS_ATSPI_LAUNCHER`/`PATH` — mutating the process environment races every other test in
-    /// this binary (and is `unsafe` from edition 2024 on).
+    /// A directory holding `name` at `mode`.
     fn dir_with(name: &str, mode: u32) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = dir.path().join(name);
@@ -472,7 +469,6 @@ mod tests {
         );
     }
 
-    /// A non-executable candidate does not stop the scan: a later one that IS runnable wins.
     #[test]
     fn the_candidate_scan_walks_past_a_non_executable_one() {
         let broken = dir_with("at-spi-bus-launcher", 0o644);

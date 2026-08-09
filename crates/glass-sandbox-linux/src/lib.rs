@@ -121,7 +121,7 @@ pub fn launch_ro_binds(
 }
 
 /// [`launch_ro_binds`] against an explicit `$PATH` value — the testable seam (no global env), so
-/// a test can exercise the bare-name branch without `set_var` racing a concurrent env reader.
+/// a test can exercise the bare-name branch.
 fn launch_ro_binds_in(
     program: &OsStr,
     args: &[OsString],
@@ -338,9 +338,9 @@ pub fn availability() -> Availability {
     }
 }
 
-/// Pure: what resolving `bwrap` alone decides — the testable seam (no global env), so a test can
-/// force either failure without `set_var` racing a concurrent reader. `Ok` here means only that
-/// a runnable `bwrap` exists; [`availability`] still has to prove it can create a namespace.
+/// Pure: what resolving `bwrap` alone decides — the testable seam (no global env). `Ok` here means
+/// only that a runnable `bwrap` exists; [`availability`] still has to prove it can create a
+/// namespace.
 ///
 /// `bin` is the configured name, needed for the [`Resolved::Absent`] message because that variant
 /// carries no path.
@@ -973,9 +973,11 @@ mod tests {
         );
     }
 
-    /// glass#374: `runnable` used `is_file()`, so a mode-644 `$GLASS_BWRAP` read as reachable and
-    /// the launch then failed at spawn. Driven through the seam rather than by setting the
-    /// environment, which is `unsafe` from edition 2024 on and races concurrent readers.
+    /// glass#374: `runnable` used `is_file()`, so a mode-644 `$GLASS_BWRAP` reached the
+    /// user-namespace probe, which forked it only to be told "could not run …: Permission
+    /// denied". The launch was refused either way — no app was ever spawned. What changes is
+    /// that the message names the fix, and that glass stops forking a binary to learn what a
+    /// `stat` had already answered.
     #[test]
     fn a_non_executable_bwrap_is_unavailable_and_says_so() {
         let Availability::Unavailable(msg) = availability_with(

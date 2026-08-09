@@ -240,7 +240,6 @@ mod tests {
         assert_eq!(resolve_bin("/nonexistent/Xvfb", None), Resolved::Absent);
     }
 
-    /// A directory is not a launch target, however its mode bits read.
     #[test]
     fn an_explicit_path_to_a_directory_is_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -260,8 +259,6 @@ mod tests {
         );
     }
 
-    /// `execvp` semantics: a non-executable match does not stop the search. Departing from this
-    /// would make glass run a different binary than the user's shell does.
     #[test]
     fn the_search_walks_past_a_non_executable_match_to_a_later_executable_one() {
         let first = dir_with("Xvfb", 0o644);
@@ -287,8 +284,6 @@ mod tests {
         );
     }
 
-    /// When the walk finds nothing runnable, the non-executable it passed is the actionable
-    /// fact — reporting `Absent` would send the user to install what is already installed.
     #[test]
     fn a_search_finding_only_a_non_executable_match_reports_it_rather_than_absent() {
         let dir = dir_with("Xvfb", 0o644);

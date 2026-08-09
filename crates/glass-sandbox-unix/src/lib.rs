@@ -1,8 +1,8 @@
-//! Bind-path resolution atoms shared by glass's two sandbox backends, bwrap on Linux
+//! Bind-path atoms shared by glass's two sandbox backends, bwrap on Linux
 //! (`glass-sandbox-linux`) and Seatbelt on macOS (`glass-sandbox-macos`) — unix both, which is what
-//! makes this crate unix. Given a program + args + cwd, which absolute host paths does the launch
-//! actually touch. No OS-specific containment logic lives here: each backend applies its OWN
-//! exposure guard/emit on top.
+//! makes this crate unix. One token to an absolute host path, and the directory to expose for a
+//! path. Which tokens a launch has, and how the results are guarded and emitted, is each backend's
+//! own: nothing here sees a program or an argument list.
 //!
 //! Whether a resolved path can be *run* is a different question, answered by `glass-exec-unix`.
 //!
