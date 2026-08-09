@@ -43,6 +43,13 @@ internal refactors, CI, or test-only changes.
   were told to build one. Such a candidate is now stepped over and the search carries on. A
   candidate that does start and reports a version glass cannot use is unchanged: the search stops
   there rather than silently running a different sway further along your `$PATH`.
+- A `sway` that never answers no longer hangs `glass_start` and `glass doctor` indefinitely. The
+  same `--version` probe waited for its answer with no time limit, so a candidate that started and
+  then never exited — wedged on a lock, on a stalled filesystem, or waiting on input — stopped both
+  with nothing to recover from. Each probe is now bounded at 5 seconds; a candidate that has not
+  answered by then is killed and stepped over like one that never started, and the search carries
+  on. `glass doctor` says such a binary gave no `--version` answer, rather than reporting its
+  version as merely unknown.
 - Accessibility now works on Debian/Ubuntu machines that are not x86-64. `glass doctor` said
   `at-spi-bus-launcher present` while every a11y launch on the same machine failed to find it —
   quietly dropping to pixel-only by default, or failing outright with `a11y: true` — because the

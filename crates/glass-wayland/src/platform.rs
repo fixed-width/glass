@@ -265,8 +265,8 @@ pub(crate) fn resolve_sway_verdict() -> std::result::Result<PathBuf, NoSway> {
     // Inlined rather than wrapped: a `fn` that only splits PATH and delegates has a
     // constant-return mutation nothing can kill on a host where the true answer is that constant
     // — here, any machine with no sway on PATH.
-    if let Some(p) =
-        std::env::var_os("PATH").and_then(|path| sway_in_dirs(std::env::split_paths(&path)))
+    if let Some(p) = std::env::var_os("PATH")
+        .and_then(|path| sway_in_dirs(std::env::split_paths(&path), VERSION_PROBE_BUDGET))
     {
         return Ok(p);
     }
@@ -329,25 +329,55 @@ fn sway_override(
     })
 }
 
+/// How long a candidate gets to answer `--version`.
+///
+/// Printing a version string is not work; the budget only has to cover an `exec` on a loaded
+/// host. Unbounded, a `sway` that never exits hung `glass_start` and `glass doctor` forever.
+pub(crate) const VERSION_PROBE_BUDGET: Duration = Duration::from_secs(5);
+
+/// What a candidate said when asked for its version.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VersionAnswer {
+    /// It ran and exited; whatever it wrote to stdout.
+    Answered(String),
+    /// The spawn failed, so the candidate never ran at all.
+    DidNotRun,
+    /// Still running when the budget ran out; it was killed.
+    TimedOut,
+}
+
+/// Ask `sway` for its version, under a time bound.
+///
+/// Shared by discovery and doctor so the two cannot disagree about how long a binary may take to
+/// answer, or about what a silence means.
+pub(crate) fn ask_sway_version(sway: &Path, budget: Duration) -> VersionAnswer {
+    let mut cmd = std::process::Command::new(sway);
+    cmd.arg("--version");
+    match glass_core::run_bounded(&mut cmd, budget, "sway:--version") {
+        Ok(out) => VersionAnswer::Answered(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Err(e) if e.bound() == Some(glass_core::BoundKind::TimedOut) => VersionAnswer::TimedOut,
+        Err(_) => VersionAnswer::DidNotRun,
+    }
+}
+
 /// The first `sway` in `dirs` whose `--version` reports >= 1.12.
 ///
 /// Only an answer ends the walk. A candidate that ran decides the outcome even when the version
 /// is too old or unreadable — that means the bundle, never a different sway further along, since
 /// `PATH` order is a precedence the user expressed.
 ///
-/// A candidate that never ran expressed nothing, so it is stepped over: no execute permission, or
-/// a spawn that failed outright (`ENOEXEC` for a file that is not a binary, `ETXTBSY` while
-/// something else holds it open for writing).
-fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+/// A candidate that never ran expressed nothing, so it is stepped over: no execute permission, a
+/// spawn that failed outright (`ENOEXEC` for a file that is not a binary, `ETXTBSY` while
+/// something else holds it open for writing), or one that outstayed `budget`.
+fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>, budget: Duration) -> Option<PathBuf> {
     for dir in dirs {
         let cand = dir.join("sway");
         if !is_executable_file(&cand) {
             continue;
         }
-        let Ok(out) = std::process::Command::new(&cand).arg("--version").output() else {
+        let VersionAnswer::Answered(ver) = ask_sway_version(&cand, budget) else {
             continue;
         };
-        let ver = String::from_utf8_lossy(&out.stdout);
         return match parse_sway_version(&ver) {
             Some((maj, min)) if (maj, min) >= (1, 12) => Some(cand),
             _ => None, // answered, just not usably -> the bundle, not a later sway
@@ -1691,12 +1721,42 @@ mod pure_tests {
         dir
     }
 
+    /// How long the hung fixture lives if nothing kills it. Long enough that a lost bound reads as
+    /// a hang against [`HUNG_PROBE_BUDGET`], short enough that such a test fails rather than
+    /// wedging the suite.
+    const HUNG_SWAY_LIFETIME: Duration = Duration::from_secs(30);
+    /// The budget the hung-candidate tests probe under. Only has to exceed a `sh` startup.
+    const HUNG_PROBE_BUDGET: Duration = Duration::from_millis(300);
+
+    /// A directory holding a `sway` that never answers `--version`, and the file it writes its own
+    /// pid to.
+    ///
+    /// `exec`, so that pid stays the sleeping process: a shell that forked its sleep would hand
+    /// the probe a child whose death proves nothing about the process actually left behind.
+    fn hung_sway() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("sway");
+        let pidfile = dir.path().join("pid");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nexec sleep {}\n",
+                pidfile.display(),
+                HUNG_SWAY_LIFETIME.as_secs()
+            ),
+        )
+        .expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (dir, pidfile)
+    }
+
     #[test]
     fn a_recent_sway_on_the_path_is_used() {
         let _guard = one_spawner_at_a_time();
         let dir = fake_sway("sway version 1.12-abc (Jun 3 2026)");
         assert_eq!(
-            sway_in_dirs([dir.path().to_path_buf()].into_iter()),
+            sway_in_dirs([dir.path().to_path_buf()].into_iter(), VERSION_PROBE_BUDGET),
             Some(dir.path().join("sway"))
         );
     }
@@ -1709,7 +1769,7 @@ mod pure_tests {
         for reply in ["sway version 1.9", "sway version 1.11-x", "wat"] {
             let dir = fake_sway(reply);
             assert_eq!(
-                sway_in_dirs([dir.path().to_path_buf()].into_iter()),
+                sway_in_dirs([dir.path().to_path_buf()].into_iter(), VERSION_PROBE_BUDGET),
                 None,
                 "{reply:?}"
             );
@@ -1719,7 +1779,79 @@ mod pure_tests {
     #[test]
     fn a_path_with_no_sway_on_it_finds_nothing() {
         let empty = tempfile::tempdir().expect("tempdir");
-        assert_eq!(sway_in_dirs([empty.path().to_path_buf()].into_iter()), None);
+        assert_eq!(
+            sway_in_dirs(
+                [empty.path().to_path_buf()].into_iter(),
+                VERSION_PROBE_BUDGET
+            ),
+            None
+        );
+    }
+
+    /// glass#392: the probe ran `--version` with no bound at all, so a `sway` that never exits
+    /// hung `resolve_sway` — and with it `glass_start` — for as long as it stayed up.
+    #[test]
+    fn a_sway_that_never_answers_is_stepped_over_within_its_budget() {
+        let _guard = one_spawner_at_a_time();
+        let (hung, _pidfile) = hung_sway();
+        let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
+        let started = Instant::now();
+        let found = sway_in_dirs(
+            [hung.path().to_path_buf(), good.path().to_path_buf()].into_iter(),
+            HUNG_PROBE_BUDGET,
+        );
+        assert_eq!(
+            found,
+            Some(good.path().join("sway")),
+            "a candidate that never answered must be stepped over, not end the walk"
+        );
+        assert!(
+            started.elapsed() < HUNG_SWAY_LIFETIME / 3,
+            "the walk waited out the whole candidate: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A bound that returns while leaving the process behind trades one hang for a leak: every
+    /// launch would add another wedged candidate to the machine.
+    #[test]
+    fn a_probe_that_times_out_kills_the_candidate() {
+        let _guard = one_spawner_at_a_time();
+        let (hung, pidfile) = hung_sway();
+        assert_eq!(
+            ask_sway_version(&hung.path().join("sway"), HUNG_PROBE_BUDGET),
+            VersionAnswer::TimedOut
+        );
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the fixture records its pid before it sleeps")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            !glass_proc_linux::any_alive(&[pid]),
+            "the probe left its candidate ({pid}) running"
+        );
+    }
+
+    /// The three answers doctor tells apart. A spawn failure reported as an empty answer would
+    /// have doctor say a binary ran and said nothing.
+    #[test]
+    fn a_candidate_that_runs_is_distinguished_from_one_that_cannot() {
+        let _guard = one_spawner_at_a_time();
+        let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
+        assert_eq!(
+            ask_sway_version(&good.path().join("sway"), VERSION_PROBE_BUDGET),
+            VersionAnswer::Answered("sway version 1.12-abc (Jun 3 2026)\n".into())
+        );
+        // An empty file at 0o755 clears the permission check and then fails to exec (`ENOEXEC`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("sway");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(
+            ask_sway_version(&bin, VERSION_PROBE_BUDGET),
+            VersionAnswer::DidNotRun
+        );
     }
 
     /// An unset or empty override is not a choice; discovery runs.
@@ -1776,7 +1908,10 @@ mod pure_tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
         assert_eq!(
-            sway_in_dirs([broken.path().to_path_buf(), good.path().to_path_buf()].into_iter()),
+            sway_in_dirs(
+                [broken.path().to_path_buf(), good.path().to_path_buf()].into_iter(),
+                VERSION_PROBE_BUDGET,
+            ),
             Some(good.path().join("sway")),
             "a sway that cannot be run must be skipped, not treated as the answer"
         );
@@ -1798,7 +1933,10 @@ mod pure_tests {
         );
         let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
         assert_eq!(
-            sway_in_dirs([unspawnable.path().to_path_buf(), good.path().to_path_buf()].into_iter()),
+            sway_in_dirs(
+                [unspawnable.path().to_path_buf(), good.path().to_path_buf()].into_iter(),
+                VERSION_PROBE_BUDGET,
+            ),
             Some(good.path().join("sway")),
             "a candidate that never ran must be stepped over, not end the walk"
         );

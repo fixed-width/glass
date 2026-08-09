@@ -9,7 +9,9 @@ use std::time::Duration;
 use glass_core::{AppSpec, Check, CheckStatus};
 
 use crate::command::{build_sway_command, sway_config};
-use crate::platform::{NoSway, resolve_sway_verdict};
+use crate::platform::{
+    NoSway, VERSION_PROBE_BUDGET, VersionAnswer, ask_sway_version, resolve_sway_verdict,
+};
 use crate::swayipc::Ipc;
 
 /// Probe the Wayland backend's environment. `deep` additionally spawns and tears down
@@ -75,18 +77,23 @@ fn wayland_checks(
 /// Resolve sway (path) and read its version string for display.
 fn discover_sway() -> Result<(PathBuf, String), NoSway> {
     let path = resolve_sway_verdict()?;
-    let ver = sway_version(&path);
+    let ver = describe_version(ask_sway_version(&path, VERSION_PROBE_BUDGET));
     Ok((path, ver))
 }
 
-fn sway_version(path: &Path) -> String {
-    std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "sway (version unknown)".into())
+/// How doctor names what the version probe got back.
+///
+/// A binary that answers nothing and one that answers nothing *in time* are different faults:
+/// only the second explains a launch that also gets no answer. An override or a bundled sway
+/// reaches here unprobed, so doctor is where a hung one is first seen.
+fn describe_version(answer: VersionAnswer) -> String {
+    match answer {
+        VersionAnswer::Answered(v) if !v.trim().is_empty() => v.trim().to_string(),
+        VersionAnswer::Answered(_) | VersionAnswer::DidNotRun => "sway (version unknown)".into(),
+        VersionAnswer::TimedOut => {
+            format!("sway (no --version answer within {VERSION_PROBE_BUDGET:?})")
+        }
+    }
 }
 
 /// Where a distro puts libEGL.
@@ -282,7 +289,8 @@ mod tests {
     #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn sway_version_reads_the_binarys_own_output() {
         let (path, _) = discover_sway().expect("sway");
-        assert!(sway_version(&path).contains("sway version"));
+        let ver = describe_version(ask_sway_version(&path, VERSION_PROBE_BUDGET));
+        assert!(ver.contains("sway version"), "{ver}");
     }
 
     /// A binary that prints nothing is not a version, and doctor's job is to say what it found.
@@ -296,7 +304,42 @@ mod tests {
         let bin = dir.path().join("mute");
         std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("write");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert_eq!(sway_version(&bin), "sway (version unknown)");
+        assert_eq!(
+            describe_version(ask_sway_version(&bin, VERSION_PROBE_BUDGET)),
+            "sway (version unknown)"
+        );
+    }
+
+    #[test]
+    fn an_answer_is_reported_trimmed() {
+        assert_eq!(
+            describe_version(VersionAnswer::Answered("sway version 1.12-abc\n".into())),
+            "sway version 1.12-abc"
+        );
+    }
+
+    /// glass#392: a binary that never answers used to hang doctor here. Reported as its own fault,
+    /// not as the silence of a binary that ran — a hang is what the user came to doctor about.
+    #[test]
+    fn a_probe_that_timed_out_says_so_rather_than_reporting_an_unknown_version() {
+        let said = describe_version(VersionAnswer::TimedOut);
+        assert!(said.contains("no --version answer"), "{said}");
+        assert!(
+            said.contains(&format!("{VERSION_PROBE_BUDGET:?}")),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_binary_that_said_nothing_or_never_ran_has_an_unknown_version() {
+        assert_eq!(
+            describe_version(VersionAnswer::Answered(String::new())),
+            "sway (version unknown)"
+        );
+        assert_eq!(
+            describe_version(VersionAnswer::DidNotRun),
+            "sway (version unknown)"
+        );
     }
 
     #[test]
