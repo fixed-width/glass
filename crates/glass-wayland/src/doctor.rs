@@ -10,7 +10,8 @@ use glass_core::{AppSpec, Check, CheckStatus};
 
 use crate::command::{build_sway_command, sway_config};
 use crate::platform::{
-    NoSway, VERSION_PROBE_BUDGET, VersionAnswer, ask_sway_version, resolve_sway_verdict,
+    CHECK_THAT_SWAY, NoSway, VERSION_PROBE_BUDGET, VersionAnswer, ask_sway_version,
+    resolve_sway_verdict,
 };
 use crate::swayipc::Ipc;
 
@@ -28,17 +29,13 @@ pub fn checks(deep: bool) -> Vec<Check> {
 
 /// Pure: build the Wayland checks from gathered facts.
 fn wayland_checks(
-    sway: &Result<(PathBuf, String), NoSway>,
+    sway: &Result<(PathBuf, VersionAnswer), NoSway>,
     gl_present: bool,
     deep_spawn: Option<Result<(), String>>,
 ) -> Vec<Check> {
     let mut checks = Vec::new();
     checks.push(match sway {
-        Ok((path, ver)) => Check::new(
-            "sway >=1.12",
-            CheckStatus::Ok,
-            format!("{ver} at {}", path.display()),
-        ),
+        Ok((path, answer)) => sway_check(path, answer),
         // The detail is the cause, not a fixed "not found": a present sway reported as missing
         // reads as a build that never ran.
         Err(no) => {
@@ -74,24 +71,45 @@ fn wayland_checks(
     checks
 }
 
-/// Resolve sway (path) and read its version string for display.
-fn discover_sway() -> Result<(PathBuf, String), NoSway> {
+/// Resolve sway (path) and ask it its version.
+///
+/// `resolve_sway_verdict` version-probes only its `PATH` walk, so a `GLASS_SWAY` override and the
+/// bundled sway reach here having never been asked — doctor's is the first `--version` either is
+/// put to.
+fn discover_sway() -> Result<(PathBuf, VersionAnswer), NoSway> {
     let path = resolve_sway_verdict()?;
-    let ver = describe_version(ask_sway_version(&path, VERSION_PROBE_BUDGET));
-    Ok((path, ver))
+    let answer = ask_sway_version(&path, VERSION_PROBE_BUDGET);
+    Ok((path, answer))
 }
 
-/// How doctor names what the version probe got back.
+/// The `sway >=1.12` check for a sway that resolved.
 ///
-/// A binary that answers nothing and one that answers nothing *in time* are different faults:
-/// only the second explains a launch that also gets no answer. An override or a bundled sway
-/// reaches here unprobed, so doctor is where a hung one is first seen.
-fn describe_version(answer: VersionAnswer) -> String {
+/// A binary that gave no version is not a proven >=1.12, so it does not get a tick. `Warn` and not
+/// `Fail` because resolution stands: an override and the bundle skip the version gate by design,
+/// so glass will still try to launch it.
+fn sway_check(path: &Path, answer: &VersionAnswer) -> Check {
+    let at = path.display();
     match answer {
-        VersionAnswer::Answered(v) if !v.trim().is_empty() => v.trim().to_string(),
-        VersionAnswer::Answered(_) | VersionAnswer::DidNotRun => "sway (version unknown)".into(),
-        VersionAnswer::TimedOut => {
-            format!("sway (no --version answer within {VERSION_PROBE_BUDGET:?})")
+        VersionAnswer::Answered(v) if !v.trim().is_empty() => Check::new(
+            "sway >=1.12",
+            CheckStatus::Ok,
+            format!("{} at {at}", v.trim()),
+        ),
+        VersionAnswer::Answered(_) => Check::new(
+            "sway >=1.12",
+            CheckStatus::Warn,
+            format!("{at} ran but reported no version"),
+        )
+        .with_remedy(CHECK_THAT_SWAY),
+        VersionAnswer::TimedOut(budget) => Check::new(
+            "sway >=1.12",
+            CheckStatus::Warn,
+            format!("{at} did not answer `--version` within {budget:?}"),
+        )
+        .with_remedy(CHECK_THAT_SWAY),
+        VersionAnswer::NoReply(why) => {
+            Check::new("sway >=1.12", CheckStatus::Warn, format!("{at}: {why}"))
+                .with_remedy(CHECK_THAT_SWAY)
         }
     }
 }
@@ -180,15 +198,19 @@ fn probe_sway(sway: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A resolved sway that answered, trimmed of the newline its `--version` ends with.
     #[test]
     fn sway_found_is_ok_with_version() {
-        let cs = wayland_checks(
-            &Ok((PathBuf::from("/usr/bin/sway"), "sway version 1.12".into())),
-            true,
-            None,
-        );
+        let cs = wayland_checks(&answered("sway version 1.12\n"), true, None);
         assert_eq!(cs[0].status, CheckStatus::Ok);
-        assert!(cs[0].detail.contains("1.12"));
+        assert_eq!(cs[0].detail, "sway version 1.12 at /usr/bin/sway");
+    }
+
+    fn answered(v: &str) -> Result<(PathBuf, VersionAnswer), NoSway> {
+        Ok((
+            PathBuf::from("/usr/bin/sway"),
+            VersionAnswer::Answered(v.into()),
+        ))
     }
 
     #[test]
@@ -225,7 +247,7 @@ mod tests {
 
     #[test]
     fn missing_gl_is_a_warning_with_remedy() {
-        let cs = wayland_checks(&Ok((PathBuf::from("/x"), "1.12".into())), false, None);
+        let cs = wayland_checks(&answered("1.12"), false, None);
         let gl = cs.iter().find(|c| c.name == "software GL (Mesa)").unwrap();
         assert_eq!(gl.status, CheckStatus::Warn);
         assert!(gl.remedy.as_deref().unwrap().contains("libgl1-mesa-dri"));
@@ -276,70 +298,59 @@ mod tests {
     #[test]
     #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn discover_sway_reports_the_real_binary_and_its_version() {
-        let (path, ver) = discover_sway().expect("this box has a discoverable sway");
+        let (path, answer) = discover_sway().expect("this box has a discoverable sway");
         assert!(
             glass_exec_unix::is_executable_file(&path),
             "discovery must yield something glass can spawn: {}",
             path.display()
         );
+        let VersionAnswer::Answered(ver) = &answer else {
+            panic!("a real sway answers --version: {answer:?}");
+        };
         assert!(ver.contains("sway version"), "{ver}");
     }
 
+    /// glass#392: a binary that never answers used to hang doctor here, and now gets no tick —
+    /// the check is named `sway >=1.12` and nothing established that.
     #[test]
-    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
-    fn sway_version_reads_the_binarys_own_output() {
-        let (path, _) = discover_sway().expect("sway");
-        let ver = describe_version(ask_sway_version(&path, VERSION_PROBE_BUDGET));
-        assert!(ver.contains("sway version"), "{ver}");
-    }
-
-    /// A binary that prints nothing is not a version, and doctor's job is to say what it found.
-    ///
-    /// Not `/bin/true`: GNU coreutils answers `--version` with its own version string.
-    #[test]
-    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
-    fn a_silent_binary_reports_an_unknown_version_not_an_empty_one() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bin = dir.path().join("mute");
-        std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("write");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert_eq!(
-            describe_version(ask_sway_version(&bin, VERSION_PROBE_BUDGET)),
-            "sway (version unknown)"
+    fn a_sway_that_never_answered_is_not_reported_as_a_working_one() {
+        let cs = wayland_checks(
+            &Ok((
+                PathBuf::from("/opt/sway/bin/sway"),
+                VersionAnswer::TimedOut(Duration::from_millis(1500)),
+            )),
+            true,
+            None,
         );
+        assert_eq!(cs[0].status, CheckStatus::Warn);
+        assert!(cs[0].detail.contains("/opt/sway/bin/sway"), "{:?}", cs[0]);
+        // The budget it actually waited, not whatever constant doctor happens to import.
+        assert!(cs[0].detail.contains("1.5s"), "{:?}", cs[0]);
+        assert_eq!(cs[0].remedy.as_deref(), Some(CHECK_THAT_SWAY));
     }
 
+    /// Ran and said nothing, and could not be asked at all — neither is a proven >=1.12, and the
+    /// second carries the runner's reason.
     #[test]
-    fn an_answer_is_reported_trimmed() {
-        assert_eq!(
-            describe_version(VersionAnswer::Answered("sway version 1.12-abc\n".into())),
-            "sway version 1.12-abc"
-        );
-    }
-
-    /// glass#392: a binary that never answers used to hang doctor here. Reported as its own fault,
-    /// not as the silence of a binary that ran — a hang is what the user came to doctor about.
-    #[test]
-    fn a_probe_that_timed_out_says_so_rather_than_reporting_an_unknown_version() {
-        let said = describe_version(VersionAnswer::TimedOut);
-        assert!(said.contains("no --version answer"), "{said}");
+    fn a_sway_that_gave_no_version_is_not_reported_as_a_working_one() {
+        let silent = wayland_checks(&answered(" \n"), true, None);
+        assert_eq!(silent[0].status, CheckStatus::Warn);
         assert!(
-            said.contains(&format!("{VERSION_PROBE_BUDGET:?}")),
-            "{said}"
+            silent[0].detail.contains("reported no version"),
+            "{:?}",
+            silent[0]
         );
-    }
 
-    #[test]
-    fn a_binary_that_said_nothing_or_never_ran_has_an_unknown_version() {
-        assert_eq!(
-            describe_version(VersionAnswer::Answered(String::new())),
-            "sway (version unknown)"
+        let cs = wayland_checks(
+            &Ok((
+                PathBuf::from("/usr/bin/sway"),
+                VersionAnswer::NoReply("failed to start: Exec format error".into()),
+            )),
+            true,
+            None,
         );
-        assert_eq!(
-            describe_version(VersionAnswer::DidNotRun),
-            "sway (version unknown)"
-        );
+        assert_eq!(cs[0].status, CheckStatus::Warn);
+        assert!(cs[0].detail.contains("Exec format error"), "{:?}", cs[0]);
     }
 
     #[test]
@@ -397,11 +408,7 @@ mod tests {
 
     #[test]
     fn deep_spawn_failure_is_reported() {
-        let cs = wayland_checks(
-            &Ok((PathBuf::from("/x"), "1.12".into())),
-            true,
-            Some(Err("no come up".into())),
-        );
+        let cs = wayland_checks(&answered("1.12"), true, Some(Err("no come up".into())));
         let deep = cs.iter().find(|c| c.name == "sway spawn (deep)").unwrap();
         assert_eq!(deep.status, CheckStatus::Fail);
         assert_eq!(deep.detail, "no come up");
