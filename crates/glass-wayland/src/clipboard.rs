@@ -433,6 +433,23 @@ fn is_retryable(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::Interrupted
 }
 
+/// How long is left before `deadline`, as a poll timeout — or `None` once it has passed.
+///
+/// The expiry check is explicit rather than left to the poll: `Instant` subtraction saturates to
+/// zero, and a zero-timeout poll still reports a ready fd, so a caller relying on that alone would
+/// run past its own deadline for as long as the other end kept the pipe ready.
+fn remaining_timespec(deadline: Instant) -> Option<rustix::event::Timespec> {
+    let now = Instant::now();
+    if now >= deadline {
+        return None;
+    }
+    let remaining = deadline - now;
+    Some(rustix::event::Timespec {
+        tv_sec: remaining.as_secs() as i64,
+        tv_nsec: remaining.subsec_nanos() as i64,
+    })
+}
+
 /// Read `fd` to EOF, but give up after `timeout`. The selection owner is an
 /// arbitrary external app; one that opens the transfer but never finishes
 /// writing (or never closes its write end) would otherwise block this read —
@@ -445,14 +462,8 @@ fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
-        let now = Instant::now();
-        if now >= deadline {
+        let Some(ts) = remaining_timespec(deadline) else {
             return Err(GlassError::Timeout(timeout.as_millis() as u64));
-        }
-        let remaining = deadline - now;
-        let ts = rustix::event::Timespec {
-            tv_sec: remaining.as_secs() as i64,
-            tv_nsec: remaining.subsec_nanos() as i64,
         };
         // The PollFd borrows `file` only for this statement, freeing it before
         // the read below.
@@ -508,25 +519,21 @@ fn is_write_retryable(e: &std::io::Error) -> bool {
 /// The fd is made non-blocking first. `POLLOUT` promises only that one byte fits, while a
 /// blocking `write` of more than `PIPE_BUF` waits for the whole payload: polling a blocking fd
 /// would leave the same unbounded wait one syscall further down.
+// The messages below name only the failure: the one caller prints them behind its own
+// "clipboard serve: paste transfer" prefix.
 fn write_all_bounded(fd: OwnedFd, buf: &[u8], timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let flags = rustix::fs::fcntl_getfl(&fd)
-        .map_err(|e| GlassError::Backend(format!("clipboard serve: fcntl_getfl: {e}")))?;
+        .map_err(|e| GlassError::Backend(format!("fcntl_getfl: {e}")))?;
     rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK)
-        .map_err(|e| GlassError::Backend(format!("clipboard serve: fcntl_setfl: {e}")))?;
+        .map_err(|e| GlassError::Backend(format!("fcntl_setfl: {e}")))?;
 
     let mut file = std::fs::File::from(fd);
     let total = buf.len();
     let mut written = 0usize;
     while written < total {
-        let now = Instant::now();
-        if now >= deadline {
+        let Some(ts) = remaining_timespec(deadline) else {
             return Err(GlassError::Timeout(timeout.as_millis() as u64));
-        }
-        let remaining = deadline - now;
-        let ts = rustix::event::Timespec {
-            tv_sec: remaining.as_secs() as i64,
-            tv_nsec: remaining.subsec_nanos() as i64,
         };
         // The PollFd borrows `file` only for this statement, freeing it before the write below.
         let ready = rustix::event::poll(
@@ -541,25 +548,25 @@ fn write_all_bounded(fd: OwnedFd, buf: &[u8], timeout: Duration) -> Result<()> {
             Ok(_) => match file.write(&buf[written..]) {
                 Ok(0) => {
                     return Err(GlassError::Backend(format!(
-                        "clipboard serve: paste transfer stalled at {written} of {total} bytes"
+                        "stalled at {written} of {total} bytes"
                     )));
                 }
                 Ok(n) => written += n,
                 Err(e) if is_write_retryable(&e) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                     return Err(GlassError::Backend(format!(
-                        "clipboard serve: paste receiver closed the transfer after {written} of {total} bytes"
+                        "receiver closed the transfer after {written} of {total} bytes"
                     )));
                 }
                 Err(e) => {
                     return Err(GlassError::Backend(format!(
-                        "clipboard serve: write pipe: {e} after {written} of {total} bytes"
+                        "write pipe: {e} after {written} of {total} bytes"
                     )));
                 }
             },
             // The poll's half of the rule `is_write_retryable` names for the write.
             Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(GlassError::Backend(format!("clipboard serve: poll: {e}"))),
+            Err(e) => return Err(GlassError::Backend(format!("poll: {e}"))),
         }
     }
     Ok(())
@@ -877,13 +884,28 @@ fn serve_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, CLIP_READ_TIMEOUT, CLIP_WRITE_TIMEOUT, ClipboardOwner, Condvar, Mutex, PoisonError,
-        ReadyState, get, is_retryable, read_to_eof_bounded, serve_loop, signal_ready,
+        Arc, AtomicBool, CLIP_READ_TIMEOUT, CLIP_WRITE_TIMEOUT, ClipboardOwner, Condvar, Mutex,
+        PoisonError, ReadyState, get, is_retryable, read_to_eof_bounded, serve_loop, signal_ready,
         write_all_bounded,
     };
     use crate::testw::Launch;
     use glass_core::GlassError;
     use std::io::Write;
+
+    /// Run `f` on its own thread and wait `within` for its result, failing with `what` if it does
+    /// not arrive. The calls these tests bound hang outright when the bound under test is missing,
+    /// and a hang on the test thread wedges the whole suite.
+    fn on_a_thread<T: Send + 'static>(
+        within: Duration,
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(within).expect(what)
+    }
 
     /// The serving thread is the clipboard — it holds the selection while it runs, and a pasting
     /// app reads from it over a pipe. Nothing under that is fakeable, so these use a real one.
@@ -939,13 +961,11 @@ mod tests {
     fn dropping_an_owner_does_not_block() {
         let s = Launch::new().start();
         let owner = ClipboardOwner::spawn(s.wayland_socket(), "held".into()).expect("spawn");
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            drop(owner);
-            let _ = tx.send(());
-        });
-        rx.recv_timeout(Duration::from_secs(10))
-            .expect("dropping an owner must stop its thread, not wait on it forever");
+        on_a_thread(
+            Duration::from_secs(10),
+            "dropping an owner must stop its thread, not wait on it forever",
+            move || drop(owner),
+        );
     }
 
     /// Dropping gives up the selection. A thread that kept running would keep answering pastes
@@ -974,28 +994,22 @@ mod tests {
         let live = ClipboardOwner::spawn(socket.clone(), "mine".into()).expect("spawn");
         assert_eq!(get(&socket).expect("get"), "mine");
 
-        let text = std::sync::Arc::new(std::sync::Mutex::new("stolen".to_string()));
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let ready = std::sync::Arc::new((
-            std::sync::Mutex::new(ReadyState::Pending),
-            std::sync::Condvar::new(),
-        ));
+        let text = Arc::new(Mutex::new("stolen".to_string()));
+        let stop = Arc::new(AtomicBool::new(true));
+        let ready = Arc::new((Mutex::new(ReadyState::Pending), Condvar::new()));
 
         // On its own thread: a compositor stalled in the setup roundtrip (or, on an ablated
-        // build, the trailing one after set_selection) would otherwise hang this call forever,
-        // and a direct call would wedge the whole suite instead of failing this test.
-        let (tx, rx) = std::sync::mpsc::channel();
+        // build, the trailing one after set_selection) would otherwise hang this call forever.
         let socket_thread = socket.clone();
-        std::thread::spawn(move || {
-            let outcome = serve_loop(socket_thread, text, stop, ready)
-                .err()
-                .map(|e| e.to_string());
-            let _ = tx.send(outcome);
-        });
-
-        let outcome = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("a stalled compositor must fail this test, not hang the whole suite");
+        let outcome = on_a_thread(
+            Duration::from_secs(10),
+            "a stalled compositor must fail this test, not hang the whole suite",
+            move || {
+                serve_loop(socket_thread, text, stop, ready)
+                    .err()
+                    .map(|e| e.to_string())
+            },
+        );
         if let Some(msg) = outcome {
             panic!("a detached thread standing down is not a serve error: {msg}");
         }
@@ -1030,20 +1044,18 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
         let accepted = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
 
-        // On its own thread: pre-fix this call never returns, and a direct call would wedge the
-        // whole suite instead of failing this test.
-        let (tx, rx) = std::sync::mpsc::channel();
+        // On its own thread: a spawn that never returns must fail this test, not wedge the whole
+        // suite.
         let started = std::time::Instant::now();
-        std::thread::spawn(move || {
-            let outcome = ClipboardOwner::spawn(socket, "text".into())
-                .err()
-                .map(|e| e.to_string());
-            let _ = tx.send(outcome);
-        });
-
-        let outcome = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("spawn must return when its own 2 s bound expires, not wait on the peer");
+        let outcome = on_a_thread(
+            Duration::from_secs(10),
+            "spawn must return when its own 2 s bound expires, not wait on the peer",
+            move || {
+                ClipboardOwner::spawn(socket, "text".into())
+                    .err()
+                    .map(|e| e.to_string())
+            },
+        );
         // Ties the test to the 2 s bound itself, not just to the 10 s ceiling above: a bound
         // loosened to e.g. 9 s would still return before the ceiling but fail this, and a bound
         // shrunk to ~0 (which would also pass the ceiling and still contain "timed out") fails

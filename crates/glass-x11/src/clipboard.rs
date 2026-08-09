@@ -560,6 +560,21 @@ mod tests {
         f()
     }
 
+    /// Run `f` on its own thread and wait `within` for its result, failing with `what` if it does
+    /// not arrive. The calls these tests bound hang outright when the bound under test is missing,
+    /// and a hang on the test thread wedges the whole suite.
+    fn on_a_thread<T: Send + 'static>(
+        within: Duration,
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(within).expect(what)
+    }
+
     #[test]
     #[ignore = "starts a real X server; needs Xvfb"]
     fn an_unowned_clipboard_reads_as_empty_rather_than_failing() {
@@ -704,20 +719,17 @@ mod tests {
         let ready = Arc::new((Mutex::new(ReadyState::Pending), Condvar::new()));
 
         // On its own thread: a stalled X server (or, on an ablated build, the trailing
-        // set_selection_owner) would otherwise hang this call forever, and a direct call would
-        // wedge the whole suite instead of failing this test.
-        let (tx, rx) = std::sync::mpsc::channel();
+        // set_selection_owner) would otherwise hang this call forever.
         let display = x.display().to_string();
-        std::thread::spawn(move || {
-            let outcome = owner_thread(&display, text, stop, ready)
-                .err()
-                .map(|e| e.to_string());
-            let _ = tx.send(outcome);
-        });
-
-        let outcome = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("a stalled X server must fail this test, not hang the whole suite");
+        let outcome = on_a_thread(
+            Duration::from_secs(10),
+            "a stalled X server must fail this test, not hang the whole suite",
+            move || {
+                owner_thread(&display, text, stop, ready)
+                    .err()
+                    .map(|e| e.to_string())
+            },
+        );
         if let Some(msg) = outcome {
             panic!("a detached thread standing down is not an owner error: {msg}");
         }
@@ -786,20 +798,18 @@ mod tests {
         let (listener, display) = wedged_x_server();
         let accepted = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
 
-        // On its own thread: pre-fix this call never returns, and a direct call would wedge the
-        // whole suite instead of failing this test.
-        let (tx, rx) = std::sync::mpsc::channel();
+        // On its own thread: a spawn that never returns must fail this test, not wedge the whole
+        // suite.
         let started = Instant::now();
-        std::thread::spawn(move || {
-            let outcome = ClipboardOwner::spawn(display, "text".to_string())
-                .err()
-                .map(|e| e.to_string());
-            let _ = tx.send(outcome);
-        });
-
-        let outcome = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("spawn must return when its own 2 s bound expires, not wait on the server");
+        let outcome = on_a_thread(
+            Duration::from_secs(10),
+            "spawn must return when its own 2 s bound expires, not wait on the server",
+            move || {
+                ClipboardOwner::spawn(display, "text".to_string())
+                    .err()
+                    .map(|e| e.to_string())
+            },
+        );
         // Ties the test to the 2 s bound itself, not just to the 10 s ceiling above: a bound
         // loosened to e.g. 9 s would still return before the ceiling but fail this, and a bound
         // shrunk to ~0 (which would also pass the ceiling and still contain "timed out") fails
