@@ -248,7 +248,7 @@ pub fn find_launcher() -> Resolved {
     find_launcher_with(
         std::env::var_os("GLASS_ATSPI_LAUNCHER"),
         LAUNCHER_CANDIDATES,
-        MULTIARCH_ROOT,
+        || multiarch_candidates(Path::new(MULTIARCH_ROOT)),
     )
 }
 
@@ -261,14 +261,16 @@ pub fn find_launcher() -> Resolved {
 fn find_launcher_with(
     override_value: Option<OsString>,
     candidates: &[&str],
-    multiarch_root: &str,
+    scan_multiarch: impl FnOnce() -> Vec<PathBuf>,
 ) -> Resolved {
     if let Some(p) = override_value.filter(|s| !s.is_empty()) {
         return resolve_path(Path::new(&p));
     }
     let mut first_non_executable = None;
-    let fixed = candidates.iter().map(PathBuf::from);
-    for cand in fixed.chain(multiarch_candidates(multiarch_root)) {
+    // `once_with`, not a plain call: as a `chain` argument the scan would run on every lookup,
+    // reading all of /usr/lib even when the first fixed candidate hits.
+    let scanned = std::iter::once_with(scan_multiarch).flatten();
+    for cand in candidates.iter().map(PathBuf::from).chain(scanned) {
         match resolve_path(&cand) {
             Resolved::Found(p) => return Resolved::Found(p),
             Resolved::NotExecutable(p) => {
@@ -283,7 +285,7 @@ fn find_launcher_with(
 /// `<multiarch_root>/<triplet>/at-spi2-core/at-spi-bus-launcher` for every entry under the root.
 /// The triplet is arch-specific (`x86_64-linux-gnu`, `aarch64-linux-gnu`, …), so scanning rather
 /// than hardcoding one keeps the lookup correct on non-x86_64 hosts.
-fn multiarch_candidates(multiarch_root: &str) -> Vec<PathBuf> {
+fn multiarch_candidates(multiarch_root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(multiarch_root) else {
         return Vec::new();
     };
@@ -470,10 +472,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
 
-    /// A multiarch root that does not exist, for the cases about the fixed list alone. The real
-    /// `/usr/lib` would make the outcome depend on whether the test host has at-spi2-core.
-    const NO_MULTIARCH: &str = "/nonexistent-multiarch-root";
-
     /// A directory holding `name` at `mode`.
     fn dir_with(name: &str, mode: u32) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -503,7 +501,7 @@ mod tests {
         let dir = dir_with("at-spi-bus-launcher", 0o644);
         let launcher = dir.path().join("at-spi-bus-launcher");
         assert_eq!(
-            find_launcher_with(Some(launcher.clone().into_os_string()), &[], NO_MULTIARCH),
+            find_launcher_with(Some(launcher.clone().into_os_string()), &[], Vec::new),
             Resolved::NotExecutable(launcher)
         );
     }
@@ -513,7 +511,7 @@ mod tests {
         let dir = dir_with("at-spi-bus-launcher", 0o755);
         let launcher = dir.path().join("at-spi-bus-launcher");
         assert_eq!(
-            find_launcher_with(Some(launcher.clone().into_os_string()), &[], NO_MULTIARCH),
+            find_launcher_with(Some(launcher.clone().into_os_string()), &[], Vec::new),
             Resolved::Found(launcher)
         );
     }
@@ -524,7 +522,7 @@ mod tests {
     fn a_launcher_under_any_multiarch_triplet_is_found() {
         let root = multiarch_root_with("aarch64-linux-gnu", 0o755);
         assert_eq!(
-            find_launcher_with(None, &[], root.path().to_str().expect("utf-8 temp path")),
+            find_launcher_with(None, &[], || multiarch_candidates(root.path())),
             Resolved::Found(
                 root.path()
                     .join("aarch64-linux-gnu/at-spi2-core/at-spi-bus-launcher")
@@ -538,7 +536,7 @@ mod tests {
     fn a_scan_finding_only_a_non_executable_multiarch_launcher_names_it() {
         let root = multiarch_root_with("aarch64-linux-gnu", 0o644);
         assert_eq!(
-            find_launcher_with(None, &[], root.path().to_str().expect("utf-8 temp path")),
+            find_launcher_with(None, &[], || multiarch_candidates(root.path())),
             Resolved::NotExecutable(
                 root.path()
                     .join("aarch64-linux-gnu/at-spi2-core/at-spi-bus-launcher")
@@ -560,17 +558,17 @@ mod tests {
         );
     }
 
-    /// The fixed list is the faster lookup and the arch-independent one; the scan only backs it up.
+    /// The fixed list wins, and the scan — a `read_dir` of every entry under /usr/lib — must not
+    /// run at all once it has: as a plain `chain` argument it would run on every lookup.
     #[test]
-    fn a_fixed_candidate_wins_over_a_multiarch_one() {
+    fn a_fixed_candidate_wins_and_leaves_the_multiarch_scan_unrun() {
         let fixed = dir_with("at-spi-bus-launcher", 0o755);
-        let root = multiarch_root_with("aarch64-linux-gnu", 0o755);
         let fixed_path = fixed.path().join("at-spi-bus-launcher");
         assert_eq!(
             find_launcher_with(
                 None,
                 &[fixed_path.to_str().expect("utf-8 temp path")],
-                root.path().to_str().expect("utf-8 temp path")
+                || panic!("a fixed candidate hit; the multiarch scan must not run")
             ),
             Resolved::Found(fixed_path)
         );
@@ -596,7 +594,7 @@ mod tests {
         ];
         let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
         assert_eq!(
-            find_launcher_with(None, &candidates, NO_MULTIARCH),
+            find_launcher_with(None, &candidates, Vec::new),
             Resolved::Found(working.path().join("at-spi-bus-launcher"))
         );
     }
@@ -609,7 +607,7 @@ mod tests {
         let launcher = dir.path().join("at-spi-bus-launcher");
         let candidates = [launcher.to_str().expect("utf-8 temp path")];
         assert_eq!(
-            find_launcher_with(None, &candidates, NO_MULTIARCH),
+            find_launcher_with(None, &candidates, Vec::new),
             Resolved::NotExecutable(launcher)
         );
     }
