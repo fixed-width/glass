@@ -1108,6 +1108,7 @@ version = "0.0.0"
 dependencies = [
  "atspi",
  "glass-core",
+ "glass-exec-unix",
  "glass-proc-linux",
  "tempfile",
  "tokio",

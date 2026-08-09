@@ -6,6 +6,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -13,6 +14,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use glass_core::{GlassError, Result};
+use glass_exec_unix::{Resolved, is_executable_file, resolve_bin};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard ceiling on the whole a11y-bus resolution (connect → proxy → GetAddress poll). The
@@ -229,18 +231,33 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// The four paths distributions install `at-spi-bus-launcher` to.
+const LAUNCHER_CANDIDATES: &[&str] = &[
+    "/usr/libexec/at-spi-bus-launcher",
+    "/usr/lib/at-spi2-core/at-spi-bus-launcher",
+    "/usr/lib/at-spi2/at-spi-bus-launcher",
+    "/usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher",
+];
+
 fn find_launcher() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("GLASS_ATSPI_LAUNCHER").filter(|s| !s.is_empty()) {
+    find_launcher_with(
+        std::env::var_os("GLASS_ATSPI_LAUNCHER"),
+        LAUNCHER_CANDIDATES,
+    )
+}
+
+/// [`find_launcher`] against explicit inputs — the testable seam (no global env). An override
+/// names the launcher outright and is not searched for among `candidates`; either way the result
+/// must be runnable, since the only thing done with it is spawning it.
+fn find_launcher_with(override_value: Option<OsString>, candidates: &[&str]) -> Option<PathBuf> {
+    if let Some(p) = override_value.filter(|s| !s.is_empty()) {
         let p = PathBuf::from(p);
-        return p.is_file().then_some(p);
+        return is_executable_file(&p).then_some(p);
     }
-    const CANDIDATES: &[&str] = &[
-        "/usr/libexec/at-spi-bus-launcher",
-        "/usr/lib/at-spi2-core/at-spi-bus-launcher",
-        "/usr/lib/at-spi2/at-spi-bus-launcher",
-        "/usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher",
-    ];
-    CANDIDATES.iter().map(PathBuf::from).find(|p| p.is_file())
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| is_executable_file(p))
 }
 
 /// Cheap, non-spawning preflight: are the binaries a private a11y bus needs resolvable on
@@ -267,8 +284,14 @@ fn available_with(launcher: Option<PathBuf>, dbus: &str) -> std::result::Result<
                 .into(),
         );
     }
-    if dbus.contains('/') && !std::path::Path::new(dbus).is_file() {
-        return Err(format!("dbus-daemon not found at {dbus}"));
+    if dbus.contains('/') {
+        match resolve_bin(dbus, None) {
+            Resolved::Found(_) => {}
+            Resolved::NotExecutable(p) => {
+                return Err(format!("dbus-daemon at {} is not executable", p.display()));
+            }
+            Resolved::Absent => return Err(format!("dbus-daemon not found at {dbus}")),
+        }
     }
     Ok(())
 }
@@ -388,7 +411,68 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
+
+    /// glass#374: the launcher was accepted on `is_file()`, so a mode-644 override read as present
+    /// and `PrivateBus::start` then failed at spawn. Drives the seam directly rather than setting
+    /// `GLASS_ATSPI_LAUNCHER` — mutating the process environment races every other test in this
+    /// binary (and is `unsafe` from edition 2024 on).
+    #[test]
+    fn a_non_executable_launcher_override_is_not_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = dir.path().join("at-spi-bus-launcher");
+        std::fs::write(&launcher, b"").expect("write");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert_eq!(
+            find_launcher_with(Some(launcher.into_os_string()), &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn an_executable_launcher_override_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = dir.path().join("at-spi-bus-launcher");
+        std::fs::write(&launcher, b"").expect("write");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(
+            find_launcher_with(Some(launcher.clone().into_os_string()), &[]),
+            Some(launcher)
+        );
+    }
+
+    /// A non-executable candidate does not stop the scan: a later one that IS runnable wins.
+    #[test]
+    fn the_candidate_scan_walks_past_a_non_executable_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let broken = dir.path().join("broken");
+        let working = dir.path().join("working");
+        std::fs::write(&broken, b"").expect("write");
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        std::fs::write(&working, b"").expect("write");
+        std::fs::set_permissions(&working, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let candidates = [
+            broken.to_str().expect("utf-8 temp path"),
+            working.to_str().expect("utf-8 temp path"),
+        ];
+        assert_eq!(find_launcher_with(None, &candidates), Some(working));
+    }
+
+    /// The preflight's other half: an explicit `$GLASS_DBUS_DAEMON` that exists but cannot be run.
+    #[test]
+    fn available_errors_when_an_explicit_dbus_daemon_path_is_not_executable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let daemon = dir.path().join("dbus-daemon");
+        std::fs::write(&daemon, b"").expect("write");
+        std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let err = available_with(
+            Some(PathBuf::from("/bin/true")),
+            daemon.to_str().expect("utf-8 temp path"),
+        )
+        .expect_err("a dbus-daemon that cannot be run must be reported");
+        assert!(err.contains("not executable"), "actionable: {err}");
+    }
 
     /// An unresolvable launcher must report unavailable with an actionable message, whether or
     /// not at-spi2-core is installed on the test host. Drives the seam directly rather than
