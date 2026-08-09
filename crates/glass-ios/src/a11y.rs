@@ -210,7 +210,11 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     if landed {
         Ok(())
     } else {
-        Err(GlassError::AxValueNotApplied(target.id.0))
+        Err(GlassError::value_not_applied(
+            target.id.0,
+            text,
+            node.value.as_deref(),
+        ))
     }
 }
 
@@ -307,11 +311,13 @@ impl Accessibility for IosA11y {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later describe: drift and truncation
                 // are structural, so re-describing for them reaches the same answer more slowly.
-                Err(e @ GlassError::AxValueNotApplied(_)) => last = Some(e),
+                Err(e @ GlassError::AxValueNotApplied { .. }) => last = Some(e),
                 Err(e) => return Err(e),
             }
         }
-        Err(last.unwrap_or(GlassError::AxValueNotApplied(target.id.0)))
+        // `VERIFY_ATTEMPTS` is non-zero, so the loop always reached a verdict; the fallback exists
+        // only to avoid an unwrap and cannot name a read-back nobody took.
+        Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
     }
 }
 
@@ -394,6 +400,24 @@ mod tests {
         }
     }
 
+    /// Pin the whole verdict, not the variant: what the caller does next comes from the two values
+    /// it names, and a field that transformed the text is told apart from one that never received
+    /// it only by reading them (glass#363).
+    #[track_caller]
+    fn assert_not_applied(outcome: Result<()>, id: u32, requested: &str, observed: Option<&str>) {
+        match outcome {
+            Err(GlassError::AxValueNotApplied {
+                id: got_id,
+                requested: req,
+                observed: obs,
+            }) => assert_eq!(
+                (got_id, req.as_str(), obs.as_deref()),
+                (id, requested, observed)
+            ),
+            other => panic!("expected a not-applied verdict, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_write_that_landed_is_reported_as_success() {
         let after = tree_with_value(Some("world"));
@@ -414,10 +438,12 @@ mod tests {
         // the clear can itself change a field that reformats on focus, and accepting that would
         // confirm a clear whose delete never fired.
         let after = tree_with_value(Some("Search settings"));
-        assert!(matches!(
+        assert_not_applied(
             verify_write(&after, &matching_target(), ""),
-            Err(GlassError::AxValueNotApplied(_))
-        ));
+            1,
+            "",
+            Some("Search settings"),
+        );
     }
 
     #[test]
@@ -439,10 +465,12 @@ mod tests {
     #[test]
     fn a_field_that_never_changed_is_not_a_successful_write() {
         let after = tree_with_value(Some("hello"));
-        assert!(matches!(
+        assert_not_applied(
             verify_write(&after, &matching_target(), "world"),
-            Err(GlassError::AxValueNotApplied(1))
-        ));
+            1,
+            "world",
+            Some("hello"),
+        );
     }
 
     #[test]
@@ -450,10 +478,12 @@ mod tests {
         // A dropped keystroke: differs from the old value, so "changed from before" would have
         // called it success.
         let after = tree_with_value(Some("worl"));
-        assert!(matches!(
+        assert_not_applied(
             verify_write(&after, &matching_target(), "world"),
-            Err(GlassError::AxValueNotApplied(1))
-        ));
+            1,
+            "world",
+            Some("worl"),
+        );
     }
 
     #[test]
@@ -466,10 +496,12 @@ mod tests {
         moved.value = Some("hello".into());
         root_field.children.push(moved);
         let after = tree_with(vec![root_field]);
-        assert!(matches!(
+        assert_not_applied(
             verify_write(&after, &matching_target(), "world"),
-            Err(GlassError::AxValueNotApplied(1))
-        ));
+            1,
+            "world",
+            Some("hello"),
+        );
     }
 
     #[test]

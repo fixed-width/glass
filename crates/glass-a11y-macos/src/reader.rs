@@ -149,7 +149,11 @@ impl Accessibility for MacosA11y {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err(GlassError::AxValueNotApplied(target.id.0));
+                return Err(GlassError::value_not_applied(
+                    target.id.0,
+                    text,
+                    after.as_deref(),
+                ));
             }
             std::thread::sleep(Duration::from_millis(SET_VALUE_POLL_MS));
         }

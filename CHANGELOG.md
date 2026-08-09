@@ -19,6 +19,16 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Changed
+- `glass_set_value`'s "did not take" error now names both what you asked for and what the element
+  holds, on every backend. The two readings need telling apart: a field that reformats or
+  autocapitalizes what it is given took every keystroke and holds the text in a form the request
+  cannot express, while a value that did not change never received the write. On the iOS Simulator
+  a text field applies sentence autocapitalization to a value typed into a field it considers
+  empty, so a lowercase value can come back capitalized — intermittently, since it turns on whether
+  the field had finished emptying when the first key arrived — and that read as an unexplained "did
+  not take" before.
+
 ### Fixed
 - A helper binary that is installed but cannot be run is now reported as exactly that, instead of
   as missing. glass resolves several external tools — `Xvfb`, `sway`, `bwrap`, `dbus-daemon`,

@@ -553,9 +553,14 @@ Where the platform can write the value directly this is instant and takes no key
 backend (Android without the on-device accessibility service, and the iOS Simulator) it taps the
 element, clears it and types, then reads the element back to confirm — up to three reads, since a
 field may commit a frame or two later. Errors if the element isn't editable, changed since the
-snapshot, does not hold the requested value afterwards, or the app exposes no accessibility tree. A
-field that reformats what it is given, and a cleared field that reports its placeholder as its text,
-both read as not applied even though the text arrived — read the element to see what it holds.
+snapshot, does not hold the requested value afterwards, or the app exposes no accessibility tree.
+
+The does-not-hold error names both values — what you asked for and what the element holds — because
+the two readings need telling apart. A field that transforms what it is given took the text in a
+form the request cannot express: one that reformats (`"1234567890"` becoming `"(123) 456-7890"`), one
+that autocapitalizes (an iOS text field returning `"Hello"` for a typed `"hello"`, intermittently:
+it depends on whether the field had finished emptying when the first key arrived), or a cleared
+field reporting its placeholder as its text. A value that did not change never received the write.
 
 One error is not a refusal: *the text was typed, but the write could not be confirmed*. The
 keystrokes went out and the read-back afterwards could not establish where they landed — it failed

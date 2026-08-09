@@ -497,7 +497,7 @@ fn write_leg(
         value: field.value.clone(),
     };
     let verdict = a11y.set_value(ctx, &target, "");
-    if !matches!(verdict, Err(GlassError::AxValueNotApplied(_))) {
+    if !matches!(verdict, Err(GlassError::AxValueNotApplied { .. })) {
         return Err(abandon_or_fail(
             a11y,
             ctx,

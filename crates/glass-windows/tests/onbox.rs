@@ -852,7 +852,7 @@ fn onbox_egui_set_value_honesty() {
     assert!(
         matches!(
             a11y.set_value(&ctx, &target, "hello"),
-            Err(GlassError::AxValueNotApplied(_))
+            Err(GlassError::AxValueNotApplied { .. })
         ),
         "set_value on an egui TextEdit must error AxValueNotApplied (read-only projection), not false success"
     );

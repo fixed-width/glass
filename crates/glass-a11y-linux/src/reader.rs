@@ -256,7 +256,7 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
         if matches!(role, CheckBox | ToggleButton | RadioButton)
             && let Some(on) = parse_bool(text)
         {
-            return set_toggle(&conn, &node, role, on, target.id.0).await;
+            return set_toggle(&conn, &node, role, on, text, target.id.0).await;
         }
     }
 
@@ -604,6 +604,7 @@ async fn set_toggle(
     node: &AccessibleProxy<'_>,
     role: glass_core::AxRole,
     target_on: bool,
+    requested: &str,
     id: u32,
 ) -> Result<()> {
     let flag = toggle_state_flag(role);
@@ -629,7 +630,12 @@ async fn set_toggle(
             return Ok(());
         }
     }
-    Err(GlassError::AxValueNotApplied(id))
+    // The last poll read the state, so the control it is still in is observed, not inferred.
+    Err(GlassError::value_not_applied(
+        id,
+        requested,
+        Some(if target_on { "off" } else { "on" }),
+    ))
 }
 
 /// The one AT-SPI action whose meaning is "flip this control's boolean state" — and so the

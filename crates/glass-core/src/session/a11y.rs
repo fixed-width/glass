@@ -418,20 +418,28 @@ impl Glass {
             // Not event-gated: this branch runs only on iOS, whose reader has no event stream.
             // No deadline either: `AxDeadline` carries the *caller's* bound, and
             // `TOGGLE_VERIFY_TIMEOUT_MS` is glass's own.
+            // The last tick's reading is what the failure reports, so it is kept as the poll runs
+            // rather than re-read afterwards — a read taken after the bound elapsed could have
+            // caught a state that arrived late and would contradict the verdict.
+            let mut seen = None;
             let outcome = crate::poll::poll_until(
                 TOGGLE_VERIFY_INTERVAL_MS,
                 TOGGLE_VERIFY_TIMEOUT_MS,
                 || {
                     let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
-                    let now = find_checkable_near(&tree.root, target.bounds.as_ref())
-                        .is_some_and(|n| n.states.checked == want);
-                    Ok(now.then_some(()))
+                    seen = find_checkable_near(&tree.root, target.bounds.as_ref())
+                        .map(|n| n.states.checked);
+                    Ok((seen == Some(want)).then_some(()))
                 },
             )?;
             return if outcome.value.is_some() {
                 Ok(())
             } else {
-                Err(GlassError::AxValueNotApplied(id.0))
+                Err(GlassError::value_not_applied(
+                    id.0,
+                    text,
+                    seen.map(|on| if on { "on" } else { "off" }),
+                ))
             };
         }
         let s = self.active_mut()?;
@@ -526,13 +534,16 @@ impl Glass {
         // Verify the model actually committed — the *target* combo (matched by bounds,
         // now closed so nothing is `expanded`) must read the wanted label.
         let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
-        let ok = find_combo_near(&tree.root, target.bounds.as_ref())
-            .and_then(|c| c.name.as_deref())
-            .is_some_and(|n| n.eq_ignore_ascii_case(want));
-        if ok {
+        let shows =
+            find_combo_near(&tree.root, target.bounds.as_ref()).and_then(|c| c.name.clone());
+        if shows
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(want))
+        {
             Ok(())
         } else {
-            Err(GlassError::AxValueNotApplied(id.0))
+            // A combo carries its selection as its name, so that is the read-back to report.
+            Err(GlassError::value_not_applied(id.0, want, shows.as_deref()))
         }
     }
 
@@ -2806,7 +2817,7 @@ mod tests {
         fn set_value(&mut self, _ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
             if !self.failed_once {
                 self.failed_once = true;
-                return Err(GlassError::AxValueNotApplied(target.id.0));
+                return Err(GlassError::value_not_applied(target.id.0, text, None));
             }
             self.set_log
                 .lock()
@@ -3209,7 +3220,11 @@ mod tests {
         g.a11y_snapshot(None).unwrap();
 
         let err = g.set_value(AxNodeId(1), "true").unwrap_err();
-        assert!(matches!(err, GlassError::AxValueNotApplied(_)));
+        assert!(
+            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed }
+                if requested == "true" && observed.as_deref() == Some("off")),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3334,7 +3349,11 @@ mod tests {
         g.a11y_snapshot(None).unwrap();
 
         let err = g.set_value(AxNodeId(2), "true").unwrap_err();
-        assert!(matches!(err, GlassError::AxValueNotApplied(2)));
+        assert!(
+            matches!(&err, GlassError::AxValueNotApplied { id: 2, requested, observed }
+                if requested == "true" && observed.as_deref() == Some("off")),
+            "{err}"
+        );
     }
 
     #[test]

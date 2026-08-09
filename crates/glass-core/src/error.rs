@@ -16,6 +16,16 @@ pub enum BoundKind {
     NotStarted,
 }
 
+/// Render a read-back for [`GlassError::AxValueNotApplied`]. An element reporting no value at all
+/// is a different answer from one holding `""` — a read-only projection that never exposed a value
+/// versus a field that emptied — so it does not render as an empty pair of quotes.
+fn render_observed(observed: &Option<String>) -> String {
+    match observed {
+        Some(v) => format!("{v:?}"),
+        None => "no value".to_string(),
+    }
+}
+
 /// All fallible glass-core operations return this error.
 ///
 /// Variants map to the actionable error kinds the MCP layer surfaces to the
@@ -143,13 +153,27 @@ pub enum GlassError {
     )]
     AxWriteUnconfirmed(u32, String),
 
+    /// A dispatched write whose read-back does not hold the request.
+    ///
+    /// Carries both values because the caller's next move turns on the difference between them,
+    /// and only the backend that raised this had them side by side. A field that transformed the
+    /// text took the write in a form the request cannot express; one that did not change never
+    /// received it. Build it with [`GlassError::value_not_applied`].
     #[error(
-        "set_value on element #{0} did not take — the element does not hold the requested value. On \
-         a desktop backend this usually means a read-only accessibility projection, so try \
-         keystrokes; on Android or the iOS Simulator the write already IS keystrokes, so the tap may \
-         have missed or the field rejected the input — re-snapshot to see what it holds"
+        "set_value on element #{id} did not take — asked for {requested:?}, the element holds {}. \
+         Compare the two: a field that reformats or autocapitalizes what it is given has taken the \
+         keystrokes in a form the request cannot express, while a value that did not change means \
+         the write never reached it — a read-only accessibility projection on a desktop backend, a \
+         tap that missed on Android or the iOS Simulator",
+        render_observed(.observed)
     )]
-    AxValueNotApplied(u32),
+    AxValueNotApplied {
+        id: u32,
+        requested: String,
+        /// What the element reads as now, as its backend renders it: the text for a field, `"on"`
+        /// / `"off"` for a boolean control, `None` for an element reporting no value at all.
+        observed: Option<String>,
+    },
 
     #[error("element #{0} exposes no native activation action")]
     AxActionUnavailable(u32),
@@ -268,8 +292,20 @@ impl GlassError {
     pub fn set_value_failed_after_writing(&self) -> bool {
         matches!(
             self,
-            GlassError::AxValueNotApplied(_) | GlassError::AxWriteUnconfirmed(..)
+            GlassError::AxValueNotApplied { .. } | GlassError::AxWriteUnconfirmed(..)
         )
+    }
+
+    /// The verdict for a write that dispatched and whose read-back does not hold the request.
+    ///
+    /// `observed` is what the element reads as now — the value the read-back just fetched, not a
+    /// fresh read and not what the caller believes is there.
+    pub fn value_not_applied(id: u32, requested: &str, observed: Option<&str>) -> GlassError {
+        GlassError::AxValueNotApplied {
+            id,
+            requested: requested.to_string(),
+            observed: observed.map(str::to_string),
+        }
     }
 
     /// Which of glass's own bounds ended this call, if one did rather than the tool answering.
@@ -539,9 +575,28 @@ mod tests {
     }
 
     #[test]
+    fn a_write_that_did_not_take_names_both_the_request_and_the_read_back() {
+        // The whole point of the variant: an iOS field that autocapitalized the first letter took
+        // every keystroke, and only seeing both strings tells the caller that (glass#363).
+        let msg = GlassError::value_not_applied(13, "glasssmoke3", Some("Glasssmoke3")).to_string();
+        assert!(msg.contains("\"glasssmoke3\""), "{msg}");
+        assert!(msg.contains("\"Glasssmoke3\""), "{msg}");
+    }
+
+    #[test]
+    fn an_element_reporting_no_value_does_not_render_as_an_empty_string() {
+        // "holds \"\"" would claim the element exposed an empty value; it exposed none.
+        let msg = GlassError::value_not_applied(13, "hello", None).to_string();
+        assert!(msg.contains("holds no value"), "{msg}");
+    }
+
+    #[test]
     fn only_a_proven_post_dispatch_verdict_invalidates_the_captured_value() {
         // The read-back verdict is reached only after the write went out.
-        assert!(GlassError::AxValueNotApplied(3).set_value_failed_after_writing());
+        assert!(
+            GlassError::value_not_applied(3, "world", Some("hello"))
+                .set_value_failed_after_writing()
+        );
         // Everything else keeps the captured value: the pre-dispatch rejections, the transport
         // errors raised on either side of the dispatch, and any variant not named (the wildcard).
         for e in [
