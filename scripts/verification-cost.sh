@@ -14,7 +14,7 @@ launcher=""
 for c in /usr/libexec/at-spi-bus-launcher \
          /usr/lib/at-spi2-core/at-spi-bus-launcher \
          /usr/lib/at-spi2/at-spi-bus-launcher \
-         /usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher; do
+         /usr/lib/*/at-spi2-core/at-spi-bus-launcher; do
     [ -x "$c" ] && launcher="$c" && break
 done
 if ! command -v dbus-daemon >/dev/null 2>&1 \

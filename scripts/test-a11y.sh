@@ -9,10 +9,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # -> rust/
 
 launcher=""
+# The last entry is a glob over the multiarch triplet dirs, matching the crate-side lookup: a
+# literal x86_64 path skips this whole suite on an aarch64 host that has at-spi2-core installed.
 for c in /usr/libexec/at-spi-bus-launcher \
          /usr/lib/at-spi2-core/at-spi-bus-launcher \
          /usr/lib/at-spi2/at-spi-bus-launcher \
-         /usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher; do
+         /usr/lib/*/at-spi2-core/at-spi-bus-launcher; do
     [ -x "$c" ] && launcher="$c" && break
 done
 
