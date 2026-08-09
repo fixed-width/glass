@@ -235,6 +235,9 @@ const LAUNCHER_CANDIDATES: &[&str] = &[
     "/usr/libexec/at-spi-bus-launcher",
     "/usr/lib/at-spi2-core/at-spi-bus-launcher",
     "/usr/lib/at-spi2/at-spi-bus-launcher",
+    // Arch builds at-spi2-core with libexecdir=/usr/lib, so its launcher sits directly there —
+    // under no at-spi2-core/ dir, which is why the multiarch scan cannot reach it either.
+    "/usr/lib/at-spi-bus-launcher",
 ];
 
 /// Parent of the Debian/Ubuntu multiarch triplet dirs the scan walks.
@@ -788,6 +791,7 @@ mod tests {
                 "/usr/libexec/at-spi-bus-launcher",
                 "/usr/lib/at-spi2-core/at-spi-bus-launcher",
                 "/usr/lib/at-spi2/at-spi-bus-launcher",
+                "/usr/lib/at-spi-bus-launcher",
             ]
         );
     }

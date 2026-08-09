@@ -17,6 +17,7 @@ have_atspi() {
     for c in /usr/libexec/at-spi-bus-launcher \
              /usr/lib/at-spi2-core/at-spi-bus-launcher \
              /usr/lib/at-spi2/at-spi-bus-launcher \
+             /usr/lib/at-spi-bus-launcher \
              /usr/lib/*/at-spi2-core/at-spi-bus-launcher; do
         if [ -f "$c" ] && [ -x "$c" ]; then
             return 0

@@ -49,7 +49,8 @@ internal refactors, CI, or test-only changes.
   report and the launch each looked for the launcher their own way, and only the report knew to
   look under the machine's own `/usr/lib/<triplet>/at-spi2-core/`. They now share one lookup, so
   they cannot disagree about a file again. Three things follow. Every architecture's directory is
-  searched, and a launcher this machine can actually execute is preferred to one it cannot — a
+  searched, Arch's `/usr/lib/at-spi-bus-launcher` is looked for, and a launcher this machine can
+  actually execute is preferred to one it cannot — a
   foreign-architecture binary looks perfectly runnable to the filesystem and fails only when glass
   tries to run it, which is reachable on any machine with a second architecture enabled.
   `GLASS_ATSPI_LAUNCHER` is
