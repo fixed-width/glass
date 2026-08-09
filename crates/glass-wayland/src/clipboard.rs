@@ -948,8 +948,25 @@ mod tests {
             std::sync::Mutex::new(ReadyState::Pending),
             std::sync::Condvar::new(),
         ));
-        serve_loop(socket.clone(), text, stop, ready)
-            .expect("a detached thread standing down is not a serve error");
+
+        // On its own thread: a compositor stalled in the setup roundtrip (or, on an ablated
+        // build, the trailing one after set_selection) would otherwise hang this call forever,
+        // and a direct call would wedge the whole suite instead of failing this test.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let socket_thread = socket.clone();
+        std::thread::spawn(move || {
+            let outcome = serve_loop(socket_thread, text, stop, ready)
+                .err()
+                .map(|e| e.to_string());
+            let _ = tx.send(outcome);
+        });
+
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a stalled compositor must fail this test, not hang the whole suite");
+        if let Some(msg) = outcome {
+            panic!("a detached thread standing down is not a serve error: {msg}");
+        }
 
         assert!(
             live.is_alive(),
