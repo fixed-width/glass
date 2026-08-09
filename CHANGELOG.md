@@ -21,12 +21,13 @@ internal refactors, CI, or test-only changes.
 
 ### Changed
 - `glass_set_value`'s "did not take" error now names both what you asked for and what the element
-  holds, on every backend. The two readings need telling apart: a field that reformats or
-  autocapitalizes what it is given took every keystroke and holds the text in a form the request
-  cannot express, while a value that did not change never received the write. On the iOS Simulator
-  a text field applies sentence autocapitalization to a value typed into a field it considers
-  empty, so a lowercase value can come back capitalized — intermittently, since it turns on whether
-  the field had finished emptying when the first key arrived — and that read as an unexplained "did
+  holds. Three outcomes used to look alike: the element transformed the write and holds it in
+  another form, so writing again changes nothing; it holds part of what you asked for, so a
+  keystroke was dropped and writing again is the fix; or it holds what it held before, so the write
+  never arrived. On the iOS Simulator this is routine — iOS applies sentence autocapitalization to
+  the first character of a field it considers empty, and a write clears the field before it types,
+  so a lowercase value can come back capitalized. It happens intermittently, depending on whether
+  the field had finished emptying when the first key arrived, and it read as an unexplained "did
   not take" before.
 
 ### Fixed

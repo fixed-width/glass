@@ -849,12 +849,15 @@ fn onbox_egui_set_value_honesty() {
         bounds: field.bounds,
         value: field.value.clone(),
     };
+    // The read-back is what makes the projection's shape visible: it still reports the field's own
+    // text, so the verdict must name that and not a failed read — UIA accepted the write and the
+    // value never moved.
+    let verdict = a11y.set_value(&ctx, &target, "hello");
     assert!(
-        matches!(
-            a11y.set_value(&ctx, &target, "hello"),
-            Err(GlassError::AxValueNotApplied { .. })
-        ),
-        "set_value on an egui TextEdit must error AxValueNotApplied (read-only projection), not false success"
+        matches!(&verdict, Err(GlassError::AxValueNotApplied { requested, observed, .. })
+            if requested == "hello" && observed.as_deref() == field.value.as_deref()),
+        "set_value on an egui TextEdit must error AxValueNotApplied naming what the field still \
+         holds (read-only projection), not false success; got {verdict:?}"
     );
 
     let _ = p.stop_app();

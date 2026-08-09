@@ -594,7 +594,8 @@ const TOGGLE_VERIFY_POLLS: usize = 6;
 /// See [`TOGGLE_VERIFY_POLLS`].
 const TOGGLE_VERIFY_INTERVAL: Duration = Duration::from_millis(120);
 
-/// Set a boolean widget (switch/checkbox/toggle/radio) to `target_on`. Idempotent:
+/// Set a boolean widget (switch/checkbox/toggle/radio) to `target_on`, as the caller spelled it in
+/// `requested`. Idempotent:
 /// only invokes the toggle action when the boolean state differs, then confirms the
 /// state actually changed (the toolkit applies the action on its next loop) — so a
 /// no-op activation (e.g. a radio can't be *un*-selected by clicking it) is reported
@@ -624,18 +625,28 @@ async fn set_toggle(
         return Err(GlassError::AxElementNotEditable(id));
     }
     // Poll until the toolkit applies it; a no-op activation never converges.
+    let mut last_on = None;
     for _ in 0..TOGGLE_VERIFY_POLLS {
         tokio::time::sleep(TOGGLE_VERIFY_INTERVAL).await;
-        if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
+        let on = node.get_state().await.map_err(bus_err)?.contains(flag);
+        last_on = Some(on);
+        if on == target_on {
             return Ok(());
         }
     }
-    // The last poll read the state, so the control it is still in is observed, not inferred.
+    // Report the state the last poll read, not `!target_on` derived from the request: the two agree
+    // only while the loop's sole exit is this equality, and nothing holds that.
     Err(GlassError::value_not_applied(
         id,
         requested,
-        Some(if target_on { "off" } else { "on" }),
+        last_on.map(toggle_state_label),
     ))
+}
+
+/// How a boolean control's state is named in a verdict the caller reads. `set_value` accepts
+/// `true`/`on`/`1` alike, so the request and the read-back would otherwise be worded differently.
+fn toggle_state_label(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
 }
 
 /// The one AT-SPI action whose meaning is "flip this control's boolean state" — and so the
@@ -797,6 +808,20 @@ async fn read_value(
 
 fn nonempty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
+}
+
+#[cfg(test)]
+mod toggle_label_tests {
+    use super::toggle_state_label;
+
+    #[test]
+    fn a_control_that_stayed_off_is_reported_as_off() {
+        // The direction is what the verdict rests on: inverted, a `set_value("true")` that failed
+        // would report the control as already on — the state the caller asked for, alongside "did
+        // not take".
+        assert_eq!(toggle_state_label(false), "off");
+        assert_eq!(toggle_state_label(true), "on");
+    }
 }
 
 #[cfg(test)]

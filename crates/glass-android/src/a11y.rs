@@ -404,10 +404,12 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     if landed {
         Ok(())
     } else {
+        // `Some("")`, not `None`: this mapper drops an empty value, so an empty field arrives here
+        // as `None` — the same `None` the verdict reserves for a reading nobody obtained.
         Err(GlassError::value_not_applied(
             target.id.0,
             text,
-            node.value.as_deref(),
+            Some(node.value.as_deref().unwrap_or("")),
         ))
     }
 }
@@ -426,6 +428,10 @@ fn read_back_failed(target: &AxTarget, e: &GlassError) -> GlassError {
 /// frame or two later — a Compose recompose, a debounced handler — which the on-device service
 /// reader polls two whole seconds for.
 const VERIFY_ATTEMPTS: usize = 3;
+const _: () = assert!(
+    VERIFY_ATTEMPTS > 0,
+    "set_value reports the last read-back, so there must be one"
+);
 
 /// How long to let the toolkit commit typed text before reading it back. Generous relative to a
 /// keystroke and small next to the `uiautomator dump` that follows it.
@@ -716,8 +722,8 @@ impl Accessibility for AndroidA11y {
                 break;
             }
         }
-        // `VERIFY_ATTEMPTS` is non-zero, so the loop always reached a verdict; the fallback exists
-        // only to avoid an unwrap and cannot name a read-back nobody took.
+        // The const assert on `VERIFY_ATTEMPTS` is what makes `last` always set; the fallback only
+        // avoids an unwrap, and names no read-back because none was taken.
         Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
     }
 }
@@ -1986,6 +1992,16 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_field_reports_an_empty_read_back_not_a_missing_one() {
+        // `axmap` drops an empty value, so the node arrives holding `None` — which the verdict
+        // reserves for a reading nobody took. A write that cleared the field and lost its text must
+        // say the field is empty, not that it could not be read.
+        let after = tree_holding(None);
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert_not_applied(verify_write(&after, &t, "world"), 0, "world", Some(""));
+    }
+
+    #[test]
     fn a_partly_typed_write_is_not_a_successful_write() {
         // The reason the rule is an exact match; `typed_text_landed` carries the argument.
         let after = tree_holding(Some("worl"));
@@ -2426,6 +2442,63 @@ mod tests {
         assert!(
             matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed }
                 if requested == "world" && observed.as_deref() == Some("hello")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_verdict_names_the_last_read_back_not_the_first() {
+        // The read-back retries because a field can commit a frame or two late, so the attempts can
+        // disagree: a first read caught mid-write and a second holding what the field settled on.
+        // Reporting the first would tell the caller the write never arrived when it arrived
+        // transformed — the misdiagnosis the two values exist to prevent.
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        // Three reads, in order: the pre-write locate, then the two verify attempts that disagree.
+        let locate = Answer::says(one_field_holding("old"));
+        let mid = Answer::says(one_field_holding("hel"));
+        let settled = Answer::says(one_field_holding("Hello"));
+        let fake = FakeAdb::scripted(&[
+            ("*shell cat*", vec![&locate, &mid, &settled]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+        let ctx = AxContext {
+            pids: vec![],
+            window: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 2400,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::from_millis(30_000),
+        };
+        let field = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: Some(AxRect {
+                x: 100,
+                y: 200,
+                width: 400,
+                height: 100,
+            }),
+            value: None,
+        };
+
+        let err = reader
+            .set_value(&ctx, &field, "hello")
+            .expect_err("neither read holds the requested text");
+        assert!(
+            matches!(&err, GlassError::AxValueNotApplied { observed, .. }
+                if observed.as_deref() == Some("Hello")),
             "{err}"
         );
     }

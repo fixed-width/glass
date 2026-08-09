@@ -418,9 +418,8 @@ impl Glass {
             // Not event-gated: this branch runs only on iOS, whose reader has no event stream.
             // No deadline either: `AxDeadline` carries the *caller's* bound, and
             // `TOGGLE_VERIFY_TIMEOUT_MS` is glass's own.
-            // The last tick's reading is what the failure reports, so it is kept as the poll runs
-            // rather than re-read afterwards — a read taken after the bound elapsed could have
-            // caught a state that arrived late and would contradict the verdict.
+            // Kept as the poll runs rather than re-read afterwards: a read taken after the bound
+            // elapsed could catch a state that arrived late and contradict the verdict.
             let mut seen = None;
             let outcome = crate::poll::poll_until(
                 TOGGLE_VERIFY_INTERVAL_MS,
@@ -435,6 +434,8 @@ impl Glass {
             return if outcome.value.is_some() {
                 Ok(())
             } else {
+                // `None` is no checkable element near the target's bounds on the last tick — the
+                // swipe moved the screen — so it reports as a reading nobody took, not as a state.
                 Err(GlassError::value_not_applied(
                     id.0,
                     text,
@@ -542,8 +543,11 @@ impl Glass {
         {
             Ok(())
         } else {
-            // A combo carries its selection as its name, so that is the read-back to report.
-            Err(GlassError::value_not_applied(id.0, want, shows.as_deref()))
+            // A combo carries its selection as its name, so that is the read-back to report; `None`
+            // is the combo no longer being where it was, which is a reading nobody took. `text`,
+            // not the trimmed `want`, so the caller sees what it asked for — as `AxOptionNotFound`
+            // above already does.
+            Err(GlassError::value_not_applied(id.0, text, shows.as_deref()))
         }
     }
 
@@ -2439,6 +2443,56 @@ mod tests {
     /// direction and the number of steps come from their index difference. Asserted on the
     /// keystrokes: the end state alone is reached by any number of Downs past the target.
     #[test]
+    fn a_combo_that_did_not_commit_names_the_selection_it_still_shows() {
+        // The selection a combo shows is its name, so that is the read-back — a future edit reaching
+        // for `value` (which no combo carries) would report every one of them as unreadable.
+        let platform = FakePlatform::new(340, 300).with_key_log(Arc::new(Mutex::new(Vec::new())));
+        let (mut g, _) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Beta", &[]),
+                combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"]),
+                combo("Beta", &[]),
+            ],
+            InvokeBehavior::Unsupported,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let err = g.set_value(AxNodeId(1), "Delta").unwrap_err();
+        assert!(
+            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed }
+                if requested == "Delta" && observed.as_deref() == Some("Beta")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_combo_no_longer_where_it_was_reports_no_reading_rather_than_no_value() {
+        // Committing can reflow the form out from under the combo. Nothing was read, so the verdict
+        // must not claim the combo holds nothing — that reads as a combo with no selection.
+        let platform = FakePlatform::new(340, 300).with_key_log(Arc::new(Mutex::new(Vec::new())));
+        let (mut g, _) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Beta", &[]),
+                combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"]),
+                tree_with(340, 300, vec![]),
+            ],
+            InvokeBehavior::Unsupported,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let err = g.set_value(AxNodeId(1), "Delta").unwrap_err();
+        assert!(
+            matches!(&err, GlassError::AxValueNotApplied { observed: None, .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("could not be read back"), "{err}");
+    }
+
+    #[test]
     fn set_combo_value_steps_from_the_current_selection_to_the_target() {
         let keys = Arc::new(Mutex::new(Vec::new()));
         let platform = FakePlatform::new(340, 300).with_key_log(keys.clone());
@@ -3210,6 +3264,25 @@ mod tests {
     }
 
     #[test]
+    fn a_toggle_whose_control_left_the_screen_reports_no_reading_rather_than_a_state() {
+        // The actuation is a swipe, which can carry the row away or navigate off the screen. No
+        // checkable was read, so the verdict must not name "on" or "off" — either would be a state
+        // nobody observed.
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(Arc::new(Mutex::new(Vec::new())))
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_a11y_seq(platform, vec![sw(false), tree_with(400, 400, vec![])]);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let err = g.set_value(AxNodeId(1), "true").unwrap_err();
+        assert!(
+            matches!(&err, GlassError::AxValueNotApplied { observed: None, .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn set_value_errors_when_the_toggle_does_not_apply() {
         let platform = FakePlatform::new(400, 400)
             .with_drag_log(Arc::new(Mutex::new(Vec::new())))
@@ -3444,7 +3517,7 @@ mod tests {
 
         // The error must be the switch-specific "expects a boolean" one, and its message must
         // actually guide the agent (name the accepted values + echo the bad input) — NOT a generic
-        // "value not applied — use keystrokes", which would send the agent down a futile path.
+        // `AxValueNotApplied`, whose remedy is to type into the element — futile for a switch.
         assert!(
             matches!(err, GlassError::AxValueNotBoolean(1, ref got) if got == "banana"),
             "{err}"

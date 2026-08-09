@@ -103,6 +103,10 @@ const VERIFY_SETTLE: Duration = Duration::from_millis(300);
 /// confirms on the first attempt and pays for one describe; the retries cover a field that commits a
 /// frame or two later.
 const VERIFY_ATTEMPTS: usize = 3;
+const _: () = assert!(
+    VERIFY_ATTEMPTS > 0,
+    "set_value reports the last read-back, so there must be one"
+);
 
 /// Judge a typed `set_value` from a tree described after it. `Ok(())` only when the field holds
 /// exactly what was asked for, or — for a named field — reads back empty after a clear.
@@ -210,10 +214,12 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     if landed {
         Ok(())
     } else {
+        // `Some("")`, not `None`: this mapper drops an empty value, so an empty field arrives here
+        // as `None` — the same `None` the verdict reserves for a reading nobody obtained.
         Err(GlassError::value_not_applied(
             target.id.0,
             text,
-            node.value.as_deref(),
+            Some(node.value.as_deref().unwrap_or("")),
         ))
     }
 }
@@ -315,8 +321,8 @@ impl Accessibility for IosA11y {
                 Err(e) => return Err(e),
             }
         }
-        // `VERIFY_ATTEMPTS` is non-zero, so the loop always reached a verdict; the fallback exists
-        // only to avoid an unwrap and cannot name a read-back nobody took.
+        // The const assert on `VERIFY_ATTEMPTS` is what makes `last` always set; the fallback only
+        // avoids an unwrap, and names no read-back because none was taken.
         Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
     }
 }
@@ -402,7 +408,7 @@ mod tests {
 
     /// Pin the whole verdict, not the variant: what the caller does next comes from the two values
     /// it names, and a field that transformed the text is told apart from one that never received
-    /// it only by reading them (glass#363).
+    /// it only by reading them (glass#363). Twin of the helper in `glass-android/src/a11y.rs`.
     #[track_caller]
     fn assert_not_applied(outcome: Result<()>, id: u32, requested: &str, observed: Option<&str>) {
         match outcome {
@@ -470,6 +476,37 @@ mod tests {
             1,
             "world",
             Some("hello"),
+        );
+    }
+
+    #[test]
+    fn an_autocapitalized_first_letter_is_not_a_successful_write() {
+        // glass#363: measured on the Simulator, iOS applies sentence autocapitalization to a value
+        // typed into a field it considers empty, so every keystroke lands and the field holds the
+        // request with its first letter uppercased. Exact match refuses it — accepting a case-only
+        // difference would report a write as landed while the field holds different bytes — and the
+        // verdict names both strings, which is the only way a caller can tell this from a lost
+        // write.
+        let after = tree_with_value(Some("Glasssmoke3"));
+        assert_not_applied(
+            verify_write(&after, &matching_target(), "glasssmoke3"),
+            1,
+            "glasssmoke3",
+            Some("Glasssmoke3"),
+        );
+    }
+
+    #[test]
+    fn an_empty_field_reports_an_empty_read_back_not_a_missing_one() {
+        // `axmap` drops an empty value, so the node arrives holding `None` — which the verdict
+        // reserves for a reading nobody took. A write that cleared the field and lost its text must
+        // say the field is empty, not that it could not be read.
+        let after = tree_with_value(None);
+        assert_not_applied(
+            verify_write(&after, &matching_target(), "world"),
+            1,
+            "world",
+            Some(""),
         );
     }
 

@@ -144,11 +144,14 @@ detected on top of the semantic check above.
   settle into the call itself.
 - **Toggles:** if a control is a switch, drive it with a short swipe across its trailing edge rather
   than a tap.
-- **A text field may capitalize the first letter of what you write.** iOS applies sentence
-  autocapitalization to a field it considers empty, and `glass_set_value` clears before it types, so
-  a lowercase value can come back capitalized — intermittently, since it turns on whether the field
-  had finished emptying when the first key arrived. Every keystroke landed; the field transformed
-  one. The error names both strings, so compare them rather than writing again, and prefer a value
-  whose first character is not a lowercase letter where you control it.
+- **A text field may capitalize the first letter of what you write**
+  ([#363](https://github.com/fixed-width/glass/issues/363)). iOS applies sentence autocapitalization
+  to a field it considers empty, and `glass_set_value` clears before it types, so a lowercase value
+  can come back capitalized. Every keystroke landed; the field transformed one, and
+  `glass_set_value` reports that it does not hold what you asked for. It happens intermittently —
+  it turns on whether the field had finished emptying when the first key arrived, so a busier host
+  hits it more often. The error names both strings; when they differ only in that first letter, the
+  write is as landed as it is going to get. Where you choose the value, one that does not start
+  with a lowercase letter avoids it entirely.
 - **Multi-touch** gestures (`glass_gesture`) are not supported on the Simulator
   ([#117](https://github.com/fixed-width/glass/issues/117)); drive with taps, swipes, and typing.

@@ -469,9 +469,10 @@ impl GlassServer {
                        since the snapshot (re-snapshot), if the element does not hold the requested \
                        value afterwards, or if the app exposes no accessibility tree. That \
                        does-not-hold error names both what you asked for and what the element \
-                       holds: a field that reformats or autocapitalizes what it is given took the \
-                       text in a form the request cannot express, so compare the two before \
-                       writing again. A separate \
+                       holds, and which one it is decides your next move: your text in another \
+                       form means the element transformed it and writing again will not help; part \
+                       of your text means a keystroke was dropped, so write again; what it held \
+                       before means the write never arrived. A separate \
                        error says the text WAS typed but the write could not be confirmed — the \
                        read-back failed, or could not tell which element now holds it. Do NOT write \
                        again on that one: the keystrokes already went out, and re-snapshotting is \
