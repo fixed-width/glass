@@ -288,8 +288,8 @@ fn find_launcher_with(
 }
 
 /// `<multiarch_root>/<triplet>/at-spi2-core/at-spi-bus-launcher` for every entry under the root.
-/// The triplet is arch-specific (`x86_64-linux-gnu`, `aarch64-linux-gnu`, …), so scanning rather
-/// than hardcoding one keeps the lookup correct on non-x86_64 hosts.
+/// The triplet is arch-specific (`x86_64-linux-gnu`, `aarch64-linux-gnu`, …), so a hardcoded one
+/// is wrong on every other host.
 fn multiarch_candidates(multiarch_root: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(multiarch_root) {
         Ok(entries) => entries,
@@ -317,11 +317,11 @@ fn scan_error_worth_reporting(kind: std::io::ErrorKind) -> bool {
 /// The launcher path under each triplet dir, this machine's architecture first and the rest
 /// sorted.
 ///
-/// This order decides which binary gets spawned. `access(X_OK)` never reads the ELF machine
-/// field, so a foreign-arch launcher resolves [`Resolved::Found`] and fails only at spawn, with
-/// `Exec format error` — and alphabetical order alone hands `i386-linux-gnu` to an x86_64 machine.
-/// Sorted below that rank because `read_dir` order is arbitrary: a host carrying at-spi2-core for
-/// two architectures would otherwise spawn a different binary run to run.
+/// `access(X_OK)` never reads the ELF machine field, so a foreign-arch launcher resolves
+/// [`Resolved::Found`] and fails only at spawn, with `Exec format error` — and alphabetical order
+/// alone hands `i386-linux-gnu` to an x86_64 machine. Sorted below that rank because `read_dir`
+/// order is arbitrary: a host carrying at-spi2-core for two architectures would otherwise spawn a
+/// different binary run to run.
 fn launchers_under(triplet_dirs: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
     let ours = elf_kind(Path::new("/proc/self/exe"));
     let mut ranked: Vec<(u8, PathBuf)> = triplet_dirs
@@ -632,8 +632,8 @@ mod tests {
     }
 
     /// A foreign-arch launcher is executable to `access(X_OK)` and dies at spawn with `Exec format
-    /// error`, so alphabetical order alone would hand a foreign triplet's launcher to a host that
-    /// carries one — which any machine with a foreign architecture enabled does.
+    /// error`, so alphabetical order alone would hand a foreign triplet's launcher to any machine
+    /// with a second architecture enabled.
     #[test]
     fn the_multiarch_scan_tries_a_launcher_this_kernel_can_exec_first() {
         let root = tempfile::tempdir().expect("tempdir");

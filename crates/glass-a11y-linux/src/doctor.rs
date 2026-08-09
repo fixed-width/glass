@@ -25,8 +25,7 @@ pub fn accessibility_launcher_present() -> bool {
     launcher_present(glass_dbus_linux::find_launcher())
 }
 
-/// Only a runnable launcher counts as present: what this feeds says a11y is ready, and glass
-/// cannot spawn a launcher whose execute bit is off.
+/// Only a runnable launcher counts as present — what this feeds says a11y is ready.
 fn launcher_present(resolved: Resolved) -> bool {
     matches!(resolved, Resolved::Found(_))
 }
@@ -211,9 +210,8 @@ fn a11y_checks(launcher: &Resolved, override_set: bool, facts: &HostA11yFacts) -
     let mut checks = Vec::new();
 
     // Concern A — can glass do a11y AT ALL? Honest precondition, never a "will work" promise.
-    // Each way of having no launcher gets its own remedy: "install at-spi2-core" about a file
-    // that is already there, or about a path the user named themselves, sends them to fix what
-    // is not broken.
+    // Each way of having no launcher gets its own remedy — "install at-spi2-core" about a file
+    // that is already there sends the user to fix what is not broken.
     checks.push(match launcher {
         Resolved::Found(_) => Check::new(
             "a11y",
@@ -338,8 +336,8 @@ mod tests {
         assert!(launcher_present(Resolved::Found("/usr/libexec/x".into())));
     }
 
-    /// The doctor cell says a11y is ready. A launcher glass cannot spawn makes it a promise the
-    /// launch then breaks, so it counts as absent here while the spawn path still names the file.
+    /// A launcher glass cannot spawn would make the ready cell a promise the launch breaks, so it
+    /// counts as absent here.
     #[test]
     fn launcher_absent_when_present_but_unrunnable() {
         assert!(!launcher_present(Resolved::NotExecutable(
@@ -474,9 +472,8 @@ mod tests {
         assert!(head.remedy.is_some());
     }
 
-    /// The package is installed and the file is right there; "apt install at-spi2-core" would
-    /// send the user to fix what is not broken. The spawn path has always named the file — this is
-    /// the surface that did not.
+    /// "apt install at-spi2-core" about a file that is right there sends the user to fix what is
+    /// not broken. The spawn path has always named it; this is the surface that did not.
     #[test]
     fn launcher_present_but_unrunnable_names_the_file_not_the_package() {
         let cs = a11y_checks(
