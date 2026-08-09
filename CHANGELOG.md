@@ -43,6 +43,15 @@ internal refactors, CI, or test-only changes.
   were told to build one. Such a candidate is now stepped over and the search carries on. A
   candidate that does start and reports a version glass cannot use is unchanged: the search stops
   there rather than silently running a different sway further along your `$PATH`.
+- `glass doctor` no longer reports AT-SPI as both installed and missing in one run. The
+  accessibility report and the code that spawns `at-spi-bus-launcher` each looked for it their own
+  way, and the two disagreed on any host that is not x86_64 and on any host where you had set
+  `GLASS_ATSPI_LAUNCHER`: on aarch64 Debian/Ubuntu, `[a11y] Ok — at-spi-bus-launcher present` and
+  `at-spi-bus-launcher not found (install at-spi2-core)` could come from the same `glass doctor`,
+  with accessibility falling back to pixel-only on launch. One lookup now answers both. It honours
+  `GLASS_ATSPI_LAUNCHER` for the report as well as the launch, and looks in every architecture's
+  `/usr/lib/<triplet>/at-spi2-core/` rather than only x86_64's, so an at-spi2-core installed by
+  your package manager is found on the arch you are actually running.
 
 ## [1.2.0] - 2026-08-07
 

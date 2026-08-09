@@ -229,18 +229,26 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// The four paths distributions install `at-spi-bus-launcher` to.
+/// The three arch-independent paths distributions install `at-spi-bus-launcher` to.
 const LAUNCHER_CANDIDATES: &[&str] = &[
     "/usr/libexec/at-spi-bus-launcher",
     "/usr/lib/at-spi2-core/at-spi-bus-launcher",
     "/usr/lib/at-spi2/at-spi-bus-launcher",
-    "/usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher",
 ];
 
-fn find_launcher() -> Resolved {
+/// Parent of the Debian/Ubuntu multiarch triplet dirs the scan walks.
+const MULTIARCH_ROOT: &str = "/usr/lib";
+
+/// This host's `at-spi-bus-launcher`, or why there is none.
+///
+/// Public because it is also the AT-SPI-present signal `glass doctor` and `glass_capabilities`
+/// report, through `glass-a11y-linux`. A second lookup let one run answer both "present" and
+/// "not found" about one file (glass#391).
+pub fn find_launcher() -> Resolved {
     find_launcher_with(
         std::env::var_os("GLASS_ATSPI_LAUNCHER"),
         LAUNCHER_CANDIDATES,
+        MULTIARCH_ROOT,
     )
 }
 
@@ -250,13 +258,18 @@ fn find_launcher() -> Resolved {
 /// The scan takes the first runnable candidate and, failing that, reports the first present-but-
 /// unrunnable one it walked past rather than [`Resolved::Absent`] — the rule `resolve_bin`
 /// applies to a `$PATH` walk.
-fn find_launcher_with(override_value: Option<OsString>, candidates: &[&str]) -> Resolved {
+fn find_launcher_with(
+    override_value: Option<OsString>,
+    candidates: &[&str],
+    multiarch_root: &str,
+) -> Resolved {
     if let Some(p) = override_value.filter(|s| !s.is_empty()) {
         return resolve_path(Path::new(&p));
     }
     let mut first_non_executable = None;
-    for cand in candidates.iter().map(Path::new) {
-        match resolve_path(cand) {
+    let fixed = candidates.iter().map(PathBuf::from);
+    for cand in fixed.chain(multiarch_candidates(multiarch_root)) {
+        match resolve_path(&cand) {
             Resolved::Found(p) => return Resolved::Found(p),
             Resolved::NotExecutable(p) => {
                 first_non_executable.get_or_insert(p);
@@ -265,6 +278,27 @@ fn find_launcher_with(override_value: Option<OsString>, candidates: &[&str]) -> 
         }
     }
     first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
+}
+
+/// `<multiarch_root>/<triplet>/at-spi2-core/at-spi-bus-launcher` for every entry under the root.
+/// The triplet is arch-specific (`x86_64-linux-gnu`, `aarch64-linux-gnu`, …), so scanning rather
+/// than hardcoding one keeps the lookup correct on non-x86_64 hosts.
+fn multiarch_candidates(multiarch_root: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(multiarch_root) else {
+        return Vec::new();
+    };
+    launchers_under(entries.flatten().map(|e| e.path()))
+}
+
+/// The launcher path under each triplet dir, sorted: a host can carry at-spi2-core for two
+/// architectures at once, and `read_dir` order is arbitrary, so an unsorted scan would spawn a
+/// different binary on different runs of one unchanged host.
+fn launchers_under(triplet_dirs: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = triplet_dirs
+        .map(|d| d.join("at-spi2-core/at-spi-bus-launcher"))
+        .collect();
+    candidates.sort();
+    candidates
 }
 
 /// The launcher to spawn, or why there is none — one mapping, so the preflight and the bring-up
@@ -436,6 +470,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
 
+    /// A multiarch root that does not exist, for the cases about the fixed list alone. The real
+    /// `/usr/lib` would make the outcome depend on whether the test host has at-spi2-core.
+    const NO_MULTIARCH: &str = "/nonexistent-multiarch-root";
+
     /// A directory holding `name` at `mode`.
     fn dir_with(name: &str, mode: u32) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -445,6 +483,19 @@ mod tests {
         dir
     }
 
+    /// A multiarch root holding `<triplet>/at-spi2-core/at-spi-bus-launcher` at `mode`.
+    fn multiarch_root_with(triplet: &str, mode: u32) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("tempdir");
+        let bin = root
+            .path()
+            .join(triplet)
+            .join("at-spi2-core/at-spi-bus-launcher");
+        std::fs::create_dir_all(bin.parent().expect("has parent")).expect("mkdir");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        root
+    }
+
     /// glass#374: the override was accepted on `is_file()`, and reporting a mere `None` let the
     /// caller say "install at-spi2-core" about a path the user had named themselves.
     #[test]
@@ -452,7 +503,7 @@ mod tests {
         let dir = dir_with("at-spi-bus-launcher", 0o644);
         let launcher = dir.path().join("at-spi-bus-launcher");
         assert_eq!(
-            find_launcher_with(Some(launcher.clone().into_os_string()), &[]),
+            find_launcher_with(Some(launcher.clone().into_os_string()), &[], NO_MULTIARCH),
             Resolved::NotExecutable(launcher)
         );
     }
@@ -462,8 +513,66 @@ mod tests {
         let dir = dir_with("at-spi-bus-launcher", 0o755);
         let launcher = dir.path().join("at-spi-bus-launcher");
         assert_eq!(
-            find_launcher_with(Some(launcher.clone().into_os_string()), &[]),
+            find_launcher_with(Some(launcher.clone().into_os_string()), &[], NO_MULTIARCH),
             Resolved::Found(launcher)
+        );
+    }
+
+    /// glass#391: this lookup hardcoded the x86_64 triplet, so on aarch64 the spawn reported
+    /// "install at-spi2-core" about a launcher the doctor's own scan had already found.
+    #[test]
+    fn a_launcher_under_any_multiarch_triplet_is_found() {
+        let root = multiarch_root_with("aarch64-linux-gnu", 0o755);
+        assert_eq!(
+            find_launcher_with(None, &[], root.path().to_str().expect("utf-8 temp path")),
+            Resolved::Found(
+                root.path()
+                    .join("aarch64-linux-gnu/at-spi2-core/at-spi-bus-launcher")
+            )
+        );
+    }
+
+    /// The chmod-away case has to survive the fixed list running dry, or the arch whose launcher
+    /// only the scan can reach is the one that gets sent to reinstall a package it already has.
+    #[test]
+    fn a_scan_finding_only_a_non_executable_multiarch_launcher_names_it() {
+        let root = multiarch_root_with("aarch64-linux-gnu", 0o644);
+        assert_eq!(
+            find_launcher_with(None, &[], root.path().to_str().expect("utf-8 temp path")),
+            Resolved::NotExecutable(
+                root.path()
+                    .join("aarch64-linux-gnu/at-spi2-core/at-spi-bus-launcher")
+            )
+        );
+    }
+
+    /// Two architectures' at-spi2-core on one host, and `read_dir` hands them over in whatever
+    /// order it likes: unsorted, which binary gets spawned varies run to run.
+    #[test]
+    fn the_multiarch_scan_orders_triplets_the_same_way_every_run() {
+        let dirs = ["/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu"];
+        assert_eq!(
+            launchers_under(dirs.iter().map(PathBuf::from)),
+            [
+                PathBuf::from("/usr/lib/aarch64-linux-gnu/at-spi2-core/at-spi-bus-launcher"),
+                PathBuf::from("/usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher"),
+            ]
+        );
+    }
+
+    /// The fixed list is the faster lookup and the arch-independent one; the scan only backs it up.
+    #[test]
+    fn a_fixed_candidate_wins_over_a_multiarch_one() {
+        let fixed = dir_with("at-spi-bus-launcher", 0o755);
+        let root = multiarch_root_with("aarch64-linux-gnu", 0o755);
+        let fixed_path = fixed.path().join("at-spi-bus-launcher");
+        assert_eq!(
+            find_launcher_with(
+                None,
+                &[fixed_path.to_str().expect("utf-8 temp path")],
+                root.path().to_str().expect("utf-8 temp path")
+            ),
+            Resolved::Found(fixed_path)
         );
     }
 
@@ -487,7 +596,7 @@ mod tests {
         ];
         let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
         assert_eq!(
-            find_launcher_with(None, &candidates),
+            find_launcher_with(None, &candidates, NO_MULTIARCH),
             Resolved::Found(working.path().join("at-spi-bus-launcher"))
         );
     }
@@ -500,7 +609,7 @@ mod tests {
         let launcher = dir.path().join("at-spi-bus-launcher");
         let candidates = [launcher.to_str().expect("utf-8 temp path")];
         assert_eq!(
-            find_launcher_with(None, &candidates),
+            find_launcher_with(None, &candidates, NO_MULTIARCH),
             Resolved::NotExecutable(launcher)
         );
     }

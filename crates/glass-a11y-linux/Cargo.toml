@@ -8,6 +8,7 @@ publish = false
 
 [target.'cfg(target_os = "linux")'.dependencies]
 glass-core.workspace = true
+glass-dbus-linux.workspace = true
 glass-exec-unix.workspace = true
 atspi.workspace = true
 atspi-common.workspace = true
