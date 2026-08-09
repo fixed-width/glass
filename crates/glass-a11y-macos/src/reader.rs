@@ -55,6 +55,11 @@ const SET_VALUE_VERIFY_MS: u64 = 800;
 /// Interval between read-back poll attempts.
 const SET_VALUE_POLL_MS: u64 = 20;
 
+/// What a write that never arrived looks like on this backend: the accessibility API accepts a
+/// value the toolkit never applies, which is a read-only projection rather than a lost write.
+const READ_ONLY_PROJECTION: &str = "this element's accessibility value may be a read-only projection that accepts a write without \
+     applying it — focus the element and type into it instead";
+
 /// How long [`resolve_window`] polls for the app's first `AXWindow` to register before giving
 /// up. The window server publishes a freshly-launched window's AX element a beat after the
 /// window exists, so a snapshot taken immediately after `start` can find an empty `AXWindows`
@@ -149,10 +154,11 @@ impl Accessibility for MacosA11y {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err(GlassError::value_not_applied(
+                return Err(GlassError::value_not_applied_because(
                     target.id.0,
                     text,
                     after.as_deref(),
+                    READ_ONLY_PROJECTION,
                 ));
             }
             std::thread::sleep(Duration::from_millis(SET_VALUE_POLL_MS));

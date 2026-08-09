@@ -59,6 +59,11 @@ const SET_VALUE_VERIFY_MS: u64 = 800;
 /// Interval between read-backs while waiting for a write / toggle to land.
 const VERIFY_POLL_MS: u64 = 20;
 
+/// What a write that never arrived looks like on this backend: the accessibility API accepts a
+/// value the toolkit never applies, which is a read-only projection rather than a lost write.
+const READ_ONLY_PROJECTION: &str = "this element's accessibility value may be a read-only projection that accepts a write without \
+     applying it — focus the element and type into it instead";
+
 #[derive(Default)]
 pub struct WindowsA11y;
 
@@ -454,10 +459,11 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(GlassError::value_not_applied(
+            return Err(GlassError::value_not_applied_because(
                 target.id.0,
                 text,
                 after.as_deref(),
+                READ_ONLY_PROJECTION,
             ));
         }
         std::thread::sleep(Duration::from_millis(VERIFY_POLL_MS));

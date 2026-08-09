@@ -485,6 +485,11 @@ impl Drop for ReadBound<'_> {
     }
 }
 
+/// What a write that never arrived looks like on this backend: `ACTION_SET_TEXT` reports success
+/// and silently does nothing when it would *replace* text already in a Compose field.
+const COMPOSE_SET_TEXT_NO_OP: &str = "a Compose field that already holds text cannot be replaced via ACTION_SET_TEXT — clear it \
+     first, or unset GLASS_ANDROID_A11Y_APK to use the uiautomator backend";
+
 impl Accessibility for ServiceA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         Ok(self.snapshot_with_refs(ctx)?.tree)
@@ -505,7 +510,12 @@ impl Accessibility for ServiceA11y {
         // value to land; error honestly only on timeout.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let after = self.snapshot(ctx)?;
+            // Every exit below this point is post-dispatch, so each must be a verdict
+            // `set_value_failed_after_writing` accepts — otherwise the session keeps the value it
+            // cached for a write that went out, and refuses the retry as drift (glass#405).
+            let after = self
+                .snapshot(ctx)
+                .map_err(|e| crate::a11y::read_back_failed(target, &e))?;
             let node = after.find(target.id);
             let got = node.and_then(|n| n.value.clone());
             // An empty field reports no value (None), not Some(""), so compare against "".
@@ -518,20 +528,22 @@ impl Accessibility for ServiceA11y {
             // caller to clear a field that is already correct and to switch backends for nothing.
             // `AndroidA11y`'s `verify_write` re-checks the same flag for the same reason.
             if node.is_some_and(|n| !n.states.editable) {
-                return Err(GlassError::AccessibilityUnavailable(format!(
-                    "set_value on element {} was sent, but the element no longer reports itself \
-                     editable, so its value cannot be read back; re-snapshot to see what it holds \
-                     rather than retyping",
-                    target.id.0
-                )));
+                return Err(GlassError::AxWriteUnconfirmed(
+                    target.id.0,
+                    "the element no longer reports itself editable, so its value cannot be read \
+                     back"
+                        .into(),
+                ));
             }
             if std::time::Instant::now() >= deadline {
-                return Err(GlassError::Backend(format!(
-                    "set_value on element {} did not take (field is {got:?}, wanted {text:?}); a \
-                     Compose field that already holds text can't be replaced via ACTION_SET_TEXT — \
-                     clear it first or unset GLASS_ANDROID_A11Y_APK to use the uiautomator backend",
-                    target.id.0
-                )));
+                return Err(GlassError::value_not_applied_because(
+                    target.id.0,
+                    text,
+                    // This reader keeps `Some("")` for an emptied field; the verdict reserves
+                    // `None` for a reading nobody took.
+                    Some(got.as_deref().unwrap_or("")),
+                    COMPOSE_SET_TEXT_NO_OP,
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
@@ -3589,6 +3601,92 @@ mod tests {
         let mut v = editable_field(value);
         v["children"][0]["bounds"] = json!({"x": dx, "y": 100, "w": 600, "h": 120});
         v
+    }
+
+    /// [`editable_field`] with the field no longer editable — a submit collapsing it to a display
+    /// row, which reports no value exactly as a lost write does.
+    fn settled_field(value: &str) -> Value {
+        let mut v = editable_field(value);
+        v["children"][0]["editable"] = json!(false);
+        v
+    }
+
+    #[test]
+    fn a_write_that_never_lands_names_both_values_and_the_compose_no_op() {
+        // ACTION_SET_TEXT reports success and does nothing when it would replace text already in a
+        // Compose field, which is a fact only this backend knows — the shared message is written
+        // for no backend in particular (glass#405).
+        let (port, _ops) = fake_service(vec![editable_field("old")], OnAction::Ok);
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let t = built(&editable_field("old"));
+
+        let err = a
+            .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
+            .expect_err("the field never takes the value");
+        assert!(
+            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed, why }
+                if requested == "new"
+                    && observed.as_deref() == Some("old")
+                    && why.is_some_and(|w| w.contains("ACTION_SET_TEXT"))),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_write_that_never_lands_invalidates_the_sessions_cached_value() {
+        // The verdict is raised after `set_text` went out, so it must be one the session treats as
+        // post-dispatch — otherwise it keeps the value it cached for a write that dispatched, and
+        // the guard refuses the retry as drift (glass#405).
+        let (port, _ops) = fake_service(vec![editable_field("old")], OnAction::Ok);
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let t = built(&editable_field("old"));
+
+        let err = a
+            .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
+            .expect_err("the field never takes the value");
+        assert!(err.set_value_failed_after_writing(), "{err}");
+    }
+
+    #[test]
+    fn a_field_that_stopped_being_editable_is_unconfirmed_and_post_dispatch() {
+        // Its value cannot be read back, so the write is unconfirmed rather than refused — and the
+        // keystrokes went out either way, so the session must drop its cached value.
+        let (port, _ops) = fake_service(
+            vec![editable_field("old"), settled_field("old")],
+            OnAction::Ok,
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let t = built(&editable_field("old"));
+
+        let err = a
+            .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
+            .expect_err("a field that stopped reporting editable cannot confirm the write");
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.set_value_failed_after_writing(), "{err}");
+    }
+
+    #[test]
+    fn a_read_back_that_fails_is_unconfirmed_and_post_dispatch() {
+        // The read-back runs after `set_text`, so its own failure must not propagate raw: every
+        // transport verdict is classified pre-dispatch, which would keep the stale cached value.
+        let (port, _ops) = fake_service_full(
+            vec![editable_field("old")],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+            vec![OnTree::Serve, OnTree::Refused("no active window")],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let t = built(&editable_field("old"));
+
+        let err = a
+            .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
+            .expect_err("the verification read is refused");
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.set_value_failed_after_writing(), "{err}");
     }
 
     #[test]

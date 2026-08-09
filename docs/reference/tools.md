@@ -561,8 +561,11 @@ another form and writing again will not change that: a field that reformats (`"1
 `"(123) 456-7890"`), or one that autocapitalizes (an iOS text field returning `"Hello"` for a typed
 `"hello"`, intermittently — it depends on whether the field had finished emptying when the first key
 arrived). An element holding **part** of your text dropped a keystroke, and writing again is the fix.
-An element holding **what it held before** never received the write: on a desktop backend its value
-is usually a read-only projection, so focus it and use `glass_type` instead.
+An element holding **what it held before** never received the write, and the error closes with what
+the backend that made the write knows about that: a desktop element's value is often a read-only
+projection, so focus it and use `glass_type` instead; a mobile write is a tap and then keystrokes,
+so the tap may have missed; and an Android field driven through the on-device accessibility service
+cannot have text *replaced*, only set into an empty field.
 
 A cleared field (`text: ""`) that reads back holding its placeholder is the one false failure here —
 the clear landed and the accessibility layer substituted the hint. Confirm it with a screenshot

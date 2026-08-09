@@ -2460,7 +2460,7 @@ mod tests {
 
         let err = g.set_value(AxNodeId(1), "Delta").unwrap_err();
         assert!(
-            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed }
+            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed, .. }
                 if requested == "Delta" && observed.as_deref() == Some("Beta")),
             "{err}"
         );
@@ -3292,7 +3292,7 @@ mod tests {
 
         let err = g.set_value(AxNodeId(1), "true").unwrap_err();
         assert!(
-            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed }
+            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed, .. }
                 if requested == "true" && observed.as_deref() == Some("off")),
             "{err}"
         );
@@ -3421,7 +3421,7 @@ mod tests {
 
         let err = g.set_value(AxNodeId(2), "true").unwrap_err();
         assert!(
-            matches!(&err, GlassError::AxValueNotApplied { id: 2, requested, observed }
+            matches!(&err, GlassError::AxValueNotApplied { id: 2, requested, observed, .. }
                 if requested == "true" && observed.as_deref() == Some("off")),
             "{err}"
         );

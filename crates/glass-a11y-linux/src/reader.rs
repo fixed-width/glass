@@ -636,10 +636,12 @@ async fn set_toggle(
     }
     // Report the state the last poll read, not `!target_on` derived from the request — the two
     // agree only while this equality is the loop's sole exit, and nothing holds that.
-    Err(GlassError::value_not_applied(
+    Err(GlassError::value_not_applied_because(
         id,
         requested,
         last_on.map(toggle_state_label),
+        "the control's toggle action fired without moving it, which is how a radio button reports \
+         that it cannot be unselected",
     ))
 }
 

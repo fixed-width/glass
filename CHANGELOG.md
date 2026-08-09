@@ -29,8 +29,20 @@ internal refactors, CI, or test-only changes.
   so a lowercase value can come back capitalized. It happens intermittently, depending on whether
   the field had finished emptying when the first key arrived, and it read as an unexplained "did
   not take" before.
+- A `glass_set_value` that does not take now closes with what the backend that made the write knows
+  about it, rather than one shared guess covering all of them: a desktop element's value is often a
+  read-only accessibility projection, a mobile write is a tap and then keystrokes so the tap can
+  miss, an Android field driven through the on-device accessibility service cannot have text
+  replaced (only set into an empty field), and a control whose toggle action fired without moving is
+  how a radio button reports it cannot be unselected.
 
 ### Fixed
+- A `glass_set_value` that failed on Android's on-device accessibility service no longer poisons the
+  retry. Three of that path's failures — the write not landing, the field ceasing to report itself
+  editable, and the read-back itself failing — were reported in a shape glass did not recognise as
+  having already written, so it kept the value it had cached for the element. A field that then
+  settled to the new text made the cached value stale, and the next `glass_set_value` on it was
+  refused as drift ("changed since the snapshot") for a write that had in fact succeeded.
 - A helper binary that is installed but cannot be run is now reported as exactly that, instead of
   as missing. glass resolves several external tools — `Xvfb`, `sway`, `bwrap`, `dbus-daemon`,
   `at-spi-bus-launcher` — and used to accept any file at the path, so one whose execute permission

@@ -406,10 +406,11 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     } else {
         // The mapper drops an empty value, so an empty field arrives as `None` — which the verdict
         // reserves for a reading nobody took.
-        Err(GlassError::value_not_applied(
+        Err(GlassError::value_not_applied_because(
             target.id.0,
             text,
             Some(node.value.as_deref().unwrap_or("")),
+            TAP_MAY_HAVE_MISSED,
         ))
     }
 }
@@ -419,9 +420,14 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
 /// Post-dispatch by construction: its only caller is the loop that runs after the keystrokes went
 /// out. A verdict `GlassError::set_value_failed_after_writing` rejects would leave the session
 /// holding the value it cached for a write that already landed, and refuse the retry as drift.
-fn read_back_failed(target: &AxTarget, e: &GlassError) -> GlassError {
+pub(crate) fn read_back_failed(target: &AxTarget, e: &GlassError) -> GlassError {
     GlassError::AxWriteUnconfirmed(target.id.0, format!("reading the element back failed: {e}"))
 }
+
+/// What a write that never arrived looks like on this backend: `set_value` types, so the tap that
+/// aims the keystrokes is the part that can miss. Twin of the const in `glass-ios/src/a11y.rs`.
+const TAP_MAY_HAVE_MISSED: &str = "this write is a tap and then keystrokes, so the tap may have missed the element — writing \
+     again is worth one attempt";
 
 /// How many times to read the element back before reporting the write as not applied. A landed
 /// write confirms on the first read and pays for one; the retries exist for a field that commits a
@@ -1963,6 +1969,7 @@ mod tests {
                 id: got_id,
                 requested: req,
                 observed: obs,
+                ..
             }) => assert_eq!(
                 (got_id, req.as_str(), obs.as_deref()),
                 (id, requested, observed)
@@ -2438,7 +2445,7 @@ mod tests {
             .set_value(&ctx, &field, "world")
             .expect_err("a field still holding the old text has not taken the write");
         assert!(
-            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed }
+            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed, .. }
                 if requested == "world" && observed.as_deref() == Some("hello")),
             "{err}"
         );

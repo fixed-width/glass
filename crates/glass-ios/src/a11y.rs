@@ -97,6 +97,11 @@ fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
 
 /// How long to let the app commit typed text before each read-back attempt. Generous next to a
 /// keystroke and small next to the `describe` that follows it.
+/// What a write that never arrived looks like on this backend: `set_value` types, so the tap that
+/// aims the keystrokes is the part that can miss.
+const TAP_MAY_HAVE_MISSED: &str = "this write is a tap and then keystrokes, so the tap may have missed the element — writing \
+     again is worth one attempt";
+
 const VERIFY_SETTLE: Duration = Duration::from_millis(300);
 
 /// How many times to read the element back before reporting the write as not applied. A landed write
@@ -216,10 +221,11 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     } else {
         // The mapper drops an empty value, so an empty field arrives as `None` — which the verdict
         // reserves for a reading nobody took.
-        Err(GlassError::value_not_applied(
+        Err(GlassError::value_not_applied_because(
             target.id.0,
             text,
             Some(node.value.as_deref().unwrap_or("")),
+            TAP_MAY_HAVE_MISSED,
         ))
     }
 }
@@ -415,6 +421,7 @@ mod tests {
                 id: got_id,
                 requested: req,
                 observed: obs,
+                ..
             }) => assert_eq!(
                 (got_id, req.as_str(), obs.as_deref()),
                 (id, requested, observed)
