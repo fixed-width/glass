@@ -500,7 +500,8 @@ fn rect_to_geom(r: &crate::swayipc::Rect) -> WindowGeometry {
     }
 }
 
-/// How long one capture may take, from the copy request to the last event it needs.
+/// How long one capture may take, from its request to the last event it needs — the format list,
+/// the copy, and the `ready` that ends it.
 const CAPTURE_BUDGET: Duration = Duration::from_secs(5);
 
 /// A capture waits on a compositor that is also driving the app being captured, so the budget has
@@ -512,15 +513,20 @@ const _: () = assert!(
     "the capture budget must leave a loaded compositor time to answer, without holding the session lock for long"
 );
 
-/// When the capture starting now must be over. A function, so removing the last use of
-/// [`CAPTURE_BUDGET`] from the capture path is a dead-code error rather than a constant left
-/// bracketed and unread.
-fn capture_deadline() -> Instant {
-    Instant::now() + CAPTURE_BUDGET
+fn capture_failed(what: &str, e: impl std::fmt::Display) -> GlassError {
+    GlassError::CaptureFailed(format!("screencopy: {what}: {e}"))
 }
 
-/// Dispatch whatever the compositor has sent, waiting no later than `deadline` for it to send
-/// something.
+/// Send what is queued and dispatch what has already arrived, without waiting for more.
+fn drain<S>(conn: &Connection, queue: &mut EventQueue<S>, state: &mut S) -> Result<()> {
+    conn.flush().map_err(|e| capture_failed("flush", e))?;
+    queue
+        .dispatch_pending(state)
+        .map_err(|e| capture_failed("dispatch", e))?;
+    Ok(())
+}
+
+/// Wait for the compositor to send something, no later than `deadline`, and dispatch it.
 ///
 /// `blocking_dispatch` waits on the socket with no timeout, so a deadline checked after it is not
 /// a bound: a compositor that goes quiet after the last event glass reacts to holds the caller —
@@ -529,8 +535,7 @@ fn capture_deadline() -> Instant {
 /// transfers use.
 ///
 /// Expiry is not an error here: this returns having made whatever progress it could, and
-/// [`wait_for`] owns the deadline. What is already in the queue is always dispatched first, so a
-/// budget spent down to nothing still delivers an answer that had already arrived.
+/// [`wait_for`] owns the deadline.
 ///
 /// Generic over the queue's state only so the bound can be tested against a socket with no
 /// compositor behind it; capture is the sole caller, hence the error variant.
@@ -540,22 +545,10 @@ fn dispatch_until<S>(
     state: &mut S,
     deadline: Instant,
 ) -> Result<()> {
-    fn failed(what: &str, e: impl std::fmt::Display) -> GlassError {
-        GlassError::CaptureFailed(format!("screencopy: {what}: {e}"))
-    }
-    let dispatch = |queue: &mut EventQueue<S>, state: &mut S| {
-        queue
-            .dispatch_pending(state)
-            .map_err(|e| failed("dispatch", e))
-    };
-    conn.flush().map_err(|e| failed("flush", e))?;
-    if dispatch(queue, state)? > 0 {
-        return Ok(());
-    }
     // `None` is a libwayland-backend condition glass cannot reach (the pure-Rust backend always
     // prepares), and it means the backend's own queue needs draining, not this one's.
     let Some(guard) = queue.prepare_read() else {
-        return Ok(());
+        return drain(conn, queue, state);
     };
     let Some(ts) = remaining_timespec(deadline) else {
         return Ok(());
@@ -578,14 +571,16 @@ fn dispatch_until<S>(
             // treats this as a retry, and so must this: it is a loaded host, not a fault.
             Err(wayland_client::backend::WaylandError::Io(e))
                 if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(failed("read", e)),
+            Err(e) => return Err(capture_failed("read", e)),
         },
         // A signal arrived and nothing was lost; the caller's deadline decides whether there is
         // time to ask again.
         Err(rustix::io::Errno::INTR) => return Ok(()),
-        Err(e) => return Err(failed("poll", e)),
+        Err(e) => return Err(capture_failed("poll", e)),
     }
-    dispatch(queue, state)?;
+    queue
+        .dispatch_pending(state)
+        .map_err(|e| capture_failed("dispatch", e))?;
     Ok(())
 }
 
@@ -594,22 +589,26 @@ fn dispatch_until<S>(
 /// The deadline check lives here rather than in each caller's own loop: [`dispatch_until`] returns
 /// at once once the budget is spent, so a loop that forgot to check would not hang as it did
 /// before glass#383 — it would spin on a core holding the session lock, which is worse.
+///
+/// An answer already in hand is taken before the deadline is judged, so a phase that inherits a
+/// spent budget reports what arrived rather than a timeout.
 fn wait_for<S, T>(
     conn: &Connection,
     queue: &mut EventQueue<S>,
     state: &mut S,
     deadline: Instant,
-    expired: &str,
+    expired: impl FnOnce(&S) -> String,
     mut answered: impl FnMut(&mut S) -> Option<Result<T>>,
 ) -> Result<T> {
     loop {
-        dispatch_until(conn, queue, state, deadline)?;
+        drain(conn, queue, state)?;
         if let Some(answer) = answered(state) {
             return answer;
         }
         if Instant::now() >= deadline {
-            return Err(GlassError::CaptureFailed(expired.to_string()));
+            return Err(GlassError::CaptureFailed(expired(state)));
         }
+        dispatch_until(conn, queue, state, deadline)?;
     }
 }
 
@@ -635,6 +634,50 @@ impl Drop for CaptureObjects {
     }
 }
 
+/// What the compositor has said about the capture in flight. Held apart from the connection so
+/// that reading a capture out of it stays a plain function, testable without a compositor.
+#[derive(Default)]
+struct CaptureScratch {
+    shm_buffers: Vec<(wl_shm::Format, u32, u32, u32)>, // advertised formats (format, w, h, stride)
+    buffer_done: bool,                                 // v3: end of the format advertisement list
+    done: Option<Result<()>>,                          // Some(Ok)=ready, Some(Err)=failed
+}
+
+impl CaptureScratch {
+    /// The buffer to allocate, once the compositor has finished advertising formats.
+    ///
+    /// `None` while the list is still arriving — the caller's only reason to keep waiting.
+    fn advertised(&mut self) -> Option<Result<(wl_shm::Format, u32, u32, u32)>> {
+        if self.buffer_done {
+            return Some(
+                crate::pixels::pick_shm_format(&self.shm_buffers).ok_or_else(|| {
+                    GlassError::CaptureFailed("screencopy: no shm format advertised".into())
+                }),
+            );
+        }
+        match self.done.take() {
+            Some(Err(e)) => Some(Err(e)),
+            // Nothing has been asked to be copied yet, so a `ready` belongs to no request of this
+            // capture's.
+            Some(Ok(())) => Some(Err(GlassError::CaptureFailed(
+                "screencopy: ready before the buffer list ended".into(),
+            ))),
+            None => None,
+        }
+    }
+
+    /// Why the format list never finished. A compositor that advertised formats and never ended
+    /// the list is a different fault from one that said nothing, and only one of them is about the
+    /// version glass binds.
+    fn no_formats(&self) -> String {
+        if self.shm_buffers.is_empty() {
+            "screencopy: no buffer event".into()
+        } else {
+            "screencopy: buffer formats advertised, but no buffer_done (v3) to end the list".into()
+        }
+    }
+}
+
 /// SCTK state: registry + output (for the output extent), shm (for capture
 /// buffers), and the per-capture wlr-screencopy scratch (reset before each
 /// capture). Window enumeration is via sway IPC, not foreign-toplevel.
@@ -642,9 +685,7 @@ struct State {
     registry: RegistryState,
     output: OutputState,
     shm: Shm,
-    shm_buffers: Vec<(wl_shm::Format, u32, u32, u32)>, // advertised formats (format, w, h, stride)
-    buffer_done: bool,                                 // v3: end of the format advertisement list
-    capture_done: Option<Result<()>>,                  // Some(Ok)=ready, Some(Err)=failed
+    capture: CaptureScratch,
 }
 
 impl ProvidesRegistryState for State {
@@ -719,12 +760,12 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 height,
                 stride,
             } => {
-                state.shm_buffers.push((f, width, height, stride));
+                state.capture.shm_buffers.push((f, width, height, stride));
             }
-            Event::BufferDone => state.buffer_done = true,
-            Event::Ready { .. } => state.capture_done = Some(Ok(())),
+            Event::BufferDone => state.capture.buffer_done = true,
+            Event::Ready { .. } => state.capture.done = Some(Ok(())),
             Event::Failed => {
-                state.capture_done =
+                state.capture.done =
                     Some(Err(GlassError::CaptureFailed("screencopy failed".into())))
             }
             _ => {} // Flags, Damage, LinuxDmabuf, etc.
@@ -830,9 +871,7 @@ fn open_session(
         registry: RegistryState::new(&globals),
         output: OutputState::new(&globals, &qh),
         shm: Shm::bind(&globals, &qh).map_err(|e| GlassError::Backend(format!("bind shm: {e}")))?,
-        shm_buffers: Vec::new(),
-        buffer_done: false,
-        capture_done: None,
+        capture: CaptureScratch::default(),
     };
     // v3 exactly, not 1..=3: capture waits for `buffer_done`, which only v3 sends. The v1/v2
     // branch that waited differently was unreachable — glass only talks to the sway it launched.
@@ -1438,9 +1477,7 @@ impl Platform for WaylandPlatform {
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
         let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        session.state.shm_buffers.clear();
-        session.state.buffer_done = false;
-        session.state.capture_done = None;
+        session.state.capture = CaptureScratch::default();
         let qh = session.queue.handle();
 
         // Map the (window-relative) request to OUTPUT coordinates by the active
@@ -1468,7 +1505,7 @@ impl Platform for WaylandPlatform {
             buffer: None,
         };
 
-        let deadline = capture_deadline();
+        let deadline = Instant::now() + CAPTURE_BUDGET;
 
         // Phase 1: dispatch until the compositor has advertised its buffer formats, then pick one
         // we can convert (preferring 32-bit). `buffer_done` marks the end of the list — a v3
@@ -1478,39 +1515,9 @@ impl Platform for WaylandPlatform {
             &mut session.queue,
             &mut session.state,
             deadline,
-            "screencopy: no buffer event",
-            |s| {
-                if s.buffer_done {
-                    return Some(
-                        crate::pixels::pick_shm_format(&s.shm_buffers).ok_or_else(|| {
-                            GlassError::CaptureFailed("screencopy: no shm format advertised".into())
-                        }),
-                    );
-                }
-                match s.capture_done.take() {
-                    Some(Err(e)) => Some(Err(e)),
-                    // Nothing has been asked to be copied yet, so a `ready` here belongs to no
-                    // request of this capture's.
-                    Some(Ok(())) => Some(Err(GlassError::CaptureFailed(
-                        "screencopy: ready before the buffer list ended".into(),
-                    ))),
-                    None => None,
-                }
-            },
-        )
-        // A compositor that advertises formats and never ends the list is a different fault from
-        // one that says nothing, and only one of them is about the version glass binds.
-        .map_err(|e| {
-            match (&e, session.state.shm_buffers.is_empty()) {
-            (GlassError::CaptureFailed(m), false) if m == "screencopy: no buffer event" => {
-                GlassError::CaptureFailed(
-                    "screencopy: buffer formats advertised, but no buffer_done (v3) to end the list"
-                        .into(),
-                )
-            }
-            _ => e,
-        }
-        })?;
+            |s| s.capture.no_formats(),
+            |s| s.capture.advertised(),
+        )?;
 
         // Allocate a matching shm buffer and request the copy.
         let mut pool = RawPool::new((stride * h) as usize, &session.state.shm)
@@ -1519,14 +1526,16 @@ impl Platform for WaylandPlatform {
         owned.frame.copy(&buffer);
         owned.buffer = Some(buffer);
 
-        // Phase 2: dispatch until ready/failed.
+        // Phase 2: dispatch until ready/failed. Bounded by the same `wait_for` as phase 1 and the
+        // same budget; nothing live proves this call site is the bounded one, so a change here has
+        // only the pure tests behind it.
         wait_for(
             &session.conn,
             &mut session.queue,
             &mut session.state,
             deadline,
-            "screencopy: no ready event after the copy request",
-            |s| s.capture_done.take(),
+            |_| "screencopy: no ready event after the copy request".into(),
+            |s| s.capture.done.take(),
         )?;
 
         // The captured buffer already matches the requested region, so no CPU crop.
@@ -1832,10 +1841,15 @@ mod pure_tests {
     /// past their own budget, which is what makes a lost bound a failure rather than a hang.
     const PURE_WAIT_BUDGET: Duration = Duration::from_millis(300);
 
+    /// Room for a wait that answers at once to be scheduled on a runner busy with the sway-backed
+    /// tests. Its own budget cannot be raised: the tests that use it assert on a fraction of it.
+    const PROMPT_WAIT_BUDGET: Duration = Duration::from_secs(1);
+
     /// [`wait_for`] over a socket with nothing behind it, answering a question the peer is never
     /// told about — so only the deadline can end it. `speak` acts as the peer and hands back the
     /// end to keep open, or `None` to close it.
     fn wait_over_a_socket(
+        budget: Duration,
         speak: impl FnOnce(UnixStream) -> Option<UnixStream>,
     ) -> (std::result::Result<(), GlassError>, Duration) {
         let (ours, theirs) = UnixStream::pair().expect("socketpair");
@@ -1847,8 +1861,8 @@ mod pure_tests {
             &conn,
             &mut queue,
             &mut (),
-            Instant::now() + PURE_WAIT_BUDGET,
-            "nothing arrived",
+            Instant::now() + budget,
+            |()| "nothing arrived".into(),
             |()| None,
         );
         (outcome, started.elapsed())
@@ -1860,8 +1874,8 @@ mod pure_tests {
     fn a_wait_gives_up_on_a_peer_that_never_speaks() {
         let (outcome, elapsed) = on_a_thread(
             PURE_WAIT_BUDGET * 20,
-            "the wait was not bounded: it never came back",
-            || wait_over_a_socket(Some),
+            "the wait never came back, so it is not bounded by its deadline",
+            || wait_over_a_socket(PURE_WAIT_BUDGET, Some),
         );
 
         let err = outcome.expect_err("a question nothing answered is a failure");
@@ -1882,12 +1896,12 @@ mod pure_tests {
     #[test]
     fn a_wait_stops_waiting_as_soon_as_the_peer_speaks() {
         let (outcome, elapsed) = on_a_thread(
-            PURE_WAIT_BUDGET * 20,
-            "the wait ignored a peer that spoke",
+            PROMPT_WAIT_BUDGET * 20,
+            "the wait did not come back from a peer that spoke",
             || {
-                wait_over_a_socket(|mut theirs| {
-                    // Bytes no wayland event could be made of: what they mean is not the point —
-                    // the wait must come back rather than sit out its budget.
+                wait_over_a_socket(PROMPT_WAIT_BUDGET, |mut theirs| {
+                    // A whole message, and nonsense: what it means is not the point — the wait
+                    // must come back rather than sit out its budget.
                     theirs
                         .write_all(&[0xff; 32])
                         .expect("write to the socketpair");
@@ -1901,8 +1915,37 @@ mod pure_tests {
             "the peer said something unreadable; that is not an answer to the question"
         );
         assert!(
-            elapsed < PURE_WAIT_BUDGET / 2,
-            "the wait sat out its deadline with an answer already on the socket: {elapsed:?}"
+            elapsed < PROMPT_WAIT_BUDGET / 2,
+            "the wait sat out its deadline with something already on the socket: {elapsed:?}"
+        );
+    }
+
+    /// Half a message is not a fault: the rest is still on its way, and upstream's own reader
+    /// retries. Failing the capture here would make a screenshot flake on a loaded host, where a
+    /// write is likeliest to be split.
+    #[test]
+    fn a_wait_keeps_waiting_through_half_a_message() {
+        let (outcome, elapsed) = on_a_thread(
+            PURE_WAIT_BUDGET * 20,
+            "the wait never came back from a partial message",
+            || {
+                // Under the 8 bytes a wayland message header takes, so the read consumes it and
+                // finds nothing behind it.
+                wait_over_a_socket(PURE_WAIT_BUDGET, |mut theirs| {
+                    theirs.write_all(&[0; 4]).expect("write to the socketpair");
+                    Some(theirs)
+                })
+            },
+        );
+
+        let err = outcome.expect_err("half a message answers nothing");
+        assert!(
+            err.to_string().contains("nothing arrived"),
+            "a partial message was reported as a read failure: {err}"
+        );
+        assert!(
+            elapsed >= PURE_WAIT_BUDGET,
+            "the wait gave up on the rest of the message instead of waiting for it: {elapsed:?}"
         );
     }
 
@@ -1911,19 +1954,131 @@ mod pure_tests {
     #[test]
     fn a_wait_reports_a_peer_that_went_away_rather_than_timing_out() {
         let (outcome, elapsed) = on_a_thread(
-            PURE_WAIT_BUDGET * 20,
+            PROMPT_WAIT_BUDGET * 20,
             "the wait did not notice the peer had gone",
-            || wait_over_a_socket(|_| None),
+            || wait_over_a_socket(PROMPT_WAIT_BUDGET, |_| None),
         );
 
         let err = outcome.expect_err("a connection that ended cannot answer");
         assert!(
-            !err.to_string().contains("nothing arrived"),
-            "the end of the connection was reported as silence: {err}"
+            err.to_string().contains("read"),
+            "the end of the connection should be reported where it was found: {err}"
         );
         assert!(
-            elapsed < PURE_WAIT_BUDGET / 2,
+            elapsed < PROMPT_WAIT_BUDGET / 2,
             "a closed connection should be noticed at once: {elapsed:?}"
+        );
+    }
+
+    /// A phase that inherits a budget the phase before it spent still has an answer in hand, and a
+    /// timeout would discard it — the compositor did everything asked of it.
+    #[test]
+    fn a_wait_takes_an_answer_already_in_hand_over_a_spent_budget() {
+        let (ours, _theirs) = UnixStream::pair().expect("socketpair");
+        let conn = Connection::from_socket(ours).expect("a connection over the socket");
+        let mut queue = conn.new_event_queue::<()>();
+
+        let answered = wait_for(
+            &conn,
+            &mut queue,
+            &mut (),
+            Instant::now() - Duration::from_secs(1),
+            |()| "nothing arrived".into(),
+            |()| Some(Ok(7)),
+        );
+
+        assert_eq!(answered.expect("the answer, not the expired budget"), 7);
+    }
+
+    /// A scratch holding one advertised format, as the compositor's `buffer` event leaves it.
+    fn advertised_one() -> CaptureScratch {
+        CaptureScratch {
+            shm_buffers: vec![(wl_shm::Format::Xrgb8888, 40, 30, 160)],
+            ..CaptureScratch::default()
+        }
+    }
+
+    #[test]
+    fn a_finished_format_list_yields_the_buffer_to_allocate() {
+        let mut scratch = CaptureScratch {
+            buffer_done: true,
+            ..advertised_one()
+        };
+        assert_eq!(
+            scratch
+                .advertised()
+                .expect("the list ended")
+                .expect("a format"),
+            (wl_shm::Format::Xrgb8888, 40, 30, 160)
+        );
+    }
+
+    /// A list that ends with nothing glass can convert is a failure, not a wait: no further event
+    /// is coming.
+    #[test]
+    fn a_finished_but_empty_format_list_is_a_failure() {
+        let mut scratch = CaptureScratch {
+            buffer_done: true,
+            ..CaptureScratch::default()
+        };
+        let err = scratch
+            .advertised()
+            .expect("the list ended")
+            .expect_err("nothing to allocate");
+        assert!(
+            err.to_string().contains("no shm format advertised"),
+            "{err}"
+        );
+    }
+
+    /// A refusal is the compositor's final word, so it ends the wait rather than running it out.
+    #[test]
+    fn a_refusal_during_the_format_list_ends_the_wait() {
+        let mut scratch = CaptureScratch {
+            done: Some(Err(GlassError::CaptureFailed("screencopy failed".into()))),
+            ..CaptureScratch::default()
+        };
+        let err = scratch
+            .advertised()
+            .expect("a refusal is an answer")
+            .expect_err("the refusal");
+        assert!(err.to_string().contains("screencopy failed"), "{err}");
+    }
+
+    /// Nothing has been asked to be copied yet, so a `ready` cannot be this capture's. Taking it
+    /// as one ends the next phase over a buffer nothing wrote.
+    #[test]
+    fn a_ready_before_the_format_list_ends_is_a_failure() {
+        let mut scratch = CaptureScratch {
+            done: Some(Ok(())),
+            ..CaptureScratch::default()
+        };
+        let err = scratch
+            .advertised()
+            .expect("a ready is an answer, wrong as it is")
+            .expect_err("not this capture's");
+        assert!(
+            err.to_string().contains("ready before the buffer list"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unfinished_format_list_is_not_yet_an_answer() {
+        assert!(advertised_one().advertised().is_none());
+    }
+
+    /// Silence and a list that never ends are different faults, and only the second is about the
+    /// protocol version glass binds.
+    #[test]
+    fn a_timeout_names_silence_and_an_unfinished_list_apart() {
+        assert_eq!(
+            CaptureScratch::default().no_formats(),
+            "screencopy: no buffer event"
+        );
+        assert!(
+            advertised_one().no_formats().contains("buffer_done"),
+            "a list that started and never ended should say so"
         );
     }
 
@@ -3011,6 +3166,35 @@ mod session_tests {
             err.to_string().contains("no buffer event"),
             "the capture should report what never arrived: {err}"
         );
+    }
+
+    /// The frame is what a capture that gave up must not leave behind; the buffer is what keeps
+    /// the compositor's mapping of that frame's memory resident, which no capture reaches through
+    /// `capture_frame` (only a copy that timed out owns one) and every capture in a
+    /// `glass_wait_stable` loop would add to.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn the_objects_a_capture_owns_are_destroyed_with_it() {
+        use wayland_client::Proxy as _;
+
+        let mut s = Launch::new().start();
+        let session = s.platform().active.as_mut().expect("a started session");
+        let qh = session.queue.handle();
+        let frame = session
+            .manager
+            .capture_output_region(0, &session.output, 0, 0, 8, 8, &qh, ());
+        let mut pool = RawPool::new(8 * 4 * 8, &session.state.shm).expect("shm pool");
+        let buffer = pool.create_buffer(0, 8, 8, 8 * 4, wl_shm::Format::Xrgb8888, (), &qh);
+        // Clones of the same objects: a proxy reports the object's state, not its own.
+        let (frame_after, buffer_after) = (frame.clone(), buffer.clone());
+
+        drop(CaptureObjects {
+            frame,
+            buffer: Some(buffer),
+        });
+
+        assert!(!frame_after.is_alive(), "the frame outlived its capture");
+        assert!(!buffer_after.is_alive(), "the buffer outlived its capture");
     }
 
     /// The frame a bounded-out capture abandons is still the compositor's to answer, and the
