@@ -846,8 +846,8 @@ fn serve_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        CLIP_READ_TIMEOUT, CLIP_WRITE_TIMEOUT, ClipboardOwner, get, is_retryable,
-        read_to_eof_bounded, write_all_bounded,
+        CLIP_READ_TIMEOUT, CLIP_WRITE_TIMEOUT, ClipboardOwner, ReadyState, get, is_retryable,
+        read_to_eof_bounded, serve_loop, write_all_bounded,
     };
     use crate::testw::Launch;
     use glass_core::GlassError;
@@ -930,6 +930,34 @@ mod tests {
         assert_eq!(get(&socket).expect("get"), "");
     }
 
+    /// A detached setup thread that unwedges after `spawn` already gave up is in exactly this
+    /// state: still running, with `stop` already true. Calling `serve_loop` directly with `stop`
+    /// pre-set reproduces it without needing a compositor that actually stalls — it must stand
+    /// down before `set_selection`, not take the selection from whatever owner is now live.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_stopped_serve_loop_does_not_take_the_selection_from_a_live_owner() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let live = ClipboardOwner::spawn(socket.clone(), "mine".into()).expect("spawn");
+        assert_eq!(get(&socket).expect("get"), "mine");
+
+        let text = std::sync::Arc::new(std::sync::Mutex::new("stolen".to_string()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ready = std::sync::Arc::new((
+            std::sync::Mutex::new(ReadyState::Pending),
+            std::sync::Condvar::new(),
+        ));
+        serve_loop(socket.clone(), text, stop, ready)
+            .expect("a detached thread standing down is not a serve error");
+
+        assert!(
+            live.is_alive(),
+            "the live owner must still be serving after a detached thread stands down"
+        );
+        assert_eq!(get(&socket).expect("get"), "mine");
+    }
+
     /// A compositor that is gone cannot be served. Reporting success would leave the caller
     /// believing the clipboard holds text no app can ever read.
     #[test]
@@ -968,11 +996,17 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("spawn must return when its own 2 s bound expires, not wait on the peer");
         // Ties the test to the 2 s bound itself, not just to the 10 s ceiling above: a bound
-        // loosened to e.g. 9 s would still return before the ceiling but fail this.
+        // loosened to e.g. 9 s would still return before the ceiling but fail this, and a bound
+        // shrunk to ~0 (which would also pass the ceiling and still contain "timed out") fails
+        // the lower check below.
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "spawn took {:?}, expected it to give up near its own 2 s bound",
-            started.elapsed()
+            elapsed < Duration::from_secs(5),
+            "spawn took {elapsed:?}, expected it to give up near its own 2 s bound"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "spawn took only {elapsed:?}, expected it to wait close to its own 2 s bound"
         );
         let msg = outcome.expect("a peer that never answers is not a served clipboard");
         assert!(msg.contains("timed out"), "{msg}");
