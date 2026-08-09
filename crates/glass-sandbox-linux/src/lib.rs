@@ -974,10 +974,9 @@ mod tests {
     }
 
     /// glass#374: `runnable` used `is_file()`, so a mode-644 `$GLASS_BWRAP` reached the
-    /// user-namespace probe, which forked it only to be told "could not run …: Permission
-    /// denied". The launch was refused either way — no app was ever spawned. What changes is
-    /// that the message names the fix, and that glass stops forking a binary to learn what a
-    /// `stat` had already answered.
+    /// user-namespace probe, which forked it and reported "could not run …: Permission denied" —
+    /// the launch was refused, no app spawned. What changes: the message names the fix, and glass
+    /// stops forking a binary to learn what a `stat` answers.
     #[test]
     fn a_non_executable_bwrap_is_unavailable_and_says_so() {
         let Availability::Unavailable(msg) = availability_with(
@@ -1004,9 +1003,9 @@ mod tests {
         );
     }
 
-    /// The arm no other test reaches. Left unpinned, replacing it with `Unavailable` refuses
-    /// every sandboxed launch on every host with the suite still green — each test that really
-    /// launches under bwrap is `#[ignore]`d.
+    /// The arm no other test reaches: replacing it with `Unavailable` refuses every sandboxed
+    /// launch on every host and the suite stays green, since each test that really launches
+    /// under bwrap is `#[ignore]`d.
     #[test]
     fn a_runnable_bwrap_clears_the_resolution_stage() {
         assert!(

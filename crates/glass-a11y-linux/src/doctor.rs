@@ -380,9 +380,9 @@ mod tests {
         assert_eq!(find_launcher(&[], root.path().to_str().unwrap()), None);
     }
 
-    /// This signal is `glass doctor`'s `[a11y]` verdict and the `glass_capabilities`
-    /// accessibility cell. A launcher glass cannot spawn reported as present is the same run
-    /// answering "at-spi-bus-launcher present" and "not found" about one file.
+    /// Feeds both `glass doctor`'s `[a11y]` verdict and the `glass_capabilities` accessibility
+    /// cell — counted present, an unspawnable launcher makes one run answer
+    /// "at-spi-bus-launcher present" and "not found" about one file.
     #[test]
     fn find_launcher_does_not_count_a_candidate_it_could_not_spawn() {
         let dir = tempfile::tempdir().unwrap();

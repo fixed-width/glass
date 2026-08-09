@@ -37,8 +37,8 @@ fn wayland_checks(
             CheckStatus::Ok,
             format!("{ver} at {}", path.display()),
         ),
-        // The detail is the cause, not a fixed "not found": a sway that is present and cannot be
-        // run is a different problem, and reported as missing it reads as a build that never ran.
+        // The detail is the cause, not a fixed "not found": a present sway reported as missing
+        // reads as a build that never ran.
         Err(no) => {
             Check::new("sway >=1.12", CheckStatus::Fail, no.cause.clone()).with_remedy(no.remedy)
         }
@@ -199,8 +199,8 @@ mod tests {
         assert_eq!(cs[0].remedy.as_deref(), Some("build it with sway-build"));
     }
 
-    /// A sway that is present and unrunnable must not print "not found": the fixed detail sent
-    /// the user to build a sway they had already built, at the path in front of them.
+    /// The fixed "not found" detail sent the user to build a sway they had already built, at the
+    /// path in front of them.
     #[test]
     fn a_sway_that_cannot_be_run_is_reported_as_such_not_as_missing() {
         let cs = wayland_checks(

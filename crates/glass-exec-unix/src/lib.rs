@@ -39,9 +39,8 @@ pub fn resolve_on_path_in(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
 /// Whether `p` is (or resolves through symlinks to) a regular file this process may execute.
 ///
 /// The permission half is the kernel's own answer, against the effective ids `exec` will use, so
-/// it accounts for which class the caller falls in, for a `noexec` mount, and for anything else
-/// the kernel consults — none of which are visible in `st_mode`. `access(2)` also grants `X_OK` on
-/// a searchable directory, hence the regular-file half.
+/// a `noexec` mount or a class the caller is not in reads false where `st_mode` reads true.
+/// `access(2)` grants `X_OK` on a searchable directory, hence the regular-file half.
 pub fn is_executable_file(p: &Path) -> bool {
     if !std::fs::metadata(p).is_ok_and(|m| m.is_file()) {
         return false;
@@ -187,8 +186,8 @@ mod tests {
     }
 
     /// Mode 0o011 carries execute bits, so `mode & 0o111 != 0` calls it runnable — but the owner
-    /// class is the one that applies to the file's owner, and it denies exec, so the spawn gets
-    /// EACCES. Same shape as a `noexec` mount or a denying ACL: permission the mode bits don't say.
+    /// class applies to the owner and denies exec, so `exec` returns EACCES. Same shape as a
+    /// `noexec` mount or a denying ACL: permission the mode bits do not say.
     #[test]
     fn a_file_whose_own_class_denies_exec_is_not_executable() {
         if rustix::process::geteuid().is_root() {

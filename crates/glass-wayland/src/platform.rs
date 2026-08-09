@@ -217,8 +217,8 @@ impl Drop for WaylandPlatform {
     }
 }
 
-/// Why no sway was resolved. Two fields because doctor prints the cause and the fix in separate
-/// columns, while the launch path has one message to say both in.
+/// Why no sway was resolved. Two fields: doctor prints cause and fix in separate columns, the
+/// launch path joins them into one message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoSway {
     pub(crate) cause: String,
@@ -289,9 +289,9 @@ pub(crate) fn resolve_sway_verdict() -> std::result::Result<PathBuf, NoSway> {
 /// The bundled sway: under the glass data dir, where the build tool installs it, then next to
 /// this executable. The testable seam — both roots come from the environment.
 ///
-/// A bundle that is there but cannot be run is reported as such rather than skipped. It is the
-/// path the user installed to (a `cp` across machines or an unzip drops the execute bit), and
-/// "no sway found, build one" would send them to rebuild what they already have.
+/// A bundle there but unrunnable is named rather than skipped: a `cp` across machines or an unzip
+/// drops the execute bit, and "no sway found, build one" would send the user to rebuild what they
+/// already have.
 fn sway_bundle_in(data: Option<PathBuf>, exe_dir: Option<PathBuf>) -> Resolved {
     let candidates = [
         data.map(|d| d.join("glass/sway/bin/sway")),
@@ -332,9 +332,8 @@ fn sway_override(
 /// The first `sway` in `dirs` whose `--version` reports >= 1.12.
 ///
 /// Precedence is the user's: a too-old sway ends the walk rather than being skipped for a later
-/// directory, because `PATH` order is a choice they expressed and substituting past it is what
-/// [`sway_override`] refuses. One glass could not have run is a different matter — it was never a
-/// choice between binaries — so it is skipped and the walk goes on.
+/// directory, because `PATH` order is a choice they expressed. One glass could never have run was
+/// not such a choice, so it is skipped and the walk goes on.
 fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
     for dir in dirs {
         let cand = dir.join("sway");
@@ -1783,9 +1782,8 @@ mod pure_tests {
         );
     }
 
-    /// A bundle whose execute bit was lost (unzipped rather than untarred, copied across
-    /// machines, on a `noexec` mount) used to be accepted and fail at spawn; skipping it
-    /// silently is no better, because the resulting "build a sway" names the path just skipped.
+    /// Skipping it silently is no better than accepting it and failing at spawn: the resulting
+    /// "build a sway" names the path just skipped.
     #[test]
     fn a_bundle_that_cannot_be_run_is_named_rather_than_skipped() {
         let root = bundle_at("glass/sway/bin/sway", 0o644);
@@ -1795,8 +1793,6 @@ mod pure_tests {
         );
     }
 
-    /// The data dir is searched first, but an unrunnable bundle there is not the answer when a
-    /// runnable one sits next to the executable.
     #[test]
     fn a_runnable_bundle_beside_the_executable_beats_an_unrunnable_data_dir_one() {
         let data = bundle_at("glass/sway/bin/sway", 0o644);

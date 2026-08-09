@@ -248,8 +248,8 @@ fn find_launcher() -> Resolved {
 /// names the launcher outright and is not searched for among `candidates`.
 ///
 /// The scan takes the first runnable candidate and, failing that, reports the first present-but-
-/// unrunnable one it walked past rather than [`Resolved::Absent`] — the same rule `resolve_bin`
-/// applies to a `$PATH` walk, and for the same reason: that file is what the user can act on.
+/// unrunnable one it walked past rather than [`Resolved::Absent`] — the rule `resolve_bin`
+/// applies to a `$PATH` walk.
 fn find_launcher_with(override_value: Option<OsString>, candidates: &[&str]) -> Resolved {
     if let Some(p) = override_value.filter(|s| !s.is_empty()) {
         return resolve_path(Path::new(&p));
@@ -267,10 +267,9 @@ fn find_launcher_with(override_value: Option<OsString>, candidates: &[&str]) -> 
     first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
 }
 
-/// The launcher to spawn, or why there is none — shared by the preflight and the bring-up so
-/// they cannot disagree. A launcher that is present but unrunnable is named as such: telling
-/// someone who set `GLASS_ATSPI_LAUNCHER` themselves to install at-spi2-core sends them to fix
-/// something that is not broken.
+/// The launcher to spawn, or why there is none — one mapping, so the preflight and the bring-up
+/// cannot disagree. A present-but-unrunnable launcher is named, because "install at-spi2-core"
+/// about a path the user set themselves sends them to fix what is not broken.
 fn launcher_or_reason(resolved: Resolved) -> std::result::Result<PathBuf, String> {
     match resolved {
         Resolved::Found(p) => Ok(p),
@@ -446,9 +445,8 @@ mod tests {
         dir
     }
 
-    /// glass#374: the override was accepted on `is_file()`. Reporting a mere `None` here was the
-    /// second half of the defect — the caller then said "install at-spi2-core" about a path the
-    /// user had named themselves.
+    /// glass#374: the override was accepted on `is_file()`, and reporting a mere `None` let the
+    /// caller say "install at-spi2-core" about a path the user had named themselves.
     #[test]
     fn a_non_executable_launcher_override_is_reported_as_present_but_unrunnable() {
         let dir = dir_with("at-spi-bus-launcher", 0o644);
@@ -507,7 +505,6 @@ mod tests {
         );
     }
 
-    /// Both halves resolvable is the only Ok.
     #[test]
     fn available_is_ok_when_both_binaries_are_runnable() {
         let launcher = dir_with("at-spi-bus-launcher", 0o755);
@@ -579,8 +576,6 @@ mod tests {
         );
     }
 
-    /// The regression this branch would otherwise have introduced: a launcher the user named
-    /// themselves, present but unrunnable, must be named — not reported as an absent package.
     #[test]
     fn available_names_a_launcher_that_is_present_but_not_executable() {
         let dir = dir_with("at-spi-bus-launcher", 0o644);
