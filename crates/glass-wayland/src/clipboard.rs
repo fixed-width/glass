@@ -203,6 +203,8 @@ struct ServeState {
     shm: Shm,
     /// The shared text to serve on `Send` events.
     text: Arc<Mutex<String>>,
+    /// The owner's stop flag, so a `Send` arriving after the owner was dropped is not served.
+    stop: Arc<AtomicBool>,
     /// Set to true when the source is `Cancelled`.
     cancelled: bool,
 }
@@ -310,12 +312,19 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ServeState {
     ) {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type: _, fd } => {
-                // Cloned out before the write — holding the mutex across it would queue set_text
-                // and every later paste behind one slow reader for up to CLIP_WRITE_TIMEOUT.
+                // `dispatch_pending` runs every queued event before returning and the loop's stop
+                // check is after it, so without this a drop waits out CLIP_WRITE_TIMEOUT per queued
+                // paste. Dropping `fd` unwritten gives the requester a clean EOF.
+                if state.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                // Cloned out before the write: `set_text` runs on another thread and would block on
+                // the mutex for up to CLIP_WRITE_TIMEOUT. Later pastes gain nothing — they are
+                // dispatched in series on this thread either way.
                 let text = state.text.lock().expect("clipboard text mutex").clone();
-                // Failures are printed, not returned — a Dispatch callback has nowhere to return
-                // them, and printing is what makes a truncated paste distinguishable from an
-                // empty clipboard.
+                // Printed, not returned: a Dispatch callback has nowhere to return an error. Only
+                // stderr records it — the requesting app sees a transfer that ended, with no
+                // in-band way to tell a short paste from a short clipboard.
                 if let Err(e) = write_all_bounded(fd, text.as_bytes(), CLIP_WRITE_TIMEOUT) {
                     eprintln!("glass-wayland: clipboard serve: paste transfer: {e}");
                 }
@@ -722,6 +731,7 @@ fn serve_loop(
         output: OutputState::new(&globals, &qh),
         shm,
         text,
+        stop: Arc::clone(&stop),
         cancelled: false,
     };
 
