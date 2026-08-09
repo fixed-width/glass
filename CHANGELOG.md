@@ -19,6 +19,24 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Fixed
+- A helper binary that is installed but cannot be run is now reported as exactly that, instead of
+  as missing. glass resolves several external tools — `Xvfb`, `sway`, `bwrap`, `dbus-daemon`,
+  `at-spi-bus-launcher` — and used to accept any file at the path, so one whose execute permission
+  was missing (a `chmod` gone wrong, an archive unzipped rather than untarred, a copy across
+  machines, a `noexec` mount) passed every check and then failed at launch. `glass doctor` reported
+  `Xvfb ✓ Ok` and the launch died with a permission error; `sway >=1.12 Fail not found` named a
+  file sitting right there and told you to build a sway you had already built; and an
+  `at-spi-bus-launcher` you had pointed `GLASS_ATSPI_LAUNCHER` at was reported as an at-spi2-core
+  package you needed to install, with accessibility quietly falling back to pixel-only. Each of
+  these now names the file and says it is not executable, and the doctor's `[a11y]` check no longer
+  reports a launcher present in the same run that reports it missing. The check is the kernel's own
+  — a binary you are not permitted to execute is not runnable even with an execute bit set for
+  somebody else. A tool named by a bare name is still searched along `$PATH` and one that cannot be
+  run is stepped over, so a good copy later on `$PATH` is used, as your shell would; the private
+  accessibility bus's preflight now searches `$PATH` for `dbus-daemon` too, rather than only
+  checking an explicitly configured path.
+
 ## [1.2.0] - 2026-08-07
 
 ### Added
