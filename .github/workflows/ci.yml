@@ -266,7 +266,7 @@ jobs:
           if-no-files-found: warn
 
   mutants:
-    name: Mutation shard ${{ matrix.shard }} (glass-core, glass-android, glass-x11)
+    name: Mutation shard ${{ matrix.shard }} (glass-core, glass-android, glass-x11, glass-exec-unix)
     runs-on: ubuntu-latest
     # A push carries no base ref to diff against; this gate is a pull-request check.
     if: github.event_name == 'pull_request'
@@ -301,7 +301,8 @@ jobs:
           git diff "origin/$BASE_REF...HEAD" \
             -- ':(glob)crates/glass-core/src/**/*.rs' \
                ':(glob)crates/glass-android/src/**/*.rs' \
-               ':(glob)crates/glass-x11/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
+               ':(glob)crates/glass-x11/src/**/*.rs' \
+               ':(glob)crates/glass-exec-unix/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
           wc -l "$RUNNER_TEMP/pr.diff"
           if [ -s "$RUNNER_TEMP/pr.diff" ]; then
             echo "touched=true" >> "$GITHUB_OUTPUT"
@@ -334,6 +335,7 @@ jobs:
           scripts/mutants.sh "$RUNNER_TEMP/mutants" \
             --test-tool nextest \
             --package glass-core --package glass-android --package glass-x11 \
+            --package glass-exec-unix \
             --shard ${{ matrix.shard }}/8 --sharding round-robin \
             --in-diff "$RUNNER_TEMP/pr.diff"
 
@@ -341,8 +343,8 @@ jobs:
   # to require. This one has a fixed name and fails if any shard did.
   #
   # The ruleset's required check matches this name, so it is frozen — renaming it blocks every
-  # pull request. It gates glass-android and glass-x11 too despite the name; rename only with
-  # the ruleset.
+  # pull request. It gates glass-android, glass-x11 and glass-exec-unix too despite the name;
+  # rename only with the ruleset.
   mutants-gate:
     name: Mutation gate (glass-core)
     runs-on: ubuntu-latest
