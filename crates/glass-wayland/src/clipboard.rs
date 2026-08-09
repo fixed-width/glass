@@ -850,9 +850,8 @@ fn serve_loop(
             break;
         }
 
-        // Prepare to read new events from the socket. `None` says the backend's own queue needs
-        // draining — a libwayland condition the pure-Rust backend glass builds never reports — so
-        // loop back to dispatch_pending rather than waiting on the fd.
+        // `None` says the backend's own queue needs draining — a libwayland condition the
+        // pure-Rust backend glass builds never reports.
         let guard = match queue.prepare_read() {
             Some(g) => g,
             None => continue,
