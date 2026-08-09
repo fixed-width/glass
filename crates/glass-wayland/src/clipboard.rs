@@ -11,7 +11,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Cap on how long `get()` waits for the selection owner to finish writing the
@@ -608,16 +608,28 @@ impl ClipboardOwner {
         let (lock, cvar) = &*ready;
         let result = cvar
             .wait_timeout_while(
-                lock.lock().expect("clipboard ready mutex"),
+                lock.lock().unwrap_or_else(PoisonError::into_inner),
                 Duration::from_secs(2),
                 |s| matches!(s, ReadyState::Pending),
             )
-            .unwrap();
+            // A poisoned lock means the serving thread panicked holding it. The state behind it
+            // still says what happened; panicking here turns a reportable clipboard failure into
+            // a crashed tool call.
+            .unwrap_or_else(PoisonError::into_inner);
 
         if result.1.timed_out() {
-            // The thread is still running but didn't signal in time; stop it.
             stop.store(true, Ordering::Relaxed);
-            let _ = handle.join();
+            // Deliberately not joined. Timing out means the thread has not reached the loop that
+            // reads `stop`, so a join waits on the wedged compositor with no bound — the hang
+            // this 2 s bound exists to prevent. Detaching is self-cleaning: the setup either
+            // fails and the thread exits, or it completes and the first pump iteration stops.
+            if handle.is_finished() && handle.join().is_err() {
+                // Finished without ever signalling: it panicked during setup. Reporting that as a
+                // timeout would send the reader looking for a slow compositor.
+                return Err(GlassError::Backend(
+                    "clipboard set: owner thread panicked during setup".into(),
+                ));
+            }
             return Err(GlassError::Backend(
                 "clipboard set: timed out waiting for selection registration".into(),
             ));
@@ -666,7 +678,7 @@ impl Drop for ClipboardOwner {
 /// Signal the ready condvar. Helper to reduce repetition.
 fn signal_ready(ready: &Arc<(Mutex<ReadyState>, Condvar)>, state: ReadyState) {
     let (lock, cvar) = &**ready;
-    *lock.lock().expect("clipboard ready mutex") = state;
+    *lock.lock().unwrap_or_else(PoisonError::into_inner) = state;
     cvar.notify_one();
 }
 
@@ -917,6 +929,42 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, GlassError::Backend(_)), "{err}");
+    }
+
+    /// A compositor that accepts the connection and then never answers is what the 2 s readiness
+    /// bound is for. Joining the setup thread there waits on the wedged peer with no bound at
+    /// all, so spawn has to return without it — every tool call is behind the session lock this
+    /// holds.
+    #[test]
+    fn an_owner_gives_up_on_a_peer_that_accepts_and_never_answers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("wayland-silent");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let accepted = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+
+        // On its own thread: pre-fix this call never returns, and a direct call would wedge the
+        // whole suite instead of failing this test.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = ClipboardOwner::spawn(socket, "text".into())
+                .err()
+                .map(|e| e.to_string());
+            let _ = tx.send(outcome);
+        });
+
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("spawn must return when its own 2 s bound expires, not wait on the peer");
+        let msg = outcome.expect("a peer that never answers is not a served clipboard");
+        assert!(msg.contains("timed out"), "{msg}");
+
+        // Closing the server side lets the detached setup thread fail and exit.
+        drop(
+            accepted
+                .join()
+                .expect("accept thread")
+                .expect("accepted stream"),
+        );
     }
 
     /// A signal arriving mid-read costs nothing and the read resumes. Every other failure is a
