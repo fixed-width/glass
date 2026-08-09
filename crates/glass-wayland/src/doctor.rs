@@ -9,7 +9,7 @@ use std::time::Duration;
 use glass_core::{AppSpec, Check, CheckStatus};
 
 use crate::command::{build_sway_command, sway_config};
-use crate::platform::resolve_sway;
+use crate::platform::{NoSway, resolve_sway_verdict};
 use crate::swayipc::Ipc;
 
 /// Probe the Wayland backend's environment. `deep` additionally spawns and tears down
@@ -26,7 +26,7 @@ pub fn checks(deep: bool) -> Vec<Check> {
 
 /// Pure: build the Wayland checks from gathered facts.
 fn wayland_checks(
-    sway: &Result<(PathBuf, String), String>,
+    sway: &Result<(PathBuf, String), NoSway>,
     gl_present: bool,
     deep_spawn: Option<Result<(), String>>,
 ) -> Vec<Check> {
@@ -37,8 +37,10 @@ fn wayland_checks(
             CheckStatus::Ok,
             format!("{ver} at {}", path.display()),
         ),
-        Err(remedy) => {
-            Check::new("sway >=1.12", CheckStatus::Fail, "not found").with_remedy(remedy.clone())
+        // The detail is the cause, not a fixed "not found": a sway that is present and cannot be
+        // run is a different problem, and reported as missing it reads as a build that never ran.
+        Err(no) => {
+            Check::new("sway >=1.12", CheckStatus::Fail, no.cause.clone()).with_remedy(no.remedy)
         }
     });
     checks.push(if gl_present {
@@ -71,14 +73,10 @@ fn wayland_checks(
 }
 
 /// Resolve sway (path) and read its version string for display.
-fn discover_sway() -> Result<(PathBuf, String), String> {
-    match resolve_sway() {
-        Ok(path) => {
-            let ver = sway_version(&path);
-            Ok((path, ver))
-        }
-        Err(e) => Err(e.to_string()),
-    }
+fn discover_sway() -> Result<(PathBuf, String), NoSway> {
+    let path = resolve_sway_verdict()?;
+    let ver = sway_version(&path);
+    Ok((path, ver))
 }
 
 fn sway_version(path: &Path) -> String {
@@ -188,9 +186,34 @@ mod tests {
 
     #[test]
     fn sway_missing_fails_with_remedy() {
-        let cs = wayland_checks(&Err("build it with sway-build".into()), true, None);
+        let cs = wayland_checks(
+            &Err(NoSway {
+                cause: "no sway >=1.12 found".into(),
+                remedy: "build it with sway-build",
+            }),
+            true,
+            None,
+        );
         assert_eq!(cs[0].status, CheckStatus::Fail);
+        assert_eq!(cs[0].detail, "no sway >=1.12 found");
         assert_eq!(cs[0].remedy.as_deref(), Some("build it with sway-build"));
+    }
+
+    /// A sway that is present and unrunnable must not print "not found": the fixed detail sent
+    /// the user to build a sway they had already built, at the path in front of them.
+    #[test]
+    fn a_sway_that_cannot_be_run_is_reported_as_such_not_as_missing() {
+        let cs = wayland_checks(
+            &Err(NoSway {
+                cause: "/opt/glass/sway/bin/sway is not executable".into(),
+                remedy: "chmod +x it",
+            }),
+            true,
+            None,
+        );
+        assert_eq!(cs[0].status, CheckStatus::Fail);
+        assert_eq!(cs[0].detail, "/opt/glass/sway/bin/sway is not executable");
+        assert_eq!(cs[0].remedy.as_deref(), Some("chmod +x it"));
     }
 
     #[test]
@@ -247,7 +270,11 @@ mod tests {
     #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn discover_sway_reports_the_real_binary_and_its_version() {
         let (path, ver) = discover_sway().expect("this box has a discoverable sway");
-        assert!(path.is_file(), "{}", path.display());
+        assert!(
+            glass_exec_unix::is_executable_file(&path),
+            "discovery must yield something glass can spawn: {}",
+            path.display()
+        );
         assert!(ver.contains("sway version"), "{ver}");
     }
 
