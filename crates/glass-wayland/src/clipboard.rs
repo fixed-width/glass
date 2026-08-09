@@ -348,6 +348,21 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ServeState {
 /// event queue, does a roundtrip to collect the selection offer, then reads the
 /// pipe transfer.
 pub fn get(socket: &Path) -> Result<String> {
+    let Some(read_end) = open_transfer(socket)? else {
+        return Ok(String::new());
+    };
+    // Read to EOF from the read end, bounded by a deadline so a misbehaving
+    // selection owner can't hang us forever (see CLIP_READ_TIMEOUT).
+    let buf = read_to_eof_bounded(read_end, CLIP_READ_TIMEOUT)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Ask the selection owner for a text transfer and return the pipe's read end, or `None` when
+/// there is nothing to read — no selection, or no text MIME on offer.
+///
+/// Once this returns the owner is writing, whether or not anybody reads: [`get`] is this plus the
+/// bounded read, and a test that wants the owner stuck mid-write is this without it.
+fn open_transfer(socket: &Path) -> Result<Option<OwnedFd>> {
     let stream = UnixStream::connect(socket)
         .map_err(|e| GlassError::Backend(format!("clipboard get: connect: {e}")))?;
     let conn = Connection::from_socket(stream)
@@ -389,14 +404,14 @@ pub fn get(socket: &Path) -> Result<String> {
 
     let (offer, mimes) = match state.selection.take() {
         Some(v) => v,
-        None => return Ok(String::new()), // no clipboard content
+        None => return Ok(None), // no clipboard content
     };
 
     let mime = match pick_mime(&mimes) {
         Some(m) => m.to_string(),
         None => {
             offer.destroy();
-            return Ok(String::new()); // no text MIME offered
+            return Ok(None); // no text MIME offered
         }
     };
 
@@ -418,13 +433,11 @@ pub fn get(socket: &Path) -> Result<String> {
         .roundtrip(&mut state)
         .map_err(|e| GlassError::Backend(format!("clipboard get: roundtrip3: {e}")))?;
 
-    // Read to EOF from the read end, bounded by a deadline so a misbehaving
-    // selection owner can't hang us forever (see CLIP_READ_TIMEOUT).
-    let buf = read_to_eof_bounded(read_end, CLIP_READ_TIMEOUT)?;
-
+    // The fd is already with the owner, so destroying the offer and dropping `conn` here cannot
+    // cut the read short.
     offer.destroy();
 
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(Some(read_end))
 }
 
 /// Whether a failed read should be retried — a signal arrived and nothing was lost. Retrying
@@ -885,8 +898,8 @@ fn serve_loop(
 mod tests {
     use super::{
         Arc, AtomicBool, CLIP_READ_TIMEOUT, CLIP_WRITE_TIMEOUT, ClipboardOwner, Condvar, Mutex,
-        PoisonError, ReadyState, get, is_retryable, read_to_eof_bounded, serve_loop, signal_ready,
-        write_all_bounded,
+        PoisonError, ReadyState, get, is_retryable, open_transfer, read_to_eof_bounded, serve_loop,
+        signal_ready, write_all_bounded,
     };
     use crate::testw::Launch;
     use glass_core::GlassError;
@@ -966,6 +979,47 @@ mod tests {
             "dropping an owner must stop its thread, not wait on it forever",
             move || drop(owner),
         );
+    }
+
+    /// An app that opens a paste and then stops reading is what the write bound exists for: the
+    /// transfer blocks once the pipe fills, on the serving thread, which is also the thread `Drop`
+    /// joins. Unbounded, that join never returns and takes session teardown with it.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn an_owner_stays_droppable_while_a_paste_is_going_unread() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        // Four times the default 64 KiB pipe buffer: a payload that fits is handed over in one
+        // write that never blocks, so a smaller one would pass with no bound at all.
+        let owner = ClipboardOwner::spawn(socket.clone(), "x".repeat(256 * 1024)).expect("spawn");
+
+        let transfer = open_transfer(&socket)
+            .expect("open a transfer")
+            .expect("a live owner offers text to transfer");
+        // Wait for the first bytes: they are what says the serving thread is past its stop check
+        // and inside the write. Nothing is read off the pipe, so it stays full and the write
+        // stays blocked.
+        let ready = rustix::event::poll(
+            &mut [rustix::event::PollFd::new(
+                &transfer,
+                rustix::event::PollFlags::IN,
+            )],
+            Some(&rustix::event::Timespec {
+                tv_sec: 10,
+                tv_nsec: 0,
+            }),
+        )
+        .expect("poll the transfer");
+        assert!(ready > 0, "the owner never started writing the paste");
+
+        on_a_thread(
+            Duration::from_secs(15),
+            "dropping an owner must not wait out a paste nobody is reading",
+            move || drop(owner),
+        );
+        // Held until here: closing the read end early fails the write as EPIPE, which would let
+        // even an unbounded write return.
+        drop(transfer);
     }
 
     /// Dropping gives up the selection. A thread that kept running would keep answering pastes
