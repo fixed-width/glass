@@ -310,13 +310,12 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ServeState {
     ) {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type: _, fd } => {
-                // Cloned out before the write, not held across it: the write can take up to
-                // CLIP_WRITE_TIMEOUT, and holding the mutex would queue set_text and every later
-                // paste behind one slow reader.
+                // Cloned out before the write — holding the mutex across it would queue set_text
+                // and every later paste behind one slow reader for up to CLIP_WRITE_TIMEOUT.
                 let text = state.text.lock().expect("clipboard text mutex").clone();
-                // Failures are printed, not returned: a Dispatch impl has nowhere to return to,
-                // and the paste happens long after set_clipboard answered its caller. Printing is
-                // what makes a truncated paste distinguishable from an empty clipboard.
+                // Failures are printed, not returned — a Dispatch callback has nowhere to return
+                // them, and printing is what makes a truncated paste distinguishable from an
+                // empty clipboard.
                 if let Err(e) = write_all_bounded(fd, text.as_bytes(), CLIP_WRITE_TIMEOUT) {
                     eprintln!("glass-wayland: clipboard serve: paste transfer: {e}");
                 }
@@ -473,9 +472,9 @@ fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
     }
 }
 
-/// Cap on how long the serving thread spends handing one paste to a requesting app. Its own
-/// constant rather than a reuse of [`CLIP_READ_TIMEOUT`]: that bounds an app glass reads from,
-/// this bounds an app glass writes to, and moving one should not move the other.
+/// Cap on how long the serving thread spends handing one paste to a requesting app — separate
+/// from [`CLIP_READ_TIMEOUT`], which bounds reads, so that changing one does not change the
+/// other.
 const CLIP_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Whether a failed write should be retried — nothing was lost and the pipe may take more. A
@@ -624,10 +623,10 @@ impl ClipboardOwner {
             // from a thread-exit path would otherwise deadlock the join below on this thread.
             drop(result);
             stop.store(true, Ordering::Relaxed);
-            // Deliberately not joined. Timing out means the thread has not reached the loop that
-            // reads `stop`, so a join waits on the wedged compositor with no bound — the hang
-            // this 2 s bound exists to prevent. Detaching is self-cleaning: the setup either
-            // fails and the thread exits, or it completes and the first pump iteration stops.
+            // Deliberately not joined: timing out means the thread hasn't reached the loop that
+            // reads `stop`, so a join would wait on the wedged compositor with no bound.
+            // Detaching is self-cleaning — the setup either fails and the thread exits, or it
+            // completes and the first pump iteration stops.
             if handle.is_finished() && handle.join().is_err() {
                 // Finished without ever signalling: it panicked during setup. Reporting that as a
                 // timeout would send the reader looking for a slow compositor.

@@ -238,10 +238,10 @@ impl ClipboardOwner {
             // from a thread-exit path would otherwise deadlock the join below on this thread.
             drop(result);
             stop.store(true, Ordering::Relaxed);
-            // Deliberately not joined. Timing out means the thread has not reached the loop that
-            // reads `stop`, so a join waits on the wedged X server with no bound — the hang this
-            // 2 s bound exists to prevent. Detaching is self-cleaning: the setup either fails and
-            // the thread exits, or it completes and the first serving iteration stops.
+            // Deliberately not joined: timing out means the thread hasn't reached the loop that
+            // reads `stop`, so a join would wait on the wedged X server with no bound.
+            // Detaching is self-cleaning — the setup either fails and the thread exits, or it
+            // completes and the first serving iteration stops.
             if handle.is_finished() && handle.join().is_err() {
                 // Finished without ever signalling: it panicked during setup. Reporting that as a
                 // timeout would send the reader looking for a slow X server.
