@@ -331,14 +331,13 @@ fn sway_override(
 
 /// The first `sway` in `dirs` whose `--version` reports >= 1.12.
 ///
-/// Only an *answer* ends the walk. A candidate that ran and reported a version decides the
-/// outcome, even a bad one: too old or unparseable means fall back to the bundle, never a
-/// different sway further along, because `PATH` order is a precedence the user expressed and
-/// substituting past it is what [`sway_override`] refuses.
+/// Only an answer ends the walk. A candidate that ran decides the outcome even when the version
+/// is too old or unreadable — that means the bundle, never a different sway further along, since
+/// `PATH` order is a precedence the user expressed.
 ///
-/// A candidate that never ran expressed nothing, so it is stepped over and the walk goes on —
-/// no execute permission, or a spawn that failed outright (`ENOEXEC` for a file that is not a
-/// binary, `ETXTBSY` while something else still holds it open for writing).
+/// A candidate that never ran expressed nothing, so it is stepped over: no execute permission, or
+/// a spawn that failed outright (`ENOEXEC` for a file that is not a binary, `ETXTBSY` while
+/// something else holds it open for writing).
 fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
     for dir in dirs {
         let cand = dir.join("sway");
@@ -351,7 +350,7 @@ fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
         let ver = String::from_utf8_lossy(&out.stdout);
         return match parse_sway_version(&ver) {
             Some((maj, min)) if (maj, min) >= (1, 12) => Some(cand),
-            _ => None, // it answered, and the answer was not a sway >=1.12 -> use the bundle
+            _ => None, // answered, just not usably -> the bundle, not a later sway
         };
     }
     None
@@ -1765,9 +1764,9 @@ mod pure_tests {
         );
     }
 
-    /// An empty file at 0o755 passes the permission check and then fails to exec (`ENOEXEC`) —
+    /// An empty file at 0o755 clears the permission check and then fails to exec (`ENOEXEC`) —
     /// the deterministic twin of the `ETXTBSY` a concurrent write raises. Ending the walk on
-    /// either made glass conclude there was no sway on `$PATH` at all.
+    /// either made glass report no sway on `$PATH` at all.
     #[test]
     fn a_sway_that_fails_to_spawn_does_not_hide_a_later_one() {
         let unspawnable = tempfile::tempdir().expect("tempdir");
