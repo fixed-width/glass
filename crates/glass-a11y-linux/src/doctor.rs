@@ -37,8 +37,11 @@ pub const fn accessibility_capability(launcher_present: bool) -> CapabilityStatu
     if launcher_present {
         CapabilityStatus::supported()
     } else {
+        // Not "AT-SPI is not installed": the launcher can also be there and unrunnable, or a
+        // GLASS_ATSPI_LAUNCHER the operator set can name nothing. `glass doctor` tells them apart.
         CapabilityStatus::requires_setup(
-            "AT-SPI not installed; install at-spi2-core so glass can spawn its private a11y bus",
+            "no runnable at-spi-bus-launcher, so glass cannot spawn its private a11y bus; install \
+             at-spi2-core (or check GLASS_ATSPI_LAUNCHER if you set it) and see `glass doctor`",
         )
     }
 }
@@ -128,7 +131,17 @@ fn gather_host_a11y() -> HostA11yFacts {
 
 /// Probe whether the AT-SPI accessibility stack is usable.
 pub fn checks() -> Vec<Check> {
-    a11y_checks(accessibility_launcher_present(), &gather_host_a11y())
+    a11y_checks(
+        &glass_dbus_linux::find_launcher(),
+        atspi_launcher_override_set(),
+        &gather_host_a11y(),
+    )
+}
+
+/// Whether `GLASS_ATSPI_LAUNCHER` holds a non-empty value — the same condition under which
+/// `find_launcher` skips discovery, so a failed lookup can name the variable as its cause.
+fn atspi_launcher_override_set() -> bool {
+    std::env::var_os("GLASS_ATSPI_LAUNCHER").is_some_and(|v| !v.is_empty())
 }
 
 /// Health of the *host* (operator's desktop) AT-SPI bus — distinct from glass's private bus.
@@ -194,22 +207,46 @@ fn count_orphaned_a11y_daemons(procs: &[ProcEntry]) -> usize {
 }
 
 /// Pure: build the a11y checks from gathered facts.
-fn a11y_checks(launcher_installed: bool, facts: &HostA11yFacts) -> Vec<Check> {
+fn a11y_checks(launcher: &Resolved, override_set: bool, facts: &HostA11yFacts) -> Vec<Check> {
     let mut checks = Vec::new();
 
     // Concern A — can glass do a11y AT ALL? Honest precondition, never a "will work" promise.
-    checks.push(if launcher_installed {
-        Check::new(
+    // Each way of having no launcher gets its own remedy: "install at-spi2-core" about a file
+    // that is already there, or about a path the user named themselves, sends them to fix what
+    // is not broken.
+    checks.push(match launcher {
+        Resolved::Found(_) => Check::new(
             "a11y",
             CheckStatus::Ok,
             "at-spi-bus-launcher present — glass spawns a private a11y bus on a11y:true launches. \
              Whether a given window exposes an accessibility tree is up to the app (egui/GTK/Qt \
              expose it; games/canvas apps may not); glass_a11y_snapshot reports per app.",
+        ),
+        Resolved::NotExecutable(p) => Check::new(
+            "a11y",
+            CheckStatus::Warn,
+            format!(
+                "at-spi-bus-launcher at {} is present but not executable",
+                p.display()
+            ),
         )
-    } else {
-        Check::new("a11y", CheckStatus::Warn, "at-spi-bus-launcher not found").with_remedy(
+        .with_remedy(
+            "restore its execute bit (`chmod +x`), or point GLASS_ATSPI_LAUNCHER at a runnable copy",
+        ),
+        // An override skips discovery outright, so the well-known paths were never consulted:
+        // whatever this host has installed, the variable is what left glass with nothing.
+        Resolved::Absent if override_set => Check::new(
+            "a11y",
+            CheckStatus::Warn,
+            "GLASS_ATSPI_LAUNCHER does not name a runnable at-spi-bus-launcher",
+        )
+        .with_remedy(
+            "point GLASS_ATSPI_LAUNCHER at a runnable launcher, or unset it to search the \
+             well-known install paths",
+        ),
+        Resolved::Absent => Check::new("a11y", CheckStatus::Warn, "at-spi-bus-launcher not found").with_remedy(
             "install the AT-SPI registry (e.g. `apt install at-spi2-core`) so glass can spawn its private a11y bus",
-        )
+        ),
     });
 
     // Concern B — host desktop a11y health (#9). Detect-only; never mutate.
@@ -403,6 +440,11 @@ mod tests {
     }
 
     // ---- pure mapper ----
+    /// A launcher the spawner resolved, for the cases that are about the host bus, not the lookup.
+    fn found() -> Resolved {
+        Resolved::Found("/usr/libexec/at-spi-bus-launcher".into())
+    }
+
     fn facts(bus: HostBusState, orphaned: usize) -> HostA11yFacts {
         HostA11yFacts {
             session_bus: true,
@@ -413,7 +455,7 @@ mod tests {
 
     #[test]
     fn launcher_present_states_precondition_not_a_promise() {
-        let cs = a11y_checks(true, &facts(HostBusState::Reachable, 0));
+        let cs = a11y_checks(&found(), false, &facts(HostBusState::Reachable, 0));
         let head = cs.iter().find(|c| c.name == "a11y").unwrap();
         assert_eq!(head.status, CheckStatus::Ok);
         assert!(head.detail.contains("private a11y bus"));
@@ -422,16 +464,48 @@ mod tests {
 
     #[test]
     fn launcher_absent_warns_with_install_remedy() {
-        let cs = a11y_checks(false, &facts(HostBusState::NotRunning, 0));
+        let cs = a11y_checks(
+            &Resolved::Absent,
+            false,
+            &facts(HostBusState::NotRunning, 0),
+        );
         let head = cs.iter().find(|c| c.name == "a11y").unwrap();
         assert_eq!(head.status, CheckStatus::Warn);
         assert!(head.remedy.is_some());
     }
 
+    /// The package is installed and the file is right there; "apt install at-spi2-core" would
+    /// send the user to fix what is not broken. The spawn path has always named the file — this is
+    /// the surface that did not.
+    #[test]
+    fn launcher_present_but_unrunnable_names_the_file_not_the_package() {
+        let cs = a11y_checks(
+            &Resolved::NotExecutable("/usr/libexec/at-spi-bus-launcher".into()),
+            false,
+            &facts(HostBusState::NotRunning, 0),
+        );
+        let head = cs.iter().find(|c| c.name == "a11y").unwrap();
+        assert_eq!(head.status, CheckStatus::Warn);
+        assert!(head.detail.contains("/usr/libexec/at-spi-bus-launcher"));
+        assert!(!head.remedy.clone().unwrap().contains("at-spi2-core"));
+    }
+
+    /// An override skips discovery, so a wrong one leaves glass with nothing on a host where
+    /// at-spi2-core is installed and fine. Naming the package there is the same misdirection.
+    #[test]
+    fn a_wrong_override_names_the_variable_not_the_package() {
+        let cs = a11y_checks(&Resolved::Absent, true, &facts(HostBusState::NotRunning, 0));
+        let head = cs.iter().find(|c| c.name == "a11y").unwrap();
+        assert_eq!(head.status, CheckStatus::Warn);
+        assert!(head.detail.contains("GLASS_ATSPI_LAUNCHER"));
+        assert!(!head.remedy.clone().unwrap().contains("at-spi2-core"));
+    }
+
     #[test]
     fn wedged_host_bus_warns() {
         let cs = a11y_checks(
-            true,
+            &found(),
+            false,
             &facts(
                 HostBusState::Wedged {
                     address: "unix:path=/x".into(),
@@ -446,7 +520,7 @@ mod tests {
 
     #[test]
     fn healthy_host_bus_ok_and_no_leak_warning() {
-        let cs = a11y_checks(true, &facts(HostBusState::Reachable, 0));
+        let cs = a11y_checks(&found(), false, &facts(HostBusState::Reachable, 0));
         assert_eq!(
             cs.iter()
                 .find(|c| c.name == "host desktop a11y")
@@ -459,7 +533,7 @@ mod tests {
 
     #[test]
     fn leaked_daemons_warn_with_count() {
-        let cs = a11y_checks(true, &facts(HostBusState::NotRunning, 3));
+        let cs = a11y_checks(&found(), false, &facts(HostBusState::NotRunning, 3));
         let leak = cs.iter().find(|c| c.name == "leaked a11y daemons").unwrap();
         assert_eq!(leak.status, CheckStatus::Warn);
         assert!(leak.detail.contains('3'));

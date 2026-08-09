@@ -257,7 +257,8 @@ pub fn find_launcher() -> Resolved {
 ///
 /// The scan takes the first runnable candidate and, failing that, reports the first present-but-
 /// unrunnable one it walked past rather than [`Resolved::Absent`] — the rule `resolve_bin`
-/// applies to a `$PATH` walk.
+/// applies to a `$PATH` walk. `scan_multiarch` extends `candidates` and is consulted only once
+/// they run dry.
 fn find_launcher_with(
     override_value: Option<OsString>,
     candidates: &[&str],
@@ -286,21 +287,48 @@ fn find_launcher_with(
 /// The triplet is arch-specific (`x86_64-linux-gnu`, `aarch64-linux-gnu`, …), so scanning rather
 /// than hardcoding one keeps the lookup correct on non-x86_64 hosts.
 fn multiarch_candidates(multiarch_root: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(multiarch_root) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(multiarch_root) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // NotFound is the ordinary "this host has no multiarch layout". Anything else — a
+            // denial, fd exhaustion, an unreadable mount — means the empty result is not
+            // evidence, and reads as "at-spi2-core is missing" wherever the scan is the only path.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "glass-dbus-linux: scanning {} for at-spi-bus-launcher: {e}",
+                    multiarch_root.display()
+                );
+            }
+            return Vec::new();
+        }
     };
     launchers_under(entries.flatten().map(|e| e.path()))
 }
 
-/// The launcher path under each triplet dir, sorted: a host can carry at-spi2-core for two
-/// architectures at once, and `read_dir` order is arbitrary, so an unsorted scan would spawn a
-/// different binary on different runs of one unchanged host.
+/// The launcher path under each triplet dir, this machine's architecture first and the rest
+/// sorted.
+///
+/// This order decides which binary gets spawned. `access(X_OK)` never reads the ELF machine
+/// field, so a foreign-arch launcher resolves [`Resolved::Found`] and fails only at spawn, with
+/// `Exec format error` — and alphabetical order alone hands `i386-linux-gnu` to an x86_64 machine.
+/// Sorted below that rank because `read_dir` order is arbitrary: a host carrying at-spi2-core for
+/// two architectures would otherwise spawn a different binary run to run.
 fn launchers_under(triplet_dirs: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
-    let mut candidates: Vec<PathBuf> = triplet_dirs
+    let mut dirs: Vec<PathBuf> = triplet_dirs.collect();
+    dirs.sort_by(|a, b| native_rank(a).cmp(&native_rank(b)).then_with(|| a.cmp(b)));
+    dirs.into_iter()
         .map(|d| d.join("at-spi2-core/at-spi-bus-launcher"))
-        .collect();
-    candidates.sort();
-    candidates
+        .collect()
+}
+
+/// 0 for this build's own multiarch triplet dir (`x86_64-linux-gnu` on x86_64), 1 for any other.
+fn native_rank(triplet_dir: &Path) -> u8 {
+    let native = triplet_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix(std::env::consts::ARCH))
+        .is_some_and(|rest| rest.starts_with('-'));
+    u8::from(!native)
 }
 
 /// The launcher to spawn, or why there is none — one mapping, so the preflight and the bring-up
@@ -517,7 +545,7 @@ mod tests {
     }
 
     /// glass#391: this lookup hardcoded the x86_64 triplet, so on aarch64 the spawn reported
-    /// "install at-spi2-core" about a launcher the doctor's own scan had already found.
+    /// "install at-spi2-core" about a launcher the doctor's then-separate scan had already found.
     #[test]
     fn a_launcher_under_any_multiarch_triplet_is_found() {
         let root = multiarch_root_with("aarch64-linux-gnu", 0o755);
@@ -545,16 +573,32 @@ mod tests {
     }
 
     /// Two architectures' at-spi2-core on one host, and `read_dir` hands them over in whatever
-    /// order it likes: unsorted, which binary gets spawned varies run to run.
+    /// order it likes: unsorted, which binary gets spawned varies run to run. Neither name is any
+    /// real `ARCH`, so this is the order among foreign triplets alone.
     #[test]
     fn the_multiarch_scan_orders_triplets_the_same_way_every_run() {
-        let dirs = ["/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu"];
+        let dirs = ["/usr/lib/zzz-linux-gnu", "/usr/lib/aaa-linux-gnu"];
         assert_eq!(
             launchers_under(dirs.iter().map(PathBuf::from)),
             [
-                PathBuf::from("/usr/lib/aarch64-linux-gnu/at-spi2-core/at-spi-bus-launcher"),
-                PathBuf::from("/usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher"),
+                PathBuf::from("/usr/lib/aaa-linux-gnu/at-spi2-core/at-spi-bus-launcher"),
+                PathBuf::from("/usr/lib/zzz-linux-gnu/at-spi2-core/at-spi-bus-launcher"),
             ]
+        );
+    }
+
+    /// A foreign-arch launcher is executable to `access(X_OK)` and dies at spawn with `Exec format
+    /// error`, so alphabetical order alone would hand `i386-linux-gnu` to an x86_64 host — which
+    /// carries one whenever a foreign architecture is enabled.
+    #[test]
+    fn the_multiarch_scan_tries_this_machines_architecture_first() {
+        let native = format!("/usr/lib/{}-linux-gnu", std::env::consts::ARCH);
+        let dirs = ["/usr/lib/aaa-linux-gnu".to_owned(), native.clone()];
+        assert_eq!(
+            launchers_under(dirs.iter().map(PathBuf::from)).first(),
+            Some(&PathBuf::from(format!(
+                "{native}/at-spi2-core/at-spi-bus-launcher"
+            )))
         );
     }
 
@@ -571,6 +615,97 @@ mod tests {
                 || panic!("a fixed candidate hit; the multiarch scan must not run")
             ),
             Resolved::Found(fixed_path)
+        );
+    }
+
+    /// Only `Absent` reaches the "install at-spi2-core" remedy. A walk that reported
+    /// `NotExecutable` when it found nothing would tell a user with no at-spi2-core to chmod a
+    /// file that is not there.
+    #[test]
+    fn a_walk_that_finds_nothing_at_all_is_absent() {
+        assert_eq!(find_launcher_with(None, &[], Vec::new), Resolved::Absent);
+    }
+
+    /// The FIRST unrunnable candidate is the one named, and the walk now spans the fixed list
+    /// plus every triplet under /usr/lib — so first-versus-last names a different real file.
+    #[test]
+    fn the_first_unrunnable_candidate_is_the_one_named() {
+        let first = dir_with("at-spi-bus-launcher", 0o644);
+        let second = dir_with("at-spi-bus-launcher", 0o644);
+        let paths = [
+            first.path().join("at-spi-bus-launcher"),
+            second.path().join("at-spi-bus-launcher"),
+        ];
+        let candidates: Vec<&str> = paths
+            .iter()
+            .map(|p| p.to_str().expect("utf-8 temp path"))
+            .collect();
+        assert_eq!(
+            find_launcher_with(None, &candidates, Vec::new),
+            Resolved::NotExecutable(paths[0].clone())
+        );
+    }
+
+    /// `GLASS_ATSPI_LAUNCHER=` is set but names nothing, so it is not an override — discovery
+    /// still runs, rather than the whole lookup failing closed on an empty string.
+    #[test]
+    fn an_empty_override_falls_through_to_discovery() {
+        let dir = dir_with("at-spi-bus-launcher", 0o755);
+        let launcher = dir.path().join("at-spi-bus-launcher");
+        assert_eq!(
+            find_launcher_with(
+                Some(OsString::new()),
+                &[launcher.to_str().expect("utf-8 temp path")],
+                Vec::new
+            ),
+            Resolved::Found(launcher)
+        );
+    }
+
+    /// The scan production actually calls, not the injected one: it must go through
+    /// `launchers_under`, or the ranking above is dead code in the only caller that matters.
+    #[test]
+    fn the_production_scan_returns_ranked_candidates() {
+        let root = multiarch_root_with("zzz-linux-gnu", 0o755);
+        // Four, not two: an unranked scan would match a two-entry expectation half the time,
+        // whatever `read_dir` happened to yield.
+        for triplet in ["aaa-linux-gnu", "bbb-linux-gnu", "ccc-linux-gnu"] {
+            std::fs::create_dir_all(root.path().join(triplet).join("at-spi2-core")).expect("mkdir");
+        }
+        let expected: Vec<PathBuf> = ["aaa", "bbb", "ccc", "zzz"]
+            .iter()
+            .map(|a| {
+                root.path()
+                    .join(format!("{a}-linux-gnu"))
+                    .join("at-spi2-core/at-spi-bus-launcher")
+            })
+            .collect();
+        assert_eq!(multiarch_candidates(root.path()), expected);
+    }
+
+    /// A root that cannot be read is "no multiarch layout here" — never a panic, which would land
+    /// inside `glass doctor` on a minimal container with an unreadable /usr/lib.
+    #[test]
+    fn an_unreadable_multiarch_root_yields_no_candidates() {
+        assert_eq!(
+            multiarch_candidates(Path::new("/nonexistent-multiarch-root")),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// These constants are the contract `glass-a11y-linux` and `scripts/lib/have-atspi.sh` follow.
+    /// Emptying either is otherwise invisible: on a host whose launcher sits at the first fixed
+    /// path, the production wiring resolves before the scan is ever consulted.
+    #[test]
+    fn the_documented_install_paths_are_the_ones_searched() {
+        assert_eq!(MULTIARCH_ROOT, "/usr/lib");
+        assert_eq!(
+            LAUNCHER_CANDIDATES,
+            [
+                "/usr/libexec/at-spi-bus-launcher",
+                "/usr/lib/at-spi2-core/at-spi-bus-launcher",
+                "/usr/lib/at-spi2/at-spi-bus-launcher",
+            ]
         );
     }
 

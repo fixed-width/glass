@@ -43,15 +43,18 @@ internal refactors, CI, or test-only changes.
   were told to build one. Such a candidate is now stepped over and the search carries on. A
   candidate that does start and reports a version glass cannot use is unchanged: the search stops
   there rather than silently running a different sway further along your `$PATH`.
-- `glass doctor` no longer reports AT-SPI as both installed and missing in one run. The
-  accessibility report and the code that spawns `at-spi-bus-launcher` each looked for it their own
-  way, and the two disagreed on any host that is not x86_64 and on any host where you had set
-  `GLASS_ATSPI_LAUNCHER`: on aarch64 Debian/Ubuntu, `[a11y] Ok — at-spi-bus-launcher present` and
-  `at-spi-bus-launcher not found (install at-spi2-core)` could come from the same `glass doctor`,
-  with accessibility falling back to pixel-only on launch. One lookup now answers both. It honours
-  `GLASS_ATSPI_LAUNCHER` for the report as well as the launch, and looks in every architecture's
-  `/usr/lib/<triplet>/at-spi2-core/` rather than only x86_64's, so an at-spi2-core installed by
-  your package manager is found on the arch you are actually running.
+- Accessibility now works on Debian/Ubuntu machines that are not x86-64. `glass doctor` said
+  `at-spi-bus-launcher present` while every a11y launch on the same machine failed to find it —
+  quietly dropping to pixel-only by default, or failing outright with `a11y: true` — because the
+  report and the launch each looked for the launcher their own way, and only the report knew to
+  look under the machine's own `/usr/lib/<triplet>/at-spi2-core/`. They now share one lookup, so
+  they cannot disagree about a file again. Three things follow. Every architecture's directory is
+  searched, the machine's own first — a foreign-architecture launcher is executable as far as the
+  filesystem is concerned and fails only when glass tries to run it. `GLASS_ATSPI_LAUNCHER` is
+  honoured by the report as well as the launch, so if you point it somewhere unusable `glass
+  doctor` now tells you that, instead of reporting the system launcher it would never have used.
+  And a launcher that is present but not executable is named as exactly that, rather than sending
+  you to install a package that is already installed.
 
 ## [1.2.0] - 2026-08-07
 

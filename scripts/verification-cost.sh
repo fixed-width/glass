@@ -10,13 +10,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-launcher=""
-for c in /usr/libexec/at-spi-bus-launcher \
-         /usr/lib/at-spi2-core/at-spi-bus-launcher \
-         /usr/lib/at-spi2/at-spi-bus-launcher \
-         /usr/lib/*/at-spi2-core/at-spi-bus-launcher; do
-    [ -x "$c" ] && launcher="$c" && break
-done
+. scripts/lib/have-atspi.sh
+launcher="$(atspi_launcher)"
 if ! command -v dbus-daemon >/dev/null 2>&1 \
    || [ -z "$launcher" ] \
    || ! command -v Xvfb >/dev/null 2>&1; then
