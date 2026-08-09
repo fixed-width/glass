@@ -1666,6 +1666,20 @@ mod pure_tests {
         assert_eq!(next, 2, "re-fetching must not consume an id");
     }
 
+    /// Serializes the tests that write a fixture and then exec it.
+    ///
+    /// `fs::write` holds a write fd on the fixture, and a `fork` on any other thread inherits it
+    /// for the instant before its own exec — so a sibling spawning at the wrong moment makes this
+    /// one's exec fail `ETXTBSY` and the search find nothing. The race is the harness's; glass
+    /// never writes a binary it is about to probe. Poison is ignored so one test's panic cannot
+    /// fail its siblings.
+    fn one_spawner_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SPAWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A directory holding a `sway` that answers `--version` with `reply`.
     fn fake_sway(reply: &str) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1678,6 +1692,7 @@ mod pure_tests {
 
     #[test]
     fn a_recent_sway_on_the_path_is_used() {
+        let _guard = one_spawner_at_a_time();
         let dir = fake_sway("sway version 1.12-abc (Jun 3 2026)");
         assert_eq!(
             sway_in_dirs([dir.path().to_path_buf()].into_iter()),
@@ -1689,6 +1704,7 @@ mod pure_tests {
     /// sway through IPC and protocol surface it only has from 1.12.
     #[test]
     fn an_old_or_unreadable_sway_on_the_path_is_not_used() {
+        let _guard = one_spawner_at_a_time();
         for reply in ["sway version 1.9", "sway version 1.11-x", "wat"] {
             let dir = fake_sway(reply);
             assert_eq!(
@@ -1752,6 +1768,7 @@ mod pure_tests {
     /// `.output().ok()?` ended the walk — so a good distro sway further along was never seen.
     #[test]
     fn a_non_executable_sway_early_on_the_path_does_not_hide_a_later_one() {
+        let _guard = one_spawner_at_a_time();
         let broken = tempfile::tempdir().expect("tempdir");
         let bin = broken.path().join("sway");
         std::fs::write(&bin, b"").expect("write");
@@ -1769,6 +1786,7 @@ mod pure_tests {
     /// either made glass report no sway on `$PATH` at all.
     #[test]
     fn a_sway_that_fails_to_spawn_does_not_hide_a_later_one() {
+        let _guard = one_spawner_at_a_time();
         let unspawnable = tempfile::tempdir().expect("tempdir");
         let bin = unspawnable.path().join("sway");
         std::fs::write(&bin, b"").expect("write");
