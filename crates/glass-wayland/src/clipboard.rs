@@ -360,8 +360,9 @@ pub fn get(socket: &Path) -> Result<String> {
 /// Ask the selection owner for a text transfer and return the pipe's read end, or `None` when
 /// there is nothing to read — no selection, or no text MIME on offer.
 ///
-/// Once this returns the owner is writing, whether or not anybody reads: [`get`] is this plus the
-/// bounded read, and a test that wants the owner stuck mid-write is this without it.
+/// Returning means the transfer has been requested and the compositor has routed the fd, not that
+/// the owner has dispatched the `Send` yet: [`get`] is this plus the bounded read, and a test that
+/// wants the owner stuck mid-write is this plus a wait for the first bytes.
 fn open_transfer(socket: &Path) -> Result<Option<OwnedFd>> {
     let stream = UnixStream::connect(socket)
         .map_err(|e| GlassError::Backend(format!("clipboard get: connect: {e}")))?;
@@ -667,7 +668,8 @@ impl ClipboardOwner {
         // join.
         let failure = match &*result.0 {
             ReadyState::Err(msg) => Some(msg.clone()),
-            // Unreachable: the wait only returns without timing out once the predicate is false.
+            // `Pending` is the state on the timed-out path, handled by the branch below;
+            // either way there is no failure message to carry.
             ReadyState::Ok | ReadyState::Pending => None,
         };
         drop(result);
@@ -789,8 +791,8 @@ fn serve_loop(
     })?;
 
     // A detached thread (spawn already timed out and returned to the caller) must not take a
-    // selection the caller has already been told it failed to get. `spawn`'s detach comment counts on this
-    // check.
+    // selection the caller has already been told it failed to get. `spawn`'s detach comment
+    // counts on this check.
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -1012,10 +1014,24 @@ mod tests {
         .expect("poll the transfer");
         assert!(ready > 0, "the owner never started writing the paste");
 
+        let started = std::time::Instant::now();
         on_a_thread(
             Duration::from_secs(15),
             "dropping an owner must not wait out a paste nobody is reading",
             move || drop(owner),
+        );
+        // Ties the test to CLIP_WRITE_TIMEOUT rather than to the ceiling above, which any bound
+        // under ~13 s would still pass. The upper check carries the owner's 50 ms dispatch tick
+        // and a loaded machine on top of the 2 s bound; the lower one fails a bound shrunk to ~0,
+        // which would return promptly and truncate every real paste.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "dropping took {elapsed:?}, expected it to return near the 2 s write bound"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "dropping took only {elapsed:?}, expected the write bound to be what released it"
         );
         // Held until here: closing the read end early fails the write as EPIPE, which would let
         // even an unbounded write return.

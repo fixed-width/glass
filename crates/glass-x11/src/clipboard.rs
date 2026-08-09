@@ -252,7 +252,8 @@ impl ClipboardOwner {
         // join.
         let failure = match &*result.0 {
             ReadyState::Err(msg) => Some(msg.clone()),
-            // Unreachable: the wait only returns without timing out once the predicate is false.
+            // `Pending` is the state on the timed-out path, handled by the branch below;
+            // either way there is no failure message to carry.
             ReadyState::Ok | ReadyState::Pending => None,
         };
         drop(result);
@@ -421,8 +422,8 @@ fn owner_thread(
     })?;
 
     // A detached thread (spawn already timed out and returned to the caller) must not take a
-    // selection the caller has already been told it failed to get. `spawn`'s detach comment counts on this
-    // check.
+    // selection the caller has already been told it failed to get. `spawn`'s detach comment
+    // counts on this check.
     if stop.load(Ordering::Relaxed) {
         // Skips the `destroy_window` the normal exit performs: `conn` is dropped on the way out,
         // and an X server destroys everything a client created once its connection closes
