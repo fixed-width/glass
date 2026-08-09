@@ -849,9 +849,8 @@ fn onbox_egui_set_value_honesty() {
         bounds: field.bounds,
         value: field.value.clone(),
     };
-    // The read-back is what makes the projection's shape visible: it still reports the field's own
-    // text, so the verdict must name that and not a failed read — UIA accepted the write and the
-    // value never moved.
+    // UIA accepted the write and the value never moved, so the read-back still reports the field's
+    // own text — the verdict must name that, not a failed read.
     let verdict = a11y.set_value(&ctx, &target, "hello");
     assert!(
         matches!(&verdict, Err(GlassError::AxValueNotApplied { requested, observed, .. })

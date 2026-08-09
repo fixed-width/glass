@@ -214,8 +214,8 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     if landed {
         Ok(())
     } else {
-        // `Some("")`, not `None`: this mapper drops an empty value, so an empty field arrives here
-        // as `None` — the same `None` the verdict reserves for a reading nobody obtained.
+        // The mapper drops an empty value, so an empty field arrives as `None` — which the verdict
+        // reserves for a reading nobody took.
         Err(GlassError::value_not_applied(
             target.id.0,
             text,
@@ -322,7 +322,7 @@ impl Accessibility for IosA11y {
             }
         }
         // The const assert on `VERIFY_ATTEMPTS` is what makes `last` always set; the fallback only
-        // avoids an unwrap, and names no read-back because none was taken.
+        // avoids an unwrap.
         Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
     }
 }
@@ -406,9 +406,8 @@ mod tests {
         }
     }
 
-    /// Pin the whole verdict, not the variant: what the caller does next comes from the two values
-    /// it names, and a field that transformed the text is told apart from one that never received
-    /// it only by reading them (glass#363). Twin of the helper in `glass-android/src/a11y.rs`.
+    /// Pin the whole verdict, not the variant: the two values it names are what a caller acts on
+    /// (glass#363). Twin of the helper in `glass-android/src/a11y.rs`.
     #[track_caller]
     fn assert_not_applied(outcome: Result<()>, id: u32, requested: &str, observed: Option<&str>) {
         match outcome {
@@ -481,12 +480,10 @@ mod tests {
 
     #[test]
     fn an_autocapitalized_first_letter_is_not_a_successful_write() {
-        // glass#363: measured on the Simulator, iOS applies sentence autocapitalization to a value
-        // typed into a field it considers empty, so every keystroke lands and the field holds the
-        // request with its first letter uppercased. Exact match refuses it — accepting a case-only
-        // difference would report a write as landed while the field holds different bytes — and the
-        // verdict names both strings, which is the only way a caller can tell this from a lost
-        // write.
+        // glass#363: iOS applies sentence autocapitalization to a value typed into a field it
+        // considers empty, so every keystroke lands and the field holds the request with its first
+        // letter uppercased. Do not relax the match to ignore case — that reports a write as landed
+        // while the field holds different bytes.
         let after = tree_with_value(Some("Glasssmoke3"));
         assert_not_applied(
             verify_write(&after, &matching_target(), "glasssmoke3"),
@@ -498,9 +495,8 @@ mod tests {
 
     #[test]
     fn an_empty_field_reports_an_empty_read_back_not_a_missing_one() {
-        // `axmap` drops an empty value, so the node arrives holding `None` — which the verdict
-        // reserves for a reading nobody took. A write that cleared the field and lost its text must
-        // say the field is empty, not that it could not be read.
+        // `axmap` drops an empty value, so an emptied field arrives as `None` — which must still
+        // report as empty, not as a reading nobody took.
         let after = tree_with_value(None);
         assert_not_applied(
             verify_write(&after, &matching_target(), "world"),

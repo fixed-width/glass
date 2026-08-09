@@ -18,9 +18,8 @@ pub enum BoundKind {
 
 /// Render a read-back for [`GlassError::AxValueNotApplied`] as the clause following "the element".
 ///
-/// `None` does not mean the element is empty — an empty field reads back as `Some("")`. It means no
-/// reading was obtained at all: the platform's read failed, or nothing matching the element was
-/// found to read. Rendering it as `""` would put a value in the element's mouth.
+/// `None` is not an empty element — that reads back as `Some("")` — it is no reading at all: the
+/// platform's read failed, or nothing matching the element was found.
 fn render_observed(observed: &Option<String>) -> String {
     match observed {
         Some(v) => format!("holds {v:?}"),
@@ -157,12 +156,10 @@ pub enum GlassError {
 
     /// A dispatched write whose read-back does not hold the request.
     ///
-    /// Carries both values because the caller's next move turns on the difference between them,
-    /// and only the code that raised this had them side by side. Three outcomes look alike from
-    /// the id alone: the element transformed the write and holds it in another form (writing again
-    /// changes nothing), it holds part of the request (a keystroke was dropped, so writing again is
-    /// the fix), or it holds what it held before (the write never arrived). Build it with
-    /// [`GlassError::value_not_applied`].
+    /// Carries both values because three outcomes look alike from the id alone: the element
+    /// transformed the write and holds it in another form (writing again changes nothing), it holds
+    /// part of the request (a keystroke was dropped, so writing again is the fix), or it holds what
+    /// it held before (the write never arrived). Build it with [`GlassError::value_not_applied`].
     #[error(
         "set_value on element #{id} did not take — asked for {requested:?}, the element {}. \
          Holding the request in another form means the element transformed it, and writing again \
@@ -175,9 +172,8 @@ pub enum GlassError {
     AxValueNotApplied {
         id: u32,
         requested: String,
-        /// What the element reads as now: the text for a field — `Some("")` when it is empty —
-        /// or `"on"` / `"off"` for a boolean control. `None` only when no reading was obtained,
-        /// never for an element that read back as holding nothing.
+        /// What the element reads as now: the text for a field — `Some("")` when it is empty — or
+        /// `"on"` / `"off"` for a boolean control. `None` only when no reading was obtained.
         observed: Option<String>,
     },
 
@@ -304,10 +300,9 @@ impl GlassError {
 
     /// The verdict for a write that dispatched and whose read-back does not hold the request.
     ///
-    /// Pass the value the verification already read, not a reading taken to fill this in: one taken
-    /// afterwards can catch a value that arrived late and contradict the verdict it explains. A
-    /// backend whose mapper drops an empty value must pass `Some("")` rather than `None` — `None`
-    /// says no reading was obtained, which is a different answer to the caller.
+    /// Pass the value the verification already read: one taken afterwards can catch a value that
+    /// arrived late and contradict the verdict it explains. A backend whose mapper drops an empty
+    /// value must pass `Some("")` rather than `None`, which says no reading was obtained.
     pub fn value_not_applied(id: u32, requested: &str, observed: Option<&str>) -> GlassError {
         GlassError::AxValueNotApplied {
             id,
@@ -584,9 +579,8 @@ mod tests {
 
     #[test]
     fn a_write_that_did_not_take_names_both_the_request_and_the_read_back() {
-        // The whole point of the variant: an iOS field that autocapitalized the first letter took
-        // every keystroke, and only seeing both strings tells the caller that (glass#363). Each is
-        // asserted with the label that binds it — "contains both strings" also passes for a message
+        // glass#363: an iOS field that autocapitalized the first letter took every keystroke. Each
+        // value is asserted with the label that binds it — "contains both" also passes a message
         // that swapped them, which is the inverted diagnosis.
         let msg = GlassError::value_not_applied(13, "glasssmoke3", Some("Glasssmoke3")).to_string();
         assert!(msg.contains("element #13"), "{msg}");
@@ -596,16 +590,16 @@ mod tests {
 
     #[test]
     fn an_empty_read_back_renders_as_an_empty_value() {
-        // An element that read back as empty holds something the caller can act on: the write
-        // arrived and left nothing, which is not the same answer as no reading at all.
+        // An empty read-back says the write arrived and left nothing — not the same answer as no
+        // reading at all.
         let msg = GlassError::value_not_applied(13, "hello", Some("")).to_string();
         assert!(msg.contains("holds \"\""), "{msg}");
     }
 
     #[test]
     fn a_reading_nobody_took_does_not_render_as_a_value() {
-        // `None` is a failed platform read or an element that could not be found. Rendering it as
-        // `""` — or as "holds no value" — states something about the element that nobody observed.
+        // `None` is a failed platform read or an element not found; rendering it as `""`, or as
+        // "holds no value", states something about the element that nobody observed.
         let msg = GlassError::value_not_applied(13, "hello", None).to_string();
         assert!(msg.contains("could not be read back"), "{msg}");
         assert!(!msg.contains("holds"), "{msg}");

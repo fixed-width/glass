@@ -634,8 +634,8 @@ async fn set_toggle(
             return Ok(());
         }
     }
-    // Report the state the last poll read, not `!target_on` derived from the request: the two agree
-    // only while the loop's sole exit is this equality, and nothing holds that.
+    // Report the state the last poll read, not `!target_on` derived from the request — the two
+    // agree only while this equality is the loop's sole exit, and nothing holds that.
     Err(GlassError::value_not_applied(
         id,
         requested,
@@ -643,8 +643,8 @@ async fn set_toggle(
     ))
 }
 
-/// How a boolean control's state is named in a verdict the caller reads. `set_value` accepts
-/// `true`/`on`/`1` alike, so the request and the read-back would otherwise be worded differently.
+/// How a boolean control's state is named in a verdict the caller reads — one spelling, where
+/// `set_value` accepts `true`/`on`/`1` for the request alike.
 fn toggle_state_label(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
@@ -816,9 +816,8 @@ mod toggle_label_tests {
 
     #[test]
     fn a_control_that_stayed_off_is_reported_as_off() {
-        // The direction is what the verdict rests on: inverted, a `set_value("true")` that failed
-        // would report the control as already on — the state the caller asked for, alongside "did
-        // not take".
+        // Inverted, a failed `set_value("true")` reports the control as already on — the state the
+        // caller asked for, alongside "did not take".
         assert_eq!(toggle_state_label(false), "off");
         assert_eq!(toggle_state_label(true), "on");
     }

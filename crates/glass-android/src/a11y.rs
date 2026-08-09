@@ -404,8 +404,8 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     if landed {
         Ok(())
     } else {
-        // `Some("")`, not `None`: this mapper drops an empty value, so an empty field arrives here
-        // as `None` — the same `None` the verdict reserves for a reading nobody obtained.
+        // The mapper drops an empty value, so an empty field arrives as `None` — which the verdict
+        // reserves for a reading nobody took.
         Err(GlassError::value_not_applied(
             target.id.0,
             text,
@@ -723,7 +723,7 @@ impl Accessibility for AndroidA11y {
             }
         }
         // The const assert on `VERIFY_ATTEMPTS` is what makes `last` always set; the fallback only
-        // avoids an unwrap, and names no read-back because none was taken.
+        // avoids an unwrap.
         Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
     }
 }
@@ -1954,9 +1954,8 @@ mod tests {
         assert!(verify_write(&after, &t, "").is_ok());
     }
 
-    /// Pin the whole verdict, not the variant: what the caller does next comes from the two values
-    /// it names, and a field that transformed the text is told apart from one that never received
-    /// it only by reading them (glass#363). Twin of the helper in `glass-ios/src/a11y.rs`.
+    /// Pin the whole verdict, not the variant: the two values it names are what a caller acts on
+    /// (glass#363). Twin of the helper in `glass-ios/src/a11y.rs`.
     #[track_caller]
     fn assert_not_applied(outcome: Result<()>, id: u32, requested: &str, observed: Option<&str>) {
         match outcome {
@@ -1993,9 +1992,8 @@ mod tests {
 
     #[test]
     fn an_empty_field_reports_an_empty_read_back_not_a_missing_one() {
-        // `axmap` drops an empty value, so the node arrives holding `None` — which the verdict
-        // reserves for a reading nobody took. A write that cleared the field and lost its text must
-        // say the field is empty, not that it could not be read.
+        // `axmap` drops an empty value, so an emptied field arrives as `None` — which must still
+        // report as empty, not as a reading nobody took.
         let after = tree_holding(None);
         let t = target(0, Some("Search"), Some(BOUNDS));
         assert_not_applied(verify_write(&after, &t, "world"), 0, "world", Some(""));
@@ -2449,10 +2447,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn the_verdict_names_the_last_read_back_not_the_first() {
-        // The read-back retries because a field can commit a frame or two late, so the attempts can
-        // disagree: a first read caught mid-write and a second holding what the field settled on.
-        // Reporting the first would tell the caller the write never arrived when it arrived
-        // transformed — the misdiagnosis the two values exist to prevent.
+        // The retries can disagree — a read caught mid-write, then the value the field settled on
+        // — and reporting the first calls a transformed write a lost one.
         use super::AndroidA11y;
         use crate::adb::{Answer, FakeAdb};
         use glass_core::Accessibility;
