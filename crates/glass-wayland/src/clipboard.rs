@@ -8,18 +8,30 @@
 
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-/// Cap on how long `get()` waits for the selection owner to finish writing the
-/// transfer pipe. The owner is an arbitrary external app, so a stuck/slow one
-/// must not hang the server (the X11 backend guards the analogous read with 1s).
+/// Cap on a whole clipboard read: the connection, the compositor's answers, and the transfer from
+/// the owner. The owner is an arbitrary external app, so a stuck or slow one must not hang the
+/// server (the X11 backend guards the analogous read with 1s).
 const CLIP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-use wayland_client::globals::registry_queue_init;
+/// How long `set_clipboard` waits for the serving thread to register the selection. The thread is
+/// detached when this expires.
+const SPAWN_READY_BUDGET: Duration = Duration::from_secs(2);
+
+/// What the serving thread's own setup gets. Strictly under [`SPAWN_READY_BUDGET`], so a setup
+/// that cannot finish says so to a caller still listening; tie the two and a few microseconds of
+/// scheduling decide which of them reports.
+const SERVE_SETUP_BUDGET: Duration = Duration::from_millis(1750);
+
+const _: () = assert!(
+    SERVE_SETUP_BUDGET.as_millis() < SPAWN_READY_BUDGET.as_millis(),
+    "the serving thread's setup must fail while its caller is still waiting to hear about it"
+);
+
 use wayland_client::protocol::wl_seat;
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols_wlr::data_control::v1::client::{
@@ -36,7 +48,7 @@ use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry};
-use wayland_client::protocol::{wl_buffer, wl_output};
+use wayland_client::protocol::{wl_buffer, wl_callback, wl_output};
 
 // ---- MIME types we offer / accept ----
 pub const MIME_UTF8: &str = "text/plain;charset=utf-8";
@@ -104,6 +116,19 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for ClipState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, crate::platform::SyncDone> for ClipState {
+    fn event(
+        _: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        done: &crate::platform::SyncDone,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        done.store(true, Ordering::Relaxed);
     }
 }
 
@@ -248,6 +273,19 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for ServeState {
     }
 }
 
+impl Dispatch<wl_callback::WlCallback, crate::platform::SyncDone> for ServeState {
+    fn event(
+        _: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        done: &crate::platform::SyncDone,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        done.store(true, Ordering::Relaxed);
+    }
+}
+
 impl Dispatch<wl_seat::WlSeat, ()> for ServeState {
     fn event(
         _: &mut Self,
@@ -348,12 +386,13 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ServeState {
 /// event queue, does a roundtrip to collect the selection offer, then reads the
 /// pipe transfer.
 pub fn get(socket: &Path) -> Result<String> {
-    let Some(read_end) = open_transfer(socket)? else {
+    // One deadline for connecting, the syncs and the read, so the session lock is held for what
+    // the constant says rather than its sum over the steps.
+    let deadline = Instant::now() + CLIP_READ_TIMEOUT;
+    let Some(read_end) = open_transfer(socket, deadline)? else {
         return Ok(String::new());
     };
-    // Read to EOF from the read end, bounded by a deadline so a misbehaving
-    // selection owner can't hang us forever (see CLIP_READ_TIMEOUT).
-    let buf = read_to_eof_bounded(read_end, CLIP_READ_TIMEOUT)?;
+    let buf = read_to_eof_bounded(read_end, deadline.saturating_duration_since(Instant::now()))?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -363,14 +402,13 @@ pub fn get(socket: &Path) -> Result<String> {
 /// Returning means the transfer has been requested and the compositor has routed the fd, not that
 /// the owner has dispatched the `Send` yet: [`get`] is this plus the bounded read, and a test that
 /// wants the owner stuck mid-write is this plus a wait for the first bytes.
-fn open_transfer(socket: &Path) -> Result<Option<OwnedFd>> {
-    let stream = UnixStream::connect(socket)
-        .map_err(|e| GlassError::Backend(format!("clipboard get: connect: {e}")))?;
-    let conn = Connection::from_socket(stream)
-        .map_err(|e| GlassError::Backend(format!("clipboard get: wayland connection: {e}")))?;
-
-    let (globals, mut queue): (_, EventQueue<ClipState>) = registry_queue_init(&conn)
-        .map_err(|e| GlassError::Backend(format!("clipboard get: registry: {e}")))?;
+fn open_transfer(socket: &Path, deadline: Instant) -> Result<Option<OwnedFd>> {
+    let (conn, globals, mut queue): (_, _, EventQueue<ClipState>) =
+        crate::platform::connect_bounded(
+            socket,
+            deadline.saturating_duration_since(Instant::now()),
+            "clipboard get: setup",
+        )?;
 
     let qh = queue.handle();
     let mut state = ClipState {
@@ -393,15 +431,22 @@ fn open_transfer(socket: &Path) -> Result<Option<OwnedFd>> {
     // get_data_device triggers `data_offer` + `offer*` + `selection` events.
     let _device = manager.get_data_device(&seat, &qh, ());
 
-    // Roundtrip: collect the initial selection advertisement.
-    queue
-        .roundtrip(&mut state)
-        .map_err(|e| GlassError::Backend(format!("clipboard get: roundtrip: {e}")))?;
-
-    // One more roundtrip to make sure pending_mimes have been accumulated.
-    queue
-        .roundtrip(&mut state)
-        .map_err(|e| GlassError::Backend(format!("clipboard get: roundtrip2: {e}")))?;
+    // Collect the initial selection advertisement, then once more so `pending_mimes` has
+    // accumulated.
+    crate::platform::roundtrip_until(
+        &conn,
+        &mut queue,
+        &mut state,
+        deadline,
+        "clipboard get: selection",
+    )?;
+    crate::platform::roundtrip_until(
+        &conn,
+        &mut queue,
+        &mut state,
+        deadline,
+        "clipboard get: mime types",
+    )?;
 
     let (offer, mimes) = match state.selection.take() {
         Some(v) => v,
@@ -426,13 +471,15 @@ fn open_transfer(socket: &Path) -> Result<Option<OwnedFd>> {
     conn.flush()
         .map_err(|e| GlassError::Backend(format!("clipboard get: flush: {e}")))?;
 
-    // Roundtrip so the compositor can service our receive request and tell the
-    // source to write data. The source's write happens in a separate connection
-    // (either ours or another client), so we just need to let the compositor
-    // route the fd.
-    queue
-        .roundtrip(&mut state)
-        .map_err(|e| GlassError::Backend(format!("clipboard get: roundtrip3: {e}")))?;
+    // Let the compositor service the receive request and tell the source to write. The source
+    // writes on a separate connection, so all this waits for is the fd being routed.
+    crate::platform::roundtrip_until(
+        &conn,
+        &mut queue,
+        &mut state,
+        deadline,
+        "clipboard get: transfer",
+    )?;
 
     // The fd is already with the owner, so destroying the offer and dropping `conn` here cannot
     // cut the read short.
@@ -650,14 +697,14 @@ impl ClipboardOwner {
             })
             .map_err(GlassError::Io)?;
 
-        // Block until the thread signals that it has called set_selection +
-        // roundtripped (or encountered an error), with a 2 s timeout.
+        // Block until the thread signals that it has called set_selection + roundtripped (or
+        // encountered an error).
         let (lock, cvar) = &*ready;
         let result = recover_readiness(
             "set: readiness wait",
             cvar.wait_timeout_while(
                 recover_readiness("set: readiness lock", lock.lock()),
-                Duration::from_secs(2),
+                SPAWN_READY_BUDGET,
                 |s| matches!(s, ReadyState::Pending),
             ),
         );
@@ -745,22 +792,22 @@ fn serve_loop(
     stop: Arc<AtomicBool>,
     ready: Arc<(Mutex<ReadyState>, Condvar)>,
 ) -> Result<()> {
-    let stream = UnixStream::connect(&socket).map_err(|e| {
-        let msg = format!("connect: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        GlassError::Backend(format!("clipboard serve: {msg}"))
-    })?;
-    let conn = Connection::from_socket(stream).map_err(|e| {
-        let msg = format!("wayland connection: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        GlassError::Backend(format!("clipboard serve: {msg}"))
-    })?;
-
-    let (globals, mut queue): (_, EventQueue<ServeState>) =
-        registry_queue_init(&conn).map_err(|e| {
-            let msg = format!("registry: {e}");
+    let deadline = Instant::now() + SERVE_SETUP_BUDGET;
+    let (conn, globals, mut queue): (_, _, EventQueue<ServeState>) =
+        crate::platform::connect_bounded(
+            &socket,
+            deadline.saturating_duration_since(Instant::now()),
+            "clipboard serve: setup",
+        )
+        .map_err(|e| {
+            // The bare cause, not the rendered error: `spawn` prefixes its own, and two variant
+            // names in one sentence say nothing the first did not.
+            let msg = match e {
+                GlassError::Backend(m) => m,
+                other => other.to_string(),
+            };
             signal_ready(&ready, ReadyState::Err(msg.clone()));
-            GlassError::Backend(format!("clipboard serve: {msg}"))
+            GlassError::Backend(msg)
         })?;
 
     let qh = queue.handle();
@@ -813,11 +860,14 @@ fn serve_loop(
     // Roundtrip so the compositor registers the selection before we return to
     // the caller. This is what makes set_clipboard synchronous: spawn() blocks
     // on the ready signal below, which is only sent after this roundtrip.
-    queue.roundtrip(&mut state).map_err(|e| {
-        let msg = format!("initial roundtrip: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        GlassError::Backend(format!("clipboard serve: {msg}"))
-    })?;
+    crate::platform::roundtrip_until(
+        &conn,
+        &mut queue,
+        &mut state,
+        deadline,
+        "clipboard serve: selection",
+    )
+    .inspect_err(|e| signal_ready(&ready, ReadyState::Err(e.to_string())))?;
 
     // Selection is now registered with the compositor — unblock spawn().
     signal_ready(&ready, ReadyState::Ok);
@@ -871,17 +921,21 @@ fn serve_loop(
             )],
             Some(&timeout),
         ) {
-            Ok(n) if n > 0 => {
-                // Data available: read into the queue.
-                if let Err(e) = guard.read() {
+            Ok(n) if n > 0 => match guard.read() {
+                Ok(_) => {}
+                // Breaking here would drop the selection over a split write (glass#402).
+                Err(e) if crate::platform::is_partial_read(&e) => {}
+                Err(e) => {
                     eprintln!("glass-wayland: clipboard serve: read: {e}");
                     break;
                 }
-            }
+            },
             Ok(_) => {
                 // Timeout — loop back and check the stop flag.
                 drop(guard);
             }
+            // A signal arrived and nothing was lost.
+            Err(rustix::io::Errno::INTR) => drop(guard),
             Err(e) => {
                 eprintln!("glass-wayland: clipboard serve: poll: {e}");
                 drop(guard);
@@ -979,7 +1033,7 @@ mod tests {
         // write that never blocks, so a smaller one would pass with no bound at all.
         let owner = ClipboardOwner::spawn(socket.clone(), "x".repeat(256 * 1024)).expect("spawn");
 
-        let transfer = open_transfer(&socket)
+        let transfer = open_transfer(&socket, std::time::Instant::now() + CLIP_READ_TIMEOUT)
             .expect("open a transfer")
             .expect("a live owner offers text to transfer");
         // Wait for the first bytes: they are what says the serving thread is past its stop check
@@ -1087,10 +1141,11 @@ mod tests {
         assert!(matches!(err, GlassError::Backend(_)), "{err}");
     }
 
-    /// A compositor that accepts the connection and then never answers is what the 2 s readiness
-    /// bound is for. Joining the setup thread there waits on the wedged peer with no bound at
-    /// all, so spawn has to return without it — every tool call is behind the session lock this
-    /// holds.
+    /// A compositor that accepts the connection and then never answers is what the readiness bound
+    /// is for: joining the setup thread would wait on the wedged peer with no bound at all, and
+    /// every tool call is behind the session lock this holds.
+    ///
+    /// The setup's budget is the shorter of the two, so the caller hears which step failed.
     #[test]
     fn an_owner_gives_up_on_a_peer_that_accepts_and_never_answers() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1124,9 +1179,50 @@ mod tests {
             "spawn took only {elapsed:?}, expected it to wait close to its own 2 s bound"
         );
         let msg = outcome.expect("a peer that never answers is not a served clipboard");
-        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.contains("clipboard serve: setup"), "{msg}");
 
         // Closing the server side lets the detached setup thread fail and exit.
+        drop(
+            accepted
+                .join()
+                .expect("accept thread")
+                .expect("accepted stream"),
+        );
+    }
+
+    /// Reading the clipboard opens its own connection, whose globals arrive over an upstream
+    /// roundtrip that polls with no timeout — so this hung outright until glass#402, session lock
+    /// held. A listener that accepts and answers nothing is a wedged compositor from this side.
+    #[test]
+    fn a_paste_gives_up_on_a_peer_that_accepts_and_never_answers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("wayland-silent");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let accepted = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+
+        let started = std::time::Instant::now();
+        let outcome = on_a_thread(
+            Duration::from_secs(20),
+            "a paste must return when its own bound expires, not wait on the peer",
+            move || get(&socket).err().map(|e| e.to_string()),
+        );
+        let elapsed = started.elapsed();
+
+        let msg = outcome.expect("a peer that never answers has no clipboard to read");
+        assert!(
+            msg.contains("clipboard get"),
+            "the failure should name the read that made it: {msg}"
+        );
+        assert!(
+            elapsed < CLIP_READ_TIMEOUT * 5,
+            "the paste outlived its own bound by too much to be bounded by it: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= CLIP_READ_TIMEOUT / 2,
+            "the bound was cut short, so a compositor merely slow to answer would be given up \
+             on: {elapsed:?}"
+        );
+
         drop(
             accepted
                 .join()

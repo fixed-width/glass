@@ -80,8 +80,25 @@ internal refactors, CI, or test-only changes.
   on with no limit at all. glass serves one tool call at a time, so every later call queued behind
   it. The 5 seconds are now a real limit: a capture the compositor has not answered by then fails
   and names the event that never arrived, and the capture after it is unaffected by the one that
-  gave up. Other calls on a compositor that stays quiet can still wait on it; only captures are
-  bounded so far.
+  gave up.
+- No tool call on the Wayland backend waits on a quiet compositor without a limit now. Every
+  request glass sends ends by asking the compositor to confirm it has caught up, and that wait had
+  none — so a compositor that stopped answering hung `glass_click`, `glass_type`, `glass_scroll`,
+  `glass_list_windows`, a launch, and reading the clipboard, each holding the session and
+  everything queued behind it. Opening a connection at all had the same problem, which is why
+  reading the clipboard — which opens its own — could hang before it reached any of the rest. The
+  compositor now gets 5 seconds to answer a request, or the remainder of your `timeout_ms` during
+  a launch, and one it does not answer fails saying which request it was. Note the limit is per
+  request: a compositor that answers everything slowly can still make a long `glass_type` or
+  `glass_drag` take the sum of its parts.
+- Input is no longer left half-applied when the compositor stops answering mid-gesture. The press
+  had already been sent, so a `glass_click` or `glass_type` that failed while waiting could leave
+  a mouse button or a modifier key held down, and the next call would inherit it — clicking where
+  it meant to move, or typing control characters. The counterpart is now sent before the failure
+  is reported.
+- A clipboard owner no longer drops the selection when a message arrives split across two reads,
+  or when a signal interrupts it — after either, the clipboard read empty until something set it
+  again.
 - Accessibility now works on Debian/Ubuntu machines that are not x86-64. `glass doctor` said
   `at-spi-bus-launcher present` while every a11y launch on the same machine failed to find it —
   quietly dropping to pixel-only by default, or failing outright with `a11y: true` — because the
