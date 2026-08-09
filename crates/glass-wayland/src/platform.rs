@@ -10,6 +10,7 @@ use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
     TEARDOWN_BUDGET, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
+use glass_exec_unix::is_executable_file;
 use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE};
 use smithay_client_toolkit::delegate_dispatch2;
 use smithay_client_toolkit::delegate_registry;
@@ -236,7 +237,7 @@ pub(crate) fn resolve_sway() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
     if let Some(d) = data {
         let cand = d.join("glass/sway/bin/sway");
-        if cand.is_file() {
+        if is_executable_file(&cand) {
             return Ok(cand);
         }
     }
@@ -244,7 +245,7 @@ pub(crate) fn resolve_sway() -> Result<PathBuf> {
         && let Some(dir) = exe.parent()
     {
         let cand = dir.join("sway/bin/sway");
-        if cand.is_file() {
+        if is_executable_file(&cand) {
             return Ok(cand);
         }
     }
@@ -261,7 +262,7 @@ pub(crate) fn resolve_sway() -> Result<PathBuf> {
 /// file — falling back to discovery would chase a version-specific bug in a different binary.
 fn sway_override(value: Option<std::ffi::OsString>) -> Option<Result<PathBuf>> {
     let p = PathBuf::from(value.filter(|s| !s.is_empty())?);
-    Some(if p.is_file() {
+    Some(if is_executable_file(&p) {
         Ok(p)
     } else {
         Err(GlassError::Backend(format!(
@@ -278,7 +279,7 @@ fn sway_override(value: Option<std::ffi::OsString>) -> Option<Result<PathBuf>> {
 fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
     for dir in dirs {
         let cand = dir.join("sway");
-        if !cand.is_file() {
+        if !is_executable_file(&cand) {
             continue;
         }
         let out = std::process::Command::new(&cand)
@@ -1524,6 +1525,8 @@ impl Platform for WaylandPlatform {
 
 #[cfg(test)]
 mod pure_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
 
     fn win(identifier: &str, x11: Option<u32>) -> SwayWindow {
@@ -1667,6 +1670,40 @@ mod pure_tests {
             .expect("a choice was made")
             .expect_err("a named path that is not there must not fall back");
         assert!(err.to_string().contains("/nonexistent/sway"), "{err}");
+    }
+
+    /// glass#374: the override was checked with `is_file()` while the error it produces has always
+    /// said "is not an executable file".
+    #[test]
+    fn an_override_naming_a_non_executable_file_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("sway");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let err = sway_override(Some(bin.clone().into_os_string()))
+            .expect("a choice was made")
+            .expect_err("a file that cannot be run must not be trusted");
+        assert!(
+            err.to_string().contains(&bin.display().to_string()),
+            "{err}"
+        );
+    }
+
+    /// A non-executable `sway` early on `PATH` used to abort discovery outright: the candidate was
+    /// accepted on `is_file()`, `--version` then failed to spawn, and `.output().ok()?` returned
+    /// `None` from the whole function — so the bundled build was never reached.
+    #[test]
+    fn a_non_executable_sway_on_the_path_does_not_abort_discovery() {
+        let broken = tempfile::tempdir().expect("tempdir");
+        let bin = broken.path().join("sway");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
+        assert_eq!(
+            sway_in_dirs([broken.path().to_path_buf(), good.path().to_path_buf()].into_iter()),
+            Some(good.path().join("sway")),
+            "a sway that cannot be run must be skipped, not treated as the answer"
+        );
     }
 
     #[test]
