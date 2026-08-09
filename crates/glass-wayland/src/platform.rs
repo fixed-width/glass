@@ -228,12 +228,22 @@ pub(crate) struct NoSway {
 const BUILD_A_SWAY: &str = "build it with https://github.com/fixed-width/sway-build \
      (./build.sh && ./build.sh install), or install a distro sway >=1.12";
 const MAKE_IT_RUNNABLE: &str = "chmod +x it, or point GLASS_SWAY at a runnable sway >=1.12";
+pub(crate) const CHECK_THAT_SWAY: &str =
+    "check that binary, or point GLASS_SWAY at a working sway >=1.12";
 
 impl NoSway {
     fn nothing_qualifies() -> Self {
         NoSway {
             cause: "no sway >=1.12 found".into(),
             remedy: BUILD_A_SWAY,
+        }
+    }
+
+    /// A sway that is installed and runnable but told glass nothing.
+    fn silent(path: &Path, why: &str) -> Self {
+        NoSway {
+            cause: format!("{}: {why}", path.display()),
+            remedy: CHECK_THAT_SWAY,
         }
     }
 
@@ -265,9 +275,10 @@ pub(crate) fn resolve_sway_verdict() -> std::result::Result<PathBuf, NoSway> {
     // Inlined rather than wrapped: a `fn` that only splits PATH and delegates has a
     // constant-return mutation nothing can kill on a host where the true answer is that constant
     // — here, any machine with no sway on PATH.
-    if let Some(p) =
-        std::env::var_os("PATH").and_then(|path| sway_in_dirs(std::env::split_paths(&path)))
-    {
+    let walk = std::env::var_os("PATH").map_or_else(PathWalk::default, |path| {
+        sway_in_dirs(std::env::split_paths(&path), VERSION_PROBE_BUDGET)
+    });
+    if let Some(p) = walk.found {
         return Ok(p);
     }
     let data = std::env::var_os("XDG_DATA_HOME")
@@ -282,7 +293,9 @@ pub(crate) fn resolve_sway_verdict() -> std::result::Result<PathBuf, NoSway> {
             "{} is not executable",
             p.display()
         ))),
-        Resolved::Absent => Err(NoSway::nothing_qualifies()),
+        // A silent candidate on PATH outranks "nothing qualifies" — telling the user to build one
+        // sends them past the sway they have.
+        Resolved::Absent => Err(walk.silent.unwrap_or_else(NoSway::nothing_qualifies)),
     }
 }
 
@@ -329,31 +342,95 @@ fn sway_override(
     })
 }
 
+/// How long ONE candidate gets to answer `--version`.
+///
+/// The budget only has to cover an `exec` on a loaded host. Unbounded, a `sway` that never exits
+/// hung `glass_start` and `glass doctor` forever.
+///
+/// Per candidate, not one deadline across the walk: a first candidate that spent a shared deadline
+/// would leave a good sway further along `PATH` unprobed — the failure glass#374 fixed.
+pub(crate) const VERSION_PROBE_BUDGET: Duration = Duration::from_secs(5);
+
+/// What a candidate said when asked for its version.
+///
+/// Not `Option<String>`: a binary that answered nothing, one that never answered, and one glass
+/// could not run at all send a reader to three different remedies.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum VersionAnswer {
+    /// It ran and exited; whatever it wrote to stdout, untrimmed and possibly empty. Empty or
+    /// unparseable still counts as an answer — see [`sway_in_dirs`].
+    Answered(String),
+    /// Nothing came back within the budget it carries, so the child was sent SIGKILL. Only the
+    /// direct child: anything it forked before wedging outlives the probe.
+    TimedOut(Duration),
+    /// No answer to be had, and why. The candidate may still have run — one that exited leaving
+    /// something it started holding its output pipe lands here too.
+    NoReply(String),
+}
+
+/// Ask `sway` for its version, under a time bound.
+///
+/// Shared by discovery and doctor so the two classify a silence the same way. Both production
+/// callers pass [`VERSION_PROBE_BUDGET`]; the parameter is for tests.
+pub(crate) fn ask_sway_version(sway: &Path, budget: Duration) -> VersionAnswer {
+    let mut cmd = std::process::Command::new(sway);
+    cmd.arg("--version");
+    match glass_core::run_bounded(&mut cmd, budget, "sway:--version") {
+        Ok(out) => VersionAnswer::Answered(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Err(e) if e.bound() == Some(glass_core::BoundKind::TimedOut) => {
+            VersionAnswer::TimedOut(budget)
+        }
+        Err(e) => VersionAnswer::NoReply(e.to_string()),
+    }
+}
+
+/// The outcome of walking `PATH`: the sway to use, and the first candidate that was there and
+/// gave no answer.
+///
+/// The second field is kept so a walk that ends empty can name it rather than report no sway.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PathWalk {
+    found: Option<PathBuf>,
+    silent: Option<NoSway>,
+}
+
 /// The first `sway` in `dirs` whose `--version` reports >= 1.12.
 ///
 /// Only an answer ends the walk. A candidate that ran decides the outcome even when the version
 /// is too old or unreadable — that means the bundle, never a different sway further along, since
 /// `PATH` order is a precedence the user expressed.
 ///
-/// A candidate that never ran expressed nothing, so it is stepped over: no execute permission, or
-/// a spawn that failed outright (`ENOEXEC` for a file that is not a binary, `ETXTBSY` while
-/// something else holds it open for writing).
-fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+/// A candidate that gave no answer expressed nothing, so it is stepped over: no execute
+/// permission, a spawn that failed outright (`ENOEXEC` for a file that is not a binary, `ETXTBSY`
+/// while something else holds it open for writing), or a wait that outstayed `budget`.
+fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>, budget: Duration) -> PathWalk {
+    let mut walk = PathWalk::default();
     for dir in dirs {
         let cand = dir.join("sway");
         if !is_executable_file(&cand) {
             continue;
         }
-        let Ok(out) = std::process::Command::new(&cand).arg("--version").output() else {
-            continue;
+        let why = match ask_sway_version(&cand, budget) {
+            VersionAnswer::Answered(ver) => {
+                walk.found = match parse_sway_version(&ver) {
+                    Some((maj, min)) if (maj, min) >= (1, 12) => Some(cand),
+                    _ => None, // answered, just not usably -> the bundle, not a later sway
+                };
+                return walk;
+            }
+            VersionAnswer::TimedOut(budget) => {
+                format!("did not answer `--version` within {budget:?}")
+            }
+            VersionAnswer::NoReply(why) => why,
         };
-        let ver = String::from_utf8_lossy(&out.stdout);
-        return match parse_sway_version(&ver) {
-            Some((maj, min)) if (maj, min) >= (1, 12) => Some(cand),
-            _ => None, // answered, just not usably -> the bundle, not a later sway
-        };
+        // Logged even when a later candidate answers — the step-over costs a whole budget on
+        // every launch and is otherwise invisible.
+        eprintln!("glass-wayland: skipping {}: {why}", cand.display());
+        walk.silent
+            .get_or_insert_with(|| NoSway::silent(&cand, &why));
     }
-    None
+    walk
 }
 
 /// Parse `"sway version 1.12-abc (...)"` -> `(1, 12)`.
@@ -1681,24 +1758,79 @@ mod pure_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A directory holding a `sway` that answers `--version` with `reply`.
-    fn fake_sway(reply: &str) -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt as _;
+    /// A directory holding an executable `sway` running `script`.
+    ///
+    /// Every fixture refuses any argument but `--version`: a probe that stopped passing it would
+    /// otherwise fail first on a user's machine, where the walk would *launch a compositor* per
+    /// candidate and then report no sway installed.
+    fn sway_script(script: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = dir.path().join("sway");
-        std::fs::write(&bin, format!("#!/bin/sh\necho '{reply}'\n")).expect("write");
+        let guard = "[ \"$1\" = --version ] || exit 3\n";
+        std::fs::write(&bin, format!("#!/bin/sh\n{guard}{script}")).expect("write");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         dir
+    }
+
+    /// A directory holding a `sway` that answers `--version` with `reply`.
+    fn fake_sway(reply: &str) -> tempfile::TempDir {
+        sway_script(&format!("echo '{reply}'\n"))
+    }
+
+    /// A directory holding an empty `sway` at `mode`. At 0o644 it is a candidate glass may not
+    /// execute; at 0o755 one that clears the permission check and then fails to exec (`ENOEXEC`)
+    /// — the deterministic twin of the `ETXTBSY` a concurrent write raises.
+    fn empty_sway(mode: u32) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("sway");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        dir
+    }
+
+    /// How long the hung fixture lives if nothing kills it, in whole seconds: a sub-second
+    /// `Duration` here would truncate to `sleep 0`, leaving the timeout tests no hang to bound.
+    const HUNG_SWAY_SECS: u64 = 30;
+    /// The budget the hung-candidate tests probe under. Wide enough for `sh` to start and record
+    /// its pid, narrow enough that [`VERSION_PROBE_BUDGET`] silently replacing it overshoots the
+    /// ceiling those tests assert.
+    const HUNG_PROBE_BUDGET: Duration = Duration::from_millis(300);
+    /// The budget for the walk tests, which probe a *good* fixture under it too — so it has to
+    /// cover a whole successful `sh` run on a loaded host, not just the hung candidate's poll.
+    const WALK_PROBE_BUDGET: Duration = Duration::from_secs(2);
+
+    /// A directory holding a `sway` that never answers `--version`, and the file it writes its own
+    /// pid to.
+    ///
+    /// `exec`, so that pid stays the sleeping process: a shell that forked its sleep would hand
+    /// the probe a child whose death proves nothing about the process actually left behind.
+    fn hung_sway() -> (tempfile::TempDir, PathBuf) {
+        let dir = sway_script("");
+        let pidfile = dir.path().join("pid");
+        let bin = dir.path().join("sway");
+        let guard = "[ \"$1\" = --version ] || exit 3\n";
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n{guard}echo $$ > {}\nexec sleep {HUNG_SWAY_SECS}\n",
+                pidfile.display()
+            ),
+        )
+        .expect("write");
+        (dir, pidfile)
+    }
+
+    /// [`sway_in_dirs`] over `dirs` at the budget the product uses. A test about a candidate that
+    /// never answers passes its own, tighter budget to `sway_in_dirs` directly.
+    fn sway_in(dirs: &[&Path]) -> PathWalk {
+        sway_in_dirs(dirs.iter().map(|d| d.to_path_buf()), VERSION_PROBE_BUDGET)
     }
 
     #[test]
     fn a_recent_sway_on_the_path_is_used() {
         let _guard = one_spawner_at_a_time();
         let dir = fake_sway("sway version 1.12-abc (Jun 3 2026)");
-        assert_eq!(
-            sway_in_dirs([dir.path().to_path_buf()].into_iter()),
-            Some(dir.path().join("sway"))
-        );
+        assert_eq!(sway_in(&[dir.path()]).found, Some(dir.path().join("sway")));
     }
 
     /// Too old, or a version this cannot read, means fall through to the bundle — glass drives
@@ -1708,18 +1840,127 @@ mod pure_tests {
         let _guard = one_spawner_at_a_time();
         for reply in ["sway version 1.9", "sway version 1.11-x", "wat"] {
             let dir = fake_sway(reply);
-            assert_eq!(
-                sway_in_dirs([dir.path().to_path_buf()].into_iter()),
-                None,
-                "{reply:?}"
-            );
+            assert_eq!(sway_in(&[dir.path()]).found, None, "{reply:?}");
         }
     }
 
     #[test]
     fn a_path_with_no_sway_on_it_finds_nothing() {
         let empty = tempfile::tempdir().expect("tempdir");
-        assert_eq!(sway_in_dirs([empty.path().to_path_buf()].into_iter()), None);
+        assert_eq!(sway_in(&[empty.path()]), PathWalk::default());
+    }
+
+    /// glass#392: the probe ran `--version` with no bound at all, so a `sway` that never exits
+    /// hung `resolve_sway` — and with it `glass_start` — for as long as it stayed up.
+    #[test]
+    fn a_sway_that_never_answers_is_stepped_over_within_its_budget() {
+        let _guard = one_spawner_at_a_time();
+        let (hung, _pidfile) = hung_sway();
+        let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
+        let started = Instant::now();
+        let walk = sway_in_dirs(
+            [hung.path().to_path_buf(), good.path().to_path_buf()].into_iter(),
+            WALK_PROBE_BUDGET,
+        );
+        assert_eq!(
+            walk.found,
+            Some(good.path().join("sway")),
+            "a candidate that never answered must be stepped over, not end the walk"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(HUNG_SWAY_SECS) / 3,
+            "the walk waited out the whole candidate: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A walk that ends empty must name the sway the user has: `nothing_qualifies` sends them
+    /// past it to build another.
+    #[test]
+    fn a_walk_that_finds_only_a_silent_sway_names_it() {
+        let _guard = one_spawner_at_a_time();
+        let (hung, _pidfile) = hung_sway();
+        let walk = sway_in_dirs([hung.path().to_path_buf()].into_iter(), HUNG_PROBE_BUDGET);
+        assert_eq!(walk.found, None);
+        let no = walk.silent.expect("the hung candidate must be recorded");
+        assert!(
+            no.cause.contains(&hung.path().display().to_string()),
+            "{no:?}"
+        );
+        assert!(no.cause.contains("did not answer"), "{no:?}");
+        assert_eq!(no.remedy, CHECK_THAT_SWAY);
+    }
+
+    /// A bound that returns while leaving the process behind trades one hang for a leak: every
+    /// launch would add another wedged candidate to the machine.
+    #[test]
+    fn a_probe_that_times_out_kills_the_candidate() {
+        let _guard = one_spawner_at_a_time();
+        let (hung, pidfile) = hung_sway();
+        let started = Instant::now();
+        assert_eq!(
+            ask_sway_version(&hung.path().join("sway"), HUNG_PROBE_BUDGET),
+            VersionAnswer::TimedOut(HUNG_PROBE_BUDGET)
+        );
+        // Against the budget passed: ignoring the parameter for VERSION_PROBE_BUDGET would still
+        // return, just far later.
+        assert!(
+            started.elapsed() < HUNG_PROBE_BUDGET * 4,
+            "the probe outstayed the budget it was given: {:?}",
+            started.elapsed()
+        );
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the fixture records its pid before it sleeps")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            !glass_proc_linux::any_alive(&[pid]),
+            "the probe left its candidate ({pid}) running"
+        );
+    }
+
+    /// Ran-and-said-nothing kept apart from could-not-be-run: the walk ends on the first, an
+    /// answer even when empty, and steps over the second.
+    #[test]
+    fn a_candidate_that_runs_is_distinguished_from_one_that_cannot() {
+        let _guard = one_spawner_at_a_time();
+        let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
+        assert_eq!(
+            ask_sway_version(&good.path().join("sway"), VERSION_PROBE_BUDGET),
+            VersionAnswer::Answered("sway version 1.12-abc (Jun 3 2026)\n".into())
+        );
+        // Not `/bin/true`: GNU coreutils answers `--version` with its own version string.
+        let silent = sway_script("exit 0\n");
+        assert_eq!(
+            ask_sway_version(&silent.path().join("sway"), VERSION_PROBE_BUDGET),
+            VersionAnswer::Answered(String::new())
+        );
+        let cannot_exec = empty_sway(0o755);
+        assert!(
+            matches!(
+                ask_sway_version(&cannot_exec.path().join("sway"), VERSION_PROBE_BUDGET),
+                VersionAnswer::NoReply(_)
+            ),
+            "a candidate that cannot be exec'd must not read as one that answered"
+        );
+    }
+
+    /// A candidate that exits leaving something it started holding its stdout: glass never reaches
+    /// end-of-file, so it has no answer it may act on.
+    #[test]
+    fn a_candidate_whose_output_is_never_finished_is_not_an_answer() {
+        let _guard = one_spawner_at_a_time();
+        let leaky = sway_script(&format!(
+            "echo 'sway version 1.12-abc'\nsleep {HUNG_SWAY_SECS} &\n"
+        ));
+        assert!(
+            matches!(
+                ask_sway_version(&leaky.path().join("sway"), VERSION_PROBE_BUDGET),
+                VersionAnswer::NoReply(_)
+            ),
+            "output glass could not finish reading is not a version it may act on"
+        );
     }
 
     /// An unset or empty override is not a choice; discovery runs.
@@ -1754,10 +1995,8 @@ mod pure_tests {
     /// said "is not an executable file".
     #[test]
     fn an_override_naming_a_non_executable_file_is_an_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = empty_sway(0o644);
         let bin = dir.path().join("sway");
-        std::fs::write(&bin, b"").expect("write");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         let err = sway_override(Some(bin.clone().into_os_string()))
             .expect("a choice was made")
             .expect_err("a file that cannot be run must not be trusted");
@@ -1770,13 +2009,10 @@ mod pure_tests {
     #[test]
     fn a_non_executable_sway_early_on_the_path_does_not_hide_a_later_one() {
         let _guard = one_spawner_at_a_time();
-        let broken = tempfile::tempdir().expect("tempdir");
-        let bin = broken.path().join("sway");
-        std::fs::write(&bin, b"").expect("write");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let broken = empty_sway(0o644);
         let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
         assert_eq!(
-            sway_in_dirs([broken.path().to_path_buf(), good.path().to_path_buf()].into_iter()),
+            sway_in(&[broken.path(), good.path()]).found,
             Some(good.path().join("sway")),
             "a sway that cannot be run must be skipped, not treated as the answer"
         );
@@ -1788,17 +2024,15 @@ mod pure_tests {
     #[test]
     fn a_sway_that_fails_to_spawn_does_not_hide_a_later_one() {
         let _guard = one_spawner_at_a_time();
-        let unspawnable = tempfile::tempdir().expect("tempdir");
+        let unspawnable = empty_sway(0o755);
         let bin = unspawnable.path().join("sway");
-        std::fs::write(&bin, b"").expect("write");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert!(
             is_executable_file(&bin),
             "the fixture must clear the permission check, or this pins the wrong branch"
         );
         let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
         assert_eq!(
-            sway_in_dirs([unspawnable.path().to_path_buf(), good.path().to_path_buf()].into_iter()),
+            sway_in(&[unspawnable.path(), good.path()]).found,
             Some(good.path().join("sway")),
             "a candidate that never ran must be stepped over, not end the walk"
         );
