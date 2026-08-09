@@ -43,8 +43,8 @@ cargo build
 cargo test --workspace                    # needs nothing installed; anything wanting a
                                           # display or device is #[ignore]d
 cargo clippy --workspace --all-targets -- -D warnings   # lint gate — keep clean
-cargo test -p glass-x11 -- --include-ignored      # + its 73 Xvfb-backed unit tests
-cargo test -p glass-wayland -- --include-ignored  # + its 61 sway-backed unit tests
+cargo test -p glass-x11 -- --include-ignored      # + its 74 Xvfb-backed unit tests
+cargo test -p glass-wayland -- --include-ignored  # + its 64 sway-backed unit tests
 ./scripts/test-x11.sh [name]              # X11 integration suite (self-starts Xvfb)
 ./scripts/test-wayland.sh [name]          # Wayland suite (needs sway >=1.12)
 ./scripts/test-a11y.sh [name]             # AT-SPI suite
