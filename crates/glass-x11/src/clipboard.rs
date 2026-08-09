@@ -179,9 +179,26 @@ enum ReadyState {
     Err(String),
 }
 
+/// Recover a poisoned readiness lock instead of propagating the panic, and say so.
+///
+/// The state behind the lock still says what happened, so panicking here would turn a reportable
+/// clipboard failure into a crashed tool call — but recovering in silence leaves the owner thread
+/// that panicked invisible.
+fn recover_readiness<T>(what: &str, r: std::result::Result<T, PoisonError<T>>) -> T {
+    match r {
+        Ok(v) => v,
+        Err(poisoned) => {
+            eprintln!("glass: clipboard {what}: a thread panicked holding this lock");
+            poisoned.into_inner()
+        }
+    }
+}
+
 /// A background thread that owns the X11 CLIPBOARD selection and serves paste
 /// requests. Created by `ClipboardOwner::spawn`; torn down by dropping it.
 pub struct ClipboardOwner {
+    // `expect`, not the readiness lock's `PoisonError::into_inner`: this one is off the readiness
+    // path and its two holders only clone the string or assign to it, so nothing under it panics.
     text: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -220,28 +237,35 @@ impl ClipboardOwner {
         // Block until the thread signals that it has taken ownership (or
         // encountered an error), with a 2 s timeout.
         let (lock, cvar) = &*ready;
-        let result = cvar
-            .wait_timeout_while(
-                lock.lock().unwrap_or_else(PoisonError::into_inner),
+        let result = recover_readiness(
+            "set: readiness wait",
+            cvar.wait_timeout_while(
+                recover_readiness("set: readiness lock", lock.lock()),
                 Duration::from_secs(2),
                 |s| matches!(s, ReadyState::Pending),
-            )
-            // A poisoned lock means the owner thread panicked holding it. The state behind it
-            // still says what happened; panicking here turns a reportable clipboard failure into
-            // a crashed tool call.
-            .unwrap_or_else(PoisonError::into_inner);
+            ),
+        );
 
         let timed_out = result.1.timed_out();
+        // Copy the outcome out and release the ready lock before either path below touches
+        // `handle`: a signal_ready reachable from a thread-exit path would otherwise deadlock the
+        // join.
+        let failure = match &*result.0 {
+            ReadyState::Err(msg) => Some(msg.clone()),
+            // Unreachable: the wait only returns without timing out once the predicate is false.
+            ReadyState::Ok | ReadyState::Pending => None,
+        };
+        drop(result);
 
         if timed_out {
-            // Release the ready lock before touching `handle`: a future signal_ready reachable
-            // from a thread-exit path would otherwise deadlock the join below on this thread.
-            drop(result);
             stop.store(true, Ordering::Relaxed);
             // Deliberately not joined: timing out means the thread hasn't reached the loop that
-            // reads `stop`, so a join would wait on the wedged X server with no bound.
-            // Detaching is self-cleaning — the setup either fails and the thread exits, or it
-            // completes and the first serving iteration stops.
+            // reads `stop`, so a join would wait on the wedged X server with no bound. Detaching
+            // is self-cleaning in all three of the outcomes left to it: the setup fails and the
+            // thread exits; the setup finishes and the `stop` check `owner_thread` makes before
+            // `set_selection_owner` returns without ever taking the selection; or `stop` arrives
+            // after that check and the first serving iteration breaks out. Drop that check and
+            // this becomes a thread that unwedges later and steals a live owner's selection.
             if handle.is_finished() && handle.join().is_err() {
                 // Finished without ever signalling: it panicked during setup. Reporting that as a
                 // timeout would send the reader looking for a slow X server.
@@ -254,14 +278,10 @@ impl ClipboardOwner {
             ));
         }
 
-        match &*result.0 {
-            ReadyState::Ok | ReadyState::Pending /* unreachable but safe */ => {}
-            ReadyState::Err(msg) => {
-                let _ = handle.join();
-                return Err(GlassError::Backend(format!("clipboard set: {msg}")));
-            }
+        if let Some(msg) = failure {
+            let _ = handle.join();
+            return Err(GlassError::Backend(format!("clipboard set: {msg}")));
         }
-        drop(result);
 
         Ok(Self {
             text,
@@ -298,7 +318,7 @@ impl Drop for ClipboardOwner {
 /// Signal the ready condvar from the owner thread. Helper to reduce repetition.
 fn signal_ready(ready: &Arc<(Mutex<ReadyState>, Condvar)>, state: ReadyState) {
     let (lock, cvar) = &**ready;
-    *lock.lock().unwrap_or_else(PoisonError::into_inner) = state;
+    *recover_readiness("owner: readiness signal", lock.lock()) = state;
     cvar.notify_one();
 }
 
@@ -401,8 +421,12 @@ fn owner_thread(
     })?;
 
     // A detached thread (spawn already timed out and returned to the caller) must not take a
-    // selection the caller has already been told it failed to get.
+    // selection the caller has already been told it failed to get. `spawn`'s detach comment counts on this
+    // check.
     if stop.load(Ordering::Relaxed) {
+        // Skips the `destroy_window` the normal exit performs: `conn` is dropped on the way out,
+        // and an X server destroys everything a client created once its connection closes
+        // (close-down mode defaults to DestroyAll).
         return Ok(());
     }
 
@@ -703,6 +727,33 @@ mod tests {
             "the live owner must still be serving after a detached thread stands down"
         );
         assert_eq!(get(x.display()).expect("get"), "mine");
+    }
+
+    /// An owner thread that panics holding the readiness lock poisons it. The readiness path has
+    /// to keep working through that: propagating the poison instead turns a clipboard failure the
+    /// caller could report into a second panic in the caller.
+    #[test]
+    fn a_poisoned_readiness_lock_is_recovered_rather_than_propagated() {
+        let ready = Arc::new((Mutex::new(ReadyState::Pending), Condvar::new()));
+        let poisoner = Arc::clone(&ready);
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.0.lock().expect("lock");
+            // The panic message below is the test working, not the test failing.
+            panic!("an owner thread panicking with the readiness lock held");
+        })
+        .join();
+        assert!(panicked.is_err(), "the thread was supposed to panic");
+        assert!(
+            ready.0.is_poisoned(),
+            "a panic under the lock is what poisons it; without that this test proves nothing"
+        );
+
+        signal_ready(&ready, ReadyState::Ok);
+        let state = ready.0.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            matches!(*state, ReadyState::Ok),
+            "signalling through a poisoned lock must still land the state"
+        );
     }
 
     #[test]
