@@ -118,12 +118,11 @@ mod tests {
     use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt;
 
-    /// The one test here that reads the real `$PATH`: this wrapper is nothing *but* the env read,
-    /// so driving `resolve_on_path_in` like its neighbours do would leave it uncovered. Reading
-    /// the environment is safe — mutating it is what races a concurrent reader.
+    /// The one test here that reads the real `$PATH` — this wrapper is nothing but the env read,
+    /// so driving `resolve_on_path_in` like its neighbours would leave it uncovered. Reading the
+    /// environment is safe; mutating it is not.
     ///
-    /// `is_some()` alone would not pin it: an empty `PathBuf` is still `Some`. The assertions name
-    /// the binary found.
+    /// Do not weaken to `is_some()`: an empty `PathBuf` is still `Some`.
     #[test]
     fn resolve_on_path_finds_a_program_every_posix_host_has() {
         let found = resolve_on_path(OsStr::new("sh")).expect("POSIX requires an sh on $PATH");
