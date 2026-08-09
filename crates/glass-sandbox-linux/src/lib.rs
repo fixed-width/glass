@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use glass_core::{AppSpec, Check, CheckStatus, GlassError, Result, SandboxLevel};
-use glass_exec_unix::resolve_on_path_in;
+use glass_exec_unix::{Resolved, resolve_bin, resolve_on_path_in};
 use glass_sandbox_unix::{abs_token, canon, dir_of};
 
 /// App-level environment that makes GUI toolkits present frames without X11 MIT-SHM. glass's
@@ -51,18 +51,6 @@ fn bwrap_bin() -> String {
 /// The POSIX shell glass runs the build command with: `$GLASS_SH`, else `sh`.
 fn sh_bin() -> String {
     glass_core::tool_path("GLASS_SH", "sh")
-}
-
-/// Whether `bin` is reachable: an explicit path (contains `/`) must be an existing
-/// file; a bare name must be found on `PATH`.
-fn runnable(bin: &str) -> bool {
-    if bin.contains('/') {
-        std::path::Path::new(bin).is_file()
-    } else {
-        std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
-            .unwrap_or(false)
-    }
 }
 
 /// Inputs `wrap_argv` needs. `level` is never `Off` (the caller skips wrapping).
@@ -343,12 +331,35 @@ pub enum Availability {
 /// Probe: the configured `bwrap` reachable and an unprivileged user namespace usable.
 pub fn availability() -> Availability {
     let bin = bwrap_bin();
-    if !runnable(&bin) {
-        return Availability::Unavailable(format!(
-            "bubblewrap ({bin}) not found (set GLASS_BWRAP to its path)"
-        ));
+    let resolved = resolve_bin(&bin, std::env::var_os("PATH").as_deref());
+    match availability_with(&bin, resolved) {
+        Availability::Ok => userns_availability(&bin),
+        unavailable => unavailable,
     }
-    match Command::new(&bin)
+}
+
+/// Pure: what resolving `bwrap` alone decides — the testable seam (no global env), so a test can
+/// force either failure without `set_var` racing a concurrent reader. `Ok` here means only that
+/// a runnable `bwrap` exists; [`availability`] still has to prove it can create a namespace.
+///
+/// `bin` is the configured name, needed for the [`Resolved::Absent`] message because that variant
+/// carries no path.
+fn availability_with(bin: &str, bwrap: Resolved) -> Availability {
+    match bwrap {
+        Resolved::Found(_) => Availability::Ok,
+        Resolved::NotExecutable(p) => Availability::Unavailable(format!(
+            "bubblewrap ({}) is not executable (chmod +x it, or set GLASS_BWRAP to a runnable binary)",
+            p.display()
+        )),
+        Resolved::Absent => Availability::Unavailable(format!(
+            "bubblewrap ({bin}) not found (set GLASS_BWRAP to its path)"
+        )),
+    }
+}
+
+/// Run `bwrap` to prove an unprivileged user namespace can actually be created here.
+fn userns_availability(bin: &str) -> Availability {
+    match Command::new(bin)
         .args(["--unshare-user", "--ro-bind", "/", "/", "--", "true"])
         .output()
     {
@@ -960,6 +971,31 @@ mod tests {
             !g.to_lowercase().contains("apparmor"),
             "generic remedy must not claim AppArmor: {g}"
         );
+    }
+
+    /// glass#374: `runnable` used `is_file()`, so a mode-644 `$GLASS_BWRAP` read as reachable and
+    /// the launch then failed at spawn. Driven through the seam rather than by setting the
+    /// environment, which is `unsafe` from edition 2024 on and races concurrent readers.
+    #[test]
+    fn a_non_executable_bwrap_is_unavailable_and_says_so() {
+        let Availability::Unavailable(msg) = availability_with(
+            "/opt/bin/bwrap",
+            Resolved::NotExecutable(PathBuf::from("/opt/bin/bwrap")),
+        ) else {
+            panic!("a non-executable bwrap must not report available");
+        };
+        assert!(
+            msg.contains("/opt/bin/bwrap") && msg.contains("not executable"),
+            "must name the file and say why: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_absent_bwrap_is_unavailable_and_points_at_the_override() {
+        let Availability::Unavailable(msg) = availability_with("bwrap", Resolved::Absent) else {
+            panic!("an absent bwrap must not report available");
+        };
+        assert!(msg.contains("GLASS_BWRAP"), "actionable message: {msg}");
     }
 
     fn make_spec(build: Option<&str>, sandbox: SandboxLevel) -> AppSpec {
