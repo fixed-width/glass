@@ -61,28 +61,15 @@ pub fn is_executable_file(p: &Path) -> bool {
 /// learns "no" cannot tell a missing binary from an installed one whose execute bit is off, and
 /// sends the user to reinstall a package that is already there.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
 pub enum Resolved {
     /// A runnable binary.
     Found(PathBuf),
-    /// A regular file is there but carries no execute bit.
+    /// A regular file is there, and this process may not execute it.
     NotExecutable(PathBuf),
-    /// Nothing by that name.
+    /// Nothing to point the user at: no such path, a directory, a path that cannot be stat'd, or
+    /// — from [`resolve_bin`] — a bare name with no search list to look it up in.
     Absent,
-}
-
-impl Resolved {
-    /// The runnable path, or `None` for either failure.
-    pub fn found(&self) -> Option<&Path> {
-        match self {
-            Self::Found(p) => Some(p),
-            Self::NotExecutable(_) | Self::Absent => None,
-        }
-    }
-
-    /// Whether a runnable binary was found.
-    pub fn is_found(&self) -> bool {
-        self.found().is_some()
-    }
 }
 
 /// Resolve a configured tool the way the child will be exec'd: a token containing `/` is an
@@ -95,14 +82,14 @@ impl Resolved {
 /// [`Resolved::Absent`], because that is the fact the user can act on.
 pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Resolved {
     if bin.contains('/') {
-        return classify(PathBuf::from(bin));
+        return resolve_path(Path::new(bin));
     }
     let Some(path) = path else {
         return Resolved::Absent;
     };
     let mut first_non_executable = None;
     for cand in std::env::split_paths(path).map(|dir| dir.join(bin)) {
-        match classify(cand) {
+        match resolve_path(&cand) {
             Resolved::Found(p) => return Resolved::Found(p),
             Resolved::NotExecutable(p) => {
                 first_non_executable.get_or_insert(p);
@@ -113,13 +100,14 @@ pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Resolved {
     first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
 }
 
-/// One candidate path's state. A directory is [`Resolved::Absent`]: it is not a launch target
+/// The verdict on one path, with no `$PATH` search — for a caller holding a single candidate
+/// rather than a name to look up. A directory is [`Resolved::Absent`]: it is not a launch target
 /// however its mode bits read.
-fn classify(p: PathBuf) -> Resolved {
-    if is_executable_file(&p) {
-        Resolved::Found(p)
+pub fn resolve_path(p: &Path) -> Resolved {
+    if is_executable_file(p) {
+        Resolved::Found(p.to_path_buf())
     } else if p.is_file() {
-        Resolved::NotExecutable(p)
+        Resolved::NotExecutable(p.to_path_buf())
     } else {
         Resolved::Absent
     }
@@ -336,21 +324,27 @@ mod tests {
     }
 
     #[test]
-    fn a_found_result_exposes_its_path() {
-        let dir = dir_with("Xvfb", 0o755);
-        let bin = dir.path().join("Xvfb");
-        assert_eq!(Resolved::Found(bin.clone()).found(), Some(bin.as_path()));
-    }
+    fn resolve_path_separates_runnable_from_present_from_nothing() {
+        let runnable = dir_with("sway", 0o755);
+        assert_eq!(
+            resolve_path(&runnable.path().join("sway")),
+            Resolved::Found(runnable.path().join("sway"))
+        );
 
-    #[test]
-    fn a_non_executable_result_does_not_read_as_found() {
-        let dir = dir_with("Xvfb", 0o644);
-        assert!(!Resolved::NotExecutable(dir.path().join("Xvfb")).is_found());
-    }
+        let present = dir_with("sway", 0o644);
+        assert_eq!(
+            resolve_path(&present.path().join("sway")),
+            Resolved::NotExecutable(present.path().join("sway"))
+        );
 
-    #[test]
-    fn an_absent_result_exposes_no_path_and_does_not_read_as_found() {
-        assert_eq!(Resolved::Absent.found(), None);
-        assert!(!Resolved::Absent.is_found());
+        assert_eq!(
+            resolve_path(Path::new("/nonexistent/sway")),
+            Resolved::Absent
+        );
+        assert_eq!(
+            resolve_path(runnable.path()),
+            Resolved::Absent,
+            "a directory answers X_OK but is not a launch target"
+        );
     }
 }
