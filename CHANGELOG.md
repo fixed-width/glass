@@ -43,6 +43,21 @@ internal refactors, CI, or test-only changes.
   were told to build one. Such a candidate is now stepped over and the search carries on. A
   candidate that does start and reports a version glass cannot use is unchanged: the search stops
   there rather than silently running a different sway further along your `$PATH`.
+- Accessibility now works on Debian/Ubuntu machines that are not x86-64. `glass doctor` said
+  `at-spi-bus-launcher present` while every a11y launch on the same machine failed to find it —
+  quietly dropping to pixel-only by default, or failing outright with `a11y: true` — because the
+  report and the launch each looked for the launcher their own way, and only the report knew to
+  look under the machine's own `/usr/lib/<triplet>/at-spi2-core/`. They now share one lookup, so
+  they cannot disagree about a file again. Three things follow. Every architecture's directory is
+  searched, Arch's `/usr/lib/at-spi-bus-launcher` is looked for, and a launcher this machine can
+  actually execute is preferred to one it cannot — a
+  foreign-architecture binary looks perfectly runnable to the filesystem and fails only when glass
+  tries to run it, which is reachable on any machine with a second architecture enabled.
+  `GLASS_ATSPI_LAUNCHER` is
+  honoured by the report as well as the launch, so if you point it somewhere unusable `glass
+  doctor` now tells you that, instead of reporting the system launcher it would never have used.
+  And a launcher that is present but not executable is named as exactly that, rather than sending
+  you to install a package that is already installed.
 
 ## [1.2.0] - 2026-08-07
 

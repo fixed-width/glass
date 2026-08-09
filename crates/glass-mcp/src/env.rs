@@ -141,7 +141,8 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "GLASS_ATSPI_LAUNCHER",
         scope: EnvScope::Linux,
-        purpose: "at-spi-bus-launcher binary; explicit value skips discovery (fail-closed if wrong)",
+        purpose: "at-spi-bus-launcher binary; explicit value skips discovery (fail-closed if wrong) \
+                  for launches and for what glass doctor / glass_capabilities report",
         default: "auto-discovered (well-known install paths)",
         secret: false,
     },

@@ -10,14 +10,24 @@ use std::time::Duration;
 
 use glass_core::capability::CapabilityStatus;
 use glass_core::{Check, CheckStatus};
+use glass_exec_unix::Resolved;
 
 /// Live: is the AT-SPI bus launcher installed, so glass can spawn its private a11y bus?
 /// This is the desktop-a11y capability signal for the Linux backends — the *same* fact the
-/// doctor's head "a11y" check reads (both go through [`find_registry`]), so `glass_capabilities`
-/// and `glass doctor` can't drift. It is only a precondition ("glass can do a11y at all"), never
-/// a promise that a given window exposes a tree — that's up to the app.
+/// doctor's head "a11y" check reads, so `glass_capabilities` and `glass doctor` can't drift. It is
+/// only a precondition ("glass can do a11y at all"), never a promise that a given window exposes a
+/// tree — that's up to the app.
+///
+/// The lookup belongs to `glass-dbus-linux`, the crate that spawns the launcher: reporting on a
+/// binary a different lookup would resolve is how one run came to answer both "present" and
+/// "not found" about one file (glass#391).
 pub fn accessibility_launcher_present() -> bool {
-    find_registry().is_some()
+    launcher_present(glass_dbus_linux::find_launcher())
+}
+
+/// Only a runnable launcher counts as present — what this feeds says a11y is ready.
+fn launcher_present(resolved: Resolved) -> bool {
+    matches!(resolved, Resolved::Found(_))
 }
 
 /// The desktop-`accessibility` capability cell for a Linux backend, from the launcher-present
@@ -26,8 +36,11 @@ pub const fn accessibility_capability(launcher_present: bool) -> CapabilityStatu
     if launcher_present {
         CapabilityStatus::supported()
     } else {
+        // Not "AT-SPI is not installed": the launcher can also be there and unrunnable, or a
+        // GLASS_ATSPI_LAUNCHER the operator set can name nothing. `glass doctor` tells them apart.
         CapabilityStatus::requires_setup(
-            "AT-SPI not installed; install at-spi2-core so glass can spawn its private a11y bus",
+            "no runnable at-spi-bus-launcher, so glass cannot spawn its private a11y bus; install \
+             at-spi2-core (or check GLASS_ATSPI_LAUNCHER if you set it) and see `glass doctor`",
         )
     }
 }
@@ -117,7 +130,17 @@ fn gather_host_a11y() -> HostA11yFacts {
 
 /// Probe whether the AT-SPI accessibility stack is usable.
 pub fn checks() -> Vec<Check> {
-    a11y_checks(accessibility_launcher_present(), &gather_host_a11y())
+    a11y_checks(
+        &glass_dbus_linux::find_launcher(),
+        atspi_launcher_override_set(),
+        &gather_host_a11y(),
+    )
+}
+
+/// Whether `GLASS_ATSPI_LAUNCHER` holds a non-empty value — the same condition under which
+/// `find_launcher` skips discovery, so a failed lookup can name the variable as its cause.
+fn atspi_launcher_override_set() -> bool {
+    std::env::var_os("GLASS_ATSPI_LAUNCHER").is_some_and(|v| !v.is_empty())
 }
 
 /// Health of the *host* (operator's desktop) AT-SPI bus — distinct from glass's private bus.
@@ -183,22 +206,45 @@ fn count_orphaned_a11y_daemons(procs: &[ProcEntry]) -> usize {
 }
 
 /// Pure: build the a11y checks from gathered facts.
-fn a11y_checks(launcher_installed: bool, facts: &HostA11yFacts) -> Vec<Check> {
+fn a11y_checks(launcher: &Resolved, override_set: bool, facts: &HostA11yFacts) -> Vec<Check> {
     let mut checks = Vec::new();
 
     // Concern A — can glass do a11y AT ALL? Honest precondition, never a "will work" promise.
-    checks.push(if launcher_installed {
-        Check::new(
+    // Each way of having no launcher gets its own remedy — "install at-spi2-core" about a file
+    // that is already there sends the user to fix what is not broken.
+    checks.push(match launcher {
+        Resolved::Found(_) => Check::new(
             "a11y",
             CheckStatus::Ok,
             "at-spi-bus-launcher present — glass spawns a private a11y bus on a11y:true launches. \
              Whether a given window exposes an accessibility tree is up to the app (egui/GTK/Qt \
              expose it; games/canvas apps may not); glass_a11y_snapshot reports per app.",
+        ),
+        Resolved::NotExecutable(p) => Check::new(
+            "a11y",
+            CheckStatus::Warn,
+            format!(
+                "at-spi-bus-launcher at {} is present but not executable",
+                p.display()
+            ),
         )
-    } else {
-        Check::new("a11y", CheckStatus::Warn, "at-spi-bus-launcher not found").with_remedy(
+        .with_remedy(
+            "restore its execute bit (`chmod +x`), or point GLASS_ATSPI_LAUNCHER at a runnable copy",
+        ),
+        // An override skips discovery outright, so the well-known paths were never consulted:
+        // whatever this host has installed, the variable is what left glass with nothing.
+        Resolved::Absent if override_set => Check::new(
+            "a11y",
+            CheckStatus::Warn,
+            "GLASS_ATSPI_LAUNCHER does not name a runnable at-spi-bus-launcher",
+        )
+        .with_remedy(
+            "point GLASS_ATSPI_LAUNCHER at a runnable launcher, or unset it to search the \
+             well-known install paths",
+        ),
+        Resolved::Absent => Check::new("a11y", CheckStatus::Warn, "at-spi-bus-launcher not found").with_remedy(
             "install the AT-SPI registry (e.g. `apt install at-spi2-core`) so glass can spawn its private a11y bus",
-        )
+        ),
     });
 
     // Concern B — host desktop a11y health (#9). Detect-only; never mutate.
@@ -253,37 +299,6 @@ fn a11y_checks(launcher_installed: bool, facts: &HostA11yFacts) -> Vec<Check> {
     checks
 }
 
-/// The at-spi bus launcher across known libexec/lib locations.
-fn find_registry() -> Option<std::path::PathBuf> {
-    const CANDIDATES: &[&str] = &[
-        "/usr/libexec/at-spi-bus-launcher",
-        "/usr/lib/at-spi2-core/at-spi-bus-launcher",
-        "/usr/lib/at-spi2/at-spi-bus-launcher",
-    ];
-    find_launcher(CANDIDATES, "/usr/lib")
-}
-
-/// Find the launcher among `fixed` absolute paths, then (if none hit) by scanning
-/// `multiarch_root/<triplet>/at-spi2-core/at-spi-bus-launcher`. The triplet directory is
-/// arch-specific (`x86_64-linux-gnu`, `aarch64-linux-gnu`, …), so scanning rather than
-/// hardcoding one arch keeps the AT-SPI-present signal correct on non-x86_64 hosts.
-///
-/// A candidate glass could not spawn is not present: what this feeds says a11y is ready.
-fn find_launcher(fixed: &[&str], multiarch_root: &str) -> Option<std::path::PathBuf> {
-    if let Some(p) = fixed
-        .iter()
-        .map(std::path::PathBuf::from)
-        .find(|p| glass_exec_unix::is_executable_file(p))
-    {
-        return Some(p);
-    }
-    std::fs::read_dir(multiarch_root)
-        .ok()?
-        .flatten()
-        .map(|e| e.path().join("at-spi2-core/at-spi-bus-launcher"))
-        .find(|p| glass_exec_unix::is_executable_file(p))
-}
-
 /// Try to reach the accessibility bus exactly the way the reader does — on a private
 /// thread + current-thread runtime with a short timeout, so a wedged bus can't hang
 /// doctor. `Ok(())` means a connection was established and dropped.
@@ -317,10 +332,22 @@ mod tests {
 
     // ---- capability signal (shared with glass-x11 / glass-wayland `capabilities()`) ----
     #[test]
-    fn launcher_present_predicate_matches_find_registry() {
-        // The capability signal must be the *same* fact the doctor's head check reads —
-        // one source, so `glass_capabilities` and `glass doctor` can't disagree.
-        assert_eq!(accessibility_launcher_present(), find_registry().is_some());
+    fn launcher_present_when_the_spawner_resolved_one() {
+        assert!(launcher_present(Resolved::Found("/usr/libexec/x".into())));
+    }
+
+    /// A launcher glass cannot spawn would make the ready cell a promise the launch breaks, so it
+    /// counts as absent here.
+    #[test]
+    fn launcher_absent_when_present_but_unrunnable() {
+        assert!(!launcher_present(Resolved::NotExecutable(
+            "/usr/libexec/x".into()
+        )));
+    }
+
+    #[test]
+    fn launcher_absent_when_nothing_resolved() {
+        assert!(!launcher_present(Resolved::Absent));
     }
 
     #[test]
@@ -335,72 +362,6 @@ mod tests {
         let c = accessibility_capability(false);
         assert_eq!(c.status, Support::RequiresSetup);
         assert!(c.note.unwrap().contains("at-spi2-core"));
-    }
-
-    // ---- launcher discovery (impure FS scan, driven with a tempdir) ----
-
-    /// Write `path` at `mode`, creating its parents.
-    fn launcher_at(path: &std::path::Path, mode: u32) {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, b"").unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-    }
-
-    #[test]
-    fn find_launcher_prefers_a_present_fixed_candidate() {
-        let dir = tempfile::tempdir().unwrap();
-        let fixed = dir.path().join("at-spi-bus-launcher");
-        launcher_at(&fixed, 0o755);
-        let fixed_str = fixed.to_str().unwrap();
-        assert_eq!(
-            find_launcher(&[fixed_str], "/nonexistent-root"),
-            Some(fixed)
-        );
-    }
-
-    #[test]
-    fn find_launcher_scans_any_multiarch_triplet_dir() {
-        // The launcher under an arbitrary <triplet>/at-spi2-core/ dir must be found — not just
-        // x86_64 (regression guard: an aarch64 host must not report AT-SPI missing).
-        let root = tempfile::tempdir().unwrap();
-        let launcher = root
-            .path()
-            .join("aarch64-linux-gnu/at-spi2-core/at-spi-bus-launcher");
-        launcher_at(&launcher, 0o755);
-        assert_eq!(
-            find_launcher(&[], root.path().to_str().unwrap()),
-            Some(launcher)
-        );
-    }
-
-    #[test]
-    fn find_launcher_none_when_absent() {
-        let root = tempfile::tempdir().unwrap();
-        assert_eq!(find_launcher(&[], root.path().to_str().unwrap()), None);
-    }
-
-    /// Feeds both `glass doctor`'s `[a11y]` verdict and the `glass_capabilities` accessibility
-    /// cell — counted present, an unspawnable launcher makes one run answer
-    /// "at-spi-bus-launcher present" and "not found" about one file.
-    #[test]
-    fn find_launcher_does_not_count_a_candidate_it_could_not_spawn() {
-        let dir = tempfile::tempdir().unwrap();
-        let fixed = dir.path().join("at-spi-bus-launcher");
-        launcher_at(&fixed, 0o644);
-        assert_eq!(
-            find_launcher(&[fixed.to_str().unwrap()], "/nonexistent-root"),
-            None
-        );
-
-        let root = tempfile::tempdir().unwrap();
-        launcher_at(
-            &root
-                .path()
-                .join("aarch64-linux-gnu/at-spi2-core/at-spi-bus-launcher"),
-            0o644,
-        );
-        assert_eq!(find_launcher(&[], root.path().to_str().unwrap()), None);
     }
 
     // ---- pure helpers ----
@@ -477,6 +438,11 @@ mod tests {
     }
 
     // ---- pure mapper ----
+    /// A launcher the spawner resolved, for the cases that are about the host bus, not the lookup.
+    fn found() -> Resolved {
+        Resolved::Found("/usr/libexec/at-spi-bus-launcher".into())
+    }
+
     fn facts(bus: HostBusState, orphaned: usize) -> HostA11yFacts {
         HostA11yFacts {
             session_bus: true,
@@ -487,7 +453,7 @@ mod tests {
 
     #[test]
     fn launcher_present_states_precondition_not_a_promise() {
-        let cs = a11y_checks(true, &facts(HostBusState::Reachable, 0));
+        let cs = a11y_checks(&found(), false, &facts(HostBusState::Reachable, 0));
         let head = cs.iter().find(|c| c.name == "a11y").unwrap();
         assert_eq!(head.status, CheckStatus::Ok);
         assert!(head.detail.contains("private a11y bus"));
@@ -496,16 +462,47 @@ mod tests {
 
     #[test]
     fn launcher_absent_warns_with_install_remedy() {
-        let cs = a11y_checks(false, &facts(HostBusState::NotRunning, 0));
+        let cs = a11y_checks(
+            &Resolved::Absent,
+            false,
+            &facts(HostBusState::NotRunning, 0),
+        );
         let head = cs.iter().find(|c| c.name == "a11y").unwrap();
         assert_eq!(head.status, CheckStatus::Warn);
         assert!(head.remedy.is_some());
     }
 
+    /// "apt install at-spi2-core" about a file that is right there sends the user to fix what is
+    /// not broken. The spawn path has always named it; this is the surface that did not.
+    #[test]
+    fn launcher_present_but_unrunnable_names_the_file_not_the_package() {
+        let cs = a11y_checks(
+            &Resolved::NotExecutable("/usr/libexec/at-spi-bus-launcher".into()),
+            false,
+            &facts(HostBusState::NotRunning, 0),
+        );
+        let head = cs.iter().find(|c| c.name == "a11y").unwrap();
+        assert_eq!(head.status, CheckStatus::Warn);
+        assert!(head.detail.contains("/usr/libexec/at-spi-bus-launcher"));
+        assert!(!head.remedy.clone().unwrap().contains("at-spi2-core"));
+    }
+
+    /// An override skips discovery, so a wrong one leaves glass with nothing on a host where
+    /// at-spi2-core is installed and fine. Naming the package there is the same misdirection.
+    #[test]
+    fn a_wrong_override_names_the_variable_not_the_package() {
+        let cs = a11y_checks(&Resolved::Absent, true, &facts(HostBusState::NotRunning, 0));
+        let head = cs.iter().find(|c| c.name == "a11y").unwrap();
+        assert_eq!(head.status, CheckStatus::Warn);
+        assert!(head.detail.contains("GLASS_ATSPI_LAUNCHER"));
+        assert!(!head.remedy.clone().unwrap().contains("at-spi2-core"));
+    }
+
     #[test]
     fn wedged_host_bus_warns() {
         let cs = a11y_checks(
-            true,
+            &found(),
+            false,
             &facts(
                 HostBusState::Wedged {
                     address: "unix:path=/x".into(),
@@ -520,7 +517,7 @@ mod tests {
 
     #[test]
     fn healthy_host_bus_ok_and_no_leak_warning() {
-        let cs = a11y_checks(true, &facts(HostBusState::Reachable, 0));
+        let cs = a11y_checks(&found(), false, &facts(HostBusState::Reachable, 0));
         assert_eq!(
             cs.iter()
                 .find(|c| c.name == "host desktop a11y")
@@ -533,7 +530,7 @@ mod tests {
 
     #[test]
     fn leaked_daemons_warn_with_count() {
-        let cs = a11y_checks(true, &facts(HostBusState::NotRunning, 3));
+        let cs = a11y_checks(&found(), false, &facts(HostBusState::NotRunning, 3));
         let leak = cs.iter().find(|c| c.name == "leaked a11y daemons").unwrap();
         assert_eq!(leak.status, CheckStatus::Warn);
         assert!(leak.detail.contains('3'));

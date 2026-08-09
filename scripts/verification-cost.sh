@@ -10,15 +10,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-launcher=""
-for c in /usr/libexec/at-spi-bus-launcher \
-         /usr/lib/at-spi2-core/at-spi-bus-launcher \
-         /usr/lib/at-spi2/at-spi-bus-launcher \
-         /usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher; do
-    [ -x "$c" ] && launcher="$c" && break
-done
+. scripts/lib/have-atspi.sh
 if ! command -v dbus-daemon >/dev/null 2>&1 \
-   || [ -z "$launcher" ] \
+   || ! have_atspi \
    || ! command -v Xvfb >/dev/null 2>&1; then
     echo "verification-cost: prerequisites missing — needs dbus-daemon,"
     echo "                   at-spi-bus-launcher, and Xvfb. Skipping."
