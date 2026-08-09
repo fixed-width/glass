@@ -617,7 +617,12 @@ impl ClipboardOwner {
             // a crashed tool call.
             .unwrap_or_else(PoisonError::into_inner);
 
-        if result.1.timed_out() {
+        let timed_out = result.1.timed_out();
+
+        if timed_out {
+            // Release the ready lock before touching `handle`: a future signal_ready reachable
+            // from a thread-exit path would otherwise deadlock the join below on this thread.
+            drop(result);
             stop.store(true, Ordering::Relaxed);
             // Deliberately not joined. Timing out means the thread has not reached the loop that
             // reads `stop`, so a join waits on the wedged compositor with no bound — the hang
@@ -732,6 +737,12 @@ fn serve_loop(
         signal_ready(&ready, ReadyState::Err(msg.clone()));
         GlassError::Backend(format!("clipboard serve: {msg}"))
     })?;
+
+    // A detached thread (spawn already timed out and returned to the caller) must not take a
+    // selection the caller has already been told it failed to get.
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
 
     let source = manager.create_data_source(&qh, ());
     source.offer(MIME_UTF8.to_string());
@@ -945,6 +956,7 @@ mod tests {
         // On its own thread: pre-fix this call never returns, and a direct call would wedge the
         // whole suite instead of failing this test.
         let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
         std::thread::spawn(move || {
             let outcome = ClipboardOwner::spawn(socket, "text".into())
                 .err()
@@ -955,6 +967,13 @@ mod tests {
         let outcome = rx
             .recv_timeout(Duration::from_secs(10))
             .expect("spawn must return when its own 2 s bound expires, not wait on the peer");
+        // Ties the test to the 2 s bound itself, not just to the 10 s ceiling above: a bound
+        // loosened to e.g. 9 s would still return before the ceiling but fail this.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "spawn took {:?}, expected it to give up near its own 2 s bound",
+            started.elapsed()
+        );
         let msg = outcome.expect("a peer that never answers is not a served clipboard");
         assert!(msg.contains("timed out"), "{msg}");
 
