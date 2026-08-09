@@ -166,6 +166,12 @@ impl PrivateBus {
     }
 }
 
+/// The address `org.a11y.Bus.GetAddress` answered, if it named a bus — the launcher owns the name
+/// before it has one to give, and answers `""` until then.
+fn usable_address(answer: String) -> Option<String> {
+    (!answer.is_empty()).then_some(answer)
+}
+
 /// Tear down the private bus, atspi-launcher FIRST then the session dbus-daemon.
 ///
 /// SIGTERM-first (graceful), not SIGKILL: `at-spi-bus-launcher` *forks its own*
@@ -489,21 +495,23 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
                 let proxy = A11yBusProxy::new(&conn)
                     .await
                     .map_err(|e| GlassError::Backend(format!("org.a11y.Bus proxy: {e}")))?;
-                let mut last = String::new();
+                let mut answered_empty = false;
                 let mut last_err: Option<String> = None;
                 for _ in 0..50 {
                     match proxy.get_address().await {
-                        Ok(a) if !a.is_empty() => {
-                            advertise_screen_reader(&conn).await;
-                            return Ok(a);
-                        }
-                        Ok(a) => last = a,
+                        Ok(a) => match usable_address(a) {
+                            Some(addr) => {
+                                advertise_screen_reader(&conn).await;
+                                return Ok(addr);
+                            }
+                            None => answered_empty = true,
+                        },
                         Err(e) => last_err = Some(e.to_string()),
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(GlassError::Backend(format!(
-                    "org.a11y.Bus.GetAddress did not yield an address after 5s (last ok: {last:?}, last err: {last_err:?})"
+                    "org.a11y.Bus.GetAddress did not yield an address after 5s (answered empty: {answered_empty}, last err: {last_err:?})"
                 )))
             };
             match tokio::time::timeout(A11Y_RESOLVE_TIMEOUT, resolve).await {
@@ -1000,6 +1008,38 @@ mod tests {
         assert!(
             extra.is_empty(),
             "private bus must expose no auto-activatable services, found: {extra:?}"
+        );
+    }
+
+    /// Nothing else reaps them: a `Child` that is only dropped is left running, so without this
+    /// every session teardown would leak a dbus-daemon and an at-spi-bus-launcher.
+    #[test]
+    #[ignore = "spawns a private dbus-daemon + at-spi-bus-launcher; run via test-a11y.sh"]
+    fn dropping_the_bus_reaps_both_children() {
+        let bus = PrivateBus::start().expect("start private bus");
+        let pids = [bus.dbus.id(), bus.atspi.id()];
+        drop(bus);
+        let alive = glass_proc_linux::any_alive(&pids);
+        // Cleaned up before asserting: under a regression they are still running, and panicking
+        // first would leak them for the rest of the run.
+        if alive {
+            for pid in pids {
+                let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            }
+        }
+        assert!(!alive, "a child survived the drop: {pids:?}");
+    }
+
+    #[test]
+    fn an_empty_getaddress_answer_is_not_an_address() {
+        assert_eq!(usable_address(String::new()), None);
+    }
+
+    #[test]
+    fn a_non_empty_getaddress_answer_is_the_address() {
+        assert_eq!(
+            usable_address("unix:path=/run/user/1000/at-spi/bus_0".to_owned()),
+            Some("unix:path=/run/user/1000/at-spi/bus_0".to_owned())
         );
     }
 
