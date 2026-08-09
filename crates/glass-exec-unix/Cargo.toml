@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+# Asking the kernel whether a file is executable, rather than reading mode bits and guessing:
+# a `noexec` mount, an ACL, or a class the caller isn't in are all invisible to `st_mode`.
+rustix.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

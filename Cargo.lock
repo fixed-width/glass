@@ -1119,6 +1119,7 @@ dependencies = [
 name = "glass-exec-unix"
 version = "0.0.0"
 dependencies = [
+ "rustix",
  "tempfile",
 ]
 

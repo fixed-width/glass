@@ -1,15 +1,19 @@
-//! Unix exec resolution: given a program name or path, what will actually run. `execvp`'s own
-//! tests — the execute bit, and `$PATH` lookup for a bare name — so a caller can tell a missing
+//! Unix exec resolution: given a program name or path, what will actually run — the kernel's own
+//! execute-permission answer, plus `$PATH` lookup for a bare name, so a caller can tell a missing
 //! binary from an installed one it cannot spawn.
 //!
-//! Used by every glass component that resolves an external tool: the sandbox backends
-//! (`glass-sandbox-linux`, `glass-sandbox-macos`), the X11 and Wayland backends, and the AT-SPI bus
-//! launcher.
+//! One gap against `execvp` remains: with `$PATH` unset `execvp` searches `confstr(_CS_PATH)`,
+//! while [`resolve_bin`] given no search list reports [`Resolved::Absent`].
+//!
+//! Consumers: the X11 and Wayland backends (`glass-x11`, `glass-wayland`), the AT-SPI bus launcher
+//! and its doctor check (`glass-dbus-linux`, `glass-a11y-linux`), and the sandbox backends
+//! (`glass-sandbox-linux`, `glass-sandbox-macos`). `glass-android` and `glass-ios` resolve their
+//! device tooling themselves.
 //!
 //! Which host paths a launch touches is a different question, answered by `glass-sandbox-unix`.
 //!
-//! Everything here reads POSIX semantics — the execute bit, `execvp` lookup — so compiled off unix
-//! the mode check would quietly mean something else.
+//! Everything here reads POSIX semantics — execute permission, `execvp` lookup — so compiled off
+//! unix it would quietly mean something else.
 #![cfg(unix)]
 #![forbid(unsafe_code)]
 
@@ -32,13 +36,23 @@ pub fn resolve_on_path_in(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
         .find(|cand| is_executable_file(cand))
 }
 
-/// Whether `p` is (or resolves through symlinks to) a regular file that is executable — `execvp`'s
-/// "is this runnable" test.
+/// Whether `p` is (or resolves through symlinks to) a regular file this process may execute.
+///
+/// The permission half is the kernel's own answer, against the effective ids `exec` will use, so
+/// it accounts for which class the caller falls in, for a `noexec` mount, and for anything else
+/// the kernel consults — none of which are visible in `st_mode`. `access(2)` also grants `X_OK` on
+/// a searchable directory, hence the regular-file half.
 pub fn is_executable_file(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    if !std::fs::metadata(p).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    rustix::fs::accessat(
+        rustix::fs::CWD,
+        p,
+        rustix::fs::Access::EXEC_OK,
+        rustix::fs::AtFlags::EACCESS,
+    )
+    .is_ok()
 }
 
 /// What resolving a configured tool found.
@@ -184,8 +198,26 @@ mod tests {
         );
     }
 
-    /// A directory holding `name` at `mode`. 0o755 is runnable, 0o644 is the case
-    /// `is_file()` used to accept.
+    /// Mode 0o011 carries execute bits, so `mode & 0o111 != 0` calls it runnable — but the owner
+    /// class is the one that applies to the file's owner, and it denies exec, so the spawn gets
+    /// EACCES. Same shape as a `noexec` mount or a denying ACL: permission the mode bits don't say.
+    #[test]
+    fn a_file_whose_own_class_denies_exec_is_not_executable() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: root may exec a file carrying any execute bit");
+            return;
+        }
+        let dir = dir_with("Xvfb", 0o011);
+        let bin = dir.path().join("Xvfb");
+        assert!(!is_executable_file(&bin));
+        assert_eq!(
+            resolve_bin(bin.to_str().expect("utf-8 temp path"), None),
+            Resolved::NotExecutable(bin),
+            "the file is there — the user needs to hear that, not 'not found'"
+        );
+    }
+
+    /// A directory holding `name` at `mode`.
     fn dir_with(name: &str, mode: u32) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = dir.path().join(name);
