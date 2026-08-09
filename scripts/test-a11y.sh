@@ -9,10 +9,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # -> rust/
 
 . scripts/lib/have-atspi.sh
-launcher="$(atspi_launcher)"
+. scripts/lib/have-sway.sh
 
 if ! command -v dbus-daemon >/dev/null 2>&1 \
-   || [ -z "$launcher" ] \
+   || ! have_atspi \
    || ! command -v Xvfb >/dev/null 2>&1 \
    || ! command -v python3 >/dev/null 2>&1 \
    || ! python3 -c 'import gi; gi.require_version("Gtk", "4.0")' >/dev/null 2>&1; then
@@ -28,8 +28,7 @@ TEST_FILTER="${1:-}"
 # scripts/test-wayland.sh does. Named, not silently dropped: a run that says nothing about them
 # reads as "the suite passed" when a quarter of the launch paths never ran.
 SKIP_ARGS=()
-SWAY_BUNDLE="${XDG_DATA_HOME:-$HOME/.local/share}/glass/sway/bin/sway"
-if [ ! -x "$SWAY_BUNDLE" ] && ! { command -v sway >/dev/null 2>&1 && sway --version 2>/dev/null | grep -qE 'version 1\.(1[2-9]|[2-9][0-9])'; }; then
+if ! have_sway; then
     echo "test-a11y: no glass-discoverable sway >=1.12 — skipping the wayland_a11y_* tests."
     SKIP_ARGS=(--skip wayland_a11y)
 fi
@@ -52,3 +51,5 @@ export XDG_RUNTIME_DIR="$A11Y_TEST_RUNTIME"
 # under the same throwaway XDG_RUNTIME_DIR isolation.
 cargo test -p glass-dbus-linux --lib -- --ignored --test-threads=1 "$TEST_FILTER"
 cargo test -p glass-a11y-linux --test integration -- --ignored --test-threads=1 "${SKIP_ARGS[@]}" "$TEST_FILTER"
+# Its own binary, so the environment it mutates is nothing else's (see the file's header).
+cargo test -p glass-a11y-linux --test launcher_override -- --ignored "$TEST_FILTER"

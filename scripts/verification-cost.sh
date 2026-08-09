@@ -11,9 +11,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 . scripts/lib/have-atspi.sh
-launcher="$(atspi_launcher)"
 if ! command -v dbus-daemon >/dev/null 2>&1 \
-   || [ -z "$launcher" ] \
+   || ! have_atspi \
    || ! command -v Xvfb >/dev/null 2>&1; then
     echo "verification-cost: prerequisites missing — needs dbus-daemon,"
     echo "                   at-spi-bus-launcher, and Xvfb. Skipping."

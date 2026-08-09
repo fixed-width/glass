@@ -7,7 +7,7 @@
 #![cfg(target_os = "linux")]
 
 use std::ffi::{OsStr, OsString};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
@@ -229,7 +229,8 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// The three arch-independent paths distributions install `at-spi-bus-launcher` to.
+/// Arch-independent paths distributions install `at-spi-bus-launcher` to, checked before the
+/// multiarch scan.
 const LAUNCHER_CANDIDATES: &[&str] = &[
     "/usr/libexec/at-spi-bus-launcher",
     "/usr/lib/at-spi2-core/at-spi-bus-launcher",
@@ -290,10 +291,7 @@ fn multiarch_candidates(multiarch_root: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(multiarch_root) {
         Ok(entries) => entries,
         Err(e) => {
-            // NotFound is the ordinary "this host has no multiarch layout". Anything else — a
-            // denial, fd exhaustion, an unreadable mount — means the empty result is not
-            // evidence, and reads as "at-spi2-core is missing" wherever the scan is the only path.
-            if e.kind() != std::io::ErrorKind::NotFound {
+            if scan_error_worth_reporting(e.kind()) {
                 eprintln!(
                     "glass-dbus-linux: scanning {} for at-spi-bus-launcher: {e}",
                     multiarch_root.display()
@@ -305,6 +303,14 @@ fn multiarch_candidates(multiarch_root: &Path) -> Vec<PathBuf> {
     launchers_under(entries.flatten().map(|e| e.path()))
 }
 
+/// Whether a failed scan is worth a diagnostic. `NotFound` is the ordinary "this host has no
+/// multiarch layout"; anything else — a denial, fd exhaustion, an unreadable mount — means the
+/// empty result is not evidence, and reads as "at-spi2-core is missing" wherever the scan is the
+/// only path to the launcher.
+fn scan_error_worth_reporting(kind: std::io::ErrorKind) -> bool {
+    kind != std::io::ErrorKind::NotFound
+}
+
 /// The launcher path under each triplet dir, this machine's architecture first and the rest
 /// sorted.
 ///
@@ -314,21 +320,36 @@ fn multiarch_candidates(multiarch_root: &Path) -> Vec<PathBuf> {
 /// Sorted below that rank because `read_dir` order is arbitrary: a host carrying at-spi2-core for
 /// two architectures would otherwise spawn a different binary run to run.
 fn launchers_under(triplet_dirs: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = triplet_dirs.collect();
-    dirs.sort_by(|a, b| native_rank(a).cmp(&native_rank(b)).then_with(|| a.cmp(b)));
-    dirs.into_iter()
+    let ours = elf_kind(Path::new("/proc/self/exe"));
+    let mut ranked: Vec<(u8, PathBuf)> = triplet_dirs
         .map(|d| d.join("at-spi2-core/at-spi-bus-launcher"))
-        .collect()
+        .map(|p| (native_rank(&p, ours), p))
+        .collect();
+    ranked.sort();
+    ranked.into_iter().map(|(_, p)| p).collect()
 }
 
-/// 0 for this build's own multiarch triplet dir (`x86_64-linux-gnu` on x86_64), 1 for any other.
-fn native_rank(triplet_dir: &Path) -> u8 {
-    let native = triplet_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_prefix(std::env::consts::ARCH))
-        .is_some_and(|rest| rest.starts_with('-'));
-    u8::from(!native)
+/// 0 for a launcher this kernel can exec, 1 for anything else — including one that cannot be read
+/// or is not an ELF at all.
+///
+/// The candidate is compared against glass's own binary rather than against `std::env::consts::ARCH`
+/// spelled as a triplet: the two disagree on the architectures where the scan matters most
+/// (`powerpc64` for `powerpc64le-linux-gnu`, `x86` for `i386-linux-gnu`, `mips` for `mipsel-…`).
+fn native_rank(candidate: &Path, ours: Option<[u8; 4]>) -> u8 {
+    match (ours, elf_kind(candidate)) {
+        (Some(ours), Some(theirs)) if ours == theirs => 0,
+        _ => 1,
+    }
+}
+
+/// The ELF fields `execve` refuses a mismatch on: `EI_CLASS`, `EI_DATA`, and the two `e_machine`
+/// bytes. `None` for a file that cannot be read or does not start with the ELF magic.
+fn elf_kind(p: &Path) -> Option<[u8; 4]> {
+    // e_machine is at offset 18 and its byte order is EI_DATA's, so the raw bytes are only
+    // comparable alongside EI_DATA — which is why both are in the key.
+    let mut head = [0u8; 20];
+    std::fs::File::open(p).ok()?.read_exact(&mut head).ok()?;
+    (head[..4] == *b"\x7fELF").then_some([head[4], head[5], head[18], head[19]])
 }
 
 /// The launcher to spawn, or why there is none — one mapping, so the preflight and the bring-up
@@ -587,18 +608,66 @@ mod tests {
         );
     }
 
+    /// A launcher at `<root>/<triplet>/at-spi2-core/` whose first 20 bytes are `head`.
+    fn triplet_launcher(root: &std::path::Path, triplet: &str, head: [u8; 20]) -> PathBuf {
+        let bin = root.join(triplet).join("at-spi2-core/at-spi-bus-launcher");
+        std::fs::create_dir_all(bin.parent().expect("has parent")).expect("mkdir");
+        std::fs::write(&bin, head).expect("write");
+        bin
+    }
+
+    /// glass's own ELF header bytes, so a fixture can be native or foreign on any host this runs
+    /// on — a fixture built from `std::env::consts::ARCH` instead would satisfy an `ARCH`-derived
+    /// rule by construction and could never catch one that disagrees with the real triplets.
+    fn our_elf_head() -> [u8; 20] {
+        let mut head = [0u8; 20];
+        std::fs::File::open("/proc/self/exe")
+            .expect("open /proc/self/exe")
+            .read_exact(&mut head)
+            .expect("read ELF header");
+        head
+    }
+
     /// A foreign-arch launcher is executable to `access(X_OK)` and dies at spawn with `Exec format
-    /// error`, so alphabetical order alone would hand `i386-linux-gnu` to an x86_64 host — which
-    /// carries one whenever a foreign architecture is enabled.
+    /// error`, so alphabetical order alone would hand a foreign triplet's launcher to a host that
+    /// carries one — which any machine with a foreign architecture enabled does.
     #[test]
-    fn the_multiarch_scan_tries_this_machines_architecture_first() {
-        let native = format!("/usr/lib/{}-linux-gnu", std::env::consts::ARCH);
-        let dirs = ["/usr/lib/aaa-linux-gnu".to_owned(), native.clone()];
+    fn the_multiarch_scan_tries_a_launcher_this_kernel_can_exec_first() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut foreign = our_elf_head();
+        foreign[18] ^= 0xff; // a different e_machine: same file, another architecture
+        triplet_launcher(root.path(), "aaa-linux-gnu", foreign);
+        let native = triplet_launcher(root.path(), "zzz-linux-gnu", our_elf_head());
         assert_eq!(
-            launchers_under(dirs.iter().map(PathBuf::from)).first(),
-            Some(&PathBuf::from(format!(
-                "{native}/at-spi2-core/at-spi-bus-launcher"
-            )))
+            launchers_under(
+                [
+                    root.path().join("aaa-linux-gnu"),
+                    root.path().join("zzz-linux-gnu")
+                ]
+                .into_iter()
+            )
+            .first(),
+            Some(&native)
+        );
+    }
+
+    /// Ranking must not promote what it cannot read: an empty or non-ELF candidate keeps its
+    /// alphabetical place rather than displacing a launcher that would actually run.
+    #[test]
+    fn an_unreadable_candidate_does_not_outrank_a_native_one() {
+        let root = tempfile::tempdir().expect("tempdir");
+        triplet_launcher(root.path(), "aaa-linux-gnu", [0u8; 20]);
+        let native = triplet_launcher(root.path(), "zzz-linux-gnu", our_elf_head());
+        assert_eq!(
+            launchers_under(
+                [
+                    root.path().join("aaa-linux-gnu"),
+                    root.path().join("zzz-linux-gnu")
+                ]
+                .into_iter()
+            )
+            .first(),
+            Some(&native)
         );
     }
 
@@ -681,6 +750,20 @@ mod tests {
             })
             .collect();
         assert_eq!(multiarch_candidates(root.path()), expected);
+    }
+
+    #[test]
+    fn a_missing_multiarch_root_is_not_worth_reporting() {
+        assert!(!scan_error_worth_reporting(std::io::ErrorKind::NotFound));
+    }
+
+    /// The scan is the only path to the launcher on hosts that keep it under a triplet dir, so a
+    /// denial or fd exhaustion there is a wrong answer, not an absent launcher.
+    #[test]
+    fn a_scan_that_failed_for_any_other_reason_is_reported() {
+        assert!(scan_error_worth_reporting(
+            std::io::ErrorKind::PermissionDenied
+        ));
     }
 
     /// A root that cannot be read is "no multiarch layout here" — never a panic, which would land
