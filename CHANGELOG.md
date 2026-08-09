@@ -72,6 +72,13 @@ internal refactors, CI, or test-only changes.
   how to launch unconfined. A bubblewrap that exits without a word — killed by the OOM killer, say
   — is reported with its exit status rather than as a refusal to create a namespace it never
   mentioned.
+- A capture on the Wayland backend no longer waits indefinitely on a compositor that has gone
+  quiet. `glass_screenshot` gave the compositor 5 seconds to hand over the frame, but only looked
+  at the clock after the compositor had said something — so a compositor that stopped answering
+  altogether, rather than refusing, was waited on with no limit at all. glass serves one tool call
+  at a time, so every later call queued behind it. The 5 seconds are now a real limit: a capture
+  the compositor has not answered by then fails, naming what never arrived, and the session stays
+  usable.
 - Accessibility now works on Debian/Ubuntu machines that are not x86-64. `glass doctor` said
   `at-spi-bus-launcher present` while every a11y launch on the same machine failed to find it —
   quietly dropping to pixel-only by default, or failing outright with `a11y: true` — because the

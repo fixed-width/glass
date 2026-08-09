@@ -452,7 +452,7 @@ fn is_retryable(e: &std::io::Error) -> bool {
 /// The expiry check is explicit rather than left to the poll: `Instant` subtraction saturates to
 /// zero, and a zero-timeout poll still reports a ready fd, so a caller relying on that alone would
 /// run past its own deadline for as long as the other end kept the pipe ready.
-fn remaining_timespec(deadline: Instant) -> Option<rustix::event::Timespec> {
+pub(crate) fn remaining_timespec(deadline: Instant) -> Option<rustix::event::Timespec> {
     let now = Instant::now();
     if now >= deadline {
         return None;
