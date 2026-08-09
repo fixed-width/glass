@@ -145,7 +145,7 @@ impl WaylandPlatform {
     /// The compositor's own pid, for a test that has to act on the compositor rather than through
     /// it — signalling it, which no session method exposes.
     pub(crate) fn session_compositor_pid(&self) -> Option<u32> {
-        Some(self.active.as_ref()?.child.id())
+        self.active.as_ref().map(|s| s.child.id())
     }
 }
 
@@ -500,27 +500,37 @@ fn rect_to_geom(r: &crate::swayipc::Rect) -> WindowGeometry {
     }
 }
 
-/// How long one capture may spend waiting on the compositor, across both of its dispatch phases.
-const CAPTURE_BUDGET: Duration = Duration::from_millis(5000);
+/// How long one capture may take, from the copy request to the last event it needs.
+const CAPTURE_BUDGET: Duration = Duration::from_secs(5);
 
 /// A capture waits on a compositor that is also driving the app being captured, so the budget has
-/// to cover a loaded host, and the whole session lock is held meanwhile. The floor is what no test
-/// can see: `capture_frame`'s live test only proves the wait ends.
+/// to cover a loaded host — and the session lock is held for all of it, so it cannot be generous.
+/// Both ends are also asserted live, but only by a test that needs sway: on every other CI leg
+/// this is the whole guard.
 const _: () = assert!(
-    CAPTURE_BUDGET.as_millis() >= 2000 && CAPTURE_BUDGET.as_millis() <= 15_000,
+    CAPTURE_BUDGET.as_secs() >= 2 && CAPTURE_BUDGET.as_secs() <= 15,
     "the capture budget must leave a loaded compositor time to answer, without holding the session lock for long"
 );
 
-/// Wait for the compositor to send something, giving up at `deadline`.
+/// When the capture starting now must be over. A function, so removing the last use of
+/// [`CAPTURE_BUDGET`] from the capture path is a dead-code error rather than a constant left
+/// bracketed and unread.
+fn capture_deadline() -> Instant {
+    Instant::now() + CAPTURE_BUDGET
+}
+
+/// Dispatch whatever the compositor has sent, waiting no later than `deadline` for it to send
+/// something.
 ///
-/// `blocking_dispatch` returns only once an event has arrived, so a deadline checked after it is
-/// not a bound: a compositor that goes quiet after the last event glass reacts to holds the caller
-/// — and, through the session lock, every other tool call — indefinitely (glass#383). Poll the
-/// connection fd for what is left of the deadline instead, as the clipboard's owner loop does.
+/// `blocking_dispatch` waits on the socket with no timeout, so a deadline checked after it is not
+/// a bound: a compositor that goes quiet after the last event glass reacts to holds the caller —
+/// and, through the session lock, every other tool call — indefinitely (glass#383). Poll the
+/// connection fd for what is left of the deadline instead, the shape the clipboard's bounded
+/// transfers use.
 ///
-/// Returns once events have been dispatched, or once the deadline passed with nothing to read; the
-/// caller re-checks its own condition and its own deadline either way, so expiry is not an error
-/// here.
+/// Expiry is not an error here: this returns having made whatever progress it could, and
+/// [`wait_for`] owns the deadline. What is already in the queue is always dispatched first, so a
+/// budget spent down to nothing still delivers an answer that had already arrived.
 ///
 /// Generic over the queue's state only so the bound can be tested against a socket with no
 /// compositor behind it; capture is the sole caller, hence the error variant.
@@ -533,34 +543,96 @@ fn dispatch_until<S>(
     fn failed(what: &str, e: impl std::fmt::Display) -> GlassError {
         GlassError::CaptureFailed(format!("screencopy: {what}: {e}"))
     }
+    let dispatch = |queue: &mut EventQueue<S>, state: &mut S| {
+        queue
+            .dispatch_pending(state)
+            .map_err(|e| failed("dispatch", e))
+    };
     conn.flush().map_err(|e| failed("flush", e))?;
-    // `None` means events are already queued: dispatch them rather than waiting for more.
-    if let Some(guard) = queue.prepare_read() {
-        let Some(ts) = remaining_timespec(deadline) else {
-            return Ok(());
-        };
-        let fd = conn.as_fd();
-        match rustix::event::poll(
-            &mut [rustix::event::PollFd::new(
-                &fd,
-                rustix::event::PollFlags::IN,
-            )],
-            Some(&ts),
-        ) {
-            Ok(0) => return Ok(()),
-            Ok(_) => {
-                guard.read().map_err(|e| failed("read", e))?;
-            }
-            // A signal arrived and nothing was lost; the caller's deadline decides whether there
-            // is time to ask again.
-            Err(rustix::io::Errno::INTR) => return Ok(()),
-            Err(e) => return Err(failed("poll", e)),
+    if dispatch(queue, state)? > 0 {
+        return Ok(());
+    }
+    // `None` is a libwayland-backend condition glass cannot reach (the pure-Rust backend always
+    // prepares), and it means the backend's own queue needs draining, not this one's.
+    let Some(guard) = queue.prepare_read() else {
+        return Ok(());
+    };
+    let Some(ts) = remaining_timespec(deadline) else {
+        return Ok(());
+    };
+    // The guard's fd, not the queue's: a queue is a dispatch bucket and has no socket of its own.
+    let fd = guard.connection_fd();
+    // A compositor that went away wakes this poll too: POSIX reports POLLHUP in `revents` whether
+    // or not it was asked for, and the read below then fails with EPIPE rather than spinning.
+    match rustix::event::poll(
+        &mut [rustix::event::PollFd::new(
+            &fd,
+            rustix::event::PollFlags::IN,
+        )],
+        Some(&ts),
+    ) {
+        Ok(0) => return Ok(()),
+        Ok(_) => match guard.read() {
+            Ok(_) => {}
+            // What the socket held was the front of a message whose rest has not arrived. Upstream
+            // treats this as a retry, and so must this: it is a loaded host, not a fault.
+            Err(wayland_client::backend::WaylandError::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(failed("read", e)),
+        },
+        // A signal arrived and nothing was lost; the caller's deadline decides whether there is
+        // time to ask again.
+        Err(rustix::io::Errno::INTR) => return Ok(()),
+        Err(e) => return Err(failed("poll", e)),
+    }
+    dispatch(queue, state)?;
+    Ok(())
+}
+
+/// Dispatch until `answered` has one, or until `deadline` passes with `expired` to say why not.
+///
+/// The deadline check lives here rather than in each caller's own loop: [`dispatch_until`] returns
+/// at once once the budget is spent, so a loop that forgot to check would not hang as it did
+/// before glass#383 — it would spin on a core holding the session lock, which is worse.
+fn wait_for<S, T>(
+    conn: &Connection,
+    queue: &mut EventQueue<S>,
+    state: &mut S,
+    deadline: Instant,
+    expired: &str,
+    mut answered: impl FnMut(&mut S) -> Option<Result<T>>,
+) -> Result<T> {
+    loop {
+        dispatch_until(conn, queue, state, deadline)?;
+        if let Some(answer) = answered(state) {
+            return answer;
+        }
+        if Instant::now() >= deadline {
+            return Err(GlassError::CaptureFailed(expired.to_string()));
         }
     }
-    queue
-        .dispatch_pending(state)
-        .map_err(|e| failed("dispatch", e))?;
-    Ok(())
+}
+
+/// The wayland objects one capture owns, destroyed when it ends however it ends.
+///
+/// Dropping a proxy destroys nothing: the object stays alive on the compositor, which goes on
+/// sending events for it — and `ready` is not a destructor, the client is what must destroy a
+/// screencopy frame. The per-capture scratch in [`State`] is keyed by nothing, so a frame this
+/// capture gave up on would have its late `ready` taken by the next capture, which then reads a
+/// buffer nothing wrote and returns it as a screenshot. Bounding the wait (glass#383) is what
+/// makes that next capture reachable at all.
+struct CaptureObjects {
+    frame: ZwlrScreencopyFrameV1,
+    buffer: Option<wl_buffer::WlBuffer>,
+}
+
+impl Drop for CaptureObjects {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            buffer.destroy();
+        }
+        self.frame.destroy();
+    }
 }
 
 /// SCTK state: registry + output (for the output extent), shm (for capture
@@ -1382,66 +1454,80 @@ impl Platform for WaylandPlatform {
             Some(r) => (wr.x + r.x as i32, wr.y + r.y as i32, r.width, r.height),
             None => (wr.x, wr.y, wr.width, wr.height),
         };
-        let frame = session.manager.capture_output_region(
-            0,
-            &session.output,
-            cx,
-            cy,
-            cw as i32,
-            ch as i32,
-            &qh,
-            (),
-        );
+        let mut owned = CaptureObjects {
+            frame: session.manager.capture_output_region(
+                0,
+                &session.output,
+                cx,
+                cy,
+                cw as i32,
+                ch as i32,
+                &qh,
+                (),
+            ),
+            buffer: None,
+        };
 
-        let deadline = Instant::now() + CAPTURE_BUDGET;
+        let deadline = capture_deadline();
 
         // Phase 1: dispatch until the compositor has advertised its buffer formats, then pick one
         // we can convert (preferring 32-bit). `buffer_done` marks the end of the list — a v3
         // event, which is why the manager is bound at v3 exactly.
-        let (format, w, h, stride) = loop {
-            dispatch_until(
-                &session.conn,
-                &mut session.queue,
-                &mut session.state,
-                deadline,
-            )?;
-            if session.state.buffer_done {
-                break crate::pixels::pick_shm_format(&session.state.shm_buffers).ok_or_else(
-                    || GlassError::CaptureFailed("screencopy: no shm format advertised".into()),
-                )?;
+        let (format, w, h, stride) = wait_for(
+            &session.conn,
+            &mut session.queue,
+            &mut session.state,
+            deadline,
+            "screencopy: no buffer event",
+            |s| {
+                if s.buffer_done {
+                    return Some(
+                        crate::pixels::pick_shm_format(&s.shm_buffers).ok_or_else(|| {
+                            GlassError::CaptureFailed("screencopy: no shm format advertised".into())
+                        }),
+                    );
+                }
+                match s.capture_done.take() {
+                    Some(Err(e)) => Some(Err(e)),
+                    // Nothing has been asked to be copied yet, so a `ready` here belongs to no
+                    // request of this capture's.
+                    Some(Ok(())) => Some(Err(GlassError::CaptureFailed(
+                        "screencopy: ready before the buffer list ended".into(),
+                    ))),
+                    None => None,
+                }
+            },
+        )
+        // A compositor that advertises formats and never ends the list is a different fault from
+        // one that says nothing, and only one of them is about the version glass binds.
+        .map_err(|e| {
+            match (&e, session.state.shm_buffers.is_empty()) {
+            (GlassError::CaptureFailed(m), false) if m == "screencopy: no buffer event" => {
+                GlassError::CaptureFailed(
+                    "screencopy: buffer formats advertised, but no buffer_done (v3) to end the list"
+                        .into(),
+                )
             }
-            if let Some(Err(e)) = session.state.capture_done.take() {
-                return Err(e);
-            }
-            if Instant::now() >= deadline {
-                return Err(GlassError::CaptureFailed(
-                    "screencopy: no buffer event".into(),
-                ));
-            }
-        };
+            _ => e,
+        }
+        })?;
 
         // Allocate a matching shm buffer and request the copy.
         let mut pool = RawPool::new((stride * h) as usize, &session.state.shm)
             .map_err(|e| GlassError::CaptureFailed(format!("shm pool: {e}")))?;
         let buffer = pool.create_buffer(0, w as i32, h as i32, stride as i32, format, (), &qh);
-        frame.copy(&buffer);
+        owned.frame.copy(&buffer);
+        owned.buffer = Some(buffer);
 
         // Phase 2: dispatch until ready/failed.
-        loop {
-            dispatch_until(
-                &session.conn,
-                &mut session.queue,
-                &mut session.state,
-                deadline,
-            )?;
-            if let Some(done) = session.state.capture_done.take() {
-                done?;
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(GlassError::CaptureFailed("screencopy timed out".into()));
-            }
-        }
+        wait_for(
+            &session.conn,
+            &mut session.queue,
+            &mut session.state,
+            deadline,
+            "screencopy: no ready event after the copy request",
+            |s| s.capture_done.take(),
+        )?;
 
         // The captured buffer already matches the requested region, so no CPU crop.
         let rgba = crate::pixels::to_rgba(pool.mmap(), format, w, h, stride)?;
@@ -1740,29 +1826,104 @@ mod pure_tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
+    use crate::testw::on_a_thread;
+
+    /// How long the pure waits below get before the test decides they are never coming back. Well
+    /// past their own budget, which is what makes a lost bound a failure rather than a hang.
+    const PURE_WAIT_BUDGET: Duration = Duration::from_millis(300);
+
+    /// [`wait_for`] over a socket with nothing behind it, answering a question the peer is never
+    /// told about — so only the deadline can end it. `speak` acts as the peer and hands back the
+    /// end to keep open, or `None` to close it.
+    fn wait_over_a_socket(
+        speak: impl FnOnce(UnixStream) -> Option<UnixStream>,
+    ) -> (std::result::Result<(), GlassError>, Duration) {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let conn = Connection::from_socket(ours).expect("a connection over the socket");
+        let mut queue = conn.new_event_queue::<()>();
+        let _peer = speak(theirs);
+        let started = Instant::now();
+        let outcome = wait_for(
+            &conn,
+            &mut queue,
+            &mut (),
+            Instant::now() + PURE_WAIT_BUDGET,
+            "nothing arrived",
+            |()| None,
+        );
+        (outcome, started.elapsed())
+    }
 
     /// The other end stays open and silent, so nothing can arrive and nothing signals the end of
     /// the connection either — what a wedged compositor looks like from this side.
     #[test]
-    fn a_dispatch_gives_up_on_a_peer_that_never_speaks() {
-        let (ours, _theirs) = UnixStream::pair().expect("socketpair");
-        let conn = Connection::from_socket(ours).expect("a connection over the socket");
-        let mut queue = conn.new_event_queue::<()>();
-        let budget = Duration::from_millis(300);
+    fn a_wait_gives_up_on_a_peer_that_never_speaks() {
+        let (outcome, elapsed) = on_a_thread(
+            PURE_WAIT_BUDGET * 20,
+            "the wait was not bounded: it never came back",
+            || wait_over_a_socket(Some),
+        );
 
-        let started = Instant::now();
-        dispatch_until(&conn, &mut queue, &mut (), Instant::now() + budget)
-            .expect("silence is the caller's to interpret, not an error here");
-        let elapsed = started.elapsed();
-
+        let err = outcome.expect_err("a question nothing answered is a failure");
+        assert!(err.to_string().contains("nothing arrived"), "{err}");
         assert!(
-            elapsed < budget * 10,
-            "the wait was not bounded by the deadline: {elapsed:?}"
+            elapsed < PURE_WAIT_BUDGET * 10,
+            "the wait outlived its deadline by too much to be bounded by it: {elapsed:?}"
         );
         assert!(
-            elapsed >= budget,
+            elapsed >= PURE_WAIT_BUDGET,
             "the deadline was cut short, so a compositor merely slow to answer would be given up \
              on: {elapsed:?}"
+        );
+    }
+
+    /// The half of the contract silence cannot show: the poll must return on the fd, not sleep out
+    /// the deadline. A wait that ignored readiness would still pass the test above.
+    #[test]
+    fn a_wait_stops_waiting_as_soon_as_the_peer_speaks() {
+        let (outcome, elapsed) = on_a_thread(
+            PURE_WAIT_BUDGET * 20,
+            "the wait ignored a peer that spoke",
+            || {
+                wait_over_a_socket(|mut theirs| {
+                    // Bytes no wayland event could be made of: what they mean is not the point —
+                    // the wait must come back rather than sit out its budget.
+                    theirs
+                        .write_all(&[0xff; 32])
+                        .expect("write to the socketpair");
+                    Some(theirs)
+                })
+            },
+        );
+
+        assert!(
+            outcome.is_err(),
+            "the peer said something unreadable; that is not an answer to the question"
+        );
+        assert!(
+            elapsed < PURE_WAIT_BUDGET / 2,
+            "the wait sat out its deadline with an answer already on the socket: {elapsed:?}"
+        );
+    }
+
+    /// A compositor that exits is a different fault from one that goes quiet, and reporting it as
+    /// a timeout would send the reader looking for a stall that never happened.
+    #[test]
+    fn a_wait_reports_a_peer_that_went_away_rather_than_timing_out() {
+        let (outcome, elapsed) = on_a_thread(
+            PURE_WAIT_BUDGET * 20,
+            "the wait did not notice the peer had gone",
+            || wait_over_a_socket(|_| None),
+        );
+
+        let err = outcome.expect_err("a connection that ended cannot answer");
+        assert!(
+            !err.to_string().contains("nothing arrived"),
+            "the end of the connection was reported as silence: {err}"
+        );
+        assert!(
+            elapsed < PURE_WAIT_BUDGET / 2,
+            "a closed connection should be noticed at once: {elapsed:?}"
         );
     }
 
@@ -2742,12 +2903,12 @@ mod session_tests {
         assert_eq!(px[3], 255, "opaque");
     }
 
-    /// How long a suspended compositor stays suspended if nothing resumes it. Past the capture
-    /// budget, so a capture that is bounded is over long before this fires.
+    /// How long a suspended compositor stays suspended if nothing resumes it. The bracket
+    /// assertion on `CAPTURE_BUDGET` caps a capture at 15s, so a bounded one is always over first.
     const SUSPENSION: Duration = Duration::from_secs(30);
 
-    /// SIGSTOPs a process until dropped: a compositor that holds the connection open and answers
-    /// nothing, which is the one thing a live sway will not do on request.
+    /// SIGSTOPs a process until dropped: a compositor holding its connection open and answering
+    /// nothing. sway has no IPC command that does this, which is why the test signals it.
     ///
     /// A stuck capture cannot be failed from the test thread — it is the test thread — so the
     /// resume also runs from a watchdog after [`SUSPENSION`]. Without it a lost bound would wedge
@@ -2759,14 +2920,18 @@ mod session_tests {
 
     impl Suspended {
         fn process(pid: u32) -> Suspended {
-            let pid = rustix::process::Pid::from_raw(pid as i32).expect("a live pid");
+            let pid = rustix::process::Pid::from_raw(pid as i32).expect("a non-zero pid");
             rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("SIGSTOP");
             let (resume, wait) = std::sync::mpsc::channel();
             let watchdog = std::thread::spawn(move || {
-                // Either end of the wait resumes it: the drop below, or the timeout.
+                // Either end of the wait resumes it: the drop below, or the timeout. The pid
+                // cannot have been recycled by then — the session still holds it as an unreaped
+                // child, and `Drop` joins this thread before teardown reaps it.
                 let _ = wait.recv_timeout(SUSPENSION);
-                let _ = rustix::process::kill_process(pid, rustix::process::Signal::CONT);
+                rustix::process::kill_process(pid, rustix::process::Signal::CONT)
+                    .expect("SIGCONT the suspended compositor");
             });
+            wait_until_stopped(pid);
             Suspended {
                 resume: Some(resume),
                 watchdog: Some(watchdog),
@@ -2778,11 +2943,33 @@ mod session_tests {
         fn drop(&mut self) {
             drop(self.resume.take());
             // Joined, so the compositor is running again before the session teardown that follows
-            // asks it to close.
+            // asks it to close. A watchdog that panicked left it stopped, which is worth the test
+            // — but not at the cost of aborting the process over an unrelated failure.
             if let Some(w) = self.watchdog.take() {
-                let _ = w.join();
+                let joined = w.join();
+                if !std::thread::panicking() {
+                    joined.expect("the watchdog resumed the compositor");
+                }
             }
         }
+    }
+
+    /// Spin until the kernel reports the process stopped. `kill` returns once the signal is
+    /// pending, so without this a compositor on another core can still service the request the
+    /// test is about to make.
+    fn wait_until_stopped(pid: rustix::process::Pid) {
+        let stat = format!("/proc/{}/stat", pid.as_raw_nonzero());
+        for _ in 0..1000 {
+            // Field 3, after the comm field — which is parenthesised and may itself contain
+            // spaces, so the split starts at the last ')'.
+            let read = std::fs::read_to_string(&stat).expect("the compositor's /proc entry");
+            let after_comm = read.rsplit_once(')').expect("a comm field").1;
+            if after_comm.split_whitespace().next() == Some("T") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the compositor never reached the stopped state");
     }
 
     /// glass#383: the capture checked its deadline only after `blocking_dispatch` returned, and
@@ -2801,19 +2988,20 @@ mod session_tests {
         let _suspended = Suspended::process(pid);
 
         let started = Instant::now();
-        let err = s
-            .platform()
-            .capture_frame(None)
-            .expect_err("a suspended compositor cannot answer a capture");
+        // Not `expect_err`: on the failure this test exists to catch, the watchdog resumes the
+        // compositor and the capture succeeds — printing a whole window of pixels as the reason.
+        let Err(err) = s.platform().capture_frame(None) else {
+            panic!("the capture was not bounded: it waited the compositor out and then succeeded");
+        };
         let elapsed = started.elapsed();
 
         assert!(
             elapsed < SUSPENSION * 2 / 3,
             "the capture waited the compositor out rather than bounding it: {elapsed:?}"
         );
-        // The other end of the bracket: every other capture test answers in milliseconds, so a
-        // budget cut to nothing would leave them green while a loaded compositor's captures all
-        // failed.
+        // The other end of the bracket: the fast capture tests cannot tell a 5s budget from a 5ms
+        // one, so without this a budget cut to nothing leaves them green while every capture on a
+        // loaded compositor fails.
         assert!(
             elapsed >= Duration::from_secs(2),
             "the capture budget is no longer generous enough for a compositor under load: \
@@ -2822,6 +3010,50 @@ mod session_tests {
         assert!(
             err.to_string().contains("no buffer event"),
             "the capture should report what never arrived: {err}"
+        );
+    }
+
+    /// The frame a bounded-out capture abandons is still the compositor's to answer, and the
+    /// per-capture scratch it answers into is keyed by nothing — so the next capture takes those
+    /// events for its own unless the abandoned frame is destroyed. Sizes differ so a stolen
+    /// `buffer` event is a visible fault rather than a coincidence.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_capture_that_follows_an_abandoned_one_reads_its_own_frame() {
+        let mut s = Launch::new().windows(&["cap:cap:200x160"]).start_mapped();
+        let pid = s
+            .platform()
+            .session_compositor_pid()
+            .expect("a started session has a compositor");
+
+        let region = |width, height| Region {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        {
+            let _suspended = Suspended::process(pid);
+            s.platform()
+                .capture_frame(Some(&region(50, 40)))
+                .expect_err("a suspended compositor cannot answer a capture");
+        }
+
+        // The compositor is running again and still owes the abandoned frame its buffer events.
+        let frame = s
+            .platform()
+            .capture_frame(Some(&region(100, 80)))
+            .expect("the compositor is answering again");
+        assert_eq!(
+            (frame.width, frame.height),
+            (100, 80),
+            "the region this capture asked for, not the one before it"
+        );
+        let px = &frame.pixels[..4];
+        assert_eq!(
+            (px[0], px[1], px[2]),
+            crate::testw::window_fill_rgb(0),
+            "the window's own pixels, not a buffer nothing wrote"
         );
     }
 

@@ -234,6 +234,21 @@ impl Session {
     }
 }
 
+/// Run `f` on its own thread and wait `within` for its result, failing with `what` if it does not
+/// arrive. The calls these tests bound hang outright when the bound under test is missing, and a
+/// hang on the test thread wedges the whole suite.
+pub(crate) fn on_a_thread<T: Send + 'static>(
+    within: Duration,
+    what: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(within).expect(what)
+}
+
 /// The event-clock stamps the fixture echoed, in arrival order.
 ///
 /// Each input line carries the compositor timestamp as a `t<N>` word (see the fixture's
