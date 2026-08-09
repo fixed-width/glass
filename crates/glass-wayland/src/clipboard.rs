@@ -310,12 +310,16 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ServeState {
     ) {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type: _, fd } => {
-                // Write the current text to the fd and close it.
+                // Cloned out before the write, not held across it: the write can take up to
+                // CLIP_WRITE_TIMEOUT, and holding the mutex would queue set_text and every later
+                // paste behind one slow reader.
                 let text = state.text.lock().expect("clipboard text mutex").clone();
-                // fd is OwnedFd; wrap in File and write (file closes on drop).
-                let mut file = std::fs::File::from(fd);
-                let _ = file.write_all(text.as_bytes());
-                // file drops here, closing the write end.
+                // Failures are printed, not returned: a Dispatch impl has nowhere to return to,
+                // and the paste happens long after set_clipboard answered its caller. Printing is
+                // what makes a truncated paste distinguishable from an empty clipboard.
+                if let Err(e) = write_all_bounded(fd, text.as_bytes(), CLIP_WRITE_TIMEOUT) {
+                    eprintln!("glass-wayland: clipboard serve: paste transfer: {e}");
+                }
             }
             zwlr_data_control_source_v1::Event::Cancelled => {
                 state.cancelled = true;
@@ -472,15 +476,12 @@ fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
 /// Cap on how long the serving thread spends handing one paste to a requesting app. Its own
 /// constant rather than a reuse of [`CLIP_READ_TIMEOUT`]: that bounds an app glass reads from,
 /// this bounds an app glass writes to, and moving one should not move the other.
-// The `Send` handler wiring lands separately; until then only the tests below call this.
-#[cfg_attr(not(test), allow(dead_code))]
 const CLIP_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Whether a failed write should be retried — nothing was lost and the pipe may take more. A
 /// signal arrived (`Interrupted`), or the pipe filled between the poll and the write
 /// (`WouldBlock`, which non-blocking mode reports instead of parking). `WouldBlock` is retryable
 /// here and not in [`is_retryable`] for exactly that reason: only this side sets `O_NONBLOCK`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_write_retryable(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -497,7 +498,6 @@ fn is_write_retryable(e: &std::io::Error) -> bool {
 /// The fd is made non-blocking first. `POLLOUT` promises only that one byte fits, while a
 /// blocking `write` of more than `PIPE_BUF` waits for the whole payload: polling a blocking fd
 /// would leave the same unbounded wait one syscall further down.
-#[cfg_attr(not(test), allow(dead_code))]
 fn write_all_bounded(fd: OwnedFd, buf: &[u8], timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let flags = rustix::fs::fcntl_getfl(&fd)
@@ -976,6 +976,18 @@ mod tests {
         // No text representation offered -> None (get short-circuits to an empty string).
         assert_eq!(pick_mime(&list(&["image/png", "text/html"])), None);
         assert_eq!(pick_mime(&[]), None);
+    }
+
+    /// A paste bigger than the pipe buffer is handed over in several writes. The transfer has to
+    /// survive that: a truncated one reaches the pasting app as silently-short text.
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_paste_larger_than_the_pipe_buffer_arrives_whole() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let big = "x".repeat(128 * 1024);
+        let _owner = ClipboardOwner::spawn(socket.clone(), big.clone()).expect("spawn");
+        assert_eq!(get(&socket).expect("get"), big);
     }
 
     /// A payload past the pipe buffer cannot be handed over in one `write`. An implementation
