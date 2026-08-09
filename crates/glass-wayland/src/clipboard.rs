@@ -451,8 +451,8 @@ fn is_retryable(e: &std::io::Error) -> bool {
 ///
 /// The expiry check is explicit rather than left to the poll: `Instant` subtraction saturates to
 /// zero, and a zero-timeout poll still reports a ready fd, so a caller relying on that alone would
-/// run past its own deadline for as long as the other end kept the pipe ready.
-fn remaining_timespec(deadline: Instant) -> Option<rustix::event::Timespec> {
+/// run past its own deadline for as long as the fd kept reporting ready.
+pub(crate) fn remaining_timespec(deadline: Instant) -> Option<rustix::event::Timespec> {
     let now = Instant::now();
     if now >= deadline {
         return None;
@@ -850,12 +850,11 @@ fn serve_loop(
             break;
         }
 
-        // Prepare to read new events from the socket. If the queue already has
-        // pending events, `prepare_read` returns `None`; in that case loop
-        // straight back to dispatch_pending without waiting on the fd.
+        // `None` says the backend's own queue needs draining — a libwayland condition the
+        // pure-Rust backend glass builds never reports.
         let guard = match queue.prepare_read() {
             Some(g) => g,
-            None => continue, // unread events still in queue
+            None => continue,
         };
 
         // Poll the connection fd with a short timeout so we can check `stop`
@@ -903,24 +902,9 @@ mod tests {
         PoisonError, ReadyState, get, is_retryable, open_transfer, read_to_eof_bounded, serve_loop,
         signal_ready, write_all_bounded,
     };
-    use crate::testw::Launch;
+    use crate::testw::{Launch, on_a_thread};
     use glass_core::GlassError;
     use std::io::Write;
-
-    /// Run `f` on its own thread and wait `within` for its result, failing with `what` if it does
-    /// not arrive. The calls these tests bound hang outright when the bound under test is missing,
-    /// and a hang on the test thread wedges the whole suite.
-    fn on_a_thread<T: Send + 'static>(
-        within: Duration,
-        what: &str,
-        f: impl FnOnce() -> T + Send + 'static,
-    ) -> T {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(f());
-        });
-        rx.recv_timeout(within).expect(what)
-    }
 
     /// The serving thread is the clipboard — it holds the selection while it runs, and a pasting
     /// app reads from it over a pipe. Nothing under that is fakeable, so these use a real one.
