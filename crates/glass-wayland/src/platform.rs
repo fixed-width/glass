@@ -1666,13 +1666,14 @@ mod pure_tests {
         assert_eq!(next, 2, "re-fetching must not consume an id");
     }
 
-    /// Serializes the tests that write a fixture and then exec it.
+    /// Serializes the tests that exec a fixture they just wrote.
     ///
-    /// `fs::write` holds a write fd on the fixture, and a `fork` on any other thread inherits it
-    /// for the instant before its own exec — so a sibling spawning at the wrong moment makes this
-    /// one's exec fail `ETXTBSY` and the search find nothing. The race is the harness's; glass
-    /// never writes a binary it is about to probe. Poison is ignored so one test's panic cannot
-    /// fail its siblings.
+    /// Another thread's `fork` inherits the write fd `fs::write` holds, until that child execs —
+    /// so a sibling spawning mid-write fails this exec with `ETXTBSY`, and the lock must cover
+    /// the write, not just the exec. Not a product bug: glass never writes a binary it is about
+    /// to probe.
+    ///
+    /// Poison is ignored — one test's panic must not fail its siblings.
     fn one_spawner_at_a_time() -> std::sync::MutexGuard<'static, ()> {
         static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
         SPAWN
