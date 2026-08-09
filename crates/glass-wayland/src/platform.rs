@@ -331,23 +331,27 @@ fn sway_override(
 
 /// The first `sway` in `dirs` whose `--version` reports >= 1.12.
 ///
-/// Precedence is the user's: a too-old sway ends the walk rather than being skipped for a later
-/// directory, because `PATH` order is a choice they expressed. One glass could never have run was
-/// not such a choice, so it is skipped and the walk goes on.
+/// Only an *answer* ends the walk. A candidate that ran and reported a version decides the
+/// outcome, even a bad one: too old or unparseable means fall back to the bundle, never a
+/// different sway further along, because `PATH` order is a precedence the user expressed and
+/// substituting past it is what [`sway_override`] refuses.
+///
+/// A candidate that never ran expressed nothing, so it is stepped over and the walk goes on —
+/// no execute permission, or a spawn that failed outright (`ENOEXEC` for a file that is not a
+/// binary, `ETXTBSY` while something else still holds it open for writing).
 fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
     for dir in dirs {
         let cand = dir.join("sway");
         if !is_executable_file(&cand) {
             continue;
         }
-        let out = std::process::Command::new(&cand)
-            .arg("--version")
-            .output()
-            .ok()?;
+        let Ok(out) = std::process::Command::new(&cand).arg("--version").output() else {
+            continue;
+        };
         let ver = String::from_utf8_lossy(&out.stdout);
         return match parse_sway_version(&ver) {
             Some((maj, min)) if (maj, min) >= (1, 12) => Some(cand),
-            _ => None, // a sway is on PATH but too old/unparseable -> use the bundle
+            _ => None, // it answered, and the answer was not a sway >=1.12 -> use the bundle
         };
     }
     None
@@ -1758,6 +1762,27 @@ mod pure_tests {
             sway_in_dirs([broken.path().to_path_buf(), good.path().to_path_buf()].into_iter()),
             Some(good.path().join("sway")),
             "a sway that cannot be run must be skipped, not treated as the answer"
+        );
+    }
+
+    /// An empty file at 0o755 passes the permission check and then fails to exec (`ENOEXEC`) —
+    /// the deterministic twin of the `ETXTBSY` a concurrent write raises. Ending the walk on
+    /// either made glass conclude there was no sway on `$PATH` at all.
+    #[test]
+    fn a_sway_that_fails_to_spawn_does_not_hide_a_later_one() {
+        let unspawnable = tempfile::tempdir().expect("tempdir");
+        let bin = unspawnable.path().join("sway");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(
+            is_executable_file(&bin),
+            "the fixture must clear the permission check, or this pins the wrong branch"
+        );
+        let good = fake_sway("sway version 1.12-abc (Jun 3 2026)");
+        assert_eq!(
+            sway_in_dirs([unspawnable.path().to_path_buf(), good.path().to_path_buf()].into_iter()),
+            Some(good.path().join("sway")),
+            "a candidate that never ran must be stepped over, not end the walk"
         );
     }
 

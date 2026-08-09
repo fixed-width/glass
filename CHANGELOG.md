@@ -36,6 +36,13 @@ internal refactors, CI, or test-only changes.
   name is still searched along `$PATH` and one that cannot be run is stepped over, so a good copy
   later on `$PATH` is used, as your shell would; the private accessibility bus's preflight now
   searches `$PATH` for `dbus-daemon` too, rather than only checking an explicitly configured path.
+- One `$PATH` entry glass cannot start no longer makes it report that no sway is installed. While
+  looking for a sway ≥1.12, glass runs each candidate with `--version`; if a candidate could not be
+  started at all — something else is writing the file, or it is not a binary — that ended the
+  search outright, so a perfectly good sway further along your `$PATH` was never reached and you
+  were told to build one. Such a candidate is now stepped over and the search carries on. A
+  candidate that does start and reports a version glass cannot use is unchanged: the search stops
+  there rather than silently running a different sway further along your `$PATH`.
 
 ## [1.2.0] - 2026-08-07
 
