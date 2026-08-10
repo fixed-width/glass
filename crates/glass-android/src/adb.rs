@@ -763,8 +763,7 @@ mod tests {
                 vec!["shell", "rm", "-f", "/sdcard/glass_dump_1_2_0.xml"],
                 AdbOp::Shell,
             ),
-            // `am` alone is not a launch: force-stop runs during teardown, where a 60s deadline
-            // would outlast the whole budget that calls it.
+            // `am` alone is not a launch — see `AdbOp::Launch`.
             (
                 vec!["shell", "am", "force-stop", "com.example.app"],
                 AdbOp::Shell,

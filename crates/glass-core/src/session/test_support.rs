@@ -60,8 +60,8 @@ pub(crate) struct FakePlatform {
     /// `glass_window` op, so the session's cached geometry is stale until something re-reads
     /// it. Empty means "report the current geometry unchanged".
     resized_to: VecDeque<WindowGeometry>,
-    /// The deadline `stop_app_by` was handed, when it was the entry point — `None` after a plain
-    /// `stop_app`, which is how a test tells the two apart.
+    /// The deadline `stop_app_by` was handed. `stop_app` is the provided half of the pair, so it
+    /// records [`crate::Deadline::UNBOUNDED`] rather than nothing.
     stop_deadline: Option<Arc<Mutex<Option<crate::Deadline>>>>,
     /// Makes `stop_app_by` spend its whole deadline, standing in for a device that stopped
     /// answering.
@@ -114,14 +114,14 @@ impl FakePlatform {
         self.stop_count = Some(c);
         self
     }
-    /// Record the deadline `stop_app_by` receives, for proving the teardown budget reaches the
-    /// backend rather than stopping at `Glass`.
     /// Spend the whole deadline in `stop_app_by`, so a test can ask what is left for the step
     /// behind it.
     pub(crate) fn burning_its_deadline(mut self) -> Self {
         self.stop_burns_deadline = true;
         self
     }
+    /// Record the deadline `stop_app_by` receives, for proving the teardown budget reaches the
+    /// backend rather than stopping at `Glass`.
     pub(crate) fn recording_stop_deadline(
         mut self,
         at: Arc<Mutex<Option<crate::Deadline>>>,

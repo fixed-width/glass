@@ -718,8 +718,8 @@ impl A11yServiceRegistry {
             READY_ATTEMPT,
             READY_ATTEMPTS,
             &|step| escalate(adb, apk, &want, step, READY_ATTEMPTS),
-            // No deadline: this is the rollback for a failed `ensure` during `glass_start`, not
-            // teardown, so each call keeps its own budget and answers to no shared one.
+            // Unbounded: this is the rollback for a failed `ensure` during `glass_start`, not
+            // teardown, so each call keeps its own budget.
             &|| restore_a11y(adb, prior, prior_a11y, port, Deadline::UNBOUNDED),
         )?;
         *self.state.lock().unwrap() = Some(Active {
