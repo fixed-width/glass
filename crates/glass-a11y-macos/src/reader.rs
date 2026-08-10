@@ -20,8 +20,7 @@ use glass_core::coords::pixel_geometry_from_content_rect;
 use glass_core::platform::WindowGeometry;
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, GlassError,
-    Result, TruncationLimit, WalkBudget, normalize_description, read_back_confirms,
-    write_took_no_effect,
+    Result, WalkBudget, normalize_description, read_back_confirms, write_took_no_effect,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
@@ -505,22 +504,13 @@ fn walk(
     // are all skipped, reached once the node/depth budget is spent, still records a truncation
     // though nothing real was declined. Pre-filtering would mean calling `should_skip` — a live
     // AX round trip — over the whole list, exactly the scan `MAX_SIBLINGS` below exists to bound.
-    if !child_els.is_empty() && may_explore_children(budget, depth) {
+    if !child_els.is_empty() && budget.may_explore_children(depth) {
         // `MAX_NODES` only counts nodes actually entered, and `should_skip` siblings are
         // skipped without entering, so an all-skipped level (a virtualized list of thousands)
         // could otherwise iterate without ever tripping it. `MAX_SIBLINGS` bounds the
         // per-level scan regardless of how many are skipped (mirrors the Windows reader).
-        let mut siblings = 0usize;
-        for child in child_els {
-            // Checked before processing each child (not after) so the child that merely
-            // completes the tree doesn't get mistaken for one the walk declined to visit.
-            if budget.nodes_exhausted() {
-                budget.hit(TruncationLimit::Nodes);
-                break;
-            }
-            siblings += 1;
-            if siblings > budget.max_siblings() {
-                budget.hit(TruncationLimit::Siblings);
+        for (scanned, child) in child_els.into_iter().enumerate() {
+            if !budget.may_visit_sibling(scanned) {
                 break;
             }
             if !should_skip(&child) {
@@ -551,30 +541,9 @@ fn should_skip(el: &AXUIElement) -> bool {
     matches!(ffi::ax_size(el), Ok((w, h)) if w <= 0.0 || h <= 0.0)
 }
 
-/// Whether this node's children may be explored, recording the bound that stopped the walk
-/// when they may not. Callers only consult this once they already know the child list is
-/// non-empty — calling it for a childless node would record a truncation for declining to
-/// explore a list that was never going to be walked anyway.
-///
-/// `walk` and `find_nth` MUST consult this one function at the same point in their
-/// traversal. They assign a node's id by arrival order, and `set_value` re-walks to a
-/// caller-supplied id — so a bound applied in one traversal but not the other resolves the
-/// id against a different tree and writes to the wrong element. Sharing the decision makes
-/// that divergence impossible to introduce by editing only one of them.
-fn may_explore_children(budget: &mut WalkBudget, depth: usize) -> bool {
-    if budget.depth_exhausted(depth) {
-        budget.hit(TruncationLimit::Depth);
-        return false;
-    }
-    if budget.nodes_exhausted() {
-        budget.hit(TruncationLimit::Nodes);
-        return false;
-    }
-    true
-}
-
 /// Pre-order walk mirroring [`walk`]'s traversal — same `should_skip` predicate, same
-/// `AXChildren` order, same bounds via [`may_explore_children`] — to locate the element at
+/// `AXChildren` order, same bounds via [`WalkBudget::may_explore_children`] — to locate the
+/// element at
 /// pre-order index `target`. That is the same numbering `glass_core::AxTree::assign_ids`
 /// gives the tree `snapshot` returns (root = 0), so a `target.id` captured from a snapshot
 /// lands on the same element here. `budget` doubles as the running id (a node's id is
@@ -607,21 +576,13 @@ fn find_nth(
     // children are all skipped, reached once the budget is spent, still records a truncation
     // though nothing real was declined — left as-is for the same reason: pre-filtering means
     // calling `should_skip` over the whole list, the scan `MAX_SIBLINGS` exists to bound.
-    if child_els.is_empty() || !may_explore_children(budget, depth) {
+    if child_els.is_empty() || !budget.may_explore_children(depth) {
         return None;
     }
-    let mut siblings = 0usize;
-    for child in child_els {
-        // Checked before processing each child (not after) so the child that merely
-        // completes the tree doesn't get mistaken for one the walk declined to visit.
-        if budget.nodes_exhausted() {
-            budget.hit(TruncationLimit::Nodes);
+    // Same per-level bound as walk(), so find_nth can't spin either.
+    for (scanned, child) in child_els.into_iter().enumerate() {
+        if !budget.may_visit_sibling(scanned) {
             break;
-        }
-        siblings += 1;
-        if siblings > budget.max_siblings() {
-            budget.hit(TruncationLimit::Siblings);
-            break; // same per-level bound as walk(), so find_nth can't spin either
         }
         if !should_skip(&child)
             && let Some(found) = find_nth(child, depth + 1, budget, target)
@@ -685,55 +646,5 @@ fn gather_states(el: &AXUIElement, role: AxRole) -> AxStateFacts {
         checkable,
         checked,
         ..Default::default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use glass_core::{MAX_DEPTH, MAX_NODES};
-
-    use super::{TruncationLimit, WalkBudget, may_explore_children};
-
-    #[test]
-    fn below_the_caps_children_may_be_explored_and_nothing_is_recorded() {
-        let mut budget = WalkBudget::new();
-        assert!(may_explore_children(&mut budget, 0));
-        assert!(budget.truncation().is_none());
-    }
-
-    #[test]
-    fn at_max_depth_the_depth_bound_is_recorded_and_children_may_not_be_explored() {
-        let mut budget = WalkBudget::new();
-        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
-        assert_eq!(
-            budget.truncation().map(|t| t.limit),
-            Some(TruncationLimit::Depth)
-        );
-    }
-
-    #[test]
-    fn with_the_node_budget_spent_the_nodes_bound_is_recorded_and_children_may_not_be_explored() {
-        let mut budget = WalkBudget::new();
-        for _ in 0..MAX_NODES {
-            budget.visit();
-        }
-        assert!(!may_explore_children(&mut budget, 0));
-        assert_eq!(
-            budget.truncation().map(|t| t.limit),
-            Some(TruncationLimit::Nodes)
-        );
-    }
-
-    #[test]
-    fn when_both_bounds_are_exhausted_the_recorded_limit_is_depth() {
-        let mut budget = WalkBudget::new();
-        for _ in 0..MAX_NODES {
-            budget.visit();
-        }
-        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
-        assert_eq!(
-            budget.truncation().map(|t| t.limit),
-            Some(TruncationLimit::Depth)
-        );
     }
 }

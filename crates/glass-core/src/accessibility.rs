@@ -509,6 +509,52 @@ impl WalkBudget {
         depth >= self.limits.depth
     }
 
+    /// Whether this node's children may be explored, recording the bound that stopped the walk
+    /// when they may not. Callers only consult this once they already know the child list is
+    /// non-empty — calling it for a childless node would record a truncation for declining to
+    /// explore a list that was never going to be walked anyway.
+    ///
+    /// Every traversal that assigns ids reaches its decision here, at the same point in the walk,
+    /// and a new one must too. Nodes are numbered by arrival and `set_value` re-walks to a
+    /// caller-supplied id, so a bound applied in one traversal and not another resolves that id
+    /// against a different tree and writes to the wrong element — between a reader's `walk` and its
+    /// `find_nth`, or between a mapper and the reader that re-finds in what it numbered.
+    //
+    // The exactly-at-cap boundary — a *complete* tree of exactly `limits.nodes` must report `None`,
+    // since the last node to arrive wasn't declined — is a property of a whole walk, so it is
+    // tested end-to-end in the Android/iOS mappers, which can size a synthetic tree to the node
+    // where a live platform tree can't be.
+    pub fn may_explore_children(&mut self, depth: usize) -> bool {
+        if self.depth_exhausted(depth) {
+            self.hit(TruncationLimit::Depth);
+            return false;
+        }
+        if self.nodes_exhausted() {
+            self.hit(TruncationLimit::Nodes);
+            return false;
+        }
+        true
+    }
+
+    /// Whether the sibling at scan position `scanned` may be visited, recording the bound that
+    /// stopped the level when it may not. `scanned` counts siblings *looked at*, not nodes entered:
+    /// a reader that skips offscreen children without entering them still advances it, which is
+    /// what bounds a virtualized list of thousands that `nodes_exhausted` alone would never stop.
+    ///
+    /// Consulted before each child rather than after, so the child that merely completes the tree
+    /// is not mistaken for one the walk declined to visit.
+    pub fn may_visit_sibling(&mut self, scanned: usize) -> bool {
+        if self.nodes_exhausted() {
+            self.hit(TruncationLimit::Nodes);
+            return false;
+        }
+        if scanned >= self.limits.siblings {
+            self.hit(TruncationLimit::Siblings);
+            return false;
+        }
+        true
+    }
+
     /// Record a subtree dropped because the platform refused to read a child.
     ///
     /// Distinct from [`WalkBudget::hit`]: a bound is a limit glass chose and can raise, while
@@ -2886,6 +2932,98 @@ mod tests {
         assert!(
             b.nodes_exhausted(),
             "the cap is reached at exactly MAX_NODES"
+        );
+    }
+
+    #[test]
+    fn below_the_caps_children_may_be_explored_and_nothing_is_recorded() {
+        let mut b = WalkBudget::new();
+        assert!(b.may_explore_children(0));
+        assert!(b.truncation().is_none());
+    }
+
+    #[test]
+    fn at_max_depth_the_depth_bound_is_recorded_and_children_may_not_be_explored() {
+        let mut b = WalkBudget::new();
+        assert!(!b.may_explore_children(MAX_DEPTH));
+        assert_eq!(
+            b.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
+
+    #[test]
+    fn with_the_node_budget_spent_the_nodes_bound_is_recorded_and_children_may_not_be_explored() {
+        let mut b = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            b.visit();
+        }
+        assert!(!b.may_explore_children(0));
+        assert_eq!(
+            b.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Nodes)
+        );
+    }
+
+    #[test]
+    fn when_both_bounds_are_exhausted_the_recorded_limit_is_depth() {
+        let mut b = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            b.visit();
+        }
+        assert!(!b.may_explore_children(MAX_DEPTH));
+        assert_eq!(
+            b.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
+
+    #[test]
+    fn a_sibling_below_both_bounds_may_be_visited_and_nothing_is_recorded() {
+        let mut b = WalkBudget::new();
+        assert!(b.may_visit_sibling(0));
+        assert!(b.truncation().is_none());
+    }
+
+    #[test]
+    fn the_sibling_past_the_per_level_cap_records_that_bound() {
+        let mut b = WalkBudget::new();
+        assert!(
+            b.may_visit_sibling(MAX_SIBLINGS - 1),
+            "the last one allowed"
+        );
+        assert!(!b.may_visit_sibling(MAX_SIBLINGS));
+        assert_eq!(
+            b.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Siblings)
+        );
+    }
+
+    #[test]
+    fn with_the_node_budget_spent_no_sibling_may_be_visited() {
+        let mut b = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            b.visit();
+        }
+        assert!(!b.may_visit_sibling(0));
+        assert_eq!(
+            b.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Nodes)
+        );
+    }
+
+    #[test]
+    fn a_spent_node_budget_outranks_the_sibling_cap() {
+        // Nodes is the cause when both are out — a caller told "too many siblings" would narrow
+        // the wrong thing.
+        let mut b = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            b.visit();
+        }
+        assert!(!b.may_visit_sibling(MAX_SIBLINGS));
+        assert_eq!(
+            b.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Nodes)
         );
     }
 

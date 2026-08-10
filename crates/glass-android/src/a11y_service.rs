@@ -8,10 +8,10 @@ use serde_json::{Value, json};
 
 use glass_core::accessibility::{
     Accessibility, AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget,
-    AxTree, Subject, TruncationLimit, WalkBudget, WalkLimits,
+    AxTree, Subject, WalkBudget, WalkLimits,
 };
 use glass_core::platform::WindowGeometry;
-use glass_core::{GlassError, Result, write_took_no_effect};
+use glass_core::{GlassError, Result, read_back_failed, write_took_no_effect};
 
 use crate::axmap::{LabelInputs, class_to_role, labels};
 use crate::conn::{CallFailure, Conn};
@@ -98,21 +98,11 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
     let children = match v.get("children").and_then(Value::as_array) {
         None => vec![],
         Some(arr) if arr.is_empty() => vec![],
-        Some(_) if walk.budget.depth_exhausted(depth) => {
-            walk.budget.hit(TruncationLimit::Depth);
-            vec![]
-        }
+        Some(_) if !walk.budget.may_explore_children(depth) => vec![],
         Some(arr) => {
             let mut out = Vec::new();
             for (i, c) in arr.iter().enumerate() {
-                // Checked before processing each child (not after) so the child that merely
-                // completes the tree doesn't get mistaken for one the walk declined to visit.
-                if walk.budget.nodes_exhausted() {
-                    walk.budget.hit(TruncationLimit::Nodes);
-                    break;
-                }
-                if i >= walk.budget.max_siblings() {
-                    walk.budget.hit(TruncationLimit::Siblings);
+                if !walk.budget.may_visit_sibling(i) {
                     break;
                 }
                 out.push(json_to_node(c, win, depth + 1, walk)?);
@@ -534,7 +524,7 @@ impl Accessibility for ServiceA11y {
             // for a write that went out and refuses the retry as drift (glass#405).
             let after = self
                 .snapshot(ctx)
-                .map_err(|e| crate::a11y::read_back_failed(target, &e))?;
+                .map_err(|e| read_back_failed(target, &e))?;
             // `find` answers `None` for a node that is gone and for one holding nothing, and
             // folding them together confirms a clear on the evidence that the element could not be
             // found. Keep polling — a tree mid-update loses it briefly.
@@ -551,7 +541,8 @@ impl Accessibility for ServiceA11y {
             };
             // Before the value check, not after: a collapsed row maps its text to `name` and
             // reports no value, so `"" == ""` would confirm a *clear* on the evidence that the
-            // field stopped being a field. `AndroidA11y`'s `verify_write` re-checks the flag too.
+            // field stopped being a field. `AndroidA11y` re-checks it too, through the shared
+            // `glass_core::verify_typed_write`.
             if !node.states.editable {
                 return Err(GlassError::AxWriteUnconfirmed(
                     target.id.0,
@@ -1185,7 +1176,7 @@ fn check_timeout(target: u32, act: &Actuated, want: bool, seen: CheckState) -> G
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::accessibility::{AxDeadline, AxRole};
+    use glass_core::accessibility::{AxDeadline, AxRole, TruncationLimit};
     use serde_json::json;
     use std::io::{BufRead, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
