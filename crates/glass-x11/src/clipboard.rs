@@ -25,9 +25,8 @@ struct GetAtoms {
 
 /// Intern one atom, naming which half of the round trip failed.
 ///
-/// Both halves are named because a round trip can fail at either end and the remedies differ.
-/// `wrap` turns the message into the caller's error type — the owner thread's has to signal the
-/// spawner on its way out, so it cannot be the one the getter uses.
+/// `wrap` turns the message into the caller's error type: the owner thread's has to signal the
+/// spawner on its way out, so it cannot be the getter's.
 fn intern<E>(
     conn: &RustConnection,
     name: &str,
@@ -319,9 +318,8 @@ fn signal_ready(ready: &Arc<(Mutex<ReadyState>, Condvar)>, state: ReadyState) {
 
 /// A setup failure that has already been reported to the spawner.
 ///
-/// Only [`setup_failed`] constructs one, and [`take_selection`] returns nothing else, so a step in
-/// there cannot report through `GlassError` and leave the spawner waiting out its bound — that
-/// mistake is a compile error rather than a silent two-second stall.
+/// Only [`setup_failed`] constructs one and [`take_selection`] returns nothing else, so reporting
+/// a step's failure through `GlassError` instead is a compile error.
 #[derive(Debug)]
 struct SetupFailed(String);
 
@@ -335,9 +333,9 @@ impl std::error::Error for SetupFailed {}
 
 /// Report a setup failure to the spawner and stop the thread, handing `msg` back as the error.
 ///
-/// Every fallible step before the `ReadyState::Ok` signal must go through this. The spawner blocks
-/// on the condvar, so a step that returns without signalling leaves it waiting out its own timeout
-/// and reporting a timeout for a failure that already had a message.
+/// Every fallible step before the `ReadyState::Ok` signal goes through this: the spawner blocks on
+/// the condvar, so one that returns without signalling leaves it to time out and blame the wait for
+/// a failure that already had a message.
 #[must_use = "the caller must return this, or the spawner is told a failure the thread ignored"]
 fn setup_failed(
     ready: &Arc<(Mutex<ReadyState>, Condvar)>,
@@ -345,8 +343,8 @@ fn setup_failed(
     msg: String,
 ) -> SetupFailed {
     signal_ready(ready, ReadyState::Err(msg.clone()));
-    // Not read on any path a failed setup can reach — `spawn` returns `Err`, so no
-    // `ClipboardOwner` exists to consult `is_alive`. It is here for a caller added later.
+    // Inert today — `spawn` returns `Err`, so no `ClipboardOwner` exists to consult `is_alive`.
+    // Kept for a caller added later.
     stop.store(true, Ordering::Relaxed);
     SetupFailed(msg)
 }
@@ -439,8 +437,8 @@ fn owner_thread(
         return Ok(());
     };
 
-    // Past this point `setup_failed` is out of scope, so a later failure cannot overwrite an `Ok`
-    // the spawner may not have read yet.
+    // Past here `setup_failed` is out of scope, so a later failure cannot overwrite an `Ok` the
+    // spawner may not have read.
     signal_ready(&ready, ReadyState::Ok);
 
     // Event loop: serve SelectionRequest until stopped or SelectionClear arrives.
@@ -763,11 +761,11 @@ mod tests {
             panic!("there is no server on :9999, so no owner can take its selection");
         };
         assert!(matches!(err, GlassError::Backend(_)), "{err:?}");
-        // The connect failure's own words, not a generic one: a setup step that reported nothing
-        // would leave the spawner to time out and blame the wait instead.
+        // The connect failure's own words: a step that reported nothing would leave the spawner
+        // to time out and blame the wait.
         assert!(err.to_string().contains("X connect"), "{err}");
-        // And it must arrive by being signalled, not by the 2 s readiness bound expiring — which
-        // is the only difference a caller sees when a setup step forgets to signal.
+        // Signalled, not the 2 s readiness bound expiring — the only difference a caller sees
+        // when a step forgets to signal.
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "{:?}",
@@ -775,9 +773,8 @@ mod tests {
         );
     }
 
-    /// The one thing every fallible setup step in `owner_thread` must do. A step that returns
-    /// without it leaves the spawner on the condvar until its own bound expires, reporting a
-    /// timeout for a failure that already had a message.
+    /// The signal, the stop and the message: dropping any one leaves the spawner on the condvar
+    /// until its own bound expires.
     #[test]
     fn a_setup_failure_signals_the_spawner_stops_the_thread_and_keeps_its_message() {
         let ready = Arc::new((Mutex::new(ReadyState::Pending), Condvar::new()));
