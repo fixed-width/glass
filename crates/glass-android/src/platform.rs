@@ -380,6 +380,20 @@ impl Platform for AndroidPlatform {
     }
 }
 
+impl Drop for AndroidPlatform {
+    /// Force-stop a still-running app on drop — parity with the X11/Wayland/Windows/macOS
+    /// backends, so a platform dropped without an explicit `stop_app()` (panic-unwind, or the
+    /// process-exit backstop) does not leave the app on the device for the next run (glass#419).
+    /// `stop_app` takes `self.app`, so this is a no-op once it has run.
+    ///
+    /// Not a guarantee where the drop is not on the caller's own thread: glass-mcp drops on a
+    /// detached thread nothing joins, so a process exiting right after kills this partway
+    /// (glass#415). The one bounded `am force-stop` here keeps that window short.
+    fn drop(&mut self) {
+        let _ = self.stop_app();
+    }
+}
+
 // Unix-gated as a whole: `FakeAdb` is a `/bin/sh` script, so this import breaks the Windows
 // build without it.
 #[cfg(test)]
@@ -573,6 +587,20 @@ mod platform_tests {
             platform.window(&WindowOp::Geometry),
             Err(GlassError::NoActiveSession)
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_platform_that_still_holds_an_app_force_stops_it() {
+        let fake = launchable();
+
+        drop(started(&fake));
+
+        assert!(
+            fake.called("am force-stop com.example.app"),
+            "{:?}",
+            fake.calls()
+        );
     }
 
     #[test]
