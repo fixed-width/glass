@@ -27,6 +27,8 @@
 //! TCC grants as `tests/a11y.rs` — see that file's module doc for how a granted run supplies
 //! them.
 
+mod common;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     println!("skipped (not macOS): test");
@@ -49,6 +51,8 @@ mod macos_main {
     };
     use glass_macos::MacosPlatform;
 
+    use crate::common::{fail, with_stop_app};
+
     /// Comma-separated launch commands to probe, e.g.
     /// `/System/Applications/TextEdit.app,/System/Applications/Calculator.app`. Each element
     /// is either a `.app` bundle path or a plain executable path — exactly what
@@ -62,13 +66,6 @@ mod macos_main {
     /// accessibility tree behind a window a beat after the window itself appears; mirrors
     /// `tests/a11y.rs`'s identically-reasoned settle.
     const STARTUP_SETTLE: Duration = Duration::from_millis(800);
-
-    /// Print a clear failure message and exit non-zero — the `harness = false` contract (no
-    /// libtest to format a panic for us). Mirrors the sibling integration tests.
-    fn fail(msg: impl AsRef<str>) -> ! {
-        eprintln!("FAIL: {}", msg.as_ref());
-        std::process::exit(1);
-    }
 
     /// AX role tokens glass maps to a role, and that a probed app has actually been seen to
     /// emit. A histogram bucket carrying one of these must not come back [`AxRole::Other`]: the
@@ -190,28 +187,6 @@ mod macos_main {
             .map(|ms| format!("{ms:.0}ms"))
             .collect::<Vec<_>>()
             .join(", ")
-    }
-
-    /// Run `body`, then always call `platform.stop_app()` afterward regardless of whether
-    /// `body` succeeded — mirrors `tests/bundle_launch.rs`'s identically-named helper.
-    fn with_stop_app<T>(
-        platform: &mut MacosPlatform,
-        label: &str,
-        body: impl FnOnce(&mut MacosPlatform) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let result = body(platform);
-        let stop_result = platform.stop_app();
-        match result {
-            Ok(v) => stop_result
-                .map(|()| v)
-                .map_err(|e| format!("stop_app({label}): {e}")),
-            Err(e) => {
-                if let Err(stop_err) = stop_result {
-                    eprintln!("(additionally) stop_app({label}) failed: {stop_err}");
-                }
-                Err(e)
-            }
-        }
     }
 
     /// Launch `run0`, snapshot it with the node cap lifted (so a big app's tree is never

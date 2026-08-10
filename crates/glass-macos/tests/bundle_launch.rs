@@ -49,6 +49,8 @@
 //! an unlocked screen session (TextEdit's window must actually receive focus for the AX
 //! snapshot in check 2 to see real content).
 
+mod common;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     println!("skipped (not macOS): test");
@@ -72,6 +74,8 @@ mod macos_main {
         WalkLimits,
     };
     use glass_macos::MacosPlatform;
+
+    use crate::common::{fail, swiftc_available, with_stop_app};
 
     /// A stock-macOS handoff app. NOTE the mechanism is not what it looks like: it does not
     /// re-exec itself through LaunchServices. Directly spawning `Contents/MacOS/TextEdit` gets
@@ -102,13 +106,6 @@ mod macos_main {
     /// request and returns; this gives the target process a moment to actually unwind.
     const TERMINATE_SETTLE: Duration = Duration::from_secs(1);
 
-    /// Print a clear failure message and exit non-zero — the `harness = false` contract (no
-    /// libtest to format a panic for us). Mirrors the sibling integration tests.
-    fn fail(msg: impl AsRef<str>) -> ! {
-        eprintln!("FAIL: {}", msg.as_ref());
-        std::process::exit(1);
-    }
-
     /// Like the sibling tests' identical helper: returns the error as a `String` instead of
     /// exiting, so a failure inside a check function still lets that check's own cleanup
     /// (`stop_app`, fixture-dir removal) run before the message propagates.
@@ -117,13 +114,6 @@ mod macos_main {
         context: &str,
     ) -> Result<T, String> {
         result.map_err(|e| format!("{context}: {e}"))
-    }
-
-    fn swiftc_available() -> bool {
-        Command::new("swiftc")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
     }
 
     /// True if a process named `name` is currently running (`pgrep -x`) — used by
@@ -213,27 +203,6 @@ mod macos_main {
         }
     }
 
-    /// Run `body`, then always call `platform.stop_app()` before returning — regardless of
-    /// whether `body` succeeded — so a failing check never leaks whatever it started. On
-    /// success, a `stop_app` failure becomes the check's own failure; on an already-failing
-    /// `body` it is only logged, so it can't mask the original failure.
-    fn with_stop_app<T>(
-        platform: &mut MacosPlatform,
-        body: impl FnOnce(&mut MacosPlatform) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let result = body(platform);
-        let stop_result = platform.stop_app();
-        match result {
-            Ok(v) => try_expect(stop_result, "stop_app").map(|()| v),
-            Err(e) => {
-                if let Err(stop_err) = stop_result {
-                    eprintln!("(additionally) stop_app failed: {stop_err}");
-                }
-                Err(e)
-            }
-        }
-    }
-
     /// The result of running one check. Distinct from a plain `Result` so a missing precondition
     /// for ONE check (`Skipped`) is reported as skipped-not-passed and never causes the OTHER
     /// checks to be skipped — the pathological "the whole test silently passes because a single
@@ -278,7 +247,7 @@ mod macos_main {
             }
         };
 
-        let result = with_stop_app(&mut platform, |platform| {
+        let result = with_stop_app(&mut platform, "bundled fixture", |platform| {
             let spec = bundle_spec(bundle.to_string_lossy().into_owned(), SandboxLevel::Default);
             let geometry = try_expect(
                 platform.start_app(&spec),
@@ -370,7 +339,7 @@ mod macos_main {
         let mut platform =
             MacosPlatform::new().map_err(|e| format!("MacosPlatform::new(): {e}"))?;
 
-        let result = with_stop_app(&mut platform, |platform| {
+        let result = with_stop_app(&mut platform, "TextEdit unsandboxed", |platform| {
             let spec = bundle_spec(TEXT_EDIT, SandboxLevel::Off);
             let geometry = try_expect(
                 platform.start_app(&spec),
@@ -461,7 +430,7 @@ mod macos_main {
         let mut platform =
             MacosPlatform::new().map_err(|e| format!("MacosPlatform::new(): {e}"))?;
 
-        with_stop_app(&mut platform, |platform| {
+        with_stop_app(&mut platform, "TextEdit fail-closed", |platform| {
             let spec = bundle_spec(TEXT_EDIT, SandboxLevel::Default);
             match platform.start_app(&spec) {
                 Err(GlassError::AppNotStarted(msg)) => {

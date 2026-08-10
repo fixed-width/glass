@@ -43,6 +43,8 @@
 //! `GLASS_A11Y_FIXTURE_BIN` when set (the granted run pre-builds it); otherwise this builds
 //! `fixture/a11y_fixture.swift` with `swiftc`, or skips if neither is available.
 
+mod common;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     println!("skipped (not macOS): test");
@@ -55,9 +57,9 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos_main {
-    use std::path::PathBuf;
-    use std::process::Command;
     use std::time::Duration;
+
+    use std::path::PathBuf;
 
     use glass_core::platform::{MouseButton, PointerEvent};
     use glass_core::{
@@ -65,6 +67,8 @@ mod macos_main {
         Platform, SandboxLevel, Stream, WalkLimits,
     };
     use glass_macos::MacosPlatform;
+
+    use crate::common::{build_fixture, expect, fail, swiftc_available, try_expect};
 
     /// Settle after an action that should print `SAVE_CLICKED` — native `invoke` or the
     /// a11y-bounds pointer click — before draining logs, mirroring `input.rs`'s
@@ -116,75 +120,6 @@ mod macos_main {
         lines
             .iter()
             .any(|(stream, line)| *stream == Stream::Stdout && line.contains(needle))
-    }
-
-    /// Print a clear failure message and exit non-zero — the `harness = false` contract (no
-    /// libtest to format a panic for us). Mirrors `capture.rs`.
-    fn fail(msg: impl AsRef<str>) -> ! {
-        eprintln!("FAIL: {}", msg.as_ref());
-        std::process::exit(1);
-    }
-
-    /// Unwrap a `Result`, failing the process with `context` prefixed on `Err`. Only safe
-    /// before a fixture process is spawned (it skips destructors) — post-spawn failures go
-    /// through `try_expect`/`run_checks` so `stop_app` still runs. Mirrors `capture.rs`.
-    fn expect<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
-        match result {
-            Ok(v) => v,
-            Err(e) => fail(format!("{context}: {e}")),
-        }
-    }
-
-    /// Like `expect`, but returns the error as a `String` so a failure flows back to `run()`
-    /// for `stop_app` + temp-dir cleanup before the process exits. Mirrors `capture.rs`.
-    fn try_expect<T, E: std::fmt::Display>(
-        result: Result<T, E>,
-        context: &str,
-    ) -> Result<T, String> {
-        result.map_err(|e| format!("{context}: {e}"))
-    }
-
-    fn swiftc_available() -> bool {
-        Command::new("swiftc")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
-
-    /// Build `fixture/a11y_fixture.swift` to a fresh temp path. Returns the built binary's
-    /// path and the temp build dir it lives in (the caller removes the dir when done).
-    /// Mirrors `capture.rs::build_fixture` (`@main` type -> `-parse-as-library`).
-    fn build_fixture() -> (PathBuf, PathBuf) {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let source = manifest_dir.join("fixture").join("a11y_fixture.swift");
-        if !source.is_file() {
-            fail(format!("fixture source not found at {}", source.display()));
-        }
-
-        let out_dir =
-            std::env::temp_dir().join(format!("glass-macos-a11y-test-{}", std::process::id()));
-        expect(
-            std::fs::create_dir_all(&out_dir),
-            "creating fixture build dir",
-        );
-        let out_bin = out_dir.join("a11y_fixture");
-
-        let status = Command::new("swiftc")
-            .arg("-O")
-            .arg("-parse-as-library")
-            .arg(&source)
-            .arg("-o")
-            .arg(&out_bin)
-            .status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => fail(format!(
-                "swiftc exited with {s} building {}",
-                source.display()
-            )),
-            Err(e) => fail(format!("failed to run swiftc: {e}")),
-        }
-        (out_bin, out_dir)
     }
 
     /// Launch the fixture, snapshot its accessibility tree, and assert the outline contains
@@ -442,7 +377,7 @@ mod macos_main {
                     println!("skipped (GLASS_A11Y_FIXTURE_BIN unset and no swiftc)");
                     return;
                 }
-                let (bin, dir) = build_fixture();
+                let (bin, dir) = build_fixture("a11y_fixture", "a11y");
                 (bin, Some(dir))
             }
         };
