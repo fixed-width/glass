@@ -106,8 +106,7 @@ async fn network_screenshot_over_http() {
         "frame is uniform/blank — image content did not cross the wire"
     );
 
-    // Stop the session: cancelling the client does not, and glass-mcp reaches its own teardown
-    // only when the serve loop returns, which dropping the test runtime skips (glass#415).
+    // Stop the session — cancelling the client does not (glass#415).
     let _ = client
         .call_tool(CallToolRequestParams::new("glass_stop"))
         .await;

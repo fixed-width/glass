@@ -626,9 +626,8 @@ pub async fn run_verification_cost(client: &Peer<RoleClient>) -> (ArmReport, Arm
     (a1, b)
 }
 
-/// Stop the fixture session. Cancelling the client does not: glass-mcp only reaches its own
-/// teardown when the serve loop returns, and dropping the test runtime instead leaves the
-/// backend's `Drop` running on a thread nothing joins (glass#415).
+/// Stop the fixture session — cancelling the client does not, and the backend's `Drop` is no
+/// fallback here (glass#415).
 pub async fn stop_fixture(client: &Peer<RoleClient>) {
     call(client, "glass_stop", json!({})).await;
 }

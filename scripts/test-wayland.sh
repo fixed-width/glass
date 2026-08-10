@@ -23,11 +23,10 @@ marker="$(mktemp)"
 status=0
 cargo test -p glass-testapp --test wayland --test wayland_ignore_regions_e2e -- --ignored --test-threads=1 "$@" || status=$?
 
-# A session's private runtime dir is dropped by the same teardown that reaps its compositor, so
-# one left behind is a session whose teardown never finished — an orphaned sway holding the app
-# and the session's a11y bus. Only dirs newer than the marker count, so an earlier run's residue
-# is not this run's failure. Tests pass while this happens (glass#415), which is why it is
-# checked here rather than asserted in any one of them.
+# A session's runtime dir is dropped by the same teardown that reaps its compositor, so one left
+# behind is a teardown that never finished — a live sway still holding the app and the session's
+# a11y bus. Newer than the marker only, so an earlier run's residue is not this run's failure.
+# Checked here rather than in a test because the tests pass while it happens (glass#415).
 leaked=$(find /tmp -maxdepth 1 -name 'glass-wl.*' -newer "$marker" 2>/dev/null || true)
 rm -f "$marker"
 if [ -n "$leaked" ]; then

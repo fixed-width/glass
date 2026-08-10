@@ -31,8 +31,7 @@ fn blink_region_json() -> Value {
 
 /// One tool call: `Ok` with the parsed success envelope's `result` object (see glass-mcp's
 /// `tools::envelope`, `{"ok":true,"tool":..., "result": {...}}`), `Err` with the tool's error
-/// text. Same contract as `mcp_cost::try_call` — a transport failure still panics, being an
-/// infrastructure fault rather than an outcome any caller here branches on.
+/// text. Same contract as `mcp_cost::try_call`; a transport failure still panics.
 async fn try_call(client: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Value, String> {
     let arguments = args
         .as_object()
@@ -65,9 +64,9 @@ async fn call(client: &Peer<RoleClient>, tool: &str, args: Value) -> Value {
 /// Stop the session, then prove it is gone by requiring a second `glass_stop` to fail with
 /// `NoActiveSession`.
 ///
-/// The second call is what gives the first one teeth. Stopping can only fail when no session
-/// exists, so asserting the stop succeeded asserts nothing a passing test could violate —
-/// delete the stop and every assertion here still passes while the compositor leaks (glass#415).
+/// Stopping can only fail when no session exists, so asserting the stop succeeded asserts
+/// nothing a passing test could violate — delete the stop and every assertion here still passes
+/// while the compositor leaks (glass#415).
 async fn stop_and_confirm(client: &Peer<RoleClient>) -> Result<(), String> {
     try_call(client, "glass_stop", json!({}))
         .await
@@ -110,11 +109,9 @@ pub async fn assert_blink_region_e2e(testapp: &str, backend: &str, start_timeout
             .await
             .expect("initialize over http");
 
-    // The assertions run as a task so a failing one arrives here as a value rather than
-    // unwinding past the stop below. glass-mcp tears a session down on a detached thread
-    // nothing joins (`GlassServer::new`), so a skipped stop does not merely postpone cleanup to
-    // process exit — it loses it, orphaning the compositor and the session's private a11y bus
-    // (glass#415).
+    // The assertions run as a task so a failing one arrives as a value instead of unwinding past
+    // the stop below — a skipped stop is not deferred cleanup but none at all (see
+    // `Drop for WaylandPlatform`, glass#415).
     let peer = client.peer().clone();
     let testapp = testapp.to_string();
     let backend = backend.to_string();

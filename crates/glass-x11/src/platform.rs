@@ -1331,8 +1331,8 @@ impl Drop for X11Platform {
     /// Reap the launched app on drop — parity with the Wayland/Windows backends, for a backend
     /// dropped without an explicit `stop_app()` (panic-unwind, or the process-exit backstop
     /// path). Not a guarantee: glass-mcp drops on a detached thread nothing joins, so a process
-    /// exiting right after kills this partway (glass#415). It stays clean where the Wayland one
-    /// does not only because it is short, which is luck rather than design. `kill_child` uses
+    /// exiting right after kills this partway (glass#415) — it stays clean where the Wayland one
+    /// does not only by being short. `kill_child` uses
     /// `self.child.take()`, so this is idempotent with `stop_app`. Field order then
     /// drops `xvfb`, tearing down any private display we spawned.
     fn drop(&mut self) {
