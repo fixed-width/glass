@@ -106,23 +106,35 @@ impl LogStream {
     /// Stream the device's unified log. `log stream` prints all system logs; that is
     /// noisy but honest — callers filter.
     ///
-    /// Best-effort: if `xcrun` fails to spawn, `child` is `None` and `drain` simply
+    /// Best-effort: if the tool fails to spawn, `child` is `None` and `drain` simply
     /// yields nothing, matching the sibling Android backend's behavior when `adb` is
     /// unavailable.
     ///
-    /// Spawned through the caller's [`Simctl`] rather than a literal `xcrun`, so a unit test's
-    /// stand-in covers this too — a hardcoded one here spawned the real tool against a fake
-    /// UDID on every macOS test run.
+    /// Spawned through the caller's [`Simctl`], not a literal `xcrun`: a hardcoded one here
+    /// spawned the real tool against a fake UDID on every macOS test run.
     pub fn spawn(simctl: &Simctl, udid: &str) -> Self {
         let buf = SharedLog::default();
         // Take the piped stdout before storing `child` — reading `child.stdout` after
         // moving `child` into `Self` would not borrow-check.
-        let mut child = Command::new(simctl.program())
+        let mut child = match Command::new(simctl.program())
             .args(simctl.full_args(&["spawn", udid, "log", "stream", "--style", "compact"]))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .ok();
+        {
+            Ok(child) => Some(child),
+            Err(e) => {
+                // The caller's "stream not confirmed live" line cannot tell a quiet two seconds
+                // from a stream that will never exist, which leaves `glass_logs` empty for the
+                // whole session — indistinguishable from an app that logged nothing.
+                eprintln!(
+                    "glass-ios: could not start the unified-log stream ({}: {e}); glass_logs \
+                     will return nothing for this session",
+                    simctl.program()
+                );
+                None
+            }
+        };
         let out = child.as_mut().and_then(|c| c.stdout.take());
         if let Some(out) = out {
             let sink = buf.clone();

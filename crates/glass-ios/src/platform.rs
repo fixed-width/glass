@@ -166,8 +166,19 @@ fn launch_stderr_tail(simctl: &Simctl, udid: &str) -> Option<String> {
 /// Terminate a launch that failed after `simctl launch` had already put the app on the screen, and
 /// hand its error back — `start_app` records `self.app` only on success, so neither `stop_app` nor
 /// the `Drop` below reaps one that failed on the way up (glass#421).
+///
+/// The caller's error is returned, not the reap's — the caller needs the failure that stopped the
+/// launch.
 fn reap_failed_launch(simctl: &Simctl, udid: &str, bundle_id: &str, e: GlassError) -> GlassError {
-    let _ = simctl.run(&["terminate", udid, bundle_id]);
+    if let Err(reap) = simctl.run(&["terminate", udid, bundle_id]) {
+        // A reap usually fails for the same reason the launch did, and says so in plainer words
+        // than the error being returned — a simulator that shut down under us reads there as a
+        // screenshot that could not be decoded.
+        eprintln!(
+            "glass-ios: {bundle_id} launched but failed on the way up, and could not then be \
+             terminated on {udid}: {reap}"
+        );
+    }
     e
 }
 
@@ -395,6 +406,11 @@ impl Platform for IosPlatform {
     }
 
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
+        // `self.app` is overwritten below, so an app still recorded here is one nothing would
+        // reap again, `Drop` included. A no-op on the path `Glass` takes — a platform per
+        // session.
+        self.stop_app()?;
+
         if let Some(build) = &spec.build {
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(build);
@@ -446,18 +462,31 @@ impl Platform for IosPlatform {
         for (k, v) in &spec.env {
             launch.env(format!("SIMCTL_CHILD_{k}"), v);
         }
+        // The app can be on the screen from here on, while `self.app` is not set until the end,
+        // so every failure below reaps for itself.
+        //
         // Bounded like every other simctl call, but spelled out here because this one cannot go
         // through `Simctl::run`: it needs `SIMCTL_CHILD_*` in the child's environment.
         let out = glass_core::run_bounded(
             &mut launch,
             crate::simctl::SimctlOp::Lifecycle.budget(),
             "simctl:launch",
-        )?;
+        )
+        // A timeout kills the `xcrun` client, not the app — `launchd_sim` launched that — so a
+        // simulator that answered late leaves it running with nothing holding it.
+        .map_err(|e| reap_failed_launch(self.target.simctl(), udid, &bundle_id, e))?;
         if !out.status.success() {
-            return Err(GlassError::Backend(format!(
-                "simctl launch failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
+            // Usually nothing launched — but `simctl launch` reports enough kinds of failure
+            // that "usually" is not worth leaving an app running on.
+            return Err(reap_failed_launch(
+                self.target.simctl(),
+                udid,
+                &bundle_id,
+                GlassError::Backend(format!(
+                    "simctl launch failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )),
+            ));
         }
         // `simctl launch` returns as soon as launchd has spawned the process, so a zero exit says
         // the app started, not that it is still running: an app that aborts on a bad launch
@@ -476,23 +505,11 @@ impl Platform for IosPlatform {
             );
         }
 
-        // The app is on the screen from here, but `self.app` is not set until the end, so each
-        // failure below has to reap for itself.
-        //
         // Capture once, purely to learn the device's pixel dimensions for the geometry we
         // report. These are device *pixels* (the screenshot's raw resolution), not UIKit
         // points — the two differ by the device's point-to-pixel scale factor.
-        let frame = match screenshot(self.target.simctl(), udid) {
-            Ok(frame) => frame,
-            Err(e) => {
-                return Err(reap_failed_launch(
-                    self.target.simctl(),
-                    udid,
-                    &bundle_id,
-                    e,
-                ));
-            }
-        };
+        let frame = screenshot(self.target.simctl(), udid)
+            .map_err(|e| reap_failed_launch(self.target.simctl(), udid, &bundle_id, e))?;
         let geometry = WindowGeometry {
             x: 0,
             y: 0,
@@ -506,17 +523,9 @@ impl Platform for IosPlatform {
         // no injector — input is unsupported — but geometry is still reported so
         // capture/logs/clipboard work.
         let injector = match &self.driver {
-            Some(driver) => match discover_scale(&driver.client) {
-                Ok(scale) => Some(IdbInjector::new(scale)),
-                Err(e) => {
-                    return Err(reap_failed_launch(
-                        self.target.simctl(),
-                        udid,
-                        &bundle_id,
-                        e,
-                    ));
-                }
-            },
+            Some(driver) => Some(IdbInjector::new(discover_scale(&driver.client).map_err(
+                |e| reap_failed_launch(self.target.simctl(), udid, &bundle_id, e),
+            )?)),
             None => None,
         };
         // Everything above would look identical for an app that died on launch: `simctl launch`
@@ -536,6 +545,9 @@ impl Platform for IosPlatform {
                 std::thread::sleep(remaining);
             }
             if !pid_is_running(pid) {
+                // The one failure below the launch that does not reap: `pid_is_running` fails
+                // open, so reaching here is evidence the app is already gone.
+                //
                 // What the app itself said travels in the message rather than being left for
                 // `glass_logs`: this return drops the `LogStream` and never registers a session,
                 // so a caller sent to that tool would be told there is no active session. The
@@ -683,10 +695,16 @@ impl Platform for IosPlatform {
 
 impl Drop for IosPlatform {
     /// Terminate the app on drop, for a platform dropped without an explicit `stop_app()` —
-    /// parity with the other backends, iOS having been the last without one. The Simulator
-    /// outlives the process, so the app would otherwise still be in the foreground for the next
-    /// run (glass#421). `stop_app` takes `self.app`, so this is a no-op once it has run, which
-    /// every path through `Glass` does.
+    /// parity with the other backends. The Simulator outlives the process, so the app would
+    /// otherwise still be in the foreground for the next run (glass#421).
+    ///
+    /// Not a guarantee, as the X11 and Wayland drops also note: glass-mcp bounds teardown by
+    /// `glass_core::TEARDOWN_BUDGET` and exits regardless, and this backend's `terminate` carries
+    /// a longer budget than that (glass#427).
+    ///
+    /// `stop_app` takes `self.app`, so this is a no-op after it — and `Glass::stop`,
+    /// `Glass::shutdown` and a session replacement all call it. The path they do not reach is a
+    /// launch that failed on the way up, which is [`reap_failed_launch`]'s.
     fn drop(&mut self) {
         let _ = self.stop_app();
     }
@@ -1191,9 +1209,9 @@ mod pid_liveness_tests {
     }
 }
 
-/// Teardown: what reaches the Simulator when a session ends, however it ends. Each builds the
-/// platform over a `FakeSimctl` and asserts on the argv it recorded — a `terminate` that never
-/// ran and one that ran are otherwise the same green test.
+/// Teardown: what reaches the Simulator when a session ends, however it ends. Each asserts on the
+/// argv a `FakeSimctl` recorded — a `terminate` that never ran and one that did are otherwise the
+/// same green test.
 #[cfg(test)]
 mod teardown_tests {
     use super::*;
@@ -1202,18 +1220,12 @@ mod teardown_tests {
 
     const BUNDLE: &str = "tech.fixedwidth.demo";
 
-    /// An observe-only platform (no companion, so no RPC is reachable) holding `app`.
-    fn platform(fake: &FakeSimctl, app: Option<RunningApp>) -> IosPlatform {
-        IosPlatform {
-            target: SimTarget::for_test_at(fake.program()),
-            app,
-            driver: None,
-            driver_error: Some("no companion in this test".into()),
-        }
-    }
-
-    fn running_app(fake: &FakeSimctl) -> RunningApp {
-        RunningApp {
+    /// An observe-only platform (no companion, so no RPC is reachable), holding a running app or
+    /// nothing. One `SimTarget` throughout — a call escaping the fake is one the assertions
+    /// cannot see.
+    fn platform(fake: &FakeSimctl, running: bool) -> IosPlatform {
+        let target = SimTarget::for_test_at(fake.program());
+        let app = running.then(|| RunningApp {
             bundle_id: BUNDLE.into(),
             pid: None,
             geometry: WindowGeometry {
@@ -1222,15 +1234,25 @@ mod teardown_tests {
                 width: 390,
                 height: 844,
             },
-            logs: LogStream::spawn(&Simctl::at(fake.program()), "test-udid"),
+            logs: LogStream::spawn(target.simctl(), target.udid()),
             injector: None,
+        });
+        IosPlatform {
+            target,
+            app,
+            driver: None,
+            driver_error: Some("no companion in this test".into()),
         }
     }
 
     fn spec() -> AppSpec {
+        spec_for(BUNDLE)
+    }
+
+    fn spec_for(bundle: &str) -> AppSpec {
         AppSpec {
             build: None,
-            run: vec![BUNDLE.to_string()],
+            run: vec![bundle.to_string()],
             cwd: None,
             env: vec![],
             window_hint: None,
@@ -1252,7 +1274,7 @@ mod teardown_tests {
     #[test]
     fn dropping_a_platform_that_still_holds_an_app_terminates_it() {
         let fake = FakeSimctl::new();
-        drop(platform(&fake, Some(running_app(&fake))));
+        drop(platform(&fake, true));
 
         assert_eq!(
             terminations(&fake),
@@ -1263,17 +1285,23 @@ mod teardown_tests {
     }
 
     #[test]
-    fn a_platform_that_never_started_an_app_terminates_nothing_on_drop() {
+    fn a_platform_that_never_started_an_app_runs_nothing_at_all_on_drop() {
         let fake = FakeSimctl::new();
-        drop(platform(&fake, None));
+        drop(platform(&fake, false));
 
-        assert!(terminations(&fake).is_empty(), "{:?}", fake.calls());
+        // The whole list, not just the terminates — a drop that reached for anything else, a
+        // `shutdown` of the simulator itself say, is as wrong as one that terminates nothing.
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     }
 
+    /// Named for the mechanism it can actually see: with the `Drop` deleted the count is still
+    /// one, so what this discriminates is `stop_app` taking the session.
     #[test]
-    fn an_explicit_stop_is_not_repeated_by_the_drop_behind_it() {
+    fn stop_app_takes_the_session_so_the_drop_behind_it_repeats_nothing() {
         let fake = FakeSimctl::new();
-        let mut p = platform(&fake, Some(running_app(&fake)));
+        let mut p = platform(&fake, true);
+        // Best-effort by construction today; when that changes (glass#428) this line changes with
+        // it.
         p.stop_app().expect("stop is best-effort and cannot fail");
         drop(p);
 
@@ -1294,10 +1322,13 @@ mod teardown_tests {
 
     /// The leak the `Drop` alone does not cover: `start_app` records `self.app` on its last
     /// statement, so an app that launched and then failed to come up is held by nothing.
+    ///
+    /// Named for the terminate, not the app — the fake runs no app, so these tests see the call,
+    /// never its effect.
     #[test]
-    fn a_launch_that_fails_after_the_app_is_up_does_not_leave_it_running() {
+    fn a_launch_that_fails_after_the_app_is_up_terminates_it_before_returning() {
         let fake = FakeSimctl::new();
-        let mut p = platform(&fake, None);
+        let mut p = platform(&fake, false);
 
         // The fake exits 0 having written no PNG, so the launch succeeds and the screenshot
         // taken for the window geometry is what fails.
@@ -1316,19 +1347,84 @@ mod teardown_tests {
             "all calls: {:?}",
             fake.calls()
         );
+        // The log stream goes through the same runner — hardcoding `xcrun` there is silent on a
+        // host without it, and reaches the real tool with a fake UDID on macOS.
+        assert!(
+            fake.called("spawn test-udid log stream"),
+            "all calls: {:?}",
+            fake.calls()
+        );
+    }
+
+    /// A reap is best-effort, but it must not swallow the failure it was called about.
+    #[test]
+    fn a_reap_that_itself_fails_still_returns_the_launch_failure() {
+        let fake = FakeSimctl::new();
+        fake.fails("terminate");
+        let mut p = platform(&fake, false);
+
+        let err = p
+            .start_app(&spec())
+            .expect_err("the screenshot still fails");
+
+        assert!(
+            matches!(err, GlassError::CaptureFailed(_)),
+            "a failed reap must not replace the error it was reaping for: {err}"
+        );
+        assert_eq!(terminations(&fake).len(), 1, "{:?}", fake.calls());
+    }
+
+    /// `simctl launch` reporting failure usually means nothing launched — but not always, and the
+    /// launch whose result this backend never sees is the one that leaves an app up.
+    #[test]
+    fn a_launch_simctl_reported_as_failed_is_reaped_too() {
+        let fake = FakeSimctl::new();
+        fake.fails("launch");
+        let mut p = platform(&fake, false);
+
+        p.start_app(&spec()).expect_err("the launch itself fails");
+
+        assert_eq!(
+            terminations(&fake),
+            vec![format!("simctl terminate test-udid {BUNDLE}")],
+            "all calls: {:?}",
+            fake.calls()
+        );
+    }
+
+    /// Starting a second app overwrites `self.app`, leaving the first running with nothing able
+    /// to reap it — the failed-launch leak from the other end. Not reachable through `Glass`,
+    /// which builds a platform per session.
+    #[test]
+    fn starting_a_second_app_terminates_the_one_the_platform_was_holding() {
+        let fake = FakeSimctl::new();
+        let mut p = platform(&fake, true);
+
+        p.start_app(&spec_for("tech.fixedwidth.other"))
+            .expect_err("the screenshot fails, as ever with this fake");
+
+        assert_eq!(
+            terminations(&fake),
+            vec![
+                format!("simctl terminate test-udid {BUNDLE}"),
+                "simctl terminate test-udid tech.fixedwidth.other".to_string(),
+            ],
+            "the old app first, then the reap of the new one: {:?}",
+            fake.calls()
+        );
     }
 
     /// The same leak one step later, on the path a real device takes: capture succeeds and it is
     /// the companion's scale RPC that fails, so the app is up with no session to hold it.
     #[test]
-    fn a_launch_whose_scale_never_resolves_does_not_leave_the_app_running() {
+    fn a_launch_whose_scale_never_resolves_terminates_the_app_before_returning() {
         let fake = FakeSimctl::new();
         fake.writes_screenshot(&png(2, 3));
         let mut p = IosPlatform {
             target: SimTarget::for_test_at(fake.program()),
             app: None,
-            // The stub client dials a socket nothing serves, which is what a companion that died
-            // between spawn and launch looks like from here.
+            // The stub client dials its own dead endpoint — what a companion that died between
+            // spawn and launch looks like from here.
             driver: Some(IdbDriver::for_test()),
             driver_error: None,
         };
@@ -1338,8 +1434,13 @@ mod teardown_tests {
             .expect_err("a scale that never resolved must not report a started app");
 
         assert!(
-            !matches!(err, GlassError::CaptureFailed(_)),
-            "capture was answered; the failure must be the scale RPC: {err}"
+            err.to_string().contains("idb describe"),
+            "the failure must be the scale RPC, not something before it: {err}"
+        );
+        assert!(
+            fake.called("io test-udid screenshot"),
+            "capture must have been reached and answered: {:?}",
+            fake.calls()
         );
         assert!(p.app.is_none(), "no session may be registered");
         assert_eq!(

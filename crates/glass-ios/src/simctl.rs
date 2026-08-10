@@ -66,10 +66,8 @@ impl SimctlOp {
 /// positionally in `sub` (matching how `simctl` itself takes it), so this holds no per-device
 /// state.
 ///
-/// The program is a field rather than a literal so a unit test can point it at a stand-in, the
-/// way `glass-android`'s `Adb` carries its `bin`. Nothing in production sets it: an installed
-/// Xcode is what `xcrun` resolves against, and a second way to name the tool would be a second
-/// thing to diagnose.
+/// The program is a field so a unit test can point it at a stand-in, as `glass-android`'s `Adb`
+/// carries its `bin` — but unlike `Adb`, there is deliberately no production override.
 #[derive(Clone, Debug)]
 pub struct Simctl {
     program: String,
@@ -89,8 +87,8 @@ impl Simctl {
         }
     }
 
-    /// A runner that invokes `program` where the real one invokes `xcrun` — the seam every
-    /// stand-in in this crate's tests goes through, so no unit test reaches CoreSimulator.
+    /// A runner that invokes `program` in place of `xcrun` — the seam every stand-in in this
+    /// crate's tests goes through, so no unit test loads CoreSimulator.
     #[cfg(test)]
     pub(crate) fn at(program: impl Into<String>) -> Self {
         Self {
@@ -131,16 +129,14 @@ impl Simctl {
     }
 }
 
-/// An `xcrun` that is a shell script rather than the real tool: it records every invocation and
-/// exits 0 saying nothing.
+/// An `xcrun` that is a shell script rather than the real tool: it records every invocation and,
+/// unless told otherwise, exits 0 saying nothing.
 ///
 /// Records the argv because a teardown stubbed to do nothing is otherwise indistinguishable from
-/// one that ran — which is the whole question a `Drop` test asks. Deliberately thinner than
-/// `glass-android`'s `FakeAdb`: nothing here needs a canned answer, because every call these
-/// tests make is one whose *result* the code discards.
+/// one that ran — the whole question a `Drop` test asks.
 #[cfg(test)]
 pub(crate) struct FakeSimctl {
-    dir: std::path::PathBuf,
+    dir: tempfile::TempDir,
 }
 
 #[cfg(test)]
@@ -150,10 +146,15 @@ const FAKE_SIMCTL_SCRIPT: &str = "\
 [ \"$1\" = --glass-probe ] && exit 0
 dir=$(dirname \"$0\")
 printf '%s\\n' \"$*\" >> \"$dir/calls\"
+# `$2` is the simctl verb, since `$1` is always `simctl`.
+if [ -f \"$dir/fail-$2\" ]; then
+    printf 'the fake xcrun was told to fail %s\\n' \"$2\" >&2
+    exit 1
+fi
 case \"$*\" in
     *screenshot*)
-        # `io <udid> screenshot ... <path>` writes a file the caller then decodes, so a planted
-        # PNG is the only way past capture. Its destination is the last argument.
+        # A planted PNG is the only way past capture — the caller decodes the file this writes.
+        # Its destination is the last argument.
         if [ -f \"$dir/screenshot.png\" ]; then
             for last in \"$@\"; do :; done
             cp \"$dir/screenshot.png\" \"$last\"
@@ -165,26 +166,23 @@ exit 0
 
 #[cfg(test)]
 impl FakeSimctl {
-    pub(crate) fn new() -> FakeSimctl {
+    pub(crate) fn new() -> Self {
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NEXT: AtomicU32 = AtomicU32::new(0);
 
-        let dir = std::env::temp_dir().join(format!(
-            "glass-fake-simctl-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("create the fake xcrun's directory");
-        let path = dir.join("xcrun");
+        // A `TempDir`, not a pid-derived name — a pid the OS has since reused would hand this
+        // fake an earlier run's recorded calls.
+        let dir = tempfile::Builder::new()
+            .prefix("glass-fake-simctl")
+            .tempdir()
+            .expect("create the fake xcrun's directory");
+        let path = dir.path().join("xcrun");
         std::fs::write(&path, FAKE_SIMCTL_SCRIPT).expect("write the fake xcrun");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("make the fake xcrun executable");
 
-        // Proven runnable before it is handed out, because a parallel test's fork can still be
-        // holding an inherited write fd, which raises `ETXTBSY` on exec. `glass-android`'s
-        // `write_executable` documents the same hazard; `--glass-probe` is the argument this
-        // script answers by exiting before it records anything.
+        // Proven runnable before it is handed out: a parallel test's fork can be holding an
+        // inherited write fd, which raises `ETXTBSY` on exec (`glass-android`'s
+        // `write_executable`, same hazard). `--glass-probe` exits before recording anything.
         for _ in 0..100 {
             match Command::new(&path).arg("--glass-probe").status() {
                 Ok(_) => return FakeSimctl { dir },
@@ -199,18 +197,32 @@ impl FakeSimctl {
 
     /// The path to hand [`Simctl::at`].
     pub(crate) fn program(&self) -> String {
-        self.dir.join("xcrun").to_string_lossy().into_owned()
+        self.dir.path().join("xcrun").to_string_lossy().into_owned()
     }
 
     /// Answer `io … screenshot` with these PNG bytes, for a test that needs to get *past*
-    /// capture. Without this the fake writes nothing and the caller fails to decode.
+    /// capture — without one the fake writes no file and the caller fails to decode.
     pub(crate) fn writes_screenshot(&self, png: &[u8]) {
-        std::fs::write(self.dir.join("screenshot.png"), png).expect("plant the fake's screenshot");
+        std::fs::write(self.dir.path().join("screenshot.png"), png)
+            .expect("plant the fake's screenshot");
+    }
+
+    /// Make every `simctl <verb>` call exit non-zero, for a test that asks what the caller does
+    /// when the Simulator refuses.
+    pub(crate) fn fails(&self, verb: &str) {
+        std::fs::write(self.dir.path().join(format!("fail-{verb}")), "")
+            .expect("tell the fake to fail");
     }
 
     /// The argv of every invocation so far, in order, joined by spaces.
     pub(crate) fn calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.dir.join("calls"))
+        // An unreadable `calls` is "nothing run yet" only while the directory is there; gone,
+        // every assertion built on this silently reads as "no calls".
+        assert!(
+            self.dir.path().exists(),
+            "the fake xcrun's directory is gone; it was dropped before what it recorded was read"
+        );
+        std::fs::read_to_string(self.dir.path().join("calls"))
             .unwrap_or_default()
             .lines()
             .map(str::to_string)
@@ -220,13 +232,6 @@ impl FakeSimctl {
     /// Whether any invocation's argv contains `needle`.
     pub(crate) fn called(&self, needle: &str) -> bool {
         self.calls().iter().any(|c| c.contains(needle))
-    }
-}
-
-#[cfg(test)]
-impl Drop for FakeSimctl {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -317,23 +322,42 @@ mod tests {
     fn program_is_xcrun_with_simctl_first_arg() {
         let s = Simctl::new();
         assert_eq!(s.program(), "xcrun");
+        // `Default` is hand-written and public API — a derived one would hand back an empty
+        // program.
+        assert_eq!(Simctl::default().program(), "xcrun");
         assert_eq!(
             s.full_args(&["help"]),
             vec!["simctl".to_string(), "help".to_string()]
         );
     }
 
-    /// The fake is load-bearing for every teardown test, which asserts on what it recorded — so
-    /// prove it records, or those tests pass against a stand-in that does nothing.
+    /// The fake is load-bearing for every teardown test — prove it records, or those tests pass
+    /// against a stand-in that does nothing.
     #[test]
     fn the_fake_xcrun_records_what_it_was_asked_and_the_real_one_is_not_run() {
         let fake = FakeSimctl::new();
         let simctl = Simctl::at(fake.program());
+        // A real `xcrun simctl terminate UDID app.id` could not answer `Ok("")`.
         assert_eq!(simctl.run(&["terminate", "UDID", "app.id"]).unwrap(), "");
+        // Two calls: a fake that recorded only the first would satisfy every assertion a single
+        // call can make.
+        simctl.run(&["list", "devices"]).unwrap();
 
-        assert_eq!(fake.calls(), vec!["simctl terminate UDID app.id"]);
-        assert!(fake.called("terminate UDID"));
+        assert_eq!(
+            fake.calls(),
+            vec!["simctl terminate UDID app.id", "simctl list devices"]
+        );
         assert!(!fake.called("boot"), "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn a_fake_told_to_fail_a_verb_fails_that_verb_and_no_other() {
+        let fake = FakeSimctl::new();
+        let simctl = Simctl::at(fake.program());
+        fake.fails("terminate");
+
+        assert!(simctl.run(&["terminate", "UDID", "app.id"]).is_err());
+        assert!(simctl.run(&["shutdown", "UDID"]).is_ok());
     }
 
     #[test]
