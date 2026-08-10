@@ -3025,10 +3025,8 @@ mod tests {
     #[test]
     fn a_post_dispatch_failure_lets_the_retry_through_once_the_field_settles() {
         // The sequence glass#405 is about, end to end: a write that dispatched and could not be
-        // confirmed, a field that then settles to the text that write sent, and a retry the guard
-        // must accept. Keeping the cached value here makes the settled field look like drift, and
-        // the caller is refused for a write that landed. Both verdicts a backend can raise once it
-        // has written must clear it.
+        // confirmed, a field that then settles to the text it sent, and a retry the guard must
+        // accept. Both verdicts a backend can raise once it has written must clear the cache.
         for failure in [
             GlassError::AxWriteUnconfirmed(0, "the result was lost".into()),
             GlassError::value_not_applied(0, "x", Some("Alice")),

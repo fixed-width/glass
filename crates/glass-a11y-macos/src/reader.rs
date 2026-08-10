@@ -155,8 +155,8 @@ impl Accessibility for MacosA11y {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                // A projection that accepted the write and kept its value is what this explains. A read
-                // that failed, or one showing a value the element reformatted, is not evidence of it.
+                // A read that failed, or one showing a value the element reformatted, is not
+                // evidence of a projection that accepted the write and kept its value.
                 return Err(match after.as_deref() {
                     Some(seen) if write_took_no_effect(seen, before.as_deref()) => {
                         GlassError::value_not_applied_because(

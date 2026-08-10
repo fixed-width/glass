@@ -637,7 +637,7 @@ async fn set_toggle(
     // Report the state the last poll read, not `!target_on` derived from the request — the two
     // agree only while this equality is the loop's sole exit, and nothing holds that.
     // The radio note only where the site can see one: `set_toggle` also serves checkboxes and
-    // switches, and a caller asking to *select* a radio is not being refused an un-selection.
+    // switches, and asking to *select* a radio is not being refused an un-selection.
     let why = if role == glass_core::AxRole::RadioButton && !target_on {
         "the control's toggle action fired without moving it, which is how a radio button reports \
          that it cannot be unselected"

@@ -224,8 +224,8 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
         // reserves for a reading nobody took.
         let observed = node.value.as_deref().unwrap_or("");
         // Only where the field never moved: on a value the element transformed — an iOS field
-        // autocapitalizing a typed lowercase letter (glass#363) — the tap landed, and telling the
-        // caller to write again contradicts the sentence this clause hangs off.
+        // autocapitalizing a typed lowercase letter (glass#363) — the tap landed, so "write again"
+        // would contradict the sentence this clause hangs off.
         Err(
             if write_took_no_effect(observed, Some(target.value.as_deref().unwrap_or(""))) {
                 GlassError::value_not_applied_because(

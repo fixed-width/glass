@@ -428,8 +428,8 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
 /// The read-back's own failure, reported as an unconfirmed write.
 ///
 /// For a read-back loop only, which is what makes it post-dispatch: `AndroidA11y`'s keystrokes and
-/// `ServiceA11y`'s `ACTION_SET_TEXT` have both gone out by the time either calls this. A verdict `GlassError::set_value_failed_after_writing` rejects would leave the session
-/// holding the value it cached for a write that already landed, and refuse the retry as drift.
+/// `ServiceA11y`'s `ACTION_SET_TEXT` have both gone out by the time either calls this, so a verdict
+/// `GlassError::set_value_failed_after_writing` rejects would refuse the retry as drift.
 pub(crate) fn read_back_failed(target: &AxTarget, e: &GlassError) -> GlassError {
     GlassError::AxWriteUnconfirmed(target.id.0, format!("reading the element back failed: {e}"))
 }

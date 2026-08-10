@@ -529,15 +529,15 @@ impl Accessibility for ServiceA11y {
         // value to land; error honestly only on timeout.
         let deadline = std::time::Instant::now() + self.write_verify_budget;
         loop {
-            // Every exit below this point is post-dispatch, so each must be a verdict
-            // `set_value_failed_after_writing` accepts — otherwise the session keeps the value it
-            // cached for a write that went out, and refuses the retry as drift (glass#405).
+            // Every exit below is post-dispatch, so each must be a verdict
+            // `set_value_failed_after_writing` accepts, or the session keeps the value it cached
+            // for a write that went out and refuses the retry as drift (glass#405).
             let after = self
                 .snapshot(ctx)
                 .map_err(|e| crate::a11y::read_back_failed(target, &e))?;
-            // A node that is not there at all is not an empty field: `find` and an emptied value
-            // both answer `None`, and folding them together confirms a clear on the evidence that
-            // the element could not be found. Keep polling — a tree mid-update loses it briefly.
+            // `find` answers `None` for a node that is gone and for one holding nothing, and
+            // folding them together confirms a clear on the evidence that the element could not be
+            // found. Keep polling — a tree mid-update loses it briefly.
             let Some(node) = after.find(target.id) else {
                 if std::time::Instant::now() >= deadline {
                     return Err(GlassError::AxWriteUnconfirmed(
@@ -549,9 +549,8 @@ impl Accessibility for ServiceA11y {
                 std::thread::sleep(WRITE_VERIFY_POLL);
                 continue;
             };
-            // Before the value check, not after: a node that stopped reporting `editable` — a
-            // submit collapsing it to a display row, focus lost — has its text mapped to `name`
-            // and reports no value, so `"" == ""` would confirm a *clear* on the evidence that the
+            // Before the value check, not after: a collapsed row maps its text to `name` and
+            // reports no value, so `"" == ""` would confirm a *clear* on the evidence that the
             // field stopped being a field. `AndroidA11y`'s `verify_write` re-checks the flag too.
             if !node.states.editable {
                 return Err(GlassError::AxWriteUnconfirmed(
@@ -1128,9 +1127,8 @@ fn disabled_error(target: u32, disabled: AxNodeId) -> GlassError {
 }
 
 /// Map a `set_text` failure onto the `set_value` contract. Only `NotSent` proves nothing was
-/// written: the other two may already have set the field, so they answer in a verdict
-/// `set_value_failed_after_writing` accepts, or the session keeps a value the device has moved past
-/// and refuses the retry as drift (glass#405).
+/// written — the other two may already have set the field, so they answer in a verdict
+/// `set_value_failed_after_writing` accepts (glass#405).
 fn write_error(target: u32, f: CallFailure) -> GlassError {
     match f {
         CallFailure::NotSent(e) => GlassError::AccessibilityUnavailable(format!(
@@ -3662,8 +3660,8 @@ mod tests {
         v
     }
 
-    /// [`editable_field`] with the field no longer editable — a submit collapsing it to a display
-    /// row, which reports no value exactly as a lost write does.
+    /// [`editable_field`] with the field no longer editable — a collapsed display row, whose text
+    /// `labels` maps to `name`, leaving no value to read.
     fn settled_field(value: &str) -> Value {
         let mut v = editable_field(value);
         v["children"][0]["editable"] = json!(false);
@@ -3680,10 +3678,8 @@ mod tests {
 
     #[test]
     fn a_write_that_never_lands_names_both_values_and_the_compose_no_op() {
-        // ACTION_SET_TEXT reports success and does nothing when it would replace text already in a
-        // Compose field, which is a fact only this backend knows — the shared message is written
-        // for no backend in particular (glass#405). The verdict must also be one the session reads
-        // as post-dispatch, or it keeps the value it cached and refuses the retry as drift.
+        // The Compose no-op is a fact only this backend knows, and the verdict must also be one
+        // the session reads as post-dispatch, or it keeps its cached value (glass#405).
         let (port, _ops) = fake_service(vec![editable_field("old")], OnAction::Ok);
         let mut a = impatient_writer(port);
         let t = built(&editable_field("old"));
@@ -3704,8 +3700,8 @@ mod tests {
 
     #[test]
     fn a_field_holding_something_neither_value_gets_no_compose_explanation() {
-        // The clause says a field that already holds text cannot be replaced, and tells the caller
-        // to clear it. A field holding something the write put there was not refused.
+        // The clause tells the caller to clear a field that already holds text; a field holding
+        // something the write put there was not refused.
         let (port, _ops) = fake_service(
             vec![editable_field("old"), editable_field("filtered")],
             OnAction::Ok,
@@ -3726,9 +3722,9 @@ mod tests {
 
     #[test]
     fn a_clear_is_not_confirmed_by_a_field_that_stopped_being_editable() {
-        // A collapsed row maps its text to `name` and reports no value, so an unguarded `"" == ""`
-        // confirms a clear that may never have fired. The editable check runs first to stop that;
-        // move it back below the value check and this is the only test that notices.
+        // A collapsed row reports no value, so an unguarded `"" == ""` confirms a clear that may
+        // never have fired. Move the editable check back below the value check and this is the
+        // only test that notices.
         let (port, _ops) = fake_service(
             vec![editable_field("old"), settled_field("old")],
             OnAction::Ok,
@@ -3785,8 +3781,8 @@ mod tests {
 
     #[test]
     fn a_field_that_stopped_being_editable_is_unconfirmed_and_post_dispatch() {
-        // Its value cannot be read back, so the write is unconfirmed rather than refused — and the
-        // keystrokes went out either way, so the session must drop its cached value.
+        // Its value cannot be read back, so the write is unconfirmed rather than refused — and
+        // `set_text` went out either way, so the session must drop its cached value.
         let (port, _ops) = fake_service(
             vec![editable_field("old"), settled_field("old")],
             OnAction::Ok,
@@ -3803,8 +3799,8 @@ mod tests {
 
     #[test]
     fn a_read_back_that_fails_is_unconfirmed_and_post_dispatch() {
-        // The read-back runs after `set_text`, so its own failure must not propagate raw: every
-        // transport verdict is classified pre-dispatch, which would keep the stale cached value.
+        // The read-back runs after `set_text`, so its own failure must not propagate raw — the
+        // transport verdicts are classified pre-dispatch, which keeps the stale cached value.
         let (port, _ops) = fake_service_full(
             vec![editable_field("old")],
             vec![OnAction::Ok],
