@@ -19,11 +19,22 @@ use crate::simctl::Simctl;
 #[derive(Clone, Default)]
 pub struct SimulatorRegistry {
     booted: Arc<Mutex<Vec<String>>>,
+    /// The runner `shutdown_all` uses, held so a test can point it at a stand-in — one built
+    /// inside `shutdown_all` put a real `xcrun simctl shutdown` in a unit test.
+    simctl: Simctl,
 }
 
 impl SimulatorRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn at(program: &str) -> Self {
+        Self {
+            booted: Arc::default(),
+            simctl: Simctl::at(program),
+        }
     }
 
     /// Record a simulator UDID glass booted.
@@ -42,9 +53,8 @@ impl SimulatorRegistry {
             .lock()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
-        let s = Simctl::new();
         for udid in udids {
-            let _ = s.run(&["shutdown", &udid]);
+            let _ = self.simctl.run(&["shutdown", &udid]);
         }
     }
 
@@ -110,12 +120,21 @@ impl SimTarget {
         &self.udid
     }
 
-    /// A `SimTarget` for `IosPlatform` unit tests that never touch a real simulator (a
-    /// `NoActiveSession`/state-machine guard fires before `target` is used).
+    /// A `SimTarget` for `IosPlatform` unit tests, whose `simctl` runs `true` instead of
+    /// `xcrun`. Both ends of a fixture's life reach `simctl` — the log stream it spawns as it is
+    /// built, the `terminate` it issues as it drops — so a real one sends both into
+    /// CoreSimulator against a bogus UDID.
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
+        Self::for_test_at("true")
+    }
+
+    /// [`SimTarget::for_test`] against a named stand-in — a `FakeSimctl`, for a test that
+    /// asserts which calls were made rather than only that none escaped.
+    #[cfg(test)]
+    pub(crate) fn for_test_at(program: impl Into<String>) -> Self {
         Self {
-            simctl: Simctl::new(),
+            simctl: Simctl::at(program),
             udid: "test-udid".to_string(),
         }
     }
@@ -158,13 +177,38 @@ mod tests {
         assert_eq!(r.udids(), vec!["AAA".to_string(), "BBB".to_string()]);
     }
 
+    /// Pinned because losing it is invisible here: with no `xcrun` on the host every escaped
+    /// call fails silently, while on a macOS runner the ~20 fixtures built from this reach
+    /// CoreSimulator with a bogus UDID, twice each.
     #[test]
-    fn shutdown_all_clears_the_registry() {
-        let r = SimulatorRegistry::new();
+    fn the_test_target_never_names_the_real_tool() {
+        assert_ne!(SimTarget::for_test().simctl().program(), "xcrun");
+    }
+
+    #[test]
+    fn shutdown_all_shuts_down_what_it_recorded_and_clears_the_registry() {
+        let fake = crate::simctl::FakeSimctl::new();
+        let r = SimulatorRegistry::at(&fake.program());
         r.register("AAA".into());
-        // Best-effort: `xcrun simctl shutdown` may fail in a CI sandbox with no real
-        // simulator, but the registry is cleared regardless.
+
         r.shutdown_all();
+
+        assert_eq!(fake.calls(), vec!["simctl shutdown AAA"]);
+        assert!(r.udids().is_empty());
+    }
+
+    /// Shutdown is best-effort — a simulator already stopped answers non-zero — but the registry
+    /// must still be cleared, or a second `shutdown_all` retries a device that is already gone.
+    #[test]
+    fn a_shutdown_that_fails_still_clears_the_registry() {
+        let fake = crate::simctl::FakeSimctl::new();
+        fake.fails("shutdown");
+        let r = SimulatorRegistry::at(&fake.program());
+        r.register("AAA".into());
+
+        r.shutdown_all();
+
+        assert!(fake.called("shutdown AAA"), "{:?}", fake.calls());
         assert!(r.udids().is_empty());
     }
 }
