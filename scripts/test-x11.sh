@@ -21,8 +21,13 @@
 # with a filter (e.g. ./scripts/test-x11.sh network_screenshot_over_http) to skip them.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/lib/session-residue.sh
 # host_conformance spawns the glass-mcp *binary* as a stdio child. `cargo test -p glass-testapp`
 # builds glass-mcp only as a library dependency, not its binary, so build the binary explicitly
 # — otherwise the test can't find it in a clean checkout (e.g. CI, which runs only this script).
 cargo build -p glass-mcp --bin glass-mcp
-exec cargo test -p glass-testapp --test integration --test network --test ignore_regions_e2e --test host_conformance --test software_render -- --ignored --test-threads=1 "$@"
+marker="$(residue_marker)"
+status=0
+cargo test -p glass-testapp --test integration --test network --test ignore_regions_e2e --test host_conformance --test software_render -- --ignored --test-threads=1 "$@" || status=$?
+status=$(report_residue "$marker" "$status")
+exit "$status"

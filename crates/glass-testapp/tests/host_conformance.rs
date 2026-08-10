@@ -249,8 +249,11 @@ impl StdioServer {
 
 impl Drop for StdioServer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait(); // closes stdout, so the reader thread's read_line returns EOF.
+        // SIGTERM first so the server reaches its own shutdown and stops the session it holds.
+        // `kill()` alone is SIGKILL, which cannot be handled — a test panicking before its
+        // `glass_stop` left the session's private a11y bus running (glass#418). Reaping waits,
+        // which closes stdout and so ends the reader thread.
+        glass_proc_linux::reap_graceful(&mut self.child, glass_proc_linux::REAP_GRACE);
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
