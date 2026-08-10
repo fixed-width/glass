@@ -290,9 +290,9 @@ pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<Stri
     }
 }
 
-/// Budget for `emulator -list-avds`. It reads the AVD directory and prints names — a fast local
-/// query — but a broken SDK can wedge the binary, and this runs first on the `glass_start` boot
-/// path, so an unbounded call here hangs a launch before anything else happens.
+/// Budget for `emulator -list-avds` — a fast local query, but a broken SDK can wedge the binary,
+/// and this runs first on the `glass_start` boot path, so an unbounded call hangs a launch before
+/// anything else happens.
 pub(crate) const EMULATOR_LIST_BUDGET: Duration = Duration::from_secs(15);
 
 fn run_emulator_list(bin: &str) -> Result<String> {

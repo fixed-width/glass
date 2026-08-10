@@ -738,9 +738,8 @@ impl A11yServiceRegistry {
     }
 
     /// Restore the device's prior accessibility state and remove the forward by `deadline`, which
-    /// the rest of teardown shares — stopping the app has already spent part of
-    /// `glass_core::TEARDOWN_BUDGET` (glass#422). [`Deadline::UNBOUNDED`] off that path, where
-    /// each call keeps its own budget.
+    /// the rest of teardown shares (glass#422); [`Deadline::UNBOUNDED`] off that path, where each
+    /// call keeps its own budget.
     ///
     /// Best-effort and idempotent. No process to kill: disabling unbinds the service.
     pub fn shutdown(&self, deadline: Deadline) {

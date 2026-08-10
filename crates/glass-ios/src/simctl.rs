@@ -119,8 +119,8 @@ impl Simctl {
     }
 
     /// [`Simctl::run`] under a deadline the whole sequence shares, [`Deadline::UNBOUNDED`] for a
-    /// call that answers to nothing but its own budget. The deadline bounds the run; it does not reserve time for
-    /// the calls behind, which is `Glass::shutdown`'s job (glass#427).
+    /// call that answers to nothing but its own budget. The deadline bounds the run; it does not
+    /// reserve time for the calls behind, which is `Glass::shutdown`'s job (glass#427).
     pub fn run_until(&self, sub: &[&str], deadline: Deadline) -> Result<String> {
         let out = self.output(sub, deadline)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
