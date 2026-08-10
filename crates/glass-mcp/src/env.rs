@@ -3,6 +3,7 @@
 //! distinct from `doctor` (health). The registry and rendering are pure so they are
 //! unit-tested without mutating the process environment.
 
+use glass_core::Palette;
 use serde::Serialize;
 
 /// Which part of glass a variable affects (controls grouping in the listing).
@@ -389,6 +390,14 @@ pub(crate) const STD_ENV: &[(&str, &str)] = &[
         "Linux accessibility (AT-SPI) bus",
     ),
     ("WINDIR", "Windows system directory"),
+    (
+        "NO_COLOR",
+        "Suppress color in doctor/env human output when set to a non-empty value (no-color.org)",
+    ),
+    (
+        "TERM",
+        "Terminal type; `dumb` suppresses color in doctor/env human output",
+    ),
 ];
 
 const DISPLAY_NOTE: &str =
@@ -411,34 +420,69 @@ fn current_cell(doc: &EnvVarDoc, current: Option<&str>) -> String {
 
 /// Render the text listing. `current` returns the live value of a var (`None` = unset).
 pub(crate) fn render_text(current: &dyn Fn(&str) -> Option<String>) -> String {
-    let mut out = String::from("glass environment\n");
+    render_styled(current, &Palette::PLAIN)
+}
+
+/// [`render_text`] drawn with `palette`. Through [`Palette::PLAIN`] the two are byte-identical.
+///
+/// Names are padded *before* they are painted: `{:<26}` counts escape bytes toward the column
+/// width, so painting first would push every purpose one column right per escape.
+pub(crate) fn render_styled(current: &dyn Fn(&str) -> Option<String>, palette: &Palette) -> String {
+    /// Width of the name column, matching the `{:<26}` this replaced.
+    const NAME_COL: usize = 26;
+    let pad_to_col = |name: &str| " ".repeat(NAME_COL.saturating_sub(name.chars().count()));
+
+    let mut out = format!("{}\n", palette.paint(palette.bold, "glass environment"));
     for scope in SCOPE_ORDER {
         let group: Vec<&EnvVarDoc> = GLASS_ENV.iter().filter(|d| d.scope == scope).collect();
         if group.is_empty() {
             continue;
         }
-        out.push_str(&format!("\n[{}]\n", scope.label()));
+        out.push_str(&format!(
+            "\n{}\n",
+            palette.paint(palette.heading, &format!("[{}]", scope.label()))
+        ));
         for d in group {
             let cur = current(d.name);
-            out.push_str(&format!("  {:<26} {}\n", d.name, d.purpose));
             out.push_str(&format!(
-                "  {:<26} default: {} | current: {}\n",
+                "  {}{} {}\n",
+                palette.paint(palette.bold, d.name),
+                pad_to_col(d.name),
+                d.purpose
+            ));
+            let cur_attr = if cur.is_some() {
+                palette.ok
+            } else {
+                palette.dim
+            };
+            out.push_str(&format!(
+                "  {:<width$} {} | {}\n",
                 "",
-                d.default,
-                current_cell(d, cur.as_deref()),
+                palette.paint(palette.dim, &format!("default: {}", d.default)),
+                palette.paint(
+                    cur_attr,
+                    &format!("current: {}", current_cell(d, cur.as_deref()))
+                ),
+                width = NAME_COL,
             ));
         }
     }
-    out.push_str("\nstandard env (read, not glass-specific)\n");
+    out.push_str(&format!(
+        "\n{}\n",
+        palette.paint(palette.heading, "standard env (read, not glass-specific)")
+    ));
     for (name, purpose) in STD_ENV {
-        let cur = if current(name).is_some() {
-            "set"
-        } else {
-            "(unset)"
-        };
-        out.push_str(&format!("  {name:<26} {purpose} | current: {cur}\n"));
+        let set = current(name).is_some();
+        let cur = if set { "set" } else { "(unset)" };
+        let attr = if set { palette.ok } else { palette.dim };
+        out.push_str(&format!(
+            "  {}{} {purpose} | {}\n",
+            palette.paint(palette.bold, name),
+            pad_to_col(name),
+            palette.paint(attr, &format!("current: {cur}")),
+        ));
     }
-    out.push_str(&format!("\n{DISPLAY_NOTE}\n"));
+    out.push_str(&format!("\n{}\n", palette.paint(palette.dim, DISPLAY_NOTE)));
     out
 }
 
@@ -642,6 +686,92 @@ mod tests {
             .map(|(_, b)| b)
             .unwrap();
         assert!(token_line.contains("current: set"), "{token_line}");
+    }
+
+    /// Drop every `\x1b[…m` SGR sequence, leaving the text bytes behind.
+    ///
+    /// Deliberately duplicated from glass-core's `doctor` tests rather than shared — exporting a
+    /// test-only helper from glass-core's public API to serve one consumer is the worse trade.
+    /// Leave both copies alone.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn strip_ansi_removes_escapes_and_is_not_the_identity() {
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\x1b[1mGLASS_BACKEND\x1b[0m"), "GLASS_BACKEND");
+        let colored = Palette::ANSI.paint(Palette::ANSI.bold, "x");
+        assert!(colored.len() > "x".len(), "expected escapes: {colored:?}");
+    }
+
+    #[test]
+    fn the_plain_palette_renders_the_same_bytes_as_render_text() {
+        assert_eq!(render_styled(&stub, &Palette::PLAIN), render_text(&stub));
+    }
+
+    #[test]
+    fn color_adds_escapes_and_changes_nothing_else() {
+        // Also the column guard: painting a name before padding it would push the purpose column
+        // right by the width of the escapes, and that shows up here as a byte difference.
+        assert_eq!(
+            strip_ansi(&render_styled(&stub, &Palette::ANSI)),
+            render_text(&stub)
+        );
+    }
+
+    #[test]
+    fn a_set_variable_is_green_and_an_unset_one_is_dim() {
+        let p = Palette::ANSI;
+        let out = render_styled(&stub, &p);
+        // GLASS_SANDBOX is set to "strict" by `stub`.
+        assert!(
+            out.contains(&format!("{}current: strict (override){}", p.ok, p.reset)),
+            "{out:?}"
+        );
+        // GLASS_BACKEND is unset.
+        assert!(
+            out.contains(&format!("{}current: (unset \u{2192} x11", p.dim)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_secret_value_never_leaks_through_the_styled_rendering_either() {
+        // A coloring bug that painted the raw value would be a leak, and the existing
+        // `secret_value_is_never_emitted` only looks at the plain and JSON forms.
+        let out = render_styled(&stub, &Palette::ANSI);
+        assert!(
+            !out.contains("supersecret"),
+            "secret leaked in styled:\n{out}"
+        );
+        let p = Palette::ANSI;
+        assert!(
+            out.contains(&format!("{}current: set{}", p.ok, p.reset)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn the_standard_env_list_documents_the_color_variables() {
+        // `color::palette` reads NO_COLOR and TERM, so `glass-mcp env` must say so — STD_ENV is
+        // the inventory of non-GLASS_* env glass reads.
+        let out = render_text(&stub);
+        assert!(out.contains("NO_COLOR"), "{out}");
+        assert!(out.contains("TERM"), "{out}");
     }
 
     #[test]
