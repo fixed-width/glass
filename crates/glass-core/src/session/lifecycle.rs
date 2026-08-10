@@ -1,4 +1,6 @@
 //! `Glass` session lifecycle: start/stop/shutdown and geometry.
+use std::time::Instant;
+
 use super::*;
 
 impl Glass {
@@ -82,16 +84,20 @@ impl Glass {
     /// failed `stop_app` must not prevent releasing the rest (the OS reaps anything
     /// left). Distinct from `stop()`, which reports errors to a tool caller.
     ///
+    /// `deadline` is when the caller stops waiting, and it is passed to both halves rather than
+    /// enforced here: the point is that the hook still gets its turn after a session that tore
+    /// down slowly, which only the steps themselves can arrange (glass#422).
+    ///
     /// Written to drain the session set so the future multi-session registry (a
     /// `HashMap` instead of this `Option`) reuses it unchanged — it becomes a `for`
     /// loop with no other change.
-    pub fn shutdown(&mut self) {
+    pub fn shutdown(&mut self, deadline: Instant) {
         if let Some(mut s) = self.active.take() {
-            let _ = s.platform.stop_app();
+            let _ = s.platform.stop_app_by(deadline);
             // `s` drops here: the backend (Xvfb/sway/Job) is torn down.
         }
         if let Some(hook) = self.shutdown_hook.take() {
-            hook();
+            hook(deadline);
         }
     }
 
@@ -137,6 +143,12 @@ mod tests {
         assert_eq!(lines[0].text, "ready");
     }
 
+    /// A deadline far enough out that nothing in these tests is bounded by it — they are about
+    /// what `shutdown` calls, not about what a spent budget does.
+    fn soon() -> std::time::Instant {
+        std::time::Instant::now() + crate::TEARDOWN_BUDGET
+    }
+
     #[test]
     fn shutdown_runs_the_hook() {
         use std::sync::Arc;
@@ -145,8 +157,8 @@ mod tests {
         let f = fired.clone();
         let mut g =
             glass_with_factory(Box::new(|_b| Err(GlassError::Backend("no backend".into()))));
-        g.set_shutdown_hook(Box::new(move || f.store(true, Ordering::SeqCst)));
-        g.shutdown();
+        g.set_shutdown_hook(Box::new(move |_| f.store(true, Ordering::SeqCst)));
+        g.shutdown(soon());
         assert!(
             fired.load(Ordering::SeqCst),
             "shutdown should invoke the hook"
@@ -193,7 +205,7 @@ mod tests {
         });
         let mut g = glass_with_factory(factory);
         g.start(&spec()).unwrap();
-        g.shutdown();
+        g.shutdown(soon());
         assert_eq!(
             *stops.lock().unwrap(),
             1,
@@ -204,7 +216,7 @@ mod tests {
             "the session is cleared after shutdown"
         );
         // Idempotent: a second shutdown with nothing active is a harmless no-op.
-        g.shutdown();
+        g.shutdown(soon());
         assert_eq!(
             *stops.lock().unwrap(),
             1,
@@ -212,9 +224,37 @@ mod tests {
         );
     }
 
+    /// The budget is only useful if it reaches the code that spends it: a backend that tears down
+    /// over a link, and a hook that does the same for the host's own resources.
+    #[test]
+    fn shutdown_hands_its_deadline_to_both_the_backend_and_the_hook() {
+        let at_stop = Arc::new(Mutex::new(None));
+        let recorded = at_stop.clone();
+        let factory: PlatformFactory = Box::new(move |_backend| {
+            Ok(Backend::display_only(Box::new(
+                FakePlatform::new(10, 10).recording_stop_deadline(recorded.clone()),
+            )))
+        });
+        let at_hook = Arc::new(Mutex::new(None));
+        let hooked = at_hook.clone();
+        let mut g = glass_with_factory(factory);
+        g.set_shutdown_hook(Box::new(move |d| *hooked.lock().unwrap() = Some(d)));
+        g.start(&spec()).unwrap();
+
+        let deadline = soon();
+        g.shutdown(deadline);
+
+        assert_eq!(
+            *at_stop.lock().unwrap(),
+            Some(deadline),
+            "the backend must be stopped through `stop_app_by`, not `stop_app`"
+        );
+        assert_eq!(*at_hook.lock().unwrap(), Some(deadline));
+    }
+
     #[test]
     fn shutdown_without_active_session_is_noop() {
         let mut g = glass_with(FakePlatform::new(10, 10));
-        g.shutdown(); // must not panic and must not error
+        g.shutdown(soon()); // must not panic and must not error
     }
 }

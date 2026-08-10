@@ -354,10 +354,14 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
     let platform_factory: glass_core::PlatformFactory =
         Box::new(move |b| make_platform(b, &reg_factory, &agents_factory, &a11y_factory));
     let mut glass = Glass::new(platform_factory, default, baselines, 10_000);
-    glass.set_shutdown_hook(Box::new(move || {
-        a11y.shutdown();
-        agents.shutdown();
-        registry.kill_all();
+    glass.set_shutdown_hook(Box::new(move |deadline| {
+        // Under the deadline the sessions did not use, so a device that stopped answering during
+        // `stop_app` cannot also spend the restore that hands it back clean (glass#422). The
+        // a11y restore goes first for that reason: of these, it is the one whose omission is
+        // visible on the device afterwards.
+        a11y.shutdown_until(Some(deadline));
+        agents.shutdown_until(Some(deadline));
+        registry.kill_all_until(Some(deadline));
         #[cfg(target_os = "macos")]
         sim_registry.shutdown_all();
     }));

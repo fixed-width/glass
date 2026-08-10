@@ -187,13 +187,19 @@ impl EmulatorRegistry {
     /// Stop every registered emulator (`adb -s <serial> emu kill`) and clear the list.
     /// Best-effort: a device already gone is fine.
     pub fn kill_all(&self) {
+        self.kill_all_until(None);
+    }
+
+    /// [`EmulatorRegistry::kill_all`] under a deadline the rest of teardown shares. Measured at
+    /// 2ms: `adb emu kill` acknowledges and lets the VM go down on its own time (glass#422).
+    pub fn kill_all_until(&self, deadline: Option<std::time::Instant>) {
         let clients = self
             .booted
             .lock()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
         for adb in clients {
-            let _ = adb.run(["emu", "kill"]);
+            let _ = adb.run_until(["emu", "kill"], deadline);
         }
     }
 

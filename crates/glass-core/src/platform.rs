@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{GlassError, Result};
 use crate::frame::{Frame, Region};
@@ -226,6 +226,18 @@ pub trait Platform {
 
     /// Terminate the running app (idempotent).
     fn stop_app(&mut self) -> Result<()>;
+
+    /// [`Platform::stop_app`] on the process-exit path, where the whole of teardown shares
+    /// [`TEARDOWN_BUDGET`] and `deadline` is what is left of it.
+    ///
+    /// The default ignores it, which is right for a backend whose teardown is a wait on a local
+    /// child it can bound with its own constants. A backend that tears down over a link to a
+    /// device — one tool invocation per step, each with a budget of its own — has no such sum to
+    /// assert, and overrides this so a step that wedges cannot spend the steps behind it
+    /// (glass#422, glass#427).
+    fn stop_app_by(&mut self, _deadline: Instant) -> Result<()> {
+        self.stop_app()
+    }
 
     /// Capture the current window contents as an RGBA frame. `region` (if set,
     /// window-relative) captures only that sub-rectangle; `None` captures the

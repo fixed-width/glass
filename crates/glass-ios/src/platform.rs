@@ -283,6 +283,20 @@ pub(crate) fn bundle_id_from_run(run: &[String]) -> Result<(Option<String>, Stri
 }
 
 impl IosPlatform {
+    /// Terminate the app, under `deadline` when the caller has one to share.
+    fn stop_app_until(&mut self, deadline: Option<Instant>) -> Result<()> {
+        if let Some(app) = self.app.take() {
+            // Best-effort teardown: the app may already be gone (it crashed, or a prior
+            // launch's `--terminate-running-process` killed it), so a failing `terminate`
+            // is not an error — dropping the session is the goal, and it is idempotent.
+            let _ = self
+                .target
+                .simctl()
+                .run_until(&["terminate", self.target.udid(), &app.bundle_id], deadline);
+        }
+        Ok(())
+    }
+
     /// Resolve (attaching to or booting) a simulator per the `GLASS_IOS_*` env vars, then
     /// try to start its `idb_companion` input/accessibility driver.
     ///
@@ -586,16 +600,14 @@ impl Platform for IosPlatform {
     }
 
     fn stop_app(&mut self) -> Result<()> {
-        if let Some(app) = self.app.take() {
-            // Best-effort teardown: the app may already be gone (it crashed, or a prior
-            // launch's `--terminate-running-process` killed it), so a failing `terminate`
-            // is not an error — dropping the session is the goal, and it is idempotent.
-            let _ = self
-                .target
-                .simctl()
-                .run(&["terminate", self.target.udid(), &app.bundle_id]);
-        }
-        Ok(())
+        self.stop_app_until(None)
+    }
+
+    /// Measured at ~0.1s against the 3s the whole of teardown gets, so the deadline is not
+    /// expected to bind — it is what keeps a simulator that has stopped answering from spending
+    /// the shutdown hook's turn as well as its own (glass#427).
+    fn stop_app_by(&mut self, deadline: Instant) -> Result<()> {
+        self.stop_app_until(Some(deadline))
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {

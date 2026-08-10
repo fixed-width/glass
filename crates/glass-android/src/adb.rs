@@ -24,8 +24,13 @@ pub enum AdbOp {
     Transfer,
     /// `am start -W`, which blocks until the activity is up. A first launch after an install pays
     /// for ART compiling and a cold page cache, so it is nothing like the tap it would otherwise
-    /// share a budget with. `am` alone is NOT this: `am force-stop` runs during teardown, inside
-    /// `glass_core::TEARDOWN_BUDGET`, and must keep the short deadline.
+    /// share a budget with. `am` alone is NOT this: `am force-stop` runs during teardown, where
+    /// the 60s a launch gets would outlast `glass_core::TEARDOWN_BUDGET` several times over.
+    ///
+    /// [`AdbOp::Shell`]'s 10s is not what force-stop is expected to cost either — measured at
+    /// 101ms median, 267ms worst over 25 runs on a four-core emulator with every core saturated.
+    /// It is the bound on a device that has stopped answering; what keeps the teardown *sequence*
+    /// inside its budget is the deadline [`Adb::run_until`] carries, not this number.
     Launch,
     /// Everything else: `input`, `dumpsys`, `devices`, `forward`, `getprop`, `pidof`.
     Shell,
@@ -118,7 +123,21 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let out = self.output(args, None)?;
+        self.run_until(args, None)
+    }
+
+    /// [`Adb::run`] under a deadline the whole sequence shares, `None` for a call that answers to
+    /// nothing but its own budget.
+    ///
+    /// Teardown is what needs it: `stop_app` and the registry shutdowns behind it are a run of
+    /// separate calls, and glass-mcp abandons the lot at [`glass_core::TEARDOWN_BUDGET`] — so
+    /// without a shared deadline one wedged call spends what the calls behind it needed
+    /// (glass#422).
+    pub fn run_until<'a, I>(&self, args: I, deadline: Option<Instant>) -> Result<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let out = self.output(args, deadline)?;
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
@@ -749,8 +768,8 @@ mod tests {
                 vec!["shell", "rm", "-f", "/sdcard/glass_dump_1_2_0.xml"],
                 AdbOp::Shell,
             ),
-            // `am` alone is not a launch: force-stop runs during teardown, inside
-            // TEARDOWN_BUDGET, and a 60s deadline there would outlast the budget that calls it.
+            // `am` alone is not a launch: force-stop runs during teardown, where a 60s deadline
+            // would outlast the whole budget that calls it.
             (
                 vec!["shell", "am", "force-stop", "com.example.app"],
                 AdbOp::Shell,

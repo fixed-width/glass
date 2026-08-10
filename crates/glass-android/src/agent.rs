@@ -327,12 +327,18 @@ impl AgentRegistry {
 
     /// Kill the device agent (via the host child) and remove the forward. Best-effort.
     pub fn shutdown(&self) {
+        self.shutdown_until(None);
+    }
+
+    /// [`AgentRegistry::shutdown`] under a deadline the rest of teardown shares (glass#422).
+    pub fn shutdown_until(&self, deadline: Option<std::time::Instant>) {
         if let Ok(mut guard) = self.state.lock()
             && let Some(p) = guard.take()
         {
-            let _ = p
-                .adb
-                .run(["forward", "--remove", &format!("tcp:{}", p.port)]);
+            let _ = p.adb.run_until(
+                ["forward", "--remove", &format!("tcp:{}", p.port)],
+                deadline,
+            );
             // p drops here → Drop kills + reaps the child
         }
     }

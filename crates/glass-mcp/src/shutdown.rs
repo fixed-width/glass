@@ -2,22 +2,36 @@
 //! best-effort `Glass::shutdown()`, plus a cross-platform termination signal.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glass_core::Glass;
 use tokio::sync::Mutex;
+
+/// How much longer this waits than the deadline it gives `Glass::shutdown`.
+///
+/// The two bounds are for different failures. Teardown's own deadline is what the steps divide
+/// between them, so they finish deliberately and the last one still gets a turn. This timeout is
+/// the backstop for a step that ignores a deadline it was given — the process is exiting either
+/// way, and abandoning a `spawn_blocking` thread mid-call orphans whatever it was running. The
+/// grace is what keeps the ordinary case from racing its own backstop and reporting an overrun on
+/// every clean exit.
+const ABANDON_GRACE: Duration = Duration::from_millis(500);
 
 /// Best-effort, time-bounded teardown of all sessions for process exit. The backend
 /// teardown blocks (it waits on the child), so it runs off the async reactor via
 /// `spawn_blocking`; after `budget` we stop waiting and let the OS reap whatever is
 /// left — we are exiting regardless.
 pub async fn run_shutdown(sessions: Arc<Mutex<Glass>>, budget: Duration) {
+    let deadline = Instant::now() + budget;
     let task = tokio::task::spawn_blocking(move || {
         // On a `spawn_blocking` thread, `blocking_lock` is allowed (it would panic on
         // a reactor worker thread).
-        sessions.blocking_lock().shutdown();
+        sessions.blocking_lock().shutdown(deadline);
     });
-    if tokio::time::timeout(budget, task).await.is_err() {
+    if tokio::time::timeout(budget + ABANDON_GRACE, task)
+        .await
+        .is_err()
+    {
         eprintln!("glass: shutdown exceeded {budget:?}; exiting anyway");
     }
 }
