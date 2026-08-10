@@ -172,6 +172,34 @@ mod teardown_tests {
     use glass_core::Deadline;
     use std::time::{Duration, Instant};
 
+    /// A device that answers gets all three asked, in the order the deadline makes load-bearing.
+    ///
+    /// The wedged case below can only ever see the first, so without this the a11y restore — and
+    /// the seam that plants something for it to restore — could do nothing and stay green.
+    #[test]
+    fn a_device_that_answers_is_asked_for_all_three_in_order() {
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let a11y = A11yServiceRegistry::new();
+        a11y.set_active_for_test(Active::for_test(fake.adb().clone(), 1234));
+        let agents = AgentRegistry::new();
+        let emulators = EmulatorRegistry::new();
+        emulators.register(fake.adb(), "emulator-5554".into());
+
+        hand_the_device_back(&a11y, &agents, &emulators, Deadline::UNBOUNDED);
+
+        let calls = fake.calls();
+        assert_eq!(
+            calls,
+            vec![
+                "-s emulator-5554 emu kill",
+                "shell settings delete secure enabled_accessibility_services",
+                "shell settings put secure accessibility_enabled 0",
+                "forward --remove tcp:1234",
+            ],
+            "all three registries, emulator first"
+        );
+    }
+
     /// The join glass-mcp's shutdown hook makes. Each registry has its own wedged-device test;
     /// this one is about the deadline reaching all three, which nothing else can see — before the
     /// `shutdown`/`shutdown_until` pairs collapsed, dropping it meant calling a differently-named

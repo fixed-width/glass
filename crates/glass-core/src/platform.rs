@@ -530,18 +530,18 @@ mod tests {
         assert_eq!(MinimalPlatform.app_pid(), None);
     }
 
-    /// The default is what the four constant-bounded backends rely on, and it is reached only on
-    /// the exit path — where a body of `Ok(())` would mean they quietly stopped stopping their
-    /// app, with every existing test still green.
+    /// `stop_app` is now the provided half of the pair, so a body of `Ok(())` would mean the tool
+    /// path quietly stopped stopping the app — with every backend still compiling, since they
+    /// implement the other one.
     #[test]
-    fn default_stop_app_by_stops_the_app_and_ignores_the_deadline() {
-        struct CountingPlatform(u32);
+    fn the_default_stop_app_reaches_stop_app_by_with_no_bound() {
+        struct CountingPlatform(Option<crate::Deadline>);
         impl Platform for CountingPlatform {
             fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
                 Ok(WindowGeometry::default())
             }
-            fn stop_app_by(&mut self, _deadline: crate::Deadline) -> Result<()> {
-                self.0 += 1;
+            fn stop_app_by(&mut self, deadline: crate::Deadline) -> Result<()> {
+                self.0 = Some(deadline);
                 Ok(())
             }
             fn capture_frame(&mut self, _region: Option<&Region>) -> Result<Frame> {
@@ -567,14 +567,13 @@ mod tests {
             }
         }
 
-        let mut p = CountingPlatform(0);
-        // A deadline already gone: the default must stop the app regardless, since it does not
-        // spend one.
-        p.stop_app_by(crate::Deadline::at(
-            std::time::Instant::now() - Duration::from_secs(1),
-        ))
-        .expect("the default delegates to stop_app");
-        assert_eq!(p.0, 1);
+        let mut p = CountingPlatform(None);
+        p.stop_app().expect("the default delegates");
+        assert_eq!(
+            p.0,
+            Some(crate::Deadline::UNBOUNDED),
+            "the tool path must reach the backend, and with no bound"
+        );
     }
 
     #[test]
