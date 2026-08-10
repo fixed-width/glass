@@ -105,6 +105,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_field_still_holding_what_it_held_took_no_effect_from_the_write() {
+        assert!(write_took_no_effect("hello", Some("hello")));
+    }
+
+    #[test]
+    fn a_field_holding_anything_else_took_something_from_the_write() {
+        // Including a transformation: an iOS field that autocapitalized the text it was given
+        // received every keystroke, so a backend's "the tap may have missed" must not attach.
+        assert!(!write_took_no_effect("Hello", Some("hello")));
+    }
+
+    #[test]
+    fn a_read_back_with_no_baseline_cannot_show_a_write_took_no_effect() {
+        // `None` is a pre-write read the backend could not take. Treating it as a match would
+        // attach an explanation of a write that never landed to one nobody can place.
+        assert!(!write_took_no_effect("hello", None));
+        assert!(!write_took_no_effect("", None));
+    }
+
+    #[test]
     fn a_write_that_changed_nothing_did_not_take() {
         // A read-only editable that accepts the write and keeps its value.
         assert!(!set_value_took("#000000", "#000000", "#12AA34"));
