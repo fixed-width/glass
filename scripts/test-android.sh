@@ -30,6 +30,13 @@
 # SUBSTRING, so a future test whose name contains the excluded one's would go too, unannounced.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/lib/device-residue.sh
+
+adb="${GLASS_ADB:-adb}"
+if ! before="$(device_snapshot "$adb")"; then
+    echo "cannot read the device (GLASS_ADB=${GLASS_ADB:-<unset>}); is one attached?" >&2
+    exit 1
+fi
 
 # Two invocations, not one `-p glass-android -p glass-mcp`: a `--test` filter applies to every
 # `-p` package, so neither package matches the other's targets and the run exits 0 having tested
@@ -52,5 +59,15 @@ cargo test --no-fail-fast -p glass-android \
 cargo test --no-fail-fast -p glass-mcp \
   --test android_session_loop \
   -- --ignored --test-threads=1 "$@" || rc=$?
+
+# After the suite, not per test: the check costs a settle wait, and a test that leaks hands the
+# device to every test after it anyway, so the run is the unit worth reporting on.
+residue=0
+report_device_residue "$adb" "$before" || residue=1
+# Only when the suite itself passed, so a leak does not overwrite cargo's 101 with a 1 and hide
+# which kind of failure this was.
+if [ "$rc" -eq 0 ]; then
+  rc="$residue"
+fi
 
 exit "$rc"
