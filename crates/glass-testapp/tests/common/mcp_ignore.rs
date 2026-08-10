@@ -174,5 +174,10 @@ pub async fn assert_blink_region_e2e(testapp: &str, backend: &str, start_timeout
         "the mask must exclude exactly its own area: {diff}"
     );
 
+    // Stop the session this test started. Cancelling the client only closes the connection, and
+    // the server's own teardown runs when its serve loop returns — which dropping the test's
+    // runtime skips. That leaves `Drop for WaylandPlatform`, which needs seconds it does not get
+    // before the test binary exits, so without this the compositor is orphaned (glass#415).
+    call(&client, "glass_stop", json!({})).await;
     client.cancel().await.ok();
 }

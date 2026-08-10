@@ -217,8 +217,10 @@ fn request_close(ipc: &mut Ipc) -> Asked {
 
 impl Drop for WaylandPlatform {
     fn drop(&mut self) {
-        // Tear down the compositor subtree even if stop_app was never called
-        // (panicking test, early return), so we never leak sway + Xwayland + app.
+        // Last resort for a `stop_app` that never happened (panicking test, early return), not a
+        // guarantee: with a session still active this asks the app to close, waits `CLOSE_GRACE`
+        // and reaps the tree, so a caller that exits the process right after dropping leaves sway
+        // orphaned mid-teardown (glass#415). Call `stop_app`.
         self.kill_session();
     }
 }
