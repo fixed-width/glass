@@ -42,6 +42,8 @@ use glass_core::{
     description_census_report, role_histogram,
 };
 
+mod common;
+
 /// Comma-separated `package/activity` components to probe, e.g.
 /// `com.android.settings/.Settings`. Each element is exactly what `AppSpec::run`'s first
 /// element accepts on this backend. Unset (or set but empty) skips the probe rather than
@@ -210,19 +212,6 @@ fn spec_for(component: &str) -> AppSpec {
     }
 }
 
-/// Restores the device's accessibility settings — `enabled_accessibility_services`,
-/// `accessibility_enabled` and the `adb forward` — when it drops. `A11yServiceRegistry::ensure`
-/// records the prior values and `shutdown` puts them back, so the only question is whether
-/// `shutdown` is reached: a guard reaches it on the panicking path too, which a plain call at
-/// the end of the test does not.
-struct RestoreServiceState<'a>(&'a A11yServiceRegistry);
-
-impl Drop for RestoreServiceState<'_> {
-    fn drop(&mut self) {
-        self.0.shutdown();
-    }
-}
-
 /// The node cap lifted, so a big app's tree is never truncated mid-probe. Depth and per-level
 /// sibling rails keep their generous structural defaults regardless.
 fn uncapped() -> WalkLimits {
@@ -241,6 +230,7 @@ fn uiautomator_role_histogram_probe() {
     };
 
     let agents = AgentRegistry::new();
+    let _stop_agent = common::StopAgent(&agents);
     let mut platform =
         AndroidPlatform::from_env(&EmulatorRegistry::new(), &agents).expect("attach to a device");
     let mut violations = Vec::new();
@@ -277,8 +267,6 @@ fn uiautomator_role_histogram_probe() {
         platform.stop_app().expect("stop_app");
     }
 
-    drop(platform); // close the platform's agent connection (if any) before the registry
-    agents.shutdown(); // never leak a launched agent
     // The census prints without a caveat now that this reader sources the field, so a reader
     // regressed to `description: None` would print a plausible zero for every app and this probe
     // would pass silently. The app list is the caller's, so this is a note, not a failure.
@@ -308,6 +296,7 @@ fn service_role_histogram_probe() {
     };
 
     let agents = AgentRegistry::new();
+    let _stop_agent = common::StopAgent(&agents);
     let mut platform =
         AndroidPlatform::from_env(&EmulatorRegistry::new(), &agents).expect("attach to a device");
     let registry = A11yServiceRegistry::new();
@@ -323,7 +312,7 @@ fn service_role_histogram_probe() {
     // Held for the rest of the run so the settings go back however this probe leaves — a
     // panicking start_app or snapshot mid-loop would otherwise strand the device in exactly
     // the state the hoisted `ensure` above exists to avoid.
-    let _restore = RestoreServiceState(&registry);
+    let _restore = common::RestoreServiceState(&registry);
     let mut a11y = ServiceA11y::new(client, String::new());
     let mut violations = Vec::new();
     let mut described = 0usize;
@@ -360,7 +349,6 @@ fn service_role_histogram_probe() {
     }
 
     drop(platform);
-    agents.shutdown();
     // Same rationale as `uiautomator_role_histogram_probe` above: a silent zero is a note here,
     // not a failure, since the app list is the caller's.
     if described == 0 {

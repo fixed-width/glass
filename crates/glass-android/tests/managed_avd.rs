@@ -9,6 +9,8 @@ use glass_android::EmulatorRegistry;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod common;
+
 fn adb() -> String {
     std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".into())
 }
@@ -84,9 +86,14 @@ fn boots_reuses_and_cleans_up() {
         "start this test with no emulator running"
     );
     let registry = EmulatorRegistry::new();
+    // `kill_all` below is what this test asserts on, so it stays explicit; this only covers the
+    // path where an assertion between here and there panics, which would otherwise leave a
+    // booted emulator behind. Idempotent — `kill_all` takes the list.
+    let _kill_emulators = common::KillBootedEmulators(&registry);
 
     // First resolve boots the AVD.
     let agents1 = glass_android::AgentRegistry::new();
+    let _stop_agent1 = common::StopAgent(&agents1);
     let mut p1 =
         glass_android::AndroidPlatform::from_env(&registry, &agents1).expect("boot+attach");
     assert_eq!(online_count(), 1, "expected one emulator after boot");
@@ -94,13 +101,16 @@ fn boots_reuses_and_cleans_up() {
 
     // Second resolve attaches to the same emulator — no second boot.
     let agents2 = glass_android::AgentRegistry::new();
+    let _stop_agent2 = common::StopAgent(&agents2);
     let _p2 = glass_android::AndroidPlatform::from_env(&registry, &agents2).expect("attach reuse");
     assert_eq!(online_count(), 1, "reuse must not boot a second emulator");
 
     // Cleanup stops the glass-booted emulator.
     drop(p1);
     drop(_p2);
-    agents1.shutdown(); // tear down any launched agent — these tests must not leak it
+    // Explicit, and before `kill_all`, because this test goes on to assert the emulator went
+    // offline: the guards above only repeat this on the panicking path.
+    agents1.shutdown();
     agents2.shutdown();
     registry.kill_all();
     let w = await_offline();
