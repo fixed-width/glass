@@ -217,8 +217,11 @@ fn request_close(ipc: &mut Ipc) -> Asked {
 
 impl Drop for WaylandPlatform {
     fn drop(&mut self) {
-        // Tear down the compositor subtree even if stop_app was never called
-        // (panicking test, early return), so we never leak sway + Xwayland + app.
+        // Last resort for a `stop_app` that never happened (panicking test, early return), not a
+        // guarantee: this asks the app to close, waits up to `CLOSE_GRACE`, reaps the tree and
+        // only then drops the private bus. glass-mcp runs it on a detached thread nothing joins,
+        // so a process exiting right after the drop kills it partway and orphans sway and the
+        // bus (glass#415) — a shorter grace would not help. Call `stop_app`.
         self.kill_session();
     }
 }

@@ -626,10 +626,15 @@ pub async fn run_verification_cost(client: &Peer<RoleClient>) -> (ArmReport, Arm
     (a1, b)
 }
 
-/// Stop and relaunch the fixture for a clean UI between arms. `glass_stop` takes no
-/// arguments (see `glass_mcp::server::glass_stop`).
-async fn restart_fixture(client: &Peer<RoleClient>) {
+/// Stop the fixture session — cancelling the client does not, and the backend's `Drop` is no
+/// fallback here (glass#415).
+pub async fn stop_fixture(client: &Peer<RoleClient>) {
     call(client, "glass_stop", json!({})).await;
+}
+
+/// Stop and relaunch the fixture for a clean UI between arms.
+async fn restart_fixture(client: &Peer<RoleClient>) {
+    stop_fixture(client).await;
     start_fixture(client).await;
 }
 
