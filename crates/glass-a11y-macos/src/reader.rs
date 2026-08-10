@@ -542,7 +542,8 @@ fn should_skip(el: &AXUIElement) -> bool {
 }
 
 /// Pre-order walk mirroring [`walk`]'s traversal — same `should_skip` predicate, same
-/// `AXChildren` order, same bounds via [`WalkBudget::may_explore_children`] — to locate the element at
+/// `AXChildren` order, same bounds via [`WalkBudget::may_explore_children`] — to locate the
+/// element at
 /// pre-order index `target`. That is the same numbering `glass_core::AxTree::assign_ids`
 /// gives the tree `snapshot` returns (root = 0), so a `target.id` captured from a snapshot
 /// lands on the same element here. `budget` doubles as the running id (a node's id is

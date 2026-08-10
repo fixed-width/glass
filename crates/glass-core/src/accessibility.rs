@@ -514,18 +514,16 @@ impl WalkBudget {
     /// non-empty — calling it for a childless node would record a truncation for declining to
     /// explore a list that was never going to be walked anyway.
     ///
-    /// Every traversal that assigns ids reaches its decision through this one method, at the same
-    /// point in the walk, and a new one must too. A reader's `walk` and `find_nth` number nodes by
-    /// arrival order and `set_value` re-walks to a caller-supplied id, so a bound applied in one
-    /// traversal but not the other resolves that id against a different tree and writes to the
-    /// wrong element — and a mapper that numbered a tree differently from the reader that re-finds
-    /// in it would do the same across the pair. Sharing the decision is what makes that divergence
-    /// impossible to introduce by editing one of them.
+    /// Every traversal that assigns ids reaches its decision here, at the same point in the walk,
+    /// and a new one must too. Nodes are numbered by arrival and `set_value` re-walks to a
+    /// caller-supplied id, so a bound applied in one traversal and not another resolves that id
+    /// against a different tree and writes to the wrong element — between a reader's `walk` and its
+    /// `find_nth`, or between a mapper and the reader that re-finds in what it numbered.
     //
     // The exactly-at-cap boundary — a *complete* tree of exactly `limits.nodes` must report `None`,
-    // since the last node to arrive wasn't declined — is a property of a whole walk rather than of
-    // this decision, so it is tested end-to-end in the Android/iOS mappers, which can size a
-    // synthetic tree to the node where a live platform tree can't be.
+    // since the last node to arrive wasn't declined — is a property of a whole walk, so it is
+    // tested end-to-end in the Android/iOS mappers, which can size a synthetic tree to the node
+    // where a live platform tree can't be.
     pub fn may_explore_children(&mut self, depth: usize) -> bool {
         if self.depth_exhausted(depth) {
             self.hit(TruncationLimit::Depth);
@@ -539,10 +537,9 @@ impl WalkBudget {
     }
 
     /// Whether the sibling at scan position `scanned` may be visited, recording the bound that
-    /// stopped the level when it may not. `scanned` counts siblings *looked at* on this level, not
-    /// nodes entered: a reader that skips offscreen children without visiting them still advances
-    /// it, which is what bounds the scan of a virtualized list of thousands that `nodes_exhausted`
-    /// alone would never stop.
+    /// stopped the level when it may not. `scanned` counts siblings *looked at*, not nodes entered:
+    /// a reader that skips offscreen children without entering them still advances it, which is
+    /// what bounds a virtualized list of thousands that `nodes_exhausted` alone would never stop.
     ///
     /// Consulted before each child rather than after, so the child that merely completes the tree
     /// is not mistaken for one the walk declined to visit.
@@ -3017,8 +3014,8 @@ mod tests {
 
     #[test]
     fn a_spent_node_budget_outranks_the_sibling_cap() {
-        // Nodes is the cause when both are out: the level would have stopped for the node budget
-        // whatever its width, and a caller told "too many siblings" would narrow the wrong thing.
+        // Nodes is the cause when both are out — a caller told "too many siblings" would narrow
+        // the wrong thing.
         let mut b = WalkBudget::new();
         for _ in 0..MAX_NODES {
             b.visit();

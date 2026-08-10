@@ -541,8 +541,8 @@ impl Accessibility for ServiceA11y {
             };
             // Before the value check, not after: a collapsed row maps its text to `name` and
             // reports no value, so `"" == ""` would confirm a *clear* on the evidence that the
-            // field stopped being a field. `AndroidA11y` re-checks the flag too, through the
-            // shared `glass_core::verify_typed_write`.
+            // field stopped being a field. `AndroidA11y` re-checks it too, through the shared
+            // `glass_core::verify_typed_write`.
             if !node.states.editable {
                 return Err(GlassError::AxWriteUnconfirmed(
                     target.id.0,
