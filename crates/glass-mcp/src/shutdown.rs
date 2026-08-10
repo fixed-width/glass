@@ -101,7 +101,7 @@ mod tests {
                 height: 10,
             })
         }
-        fn stop_app(&mut self) -> Result<()> {
+        fn stop_app_by(&mut self, _deadline: glass_core::Deadline) -> Result<()> {
             // 2s >> the 200ms budget below — long enough to prove `run_shutdown`
             // returns on the timeout rather than waiting for stop_app, but short
             // enough that the runtime's wait for this detached blocking thread at

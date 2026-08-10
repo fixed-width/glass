@@ -87,6 +87,29 @@ pub(crate) fn unsupported_window_move_resize() -> glass_core::GlassError {
     )
 }
 
+/// Give the device back what glass took: the accessibility companion it enabled, the `adb forward`
+/// it opened, the emulator it booted — all by `deadline`.
+///
+/// `Glass::shutdown` keeps `TEARDOWN_HOOK_RESERVE` back from the sessions so these have time
+/// (glass#422). Between themselves it is first-come-first-served, which makes the order
+/// load-bearing: the emulator goes first, being both the cheapest step (`adb emu kill` measured at
+/// 2ms) and the largest leak. Put it last and a wedged device spends the whole deadline on the
+/// settings restore, leaving a ~2GB VM that was never asked to stop.
+///
+/// One function rather than three calls in glass-mcp's hook, so a test can watch the deadline
+/// reach all three — collapsing each registry's `shutdown`/`shutdown_until` pair made losing it a
+/// one-token edit.
+pub fn hand_the_device_back(
+    a11y: &A11yServiceRegistry,
+    agents: &AgentRegistry,
+    emulators: &EmulatorRegistry,
+    deadline: glass_core::Deadline,
+) {
+    emulators.kill_all(deadline);
+    a11y.shutdown(deadline);
+    agents.shutdown(deadline);
+}
+
 #[cfg(test)]
 mod capability_tests {
     use super::*;
@@ -137,5 +160,51 @@ mod capability_tests {
         assert!(msg.contains("android backend"), "{msg}");
         assert!(msg.contains("full-screen"), "{msg}");
         assert!(msg.contains("glass_capabilities"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod teardown_tests {
+    use super::*;
+    use crate::a11y_service::Active;
+    use crate::adb::{Answer, FakeAdb};
+    use glass_core::Deadline;
+    use std::time::{Duration, Instant};
+
+    /// The join glass-mcp's shutdown hook makes. Each registry has its own wedged-device test;
+    /// this one is about the deadline reaching all three, which nothing else can see — before the
+    /// `shutdown`/`shutdown_until` pairs collapsed, dropping it meant calling a differently-named
+    /// method (glass#422).
+    #[test]
+    fn a_device_that_stopped_answering_cannot_spend_more_than_the_deadline_on_all_three() {
+        let fake = FakeAdb::new(&[("*", Answer::Lingers)]);
+        let a11y = A11yServiceRegistry::new();
+        a11y.set_active_for_test(Active::for_test(fake.adb().clone(), 1234));
+        let agents = AgentRegistry::new();
+        let emulators = EmulatorRegistry::new();
+        emulators.register(fake.adb(), "emulator-5554".into());
+
+        let started = Instant::now();
+        hand_the_device_back(
+            &a11y,
+            &agents,
+            &emulators,
+            Deadline::at(Instant::now() + Duration::from_millis(300)),
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "waited {:?} handing the device back — one of the three is running unbounded, and \
+             three AdbOp::Shell budgets is 30s against a 3s teardown",
+            started.elapsed()
+        );
+        // The emulator is asked first, so a wedged device cannot leave a VM running that was
+        // never even asked to stop. The two behind it are starved, which is the trade.
+        assert!(
+            fake.called("emu kill"),
+            "the largest leak must be asked about before the deadline can be spent: {:?}",
+            fake.calls()
+        );
     }
 }

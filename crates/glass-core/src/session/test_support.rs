@@ -900,7 +900,7 @@ impl Platform for BareMinPlatform {
     fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
         Ok(WindowGeometry::default())
     }
-    fn stop_app(&mut self) -> Result<()> {
+    fn stop_app_by(&mut self, _deadline: crate::Deadline) -> Result<()> {
         Ok(())
     }
     fn capture_frame(&mut self, _region: Option<&crate::frame::Region>) -> Result<Frame> {

@@ -326,12 +326,12 @@ impl AgentRegistry {
         Ok(port)
     }
 
-    /// Kill the device agent (via the host child) and remove the forward. Best-effort.
-    /// Kill the agent and remove its forward by `deadline`, which the rest of teardown shares
-    /// (glass#422); [`Deadline::UNBOUNDED`] off that path.
+    /// Kill the device agent (via the host child) and remove the forward by `deadline`, which the
+    /// rest of teardown shares (glass#422); [`Deadline::UNBOUNDED`] off that path. Best-effort.
     ///
-    /// Only the forward removal is under it — dropping `p` then kills and reaps the agent with an
-    /// unbounded `wait()`, the gap `AndroidPlatform::stop_app_until` names for logcat.
+    /// Only the forward removal is under the deadline — dropping `p` then kills and reaps the
+    /// agent with an unbounded `wait()`, the gap `AndroidPlatform::stop_app_until` names for
+    /// logcat.
     pub fn shutdown(&self, deadline: Deadline) {
         if let Ok(mut guard) = self.state.lock()
             && let Some(p) = guard.take()

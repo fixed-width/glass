@@ -59,6 +59,9 @@ const MAX_CAPTURE: usize = 64 * 1024 * 1024;
 ///
 /// Both pipes are drained on their own threads: a child that fills a pipe buffer while the parent
 /// waits blocks in `write` and never exits, putting the deadline itself out of reach.
+///
+/// A zero `budget` is [`BoundKind::NotStarted`] — the command is not spawned at all, rather than
+/// spawned and killed at once.
 pub fn run_bounded(cmd: &mut Command, budget: Duration, op: &str) -> Result<Output> {
     run_bounded_until(cmd, budget, Deadline::UNBOUNDED, op)
 }

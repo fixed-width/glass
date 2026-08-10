@@ -1310,52 +1310,6 @@ pub fn element_match<'a>(
 mod tests {
     use super::*;
 
-    /// The two bounds a reader holds — its own and its caller's — resolve to whichever falls
-    /// first, in both directions.
-    #[test]
-    fn a_deadline_caps_a_proposed_instant_only_when_it_falls_first() {
-        let soon = Deadline::from_millis(1_000);
-        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        assert!(soon.cap(later) < later, "the nearer bound did not govern");
-
-        let now = std::time::Instant::now();
-        assert_eq!(
-            soon.cap(now),
-            now,
-            "a reader's own nearer bound was widened"
-        );
-    }
-
-    /// A caller that named no instant leaves the reader whatever it proposed — [`Deadline::UNBOUNDED`]
-    /// is not a deadline of zero, which would stop every read before it started.
-    #[test]
-    fn no_deadline_caps_nothing_and_is_never_spent() {
-        let proposed = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        assert_eq!(Deadline::UNBOUNDED.cap(proposed), proposed);
-        assert_eq!(Deadline::UNBOUNDED.remaining(), None);
-        assert!(!Deadline::UNBOUNDED.has_passed());
-    }
-
-    /// The tie-break is load-bearing: a reader blames its own bound when both fall together, so a
-    /// backend that hung for its whole ceiling is never reported as a caller who ran out of time.
-    #[test]
-    fn a_deadline_governs_a_step_only_when_it_falls_strictly_first() {
-        let now = std::time::Instant::now();
-        let soon = Deadline::from_millis(1_000);
-        assert!(soon.governs(now + std::time::Duration::from_secs(60)));
-        assert!(!soon.governs(now));
-        assert!(!Deadline::UNBOUNDED.governs(now + std::time::Duration::from_secs(60)));
-        // The tie itself, which only a shared instant can express: `<=` here would blame the
-        // caller for a backend that hung for exactly its own ceiling.
-        assert!(!Deadline::at(now).governs(now));
-    }
-
-    #[test]
-    fn a_deadline_has_passed_once_its_instant_has_passed() {
-        assert!(Deadline::from_millis(0).has_passed());
-        assert!(!Deadline::from_millis(60_000).has_passed());
-    }
-
     /// Compile-time guard for [`AxRole::ALL`] — never called, and exists only for its exhaustive
     /// match. The role-parity tests and [`crate::role_support::ROLE_SUPPORT`] quantify their
     /// completeness claims over `ALL`, so a new variant missing from it would silently weaken

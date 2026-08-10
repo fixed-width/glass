@@ -416,7 +416,7 @@ impl Glass {
             // holds the tree that observed the toggle.
             self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
             // Not event-gated: this branch runs only on iOS, whose reader has no event stream.
-            // No deadline either: `Deadline` carries the *caller's* bound, and
+            // Unbounded here too: a `Deadline` carries the *caller's* bound, and
             // `TOGGLE_VERIFY_TIMEOUT_MS` is glass's own.
             // Kept as the poll runs, not re-read afterwards — a read taken after the bound elapsed
             // could catch a state that arrived late and contradict the verdict.

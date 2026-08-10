@@ -643,13 +643,28 @@ pub fn a11y_apk(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     )
 }
 
-struct Active {
+pub(crate) struct Active {
     /// The client the service was enabled through, kept rather than resolved again at teardown:
     /// `Adb::from_env` reads the environment as it is *then*, which need not be what set this up.
     adb: Adb,
     port: u16,
     prior_enabled: String,
     prior_a11y_enabled: String,
+}
+
+// Unix-gated with its only consumer, the `FakeAdb`-backed teardown test — that fake is a
+// `/bin/sh` script.
+#[cfg(all(test, unix))]
+impl Active {
+    /// An enabled service to restore, for a test that needs a registry with work to do.
+    pub(crate) fn for_test(adb: Adb, port: u16) -> Self {
+        Self {
+            adb,
+            port,
+            prior_enabled: String::new(),
+            prior_a11y_enabled: "0".to_string(),
+        }
+    }
 }
 
 /// Owns the installed+enabled state so the shutdown hook can restore it. Cloneable (shared
@@ -716,11 +731,18 @@ impl A11yServiceRegistry {
         Ok(client)
     }
 
-    /// Restore the device's prior accessibility state and remove the forward. Best-effort,
-    /// idempotent. No process to kill (disabling unbinds the service).
-    /// Restore the device and remove the forward by `deadline`, which the rest of teardown shares
-    /// — stopping the app has already spent part of `glass_core::TEARDOWN_BUDGET` (glass#422).
-    /// [`Deadline::UNBOUNDED`] off that path, where each call keeps its own budget.
+    /// Plant an active service, for a test that needs a registry with something to restore.
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_active_for_test(&self, active: Active) {
+        *self.state.lock().unwrap() = Some(active);
+    }
+
+    /// Restore the device's prior accessibility state and remove the forward by `deadline`, which
+    /// the rest of teardown shares — stopping the app has already spent part of
+    /// `glass_core::TEARDOWN_BUDGET` (glass#422). [`Deadline::UNBOUNDED`] off that path, where
+    /// each call keeps its own budget.
+    ///
+    /// Best-effort and idempotent. No process to kill: disabling unbinds the service.
     pub fn shutdown(&self, deadline: Deadline) {
         if let Ok(mut g) = self.state.lock()
             && let Some(a) = g.take()

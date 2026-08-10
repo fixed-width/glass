@@ -253,7 +253,8 @@ mod backend {
             }
         }
 
-        fn stop_app(&mut self) -> Result<()> {
+        /// Ignores the deadline: this teardown is a Job object close, already asserted against TEARDOWN_BUDGET.
+        fn stop_app_by(&mut self, _deadline: glass_core::Deadline) -> Result<()> {
             if let Some(app) = self.app.take() {
                 crate::process::disclose_teardown(app.kill());
             }

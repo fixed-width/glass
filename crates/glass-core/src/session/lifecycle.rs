@@ -1,6 +1,4 @@
 //! `Glass` session lifecycle: start/stop/shutdown and geometry.
-use std::time::Duration;
-
 use super::*;
 
 impl Glass {
@@ -96,13 +94,10 @@ impl Glass {
     /// `HashMap` instead of this `Option`) reuses it unchanged — it becomes a `for`
     /// loop with no other change.
     pub fn shutdown(&mut self, deadline: Deadline) {
-        // Never more than half, or a caller whose budget is smaller than the reserve — a test,
-        // a host that shortens it — starves the sessions instead of the hook.
-        let reserve = deadline.remaining().map_or(Duration::ZERO, |left| {
-            crate::TEARDOWN_HOOK_RESERVE.min(left / 2)
-        });
         if let Some(mut s) = self.active.take() {
-            let _ = s.platform.stop_app_by(deadline.less(reserve));
+            let _ = s
+                .platform
+                .stop_app_by(deadline.reserving(crate::TEARDOWN_HOOK_RESERVE));
             // `s` drops here: the backend (Xvfb/sway/Job) is torn down.
         }
         if let Some(hook) = self.shutdown_hook.take() {
@@ -257,7 +252,8 @@ mod tests {
             .lock()
             .unwrap()
             .expect("the backend must be stopped through `stop_app_by`, not `stop_app`");
-        // Both read now, so the difference between them is the reserve.
+        // Each `remaining()` reads its own now, microseconds apart, so comparing them compares
+        // the instants they hold.
         assert!(
             at_stop.remaining().expect("a bounded share") < deadline.remaining().unwrap(),
             "the session's share must stop short of the hook's, or the reserve is not held back"
@@ -269,7 +265,6 @@ mod tests {
         );
     }
 
-    /// The property this whole split exists for (glass#422): a session that spends everything it
     /// The other half of the split: the reserve is a fixed 750ms, so without the clamp a caller
     /// whose whole budget is smaller hands the sessions a deadline already in the past.
     #[test]
@@ -289,13 +284,13 @@ mod tests {
         let started = std::time::Instant::now();
         g.shutdown(Deadline::at(started + budget));
 
+        // Measured from `started`, not from now: `remaining()` here would subtract whatever the
+        // test itself has since spent, and the margin is only tens of milliseconds.
         let given = at_stop
             .lock()
             .unwrap()
             .expect("the backend was stopped")
-            .remaining()
-            .expect("a bounded share");
-        let _ = started;
+            .within(std::time::Duration::MAX, started);
         assert!(
             given >= budget / 3,
             "the sessions were given {given:?} of a {budget:?} budget — the reserve was taken \
@@ -303,9 +298,10 @@ mod tests {
         );
     }
 
-    /// is given must still leave the hook enough to run. Without the reserve the hook is reached
-    /// with a spent deadline, and `run_bounded_until` does not start a command it has no time for
-    /// — so every step behind it is skipped rather than merely slow.
+    /// The property this whole split exists for (glass#422): a session that spends everything it is
+    /// given must still leave the hook enough to run. Without the reserve the hook is reached with
+    /// a spent deadline, and `run_bounded_until` does not start a command it has no time for — so
+    /// every step behind it is skipped rather than merely slow.
     #[test]
     fn a_session_that_burns_its_deadline_still_leaves_the_hook_time_to_run() {
         let factory: PlatformFactory = Box::new(move |_backend| {

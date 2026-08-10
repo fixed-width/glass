@@ -16,9 +16,9 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use super::proto;
 use proto::companion_service_client::CompanionServiceClient;
 
-/// Deadline for establishing the connection (dial + HTTP/2 handshake).
+/// Budget for establishing the connection (dial + HTTP/2 handshake).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Deadline for a single RPC. 30s mirrors glass-android's socket timeout.
+/// Budget for a single RPC. 30s mirrors glass-android's socket timeout.
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Blocking handle to `idb_companion`'s gRPC service.
@@ -41,7 +41,7 @@ pub struct IdbClient {
     client: CompanionServiceClient<Channel>,
 }
 
-/// Deadline for one `hid` stream. A `HidSwipe`/`HidDelay`/`HidPinch` plays out over
+/// Budget for one `hid` stream. A `HidSwipe`/`HidDelay`/`HidPinch` plays out over
 /// its `duration` seconds on the device and holds the streaming RPC open at least
 /// that long, so a flat [`RPC_TIMEOUT`] aborts any gesture longer than it mid-stream
 /// (issue #116). Budget the summed event durations plus [`RPC_TIMEOUT`] of margin: a

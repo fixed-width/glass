@@ -578,7 +578,7 @@ pub(crate) mod testutil {
             self.started = true;
             Ok(self.geometry.clone())
         }
-        fn stop_app(&mut self) -> Result<()> {
+        fn stop_app_by(&mut self, _deadline: glass_core::Deadline) -> Result<()> {
             self.started = false;
             Ok(())
         }

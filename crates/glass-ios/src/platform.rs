@@ -601,10 +601,6 @@ impl Platform for IosPlatform {
         self.app.as_ref().and_then(|a| a.pid)
     }
 
-    fn stop_app(&mut self) -> Result<()> {
-        self.stop_app_until(Deadline::UNBOUNDED)
-    }
-
     /// `terminate` measures ~101ms against the 3s all of teardown gets, so the deadline is not
     /// expected to bind. It is for the simulator that stopped answering, which would otherwise run
     /// out the 10s `SimctlOp::Query` budget and leave nothing for the hook behind it
