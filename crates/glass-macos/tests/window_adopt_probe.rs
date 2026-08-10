@@ -41,6 +41,8 @@
 //! TCC grants as `tests/a11y.rs` — see that file's module doc for how a granted run supplies
 //! them.
 
+mod common;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     println!("skipped (not macOS): test");
@@ -61,6 +63,8 @@ mod macos_main {
         WindowGeometry, WindowInfo, WindowOp,
     };
     use glass_macos::MacosPlatform;
+
+    use crate::common::{fail, with_stop_app};
 
     /// The launch command to probe — a `.app` bundle path or a plain executable path, exactly
     /// what `AppSpec::run`'s first element accepts (see `MacosPlatform::start_app`'s
@@ -95,13 +99,6 @@ mod macos_main {
     const EARLY_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
     const EARLY_SAMPLE_WINDOW: Duration = Duration::from_millis(300);
 
-    /// Print a clear failure message and exit non-zero — the `harness = false` contract (no
-    /// libtest to format a panic for us). Mirrors the sibling integration tests.
-    fn fail(msg: impl AsRef<str>) -> ! {
-        eprintln!("FAIL: {}", msg.as_ref());
-        std::process::exit(1);
-    }
-
     /// One window as one line: everything needed to tell a real app window from a transient
     /// panel — its id, title, pixel geometry, and whether the backend considers it active.
     fn render_window(w: &WindowInfo) -> String {
@@ -117,28 +114,6 @@ mod macos_main {
             w.geometry.y,
             if w.active { " ACTIVE" } else { "" }
         )
-    }
-
-    /// Run `body`, then always call `platform.stop_app()` afterward regardless of whether
-    /// `body` succeeded — mirrors `tests/role_probe.rs`'s identically-named helper.
-    fn with_stop_app<T>(
-        platform: &mut MacosPlatform,
-        label: &str,
-        body: impl FnOnce(&mut MacosPlatform) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let result = body(platform);
-        let stop_result = platform.stop_app();
-        match result {
-            Ok(v) => stop_result
-                .map(|()| v)
-                .map_err(|e| format!("stop_app({label}): {e}")),
-            Err(e) => {
-                if let Err(stop_err) = stop_result {
-                    eprintln!("(additionally) stop_app({label}) failed: {stop_err}");
-                }
-                Err(e)
-            }
-        }
     }
 
     /// One run's outcome: whether the adopted geometry matched a window the app's pid actually

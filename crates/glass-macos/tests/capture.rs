@@ -19,6 +19,8 @@
 //! inherits the bundle's grants. See `scripts/test-macos.sh`'s `GLASS_MACOS_ONBOX` gate
 //! for how this fits the test scripts.
 
+mod common;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     println!("skipped (not macOS): test");
@@ -31,138 +33,19 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos_main {
-    use std::path::PathBuf;
-    use std::process::Command;
     use std::time::Duration;
 
     use glass_core::{AppSpec, Platform, Region, SandboxLevel};
     use glass_macos::MacosPlatform;
 
-    /// Per-channel RGBA tolerance for a sampled pixel vs. its expected known color.
-    /// Generous relative to `deviceRGB` fills (which should land very close to exact),
-    /// but wide enough to absorb any residual compositor/backing-scale blending at a
-    /// sampled point (sample points are quadrant *centers*, away from color boundaries,
-    /// so this is a safety margin, not a load-bearing tolerance).
-    const TOLERANCE: i32 = 40;
+    use crate::common::{
+        PIXEL_TOLERANCE, assert_pixel, close, pixel_at, run_fixture_test, try_expect,
+    };
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const GREEN: [u8; 4] = [0, 255, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
     const WHITE: [u8; 4] = [255, 255, 255, 255];
-
-    /// Print a clear failure message and exit non-zero — the `harness = false` contract
-    /// (no libtest to format a panic for us).
-    fn fail(msg: impl AsRef<str>) -> ! {
-        eprintln!("FAIL: {}", msg.as_ref());
-        std::process::exit(1);
-    }
-
-    /// Unwrap a `Result`, failing the whole test process with `context` prefixed to the
-    /// error on `Err`. Only safe to use before a fixture process has been spawned (or
-    /// once all spawn-time cleanup is already done) — it exits immediately, skipping
-    /// destructors, so anything that still needs `MacosPlatform::stop_app()` run against
-    /// it must go through `try_expect`/`run_checks` below instead.
-    fn expect<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
-        match result {
-            Ok(v) => v,
-            Err(e) => fail(format!("{context}: {e}")),
-        }
-    }
-
-    /// Like `expect`, but returns the error as a `String` instead of exiting the
-    /// process. Used inside `run_checks`, where a failure must still flow back to
-    /// `run()` so it can `stop_app()` the spawned fixture (and clean up the fixture
-    /// build dir) before the process exits — `std::process::exit` skips Rust
-    /// destructors, so `MacosPlatform::Drop` would never reap the child if we exited
-    /// straight from in here.
-    fn try_expect<T, E: std::fmt::Display>(
-        result: Result<T, E>,
-        context: &str,
-    ) -> Result<T, String> {
-        result.map_err(|e| format!("{context}: {e}"))
-    }
-
-    fn swiftc_available() -> bool {
-        Command::new("swiftc")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
-
-    /// Build `fixture/quadrants.swift` to a fresh temp path. Returns the built binary's
-    /// path and the temp build dir it lives in (the caller is responsible for removing
-    /// the dir once done with it — see `run()`).
-    fn build_fixture() -> (PathBuf, PathBuf) {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let source = manifest_dir.join("fixture").join("quadrants.swift");
-        if !source.is_file() {
-            fail(format!("fixture source not found at {}", source.display()));
-        }
-
-        let out_dir =
-            std::env::temp_dir().join(format!("glass-macos-capture-test-{}", std::process::id()));
-        expect(
-            std::fs::create_dir_all(&out_dir),
-            "creating fixture build dir",
-        );
-        let out_bin = out_dir.join("quadrants");
-
-        let status = Command::new("swiftc")
-            .arg("-O")
-            .arg("-parse-as-library")
-            .arg(&source)
-            .arg("-o")
-            .arg(&out_bin)
-            .status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => fail(format!(
-                "swiftc exited with {s} building {}",
-                source.display()
-            )),
-            Err(e) => fail(format!("failed to run swiftc: {e}")),
-        }
-        (out_bin, out_dir)
-    }
-
-    /// Fetch pixel `(x, y)` from a tightly-packed RGBA8 `Frame` buffer.
-    fn pixel_at(pixels: &[u8], frame_width: u32, x: u32, y: u32) -> [u8; 4] {
-        let idx = (y as usize * frame_width as usize + x as usize) * 4;
-        [
-            pixels[idx],
-            pixels[idx + 1],
-            pixels[idx + 2],
-            pixels[idx + 3],
-        ]
-    }
-
-    fn close(a: [u8; 4], b: [u8; 4]) -> bool {
-        a.iter()
-            .zip(b.iter())
-            .all(|(x, y)| (*x as i32 - *y as i32).abs() <= TOLERANCE)
-    }
-
-    /// Assert the pixel at `(x, y)` in `frame` is within tolerance of `expected`,
-    /// returning a detailed `Err` message (including the actual bytes) otherwise. Returns
-    /// `Result` rather than failing the process directly so a mismatch, raised from
-    /// inside `run_checks` with a fixture process already spawned, still flows back to
-    /// `run()`'s cleanup (`stop_app` + temp dir removal) before the process exits.
-    fn assert_pixel(
-        pixels: &[u8],
-        frame_width: u32,
-        x: u32,
-        y: u32,
-        expected: [u8; 4],
-        label: &str,
-    ) -> Result<(), String> {
-        let got = pixel_at(pixels, frame_width, x, y);
-        if !close(got, expected) {
-            return Err(format!(
-                "{label} pixel at ({x},{y}) = {got:?}, expected ~{expected:?} (tolerance {TOLERANCE})"
-            ));
-        }
-        Ok(())
-    }
 
     /// Assert every pixel in a tightly-packed RGBA8 buffer of `w`x`h` is within tolerance
     /// of `expected`. Returns `Result` for the same reason as `assert_pixel`.
@@ -179,7 +62,7 @@ mod macos_main {
                 if !close(got, expected) {
                     return Err(format!(
                         "{label}: non-uniform pixel at ({x},{y}) = {got:?}, expected ~{expected:?} \
-                         (tolerance {TOLERANCE}) within a {w}x{h} region"
+                         (tolerance {PIXEL_TOLERANCE}) within a {w}x{h} region"
                     ));
                 }
             }
@@ -276,47 +159,6 @@ mod macos_main {
     }
 
     pub(super) fn run() {
-        if !swiftc_available() {
-            println!("skipped (no swiftc)");
-            return;
-        }
-
-        let (fixture_bin, fixture_dir) = build_fixture();
-        println!("built fixture at {}", fixture_bin.display());
-
-        let mut platform = match MacosPlatform::new() {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&fixture_dir);
-                fail(format!(
-                    "MacosPlatform::new() (Screen Recording / Accessibility grant missing?): {e}"
-                ));
-            }
-        };
-
-        let result = run_checks(&mut platform, &fixture_bin);
-
-        // Reached regardless of outcome and BEFORE any process::exit below: `stop_app` is
-        // documented idempotent, so this is what guarantees the fixture's `quadrants` process
-        // never survives a failed run.
-        let stop_result = platform.stop_app();
-        let _ = std::fs::remove_dir_all(&fixture_dir);
-
-        match result {
-            Ok(()) => {
-                expect(stop_result, "stop_app");
-                println!("CAPTURE_INTEGRATION_PASS");
-                std::process::exit(0);
-            }
-            Err(msg) => {
-                // stop_app is infallible today (always Ok), but surface a future failure
-                // here too rather than silently dropping it — this is the last point
-                // before the process exits, so it's the only chance to report it.
-                if let Err(e) = stop_result {
-                    eprintln!("(additionally) stop_app failed: {e}");
-                }
-                fail(msg);
-            }
-        }
+        run_fixture_test("quadrants", "CAPTURE_INTEGRATION_PASS", run_checks);
     }
 }

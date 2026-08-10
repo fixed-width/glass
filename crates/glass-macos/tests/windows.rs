@@ -36,6 +36,8 @@
 //! match..."`) — its PRESENCE means the private symbol failed and the geometry fallback
 //! engaged for this run; its ABSENCE means the private correlation itself succeeded.
 
+mod common;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     println!("skipped (not macOS): test");
@@ -49,13 +51,13 @@ fn main() {
 #[cfg(target_os = "macos")]
 mod macos_main {
     use std::collections::HashSet;
-    use std::path::PathBuf;
-    use std::process::Command;
     use std::time::Duration;
 
     use glass_core::platform::{WindowGeometry, WindowInfo, WindowOp};
     use glass_core::{AppSpec, Platform, SandboxLevel};
     use glass_macos::MacosPlatform;
+
+    use crate::common::{assert_pixel, run_fixture_test, try_expect};
 
     /// Settle after `start_app` before the first `list_windows` — both fixture windows need
     /// a moment to finish appearing/painting (mirrors `capture.rs`/`input.rs`'s identical
@@ -95,9 +97,6 @@ mod macos_main {
     /// rejects a resize that visibly did nothing, not rounding noise.
     const RESIZE_CHANGE_THRESHOLD_PX: i64 = 20;
 
-    /// Per-channel RGBA tolerance for a sampled pixel vs. its expected known color — same
-    /// value and rationale as `capture.rs`'s identical constant.
-    const PIXEL_TOLERANCE: i32 = 40;
     /// `quadrants.swift`'s `secondaryPalette` ("glass-fixture-2"'s quadrant colors) — see that
     /// file's module doc. Used to confirm `capture_frame(None)` captured the SELECTED
     /// (secondary) window, not the primary one, by pixel color alone.
@@ -105,77 +104,6 @@ mod macos_main {
     const SECONDARY_TOP_RIGHT: [u8; 4] = [255, 0, 255, 255]; // magenta
     const SECONDARY_BOTTOM_LEFT: [u8; 4] = [255, 255, 0, 255]; // yellow
     const SECONDARY_BOTTOM_RIGHT: [u8; 4] = [0, 0, 0, 255]; // black
-
-    /// Print a clear failure message and exit non-zero — the `harness = false` contract (no
-    /// libtest to format a panic for us).
-    fn fail(msg: impl AsRef<str>) -> ! {
-        eprintln!("FAIL: {}", msg.as_ref());
-        std::process::exit(1);
-    }
-
-    /// Unwrap a `Result`, failing the whole test process with `context` prefixed to the error
-    /// on `Err`. Only safe to use before a fixture process has been spawned — see
-    /// `capture.rs`'s identical helper for why anything after that must go through
-    /// `try_expect`/`run_checks` instead.
-    fn expect<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
-        match result {
-            Ok(v) => v,
-            Err(e) => fail(format!("{context}: {e}")),
-        }
-    }
-
-    /// Like `expect`, but returns the error as a `String` instead of exiting the process — so
-    /// a failure raised inside `run_checks` (fixture already spawned) still flows back to
-    /// `run()`, which reaches `stop_app()` before the process exits.
-    fn try_expect<T, E: std::fmt::Display>(
-        result: Result<T, E>,
-        context: &str,
-    ) -> Result<T, String> {
-        result.map_err(|e| format!("{context}: {e}"))
-    }
-
-    fn swiftc_available() -> bool {
-        Command::new("swiftc")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
-
-    /// Build `fixture/quadrants.swift` to a fresh temp path — identical to `capture.rs`'s/
-    /// `input.rs`'s `build_fixture`, just a distinct temp-dir name so a parallel run of all
-    /// three tests never collides.
-    fn build_fixture() -> (PathBuf, PathBuf) {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let source = manifest_dir.join("fixture").join("quadrants.swift");
-        if !source.is_file() {
-            fail(format!("fixture source not found at {}", source.display()));
-        }
-
-        let out_dir =
-            std::env::temp_dir().join(format!("glass-macos-windows-test-{}", std::process::id()));
-        expect(
-            std::fs::create_dir_all(&out_dir),
-            "creating fixture build dir",
-        );
-        let out_bin = out_dir.join("quadrants");
-
-        let status = Command::new("swiftc")
-            .arg("-O")
-            .arg("-parse-as-library")
-            .arg(&source)
-            .arg("-o")
-            .arg(&out_bin)
-            .status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => fail(format!(
-                "swiftc exited with {s} building {}",
-                source.display()
-            )),
-            Err(e) => fail(format!("failed to run swiftc: {e}")),
-        }
-        (out_bin, out_dir)
-    }
 
     /// Number of `windows` entries with `active == true`.
     fn count_active(windows: &[WindowInfo]) -> usize {
@@ -218,43 +146,6 @@ mod macos_main {
         let dist_after = (after.width as i64 - target.0 as i64).abs()
             + (after.height as i64 - target.1 as i64).abs();
         dist_after <= dist_before
-    }
-
-    /// Fetch pixel `(x, y)` from a tightly-packed RGBA8 `Frame` buffer — identical to
-    /// `capture.rs`'s helper of the same name.
-    fn pixel_at(pixels: &[u8], frame_width: u32, x: u32, y: u32) -> [u8; 4] {
-        let idx = (y as usize * frame_width as usize + x as usize) * 4;
-        [
-            pixels[idx],
-            pixels[idx + 1],
-            pixels[idx + 2],
-            pixels[idx + 3],
-        ]
-    }
-
-    fn close(a: [u8; 4], b: [u8; 4]) -> bool {
-        a.iter()
-            .zip(b.iter())
-            .all(|(x, y)| (*x as i32 - *y as i32).abs() <= PIXEL_TOLERANCE)
-    }
-
-    /// Assert the pixel at `(x, y)` in a tightly-packed RGBA8 buffer is within tolerance of
-    /// `expected` — identical shape to `capture.rs`'s helper of the same name.
-    fn assert_pixel(
-        pixels: &[u8],
-        frame_width: u32,
-        x: u32,
-        y: u32,
-        expected: [u8; 4],
-        label: &str,
-    ) -> Result<(), String> {
-        let got = pixel_at(pixels, frame_width, x, y);
-        if !close(got, expected) {
-            return Err(format!(
-                "{label} pixel at ({x},{y}) = {got:?}, expected ~{expected:?} (tolerance {PIXEL_TOLERANCE})"
-            ));
-        }
-        Ok(())
     }
 
     /// The whole `start_app` -> list/select/move/resize/capture -> assertion flow. Returns
@@ -492,46 +383,6 @@ mod macos_main {
     }
 
     pub(super) fn run() {
-        if !swiftc_available() {
-            println!("skipped (no swiftc)");
-            return;
-        }
-
-        let (fixture_bin, fixture_dir) = build_fixture();
-        println!("built fixture at {}", fixture_bin.display());
-
-        let mut platform = match MacosPlatform::new() {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&fixture_dir);
-                fail(format!(
-                    "MacosPlatform::new() (Screen Recording / Accessibility grant missing?): {e}"
-                ));
-            }
-        };
-
-        let result = run_checks(&mut platform, &fixture_bin);
-
-        // Reached regardless of outcome, and BEFORE any process::exit below — see
-        // capture.rs's/input.rs's identical cleanup ordering for why this must run before
-        // any exit (stop_app is idempotent/infallible-today, and this is what guarantees the
-        // fixture's `quadrants` process — now potentially TWO windows' worth of it, still one
-        // process — never survives a failed run).
-        let stop_result = platform.stop_app();
-        let _ = std::fs::remove_dir_all(&fixture_dir);
-
-        match result {
-            Ok(()) => {
-                expect(stop_result, "stop_app");
-                println!("WINDOW_INTEGRATION_PASS");
-                std::process::exit(0);
-            }
-            Err(msg) => {
-                if let Err(e) = stop_result {
-                    eprintln!("(additionally) stop_app failed: {e}");
-                }
-                fail(msg);
-            }
-        }
+        run_fixture_test("quadrants", "WINDOW_INTEGRATION_PASS", run_checks);
     }
 }

@@ -38,6 +38,8 @@
 //! unaffected by it (compositor output is readable regardless of lock state), which is why
 //! this gap wasn't visible until this file's first real input-posting run.
 
+mod common;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     println!("skipped (not macOS): test");
@@ -50,13 +52,13 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos_main {
-    use std::path::PathBuf;
-    use std::process::Command;
     use std::time::Duration;
 
     use glass_core::platform::{KeyEvent, MouseButton, PointerEvent};
     use glass_core::{AppSpec, Platform, SandboxLevel, Stream};
     use glass_macos::MacosPlatform;
+
+    use crate::common::{run_fixture_test, try_expect};
 
     /// Settle after each injected action before draining logs — generous relative to
     /// `input.rs`'s own internal `FOCUS_SETTLE` (300ms, already paid once per `send_key`/
@@ -71,80 +73,6 @@ mod macos_main {
     /// drift from `CLICK_TARGET` and still count as a correct round trip (rounding in the
     /// pixel<->point conversion, not a loose "close enough").
     const CLICK_TOLERANCE: i32 = 5;
-
-    /// Print a clear failure message and exit non-zero — the `harness = false` contract
-    /// (no libtest to format a panic for us).
-    fn fail(msg: impl AsRef<str>) -> ! {
-        eprintln!("FAIL: {}", msg.as_ref());
-        std::process::exit(1);
-    }
-
-    /// Unwrap a `Result`, failing the whole test process with `context` prefixed to the
-    /// error on `Err`. Only safe to use before a fixture process has been spawned (or once
-    /// all spawn-time cleanup is already done) — see `capture.rs`'s identical helper for why
-    /// anything after that must go through `try_expect`/`run_checks` instead.
-    fn expect<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
-        match result {
-            Ok(v) => v,
-            Err(e) => fail(format!("{context}: {e}")),
-        }
-    }
-
-    /// Like `expect`, but returns the error as a `String` instead of exiting the process —
-    /// see `capture.rs`'s identical helper's doc for why: a failure raised inside
-    /// `run_checks` (fixture already spawned) must flow back to `run()` so it can
-    /// `stop_app()` before the process exits, which a direct `std::process::exit` would skip
-    /// (Rust destructors don't run across `exit`).
-    fn try_expect<T, E: std::fmt::Display>(
-        result: Result<T, E>,
-        context: &str,
-    ) -> Result<T, String> {
-        result.map_err(|e| format!("{context}: {e}"))
-    }
-
-    fn swiftc_available() -> bool {
-        Command::new("swiftc")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
-
-    /// Build `fixture/quadrants.swift` to a fresh temp path — identical to `capture.rs`'s
-    /// `build_fixture`, just a distinct temp-dir name so a parallel run of both tests never
-    /// collides. Returns the built binary's path and the temp build dir it lives in (the
-    /// caller removes the dir once done — see `run()`).
-    fn build_fixture() -> (PathBuf, PathBuf) {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let source = manifest_dir.join("fixture").join("quadrants.swift");
-        if !source.is_file() {
-            fail(format!("fixture source not found at {}", source.display()));
-        }
-
-        let out_dir =
-            std::env::temp_dir().join(format!("glass-macos-input-test-{}", std::process::id()));
-        expect(
-            std::fs::create_dir_all(&out_dir),
-            "creating fixture build dir",
-        );
-        let out_bin = out_dir.join("quadrants");
-
-        let status = Command::new("swiftc")
-            .arg("-O")
-            .arg("-parse-as-library")
-            .arg(&source)
-            .arg("-o")
-            .arg(&out_bin)
-            .status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => fail(format!(
-                "swiftc exited with {s} building {}",
-                source.display()
-            )),
-            Err(e) => fail(format!("failed to run swiftc: {e}")),
-        }
-        (out_bin, out_dir)
-    }
 
     /// Every stdout line from `lines` that starts with `prefix`, with the prefix stripped —
     /// e.g. `find_reported(lines, "key: ")` yields `["h", "e", ...]` from `quadrants.swift`'s
@@ -321,43 +249,6 @@ mod macos_main {
     }
 
     pub(super) fn run() {
-        if !swiftc_available() {
-            println!("skipped (no swiftc)");
-            return;
-        }
-
-        let (fixture_bin, fixture_dir) = build_fixture();
-        println!("built fixture at {}", fixture_bin.display());
-
-        let mut platform = match MacosPlatform::new() {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&fixture_dir);
-                fail(format!(
-                    "MacosPlatform::new() (Screen Recording / Accessibility grant missing?): {e}"
-                ));
-            }
-        };
-
-        let result = run_checks(&mut platform, &fixture_bin);
-
-        // Reached regardless of outcome, and BEFORE any process::exit below — see
-        // capture.rs's identical cleanup ordering for why this must run before any exit.
-        let stop_result = platform.stop_app();
-        let _ = std::fs::remove_dir_all(&fixture_dir);
-
-        match result {
-            Ok(()) => {
-                expect(stop_result, "stop_app");
-                println!("INPUT_INTEGRATION_PASS");
-                std::process::exit(0);
-            }
-            Err(msg) => {
-                if let Err(e) = stop_result {
-                    eprintln!("(additionally) stop_app failed: {e}");
-                }
-                fail(msg);
-            }
-        }
+        run_fixture_test("quadrants", "INPUT_INTEGRATION_PASS", run_checks);
     }
 }
