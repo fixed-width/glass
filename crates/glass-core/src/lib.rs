@@ -81,7 +81,7 @@ pub use platform::{
 };
 
 pub mod deadline;
-pub use deadline::Deadline;
+pub use deadline::{Deadline, Whose};
 
 pub mod accessibility;
 pub use accessibility::{

@@ -16,18 +16,8 @@
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use crate::deadline::Deadline;
+use crate::deadline::{Deadline, Whose};
 use crate::{GlassError, Result};
-
-/// Which bound ended a wait. Decided before the wait, never inferred from its outcome — the
-/// mistake glass#341 recorded.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum EndedBy {
-    /// The caller's own deadline fell first: a spent budget, not a fault.
-    Caller,
-    /// The reader's ceiling ran out: the backend stopped answering.
-    Ceiling,
-}
 
 /// The bounded calls one accessibility backend makes on its detached worker thread.
 ///
@@ -80,22 +70,17 @@ impl A11yThread {
         A11yThread { backend, ceiling }
     }
 
-    /// How long a call may block, and which bound ends it.
+    /// How long a call may block, and which bound ends it — one comparison, made before the wait
+    /// (glass#341, glass#432).
     ///
-    /// Both come from one comparison, made before the wait: a call the *caller* cut short is a
-    /// spent budget and one that used the whole ceiling is a backend that stopped answering, and
-    /// inferring which afterwards is the mistake glass#341 recorded.
-    fn bounded_wait(&self, deadline: Deadline) -> (Duration, EndedBy) {
-        let own = Instant::now() + self.ceiling;
-        let ended_by = if deadline.governs(own) {
-            EndedBy::Caller
-        } else {
-            EndedBy::Ceiling
-        };
-        (
-            deadline.cap(own).saturating_duration_since(Instant::now()),
-            ended_by,
-        )
+    /// One clock read, so the ceiling branch is exactly `ceiling` rather than `ceiling` minus
+    /// whatever fell between two reads. It trades the other way on the caller branch, where the
+    /// wait now expires a read later than the deadline instead of a read earlier; both are
+    /// nanoseconds against a wait the thread spawn below already dominates.
+    fn bounded_wait(&self, deadline: Deadline) -> (Duration, Whose) {
+        let now = Instant::now();
+        let (ends, whose) = deadline.resolve(now + self.ceiling);
+        (ends.saturating_duration_since(now), whose)
     }
 
     /// Read the tree, bounded by whichever of the caller's deadline and the ceiling falls first.
@@ -108,7 +93,7 @@ impl A11yThread {
         job: impl FnOnce() -> Result<T> + Send + 'static,
     ) -> Result<T> {
         if deadline.has_passed() {
-            return Err(self.never_answered(EndedBy::Caller));
+            return Err(self.never_answered(Whose::Caller));
         }
         let (wait, ended_by) = self.bounded_wait(deadline);
         self.detached(Op::Snapshot, wait, job, ended_by)
@@ -119,7 +104,7 @@ impl A11yThread {
     /// No deadline: the seam places the capping obligation on `snapshot`, and the session builds
     /// both this context and `invoke`'s with [`Deadline::UNBOUNDED`], so there is none to honour.
     pub fn set_value(&self, job: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
-        self.detached(Op::SetValue, self.ceiling, job, EndedBy::Ceiling)
+        self.detached(Op::SetValue, self.ceiling, job, Whose::Callee)
     }
 
     /// Actuate the element, bounded by the ceiling alone.
@@ -128,18 +113,18 @@ impl A11yThread {
     /// [`GlassError::invoke_fallback_eligible`] excludes — so no pointer click is layered on top of
     /// an action that may be about to fire.
     pub fn invoke(&self, job: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
-        self.detached(Op::Invoke, self.ceiling, job, EndedBy::Ceiling)
+        self.detached(Op::Invoke, self.ceiling, job, Whose::Callee)
     }
 
     /// The verdict for a read that never answered. The caller's own deadline ending it is
     /// `AccessibilityNotReady`, which [`crate::Glass::wait_for_element`] polls through, where the
     /// backend going quiet for a whole ceiling is not.
-    fn never_answered(&self, ended_by: EndedBy) -> GlassError {
+    fn never_answered(&self, ended_by: Whose) -> GlassError {
         match ended_by {
-            EndedBy::Caller => GlassError::AccessibilityNotReady(
+            Whose::Caller => GlassError::AccessibilityNotReady(
                 "no accessibility tree within the time this call allowed".into(),
             ),
-            EndedBy::Ceiling => self.timed_out(Op::Snapshot),
+            Whose::Callee => self.timed_out(Op::Snapshot),
         }
     }
 
@@ -170,7 +155,7 @@ impl A11yThread {
         op: Op,
         wait: Duration,
         job: impl FnOnce() -> Result<T> + Send + 'static,
-        ended_by: EndedBy,
+        ended_by: Whose,
     ) -> Result<T> {
         let (tx, rx) = mpsc::channel();
         // Named and fallible, unlike a bare `spawn`: a timed-out worker outlives its wait holding
@@ -231,7 +216,7 @@ mod tests {
     fn a_read_is_bounded_by_the_caller_when_that_falls_first() {
         let (wait, ended_by) = reader().bounded_wait(Deadline::from_millis(50));
         assert!(wait <= Duration::from_millis(50), "{wait:?}");
-        assert_eq!(ended_by, EndedBy::Caller);
+        assert_eq!(ended_by, Whose::Caller);
     }
 
     /// The other direction: without it the test above passes on a reader that waits for nothing.
@@ -239,7 +224,7 @@ mod tests {
     fn a_caller_that_names_no_deadline_leaves_the_read_its_own_ceiling() {
         let (wait, ended_by) = reader().bounded_wait(Deadline::UNBOUNDED);
         assert!(wait > CEILING - Duration::from_secs(1), "{wait:?}");
-        assert_eq!(ended_by, EndedBy::Ceiling);
+        assert_eq!(ended_by, Whose::Callee);
     }
 
     /// The variant decides whether a wait polls on or fails, so the two causes must not collapse:
@@ -248,18 +233,18 @@ mod tests {
     #[test]
     fn a_read_the_caller_cut_short_reads_as_not_ready_where_a_quiet_backend_does_not() {
         assert!(matches!(
-            reader().never_answered(EndedBy::Caller),
+            reader().never_answered(Whose::Caller),
             GlassError::AccessibilityNotReady(_)
         ));
         assert!(matches!(
-            reader().never_answered(EndedBy::Ceiling),
+            reader().never_answered(Whose::Callee),
             GlassError::AccessibilityUnavailable(_)
         ));
     }
 
     #[test]
     fn a_timeout_names_the_backend_that_stopped_answering() {
-        let e = A11yThread::new("UIA", CEILING).never_answered(EndedBy::Ceiling);
+        let e = A11yThread::new("UIA", CEILING).never_answered(Whose::Callee);
         assert!(e.to_string().contains("UIA not responding"), "{e}");
     }
 

@@ -290,7 +290,8 @@ mod tests {
             .lock()
             .unwrap()
             .expect("the backend was stopped")
-            .within(std::time::Duration::MAX, started);
+            .remaining_at(started)
+            .expect("a bounded share");
         assert!(
             given >= budget / 3,
             "the sessions were given {given:?} of a {budget:?} budget — the reserve was taken \
