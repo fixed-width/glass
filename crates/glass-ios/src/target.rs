@@ -110,12 +110,21 @@ impl SimTarget {
         &self.udid
     }
 
-    /// A `SimTarget` for `IosPlatform` unit tests that never touch a real simulator (a
-    /// `NoActiveSession`/state-machine guard fires before `target` is used).
+    /// A `SimTarget` for `IosPlatform` unit tests, whose `simctl` runs `true` instead of
+    /// `xcrun`. A stand-in rather than the real tool because the platform now terminates its
+    /// app on drop: a real `Simctl` here would have every test holding a fake `RunningApp`
+    /// reach CoreSimulator with a bogus UDID as it dropped.
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
+        Self::for_test_at("true")
+    }
+
+    /// [`SimTarget::for_test`] against a named stand-in program — a `FakeSimctl`, for a test
+    /// that asserts on which calls were made rather than only that none escaped.
+    #[cfg(test)]
+    pub(crate) fn for_test_at(program: impl Into<String>) -> Self {
         Self {
-            simctl: Simctl::new(),
+            simctl: Simctl::at(program),
             udid: "test-udid".to_string(),
         }
     }

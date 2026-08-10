@@ -163,6 +163,14 @@ fn launch_stderr_tail(simctl: &Simctl, udid: &str) -> Option<String> {
     Some(tail.into_iter().rev().collect::<Vec<_>>().join(" | "))
 }
 
+/// Terminate a launch that failed after `simctl launch` had already put the app on the screen, and
+/// hand its error back — `start_app` records `self.app` only on success, so neither `stop_app` nor
+/// the `Drop` below reaps one that failed on the way up (glass#421).
+fn reap_failed_launch(simctl: &Simctl, udid: &str, bundle_id: &str, e: GlassError) -> GlassError {
+    let _ = simctl.run(&["terminate", udid, bundle_id]);
+    e
+}
+
 /// Whether `pid` is still running, asked of the host: a Simulator app is an ordinary host
 /// process, so `ps` answers for it without this crate taking a `libc` dependency for one probe.
 ///
@@ -417,7 +425,7 @@ impl Platform for IosPlatform {
         // confirmed-live stream closes that race. Logs stay best-effort: a stream that never
         // comes up does not fail the launch — it only means a launch-time line may be missed,
         // which is noted rather than swallowed.
-        let logs = LogStream::spawn(udid);
+        let logs = LogStream::spawn(self.target.simctl(), udid);
         if !logs.wait_until_ready(LOG_STREAM_READY_TIMEOUT) {
             eprintln!(
                 "glass-ios: unified-log stream not confirmed live before launch; a \
@@ -468,10 +476,23 @@ impl Platform for IosPlatform {
             );
         }
 
+        // The app is on the screen from here, but `self.app` is not set until the end, so each
+        // failure below has to reap for itself.
+        //
         // Capture once, purely to learn the device's pixel dimensions for the geometry we
         // report. These are device *pixels* (the screenshot's raw resolution), not UIKit
         // points — the two differ by the device's point-to-pixel scale factor.
-        let frame = screenshot(self.target.simctl(), udid)?;
+        let frame = match screenshot(self.target.simctl(), udid) {
+            Ok(frame) => frame,
+            Err(e) => {
+                return Err(reap_failed_launch(
+                    self.target.simctl(),
+                    udid,
+                    &bundle_id,
+                    e,
+                ));
+            }
+        };
         let geometry = WindowGeometry {
             x: 0,
             y: 0,
@@ -485,7 +506,17 @@ impl Platform for IosPlatform {
         // no injector — input is unsupported — but geometry is still reported so
         // capture/logs/clipboard work.
         let injector = match &self.driver {
-            Some(driver) => Some(IdbInjector::new(discover_scale(&driver.client)?)),
+            Some(driver) => match discover_scale(&driver.client) {
+                Ok(scale) => Some(IdbInjector::new(scale)),
+                Err(e) => {
+                    return Err(reap_failed_launch(
+                        self.target.simctl(),
+                        udid,
+                        &bundle_id,
+                        e,
+                    ));
+                }
+            },
             None => None,
         };
         // Everything above would look identical for an app that died on launch: `simctl launch`
@@ -650,6 +681,17 @@ impl Platform for IosPlatform {
     }
 }
 
+impl Drop for IosPlatform {
+    /// Terminate the app on drop, for a platform dropped without an explicit `stop_app()` —
+    /// parity with the other backends, iOS having been the last without one. The Simulator
+    /// outlives the process, so the app would otherwise still be in the foreground for the next
+    /// run (glass#421). `stop_app` takes `self.app`, so this is a no-op once it has run, which
+    /// every path through `Glass` does.
+    fn drop(&mut self) {
+        let _ = self.stop_app();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,9 +746,11 @@ mod tests {
 
 /// State-machine tests: `IosPlatform` built directly (bypassing `from_env`) with a fake
 /// `RunningApp` (or none) and a stub driver (or none), so none of these touch a real
-/// simulator or `idb_companion` — `xcrun` is never invoked and no RPC is made, only the
-/// pure in-memory branching (session guards, driver presence, the `Move`-is-a-noop
-/// short-circuit, the input-error surface).
+/// simulator or `idb_companion` — no RPC is made, only the pure in-memory branching (session
+/// guards, driver presence, the `Move`-is-a-noop short-circuit, the input-error surface).
+///
+/// Every `simctl` call a fixture does make — the log stream, and the `terminate` each platform
+/// now issues as it drops — goes to `SimTarget::for_test`'s stand-in program, not to `xcrun`.
 #[cfg(test)]
 mod state_machine_tests {
     use super::*;
@@ -724,15 +768,16 @@ mod state_machine_tests {
     /// A running app with a driver present: input reaches the injector (its RPC would fail,
     /// but these tests only exercise events that error or short-circuit before any RPC).
     fn running_platform() -> IosPlatform {
+        let target = SimTarget::for_test();
         IosPlatform {
-            target: SimTarget::for_test(),
             app: Some(RunningApp {
                 bundle_id: "tech.fixedwidth.demo".into(),
                 pid: None,
                 geometry: geometry(),
-                logs: LogStream::spawn("fake"),
+                logs: LogStream::spawn(target.simctl(), "fake"),
                 injector: Some(IdbInjector::new(1.0)),
             }),
+            target,
             driver: Some(IdbDriver::for_test()),
             driver_error: None,
         }
@@ -751,15 +796,16 @@ mod state_machine_tests {
     /// Observe-only: no companion, so a running app has no injector. Capture/logs/clipboard
     /// would work; input and the accessibility reader degrade.
     fn observe_only_platform() -> IosPlatform {
+        let target = SimTarget::for_test();
         IosPlatform {
-            target: SimTarget::for_test(),
             app: Some(RunningApp {
                 bundle_id: "tech.fixedwidth.demo".into(),
                 pid: None,
                 geometry: geometry(),
-                logs: LogStream::spawn("fake"),
+                logs: LogStream::spawn(target.simctl(), "fake"),
                 injector: None,
             }),
+            target,
             driver: None,
             driver_error: Some(
                 "idb_companion not found (install: brew install idb-companion)".into(),
@@ -1142,5 +1188,165 @@ mod pid_liveness_tests {
         let pid = child.id();
         child.wait().expect("reap it");
         assert!(!pid_is_running(pid));
+    }
+}
+
+/// Teardown: what reaches the Simulator when a session ends, however it ends. Each builds the
+/// platform over a `FakeSimctl` and asserts on the argv it recorded — a `terminate` that never
+/// ran and one that ran are otherwise the same green test.
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+    use crate::simctl::FakeSimctl;
+    use glass_core::SandboxLevel;
+
+    const BUNDLE: &str = "tech.fixedwidth.demo";
+
+    /// An observe-only platform (no companion, so no RPC is reachable) holding `app`.
+    fn platform(fake: &FakeSimctl, app: Option<RunningApp>) -> IosPlatform {
+        IosPlatform {
+            target: SimTarget::for_test_at(fake.program()),
+            app,
+            driver: None,
+            driver_error: Some("no companion in this test".into()),
+        }
+    }
+
+    fn running_app(fake: &FakeSimctl) -> RunningApp {
+        RunningApp {
+            bundle_id: BUNDLE.into(),
+            pid: None,
+            geometry: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 390,
+                height: 844,
+            },
+            logs: LogStream::spawn(&Simctl::at(fake.program()), "test-udid"),
+            injector: None,
+        }
+    }
+
+    fn spec() -> AppSpec {
+        AppSpec {
+            build: None,
+            run: vec![BUNDLE.to_string()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 2_000,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        }
+    }
+
+    /// The `terminate` calls, matched on the verb in argv position — `launch` carries
+    /// `--terminate-running-process`, which a bare substring test counts as a teardown.
+    fn terminations(fake: &FakeSimctl) -> Vec<String> {
+        fake.calls()
+            .into_iter()
+            .filter(|c| c.starts_with("simctl terminate "))
+            .collect()
+    }
+
+    #[test]
+    fn dropping_a_platform_that_still_holds_an_app_terminates_it() {
+        let fake = FakeSimctl::new();
+        drop(platform(&fake, Some(running_app(&fake))));
+
+        assert_eq!(
+            terminations(&fake),
+            vec![format!("simctl terminate test-udid {BUNDLE}")],
+            "all calls: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn a_platform_that_never_started_an_app_terminates_nothing_on_drop() {
+        let fake = FakeSimctl::new();
+        drop(platform(&fake, None));
+
+        assert!(terminations(&fake).is_empty(), "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn an_explicit_stop_is_not_repeated_by_the_drop_behind_it() {
+        let fake = FakeSimctl::new();
+        let mut p = platform(&fake, Some(running_app(&fake)));
+        p.stop_app().expect("stop is best-effort and cannot fail");
+        drop(p);
+
+        assert_eq!(terminations(&fake).len(), 1, "{:?}", fake.calls());
+    }
+
+    /// A `w`x`h` opaque PNG, as `simctl io screenshot` writes one.
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode a PNG");
+        bytes
+    }
+
+    /// The leak the `Drop` alone does not cover: `start_app` records `self.app` on its last
+    /// statement, so an app that launched and then failed to come up is held by nothing.
+    #[test]
+    fn a_launch_that_fails_after_the_app_is_up_does_not_leave_it_running() {
+        let fake = FakeSimctl::new();
+        let mut p = platform(&fake, None);
+
+        // The fake exits 0 having written no PNG, so the launch succeeds and the screenshot
+        // taken for the window geometry is what fails.
+        let err = p
+            .start_app(&spec())
+            .expect_err("a screenshot that decodes to nothing must not report a started app");
+
+        assert!(
+            matches!(err, GlassError::CaptureFailed(_)),
+            "the launch failure must survive the reap: {err}"
+        );
+        assert!(p.app.is_none(), "no session may be registered");
+        assert_eq!(
+            terminations(&fake),
+            vec![format!("simctl terminate test-udid {BUNDLE}")],
+            "all calls: {:?}",
+            fake.calls()
+        );
+    }
+
+    /// The same leak one step later, on the path a real device takes: capture succeeds and it is
+    /// the companion's scale RPC that fails, so the app is up with no session to hold it.
+    #[test]
+    fn a_launch_whose_scale_never_resolves_does_not_leave_the_app_running() {
+        let fake = FakeSimctl::new();
+        fake.writes_screenshot(&png(2, 3));
+        let mut p = IosPlatform {
+            target: SimTarget::for_test_at(fake.program()),
+            app: None,
+            // The stub client dials a socket nothing serves, which is what a companion that died
+            // between spawn and launch looks like from here.
+            driver: Some(IdbDriver::for_test()),
+            driver_error: None,
+        };
+
+        let err = p
+            .start_app(&spec())
+            .expect_err("a scale that never resolved must not report a started app");
+
+        assert!(
+            !matches!(err, GlassError::CaptureFailed(_)),
+            "capture was answered; the failure must be the scale RPC: {err}"
+        );
+        assert!(p.app.is_none(), "no session may be registered");
+        assert_eq!(
+            terminations(&fake),
+            vec![format!("simctl terminate test-udid {BUNDLE}")],
+            "all calls: {:?}",
+            fake.calls()
+        );
     }
 }

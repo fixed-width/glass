@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use glass_core::Stream;
 
+use crate::simctl::Simctl;
+
 /// Does `line` look like a real `log stream --style compact` entry, as opposed to the tool's
 /// own startup output? Compact entries begin with an ISO-ish timestamp (`2026-07-11 ...`), so a
 /// leading ASCII digit distinguishes them from the `Timestamp  Ty Process[PID:TID]` column
@@ -107,14 +109,16 @@ impl LogStream {
     /// Best-effort: if `xcrun` fails to spawn, `child` is `None` and `drain` simply
     /// yields nothing, matching the sibling Android backend's behavior when `adb` is
     /// unavailable.
-    pub fn spawn(udid: &str) -> Self {
+    ///
+    /// Spawned through the caller's [`Simctl`] rather than a literal `xcrun`, so a unit test's
+    /// stand-in covers this too — a hardcoded one here spawned the real tool against a fake
+    /// UDID on every macOS test run.
+    pub fn spawn(simctl: &Simctl, udid: &str) -> Self {
         let buf = SharedLog::default();
         // Take the piped stdout before storing `child` — reading `child.stdout` after
         // moving `child` into `Self` would not borrow-check.
-        let mut child = Command::new("xcrun")
-            .args([
-                "simctl", "spawn", udid, "log", "stream", "--style", "compact",
-            ])
+        let mut child = Command::new(simctl.program())
+            .args(simctl.full_args(&["spawn", udid, "log", "stream", "--style", "compact"]))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
