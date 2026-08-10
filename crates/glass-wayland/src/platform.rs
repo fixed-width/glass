@@ -218,9 +218,10 @@ fn request_close(ipc: &mut Ipc) -> Asked {
 impl Drop for WaylandPlatform {
     fn drop(&mut self) {
         // Last resort for a `stop_app` that never happened (panicking test, early return), not a
-        // guarantee: with a session still active this asks the app to close, waits `CLOSE_GRACE`
-        // and reaps the tree, so a caller that exits the process right after dropping leaves sway
-        // orphaned mid-teardown (glass#415). Call `stop_app`.
+        // guarantee: this asks the app to close, waits up to `CLOSE_GRACE`, reaps the tree and
+        // only then drops the private bus. glass-mcp runs it on a detached thread nothing joins,
+        // so a process exiting right after the drop kills it partway and orphans sway and the
+        // bus (glass#415) — a shorter grace would not help. Call `stop_app`.
         self.kill_session();
     }
 }

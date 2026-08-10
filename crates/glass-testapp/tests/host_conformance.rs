@@ -410,6 +410,11 @@ async fn http_host_can_initialize_list_tools_and_get_an_image() {
         "screenshot response carried no text block alongside the image: {shot:?}"
     );
 
+    // The stdio arm above stops its session; this one must too, or it outlives the test
+    // (glass#415).
+    let _ = client
+        .call_tool(CallToolRequestParams::new("glass_stop"))
+        .await;
     client.cancel().await.ok();
 }
 

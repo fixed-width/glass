@@ -42,6 +42,7 @@ async fn probe_fixture_a11y_tree_is_reachable() {
         "editable text field not addressable in the a11y tree:\n{outline}"
     );
 
+    mcp_cost::stop_fixture(&client).await;
     client.cancel().await.ok();
 }
 
@@ -67,6 +68,7 @@ async fn arm_a_is_text_only_and_completes() {
         "arm A must carry no image bytes: {report}"
     );
 
+    mcp_cost::stop_fixture(&client).await;
     client.cancel().await.ok();
 }
 
@@ -91,6 +93,7 @@ async fn arm_b_uses_images_and_completes() {
         "arm B must record image dims: {report}"
     );
 
+    mcp_cost::stop_fixture(&client).await;
     client.cancel().await.ok();
 }
 
@@ -133,6 +136,7 @@ async fn verification_cost_semantic_beats_screenshot() {
     );
     assert!(a.text_bytes > 0 && b.text_bytes > 0);
 
+    mcp_cost::stop_fixture(&client).await;
     client.cancel().await.ok();
 }
 

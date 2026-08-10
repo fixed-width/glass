@@ -29,10 +29,11 @@ fn blink_region_json() -> Value {
     json!({ "x": x, "y": y, "width": width, "height": height })
 }
 
-/// Call `tool` with `args` (a JSON object), assert it did not error, and return the parsed
-/// success envelope's `result` object — see glass-mcp's `tools::envelope`
-/// (`{"ok":true,"tool":..., "result": {...}}`).
-async fn call(client: &Peer<RoleClient>, tool: &str, args: Value) -> Value {
+/// One tool call: `Ok` with the parsed success envelope's `result` object (see glass-mcp's
+/// `tools::envelope`, `{"ok":true,"tool":..., "result": {...}}`), `Err` with the tool's error
+/// text. Same contract as `mcp_cost::try_call` — a transport failure still panics, being an
+/// infrastructure fault rather than an outcome any caller here branches on.
+async fn try_call(client: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Value, String> {
     let arguments = args
         .as_object()
         .unwrap_or_else(|| panic!("{tool} args must be a JSON object: {args}"))
@@ -41,19 +42,41 @@ async fn call(client: &Peer<RoleClient>, tool: &str, args: Value) -> Value {
         .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(arguments))
         .await
         .unwrap_or_else(|e| panic!("{tool} call failed: {e}"));
-    assert_ne!(
-        result.is_error,
-        Some(true),
-        "{tool} returned an error result: {result:?}"
-    );
     let text = result
         .content
         .iter()
-        .find_map(|c| c.as_text().map(|t| t.text.clone()))
-        .unwrap_or_else(|| panic!("{tool} returned no text content: {result:?}"));
+        .find_map(|c| c.as_text().map(|t| t.text.clone()));
+    if result.is_error == Some(true) {
+        return Err(text.unwrap_or_else(|| format!("{result:?}")));
+    }
+    let text = text.unwrap_or_else(|| panic!("{tool} returned no text content: {result:?}"));
     let envelope: Value = serde_json::from_str(&text)
         .unwrap_or_else(|e| panic!("{tool} text content is not JSON ({e}): {text}"));
-    envelope["result"].clone()
+    Ok(envelope["result"].clone())
+}
+
+/// [`try_call`], asserting the tool did not error.
+async fn call(client: &Peer<RoleClient>, tool: &str, args: Value) -> Value {
+    try_call(client, tool, args)
+        .await
+        .unwrap_or_else(|e| panic!("{tool} returned an error result: {e}"))
+}
+
+/// Stop the session, then prove it is gone by requiring a second `glass_stop` to fail with
+/// `NoActiveSession`.
+///
+/// The second call is what gives the first one teeth. Stopping can only fail when no session
+/// exists, so asserting the stop succeeded asserts nothing a passing test could violate —
+/// delete the stop and every assertion here still passes while the compositor leaks (glass#415).
+async fn stop_and_confirm(client: &Peer<RoleClient>) -> Result<(), String> {
+    try_call(client, "glass_stop", json!({}))
+        .await
+        .map_err(|e| format!("glass_stop failed: {e}"))?;
+    match try_call(client, "glass_stop", json!({})).await {
+        Err(e) if e.contains("no active session") => Ok(()),
+        Err(e) => Err(format!("stopping twice failed for the wrong reason: {e}")),
+        Ok(_) => Err("a second glass_stop succeeded — the first left the session running".into()),
+    }
 }
 
 /// Drive a real `glass-mcp` server end to end against `testapp --blink` launched under
@@ -61,6 +84,8 @@ async fn call(client: &Peer<RoleClient>, tool: &str, args: Value) -> Value {
 /// (the region really is changing), must settle once masked (and never count the masked
 /// motion as `saw_motion`), and a baseline diff with the same mask must report zero real
 /// change plus exactly the masked pixel count.
+///
+/// Returns with no active session: the helper stops what it started.
 pub async fn assert_blink_region_e2e(testapp: &str, backend: &str, start_timeout_ms: u64) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -85,8 +110,40 @@ pub async fn assert_blink_region_e2e(testapp: &str, backend: &str, start_timeout
             .await
             .expect("initialize over http");
 
+    // The assertions run as a task so a failing one arrives here as a value rather than
+    // unwinding past the stop below. glass-mcp tears a session down on a detached thread
+    // nothing joins (`GlassServer::new`), so a skipped stop does not merely postpone cleanup to
+    // process exit — it loses it, orphaning the compositor and the session's private a11y bus
+    // (glass#415).
+    let peer = client.peer().clone();
+    let testapp = testapp.to_string();
+    let backend = backend.to_string();
+    let asserted =
+        tokio::spawn(
+            async move { blink_region(&peer, &testapp, &backend, start_timeout_ms).await },
+        )
+        .await;
+
+    let stopped = stop_and_confirm(&client).await;
+    client.cancel().await.ok();
+
+    // A failing assertion is the interesting failure — re-raise it before reporting the stop.
+    if let Err(e) = asserted {
+        std::panic::resume_unwind(e.into_panic());
+    }
+    if let Err(e) = stopped {
+        panic!("{e}");
+    }
+}
+
+async fn blink_region(
+    client: &Peer<RoleClient>,
+    testapp: &str,
+    backend: &str,
+    start_timeout_ms: u64,
+) {
     call(
-        &client,
+        client,
         "glass_start",
         json!({
             "run": [testapp, "--blink"],
@@ -99,7 +156,7 @@ pub async fn assert_blink_region_e2e(testapp: &str, backend: &str, start_timeout
     // No ignore: the blink rect changes on every ~5ms tick, far faster than the 50ms poll
     // interval, so 3 consecutive identical polls (settle_frames) never happen within 400ms.
     let unmasked = call(
-        &client,
+        client,
         "glass_wait_stable",
         json!({
             "interval_ms": 50,
@@ -124,7 +181,7 @@ pub async fn assert_blink_region_e2e(testapp: &str, backend: &str, start_timeout
     // and the masked motion must never be reported as saw_motion (proves the mask, not a
     // merely-generous timeout, is why this settled).
     let masked = call(
-        &client,
+        client,
         "glass_wait_stable",
         json!({
             "interval_ms": 50,
@@ -146,13 +203,13 @@ pub async fn assert_blink_region_e2e(testapp: &str, backend: &str, start_timeout
         "motion confined to the ignore rect must never set saw_motion: {masked}"
     );
 
-    call(&client, "glass_baseline_save", json!({ "name": "e2e" })).await;
+    call(client, "glass_baseline_save", json!({ "name": "e2e" })).await;
     // Let the blink keep animating so the diff below genuinely exercises live, masked motion —
     // not two captures that happen to land in the same ~5ms tick.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let diff = call(
-        &client,
+        client,
         "glass_diff",
         json!({
             "name": "e2e",
@@ -173,11 +230,4 @@ pub async fn assert_blink_region_e2e(testapp: &str, backend: &str, start_timeout
         json!(u64::from(w * h)),
         "the mask must exclude exactly its own area: {diff}"
     );
-
-    // Stop the session this test started. Cancelling the client only closes the connection, and
-    // the server's own teardown runs when its serve loop returns — which dropping the test's
-    // runtime skips. That leaves `Drop for WaylandPlatform`, which needs seconds it does not get
-    // before the test binary exits, so without this the compositor is orphaned (glass#415).
-    call(&client, "glass_stop", json!({})).await;
-    client.cancel().await.ok();
 }
