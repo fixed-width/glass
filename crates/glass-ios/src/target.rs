@@ -263,10 +263,9 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// The measured defect (glass#427): a real `simctl shutdown` takes ~3.3s, which is over the
-    /// whole teardown budget on its own, so process exit must not wait for it. The fake sleeps 1s
-    /// rather than 3 so the test does not end with its own `TempDir` deleted under a running
-    /// script.
+    /// Process exit must not wait for the shutdown measured on [`SimTarget::request_shutdown_all`]
+    /// (glass#427). The fake sleeps 1s rather than 3 so the test does not end with its own
+    /// `TempDir` deleted under a running script.
     #[test]
     fn shutdown_all_returns_without_waiting_for_the_simulator_to_go_down() {
         let fake = crate::simctl::FakeSimctl::new();

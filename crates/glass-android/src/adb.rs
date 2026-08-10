@@ -126,9 +126,8 @@ impl Adb {
         self.run_until(args, Deadline::UNBOUNDED)
     }
 
-    /// [`Adb::run`] under a deadline the whole sequence shares, [`Deadline::UNBOUNDED`] for a call
-    /// that answers to nothing but its own budget. The deadline bounds the run; it does not
-    /// reserve time for the calls behind, which is `Glass::shutdown`'s job (glass#422).
+    /// [`Adb::run`] under a deadline the whole sequence shares. The deadline bounds the run; it
+    /// does not reserve time for the calls behind, which is `Glass::shutdown`'s job (glass#422).
     pub fn run_until<'a, I>(&self, args: I, deadline: Deadline) -> Result<String>
     where
         I: IntoIterator<Item = &'a str>,

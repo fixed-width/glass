@@ -294,9 +294,7 @@ mod tests {
     }
 
     /// The property this whole split exists for (glass#422): a session that spends everything it is
-    /// given must still leave the hook enough to run. Without the reserve the hook is reached with
-    /// a spent deadline, and `run_bounded_until` does not start a command it has no time for — so
-    /// every step behind it is skipped rather than merely slow.
+    /// given must still leave the hook enough to run.
     #[test]
     fn a_session_that_burns_its_deadline_still_leaves_the_hook_time_to_run() {
         let factory: PlatformFactory = Box::new(move |_backend| {

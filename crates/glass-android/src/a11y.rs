@@ -84,8 +84,7 @@ pub(crate) fn adb_runner(
 /// re-snapshots inside.
 ///
 /// A caller that named a deadline gets [`Deadline::resolve`] of this instead — see
-/// [`dump_until_ready`], which needs the verdict it returns to tell which bound ended an
-/// attempt.
+/// [`dump_until_ready`].
 pub(crate) fn attempt_deadline() -> Instant {
     Instant::now() + AdbOp::Dump.budget()
 }
@@ -263,8 +262,7 @@ fn dump_until_ready(
         let (ends, whose) = caller.resolve(attempt_deadline());
         match dump_once(run, prefix, ends) {
             Attempt::Dumped(xml) => return Ok(xml),
-            // An attempt the *caller's* deadline cut short is not a device that failed. Whose
-            // bound ends it is settled before the attempt, not read off its error (glass#341).
+            // An attempt the *caller's* deadline cut short is not a device that failed.
             //
             // The abandoned attempt's own error is carried, not dropped: a wedged adb reaches
             // here too — it cannot be told apart from a slow one at the moment the budget ends —
