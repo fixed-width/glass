@@ -13,14 +13,10 @@
 # prerequisites are absent), and finally combines them into one report.
 #
 # The direct test runs are `cargo nextest run`; the harness scripts below still run libtest.
-# nextest gives each test its own process, so a test that aborts or corrupts process-global
-# state takes down itself rather than the rest of its binary, and with `--no-tests=fail` it
-# exits 4 where libtest exits 0 on a run that selected nothing. It also pools every binary's
-# tests together instead of running one binary at a time, so tests from different crates now
-# overlap; nothing in the workspace serializes on a fixed port, path or display, and a test
-# that needs to would have to say so itself. nextest runs no doctests — the workspace has
-# none (every rustdoc fence is ```text or ```sh), and the `check` job's `cargo test` would
-# still run one.
+# Each test gets its own process, so one that aborts takes down itself rather than its whole
+# binary — and every binary's tests share one pool, so tests from different crates overlap for
+# the first time. Nothing here serializes on a fixed port, path or display; a test that needs to
+# must say so itself. nextest runs no doctests, and the workspace has none.
 #
 # CAVEAT (always true on Linux): the glass-windows Win32 FFI code (capture, input,
 # clipboard, process, util, windows) is cfg(windows) and is NOT compiled or run
@@ -68,10 +64,9 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# Export the instrumentation env so every test run below — the direct `cargo nextest run`s and
-# the `cargo test`s the integration harnesses run — writes .profraw into the shared coverage
-# target dir. `LLVM_PROFILE_FILE` carries `%p`: that is what keeps nextest's process-per-test
-# from having every test clobber one file.
+# Export the instrumentation env so every test run below — the direct nextest runs and the
+# `cargo test`s the harnesses run — writes .profraw into the shared coverage target dir.
+# `LLVM_PROFILE_FILE` carries `%p`; without it nextest's process-per-test clobbers one file.
 # shellcheck disable=SC1090
 source <(cargo llvm-cov show-env --sh)
 cargo llvm-cov clean --workspace
@@ -106,14 +101,13 @@ classify_suite() {  # label cmd...
 # sentinel the way `classify_suite` does — a self-skipping test prints "skipping" too, and one
 # of them would file the whole run as skipped.
 #
-# Exit status decides it instead. `--no-fail-fast` keeps a single failing test from costing the
-# rest of the run its coverage, and `--no-tests=fail` exits 4 when every test was filtered or
-# ignored, which libtest exits 0 on and which records an empty run as coverage. The check is per
-# invocation, so it catches a `-p` leg that ran nothing but not one silent crate inside
-# `--workspace`.
+# Exit status decides it. `--no-fail-fast` keeps one failing test from costing the rest of the
+# run its coverage; `--no-tests=fail` exits 4 where libtest exits 0 on a run that selected
+# nothing and records it as coverage. Per invocation, so it catches a `-p` leg that ran nothing,
+# not one silent crate inside `--workspace`.
 #
-# Named for the runner because it hardcodes it: a leg needing libtest — a doctest one, say,
-# which nextest cannot run — needs its own helper, not this one with different arguments.
+# It hardcodes the runner, hence the name: a leg needing libtest — a doctest one, which nextest
+# cannot run — needs its own helper, not this one with different arguments.
 run_nextest() { # label nextest-args...
     local label="$1" out rc
     shift
@@ -122,7 +116,7 @@ run_nextest() { # label nextest-args...
     if [ "$rc" -eq 0 ]; then
         ran+=("$label")
     else
-        # Distinct from a test failure: "coverage still collected" is false for an empty run.
+        # Exit 4 ran nothing, so the summary below must not credit it with coverage.
         [ "$rc" -eq 4 ] && label="$label (ran no tests)"
         failed+=("$label")
         tail -n 30 <<<"$out"
