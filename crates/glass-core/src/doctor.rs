@@ -428,6 +428,10 @@ mod tests {
         let p = Palette::PLAIN;
         assert_eq!(p.paint(p.bold, "text"), "text");
         assert_eq!(p.paint(p.ok, "✓"), "✓");
+        // The PLAIN assertions above cannot discriminate on their own: PLAIN's `reset` is empty
+        // too, so appending it appends nothing. Only an empty attribute against a palette with a
+        // real reset separates "skip the reset" from "append it unconditionally".
+        assert_eq!(Palette::ANSI.paint("", "text"), "text");
     }
 
     #[test]
