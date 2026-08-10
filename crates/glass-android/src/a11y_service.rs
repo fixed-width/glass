@@ -656,7 +656,7 @@ pub(crate) struct Active {
 // `/bin/sh` script.
 #[cfg(all(test, unix))]
 impl Active {
-    /// An enabled service to restore, for a test that needs a registry with work to do.
+    /// State a shutdown has something to undo.
     pub(crate) fn for_test(adb: Adb, port: u16) -> Self {
         Self {
             adb,

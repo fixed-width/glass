@@ -1051,7 +1051,8 @@ impl Platform for X11Platform {
         }
     }
 
-    /// Ignores the deadline: this teardown is a signal ladder over local processes, already asserted against TEARDOWN_BUDGET.
+    /// Ignores the deadline — the close-then-signal ladder above is asserted against
+    /// `TEARDOWN_BUDGET` instead.
     fn stop_app_by(&mut self, _deadline: glass_core::Deadline) -> Result<()> {
         self.kill_child();
         Ok(())
