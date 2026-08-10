@@ -12,10 +12,15 @@
 # the unit tests AND each integration harness (each self-skips when its
 # prerequisites are absent), and finally combines them into one report.
 #
-# The direct `cargo test` runs are `cargo nextest run` instead: nextest gives each test
-# its own process, so a test that leaves the host dirty cannot be masked by an in-process
-# neighbour, and it exits 4 rather than 0 when a filter selects nothing. The harness
-# scripts below still run libtest — their suites are `--test-threads=1` by design.
+# The direct test runs are `cargo nextest run`; the harness scripts below still run libtest.
+# nextest gives each test its own process, so a test that aborts or corrupts process-global
+# state takes down itself rather than the rest of its binary, and with `--no-tests=fail` it
+# exits 4 where libtest exits 0 on a run that selected nothing. It also pools every binary's
+# tests together instead of running one binary at a time, so tests from different crates now
+# overlap; nothing in the workspace serializes on a fixed port, path or display, and a test
+# that needs to would have to say so itself. nextest runs no doctests — the workspace has
+# none (every rustdoc fence is ```text or ```sh), and the `check` job's `cargo test` would
+# still run one.
 #
 # CAVEAT (always true on Linux): the glass-windows Win32 FFI code (capture, input,
 # clipboard, process, util, windows) is cfg(windows) and is NOT compiled or run
@@ -63,8 +68,10 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# Export the instrumentation env so every `cargo test` below (incl. the ones the
-# integration harnesses run) writes .profraw into the shared coverage target dir.
+# Export the instrumentation env so every test run below — the direct `cargo nextest run`s and
+# the `cargo test`s the integration harnesses run — writes .profraw into the shared coverage
+# target dir. `LLVM_PROFILE_FILE` carries `%p`: that is what keeps nextest's process-per-test
+# from having every test clobber one file.
 # shellcheck disable=SC1090
 source <(cargo llvm-cov show-env --sh)
 cargo llvm-cov clean --workspace
@@ -99,24 +106,32 @@ classify_suite() {  # label cmd...
 # sentinel the way `classify_suite` does — a self-skipping test prints "skipping" too, and one
 # of them would file the whole run as skipped.
 #
-# Exit status decides it, because `--no-tests=fail` makes nextest exit 4 when every test was
-# filtered or ignored. Recording an empty run as coverage is how a crate drops out of the
-# report unseen, and libtest exits 0 on one.
-run_tests() { # label cargo-args...
-    local label="$1" out
+# Exit status decides it instead. `--no-fail-fast` keeps a single failing test from costing the
+# rest of the run its coverage, and `--no-tests=fail` exits 4 when every test was filtered or
+# ignored, which libtest exits 0 on and which records an empty run as coverage. The check is per
+# invocation, so it catches a `-p` leg that ran nothing but not one silent crate inside
+# `--workspace`.
+#
+# Named for the runner because it hardcodes it: a leg needing libtest — a doctest one, say,
+# which nextest cannot run — needs its own helper, not this one with different arguments.
+run_nextest() { # label nextest-args...
+    local label="$1" out rc
     shift
-    if out=$(cargo nextest run --no-fail-fast --no-tests=fail "$@" 2>&1); then
+    out=$(cargo nextest run --no-fail-fast --no-tests=fail "$@" 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
         ran+=("$label")
     else
+        # Distinct from a test failure: "coverage still collected" is false for an empty run.
+        [ "$rc" -eq 4 ] && label="$label (ran no tests)"
         failed+=("$label")
         tail -n 30 <<<"$out"
     fi
 }
 
-# Always: the workspace unit tests (and the always-on integration tests). Keep
-# going on failure so a single failing test still yields a coverage report.
+# Always: the workspace unit tests (and the always-on integration tests).
 echo "coverage: running workspace unit tests…"
-run_tests unit --workspace
+run_nextest unit --workspace
 
 if [ "$unit_only" -eq 0 ]; then
     # Each harness exits 0 and self-skips when its prerequisites are missing, so we
@@ -126,7 +141,7 @@ if [ "$unit_only" -eq 0 ]; then
     if command -v Xvfb >/dev/null 2>&1; then
         # The workspace run above skipped glass-x11's `#[ignore]`d display tests — half the
         # crate's coverage.
-        run_tests x11-unit -p glass-x11 --run-ignored=all
+        run_nextest x11-unit -p glass-x11 --run-ignored=all
         classify_suite x11 ./scripts/test-x11.sh
     else
         skipped+=("x11-unit (no Xvfb)" "x11 (no Xvfb)")
@@ -134,7 +149,7 @@ if [ "$unit_only" -eq 0 ]; then
 
     echo "coverage: running Wayland integration suite (needs sway >=1.12)…"
     if have_sway; then
-        run_tests wayland-unit -p glass-wayland --run-ignored=all
+        run_nextest wayland-unit -p glass-wayland --run-ignored=all
     else
         skipped+=("wayland-unit (no sway)")
     fi
@@ -163,7 +178,7 @@ fi
 echo
 echo "coverage: suites run:     ${ran[*]:-none}"
 echo "coverage: suites skipped: ${skipped[*]:-none}"
-[ ${#failed[@]} -gt 0 ] && echo "coverage: suites with failing tests (coverage still collected): ${failed[*]}"
+[ ${#failed[@]} -gt 0 ] && echo "coverage: suites that failed (a failing suite still contributes its coverage): ${failed[*]}"
 echo "coverage: NOTE glass-windows Win32 FFI is cfg(windows) — not measured on Linux (on-box only)."
 # Exit non-zero only if the unit suite itself failed to build/run; integration
 # flakiness shouldn't fail a coverage report.
