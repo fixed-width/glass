@@ -273,10 +273,9 @@ impl Platform for AndroidPlatform {
         Ok(window)
     }
 
-    /// Force-stop measures 101ms median, 267ms worst on an emulator with every core saturated,
-    /// against the 3s all of teardown gets — so the deadline is not expected to bind. It is for
-    /// the device that stopped answering, which would otherwise run out the 10s `AdbOp::Shell`
-    /// budget and leave the hook nothing (glass#422).
+    /// Force-stop measures well inside the 3s all of teardown gets (see [`AdbOp::Launch`]), so the
+    /// deadline is not expected to bind. It is for the device that stopped answering, which would
+    /// otherwise run out the 10s `AdbOp::Shell` budget and leave the hook nothing (glass#422).
     fn stop_app_by(&mut self, deadline: Deadline) -> Result<()> {
         self.stop_app_until(deadline)
     }

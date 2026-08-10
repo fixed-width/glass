@@ -67,10 +67,8 @@ impl IdbDriver {
 ///
 /// Capture, logs, clipboard, and window queries run over `xcrun simctl` alone. Input
 /// (tap/type/swipe/scroll) and the accessibility tree additionally need an `idb_companion`
-/// [`IdbDriver`]; when the companion isn't available the backend degrades to observe-only:
-/// capture/logs/clipboard keep working, while input and the accessibility tree report a
-/// clear [`GlassError::Unsupported`]. The failure that disabled the driver is kept in
-/// `driver_error` and surfaced in that message.
+/// [`IdbDriver`]; without it the backend degrades to observe-only and those two report a clear
+/// [`GlassError::Unsupported`], carrying the `driver_error` that disabled the driver.
 pub struct IosPlatform {
     target: SimTarget,
     app: Option<RunningApp>,

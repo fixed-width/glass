@@ -7,8 +7,7 @@
 //! `scripts/test-android.sh` fails a run that ends with any of it still on.
 //!
 //! Declare a guard BEFORE the platform it serves: locals drop in reverse, so the platform's agent
-//! connection closes before the registry that owns the agent. Order between the two registries
-//! does not matter — separate forwards, and the a11y one has no process.
+//! connection closes before the registry that owns the agent.
 
 #![allow(dead_code)]
 
