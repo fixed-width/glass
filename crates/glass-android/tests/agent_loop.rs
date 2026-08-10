@@ -9,6 +9,8 @@
 use glass_android::{AgentRegistry, EmulatorRegistry};
 use glass_core::{AppSpec, KeyEvent, MouseButton, Platform, PointerEvent, SandboxLevel};
 
+mod common;
+
 fn settings_spec() -> AppSpec {
     AppSpec {
         build: None,
@@ -29,6 +31,9 @@ fn agent_clipboard_and_input_roundtrip() {
     // tear the agent down explicitly at the end — in production `Glass`'s shutdown hook does
     // this; a test must not leak the process (the registry doesn't kill on drop).
     let agents = AgentRegistry::new();
+    // Before the platform, so the platform's agent connection closes first — and so a
+    // panicking assertion below cannot skip the teardown (glass#423).
+    let _stop_agent = common::StopAgent(&agents);
     let mut p = glass_android::AndroidPlatform::from_env(&EmulatorRegistry::new(), &agents)
         .expect("attach + agent");
     p.start_app(&settings_spec()).expect("launch settings");
@@ -50,6 +55,4 @@ fn agent_clipboard_and_input_roundtrip() {
         .expect("agent text");
 
     p.stop_app().expect("stop");
-    drop(p); // close the platform's agent connection before stopping the agent
-    agents.shutdown(); // kill the launched agent + remove the forward (no leaked process)
 }

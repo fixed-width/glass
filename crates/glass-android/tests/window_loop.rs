@@ -7,6 +7,8 @@
 
 use glass_core::{AppSpec, Platform, SandboxLevel, WindowId};
 
+mod common;
+
 fn settings_spec() -> AppSpec {
     AppSpec {
         build: None,
@@ -24,6 +26,9 @@ fn settings_spec() -> AppSpec {
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn lists_and_selects_app_windows() {
     let agents = glass_android::AgentRegistry::new();
+    // Before the platform, so the platform's agent connection closes first — and so a
+    // panicking assertion below cannot skip the teardown (glass#423).
+    let _stop_agent = common::StopAgent(&agents);
     let mut p =
         glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
             .expect("attach");
@@ -47,6 +52,4 @@ fn lists_and_selects_app_windows() {
     ));
 
     p.stop_app().expect("stop");
-    drop(p); // close the platform's agent connection (if any) first
-    agents.shutdown(); // tear down a launched agent — these tests must not leak it
 }

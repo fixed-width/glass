@@ -15,6 +15,8 @@ use glass_core::accessibility::{
 };
 use glass_core::{AppSpec, Platform, SandboxLevel, WindowGeometry};
 
+mod common;
+
 /// Serialize the two tests below: the on-device accessibility service accepts one connection
 /// at a time, and both tests drive whichever activity is currently foreground, so running them
 /// concurrently makes each retarget the other's window. Poison-tolerant so a panicking test
@@ -29,6 +31,7 @@ fn a11y_service_snapshot_and_actions() {
     // Resolve the device the same way production does, and reuse its serial-bound adb (the
     // `resolved_adb()` accessor) — no bespoke test helper. Launch Settings for an active window.
     let agents = AgentRegistry::new();
+    let _stop_agent = common::StopAgent(&agents);
     let mut p = AndroidPlatform::from_env(&EmulatorRegistry::new(), &agents).expect("attach");
     let spec = AppSpec {
         build: None,
@@ -44,6 +47,7 @@ fn a11y_service_snapshot_and_actions() {
     let adb = p.resolved_adb();
 
     let reg = A11yServiceRegistry::new();
+    let _restore = common::RestoreServiceState(&reg);
     let client = reg.ensure(&adb, &apk).expect("install + enable + connect");
     let mut a11y = ServiceA11y::new(client, String::new());
     let ctx = AxContext {
@@ -89,13 +93,9 @@ fn a11y_service_snapshot_and_actions() {
             .expect("set_value via ACTION_SET_TEXT");
     }
 
-    reg.shutdown(); // restores enabled_accessibility_services + removes the forward
     p.stop_app().ok();
-    drop(p);
-    agents.shutdown(); // tear down any agent the platform launched (no leaks)
-
-    // Then the controller condition-polls the device to confirm teardown left no enabled service
-    // and no forward (don't snapshot immediately — the unbind is async, ~1s; mirror the agent_loop leak check).
+    // The guards above restore the service settings and the forwards as they drop, and
+    // scripts/test-android.sh re-reads the device after the suite to confirm they did.
 }
 
 /// Native invoke against the fixture. Ignored; same environment as the test above.
@@ -108,6 +108,7 @@ fn native_invoke_actuates_the_fixture() {
         std::env::var("GLASS_ANDROID_FIXTURE_APK").expect("set GLASS_ANDROID_FIXTURE_APK");
 
     let agents = AgentRegistry::new();
+    let _stop_agent = common::StopAgent(&agents);
     let mut p = AndroidPlatform::from_env(&EmulatorRegistry::new(), &agents).expect("attach");
     let adb = p.resolved_adb();
     adb.run(["install", "-r", "-g", &fixture])
@@ -127,6 +128,7 @@ fn native_invoke_actuates_the_fixture() {
         .expect("launch view fixture");
 
     let reg = A11yServiceRegistry::new();
+    let _restore = common::RestoreServiceState(&reg);
     let client = reg.ensure(&adb, &apk).expect("install + enable + connect");
     let mut a11y = ServiceA11y::new(client, String::new());
     let ctx = AxContext {
@@ -302,11 +304,9 @@ fn native_invoke_actuates_the_fixture() {
         || counter(&mut a11y),
     );
 
-    reg.shutdown();
     p.stop_app().ok();
     drop(p);
     // The fixture is glass's to install and glass's to remove: leaving it installed lets device
     // state accumulate across runs.
     adb.run(["uninstall", "com.fixedwidth.glassfixture"]).ok();
-    agents.shutdown();
 }
