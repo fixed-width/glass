@@ -1322,6 +1322,31 @@ mod teardown_tests {
         assert_eq!(terminations(&fake).len(), 1, "{:?}", fake.calls());
     }
 
+    /// The iOS half of the composition guarantee: a `terminate` that never answers must not spend
+    /// what the hook behind it needs (glass#427).
+    #[test]
+    fn a_terminate_that_never_answers_gives_up_at_the_shared_deadline() {
+        let fake = FakeSimctl::new();
+        fake.slow("terminate", 5);
+        let mut p = platform(&fake, true);
+
+        let started = std::time::Instant::now();
+        p.stop_app_by(std::time::Instant::now() + std::time::Duration::from_millis(300))
+            .expect("teardown is best-effort and reports success either way");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "waited {waited:?} on a terminate that never answers — the 10s SimctlOp budget was \
+             used instead of the deadline"
+        );
+        assert!(
+            fake.called("terminate test-udid"),
+            "it still has to ask: {:?}",
+            fake.calls()
+        );
+    }
+
     /// A `w`x`h` opaque PNG, as `simctl io screenshot` writes one.
     fn png(w: u32, h: u32) -> Vec<u8> {
         let mut bytes = Vec::new();

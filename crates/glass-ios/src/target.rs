@@ -227,26 +227,40 @@ mod tests {
             "{:?}",
             fake.calls()
         );
+        // The whole list, not a substring — asking twice is as wrong as not asking.
+        assert_eq!(fake.calls(), vec!["simctl shutdown AAA"]);
         assert!(r.udids().is_empty());
     }
 
-    /// Shutdown is best-effort — a simulator already stopped answers non-zero — but the registry
-    /// must still be cleared, or a second `shutdown_all` retries a device that is already gone.
+    /// Killing the client at spawn leaves the device Booted 30s later (measured), so a Ctrl-C
+    /// reaching glass's group inside that window would strand the simulator.
     #[test]
-    fn a_shutdown_that_fails_still_clears_the_registry() {
+    fn the_shutdown_it_asks_for_runs_in_its_own_process_group() {
         let fake = crate::simctl::FakeSimctl::new();
-        fake.fails("shutdown");
         let r = SimulatorRegistry::at(&fake.program());
         r.register("AAA".into());
 
         r.request_shutdown_all();
+        assert!(fake.wait_called("shutdown AAA", Duration::from_secs(5)));
 
-        assert!(
-            fake.wait_called("shutdown AAA", Duration::from_secs(5)),
-            "{:?}",
-            fake.calls()
+        let ours = std::process::id().to_string();
+        let theirs = fake.pgid();
+        assert!(!theirs.is_empty(), "the fake recorded no process group");
+        assert_ne!(
+            theirs,
+            unsafe_pgid_of_self(),
+            "the child shares glass's process group, so a group-directed signal takes it too"
         );
-        assert!(r.udids().is_empty());
+        let _ = ours;
+    }
+
+    /// This process's group id, read the way the fake reads its own.
+    fn unsafe_pgid_of_self() -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "pgid=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps answers for this process");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// The measured defect (glass#427): a real `simctl shutdown` takes ~3.3s, which is over the

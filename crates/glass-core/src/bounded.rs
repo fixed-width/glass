@@ -94,13 +94,15 @@ pub fn run_bounded_until(
 /// which every teardown caller discards — nothing can be done about it while the process exits.
 /// Left at that it is invisible: the companion stays enabled, the `adb forward` stays open in a
 /// server that outlives glass, the emulator stays up, and the exit looks clean.
-pub fn note_if_skipped<T>(step: &str, outcome: &Result<T>) {
-    if outcome.as_ref().err().and_then(GlassError::bound) == Some(BoundKind::NotStarted) {
-        eprintln!(
-            "glass: teardown skipped {step} — the deadline was spent before it could run, so the \
-             device still carries it"
-        );
+pub fn note_if_skipped<T>(step: &str, outcome: &Result<T>) -> bool {
+    if outcome.as_ref().err().and_then(GlassError::bound) != Some(BoundKind::NotStarted) {
+        return false;
     }
+    eprintln!(
+        "glass: teardown skipped {step} — the deadline was spent before it could run, so the \
+         device still carries it"
+    );
+    true
 }
 
 /// [`run_bounded`], but writing `stdin` to the child first.
@@ -415,6 +417,27 @@ mod tests {
     //! hardcoded `/bin/sh` there fails with "the system cannot find the path specified" rather than
     //! testing anything. What stays portable is everything that needs no process: the capture cap,
     //! the deadline boundary, the backoff, and the pipe-drain behaviour, which takes any `Read`.
+
+    /// The only signal that a teardown step never ran, so it reports that and nothing else: a
+    /// failure that did run says so through its own error.
+    #[test]
+    fn only_a_step_that_never_started_is_reported_as_skipped() {
+        let skipped: Result<()> = Err(GlassError::Bounded {
+            kind: BoundKind::NotStarted,
+            message: "spent".into(),
+        });
+        let timed_out: Result<()> = Err(GlassError::Bounded {
+            kind: BoundKind::TimedOut,
+            message: "ran, then gave up".into(),
+        });
+        assert!(note_if_skipped("a step", &skipped));
+        assert!(!note_if_skipped("a step", &timed_out));
+        assert!(!note_if_skipped("a step", &Ok(())));
+        assert!(!note_if_skipped(
+            "a step",
+            &Err::<(), _>(GlassError::Backend("plain".into()))
+        ));
+    }
 
     use super::*;
     #[cfg(unix)]

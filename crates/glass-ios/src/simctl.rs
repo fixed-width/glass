@@ -178,6 +178,8 @@ const FAKE_SIMCTL_SCRIPT: &str = "\
 # Stand-in for xcrun; see FakeSimctl in simctl.rs.
 [ \"$1\" = --glass-probe ] && exit 0
 dir=$(dirname \"$0\")
+# Before the argv line, so a test that waits for the call can then read this without racing it.
+printf '%s' \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$dir/pgid\"
 printf '%s\\n' \"$*\" >> \"$dir/calls\"
 # `$2` is the simctl verb, since `$1` is always `simctl`.
 # Recorded before sleeping, so a test can see the call while this one is still running.
@@ -277,6 +279,11 @@ impl FakeSimctl {
     /// Whether any invocation's argv contains `needle`.
     pub(crate) fn called(&self, needle: &str) -> bool {
         self.calls().iter().any(|c| c.contains(needle))
+    }
+
+    /// The process group the last invocation ran in, as it saw it.
+    pub(crate) fn pgid(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("pgid")).unwrap_or_default()
     }
 
     /// [`FakeSimctl::called`], waiting up to `within` for the call to arrive — for a caller that
@@ -408,6 +415,27 @@ mod tests {
             vec!["simctl terminate UDID app.id", "simctl list devices"]
         );
         assert!(!fake.called("boot"), "{:?}", fake.calls());
+    }
+
+    /// `slow` is what lets every "does it wait?" test fail: without the sleep landing, a caller
+    /// that waits looks exactly like one that does not.
+    #[test]
+    fn a_fake_told_to_be_slow_actually_takes_that_long() {
+        let fake = FakeSimctl::new();
+        let simctl = Simctl::at(fake.program());
+        fake.slow("terminate", 1);
+
+        let started = std::time::Instant::now();
+        simctl.run(&["terminate", "UDID", "app.id"]).unwrap();
+        let slept = started.elapsed();
+        assert!(slept >= Duration::from_millis(900), "returned in {slept:?}");
+
+        let started = std::time::Instant::now();
+        simctl.run(&["list", "devices"]).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "an unmarked verb must not be slowed too"
+        );
     }
 
     #[test]

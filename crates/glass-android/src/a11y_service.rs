@@ -1273,6 +1273,39 @@ mod tests {
         .expect("maps")
     }
 
+    /// The restore hands the device back — service disabled, forward removed — and runs after the
+    /// app was stopped, so a wedge earlier in teardown is what would starve it (glass#422).
+    #[test]
+    #[cfg(unix)]
+    fn a_restore_that_never_answers_gives_up_at_the_shared_deadline() {
+        use crate::adb::{Answer, FakeAdb};
+        use std::time::{Duration, Instant};
+
+        let fake = FakeAdb::new(&[("*", Answer::Lingers)]);
+        let reg = A11yServiceRegistry::new();
+        *reg.state.lock().unwrap() = Some(Active {
+            adb: fake.adb().clone(),
+            port: 1234,
+            prior_enabled: String::new(),
+            prior_a11y_enabled: "0".to_string(),
+        });
+
+        let started = Instant::now();
+        reg.shutdown_until(Some(Instant::now() + Duration::from_millis(300)));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?} on a device that never answers — three unbounded calls at 10s each is \
+             what the deadline exists to prevent",
+            started.elapsed()
+        );
+        assert!(
+            fake.called("settings"),
+            "the first step still has to be attempted: {:?}",
+            fake.calls()
+        );
+    }
+
     #[test]
     fn signature_mismatch_detected() {
         let failed = |said: &str| {

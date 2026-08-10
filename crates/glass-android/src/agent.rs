@@ -377,6 +377,40 @@ fn wait_for_agent_until(port: u16, deadline: Instant) -> Result<AgentClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deadline-bearing half of the agent's teardown — without it a wedged device leaks an
+    /// `adb forward` into a server that outlives glass (glass#422).
+    #[test]
+    #[cfg(unix)]
+    fn a_forward_removal_that_never_answers_gives_up_at_the_shared_deadline() {
+        use crate::adb::{Answer, FakeAdb};
+        use std::time::{Duration, Instant};
+
+        let fake = FakeAdb::new(&[("*", Answer::Lingers)]);
+        let reg = AgentRegistry::new();
+        *reg.state.lock().unwrap() = Some(AgentProc {
+            child: std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("a child to stand in for the agent"),
+            port: 1234,
+            adb: fake.adb().clone(),
+        });
+
+        let started = Instant::now();
+        reg.shutdown_until(Some(Instant::now() + Duration::from_millis(300)));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?} on a device that never answers",
+            started.elapsed()
+        );
+        assert!(
+            fake.called("forward --remove"),
+            "it still has to ask: {:?}",
+            fake.calls()
+        );
+    }
     use std::io::Write;
     use std::net::TcpListener;
 

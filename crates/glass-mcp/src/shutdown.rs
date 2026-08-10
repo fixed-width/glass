@@ -154,6 +154,79 @@ mod tests {
         }
     }
 
+    /// Nothing else checks that `run_shutdown` subtracts the headroom that pays for killing a
+    /// wedged step — up to `KILL_REAP` past its deadline.
+    #[tokio::test]
+    async fn the_deadline_the_backend_gets_leaves_room_to_kill_a_wedged_step() {
+        struct RecordingBackend(Arc<std::sync::Mutex<Option<Duration>>>);
+        impl Platform for RecordingBackend {
+            fn start_app(&mut self, _s: &AppSpec) -> Result<WindowGeometry> {
+                Ok(WindowGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                })
+            }
+            fn stop_app(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn stop_app_by(&mut self, deadline: Instant) -> Result<()> {
+                *self.0.lock().unwrap() = Some(deadline.saturating_duration_since(Instant::now()));
+                Ok(())
+            }
+            fn capture_frame(&mut self, _r: Option<&Region>) -> Result<Frame> {
+                unimplemented!()
+            }
+            fn send_pointer(&mut self, _e: &PointerEvent) -> Result<()> {
+                unimplemented!()
+            }
+            fn send_key(&mut self, _e: &KeyEvent) -> Result<()> {
+                unimplemented!()
+            }
+            fn window(&mut self, _o: &WindowOp) -> Result<WindowGeometry> {
+                unimplemented!()
+            }
+            fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+                Ok(vec![])
+            }
+            fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+                unimplemented!()
+            }
+            fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+                vec![]
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let recorded = seen.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let factory: PlatformFactory = Box::new(move |_b| {
+            Ok(Backend::display_only(Box::new(RecordingBackend(
+                recorded.clone(),
+            ))))
+        });
+        let mut glass = Glass::new(
+            factory,
+            "x11".into(),
+            BaselineStore::new(dir.path().join("baselines")),
+            100,
+        );
+        glass.start(&spec()).unwrap();
+
+        let budget = Duration::from_secs(3);
+        run_shutdown(Arc::new(Mutex::new(glass)), budget).await;
+
+        let got = seen.lock().unwrap().expect("the backend was stopped");
+        // With a margin: without the subtraction the backend still comes up a few microseconds
+        // short of the budget, which a bare `<` would read as headroom.
+        assert!(
+            got + Duration::from_millis(100) < budget - glass_core::TEARDOWN_REAP_HEADROOM,
+            "the backend was handed {got:?} of a {budget:?} budget — the headroom that pays for \
+             killing a wedged step was not subtracted"
+        );
+    }
+
     #[tokio::test]
     async fn run_shutdown_is_bounded_when_teardown_blocks() {
         let mut glass = glass_with_blocking_backend();

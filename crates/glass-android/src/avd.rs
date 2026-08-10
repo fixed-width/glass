@@ -408,6 +408,34 @@ mod tests {
         );
     }
 
+    /// The deadline has to reach here, or a wedge earlier in teardown leaves a whole emulator
+    /// running — the cheapest step to make, the worst to skip (glass#422).
+    #[test]
+    #[cfg(unix)]
+    fn a_kill_that_never_answers_gives_up_at_the_shared_deadline() {
+        use crate::adb::{Answer, FakeAdb};
+        use std::time::{Duration, Instant};
+
+        let fake = FakeAdb::new(&[("*", Answer::Lingers)]);
+        let reg = EmulatorRegistry::new();
+        reg.register(fake.adb(), "emulator-5554".into());
+
+        let started = Instant::now();
+        reg.kill_all_until(Some(Instant::now() + Duration::from_millis(300)));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?} on an emulator that never answers — the 10s AdbOp budget was used \
+             instead of the deadline",
+            started.elapsed()
+        );
+        assert!(
+            fake.called("emu kill"),
+            "it still has to ask: {:?}",
+            fake.calls()
+        );
+    }
+
     #[test]
     fn list_avds_parses_names_only() {
         let out = "INFO | Storing crashdata\nPixel_6\nglass\n";
