@@ -6,8 +6,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use glass_core::Deadline;
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree};
+use glass_core::{Deadline, Whose};
 use glass_core::{
     GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, WindowGeometry,
     read_back_failed, verify_typed_write,
@@ -247,7 +247,8 @@ fn dump_until_ready(
     interval: Duration,
     caller: Deadline,
 ) -> Result<String> {
-    let retry_until = caller.cap(Instant::now() + bound.then_within);
+    // `.0`: a retry window is not a step, so there is no bound to blame — only the instant.
+    let retry_until = caller.resolve(Instant::now() + bound.then_within).0;
     let mut owed = bound.least.max(1);
     // Kept so a spent caller deadline can name what the device last said, not just the budget.
     let mut unready: Option<GlassError> = None;
@@ -258,17 +259,16 @@ fn dump_until_ready(
         if caller.has_passed() {
             return Err(out_of_time(unready.as_ref()));
         }
-        let own = attempt_deadline();
-        let ends = caller.cap(own);
+        let (ends, whose) = caller.resolve(attempt_deadline());
         match dump_once(run, prefix, ends) {
             Attempt::Dumped(xml) => return Ok(xml),
-            // An attempt the *caller's* deadline cut short is not a device that failed. Which
-            // bound governs is settled before the attempt, not read off its error (glass#341).
+            // An attempt the *caller's* deadline cut short is not a device that failed. Whose
+            // bound ends it is settled before the attempt, not read off its error (glass#341).
             //
             // The abandoned attempt's own error is carried, not dropped: a wedged adb reaches
             // here too — it cannot be told apart from a slow one at the moment the budget ends —
             // and its message is the only place glass names the `adb kill-server` remedy.
-            Attempt::Fatal(e) if caller.governs(own) && bound_fired(&e) => {
+            Attempt::Fatal(e) if whose == Whose::Caller && bound_fired(&e) => {
                 return Err(out_of_time(Some(&e)));
             }
             Attempt::Fatal(e) => return Err(e),
@@ -1091,7 +1091,7 @@ mod tests {
             PREFIX,
             RetryBound::ONCE,
             Duration::ZERO,
-            // Nearer than `AdbOp::Dump`'s budget, so the caller's bound governs the attempt —
+            // Nearer than `AdbOp::Dump`'s budget, so the attempt resolves to `Whose::Caller` —
             // which is true of every read a `wait_for_element` makes.
             Deadline::from_millis(5_000),
         )
