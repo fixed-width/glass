@@ -40,6 +40,66 @@ impl CheckStatus {
     }
 }
 
+/// ANSI attributes for the human `doctor` and `env` renderings — a table of escape-sequence
+/// prefixes plus one reset. [`Palette::PLAIN`] leaves every field empty, so rendering through it
+/// emits no escapes at all and is byte-identical to the uncolored form. Deciding *whether* a
+/// terminal wants color is the caller's job; this type only says what the escapes are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Palette {
+    pub ok: &'static str,
+    pub warn: &'static str,
+    pub fail: &'static str,
+    pub dim: &'static str,
+    pub bold: &'static str,
+    pub heading: &'static str,
+    pub reset: &'static str,
+}
+
+impl Palette {
+    /// No color.
+    pub const PLAIN: Palette = Palette {
+        ok: "",
+        warn: "",
+        fail: "",
+        dim: "",
+        bold: "",
+        heading: "",
+        reset: "",
+    };
+
+    /// Basic SGR attributes, which every terminal that renders ANSI at all handles.
+    pub const ANSI: Palette = Palette {
+        ok: "\x1b[32m",
+        warn: "\x1b[33m",
+        fail: "\x1b[31m",
+        dim: "\x1b[2m",
+        bold: "\x1b[1m",
+        heading: "\x1b[1;36m",
+        reset: "\x1b[0m",
+    };
+
+    /// `text` wrapped in `attr` and this palette's reset. An empty `attr` returns `text`
+    /// unchanged — with no reset appended, which is what keeps [`Palette::PLAIN`] byte-identical.
+    pub fn paint(&self, attr: &str, text: &str) -> String {
+        if attr.is_empty() {
+            text.to_string()
+        } else {
+            format!("{attr}{text}{}", self.reset)
+        }
+    }
+
+    /// The attribute a check of this status is drawn in. `Skip` shares `dim`: it reports
+    /// something that did not run, so nothing in it should draw the eye.
+    pub fn for_status(&self, status: CheckStatus) -> &'static str {
+        match status {
+            CheckStatus::Ok => self.ok,
+            CheckStatus::Warn => self.warn,
+            CheckStatus::Fail => self.fail,
+            CheckStatus::Skip => self.dim,
+        }
+    }
+}
+
 /// One diagnostic check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Check {
@@ -317,5 +377,76 @@ mod tests {
         assert!(out.contains(
             "↪ open: x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
         ));
+    }
+
+    /// Drop every `\x1b[…m` SGR sequence, leaving the text bytes behind. Test-only: the
+    /// byte-identity assertions compare a colored render against a plain one through it.
+    ///
+    /// Deliberately duplicated in glass-mcp's `env` tests rather than shared — exporting a
+    /// test-only helper from this crate's public API to serve one consumer is the worse trade.
+    /// Leave both copies alone.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn strip_ansi_removes_escapes_and_keeps_everything_else() {
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\x1b[32m✓\x1b[0m"), "✓");
+        assert_eq!(strip_ansi("\x1b[1m\x1b[36m[x11]\x1b[0m"), "[x11]");
+        assert_eq!(strip_ansi("done\x1b[0m"), "done");
+    }
+
+    #[test]
+    fn strip_ansi_is_not_the_identity_function() {
+        // The byte-identity tests compare `strip_ansi(colored)` against `plain`. A helper that
+        // returned its input unchanged would make them pass against an implementation that
+        // emitted no color at all, so pin that it actually removes something.
+        let colored = Palette::ANSI.paint(Palette::ANSI.ok, "x");
+        assert!(colored.len() > "x".len(), "expected escapes: {colored:?}");
+        assert_eq!(strip_ansi(&colored), "x");
+    }
+
+    #[test]
+    fn a_plain_paint_appends_nothing_at_all() {
+        // Not merely "looks the same": an implementation that always appended `reset` would
+        // render identically to the eye while adding an escape to every painted span, and every
+        // byte-identity assertion downstream rests on this.
+        let p = Palette::PLAIN;
+        assert_eq!(p.paint(p.bold, "text"), "text");
+        assert_eq!(p.paint(p.ok, "✓"), "✓");
+    }
+
+    #[test]
+    fn an_ansi_paint_wraps_the_text_in_the_attribute_and_a_reset() {
+        let p = Palette::ANSI;
+        assert_eq!(p.paint(p.ok, "✓"), "\x1b[32m✓\x1b[0m");
+    }
+
+    #[test]
+    fn each_status_draws_in_its_own_attribute() {
+        // Compared pairwise rather than checked non-empty, so swapping two match arms fails.
+        let p = Palette::ANSI;
+        assert_eq!(p.for_status(CheckStatus::Ok), p.ok);
+        assert_eq!(p.for_status(CheckStatus::Warn), p.warn);
+        assert_eq!(p.for_status(CheckStatus::Fail), p.fail);
+        assert_eq!(p.for_status(CheckStatus::Skip), p.dim);
+        // and the attributes are distinct, so those comparisons can discriminate
+        assert_ne!(p.ok, p.warn);
+        assert_ne!(p.warn, p.fail);
+        assert_ne!(p.fail, p.dim);
     }
 }
