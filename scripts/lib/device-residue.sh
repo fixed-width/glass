@@ -14,17 +14,16 @@
 # Seconds to keep re-reading before calling a difference real, or an unreadable device dead.
 : "${GLASS_RESIDUE_SETTLE:=15}"
 
-# `SERVICE_PACKAGE` and the two `SOCKET` constants in crates/glass-android/src/{a11y_service,agent}.rs.
-# Duplicated because a shell script cannot read a Rust `const`; `assert_clean_baseline` is what
-# would notice them drifting, by never firing again.
+# `SERVICE_PACKAGE` in crates/glass-android/src/a11y_service.rs, duplicated because a shell script
+# cannot read a Rust `const`. Drift shows up as `assert_clean_baseline` never firing again.
 GLASS_RESIDUE_SERVICE_PKG='com.fixedwidth.glassa11y'
 
 # Run adb against the device the suite drives. `GLASS_ANDROID_SERIAL` is how a host with more than
 # one device online picks it (crates/glass-android/src/adb.rs `build_argv` does the same), and
 # without it every probe here fails on exactly the setup that variable exists for.
 #
-# `timeout` because a wedged device otherwise hangs the probe forever: the Rust side bounds every
-# adb call, and the poll below only checks its deadline between reads.
+# `timeout` because the poll below only checks its deadline between reads, so a wedged device
+# would hang a probe forever.
 _residue_adb() {
     local adb="$1"
     shift
@@ -110,9 +109,8 @@ assert_clean_baseline() {
 # it has not gone back to $2 within `GLASS_RESIDUE_SETTLE` seconds.
 report_device_residue() {
     local adb="$1" before="$2" after last="" looks=0 started=$SECONDS deadline
-    # Validated rather than trusted: an arithmetic error in the deadline below would skip the
-    # comparison, and the whole run would then pass having checked nothing. `10#` so a
-    # zero-padded `08` is eight seconds rather than a base-8 error.
+    # Validated, because an arithmetic error in the deadline below would skip the comparison and
+    # the run would pass having checked nothing. `10#` so `08` is eight seconds, not a base-8 error.
     case "$GLASS_RESIDUE_SETTLE" in
         '' | *[!0-9]*)
             echo "FAIL: GLASS_RESIDUE_SETTLE must be whole seconds, got '$GLASS_RESIDUE_SETTLE'" >&2
