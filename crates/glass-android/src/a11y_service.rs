@@ -534,7 +534,7 @@ impl Accessibility for ServiceA11y {
             // for a write that went out and refuses the retry as drift (glass#405).
             let after = self
                 .snapshot(ctx)
-                .map_err(|e| crate::a11y::read_back_failed(target, &e))?;
+                .map_err(|e| glass_core::read_back_failed(target, &e))?;
             // `find` answers `None` for a node that is gone and for one holding nothing, and
             // folding them together confirms a clear on the evidence that the element could not be
             // found. Keep polling — a tree mid-update loses it briefly.
@@ -551,7 +551,7 @@ impl Accessibility for ServiceA11y {
             };
             // Before the value check, not after: a collapsed row maps its text to `name` and
             // reports no value, so `"" == ""` would confirm a *clear* on the evidence that the
-            // field stopped being a field. `AndroidA11y`'s `verify_write` re-checks the flag too.
+            // field stopped being a field. `AndroidA11y`'s `verify_typed_write` re-checks the flag too.
             if !node.states.editable {
                 return Err(GlassError::AxWriteUnconfirmed(
                     target.id.0,

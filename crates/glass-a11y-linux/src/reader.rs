@@ -297,32 +297,6 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
     Err(GlassError::AxElementNotEditable(target.id.0))
 }
 
-/// Whether this node's children may be explored, recording the bound that stopped the walk
-/// when they may not. Callers only consult this once they already know the child list is
-/// non-empty — calling it for a childless node would record a truncation for declining to
-/// explore a list that was never going to be walked anyway.
-///
-/// `walk` and `find_nth` MUST consult this one function at the same point in their
-/// traversal. They assign a node's id by arrival order, and `set_value` re-walks to a
-/// caller-supplied id — so a bound applied in one traversal but not the other resolves the
-/// id against a different tree and writes to the wrong element. Sharing the decision makes
-/// that divergence impossible to introduce by editing only one of them.
-//
-// The exactly-at-cap boundary — a *complete* tree of exactly MAX_NODES must report `None`, since
-// the last node to arrive wasn't declined — is unit-tested in the Android/iOS mappers, which can
-// size a synthetic tree to the node. A live GTK tree can't be.
-fn may_explore_children(budget: &mut WalkBudget, depth: usize) -> bool {
-    if budget.depth_exhausted(depth) {
-        budget.hit(TruncationLimit::Depth);
-        return false;
-    }
-    if budget.nodes_exhausted() {
-        budget.hit(TruncationLimit::Nodes);
-        return false;
-    }
-    true
-}
-
 /// Pre-order DFS to the node at index `target`, mirroring `walk` exactly: visit the node (its
 /// id is the arrival count), then recurse each child in `get_children` order, skipping children
 /// whose proxy fails to build — **and stopping at the same depth/node/sibling bounds**. The
@@ -343,7 +317,7 @@ async fn find_nth(
     // Resolved before the gate: a childless node must never be reported truncated for
     // declining to explore a list that was already empty.
     let child_refs = proxy.get_children().await.map_err(bus_err)?;
-    if child_refs.is_empty() || !may_explore_children(budget, depth) {
+    if child_refs.is_empty() || !budget.may_explore_children(depth) {
         return Ok(None);
     }
     let mut siblings = 0usize;
@@ -465,7 +439,7 @@ async fn walk(
     // Resolved before the gate: a childless node must never be reported truncated for
     // declining to explore a list that was already empty.
     let child_refs = child_refs_res.map_err(bus_err)?;
-    if !child_refs.is_empty() && may_explore_children(budget, depth) {
+    if !child_refs.is_empty() && budget.may_explore_children(depth) {
         let mut siblings = 0usize;
         for child_ref in child_refs {
             // Checked before processing each child (not after) so the child that merely
@@ -835,7 +809,6 @@ mod toggle_label_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::{MAX_DEPTH, MAX_NODES};
 
     /// glass#338: only the reader can hold a read inside the caller's timeout — the worker below
     /// is detached, so nothing outside it can shorten one that has started.
@@ -867,49 +840,6 @@ mod tests {
             never_answered(false),
             GlassError::AccessibilityUnavailable(_)
         ));
-    }
-
-    #[test]
-    fn below_the_caps_children_may_be_explored_and_nothing_is_recorded() {
-        let mut budget = WalkBudget::new();
-        assert!(may_explore_children(&mut budget, 0));
-        assert!(budget.truncation().is_none());
-    }
-
-    #[test]
-    fn at_max_depth_the_depth_bound_is_recorded_and_children_may_not_be_explored() {
-        let mut budget = WalkBudget::new();
-        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
-        assert_eq!(
-            budget.truncation().map(|t| t.limit),
-            Some(TruncationLimit::Depth)
-        );
-    }
-
-    #[test]
-    fn with_the_node_budget_spent_the_nodes_bound_is_recorded_and_children_may_not_be_explored() {
-        let mut budget = WalkBudget::new();
-        for _ in 0..MAX_NODES {
-            budget.visit();
-        }
-        assert!(!may_explore_children(&mut budget, 0));
-        assert_eq!(
-            budget.truncation().map(|t| t.limit),
-            Some(TruncationLimit::Nodes)
-        );
-    }
-
-    #[test]
-    fn when_both_bounds_are_exhausted_the_recorded_limit_is_depth() {
-        let mut budget = WalkBudget::new();
-        for _ in 0..MAX_NODES {
-            budget.visit();
-        }
-        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
-        assert_eq!(
-            budget.truncation().map(|t| t.limit),
-            Some(TruncationLimit::Depth)
-        );
     }
 
     #[test]
