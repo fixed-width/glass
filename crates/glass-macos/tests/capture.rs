@@ -159,11 +159,6 @@ mod macos_main {
     }
 
     pub(super) fn run() {
-        run_fixture_test(
-            "quadrants",
-            "capture",
-            "CAPTURE_INTEGRATION_PASS",
-            run_checks,
-        );
+        run_fixture_test("quadrants", "CAPTURE_INTEGRATION_PASS", run_checks);
     }
 }

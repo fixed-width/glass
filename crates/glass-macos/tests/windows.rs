@@ -383,11 +383,6 @@ mod macos_main {
     }
 
     pub(super) fn run() {
-        run_fixture_test(
-            "quadrants",
-            "windows",
-            "WINDOW_INTEGRATION_PASS",
-            run_checks,
-        );
+        run_fixture_test("quadrants", "WINDOW_INTEGRATION_PASS", run_checks);
     }
 }

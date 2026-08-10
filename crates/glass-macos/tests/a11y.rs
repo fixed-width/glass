@@ -57,9 +57,8 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos_main {
-    use std::time::Duration;
-
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use glass_core::platform::{MouseButton, PointerEvent};
     use glass_core::{
@@ -377,7 +376,7 @@ mod macos_main {
                     println!("skipped (GLASS_A11Y_FIXTURE_BIN unset and no swiftc)");
                     return;
                 }
-                let (bin, dir) = build_fixture("a11y_fixture", "a11y");
+                let (bin, dir) = build_fixture("a11y_fixture");
                 (bin, Some(dir))
             }
         };

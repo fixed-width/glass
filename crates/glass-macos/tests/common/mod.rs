@@ -51,12 +51,15 @@ pub fn swiftc_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Build `fixture/{stem}.swift` to a fresh temp dir named for `tag`, returning the binary and the
-/// dir. The caller removes the dir; [`run_fixture_test`] does it for the targets that use it.
+/// Build `fixture/{stem}.swift` to a fresh temp dir, returning the binary and the dir. The caller
+/// removes the dir; [`run_fixture_test`] does it for the targets that use it.
 ///
-/// `tag` is the calling target's name so a parallel run of all of them cannot have two targets
-/// building into one dir — the pid alone would not separate them.
-pub fn build_fixture(stem: &str, tag: &str) -> (PathBuf, PathBuf) {
+/// The dir is named for the calling target — `env!` here expands per including target, so the name
+/// cannot desync from it — and for the pid, which is what separates two runs of the same target.
+/// The target's name is what makes a dir left behind by a crashed run say who leaked it, and stops
+/// a later target that draws the same pid from re-entering it.
+pub fn build_fixture(stem: &str) -> (PathBuf, PathBuf) {
+    let tag = env!("CARGO_CRATE_NAME");
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = manifest_dir.join("fixture").join(format!("{stem}.swift"));
     if !source.is_file() {
@@ -96,7 +99,6 @@ pub fn build_fixture(stem: &str, tag: &str) -> (PathBuf, PathBuf) {
 /// process alive. `checks` returns `Result` rather than exiting for the same reason.
 pub fn run_fixture_test(
     stem: &str,
-    tag: &str,
     pass_marker: &str,
     checks: impl FnOnce(&mut MacosPlatform, &Path) -> Result<(), String>,
 ) {
@@ -105,7 +107,7 @@ pub fn run_fixture_test(
         return;
     }
 
-    let (fixture_bin, fixture_dir) = build_fixture(stem, tag);
+    let (fixture_bin, fixture_dir) = build_fixture(stem);
     println!("built fixture at {}", fixture_bin.display());
 
     let mut platform = match MacosPlatform::new() {
@@ -141,6 +143,9 @@ pub fn run_fixture_test(
 }
 
 /// Run `body`, then always `stop_app` afterwards, whether or not `body` succeeded.
+///
+/// On success a `stop_app` failure becomes the caller's failure; on an already-failing `body` it is
+/// only logged, so it cannot mask the original.
 pub fn with_stop_app<T>(
     platform: &mut MacosPlatform,
     label: &str,
@@ -161,9 +166,10 @@ pub fn with_stop_app<T>(
     }
 }
 
-/// Per-channel RGBA tolerance for a sampled pixel against its expected colour. Generous next to a
-/// `deviceRGB` fill, which lands close to exact; sample points are quadrant centres, away from
-/// colour boundaries, so this is margin rather than a load-bearing bound.
+/// Per-channel RGBA tolerance for a sampled pixel against its expected colour, shared by the two
+/// targets that sample one. Generous next to a `deviceRGB` fill, which lands close to exact; sample
+/// points are quadrant centres, away from colour boundaries, so this is margin rather than a
+/// load-bearing bound.
 pub const PIXEL_TOLERANCE: i32 = 40;
 
 /// Fetch pixel `(x, y)` from a tightly-packed RGBA8 buffer.

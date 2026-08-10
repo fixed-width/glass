@@ -75,7 +75,7 @@ mod macos_main {
     };
     use glass_macos::MacosPlatform;
 
-    use crate::common::{fail, swiftc_available, with_stop_app};
+    use crate::common::{fail, swiftc_available, try_expect, with_stop_app};
 
     /// A stock-macOS handoff app. NOTE the mechanism is not what it looks like: it does not
     /// re-exec itself through LaunchServices. Directly spawning `Contents/MacOS/TextEdit` gets
@@ -105,16 +105,6 @@ mod macos_main {
     /// exited (check 2's no-orphan assertion) — `ffi::terminate_app` posts a terminate
     /// request and returns; this gives the target process a moment to actually unwind.
     const TERMINATE_SETTLE: Duration = Duration::from_secs(1);
-
-    /// Like the sibling tests' identical helper: returns the error as a `String` instead of
-    /// exiting, so a failure inside a check function still lets that check's own cleanup
-    /// (`stop_app`, fixture-dir removal) run before the message propagates.
-    fn try_expect<T, E: std::fmt::Display>(
-        result: Result<T, E>,
-        context: &str,
-    ) -> Result<T, String> {
-        result.map_err(|e| format!("{context}: {e}"))
-    }
 
     /// True if a process named `name` is currently running (`pgrep -x`) — used by
     /// [`run_handoff_check`] to tell a genuinely fresh `NSWorkspace` launch (no prior
