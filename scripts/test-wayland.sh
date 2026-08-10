@@ -13,26 +13,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib/have-sway.sh
+. scripts/lib/session-residue.sh
 if ! have_sway; then
     echo "no glass-discoverable sway >=1.12; build+install via https://github.com/fixed-width/sway-build. Skipping Wayland tests."
     exit 0
 fi
 # --test-threads=1: each test spawns its own sway (and Xwayland); serialize
 # so concurrent compositors don't contend for the display.
-marker="$(mktemp)"
+marker="$(residue_marker)"
+trap 'rm -f "$marker"' EXIT
 status=0
 cargo test -p glass-testapp --test wayland --test wayland_ignore_regions_e2e -- --ignored --test-threads=1 "$@" || status=$?
-
-# A session's runtime dir is dropped by the same teardown that reaps its compositor, so one left
-# behind is a teardown that never finished — a live sway still holding the app and the session's
-# a11y bus. Newer than the marker only, so an earlier run's residue is not this run's failure.
-# Checked here rather than in a test because the tests pass while it happens (glass#415).
-leaked=$(find /tmp -maxdepth 1 -name 'glass-wl.*' -newer "$marker" 2>/dev/null || true)
-rm -f "$marker"
-if [ -n "$leaked" ]; then
-    echo "FAIL: the suite leaked $(printf '%s\n' "$leaked" | wc -l) compositor session(s):" >&2
-    printf '%s\n' "$leaked" >&2
-    echo "Each is a live sway; the test that started it never stopped its session." >&2
-    status=1
-fi
+report_residue "$marker" 'glass-wl.??????' 'glass-a11y-??????' || status=1
 exit "$status"

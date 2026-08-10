@@ -40,6 +40,11 @@ const TESTAPP: &str = env!("CARGO_BIN_EXE_glass-testapp");
 /// job timeout.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the server gets to shut down before SIGKILL. Not `glass_proc_linux::REAP_GRACE`: at
+/// 2s it is shorter than the `TEARDOWN_BUDGET` glass-mcp's `run_shutdown` may take, so it would
+/// kill inside a legitimate teardown and reinstate the leak (glass#418).
+const SERVER_REAP_GRACE: Duration = Duration::from_secs(glass_core::TEARDOWN_BUDGET.as_secs() + 1);
+
 /// Path to the `glass-mcp` binary. `env!("CARGO_BIN_EXE_glass-mcp")` isn't usable here:
 /// Cargo only injects `CARGO_BIN_EXE_<name>` for binaries owned by the package the test
 /// itself belongs to, and this test lives in `glass-testapp`, not `glass-mcp`. Every
@@ -249,8 +254,10 @@ impl StdioServer {
 
 impl Drop for StdioServer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait(); // closes stdout, so the reader thread's read_line returns EOF.
+        // SIGTERM first so the server runs its own shutdown: `kill()` alone is SIGKILL, which
+        // cannot be handled, and a test panicking before its `glass_stop` left the session's
+        // private a11y bus running (glass#418). Reaping `wait`s, so the reader thread sees EOF.
+        glass_proc_linux::reap_graceful(&mut self.child, SERVER_REAP_GRACE);
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
