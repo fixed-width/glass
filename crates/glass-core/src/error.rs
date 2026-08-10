@@ -154,8 +154,8 @@ pub enum GlassError {
     /// A write that went out and could not then be confirmed. Distinct from the pre-write
     /// refusals because only this one has dispatched — see `set_value_failed_after_writing`.
     #[error(
-        "element #{0}: the text was typed, but the write could not be confirmed — {1}. Re-snapshot \
-         to see where it landed rather than typing it again"
+        "element #{0}: the write went out, but could not be confirmed — {1}. Re-snapshot to see \
+         where it landed rather than writing it again"
     )]
     AxWriteUnconfirmed(u32, String),
 
@@ -164,13 +164,14 @@ pub enum GlassError {
     /// Carries both values because three outcomes look alike from the id alone: the element
     /// transformed the write and holds it in another form (writing again changes nothing), it holds
     /// part of the request (a keystroke was dropped, so writing again is the fix), or it holds what
-    /// it held before (the write never arrived). Build it with [`GlassError::value_not_applied`],
-    /// or [`GlassError::value_not_applied_because`] where the backend can name the last case.
+    /// it held before (the write took no effect). Build it with [`GlassError::value_not_applied`],
+    /// or [`GlassError::value_not_applied_because`] for the last case, which is the only one a
+    /// backend's own explanation fits — [`crate::write_took_no_effect`] is the test for it.
     #[error(
         "set_value on element #{id} did not take — asked for {requested:?}, the element {}. \
          Holding the request in another form means the element transformed it, and writing again \
-         will not change that; holding part of it, or none of it, means the write did not \
-         arrive{}",
+         will not change that; holding part of it, or none of it, means the write did not take \
+         effect{}",
         render_observed(.observed),
         render_why(.why)
     )]
@@ -322,7 +323,12 @@ impl GlassError {
     }
 
     /// As [`Self::value_not_applied`], plus what this backend knows about a write of its own that
-    /// does not arrive — the mechanism and its remedy, appended to the shared message.
+    /// takes no effect — the mechanism, and a remedy where there is one, appended to the shared
+    /// message.
+    ///
+    /// Only for a read-back [`crate::write_took_no_effect`] accepts: the clause subordinates to
+    /// that outcome, so attaching it to a transformed value contradicts the sentence before it.
+    /// It is appended after `" — "`, so it reads as a continuation — lowercase, no closing stop.
     ///
     /// `&'static str` deliberately: a remedy is a fixed explanation of how this backend writes, not
     /// a place to format the call's data into.
@@ -629,14 +635,18 @@ mod tests {
         )
         .to_string();
         assert!(msg.ends_with("ACTION_SET_TEXT cannot replace text already in a Compose field"));
-        assert!(msg.contains("the write did not arrive —"), "{msg}");
+        assert!(msg.contains("the write did not take effect —"), "{msg}");
     }
 
     #[test]
     fn a_verdict_with_no_backend_explanation_ends_at_the_shared_text() {
         // No trailing dash with nothing after it for a site that has nothing to add.
         let msg = GlassError::value_not_applied(13, "new", Some("old")).to_string();
-        assert!(msg.ends_with("the write did not arrive"), "{msg}");
+        assert!(msg.ends_with("the write did not take effect"), "{msg}");
+        // The three-outcome reading is the reason the variant carries both values; an edit that
+        // trimmed the message back to its last clause would otherwise keep every test green.
+        assert!(msg.contains("in another form"), "{msg}");
+        assert!(msg.contains("holding part of it"), "{msg}");
     }
 
     #[test]
@@ -695,7 +705,7 @@ mod tests {
             "nothing in the tree carries its role and name".into(),
         );
         let msg = e.to_string();
-        assert!(msg.contains("the text was typed"), "{msg}");
+        assert!(msg.contains("the write went out"), "{msg}");
         assert!(
             msg.contains("nothing in the tree carries its role and name"),
             "{msg}"

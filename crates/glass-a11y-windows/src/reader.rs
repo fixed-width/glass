@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use glass_core::{
     Accessibility, AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal,
     GlassError, Result, TruncationLimit, WalkBudget, normalize_description, read_back_confirms,
+    write_took_no_effect,
 };
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
@@ -59,10 +60,10 @@ const SET_VALUE_VERIFY_MS: u64 = 800;
 /// Interval between read-backs while waiting for a write / toggle to land.
 const VERIFY_POLL_MS: u64 = 20;
 
-/// What a write that never arrived looks like on this backend: the accessibility API accepts a
-/// value the toolkit never applies, which is a read-only projection rather than a lost write.
-const READ_ONLY_PROJECTION: &str = "this element's accessibility value may be a read-only projection that accepts a write without \
-     applying it — focus the element and type into it instead";
+/// What a write that took no effect looks like on this backend: the accessibility API accepts a
+/// value the toolkit never applies. Twin of the const in `glass-a11y-macos/src/reader.rs`.
+const READ_ONLY_PROJECTION: &str = "this element's accessibility value may be a read-only projection that accepts a write \
+     without applying it — focus the element and type into it instead";
 
 #[derive(Default)]
 pub struct WindowsA11y;
@@ -459,12 +460,19 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(GlassError::value_not_applied_because(
-                target.id.0,
-                text,
-                after.as_deref(),
-                READ_ONLY_PROJECTION,
-            ));
+            // A projection that accepted the write and kept its value is what this explains. A read
+            // that failed, or one showing a value the element reformatted, is not evidence of it.
+            return Err(match after.as_deref() {
+                Some(seen) if write_took_no_effect(seen, before.as_deref()) => {
+                    GlassError::value_not_applied_because(
+                        target.id.0,
+                        text,
+                        Some(seen),
+                        READ_ONLY_PROJECTION,
+                    )
+                }
+                seen => GlassError::value_not_applied(target.id.0, text, seen),
+            });
         }
         std::thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
     }

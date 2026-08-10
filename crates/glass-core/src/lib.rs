@@ -16,7 +16,9 @@ pub mod bounded;
 pub use bounded::{run_bounded, run_bounded_until, run_bounded_with_stdin};
 
 pub mod set_value;
-pub use set_value::{read_back_confirms, typed_clear_landed, typed_text_landed};
+pub use set_value::{
+    read_back_confirms, typed_clear_landed, typed_text_landed, write_took_no_effect,
+};
 
 pub mod frame;
 pub use frame::{Frame, Region};

@@ -436,10 +436,11 @@ impl Glass {
             } else {
                 // `None` is no checkable near the target's bounds on the last tick — the swipe
                 // moved the screen — so it reports as a reading nobody took, not as a state.
-                Err(GlassError::value_not_applied(
+                Err(GlassError::value_not_applied_because(
                     id.0,
                     text,
                     seen.map(|on| if on { "on" } else { "off" }),
+                    "the swipe across the control's trailing edge did not move it",
                 ))
             };
         }
@@ -546,7 +547,12 @@ impl Glass {
             // A combo carries its selection as its name, so that is the read-back; `None` is the
             // combo no longer being where it was. `text` rather than the trimmed `want`, so the
             // caller sees what it asked for, as `AxOptionNotFound` above does.
-            Err(GlassError::value_not_applied(id.0, text, shows.as_deref()))
+            Err(GlassError::value_not_applied_because(
+                id.0,
+                text,
+                shows.as_deref(),
+                "the option was stepped to and committed, and the combo still shows another",
+            ))
         }
     }
 
@@ -2961,12 +2967,12 @@ mod tests {
 
     /// [`GuardedAccessibility`] whose first call fails before dispatching anything — the shape of
     /// Android's `set_value`, which re-snapshots and reaches for adb before it taps.
-    struct PreDispatchFailureThenGuarded {
+    struct FirstFailureThenGuarded {
         first_failure: Option<GlassError>,
         guarded: GuardedAccessibility,
     }
 
-    impl Accessibility for PreDispatchFailureThenGuarded {
+    impl Accessibility for FirstFailureThenGuarded {
         fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
             self.guarded.snapshot(ctx)
         }
@@ -2989,7 +2995,7 @@ mod tests {
             GlassError::AccessibilityUnavailable("adb: device offline".into()),
         ] {
             let set_log = Arc::new(Mutex::new(Vec::new()));
-            let mut g = glass_ready_for_set_value(Box::new(PreDispatchFailureThenGuarded {
+            let mut g = glass_ready_for_set_value(Box::new(FirstFailureThenGuarded {
                 first_failure: Some(failure),
                 guarded: GuardedAccessibility {
                     tree: editable_field_tree(Some("Alice")),
@@ -3012,6 +3018,42 @@ mod tests {
             assert!(
                 set_log.lock().unwrap().is_empty(),
                 "no write may land on the drifted row"
+            );
+        }
+    }
+
+    #[test]
+    fn a_post_dispatch_failure_lets_the_retry_through_once_the_field_settles() {
+        // The sequence glass#405 is about, end to end: a write that dispatched and could not be
+        // confirmed, a field that then settles to the text that write sent, and a retry the guard
+        // must accept. Keeping the cached value here makes the settled field look like drift, and
+        // the caller is refused for a write that landed. Both verdicts a backend can raise once it
+        // has written must clear it.
+        for failure in [
+            GlassError::AxWriteUnconfirmed(0, "the result was lost".into()),
+            GlassError::value_not_applied(0, "x", Some("Alice")),
+        ] {
+            let set_log = Arc::new(Mutex::new(Vec::new()));
+            let mut g = glass_ready_for_set_value(Box::new(FirstFailureThenGuarded {
+                first_failure: Some(failure),
+                guarded: GuardedAccessibility {
+                    tree: editable_field_tree(Some("Alice")),
+                    // The device applied the write the caller was told it could not confirm.
+                    held: Some("x".into()),
+                    set_log: set_log.clone(),
+                },
+            }));
+
+            assert!(
+                g.set_value(AxNodeId(0), "x").is_err(),
+                "first write is scripted to fail after dispatch"
+            );
+            g.set_value(AxNodeId(0), "x")
+                .expect("the retry must not be refused as drift for a write that landed");
+            assert_eq!(
+                set_log.lock().unwrap().len(),
+                1,
+                "exactly the retry reaches the element"
             );
         }
     }
@@ -3515,7 +3557,7 @@ mod tests {
 
         // The error must be the switch-specific "expects a boolean" one, and its message must
         // actually guide the agent (name the accepted values + echo the bad input) — NOT a generic
-        // `AxValueNotApplied`, whose remedy is to type into the element — futile for a switch.
+        // `AxValueNotApplied`, which reads as a text field that would not take the text.
         assert!(
             matches!(err, GlassError::AxValueNotBoolean(1, ref got) if got == "banana"),
             "{err}"

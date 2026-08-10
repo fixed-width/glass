@@ -53,6 +53,19 @@ pub fn read_back_confirms(read_back: Option<&str>, before: Option<&str>, request
     }
 }
 
+/// Whether a read-back shows the element holding exactly what it held before the write — the one
+/// outcome that means the write never took effect, as against arriving and being transformed.
+///
+/// The caller passes a reading it actually took, with an absent value already normalized to `""`:
+/// a mapper that drops empty values reports an empty field as no value, and a backend whose
+/// read-back *failed* has no reading to compare and must not ask.
+///
+/// What a backend's own explanation of a write hangs on — attach it here and nowhere else, or a
+/// field that transformed the text is handed a remedy for one that never received it.
+pub fn write_took_no_effect(observed: &str, before: Option<&str>) -> bool {
+    before.is_some_and(|b| b == observed)
+}
+
 /// Whether a *typed* write landed, judged from the value read back.
 ///
 /// Exact match, unlike [`read_back_confirms`]: keystrokes can land partially, and a field holding

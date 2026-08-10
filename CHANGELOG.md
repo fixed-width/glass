@@ -21,28 +21,32 @@ internal refactors, CI, or test-only changes.
 
 ### Changed
 - `glass_set_value`'s "did not take" error now names both what you asked for and what the element
-  holds. Three outcomes used to look alike: the element transformed the write and holds it in
-  another form, so writing again changes nothing; it holds part of what you asked for, so a
-  keystroke was dropped and writing again is the fix; or it holds what it held before, so the write
-  never arrived. On the iOS Simulator this is routine — iOS applies sentence autocapitalization to
+  holds, and closes with what the backend that made the write knows about it. Three outcomes used
+  to look alike: the element transformed the write and holds it in another form, so writing again
+  changes nothing; it holds part of what you asked for, so a keystroke was dropped and writing
+  again is the fix; or it holds what it held before, so the write took no effect — and for that
+  last one the error now says why it can happen on the backend you are driving. A desktop
+  element's value is often a read-only accessibility projection; a mobile write is a tap and then
+  keystrokes, so the tap can miss; a *Compose* field driven through Android's on-device
+  accessibility service cannot have its text replaced, only set into an empty field; and a toggle
+  action that fired without moving the control is how a radio button reports that it cannot be
+  unselected.
+- On the iOS Simulator the transformed case is routine: iOS applies sentence autocapitalization to
   the first character of a field it considers empty, and a write clears the field before it types,
   so a lowercase value can come back capitalized. It happens intermittently, depending on whether
   the field had finished emptying when the first key arrived, and it read as an unexplained "did
   not take" before.
-- A `glass_set_value` that does not take now closes with what the backend that made the write knows
-  about it, rather than one shared guess covering all of them: a desktop element's value is often a
-  read-only accessibility projection, a mobile write is a tap and then keystrokes so the tap can
-  miss, an Android field driven through the on-device accessibility service cannot have text
-  replaced (only set into an empty field), and a control whose toggle action fired without moving is
-  how a radio button reports it cannot be unselected.
 
 ### Fixed
 - A `glass_set_value` that failed on Android's on-device accessibility service no longer poisons the
   retry. Three of that path's failures — the write not landing, the field ceasing to report itself
-  editable, and the read-back itself failing — were reported in a shape glass did not recognise as
-  having already written, so it kept the value it had cached for the element. A field that then
+  editable, and the read-back itself failing — along with a write whose answer was lost in
+  transport, were reported as failures glass did not recognise as having already written, so it
+  kept the value it had cached for the element. A field that then
   settled to the new text made the cached value stale, and the next `glass_set_value` on it was
-  refused as drift ("changed since the snapshot") for a write that had in fact succeeded.
+  refused as drift ("changed since the snapshot") for a write that had in fact succeeded. On the
+  same path, an element that left the tree during the write, and a cleared field that stopped
+  reporting itself editable, are no longer reported as an empty reading and a confirmed clear.
 - A helper binary that is installed but cannot be run is now reported as exactly that, instead of
   as missing. glass resolves several external tools — `Xvfb`, `sway`, `bwrap`, `dbus-daemon`,
   `at-spi-bus-launcher` — and used to accept any file at the path, so one whose execute permission
