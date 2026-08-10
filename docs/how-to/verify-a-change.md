@@ -127,7 +127,7 @@ Fourteen run locally. One drives another machine.
 | **`test-windows.sh`** | **drives a REMOTE Windows box over SSH**; skips cleanly when none is configured |
 | `sandbox-xvfb.sh` | manage the sandbox X display glass-mcp drives |
 | `bench.sh` | run the benchmarks, or flamegraph one |
-| `coverage.sh` | coverage via cargo-llvm-cov |
+| `coverage.sh` | coverage via cargo-llvm-cov + cargo-nextest |
 | `mutants.sh` | mutation-test glass-core (CI does this; see the table above) |
 | `build-bundle.sh` | build the distribution bundle |
 | `verification-cost.sh` | measure what the verification loop costs |

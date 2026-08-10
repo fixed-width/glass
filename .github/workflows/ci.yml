@@ -233,7 +233,8 @@ jobs:
     # Non-gating: a coverage report, never a merge blocker. The number undercounts
     # by design (see scripts/coverage.sh): glass-windows Win32 FFI is
     # cfg(windows) so it isn't measured here; the Wayland suite needs a sway this job does not
-    # fetch, so it self-skips, and glass-wayland's own tests are `#[ignore]`d for the same reason.
+    # fetch, so it self-skips, and glass-wayland's own tests are `#[ignore]`d for the same reason;
+    # and nextest runs no doctests — the workspace has none.
     continue-on-error: true
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -241,9 +242,11 @@ jobs:
         run: rustup show
       - name: Add llvm-tools (required by cargo-llvm-cov)
         run: rustup component add llvm-tools-preview
+      # scripts/coverage.sh runs its direct test legs under nextest and hard-exits without it —
+      # which this `continue-on-error` job would report as a pass that measured nothing.
       - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov,cargo-nextest
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
