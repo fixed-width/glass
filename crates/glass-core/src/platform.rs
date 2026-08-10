@@ -29,8 +29,7 @@ pub const TEARDOWN_REAP_HEADROOM: Duration = Duration::from_millis(750);
 /// A shared deadline bounds a sequence; it does not divide one. Without a reserve, a device that
 /// stops answering during `stop_app` leaves the hook nothing — and `run_bounded_until` does not
 /// start a command with no time left, so its steps are skipped rather than slowed. On Android the
-/// hook is what hands the device back: the companion it enabled, the `adb forward` it opened, the
-/// emulator it booted.
+/// hook is what hands the device back (`glass_android::hand_the_device_back`).
 ///
 /// Five adb calls, the slowest measured at 52ms on an emulator with every core saturated
 /// (glass#422).

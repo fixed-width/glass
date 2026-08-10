@@ -78,9 +78,9 @@ impl Glass {
     }
 
     /// Best-effort teardown of **all** active sessions for process exit. Idempotent:
-    /// a no-op when nothing is active. Errors are swallowed — we are exiting, so a
-    /// failed `stop_app` must not prevent releasing the rest (the OS reaps anything
-    /// left). Distinct from `stop()`, which reports errors to a tool caller.
+    /// a no-op when nothing is active. Errors are swallowed — we are exiting, so a failed
+    /// `stop_app` must not prevent releasing the rest. Distinct from `stop()`, which reports
+    /// errors to a tool caller.
     ///
     /// `deadline` is when teardown is expected to be done. Stopping the sessions is held
     /// [`crate::TEARDOWN_HOOK_RESERVE`] short of it: a shared deadline bounds a sequence without
@@ -89,10 +89,6 @@ impl Glass {
     ///
     /// A third step between them is bounded by neither — dropping the session reaps the backend
     /// (Xvfb, sway, a Job object) and the log-stream children, each an unbounded `wait()`.
-    ///
-    /// Written to drain the session set so the future multi-session registry (a
-    /// `HashMap` instead of this `Option`) reuses it unchanged — it becomes a `for`
-    /// loop with no other change.
     pub fn shutdown(&mut self, deadline: Deadline) {
         if let Some(mut s) = self.active.take() {
             let _ = s
