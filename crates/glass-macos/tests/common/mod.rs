@@ -1,14 +1,14 @@
 //! Helpers shared by the mac-gated integration tests and probes in this directory.
 //!
-//! All of them exist because these targets are `harness = false` (see `Cargo.toml`): there is no
-//! libtest to format a panic, spawn a thread per test, or reap a fixture process, so each target
-//! has to do those itself — and each had grown its own copy of the same seven or eight functions.
+//! These targets are `harness = false` (see `Cargo.toml`), so there is no libtest to format a
+//! panic, run each test on its own thread, or reap a fixture process — and each target had grown
+//! its own copy of the functions that do.
 //!
-//! Cargo does not treat a subdirectory of `tests/` as a target, so this is a module the targets
-//! include rather than a test in its own right.
+//! Cargo does not treat a subdirectory of `tests/` as a target, so this is a module they include
+//! rather than an eighth test.
 #![cfg(target_os = "macos")]
-// Every target compiles the whole module and uses a subset of it — the probes never build a Swift
-// fixture, and only the two pixel tests sample a frame.
+// Every target compiles the whole module and uses a subset — the probes never build a Swift
+// fixture, and only two of them sample a frame.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -54,10 +54,9 @@ pub fn swiftc_available() -> bool {
 /// Build `fixture/{stem}.swift` to a fresh temp dir, returning the binary and the dir. The caller
 /// removes the dir; [`run_fixture_test`] does it for the targets that use it.
 ///
-/// The dir is named for the calling target — `env!` here expands per including target, so the name
-/// cannot desync from it — and for the pid, which is what separates two runs of the same target.
-/// The target's name is what makes a dir left behind by a crashed run say who leaked it, and stops
-/// a later target that draws the same pid from re-entering it.
+/// The dir is named for the pid, which separates two runs, and for the calling target, which makes
+/// a dir a crashed run left behind say who leaked it. `env!` expands per including target, so that
+/// name cannot desync from the target it names.
 pub fn build_fixture(stem: &str) -> (PathBuf, PathBuf) {
     let tag = env!("CARGO_CRATE_NAME");
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -95,7 +94,7 @@ pub fn build_fixture(stem: &str) -> (PathBuf, PathBuf) {
 /// Build the fixture, run `checks` against a fresh `MacosPlatform`, and clean up whatever happened.
 ///
 /// The cleanup ordering is the point: `stop_app` and the temp-dir removal run before any
-/// `process::exit`, which skips destructors — so without them a failed run leaves the fixture
+/// `process::exit`, which skips destructors, so without them a failed run leaves the fixture
 /// process alive. `checks` returns `Result` rather than exiting for the same reason.
 pub fn run_fixture_test(
     stem: &str,
@@ -166,10 +165,9 @@ pub fn with_stop_app<T>(
     }
 }
 
-/// Per-channel RGBA tolerance for a sampled pixel against its expected colour, shared by the two
-/// targets that sample one. Generous next to a `deviceRGB` fill, which lands close to exact; sample
-/// points are quadrant centres, away from colour boundaries, so this is margin rather than a
-/// load-bearing bound.
+/// Per-channel RGBA tolerance for a sampled pixel, shared by the two targets that sample one.
+/// Sample points are quadrant centres, away from colour boundaries, so this is margin rather than
+/// a load-bearing bound.
 pub const PIXEL_TOLERANCE: i32 = 40;
 
 /// Fetch pixel `(x, y)` from a tightly-packed RGBA8 buffer.
@@ -190,8 +188,8 @@ pub fn close(a: [u8; 4], b: [u8; 4]) -> bool {
 }
 
 /// Assert the pixel at `(x, y)` is within tolerance of `expected`, returning the actual bytes on
-/// mismatch. `Result`, not a process exit, so a mismatch found with a fixture spawned still
-/// reaches the cleanup that reaps it.
+/// mismatch. `Result`, not a process exit, so a mismatch still reaches the cleanup that reaps the
+/// fixture.
 pub fn assert_pixel(
     pixels: &[u8],
     frame_width: u32,
