@@ -20,8 +20,7 @@ use glass_core::coords::pixel_geometry_from_content_rect;
 use glass_core::platform::WindowGeometry;
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, GlassError,
-    Result, TruncationLimit, WalkBudget, normalize_description, read_back_confirms,
-    write_took_no_effect,
+    Result, WalkBudget, normalize_description, read_back_confirms, write_took_no_effect,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
@@ -510,17 +509,8 @@ fn walk(
         // skipped without entering, so an all-skipped level (a virtualized list of thousands)
         // could otherwise iterate without ever tripping it. `MAX_SIBLINGS` bounds the
         // per-level scan regardless of how many are skipped (mirrors the Windows reader).
-        let mut siblings = 0usize;
-        for child in child_els {
-            // Checked before processing each child (not after) so the child that merely
-            // completes the tree doesn't get mistaken for one the walk declined to visit.
-            if budget.nodes_exhausted() {
-                budget.hit(TruncationLimit::Nodes);
-                break;
-            }
-            siblings += 1;
-            if siblings > budget.max_siblings() {
-                budget.hit(TruncationLimit::Siblings);
+        for (scanned, child) in child_els.into_iter().enumerate() {
+            if !budget.may_visit_sibling(scanned) {
                 break;
             }
             if !should_skip(&child) {
@@ -588,18 +578,10 @@ fn find_nth(
     if child_els.is_empty() || !budget.may_explore_children(depth) {
         return None;
     }
-    let mut siblings = 0usize;
-    for child in child_els {
-        // Checked before processing each child (not after) so the child that merely
-        // completes the tree doesn't get mistaken for one the walk declined to visit.
-        if budget.nodes_exhausted() {
-            budget.hit(TruncationLimit::Nodes);
+    // Same per-level bound as walk(), so find_nth can't spin either.
+    for (scanned, child) in child_els.into_iter().enumerate() {
+        if !budget.may_visit_sibling(scanned) {
             break;
-        }
-        siblings += 1;
-        if siblings > budget.max_siblings() {
-            budget.hit(TruncationLimit::Siblings);
-            break; // same per-level bound as walk(), so find_nth can't spin either
         }
         if !should_skip(&child)
             && let Some(found) = find_nth(child, depth + 1, budget, target)

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     Accessibility, AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal,
-    GlassError, Result, TruncationLimit, WalkBudget, normalize_description, read_back_confirms,
+    GlassError, Result, WalkBudget, normalize_description, read_back_confirms,
     write_took_no_effect,
 };
 use uiautomation::patterns::{
@@ -236,15 +236,10 @@ fn walk(
         while let Some(c) = child {
             // Checked before processing each child (not after) so the child that merely
             // completes the tree doesn't get mistaken for one the walk declined to visit.
-            if budget.nodes_exhausted() {
-                budget.hit(TruncationLimit::Nodes);
+            if !budget.may_visit_sibling(siblings) {
                 break;
             }
             siblings += 1;
-            if siblings > budget.max_siblings() {
-                budget.hit(TruncationLimit::Siblings);
-                break;
-            }
             if !c.is_offscreen().unwrap_or(false) {
                 children.push(walk(walker, &c, origin, depth + 1, budget)?);
             }
@@ -603,15 +598,11 @@ fn find_nth(
     while let Some(c) = child {
         // Checked before processing each child (not after) so the child that merely
         // completes the tree doesn't get mistaken for one the walk declined to visit.
-        if budget.nodes_exhausted() {
-            budget.hit(TruncationLimit::Nodes);
+        // Same per-level bound as walk(), so find_nth can't spin either.
+        if !budget.may_visit_sibling(siblings) {
             break;
         }
         siblings += 1;
-        if siblings > budget.max_siblings() {
-            budget.hit(TruncationLimit::Siblings);
-            break; // same per-level bound as walk(), so find_nth can't spin either
-        }
         if !c.is_offscreen().unwrap_or(false)
             && let Some(found) = find_nth(walker, &c, depth + 1, budget, target)
         {

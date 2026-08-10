@@ -1,7 +1,7 @@
 //! Pure mapping from `uiautomator dump` XML into glass's normalized `AxTree`.
 
 use glass_core::accessibility::{
-    AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, TruncationLimit, WalkBudget, WalkLimits,
+    AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, WalkBudget, WalkLimits,
     normalize_description,
 };
 use glass_core::{GlassError, Result, WindowGeometry};
@@ -115,15 +115,7 @@ pub fn build_tree(xml: &str, window: &WindowGeometry, limits: WalkLimits) -> Res
         .filter(|n| n.is_element() && n.tag_name().name() == "node")
         .enumerate()
     {
-        // Checked before processing each child (not after) so a child that merely
-        // completes the tree — the last one, pushing the count to MAX_NODES — doesn't
-        // get mistaken for a child the walk declined to visit.
-        if budget.nodes_exhausted() {
-            budget.hit(TruncationLimit::Nodes);
-            break;
-        }
-        if i >= budget.max_siblings() {
-            budget.hit(TruncationLimit::Siblings);
+        if !budget.may_visit_sibling(i) {
             break;
         }
         children.push(map_node(n, window, 0, &mut budget));
@@ -196,25 +188,12 @@ fn map_node(
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "node")
         .collect();
-    let children = if child_nodes.is_empty() {
-        vec![]
-    } else if budget.depth_exhausted(depth) {
-        budget.hit(TruncationLimit::Depth);
-        vec![]
-    } else if budget.nodes_exhausted() {
-        budget.hit(TruncationLimit::Nodes);
+    let children = if child_nodes.is_empty() || !budget.may_explore_children(depth) {
         vec![]
     } else {
         let mut out = Vec::new();
         for (i, n) in child_nodes.into_iter().enumerate() {
-            // Checked before processing each child (not after) so the child that merely
-            // completes the tree doesn't get mistaken for one the walk declined to visit.
-            if budget.nodes_exhausted() {
-                budget.hit(TruncationLimit::Nodes);
-                break;
-            }
-            if i >= budget.max_siblings() {
-                budget.hit(TruncationLimit::Siblings);
+            if !budget.may_visit_sibling(i) {
                 break;
             }
             out.push(map_node(n, window, depth + 1, budget));
@@ -334,7 +313,7 @@ fn non_empty(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::accessibility::AxRole;
+    use glass_core::accessibility::{AxRole, TruncationLimit};
     use glass_core::{GlassError, WindowGeometry};
 
     /// Roles the container rule in [`class_to_role`] can produce (any leaf ending in `Layout`,

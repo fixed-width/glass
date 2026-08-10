@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use glass_core::accessibility::{Accessibility, AxContext, AxDeadline, AxNode, AxTarget, AxTree};
 use glass_core::{
-    GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry, read_back_failed,
-    verify_typed_write,
+    GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, WindowGeometry,
+    read_back_failed, verify_typed_write,
 };
 
 use crate::adb::{Adb, AdbOp};
@@ -581,7 +581,7 @@ impl Accessibility for AndroidA11y {
                 .snapshot_within(ctx, VERIFY_BOUND)
                 .map_err(|e| read_back_failed(target, &e))?;
             after.assign_ids();
-            match verify_typed_write(&after, target, text) {
+            match verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED) {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later read: drift and truncation are
                 // structural, and re-dumping for them costs seconds to reach the same answer.

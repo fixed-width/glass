@@ -7,7 +7,8 @@ use glass_core::accessibility::{Accessibility, AxContext, AxRect, AxTarget, AxTr
 use std::time::Duration;
 
 use glass_core::{
-    GlassError, KeyEvent, MouseButton, PointerEvent, Result, read_back_failed, verify_typed_write,
+    GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, read_back_failed,
+    verify_typed_write,
 };
 
 use crate::axmap;
@@ -188,7 +189,7 @@ impl Accessibility for IosA11y {
             let (after, _) = self
                 .describe(ctx)
                 .map_err(|e| read_back_failed(target, &e))?;
-            match verify_typed_write(&after, target, text) {
+            match verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED) {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later describe: drift and truncation
                 // are structural, so re-describing for them reaches the same answer more slowly.

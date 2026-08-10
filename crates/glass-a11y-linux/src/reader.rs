@@ -11,7 +11,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
     Accessibility, AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError,
-    Result, TruncationLimit, WalkBudget, normalize_description,
+    Result, WalkBudget, normalize_description,
 };
 
 use crate::mapping::{map_role, map_states};
@@ -320,17 +320,8 @@ async fn find_nth(
     if child_refs.is_empty() || !budget.may_explore_children(depth) {
         return Ok(None);
     }
-    let mut siblings = 0usize;
-    for child_ref in child_refs {
-        // Checked before processing each child (not after) so the child that merely
-        // completes the tree doesn't get mistaken for one the walk declined to visit.
-        if budget.nodes_exhausted() {
-            budget.hit(TruncationLimit::Nodes);
-            break;
-        }
-        siblings += 1;
-        if siblings > budget.max_siblings() {
-            budget.hit(TruncationLimit::Siblings);
+    for (scanned, child_ref) in child_refs.into_iter().enumerate() {
+        if !budget.may_visit_sibling(scanned) {
             break;
         }
         let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
@@ -440,17 +431,8 @@ async fn walk(
     // declining to explore a list that was already empty.
     let child_refs = child_refs_res.map_err(bus_err)?;
     if !child_refs.is_empty() && budget.may_explore_children(depth) {
-        let mut siblings = 0usize;
-        for child_ref in child_refs {
-            // Checked before processing each child (not after) so the child that merely
-            // completes the tree doesn't get mistaken for one the walk declined to visit.
-            if budget.nodes_exhausted() {
-                budget.hit(TruncationLimit::Nodes);
-                break;
-            }
-            siblings += 1;
-            if siblings > budget.max_siblings() {
-                budget.hit(TruncationLimit::Siblings);
+        for (scanned, child_ref) in child_refs.into_iter().enumerate() {
+            if !budget.may_visit_sibling(scanned) {
                 break;
             }
             let Ok(child) = child_ref.as_accessible_proxy(conn).await else {

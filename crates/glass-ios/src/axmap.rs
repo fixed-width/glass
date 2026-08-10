@@ -20,7 +20,7 @@
 //! key anywhere in the output), so [`AxStates::focused`] is always false from this
 //! backend — a known limitation.
 use glass_core::accessibility::{
-    AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, TruncationLimit, WalkBudget, WalkLimits,
+    AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, WalkBudget, WalkLimits,
     normalize_description,
 };
 use glass_core::{GlassError, Result, WindowGeometry};
@@ -115,15 +115,7 @@ pub fn build_tree(
         Value::Array(a) => {
             let mut out = Vec::new();
             for (i, n) in a.iter().enumerate() {
-                // Checked before processing each element (not after) so the element that
-                // merely completes the tree doesn't get mistaken for one the walk declined
-                // to visit.
-                if budget.nodes_exhausted() {
-                    budget.hit(TruncationLimit::Nodes);
-                    break;
-                }
-                if i >= budget.max_siblings() {
-                    budget.hit(TruncationLimit::Siblings);
+                if !budget.may_visit_sibling(i) {
                     break;
                 }
                 out.push(map_node(n, scale, 0, &mut budget));
@@ -231,25 +223,11 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
     let children = match n.get("children").and_then(Value::as_array) {
         None => vec![],
         Some(arr) if arr.is_empty() => vec![],
-        Some(_) if budget.depth_exhausted(depth) => {
-            budget.hit(TruncationLimit::Depth);
-            vec![]
-        }
-        Some(_) if budget.nodes_exhausted() => {
-            budget.hit(TruncationLimit::Nodes);
-            vec![]
-        }
+        Some(_) if !budget.may_explore_children(depth) => vec![],
         Some(kids) => {
             let mut out = Vec::new();
             for (i, c) in kids.iter().enumerate() {
-                // Checked before processing each child (not after) so the child that merely
-                // completes the tree doesn't get mistaken for one the walk declined to visit.
-                if budget.nodes_exhausted() {
-                    budget.hit(TruncationLimit::Nodes);
-                    break;
-                }
-                if i >= budget.max_siblings() {
-                    budget.hit(TruncationLimit::Siblings);
+                if !budget.may_visit_sibling(i) {
                     break;
                 }
                 out.push(map_node(c, scale, depth + 1, budget));
@@ -289,7 +267,7 @@ fn frame_to_rect(f: &Value, scale: f64) -> Option<AxRect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::accessibility::{AxNode, AxRole};
+    use glass_core::accessibility::{AxNode, AxRole, TruncationLimit};
     use glass_core::{DescribedSample, WindowGeometry};
 
     const FIXTURE: &str = include_str!("../tests/fixtures/describe_nested.json");
