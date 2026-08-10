@@ -47,18 +47,18 @@ pub struct AndroidPlatform {
 impl AndroidPlatform {
     /// Stop the app, under `deadline` when the caller has one to share.
     ///
-    /// The logcat reap comes first and is unbounded, which measurement says costs 0-1ms: it is a
-    /// `SIGKILL` to a direct child, so only that child sitting in uninterruptible sleep can hold
-    /// it up.
+    /// The logcat reap comes first and is unbounded, measured at 0-1ms — a kill and reap of a
+    /// direct child, which only uninterruptible sleep can hold up.
     fn stop_app_until(&mut self, deadline: Option<Instant>) -> Result<()> {
         if let Some(mut app) = self.app.take() {
             if let Some(mut logcat) = app.logcat.take() {
                 logcat.stop();
             }
-            let _ = self.adb().run_until(
+            let stopped = self.adb().run_until(
                 force_stop_args(&app.package).iter().map(String::as_str),
                 deadline,
             );
+            glass_core::note_if_skipped("the app force-stop", &stopped);
         }
         Ok(())
     }
@@ -276,9 +276,10 @@ impl Platform for AndroidPlatform {
         self.stop_app_until(None)
     }
 
-    /// Measured at ~0.1s on a loaded emulator against the 3s the whole of teardown gets, so the
-    /// deadline is not expected to bind — it is what keeps a device that has stopped answering
-    /// from spending the shutdown hook's turn as well as its own (glass#422).
+    /// Force-stop measures 101ms median, 267ms worst on an emulator with every core saturated,
+    /// against the 3s all of teardown gets — so the deadline is not expected to bind. It is for
+    /// the device that stopped answering, which would otherwise run out the 10s `AdbOp::Shell`
+    /// budget and leave the hook nothing (glass#422).
     fn stop_app_by(&mut self, deadline: Instant) -> Result<()> {
         self.stop_app_until(Some(deadline))
     }

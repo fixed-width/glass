@@ -289,10 +289,11 @@ impl IosPlatform {
             // Best-effort teardown: the app may already be gone (it crashed, or a prior
             // launch's `--terminate-running-process` killed it), so a failing `terminate`
             // is not an error — dropping the session is the goal, and it is idempotent.
-            let _ = self
+            let stopped = self
                 .target
                 .simctl()
                 .run_until(&["terminate", self.target.udid(), &app.bundle_id], deadline);
+            glass_core::note_if_skipped("terminating the app", &stopped);
         }
         Ok(())
     }
@@ -603,9 +604,10 @@ impl Platform for IosPlatform {
         self.stop_app_until(None)
     }
 
-    /// Measured at ~0.1s against the 3s the whole of teardown gets, so the deadline is not
-    /// expected to bind — it is what keeps a simulator that has stopped answering from spending
-    /// the shutdown hook's turn as well as its own (glass#427).
+    /// `terminate` measures ~101ms against the 3s all of teardown gets, so the deadline is not
+    /// expected to bind. It is for the simulator that stopped answering, which would otherwise run
+    /// out the 10s `SimctlOp::Query` budget and leave nothing for the hook behind it
+    /// (glass#427).
     fn stop_app_by(&mut self, deadline: Instant) -> Result<()> {
         self.stop_app_until(Some(deadline))
     }

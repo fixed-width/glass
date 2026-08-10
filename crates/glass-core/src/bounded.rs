@@ -42,7 +42,7 @@ const DRAIN_SETTLE: Duration = Duration::from_millis(200);
 /// `wait()`: SIGKILL only lands when the child next leaves the kernel, so a process stuck in an
 /// uninterruptible syscall — the very failure this module exists for — would otherwise strand a
 /// caller who has already spent their whole budget. A stray zombie is the cheaper outcome.
-const KILL_REAP: Duration = Duration::from_millis(500);
+pub const KILL_REAP: Duration = Duration::from_millis(500);
 
 /// Most output ONE PIPE may buffer, so a drain thread left reading a pipe something else still
 /// holds cannot grow without bound. Far past any real one-shot's output: measured on the dogfood
@@ -86,6 +86,21 @@ pub fn run_bounded_until(
         });
     }
     run_bounded_inner(cmd, budget, op, None)
+}
+
+/// Say on stderr that a teardown step never ran, when that is what `outcome` reports.
+///
+/// [`BoundKind::NotStarted`] means the deadline was spent before the command was spawned at all,
+/// which every teardown caller discards — nothing can be done about it while the process exits.
+/// Left at that it is invisible: the companion stays enabled, the `adb forward` stays open in a
+/// server that outlives glass, the emulator stays up, and the exit looks clean.
+pub fn note_if_skipped<T>(step: &str, outcome: &Result<T>) {
+    if outcome.as_ref().err().and_then(GlassError::bound) == Some(BoundKind::NotStarted) {
+        eprintln!(
+            "glass: teardown skipped {step} — the deadline was spent before it could run, so the \
+             device still carries it"
+        );
+    }
 }
 
 /// [`run_bounded`], but writing `stdin` to the child first.

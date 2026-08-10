@@ -84,16 +84,24 @@ impl Glass {
     /// failed `stop_app` must not prevent releasing the rest (the OS reaps anything
     /// left). Distinct from `stop()`, which reports errors to a tool caller.
     ///
-    /// `deadline` is when the caller stops waiting, and it is passed to both halves rather than
-    /// enforced here: the point is that the hook still gets its turn after a session that tore
-    /// down slowly, which only the steps themselves can arrange (glass#422).
+    /// `deadline` is when teardown is expected to be done. Stopping the sessions is held
+    /// [`crate::TEARDOWN_HOOK_RESERVE`] short of it: a shared deadline bounds a sequence without
+    /// dividing one, so a device that stops answering during `stop_app` would otherwise leave the
+    /// hook with nothing, and a step with no time left is not run at all (glass#422).
+    ///
+    /// A third step between them is bounded by neither — dropping the session reaps the backend
+    /// (Xvfb, sway, a Job object) and the log-stream children, each an unbounded `wait()`.
     ///
     /// Written to drain the session set so the future multi-session registry (a
     /// `HashMap` instead of this `Option`) reuses it unchanged — it becomes a `for`
     /// loop with no other change.
     pub fn shutdown(&mut self, deadline: Instant) {
+        // Never more than half, or a caller whose budget is smaller than the reserve — a test,
+        // a host that shortens it — starves the sessions instead of the hook.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let reserve = crate::TEARDOWN_HOOK_RESERVE.min(remaining / 2);
         if let Some(mut s) = self.active.take() {
-            let _ = s.platform.stop_app_by(deadline);
+            let _ = s.platform.stop_app_by(deadline - reserve);
             // `s` drops here: the backend (Xvfb/sway/Job) is torn down.
         }
         if let Some(hook) = self.shutdown_hook.take() {
@@ -244,12 +252,50 @@ mod tests {
         let deadline = soon();
         g.shutdown(deadline);
 
-        assert_eq!(
-            *at_stop.lock().unwrap(),
-            Some(deadline),
-            "the backend must be stopped through `stop_app_by`, not `stop_app`"
+        let at_stop = at_stop
+            .lock()
+            .unwrap()
+            .expect("the backend must be stopped through `stop_app_by`, not `stop_app`");
+        assert!(
+            at_stop < deadline,
+            "the session's share must stop short of the hook's, or the reserve is not held back"
         );
-        assert_eq!(*at_hook.lock().unwrap(), Some(deadline));
+        assert_eq!(
+            *at_hook.lock().unwrap(),
+            Some(deadline),
+            "the hook gets the whole deadline; the reserve is what the session gave up"
+        );
+    }
+
+    /// The property this whole split exists for (glass#422): a session that spends everything it
+    /// is given must still leave the hook enough to run. Without the reserve the hook is reached
+    /// with a spent deadline, and `run_bounded_until` does not start a command it has no time for
+    /// — so every step behind it is skipped rather than merely slow.
+    #[test]
+    fn a_session_that_burns_its_deadline_still_leaves_the_hook_time_to_run() {
+        let factory: PlatformFactory = Box::new(move |_backend| {
+            Ok(Backend::display_only(Box::new(
+                FakePlatform::new(10, 10).burning_its_deadline(),
+            )))
+        });
+        let left = Arc::new(Mutex::new(None));
+        let recorded = left.clone();
+        let mut g = glass_with_factory(factory);
+        g.set_shutdown_hook(Box::new(move |d| {
+            *recorded.lock().unwrap() =
+                Some(d.saturating_duration_since(std::time::Instant::now()));
+        }));
+        g.start(&spec()).unwrap();
+
+        // A tenth of the real budget, so the test costs what it measures rather than 3s.
+        let budget = crate::TEARDOWN_BUDGET / 10;
+        g.shutdown(std::time::Instant::now() + budget);
+
+        let left = left.lock().unwrap().expect("the hook ran at all");
+        assert!(
+            left > std::time::Duration::ZERO,
+            "the hook was handed a spent deadline, so every step behind the session is skipped"
+        );
     }
 
     #[test]

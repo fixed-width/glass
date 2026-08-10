@@ -7,32 +7,44 @@ use std::time::{Duration, Instant};
 use glass_core::Glass;
 use tokio::sync::Mutex;
 
-/// How much longer this waits than the deadline it gives `Glass::shutdown`.
+/// How long a tool call may hold the session before teardown says so.
 ///
-/// The two bounds are for different failures. Teardown's own deadline is what the steps divide
-/// between them, so they finish deliberately and the last one still gets a turn. This timeout is
-/// the backstop for a step that ignores a deadline it was given — the process is exiting either
-/// way, and abandoning a `spawn_blocking` thread mid-call orphans whatever it was running. The
-/// grace is what keeps the ordinary case from racing its own backstop and reporting an overrun on
-/// every clean exit.
-const ABANDON_GRACE: Duration = Duration::from_millis(500);
+/// The lock is held for a whole tool body and some legitimately outlast the budget — `am start`
+/// gets 60s — which is a different failure from a step that ran and overran, and reads the same
+/// without a line of its own.
+const LOCK_WAIT_WORTH_SAYING: Duration = Duration::from_millis(250);
 
 /// Best-effort, time-bounded teardown of all sessions for process exit. The backend
 /// teardown blocks (it waits on the child), so it runs off the async reactor via
 /// `spawn_blocking`; after `budget` we stop waiting and let the OS reap whatever is
 /// left — we are exiting regardless.
+///
+/// Two bounds, for two failures. `Glass::shutdown`'s deadline is what its steps spend, held
+/// [`glass_core::TEARDOWN_REAP_HEADROOM`] short of `budget` so killing a wedged step — up to
+/// `bounded::KILL_REAP` past its deadline — still lands inside. This `timeout` is the backstop for
+/// a step that ignores the deadline: a `spawn_blocking` task cannot be cancelled, so that step is
+/// still running when the process exits, and its child is orphaned.
 pub async fn run_shutdown(sessions: Arc<Mutex<Glass>>, budget: Duration) {
-    let deadline = Instant::now() + budget;
     let task = tokio::task::spawn_blocking(move || {
+        // Started after the lock: a tool call in flight holds the session, and a deadline
+        // measured across that wait arrives spent — reported downstream as every step skipped,
+        // when what happened is that teardown never got to start.
+        let waiting = Instant::now();
         // On a `spawn_blocking` thread, `blocking_lock` is allowed (it would panic on
         // a reactor worker thread).
-        sessions.blocking_lock().shutdown(deadline);
+        let mut glass = sessions.blocking_lock();
+        let waited = waiting.elapsed();
+        if waited > LOCK_WAIT_WORTH_SAYING {
+            eprintln!("glass: a tool call held the session for {waited:?} before teardown started");
+        }
+        glass.shutdown(Instant::now() + budget - glass_core::TEARDOWN_REAP_HEADROOM);
     });
-    if tokio::time::timeout(budget + ABANDON_GRACE, task)
-        .await
-        .is_err()
-    {
-        eprintln!("glass: shutdown exceeded {budget:?}; exiting anyway");
+    match tokio::time::timeout(budget, task).await {
+        Ok(Ok(())) => {}
+        // A panic inside teardown: the steps behind it did not run, and the process is about to
+        // exit past it.
+        Ok(Err(e)) => eprintln!("glass: teardown panicked ({e}); exiting anyway"),
+        Err(_) => eprintln!("glass: shutdown exceeded {budget:?}; exiting anyway"),
     }
 }
 

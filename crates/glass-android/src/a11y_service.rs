@@ -702,6 +702,8 @@ impl A11yServiceRegistry {
             READY_ATTEMPT,
             READY_ATTEMPTS,
             &|step| escalate(adb, apk, &want, step, READY_ATTEMPTS),
+            // No deadline: this is the rollback for a failed `ensure` during `glass_start`, not
+            // teardown, so each call keeps its own budget and answers to no shared one.
             &|| restore_a11y(adb, prior, prior_a11y, port, None),
         )?;
         *self.state.lock().unwrap() = Some(Active {
@@ -720,8 +722,8 @@ impl A11yServiceRegistry {
     }
 
     /// [`A11yServiceRegistry::shutdown`] under a deadline the rest of teardown shares — the
-    /// process-exit path, where what is left of `glass_core::TEARDOWN_BUDGET` has already paid for
-    /// stopping the app (glass#422).
+    /// process-exit path, where stopping the app has already spent part of
+    /// `glass_core::TEARDOWN_BUDGET` (glass#422).
     pub fn shutdown_until(&self, deadline: Option<std::time::Instant>) {
         if let Ok(mut g) = self.state.lock()
             && let Some(a) = g.take()
@@ -749,8 +751,17 @@ fn escalate(adb: &Adb, apk: &str, want: &str, step: u32, attempts: u32) -> Resul
 }
 
 fn put_secure(adb: &Adb, key: &str, value: &str) -> Result<()> {
-    adb.run(["shell", "settings", "put", "secure", key, value])
-        .map(|_| ())
+    put_secure_until(adb, key, value, None).map(|_| ())
+}
+
+/// [`put_secure`] under a deadline the caller shares with the rest of its sequence.
+fn put_secure_until(
+    adb: &Adb,
+    key: &str,
+    value: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<String> {
+    adb.run_until(["shell", "settings", "put", "secure", key, value], deadline)
 }
 
 /// Write `enabled_accessibility_services`. An empty list is a `delete`: `settings put ... ""`
@@ -778,18 +789,7 @@ fn put_enabled_services_until(
         )
         .map(|_| ())
     } else {
-        adb.run_until(
-            [
-                "shell",
-                "settings",
-                "put",
-                "secure",
-                "enabled_accessibility_services",
-                list,
-            ],
-            deadline,
-        )
-        .map(|_| ())
+        put_secure_until(adb, "enabled_accessibility_services", list, deadline).map(|_| ())
     }
 }
 
@@ -820,19 +820,12 @@ fn restore_a11y(
     port: u16,
     deadline: Option<std::time::Instant>,
 ) {
-    let _ = put_enabled_services_until(adb, prior_enabled, deadline);
-    let _ = adb.run_until(
-        [
-            "shell",
-            "settings",
-            "put",
-            "secure",
-            "accessibility_enabled",
-            prior_a11y_enabled,
-        ],
-        deadline,
-    );
-    let _ = adb.run_until(["forward", "--remove", &format!("tcp:{port}")], deadline);
+    let services = put_enabled_services_until(adb, prior_enabled, deadline);
+    glass_core::note_if_skipped("restoring enabled_accessibility_services", &services);
+    let enabled = put_secure_until(adb, "accessibility_enabled", prior_a11y_enabled, deadline);
+    glass_core::note_if_skipped("restoring accessibility_enabled", &enabled);
+    let forward = adb.run_until(["forward", "--remove", &format!("tcp:{port}")], deadline);
+    glass_core::note_if_skipped("removing the a11y service's adb forward", &forward);
 }
 
 /// How long ONE readiness attempt polls for a served window. On a cold-booted device readiness

@@ -123,10 +123,10 @@ impl Glass {
     /// Install a teardown callback run once at the end of `shutdown()` — used by the host
     /// (glass-mcp) for resource cleanup it owns (e.g. stopping a glass-booted emulator).
     ///
-    /// It is handed the same deadline `shutdown` was given, which is what is left of
-    /// [`crate::TEARDOWN_BUDGET`] after the sessions stopped. A hook whose cleanup is local can
-    /// ignore it; one that talks to a device cannot, or the last step spends a budget the first
-    /// step already used.
+    /// It gets the whole deadline, the sessions before it having been held
+    /// [`crate::TEARDOWN_HOOK_RESERVE`] short so this still has time. A hook whose cleanup is
+    /// local can ignore it; one that talks to a device spends it, and gets
+    /// `BoundKind::NotStarted` for whatever it reaches with nothing left.
     pub fn set_shutdown_hook(&mut self, hook: Box<dyn FnOnce(std::time::Instant) + Send>) {
         self.shutdown_hook = Some(hook);
     }

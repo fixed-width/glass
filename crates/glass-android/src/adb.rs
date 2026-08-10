@@ -127,12 +127,8 @@ impl Adb {
     }
 
     /// [`Adb::run`] under a deadline the whole sequence shares, `None` for a call that answers to
-    /// nothing but its own budget.
-    ///
-    /// Teardown is what needs it: `stop_app` and the registry shutdowns behind it are a run of
-    /// separate calls, and glass-mcp abandons the lot at [`glass_core::TEARDOWN_BUDGET`] — so
-    /// without a shared deadline one wedged call spends what the calls behind it needed
-    /// (glass#422).
+    /// nothing but its own budget. The deadline bounds the run; it does not reserve time for the
+    /// calls behind, which is `Glass::shutdown`'s job (glass#422).
     pub fn run_until<'a, I>(&self, args: I, deadline: Option<Instant>) -> Result<String>
     where
         I: IntoIterator<Item = &'a str>,

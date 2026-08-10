@@ -63,6 +63,9 @@ pub(crate) struct FakePlatform {
     /// The deadline `stop_app_by` was handed, when it was the entry point — `None` after a plain
     /// `stop_app`, which is how a test tells the two apart.
     stop_deadline: Option<Arc<Mutex<Option<std::time::Instant>>>>,
+    /// Makes `stop_app_by` spend its whole deadline, standing in for a device that stopped
+    /// answering.
+    stop_burns_deadline: bool,
 }
 
 impl FakePlatform {
@@ -113,6 +116,12 @@ impl FakePlatform {
     }
     /// Record the deadline `stop_app_by` receives, for proving the teardown budget reaches the
     /// backend rather than stopping at `Glass`.
+    /// Spend the whole deadline in `stop_app_by`, so a test can ask what is left for the step
+    /// behind it.
+    pub(crate) fn burning_its_deadline(mut self) -> Self {
+        self.stop_burns_deadline = true;
+        self
+    }
     pub(crate) fn recording_stop_deadline(
         mut self,
         at: Arc<Mutex<Option<std::time::Instant>>>,
@@ -177,6 +186,9 @@ impl Platform for FakePlatform {
     fn stop_app_by(&mut self, deadline: std::time::Instant) -> Result<()> {
         if let Some(at) = &self.stop_deadline {
             *at.lock().unwrap() = Some(deadline);
+        }
+        if self.stop_burns_deadline {
+            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
         }
         self.stop_app()
     }

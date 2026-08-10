@@ -10,10 +10,10 @@ use glass_core::{GlassError, Result, run_bounded, run_bounded_until};
 /// than left unbounded, because a boot that never completes must still end as an error.
 ///
 /// Budgets are ~4x the slowest healthy run measured on the dogfood simulator, floored at 10s — a
-/// bound on a simulator that has stopped answering, not what a call is expected to cost. Measured
-/// over 25 runs: `terminate` 101ms median, `io screenshot` well inside its own budget. The
-/// exception is `shutdown` at ~3.3s, which is why nothing waits on one during teardown (glass#427,
-/// `SimulatorRegistry::shutdown_all`).
+/// bound on a simulator that has stopped answering, not what a call is expected to cost:
+/// `terminate` measured 101ms median over 25 runs. `shutdown` is the one verb whose *expected*
+/// cost (~3.3s) exceeds `glass_core::TEARDOWN_BUDGET`, which is why nothing waits on one during
+/// teardown (glass#427, `SimulatorRegistry::request_shutdown_all`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimctlOp {
     /// `bootstatus -b` — waits out the whole boot.
@@ -25,9 +25,9 @@ pub enum SimctlOp {
     Install,
     /// `io <udid> screenshot` — encodes a frame.
     Screenshot,
-    /// Everything else: `list`, `pbcopy`, `pbpaste`, `terminate`, `spawn`. `terminate` is a
-    /// teardown call and measures ~101ms, so the 10s here is headroom for a wedged simulator; the
-    /// teardown *sequence* is bounded by the deadline [`Simctl::run_until`] carries instead.
+    /// Everything else: `list`, `pbcopy`, `pbpaste`, `terminate`, `spawn`. `terminate` measures
+    /// ~101ms, so the 10s here is headroom for a wedged simulator; a teardown *sequence* is
+    /// bounded by the deadline [`Simctl::run_until`] carries instead.
     Query,
 }
 
@@ -119,14 +119,28 @@ impl Simctl {
     }
 
     /// [`Simctl::run`] under a deadline the whole sequence shares, `None` for a call that answers
-    /// to nothing but its own budget.
-    ///
-    /// Teardown is what needs it: glass-mcp abandons the whole of it at
-    /// [`glass_core::TEARDOWN_BUDGET`], so a call that wedges would otherwise spend what the calls
-    /// behind it needed (glass#427).
+    /// to nothing but its own budget. The deadline bounds the run; it does not reserve time for
+    /// the calls behind, which is `Glass::shutdown`'s job (glass#427).
     pub fn run_until(&self, sub: &[&str], deadline: Option<Instant>) -> Result<String> {
         let out = self.output(sub, deadline)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Start `xcrun simctl <sub...>` and hand back the child unwaited, in a process group of its
+    /// own so a signal to glass's group does not take it too.
+    ///
+    /// For the one call costing more than its caller's whole budget (`shutdown`, ~3.3s against a
+    /// 3s teardown), where waiting only delays the exit. stdout is closed rather than inherited —
+    /// on stdio an inherited one corrupts the MCP stream.
+    pub fn spawn_detached(&self, sub: &[&str]) -> std::io::Result<std::process::Child> {
+        let mut cmd = Command::new(self.program());
+        cmd.args(self.full_args(sub))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        cmd.spawn()
     }
 
     fn output(&self, sub: &[&str], deadline: Option<Instant>) -> Result<Vec<u8>> {

@@ -331,14 +331,18 @@ impl AgentRegistry {
     }
 
     /// [`AgentRegistry::shutdown`] under a deadline the rest of teardown shares (glass#422).
+    ///
+    /// Only the forward removal is under it — dropping `p` then kills and reaps the agent with an
+    /// unbounded `wait()`, the gap `AndroidPlatform::stop_app_until` names for logcat.
     pub fn shutdown_until(&self, deadline: Option<std::time::Instant>) {
         if let Ok(mut guard) = self.state.lock()
             && let Some(p) = guard.take()
         {
-            let _ = p.adb.run_until(
+            let removed = p.adb.run_until(
                 ["forward", "--remove", &format!("tcp:{}", p.port)],
                 deadline,
             );
+            glass_core::note_if_skipped("removing the agent's adb forward", &removed);
             // p drops here → Drop kills + reaps the child
         }
     }

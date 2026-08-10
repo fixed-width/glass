@@ -190,8 +190,9 @@ impl EmulatorRegistry {
         self.kill_all_until(None);
     }
 
-    /// [`EmulatorRegistry::kill_all`] under a deadline the rest of teardown shares. Measured at
-    /// 2ms: `adb emu kill` acknowledges and lets the VM go down on its own time (glass#422).
+    /// [`EmulatorRegistry::kill_all`] under a deadline the rest of teardown shares. `adb emu kill`
+    /// was observed at 2ms — it acknowledges and lets the VM go down on its own time — so this is
+    /// the cheapest step in teardown and the worst one to skip (glass#422).
     pub fn kill_all_until(&self, deadline: Option<std::time::Instant>) {
         let clients = self
             .booted
@@ -199,7 +200,8 @@ impl EmulatorRegistry {
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
         for adb in clients {
-            let _ = adb.run_until(["emu", "kill"], deadline);
+            let killed = adb.run_until(["emu", "kill"], deadline);
+            glass_core::note_if_skipped("killing a glass-booted emulator", &killed);
         }
     }
 
