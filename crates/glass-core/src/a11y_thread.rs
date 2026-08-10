@@ -96,7 +96,7 @@ impl A11yThread {
             return Err(self.never_answered(Whose::Caller));
         }
         let (wait, ended_by) = self.bounded_wait(deadline);
-        self.detached(Op::Snapshot, wait, job, ended_by)
+        self.detached(Op::Snapshot, wait, job, || self.never_answered(ended_by))
     }
 
     /// Write a value, bounded by the ceiling alone.
@@ -104,7 +104,9 @@ impl A11yThread {
     /// No deadline: the seam places the capping obligation on `snapshot`, and the session builds
     /// both this context and `invoke`'s with [`Deadline::UNBOUNDED`], so there is none to honour.
     pub fn set_value(&self, job: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
-        self.detached(Op::SetValue, self.ceiling, job, Whose::Callee)
+        self.detached(Op::SetValue, self.ceiling, job, || {
+            self.timed_out(Op::SetValue)
+        })
     }
 
     /// Actuate the element, bounded by the ceiling alone.
@@ -113,7 +115,7 @@ impl A11yThread {
     /// [`GlassError::invoke_fallback_eligible`] excludes — so no pointer click is layered on top of
     /// an action that may be about to fire.
     pub fn invoke(&self, job: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
-        self.detached(Op::Invoke, self.ceiling, job, Whose::Callee)
+        self.detached(Op::Invoke, self.ceiling, job, || self.timed_out(Op::Invoke))
     }
 
     /// The verdict for a read that never answered. The caller's own deadline ending it is
@@ -150,12 +152,14 @@ impl A11yThread {
         ))
     }
 
+    /// `on_timeout` rather than a `Whose`: only a snapshot has two bounds to choose between, and
+    /// handing the other two a verdict this never read let them pass a wrong one unnoticed.
     fn detached<T: Send + 'static>(
         &self,
         op: Op,
         wait: Duration,
         job: impl FnOnce() -> Result<T> + Send + 'static,
-        ended_by: Whose,
+        on_timeout: impl FnOnce() -> GlassError,
     ) -> Result<T> {
         let (tx, rx) = mpsc::channel();
         // Named and fallible, unlike a bare `spawn`: a timed-out worker outlives its wait holding
@@ -174,10 +178,7 @@ impl A11yThread {
             })?;
         match rx.recv_timeout(wait) {
             Ok(r) => r,
-            Err(RecvTimeoutError::Timeout) => Err(match op {
-                Op::Snapshot => self.never_answered(ended_by),
-                _ => self.timed_out(op),
-            }),
+            Err(RecvTimeoutError::Timeout) => Err(on_timeout()),
             // The sender drops unsent only when the worker unwinds, so this is a panic, not a
             // slow answer — a timeout would claim the backend is alive and still working.
             Err(RecvTimeoutError::Disconnected) => Err(self.worker_panicked(op)),
@@ -217,13 +218,21 @@ mod tests {
         let (wait, ended_by) = reader().bounded_wait(Deadline::from_millis(50));
         assert!(wait <= Duration::from_millis(50), "{wait:?}");
         assert_eq!(ended_by, Whose::Caller);
+
+        // And it is the caller's whole bound, not zero: a Caller branch that waits for nothing
+        // spawns a worker, gives up before it can answer, and reports every read in the window as
+        // the caller running out of time.
+        let (wait, _) = reader().bounded_wait(Deadline::from_millis(5_000));
+        assert!(wait > Duration::from_secs(4), "{wait:?}");
     }
 
     /// The other direction: without it the test above passes on a reader that waits for nothing.
     #[test]
     fn a_caller_that_names_no_deadline_leaves_the_read_its_own_ceiling() {
         let (wait, ended_by) = reader().bounded_wait(Deadline::UNBOUNDED);
-        assert!(wait > CEILING - Duration::from_secs(1), "{wait:?}");
+        // Exactly, not approximately: one clock read makes this branch deterministic, and the
+        // two-read shape it replaced came up short by whatever fell between them.
+        assert_eq!(wait, CEILING, "{wait:?}");
         assert_eq!(ended_by, Whose::Callee);
     }
 
@@ -335,6 +344,17 @@ mod tests {
         assert!(
             matches!(e, GlassError::AccessibilityUnavailable(_)),
             "a caller that named no deadline cannot be the one that ran out: {e}"
+        );
+
+        // The same verdict with a deadline present but further out — the shape of every read
+        // `wait_for_element` makes, where blaming the caller would poll straight through a backend
+        // that has stopped answering (glass#341).
+        let e = impatient()
+            .snapshot(Deadline::from_millis(60_000), hangs())
+            .unwrap_err();
+        assert!(
+            matches!(e, GlassError::AccessibilityUnavailable(_)),
+            "the ceiling fell first, so the caller still had time: {e}"
         );
     }
 

@@ -163,6 +163,9 @@ mod tests {
             Deadline::at(now + second),
             Deadline::at(now),
             Deadline::at(now - second),
+            // Past `proposed`, so the callee's own bound is the nearer one — without it every
+            // bounded case here takes the caller arm.
+            Deadline::at(now + std::time::Duration::from_secs(60)),
             Deadline::UNBOUNDED,
         ] {
             let proposed = now + std::time::Duration::from_secs(30);
