@@ -30,7 +30,6 @@ marker="$(residue_marker)"
 trap 'rm -f "$marker"' EXIT
 status=0
 cargo test -p glass-testapp --test integration --test network --test ignore_regions_e2e --test host_conformance --test software_render -- --ignored --test-threads=1 "$@" || status=$?
-# No compositor glob: this suite cannot create one, so matching it would only let a concurrent
-# Wayland run read as this suite's leak.
+# No compositor glob: this suite cannot create one, so it would only catch a concurrent Wayland run.
 report_residue "$marker" 'glass-a11y-??????' || status=1
 exit "$status"
