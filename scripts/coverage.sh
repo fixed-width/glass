@@ -12,6 +12,11 @@
 # the unit tests AND each integration harness (each self-skips when its
 # prerequisites are absent), and finally combines them into one report.
 #
+# The direct `cargo test` runs are `cargo nextest run` instead: nextest gives each test
+# its own process, so a test that leaves the host dirty cannot be masked by an in-process
+# neighbour, and it exits 4 rather than 0 when a filter selects nothing. The harness
+# scripts below still run libtest — their suites are `--test-threads=1` by design.
+#
 # CAVEAT (always true on Linux): the glass-windows Win32 FFI code (capture, input,
 # clipboard, process, util, windows) is cfg(windows) and is NOT compiled or run
 # here, so it never appears in this report. Its pure modules (dpi/jobpids/vkmap/
@@ -32,6 +37,12 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
     echo "coverage: cargo-llvm-cov is not installed." >&2
     echo "          install it with:  cargo install cargo-llvm-cov" >&2
     echo "          and the llvm-tools component:  rustup component add llvm-tools-preview" >&2
+    exit 1
+fi
+
+if ! cargo nextest --version >/dev/null 2>&1; then
+    echo "coverage: cargo-nextest is not installed." >&2
+    echo "          install it with:  cargo install cargo-nextest --locked" >&2
     exit 1
 fi
 
@@ -84,30 +95,28 @@ classify_suite() {  # label cmd...
     fi
 }
 
-# A plain `cargo test` run rather than a harness. Its output must NOT be grepped for the skip
+# A direct nextest run rather than a harness. Its output must NOT be grepped for the skip
 # sentinel the way `classify_suite` does — a self-skipping test prints "skipping" too, and one
 # of them would file the whole run as skipped.
-classify_tests() { # label cmd...
+#
+# Exit status decides it, because `--no-tests=fail` makes nextest exit 4 when every test was
+# filtered or ignored. Recording an empty run as coverage is how a crate drops out of the
+# report unseen, and libtest exits 0 on one.
+run_tests() { # label cargo-args...
     local label="$1" out
     shift
-    if ! out=$("$@" 2>&1); then
+    if out=$(cargo nextest run --no-fail-fast --no-tests=fail "$@" 2>&1); then
+        ran+=("$label")
+    else
         failed+=("$label")
         tail -n 30 <<<"$out"
-    elif ! grep -qE '^test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
-        # Exit 0 having run nothing: every test filtered or ignored. Recording that as
-        # coverage is how a crate drops out of the report unseen. Look for a target that DID
-        # run something — a crate reports one line per target, and the empty ones read
-        # `0 passed` however well the rest went.
-        failed+=("$label (ran no tests)")
-    else
-        ran+=("$label")
     fi
 }
 
 # Always: the workspace unit tests (and the always-on integration tests). Keep
 # going on failure so a single failing test still yields a coverage report.
 echo "coverage: running workspace unit tests…"
-classify_tests unit cargo test --workspace --no-fail-fast
+run_tests unit --workspace
 
 if [ "$unit_only" -eq 0 ]; then
     # Each harness exits 0 and self-skips when its prerequisites are missing, so we
@@ -117,7 +126,7 @@ if [ "$unit_only" -eq 0 ]; then
     if command -v Xvfb >/dev/null 2>&1; then
         # The workspace run above skipped glass-x11's `#[ignore]`d display tests — half the
         # crate's coverage.
-        classify_tests x11-unit cargo test -p glass-x11 --no-fail-fast -- --include-ignored
+        run_tests x11-unit -p glass-x11 --run-ignored=all
         classify_suite x11 ./scripts/test-x11.sh
     else
         skipped+=("x11-unit (no Xvfb)" "x11 (no Xvfb)")
@@ -125,7 +134,7 @@ if [ "$unit_only" -eq 0 ]; then
 
     echo "coverage: running Wayland integration suite (needs sway >=1.12)…"
     if have_sway; then
-        classify_tests wayland-unit cargo test -p glass-wayland --no-fail-fast -- --include-ignored
+        run_tests wayland-unit -p glass-wayland --run-ignored=all
     else
         skipped+=("wayland-unit (no sway)")
     fi
