@@ -268,6 +268,37 @@ mod tests {
     }
 
     /// The property this whole split exists for (glass#422): a session that spends everything it
+    /// The other half of the split: the reserve is a fixed 750ms, so without the clamp a caller
+    /// whose whole budget is smaller hands the sessions a deadline already in the past.
+    #[test]
+    fn a_budget_smaller_than_the_reserve_still_leaves_the_sessions_time() {
+        let at_stop = Arc::new(Mutex::new(None));
+        let recorded = at_stop.clone();
+        let factory: PlatformFactory = Box::new(move |_backend| {
+            Ok(Backend::display_only(Box::new(
+                FakePlatform::new(10, 10).recording_stop_deadline(recorded.clone()),
+            )))
+        });
+        let mut g = glass_with_factory(factory);
+        g.start(&spec()).unwrap();
+
+        // A fifth of the reserve, so an unclamped subtraction lands well in the past.
+        let budget = crate::TEARDOWN_HOOK_RESERVE / 5;
+        let started = std::time::Instant::now();
+        g.shutdown(started + budget);
+
+        let given = at_stop
+            .lock()
+            .unwrap()
+            .expect("the backend was stopped")
+            .saturating_duration_since(started);
+        assert!(
+            given >= budget / 3,
+            "the sessions were given {given:?} of a {budget:?} budget — the reserve was taken \
+             whole from a budget too small to pay it"
+        );
+    }
+
     /// is given must still leave the hook enough to run. Without the reserve the hook is reached
     /// with a spent deadline, and `run_bounded_until` does not start a command it has no time for
     /// — so every step behind it is skipped rather than merely slow.
