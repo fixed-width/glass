@@ -6,6 +6,7 @@
 //! `glass-a11y-linux`) map their native roles/states into the normalized types
 //! here; no OS/AT-SPI/D-Bus types appear in this module.
 
+use crate::deadline::Deadline;
 use crate::error::{GlassError, Result};
 use crate::platform::{Segment, WindowGeometry};
 
@@ -777,67 +778,7 @@ pub struct AxContext {
     /// tree with the same bounds (ids stay resolvable).
     pub limits: WalkLimits,
     /// The time bound for this call, as [`Self::limits`] is its size bound.
-    pub deadline: AxDeadline,
-}
-
-/// When the caller stops waiting for the accessibility call this context belongs to.
-///
-/// A reader cannot be interrupted mid-read — [`crate::Glass::wait_for_element`] re-reads from a
-/// synchronous tick — so a 20s `uiautomator dump` answered a 10s wait until readers took this
-/// (glass#338). The obligation is stated on [`Accessibility::snapshot`], where an implementer
-/// meets it.
-///
-/// [`Self::UNBOUNDED`] leaves the reader its own budget: it is the *widest* value, as `WalkLimits`'
-/// unbounded is, and not a deadline of zero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[must_use]
-pub struct AxDeadline(Option<std::time::Instant>);
-
-impl AxDeadline {
-    /// The caller named no instant to stop at.
-    pub const UNBOUNDED: Self = Self(None);
-
-    /// Stop `ms` milliseconds from now.
-    pub fn from_millis(ms: u64) -> Self {
-        Self::at(std::time::Instant::now() + std::time::Duration::from_millis(ms))
-    }
-
-    /// Stop at `instant` — for a caller that already holds the moment it stops waiting, and for a
-    /// test that needs the same instant on both sides of a comparison.
-    pub const fn at(instant: std::time::Instant) -> Self {
-        Self(Some(instant))
-    }
-
-    /// `proposed`, or this deadline when it falls first — the bound one step of a call runs under.
-    pub fn cap(self, proposed: std::time::Instant) -> std::time::Instant {
-        match self.0 {
-            Some(d) => proposed.min(d),
-            None => proposed,
-        }
-    }
-
-    /// Whether this deadline falls before `proposed`, so a step that runs out was cut off rather
-    /// than unanswered.
-    ///
-    /// A tie is deliberately not this deadline: reporting a backend that hung for its whole
-    /// ceiling as a spent caller budget hides it.
-    pub fn governs(self, proposed: std::time::Instant) -> bool {
-        self.0.is_some_and(|d| d < proposed)
-    }
-
-    /// How long is left, or `None` when the caller named no instant. Zero once it has passed.
-    pub fn remaining(self) -> Option<std::time::Duration> {
-        self.0
-            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
-    }
-
-    /// Whether the caller named an instant that has passed — work started now cannot be wanted.
-    ///
-    /// `false` for [`Self::UNBOUNDED`] — this asks whether the caller has gone, not whether
-    /// budget remains, and a reader reading it as the latter would retry an untimed call forever.
-    pub fn has_passed(self) -> bool {
-        self.remaining().is_some_and(|left| left.is_zero())
-    }
+    pub deadline: Deadline,
 }
 
 /// A fingerprint identifying the element a value-set targets: its synthetic id
@@ -1373,7 +1314,7 @@ mod tests {
     /// first, in both directions.
     #[test]
     fn a_deadline_caps_a_proposed_instant_only_when_it_falls_first() {
-        let soon = AxDeadline::from_millis(1_000);
+        let soon = Deadline::from_millis(1_000);
         let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
         assert!(soon.cap(later) < later, "the nearer bound did not govern");
 
@@ -1385,14 +1326,14 @@ mod tests {
         );
     }
 
-    /// A caller that named no instant leaves the reader whatever it proposed — [`AxDeadline::UNBOUNDED`]
+    /// A caller that named no instant leaves the reader whatever it proposed — [`Deadline::UNBOUNDED`]
     /// is not a deadline of zero, which would stop every read before it started.
     #[test]
     fn no_deadline_caps_nothing_and_is_never_spent() {
         let proposed = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        assert_eq!(AxDeadline::UNBOUNDED.cap(proposed), proposed);
-        assert_eq!(AxDeadline::UNBOUNDED.remaining(), None);
-        assert!(!AxDeadline::UNBOUNDED.has_passed());
+        assert_eq!(Deadline::UNBOUNDED.cap(proposed), proposed);
+        assert_eq!(Deadline::UNBOUNDED.remaining(), None);
+        assert!(!Deadline::UNBOUNDED.has_passed());
     }
 
     /// The tie-break is load-bearing: a reader blames its own bound when both fall together, so a
@@ -1400,19 +1341,19 @@ mod tests {
     #[test]
     fn a_deadline_governs_a_step_only_when_it_falls_strictly_first() {
         let now = std::time::Instant::now();
-        let soon = AxDeadline::from_millis(1_000);
+        let soon = Deadline::from_millis(1_000);
         assert!(soon.governs(now + std::time::Duration::from_secs(60)));
         assert!(!soon.governs(now));
-        assert!(!AxDeadline::UNBOUNDED.governs(now + std::time::Duration::from_secs(60)));
+        assert!(!Deadline::UNBOUNDED.governs(now + std::time::Duration::from_secs(60)));
         // The tie itself, which only a shared instant can express: `<=` here would blame the
         // caller for a backend that hung for exactly its own ceiling.
-        assert!(!AxDeadline::at(now).governs(now));
+        assert!(!Deadline::at(now).governs(now));
     }
 
     #[test]
     fn a_deadline_has_passed_once_its_instant_has_passed() {
-        assert!(AxDeadline::from_millis(0).has_passed());
-        assert!(!AxDeadline::from_millis(60_000).has_passed());
+        assert!(Deadline::from_millis(0).has_passed());
+        assert!(!Deadline::from_millis(60_000).has_passed());
     }
 
     /// Compile-time guard for [`AxRole::ALL`] — never called, and exists only for its exhaustive
@@ -1521,7 +1462,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: AxDeadline::UNBOUNDED,
+            deadline: Deadline::UNBOUNDED,
         };
         let err = Bare
             .set_value(&ctx, &target, "x")
@@ -3239,7 +3180,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: AxDeadline::UNBOUNDED,
+            deadline: Deadline::UNBOUNDED,
         };
         let target = AxTarget {
             id: AxNodeId(1),

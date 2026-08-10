@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use glass_core::Glass;
+use glass_core::{Deadline, Glass};
 use tokio::sync::Mutex;
 
 /// How long a tool call may hold the session before teardown says so.
@@ -37,7 +37,9 @@ pub async fn run_shutdown(sessions: Arc<Mutex<Glass>>, budget: Duration) {
         if waited > LOCK_WAIT_WORTH_SAYING {
             eprintln!("glass: a tool call held the session for {waited:?} before teardown started");
         }
-        glass.shutdown(Instant::now() + budget - glass_core::TEARDOWN_REAP_HEADROOM);
+        glass.shutdown(Deadline::at(
+            Instant::now() + budget - glass_core::TEARDOWN_REAP_HEADROOM,
+        ));
     });
     match tokio::time::timeout(budget, task).await {
         Ok(Ok(())) => {}
@@ -171,8 +173,8 @@ mod tests {
             fn stop_app(&mut self) -> Result<()> {
                 Ok(())
             }
-            fn stop_app_by(&mut self, deadline: Instant) -> Result<()> {
-                *self.0.lock().unwrap() = Some(deadline.saturating_duration_since(Instant::now()));
+            fn stop_app_by(&mut self, deadline: glass_core::Deadline) -> Result<()> {
+                *self.0.lock().unwrap() = deadline.remaining();
                 Ok(())
             }
             fn capture_frame(&mut self, _r: Option<&Region>) -> Result<Frame> {

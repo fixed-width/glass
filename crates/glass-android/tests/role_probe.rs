@@ -36,7 +36,8 @@ use std::time::Duration;
 use glass_android::{
     A11yServiceRegistry, AgentRegistry, AndroidA11y, AndroidPlatform, EmulatorRegistry, ServiceA11y,
 };
-use glass_core::accessibility::{Accessibility, AxContext, AxDeadline, WalkLimits};
+use glass_core::Deadline;
+use glass_core::accessibility::{Accessibility, AxContext, WalkLimits};
 use glass_core::{
     AppSpec, AxRole, AxTree, DescriptionSourcing, Platform, SandboxLevel,
     description_census_report, role_histogram,
@@ -248,7 +249,7 @@ fn uiautomator_role_histogram_probe() {
             window_handle: None,
             a11y_bus_addr: None,
             limits: uncapped(),
-            deadline: AxDeadline::UNBOUNDED,
+            deadline: Deadline::UNBOUNDED,
         };
         let mut a11y = AndroidA11y::new();
         let mut tree = a11y
@@ -329,7 +330,7 @@ fn service_role_histogram_probe() {
             window_handle: None,
             a11y_bus_addr: None,
             limits: uncapped(),
-            deadline: AxDeadline::UNBOUNDED,
+            deadline: Deadline::UNBOUNDED,
         };
         let mut tree = a11y
             .snapshot(&ctx)

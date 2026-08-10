@@ -22,7 +22,8 @@
 
 #![cfg(unix)]
 
-use glass_core::accessibility::{Accessibility, AxContext, AxDeadline, AxNode, AxTree, WalkLimits};
+use glass_core::Deadline;
+use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTree, WalkLimits};
 use glass_core::{AppSpec, Platform, SandboxLevel};
 use glass_ios::{IosPlatform, SimulatorRegistry};
 
@@ -73,7 +74,7 @@ fn screen_of(spec: &AppSpec) -> AxTree {
         window_handle: None,
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
-        deadline: AxDeadline::UNBOUNDED,
+        deadline: Deadline::UNBOUNDED,
     };
     // UIKit keeps building the hierarchy for a beat after the app is up, so a tree read straight
     // after `start_app` can be half-drawn — which would fail here as "the argument did not

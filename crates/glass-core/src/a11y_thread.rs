@@ -16,7 +16,7 @@
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use crate::accessibility::AxDeadline;
+use crate::deadline::Deadline;
 use crate::{GlassError, Result};
 
 /// Which bound ended a wait. Decided before the wait, never inferred from its outcome — the
@@ -85,7 +85,7 @@ impl A11yThread {
     /// Both come from one comparison, made before the wait: a call the *caller* cut short is a
     /// spent budget and one that used the whole ceiling is a backend that stopped answering, and
     /// inferring which afterwards is the mistake glass#341 recorded.
-    fn bounded_wait(&self, deadline: AxDeadline) -> (Duration, EndedBy) {
+    fn bounded_wait(&self, deadline: Deadline) -> (Duration, EndedBy) {
         let own = Instant::now() + self.ceiling;
         let ended_by = if deadline.governs(own) {
             EndedBy::Caller
@@ -104,7 +104,7 @@ impl A11yThread {
     /// waiting holds the backend's connection while producing an answer nobody reads.
     pub fn snapshot<T: Send + 'static>(
         &self,
-        deadline: AxDeadline,
+        deadline: Deadline,
         job: impl FnOnce() -> Result<T> + Send + 'static,
     ) -> Result<T> {
         if deadline.has_passed() {
@@ -117,7 +117,7 @@ impl A11yThread {
     /// Write a value, bounded by the ceiling alone.
     ///
     /// No deadline: the seam places the capping obligation on `snapshot`, and the session builds
-    /// both this context and `invoke`'s with [`AxDeadline::UNBOUNDED`], so there is none to honour.
+    /// both this context and `invoke`'s with [`Deadline::UNBOUNDED`], so there is none to honour.
     pub fn set_value(&self, job: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
         self.detached(Op::SetValue, self.ceiling, job, EndedBy::Ceiling)
     }
@@ -229,7 +229,7 @@ mod tests {
     /// detached, so nothing outside it can shorten one that has started.
     #[test]
     fn a_read_is_bounded_by_the_caller_when_that_falls_first() {
-        let (wait, ended_by) = reader().bounded_wait(AxDeadline::from_millis(50));
+        let (wait, ended_by) = reader().bounded_wait(Deadline::from_millis(50));
         assert!(wait <= Duration::from_millis(50), "{wait:?}");
         assert_eq!(ended_by, EndedBy::Caller);
     }
@@ -237,7 +237,7 @@ mod tests {
     /// The other direction: without it the test above passes on a reader that waits for nothing.
     #[test]
     fn a_caller_that_names_no_deadline_leaves_the_read_its_own_ceiling() {
-        let (wait, ended_by) = reader().bounded_wait(AxDeadline::UNBOUNDED);
+        let (wait, ended_by) = reader().bounded_wait(Deadline::UNBOUNDED);
         assert!(wait > CEILING - Duration::from_secs(1), "{wait:?}");
         assert_eq!(ended_by, EndedBy::Ceiling);
     }
@@ -270,7 +270,7 @@ mod tests {
         // a quiet window, which would be a race: refusing drops `job` unrun and its `Sender` with
         // it, where a worker that ran would have sent. No load can turn one into the other.
         let (started, ran) = mpsc::channel();
-        let r: Result<()> = reader().snapshot(AxDeadline::from_millis(0), move || {
+        let r: Result<()> = reader().snapshot(Deadline::from_millis(0), move || {
             let _ = started.send(());
             Ok(())
         });
@@ -287,10 +287,7 @@ mod tests {
 
     #[test]
     fn an_answer_within_the_bound_is_returned() {
-        assert_eq!(
-            reader().snapshot(AxDeadline::UNBOUNDED, || Ok(7)).unwrap(),
-            7
-        );
+        assert_eq!(reader().snapshot(Deadline::UNBOUNDED, || Ok(7)).unwrap(), 7);
     }
 
     #[test]
@@ -327,7 +324,7 @@ mod tests {
     #[test]
     fn a_read_that_timed_out_claims_nothing_about_landing() {
         let e = impatient()
-            .snapshot(AxDeadline::UNBOUNDED, hangs())
+            .snapshot(Deadline::UNBOUNDED, hangs())
             .unwrap_err();
         assert!(e.to_string().contains("snapshot timed out"), "{e}");
         assert!(!e.to_string().contains("may still land"), "{e}");
@@ -338,7 +335,7 @@ mod tests {
     #[test]
     fn a_read_the_caller_ran_out_of_time_for_blames_the_caller_not_the_backend() {
         // A live deadline well inside the ceiling, against a job that will not answer within it.
-        let r: Result<()> = reader().snapshot(AxDeadline::from_millis(30), hangs());
+        let r: Result<()> = reader().snapshot(Deadline::from_millis(30), hangs());
         assert!(
             matches!(r, Err(GlassError::AccessibilityNotReady(_))),
             "{r:?}"
@@ -348,7 +345,7 @@ mod tests {
     #[test]
     fn a_read_that_outruns_the_ceiling_blames_the_backend_not_the_caller() {
         let e = impatient()
-            .snapshot(AxDeadline::UNBOUNDED, hangs())
+            .snapshot(Deadline::UNBOUNDED, hangs())
             .unwrap_err();
         assert!(
             matches!(e, GlassError::AccessibilityUnavailable(_)),
@@ -371,7 +368,7 @@ mod tests {
     #[test]
     fn a_panicking_read_is_never_the_variant_a_wait_polls_through() {
         let e = reader()
-            .snapshot(AxDeadline::from_millis(60_000), || -> Result<()> {
+            .snapshot(Deadline::from_millis(60_000), || -> Result<()> {
                 panic!("the backend crate unwound")
             })
             .unwrap_err();

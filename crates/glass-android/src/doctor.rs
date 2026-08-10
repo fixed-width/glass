@@ -4,6 +4,7 @@
 //! Pure `build_checks(&Probe)` over observed state, plus a thin subprocess `probe`.
 //! Reports `Check` statuses; never errors.
 
+use glass_core::Deadline;
 use glass_core::{Check, CheckStatus};
 
 use crate::a11y::{Attempt, adb_runner, attempt_deadline, dump_once};
@@ -145,7 +146,7 @@ fn probe_with(
                 .ensure(&adb.with_serial(serial.clone()), get)
                 .map(|_| ())
                 .map_err(|e| e.to_string());
-            reg.shutdown();
+            reg.shutdown(Deadline::UNBOUNDED);
             Some(r)
         }
         _ => None,
@@ -169,7 +170,7 @@ fn probe_with(
                 .ensure(&adb.with_serial(serial.clone()), apk)
                 .map(|_| ())
                 .map_err(|e| e.to_string());
-            reg.shutdown();
+            reg.shutdown(Deadline::UNBOUNDED);
             Some(r)
         }
         _ => None,

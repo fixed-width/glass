@@ -62,7 +62,7 @@ pub(crate) struct FakePlatform {
     resized_to: VecDeque<WindowGeometry>,
     /// The deadline `stop_app_by` was handed, when it was the entry point — `None` after a plain
     /// `stop_app`, which is how a test tells the two apart.
-    stop_deadline: Option<Arc<Mutex<Option<std::time::Instant>>>>,
+    stop_deadline: Option<Arc<Mutex<Option<crate::Deadline>>>>,
     /// Makes `stop_app_by` spend its whole deadline, standing in for a device that stopped
     /// answering.
     stop_burns_deadline: bool,
@@ -124,7 +124,7 @@ impl FakePlatform {
     }
     pub(crate) fn recording_stop_deadline(
         mut self,
-        at: Arc<Mutex<Option<std::time::Instant>>>,
+        at: Arc<Mutex<Option<crate::Deadline>>>,
     ) -> Self {
         self.stop_deadline = Some(at);
         self
@@ -183,12 +183,12 @@ impl Platform for FakePlatform {
         }
         Ok(())
     }
-    fn stop_app_by(&mut self, deadline: std::time::Instant) -> Result<()> {
+    fn stop_app_by(&mut self, deadline: crate::Deadline) -> Result<()> {
         if let Some(at) = &self.stop_deadline {
             *at.lock().unwrap() = Some(deadline);
         }
         if self.stop_burns_deadline {
-            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+            std::thread::sleep(deadline.remaining().unwrap_or_default());
         }
         self.stop_app()
     }
@@ -988,7 +988,7 @@ impl Accessibility for NotReadyThenTree {
 }
 
 /// A reader that answers while the caller's deadline has time and gives up once it is spent —
-/// what a backend honouring [`AxDeadline`] does on the tick that ends a wait.
+/// what a backend honouring [`Deadline`] does on the tick that ends a wait.
 ///
 /// Every other fake here ignores `ctx.deadline`, so none of them can reach the case a wait's own
 /// deadline creates.

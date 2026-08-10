@@ -359,9 +359,9 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
         // time (glass#422). Between themselves it is first-come-first-served, which holds because
         // at most one of the first three has real work: `kill_all` is empty unless glass booted
         // the emulator, and if it did, the a11y settings restored before it die with the VM.
-        a11y.shutdown_until(Some(deadline));
-        agents.shutdown_until(Some(deadline));
-        registry.kill_all_until(Some(deadline));
+        a11y.shutdown(deadline);
+        agents.shutdown(deadline);
+        registry.kill_all(deadline);
         // Not under the deadline: it does not wait (see `shutdown_all`).
         #[cfg(target_os = "macos")]
         sim_registry.request_shutdown_all();

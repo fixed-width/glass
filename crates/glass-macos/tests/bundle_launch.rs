@@ -70,7 +70,7 @@ mod macos_main {
     use glass_a11y_macos::MacosA11y;
     use glass_core::platform::{MouseButton, PointerEvent};
     use glass_core::{
-        Accessibility, AppSpec, AxContext, AxDeadline, GlassError, Platform, SandboxLevel, Stream,
+        Accessibility, AppSpec, AxContext, Deadline, GlassError, Platform, SandboxLevel, Stream,
         WalkLimits,
     };
     use glass_macos::MacosPlatform;
@@ -352,7 +352,7 @@ mod macos_main {
                 window_handle: None,
                 a11y_bus_addr: None,
                 limits: WalkLimits::DEFAULT,
-                deadline: AxDeadline::UNBOUNDED,
+                deadline: Deadline::UNBOUNDED,
             };
             let mut a11y = MacosA11y::new();
             let mut tree = try_expect(a11y.snapshot(&ctx), "a11y snapshot(TextEdit)")?;

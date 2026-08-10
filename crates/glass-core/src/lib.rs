@@ -80,12 +80,15 @@ pub use platform::{
     WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
 };
 
+pub mod deadline;
+pub use deadline::Deadline;
+
 pub mod accessibility;
 pub use accessibility::{
-    Accessibility, AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget,
-    AxTree, ChangeSignal, ChangeWait, ClickMethod, ElementCondition, ElementInfo, ElementMatch,
-    MAX_DEPTH, MAX_NODES, MAX_SIBLINGS, Subject, Truncation, TruncationLimit, WalkBudget,
-    WalkLimits, element_match, normalize_description,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
+    ChangeSignal, ChangeWait, ClickMethod, ElementCondition, ElementInfo, ElementMatch, MAX_DEPTH,
+    MAX_NODES, MAX_SIBLINGS, Subject, Truncation, TruncationLimit, WalkBudget, WalkLimits,
+    element_match, normalize_description,
 };
 
 pub mod marks;

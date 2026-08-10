@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::error::{GlassError, Result};
 use crate::frame::{Frame, Region};
@@ -267,7 +267,7 @@ pub trait Platform {
     /// residual its own comment names). A backend that tears down over a link to a device has one
     /// tool invocation per step, each with its own budget and no sum to assert, so it overrides
     /// this and spends the shared deadline (glass#422, glass#427).
-    fn stop_app_by(&mut self, _deadline: Instant) -> Result<()> {
+    fn stop_app_by(&mut self, _deadline: crate::Deadline) -> Result<()> {
         self.stop_app()
     }
 
@@ -563,8 +563,10 @@ mod tests {
         let mut p = CountingPlatform(0);
         // A deadline already gone: the default must stop the app regardless, since it does not
         // spend one.
-        p.stop_app_by(Instant::now() - Duration::from_secs(1))
-            .expect("the default delegates to stop_app");
+        p.stop_app_by(crate::Deadline::at(
+            std::time::Instant::now() - Duration::from_secs(1),
+        ))
+        .expect("the default delegates to stop_app");
         assert_eq!(p.0, 1);
     }
 

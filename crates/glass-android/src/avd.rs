@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use glass_core::Deadline;
 use glass_core::{GlassError, Result};
 
 use crate::adb::Adb;
@@ -186,14 +187,10 @@ impl EmulatorRegistry {
 
     /// Stop every registered emulator (`adb -s <serial> emu kill`) and clear the list.
     /// Best-effort: a device already gone is fine.
-    pub fn kill_all(&self) {
-        self.kill_all_until(None);
-    }
-
-    /// [`EmulatorRegistry::kill_all`] under a deadline the rest of teardown shares. `adb emu kill`
+    /// Stop every registered emulator by `deadline` — the rest of teardown shares it. `adb emu kill`
     /// was observed at 2ms — it acknowledges and lets the VM go down on its own time — so this is
     /// the cheapest step in teardown and the worst one to skip (glass#422).
-    pub fn kill_all_until(&self, deadline: Option<std::time::Instant>) {
+    pub fn kill_all(&self, deadline: Deadline) {
         let clients = self
             .booted
             .lock()
@@ -421,7 +418,7 @@ mod tests {
         reg.register(fake.adb(), "emulator-5554".into());
 
         let started = Instant::now();
-        reg.kill_all_until(Some(Instant::now() + Duration::from_millis(300)));
+        reg.kill_all(Deadline::at(Instant::now() + Duration::from_millis(300)));
 
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -547,7 +544,7 @@ mod tests {
         registry.register(fake.adb(), "emulator-5554".into());
         registry.register(fake.adb(), "emulator-5556".into());
 
-        registry.kill_all();
+        registry.kill_all(Deadline::UNBOUNDED);
 
         assert_eq!(
             fake.calls(),
@@ -555,7 +552,7 @@ mod tests {
         );
         // Cleared, so a second shutdown does not kill a device someone has since started.
         assert!(registry.serials().is_empty());
-        registry.kill_all();
+        registry.kill_all(Deadline::UNBOUNDED);
         assert_eq!(fake.calls().len(), 2);
     }
 

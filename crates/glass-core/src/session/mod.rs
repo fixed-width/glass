@@ -2,11 +2,12 @@
 //! its operations are grouped into submodules (each adds an `impl Glass` block).
 
 use crate::accessibility::{
-    Accessibility, AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree,
-    ChangeSignal, ChangeWait, ClickMethod, ElementCondition, ElementInfo, ElementMatch, WalkLimits,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, ChangeSignal,
+    ChangeWait, ClickMethod, ElementCondition, ElementInfo, ElementMatch, WalkLimits,
     element_match,
 };
 use crate::baseline::BaselineStore;
+use crate::deadline::Deadline;
 use crate::diff::{
     BBox, DiffResult, IgnoreMask, RegionUntil, diff_perceptual_with_mask, diff_with_mask,
     region_satisfied,
@@ -94,7 +95,7 @@ pub struct Glass {
     log_capacity: usize,
     active: Option<ActiveSession>,
     audit: Option<Box<dyn crate::audit::AuditSink>>,
-    shutdown_hook: Option<Box<dyn FnOnce(std::time::Instant) + Send>>,
+    shutdown_hook: Option<Box<dyn FnOnce(Deadline) + Send>>,
 }
 
 impl Glass {
@@ -127,7 +128,7 @@ impl Glass {
     /// [`crate::TEARDOWN_HOOK_RESERVE`] short so this still has time. A hook whose cleanup is
     /// local can ignore it; one that talks to a device spends it, and gets
     /// `BoundKind::NotStarted` for whatever it reaches with nothing left.
-    pub fn set_shutdown_hook(&mut self, hook: Box<dyn FnOnce(std::time::Instant) + Send>) {
+    pub fn set_shutdown_hook(&mut self, hook: Box<dyn FnOnce(Deadline) + Send>) {
         self.shutdown_hook = Some(hook);
     }
 

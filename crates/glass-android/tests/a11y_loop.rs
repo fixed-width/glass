@@ -12,9 +12,8 @@
 //! says which app it describes; and that a test which fails mid-interaction still hands the
 //! device back launchable.
 
-use glass_core::accessibility::{
-    Accessibility, AxContext, AxDeadline, AxNode, AxTarget, AxTree, WalkLimits,
-};
+use glass_core::Deadline;
+use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree, WalkLimits};
 use glass_core::{
     AppSpec, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel, WindowGeometry,
 };
@@ -86,7 +85,7 @@ impl Session {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: AxDeadline::UNBOUNDED,
+            deadline: Deadline::UNBOUNDED,
         }
     }
 
@@ -125,9 +124,9 @@ impl Drop for Session {
         if let Some(mut platform) = self.platform.take() {
             let _ = platform.stop_app();
         }
-        self.agents.shutdown();
+        self.agents.shutdown(Deadline::UNBOUNDED);
         if let Some(registry) = &self.a11y_service {
-            registry.shutdown();
+            registry.shutdown(Deadline::UNBOUNDED);
         }
     }
 }
@@ -173,7 +172,7 @@ fn a_read_stops_at_the_deadline_its_caller_named() {
         .expect("the first snapshot warms the reader");
 
     let mut hurried = session.ctx();
-    hurried.deadline = AxDeadline::from_millis(50);
+    hurried.deadline = Deadline::from_millis(50);
     let started = std::time::Instant::now();
     let e = a11y
         .snapshot(&hurried)

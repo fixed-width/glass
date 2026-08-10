@@ -1,7 +1,7 @@
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use glass_core::{BoundKind, GlassError, Result, run_bounded, run_bounded_until};
+use glass_core::{BoundKind, Deadline, GlassError, Result, run_bounded_until};
 
 /// What an adb invocation is doing, which is what decides how long it may take.
 ///
@@ -123,13 +123,13 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        self.run_until(args, None)
+        self.run_until(args, Deadline::UNBOUNDED)
     }
 
     /// [`Adb::run`] under a deadline the whole sequence shares, `None` for a call that answers to
     /// nothing but its own budget. The deadline bounds the run; it does not reserve time for the
     /// calls behind, which is `Glass::shutdown`'s job (glass#422).
-    pub fn run_until<'a, I>(&self, args: I, deadline: Option<Instant>) -> Result<String>
+    pub fn run_until<'a, I>(&self, args: I, deadline: Deadline) -> Result<String>
     where
         I: IntoIterator<Item = &'a str>,
     {
@@ -144,11 +144,11 @@ impl Adb {
     /// from the streams itself. The call gets its operation's budget or what is left of `deadline`,
     /// whichever is nearer, so the steps of one dump cannot together cost the sum of their
     /// budgets.
-    pub fn run_streams_until<'a, I>(&self, args: I, deadline: Instant) -> Result<(String, String)>
+    pub fn run_streams_until<'a, I>(&self, args: I, deadline: Deadline) -> Result<(String, String)>
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let out = self.output(args, Some(deadline))?;
+        let out = self.output(args, deadline)?;
         Ok((
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -160,13 +160,13 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        Ok(self.output(args, None)?.stdout)
+        Ok(self.output(args, Deadline::UNBOUNDED)?.stdout)
     }
 
     /// Run adb and return the completed process, erroring on spawn failure or non-zero
     /// exit so every caller reports those two the same way. `deadline` is the outer bound of a
     /// multi-call sequence, where there is one.
-    fn output<'a, I>(&self, args: I, deadline: Option<Instant>) -> Result<Output>
+    fn output<'a, I>(&self, args: I, deadline: Deadline) -> Result<Output>
     where
         I: IntoIterator<Item = &'a str>,
     {
@@ -177,11 +177,8 @@ impl Adb {
         cmd.args(&argv);
         // A wedged adb server answers nothing at all, and the fix is one command — so the remedy
         // rides in the error the caller sees rather than in a log line nobody reads.
-        let out = match deadline {
-            Some(d) => run_bounded_until(&mut cmd, op.budget(), d, op.label()),
-            None => run_bounded(&mut cmd, op.budget(), op.label()),
-        }
-        .map_err(with_adb_hint)?;
+        let out = run_bounded_until(&mut cmd, op.budget(), deadline, op.label())
+            .map_err(with_adb_hint)?;
         if out.status.success() {
             Ok(out)
         } else {
@@ -225,7 +222,7 @@ pub(crate) fn a_real_timeout() -> GlassError {
     #[cfg(windows)]
     let (bin, args): (&str, &[&str]) = ("ping", &["-n", "31", "127.0.0.1"]);
 
-    let e = run_bounded(
+    let e = glass_core::run_bounded(
         Command::new(bin).args(args),
         Duration::from_millis(200),
         "adb:shell",
@@ -451,12 +448,12 @@ impl FakeAdb {
     }
 
     fn wait_until(&self, within: Duration, ready: impl Fn() -> bool) -> bool {
-        let deadline = Instant::now() + within;
+        let deadline = std::time::Instant::now() + within;
         loop {
             if ready() {
                 return true;
             }
-            if Instant::now() >= deadline {
+            if std::time::Instant::now() >= deadline {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -632,13 +629,15 @@ mod tests {
             bin: "/bin/sh".to_string(),
             serial: None,
         };
+        use glass_core::Deadline;
+
         let started = std::time::Instant::now();
         let err = adb
             .run_streams_until(
                 // `exec` so the bound kills the sleep itself; without it the shell is what dies
                 // and the sleep is orphaned for its full thirty seconds.
                 ["-c", "exec sleep 30"],
-                std::time::Instant::now() + Duration::from_millis(300),
+                Deadline::at(std::time::Instant::now() + Duration::from_millis(300)),
             )
             .expect_err("a step must not outlive the deadline it serves");
 

@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use glass_core::Deadline;
 use glass_core::Platform;
 use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, PointerEvent, Region, Result, Stream, WindowGeometry,
@@ -49,7 +50,7 @@ impl AndroidPlatform {
     ///
     /// The logcat reap comes first and is unbounded, measured at 0-1ms — a kill and reap of a
     /// direct child, which only uninterruptible sleep can hold up.
-    fn stop_app_until(&mut self, deadline: Option<Instant>) -> Result<()> {
+    fn stop_app_until(&mut self, deadline: Deadline) -> Result<()> {
         if let Some(mut app) = self.app.take() {
             if let Some(mut logcat) = app.logcat.take() {
                 logcat.stop();
@@ -273,15 +274,15 @@ impl Platform for AndroidPlatform {
     }
 
     fn stop_app(&mut self) -> Result<()> {
-        self.stop_app_until(None)
+        self.stop_app_until(Deadline::UNBOUNDED)
     }
 
     /// Force-stop measures 101ms median, 267ms worst on an emulator with every core saturated,
     /// against the 3s all of teardown gets — so the deadline is not expected to bind. It is for
     /// the device that stopped answering, which would otherwise run out the 10s `AdbOp::Shell`
     /// budget and leave the hook nothing (glass#422).
-    fn stop_app_by(&mut self, deadline: Instant) -> Result<()> {
-        self.stop_app_until(Some(deadline))
+    fn stop_app_by(&mut self, deadline: Deadline) -> Result<()> {
+        self.stop_app_until(deadline)
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
@@ -681,7 +682,7 @@ mod platform_tests {
 
         let started_at = Instant::now();
         platform
-            .stop_app_by(Instant::now() + Duration::from_millis(300))
+            .stop_app_by(Deadline::at(Instant::now() + Duration::from_millis(300)))
             .expect("teardown is best-effort and reports success either way");
         let waited = started_at.elapsed();
 

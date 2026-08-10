@@ -4,6 +4,7 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use glass_core::Deadline;
 use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
     WindowGeometry, WindowId, WindowInfo, WindowOp,
@@ -284,7 +285,7 @@ pub(crate) fn bundle_id_from_run(run: &[String]) -> Result<(Option<String>, Stri
 
 impl IosPlatform {
     /// Terminate the app, under `deadline` when the caller has one to share.
-    fn stop_app_until(&mut self, deadline: Option<Instant>) -> Result<()> {
+    fn stop_app_until(&mut self, deadline: Deadline) -> Result<()> {
         if let Some(app) = self.app.take() {
             // Best-effort teardown: the app may already be gone (it crashed, or a prior
             // launch's `--terminate-running-process` killed it), so a failing `terminate`
@@ -601,15 +602,15 @@ impl Platform for IosPlatform {
     }
 
     fn stop_app(&mut self) -> Result<()> {
-        self.stop_app_until(None)
+        self.stop_app_until(Deadline::UNBOUNDED)
     }
 
     /// `terminate` measures ~101ms against the 3s all of teardown gets, so the deadline is not
     /// expected to bind. It is for the simulator that stopped answering, which would otherwise run
     /// out the 10s `SimctlOp::Query` budget and leave nothing for the hook behind it
     /// (glass#427).
-    fn stop_app_by(&mut self, deadline: Instant) -> Result<()> {
-        self.stop_app_until(Some(deadline))
+    fn stop_app_by(&mut self, deadline: Deadline) -> Result<()> {
+        self.stop_app_until(deadline)
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
@@ -1331,8 +1332,10 @@ mod teardown_tests {
         let mut p = platform(&fake, true);
 
         let started = std::time::Instant::now();
-        p.stop_app_by(std::time::Instant::now() + std::time::Duration::from_millis(300))
-            .expect("teardown is best-effort and reports success either way");
+        p.stop_app_by(Deadline::at(
+            std::time::Instant::now() + std::time::Duration::from_millis(300),
+        ))
+        .expect("teardown is best-effort and reports success either way");
         let waited = started.elapsed();
 
         assert!(

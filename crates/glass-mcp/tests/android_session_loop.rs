@@ -8,6 +8,7 @@
 //!     cargo test -p glass-mcp --test android_session_loop -- --ignored --nocapture
 
 use glass_android::{A11yServiceRegistry, AgentRegistry, AndroidPlatform, EmulatorRegistry};
+use glass_core::Deadline;
 use glass_core::accessibility::{AxNode, AxTree, ClickMethod};
 use glass_core::{AppSpec, BaselineStore, Glass, PlatformFactory, SandboxLevel};
 
@@ -33,10 +34,10 @@ impl Drop for Companions {
     fn drop(&mut self) {
         // Reached while a panic unwinds, where a second panic aborts the process — nothing here
         // may assert.
-        self.agents.shutdown();
-        self.a11y.shutdown();
+        self.agents.shutdown(Deadline::UNBOUNDED);
+        self.a11y.shutdown(Deadline::UNBOUNDED);
         // A no-op unless glass booted the emulator rather than attaching to one.
-        self.emulators.kill_all();
+        self.emulators.kill_all(Deadline::UNBOUNDED);
     }
 }
 

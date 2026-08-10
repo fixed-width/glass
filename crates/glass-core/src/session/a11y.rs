@@ -34,7 +34,7 @@ impl Glass {
             crate::accessibility::WalkLimits::from_max_nodes(max_nodes);
         // The tool takes no timeout, so the reader keeps its own budget. Inventing one here would
         // cap a plain snapshot at a number no caller asked for.
-        self.snapshot_at_current_limits(AxDeadline::UNBOUNDED)
+        self.snapshot_at_current_limits(Deadline::UNBOUNDED)
     }
 
     /// Subscribe to the backend's change notifications for the active app, if it has any.
@@ -48,7 +48,7 @@ impl Glass {
     /// bound their own registration — so today it only travels.
     pub(crate) fn subscribe_a11y_changes(
         &mut self,
-        deadline: AxDeadline,
+        deadline: Deadline,
     ) -> Option<Box<dyn ChangeSignal>> {
         let s = self.active_mut().ok()?;
         // Reader check first: the accessors below are platform round-trips (`app_pids` shells
@@ -72,16 +72,16 @@ impl Glass {
     /// and the scroll/combo/toggle loops) so an agent working in a raised-cap tree keeps that
     /// id-space instead of silently reverting to the default cap on the next internal snapshot.
     ///
-    /// `deadline` is the enclosing operation's bound, not this walk's — see [`AxDeadline`]. A
-    /// caller with no timeout of its own passes [`AxDeadline::UNBOUNDED`].
-    pub fn a11y_resnapshot(&mut self, deadline: AxDeadline) -> Result<AxTree> {
+    /// `deadline` is the enclosing operation's bound, not this walk's — see [`Deadline`]. A
+    /// caller with no timeout of its own passes [`Deadline::UNBOUNDED`].
+    pub fn a11y_resnapshot(&mut self, deadline: Deadline) -> Result<AxTree> {
         self.snapshot_at_current_limits(deadline)
     }
 
     /// The snapshot worker: walks the active window's tree bounded by the session's current
     /// `a11y_limits` and caches it. Callers set `a11y_limits` first (or reuse it) — see
     /// [`Glass::a11y_snapshot`] / [`Glass::a11y_resnapshot`].
-    fn snapshot_at_current_limits(&mut self, deadline: AxDeadline) -> Result<AxTree> {
+    fn snapshot_at_current_limits(&mut self, deadline: Deadline) -> Result<AxTree> {
         let s = self.active_mut()?;
         let limits = s.a11y_limits;
         // Reader-presence check up front (mirrors set_value_inner) so `AxUnsupported` keeps
@@ -119,7 +119,7 @@ impl Glass {
     /// Caches the snapshot, so `click_element` resolves a mark's id afterward.
     pub fn a11y_marks(&mut self) -> Result<(Frame, Vec<Mark>)> {
         let frame = self.screenshot(None, None)?;
-        let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
+        let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
         Ok(crate::marks::render(&frame, &tree))
     }
 
@@ -305,7 +305,7 @@ impl Glass {
                 window_handle: s.platform.active_window_handle(),
                 a11y_bus_addr: s.platform.a11y_bus_addr(),
                 limits: s.a11y_limits,
-                deadline: AxDeadline::UNBOUNDED,
+                deadline: Deadline::UNBOUNDED,
             };
             (target, ctx)
         };
@@ -370,7 +370,7 @@ impl Glass {
                 window_handle: s.platform.active_window_handle(),
                 a11y_bus_addr: s.platform.a11y_bus_addr(),
                 limits: s.a11y_limits,
-                deadline: AxDeadline::UNBOUNDED,
+                deadline: Deadline::UNBOUNDED,
             };
             (target, ctx)
         };
@@ -416,7 +416,7 @@ impl Glass {
             // holds the tree that observed the toggle.
             self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
             // Not event-gated: this branch runs only on iOS, whose reader has no event stream.
-            // No deadline either: `AxDeadline` carries the *caller's* bound, and
+            // No deadline either: `Deadline` carries the *caller's* bound, and
             // `TOGGLE_VERIFY_TIMEOUT_MS` is glass's own.
             // Kept as the poll runs, not re-read afterwards — a read taken after the bound elapsed
             // could catch a state that arrived late and contradict the verdict.
@@ -425,7 +425,7 @@ impl Glass {
                 TOGGLE_VERIFY_INTERVAL_MS,
                 TOGGLE_VERIFY_TIMEOUT_MS,
                 || {
-                    let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
+                    let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
                     seen = find_checkable_near(&tree.root, target.bounds.as_ref())
                         .map(|n| n.states.checked);
                     Ok((seen == Some(want)).then_some(()))
@@ -497,7 +497,7 @@ impl Glass {
         self.settle_for_popup();
         // Ids don't survive a re-snapshot, so match the open (`expanded`) combo, else the one
         // nearest the target's bounds.
-        let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
+        let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
         let combo = find_expanded_combo(&tree.root)
             .or_else(|| find_combo_near(&tree.root, target.bounds.as_ref()))
             .ok_or(GlassError::AxElementChanged(id.0))?;
@@ -535,7 +535,7 @@ impl Glass {
         self.settle_for_popup();
         // Verify the model actually committed — the *target* combo (matched by bounds,
         // now closed so nothing is `expanded`) must read the wanted label.
-        let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
+        let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
         let shows =
             find_combo_near(&tree.root, target.bounds.as_ref()).and_then(|c| c.name.clone());
         if shows
@@ -3070,7 +3070,7 @@ mod tests {
                 .as_ref()
                 .expect("snapshot recorded its ctx")
                 .deadline,
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         );
     }
 

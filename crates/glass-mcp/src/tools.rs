@@ -387,7 +387,7 @@ fn resolve_return(
             // Reuse the session's current limits so a fold after a raised/unbounded snapshot
             // isn't silently re-truncated to the default cap.
             let tree = glass
-                .a11y_resnapshot(glass_core::AxDeadline::UNBOUNDED)
+                .a11y_resnapshot(glass_core::Deadline::UNBOUNDED)
                 .map_err(|e| e.to_string())?;
             // Same shape as `a11y_snapshot`: the app-derived outline stays untrusted-wrapped;
             // glass's own steers are separate trusted blocks, not baked into that body.
