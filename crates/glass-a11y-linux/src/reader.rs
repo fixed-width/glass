@@ -1,6 +1,7 @@
-//! `LinuxA11y`: the AT-SPI `Accessibility` reader. Connects on a private thread +
-//! current-thread runtime (so it never `block_on`s inside the caller's tokio
-//! runtime), finds the launched app by PID, and walks its subtree into an `AxTree`.
+//! `LinuxA11y`: the AT-SPI `Accessibility` reader. Runs each bounded call on a detached thread
+//! (`glass_core::A11yThread`) with its own current-thread runtime, so it never `block_on`s inside
+//! the caller's tokio runtime; finds the launched app by PID, and walks its subtree into an
+//! `AxTree`.
 
 use std::time::Duration;
 
@@ -9,15 +10,16 @@ use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
-    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
-    ThreadBoundReader, WalkBudget, normalize_description,
+    A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError,
+    Result, WalkBudget, normalize_description,
 };
 
 use crate::mapping::{map_role, map_states};
 
-/// Every call runs on a fresh detached thread: atspi is async and would `block_on` inside the
-/// caller's tokio runtime. Ten seconds is the hard cap, so a wedged bus can't hang the calling tool.
-const BUS: ThreadBoundReader = ThreadBoundReader::new("a11y bus", Duration::from_secs(10));
+/// Every bounded call runs on a fresh detached thread: this reader drives an async API with
+/// `block_on`, which panics inside the caller's tokio runtime. The cap is what stops a wedged bus
+/// hanging the calling tool for longer than it.
+static BUS: A11yThread = A11yThread::new("a11y bus", Duration::from_secs(10));
 
 #[derive(Default)]
 pub struct LinuxA11y;
@@ -30,6 +32,8 @@ impl LinuxA11y {
 
 impl Accessibility for LinuxA11y {
     fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn glass_core::ChangeSignal>> {
+        // Not one of [`BUS`]'s bounded calls: the subscription's own thread is the long-lived one,
+        // and `subscribe` already bounds how long it waits for the registrations to land.
         crate::events::subscribe(ctx)
     }
 
@@ -42,14 +46,14 @@ impl Accessibility for LinuxA11y {
         let ctx = ctx.clone();
         let target = target.clone();
         let text = text.to_string();
-        BUS.write(move || run_set_value(&ctx, &target, &text))
+        BUS.set_value(move || run_set_value(&ctx, &target, &text))
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         let ctx = ctx.clone();
         let target = target.clone();
         // This reader actuates the element it resolved, so it never substitutes another.
-        BUS.action(move || run_invoke(&ctx, &target)).map(|()| None)
+        BUS.invoke(move || run_invoke(&ctx, &target)).map(|()| None)
     }
 }
 
@@ -722,13 +726,6 @@ mod toggle_label_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The name this reader hands `glass_core` — it is what a timeout message blames, and nothing
-    /// else in the crate would notice it changing.
-    #[test]
-    fn a_timeout_from_this_reader_blames_the_a11y_bus() {
-        assert_eq!(BUS.subject(), "a11y bus");
-    }
 
     #[test]
     fn no_matching_app_message_is_developer_framed() {

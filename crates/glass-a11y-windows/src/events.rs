@@ -1,7 +1,7 @@
 //! UI Automation change notifications, so a wait stops re-walking a tree that has not changed.
 //!
 //! A registration belongs to the COM apartment its thread initialized, so the pump thread outlives
-//! any single read — unlike the reader's per-snapshot threads.
+//! any single read — unlike the reader's per-call threads.
 //!
 //! Handlers run on UIA's own RPC threads, which is why nothing but a unit crosses the channel
 //! (see [`Notify`]).

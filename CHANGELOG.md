@@ -38,6 +38,16 @@ internal refactors, CI, or test-only changes.
   not take" before.
 
 ### Fixed
+- An accessibility reader that crashes on a particular app's tree now says so, instead of reporting
+  that the backend stopped responding. On Linux and Windows the reader runs each call on its own
+  worker thread; a crash there was indistinguishable from a call that never came back, so a read
+  reported that *you* had run out of time — and `glass_wait_for_element` treats that as "not yet",
+  polling for its whole timeout before reporting the element missing. Both halves were untrue: no
+  time had been spent, and the tree was unreachable rather than slow.
+- A `glass_set_value` that times out now says the write may still land, as `glass_click_element`
+  already did for an action. The work is not cancelled when the call gives up, so a write can arrive
+  after the error does; an agent that read the old message as "nothing happened" and typed the text
+  in by hand could end up with it entered twice.
 - A `glass_set_value` that failed on Android's on-device accessibility service no longer poisons the
   retry. Three of that path's failures — the write not landing, the field ceasing to report itself
   editable, and the read-back itself failing — along with a write whose answer was lost in

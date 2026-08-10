@@ -16,7 +16,7 @@ pub mod bounded;
 pub use bounded::{run_bounded, run_bounded_until, run_bounded_with_stdin};
 
 pub mod a11y_thread;
-pub use a11y_thread::ThreadBoundReader;
+pub use a11y_thread::A11yThread;
 
 pub mod set_value;
 pub use set_value::{

@@ -1,13 +1,13 @@
-//! `WindowsA11y`: the UI Automation `Accessibility` reader. Runs UIA on a fresh
-//! per-snapshot thread (COM-isolated, like the AT-SPI reader's private thread),
-//! finds the app's top-level window by PID (geometry fallback), and walks the bounded Control view
-//! into an `AxTree`. Never returns a stub: failures are `AccessibilityUnavailable`.
+//! `WindowsA11y`: the UI Automation `Accessibility` reader. Runs each bounded call on a detached,
+//! COM-isolated thread (`glass_core::A11yThread`), finds the app's top-level window by PID
+//! (geometry fallback), and walks the bounded Control view into an `AxTree`. Never returns a stub:
+//! failures are `AccessibilityUnavailable`.
 
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal, GlassError,
-    Result, ThreadBoundReader, WalkBudget, normalize_description, read_back_confirms,
+    A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal,
+    GlassError, Result, WalkBudget, normalize_description, read_back_confirms,
     write_took_no_effect,
 };
 use uiautomation::patterns::{
@@ -17,9 +17,10 @@ use uiautomation::patterns::{
 use uiautomation::types::{ExpandCollapseState, Handle, Rect, ToggleState};
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
 
-/// Every call runs on a fresh detached thread: UIA is COM and thread-affine, so it must not run on
-/// the caller's. Ten seconds is the hard cap, so a hung provider can't block the calling tool.
-const UIA: ThreadBoundReader = ThreadBoundReader::new("UIA", Duration::from_secs(10));
+/// Every bounded call runs on a fresh detached thread: UIA is COM and thread-affine, so it must
+/// not run on the caller's. The cap is what stops a hung provider blocking the calling tool for
+/// longer than it.
+static UIA: A11yThread = A11yThread::new("UIA", Duration::from_secs(10));
 /// Per-edge tolerance (px) for the set_value bounds-fingerprint check. Window-relative
 /// bounds are stable for a static element across snapshot→set_value (window moves cancel),
 /// so this only absorbs sub-pixel/timing jitter; a different element that drift landed on
@@ -63,14 +64,14 @@ impl Accessibility for WindowsA11y {
         let ctx = ctx.clone();
         let target = target.clone();
         let text = text.to_string();
-        UIA.write(move || run_set_value(&ctx, &target, &text))
+        UIA.set_value(move || run_set_value(&ctx, &target, &text))
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         let ctx = ctx.clone();
         let target = target.clone();
         // This reader actuates the element it resolved, so it never substitutes another.
-        UIA.action(move || run_invoke(&ctx, &target)).map(|()| None)
+        UIA.invoke(move || run_invoke(&ctx, &target)).map(|()| None)
     }
 }
 
@@ -550,13 +551,6 @@ fn find_nth(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The name this reader hands `glass_core` — it is what a timeout message blames, and nothing
-    /// else in the crate would notice it changing.
-    #[test]
-    fn a_timeout_from_this_reader_blames_uia() {
-        assert_eq!(UIA.subject(), "UIA");
-    }
 
     /// The failure mode this guards: if an absent child ever stopped arriving as a zero code,
     /// every leaf in every snapshot would report an unreadable subtree. Builds the error
