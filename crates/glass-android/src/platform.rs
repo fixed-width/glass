@@ -203,6 +203,13 @@ fn visible_window_region(win: &WindowGeometry, disp_w: u32, disp_h: u32) -> Resu
     })
 }
 
+/// Force-stop a launch that failed after `am start` had already put the app on the device, and
+/// hand its error back — `start_app` records `self.app` only on success, so nothing else reaps it.
+fn reap_failed_launch(adb: &Adb, package: &str, e: GlassError) -> GlassError {
+    let _ = adb.run(force_stop_args(package).iter().map(String::as_str));
+    e
+}
+
 impl Platform for AndroidPlatform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         run_build(spec, &self.logs)?;
@@ -217,14 +224,22 @@ impl Platform for AndroidPlatform {
         let started = adb.run(launch_args(&target.component).iter().map(String::as_str))?;
         check_am_start(&started)?;
 
-        let (active_id, window) = self.discover_window(&target.package, spec.timeout_ms)?;
+        // The app is on the device from here, but `self.app` is not set until the end, so each
+        // failure below has to reap for itself.
+        let (active_id, window) = match self.discover_window(&target.package, spec.timeout_ms) {
+            Ok(found) => found,
+            Err(e) => return Err(reap_failed_launch(&adb, &target.package, e)),
+        };
 
         let pidof = adb
             .run(["shell", "pidof", &target.package])
             .unwrap_or_default();
         let pid = parse_pid(&pidof);
         let logcat = match pid {
-            Some(pid) => Some(LogcatStream::spawn(&adb, pid, self.logs.clone())?),
+            Some(pid) => match LogcatStream::spawn(&adb, pid, self.logs.clone()) {
+                Ok(stream) => Some(stream),
+                Err(e) => return Err(reap_failed_launch(&adb, &target.package, e)),
+            },
             None => None,
         };
 
@@ -377,6 +392,16 @@ impl Platform for AndroidPlatform {
             }
         }
         self.app_pid().into_iter().collect()
+    }
+}
+
+impl Drop for AndroidPlatform {
+    /// Force-stop the app on drop, for a platform dropped without an explicit `stop_app()` —
+    /// parity with the X11/Wayland/Windows/macOS backends. The device outlives the process, so
+    /// the app would otherwise still be there for the next run (glass#419). `stop_app` takes
+    /// `self.app`, so this is a no-op once it has run, which every path through `Glass` does.
+    fn drop(&mut self) {
+        let _ = self.stop_app();
     }
 }
 
@@ -573,6 +598,48 @@ mod platform_tests {
             platform.window(&WindowOp::Geometry),
             Err(GlassError::NoActiveSession)
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_launch_whose_window_never_appears_does_not_leave_the_app_running() {
+        let empty = Answer::says("");
+        let started = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&started]),
+            ("shell dumpsys window windows", vec![&empty]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+
+        let mut platform = platform_over(&fake);
+        let mut spec = spec();
+        spec.timeout_ms = 300;
+
+        platform
+            .start_app(&spec)
+            .expect_err("a launch whose window never appears fails");
+
+        // `am start` put it on the device and the failure left `self.app` unset, so the drop
+        // below passes over it.
+        assert!(
+            fake.called("am force-stop com.example.app"),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_platform_that_still_holds_an_app_force_stops_it() {
+        let fake = launchable();
+
+        drop(started(&fake));
+
+        assert!(
+            fake.called("am force-stop com.example.app"),
+            "{:?}",
+            fake.calls()
+        );
     }
 
     #[test]

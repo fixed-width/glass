@@ -16,6 +16,30 @@ use glass_core::{AppSpec, BaselineStore, Glass, PlatformFactory, SandboxLevel};
 const AWAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const AWAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// The registries whose `ensure` switches something on for the whole device, put back when this
+/// goes out of scope — a trailing `shutdown()` is skipped by a panic. Only `shutdown` restores
+/// the secure settings and removes the `adb forward` each one opened; the APK stays installed,
+/// as glass owns that package (glass#419).
+///
+/// A guard, not a block around the assertions: `Glass::start` runs the factory — which enables
+/// the companion — before `start_app`, so a failing launch panics with the state already on.
+struct Companions {
+    agents: AgentRegistry,
+    a11y: A11yServiceRegistry,
+    emulators: EmulatorRegistry,
+}
+
+impl Drop for Companions {
+    fn drop(&mut self) {
+        // Reached while a panic unwinds, where a second panic aborts the process — nothing here
+        // may assert.
+        self.agents.shutdown();
+        self.a11y.shutdown();
+        // A no-op unless glass booted the emulator rather than attaching to one.
+        self.emulators.kill_all();
+    }
+}
+
 /// glass#287: the glass-android device tests build `ServiceA11y` by hand, so none of them can see
 /// which reader a session would have picked — and picking the uiautomator one makes every click a
 /// pointer tap that still reports `Ok`.
@@ -28,29 +52,46 @@ fn a_session_click_reports_the_native_accessibility_action() {
     let fixture =
         std::env::var("GLASS_ANDROID_FIXTURE_APK").expect("set GLASS_ANDROID_FIXTURE_APK");
 
-    // Under the default attach-or-boot lifecycle a second `EmulatorRegistry` with no device
-    // attached boots a second emulator, so the install below and the factory share one.
-    let registry = EmulatorRegistry::new();
-    let agents = AgentRegistry::new();
-    let a11y = A11yServiceRegistry::new();
+    // First, so it drops last: the app has to be force-stopped before the companion reading it
+    // goes away. Under the default attach-or-boot lifecycle a second `EmulatorRegistry` with no
+    // device attached boots a second emulator, so the install below and the factory share one.
+    let device = Companions {
+        agents: AgentRegistry::new(),
+        a11y: A11yServiceRegistry::new(),
+        emulators: EmulatorRegistry::new(),
+    };
 
     {
-        let p = AndroidPlatform::from_env(&registry, &agents).expect("attach to a device");
+        let p = AndroidPlatform::from_env(&device.emulators, &device.agents)
+            .expect("attach to a device");
         p.resolved_adb()
             .run(["install", "-r", "-g", &fixture])
             .expect("install the fixture APK");
     }
 
     // The two shapes of `boot`'s own factory closure — `make_platform` takes the iOS Simulator
-    // registry on macOS only.
+    // registry on macOS only. The registries are handles to shared state, so the closure's
+    // clones are the ones `device` shuts down.
     #[cfg(target_os = "macos")]
     let sim = glass_ios::SimulatorRegistry::new();
     #[cfg(target_os = "macos")]
-    let factory: PlatformFactory =
-        Box::new(move |b| glass_mcp::make_platform(b, &registry, &agents, &a11y, &sim));
+    let factory: PlatformFactory = {
+        let (emulators, agents, a11y) = (
+            device.emulators.clone(),
+            device.agents.clone(),
+            device.a11y.clone(),
+        );
+        Box::new(move |b| glass_mcp::make_platform(b, &emulators, &agents, &a11y, &sim))
+    };
     #[cfg(not(target_os = "macos"))]
-    let factory: PlatformFactory =
-        Box::new(move |b| glass_mcp::make_platform(b, &registry, &agents, &a11y));
+    let factory: PlatformFactory = {
+        let (emulators, agents, a11y) = (
+            device.emulators.clone(),
+            device.agents.clone(),
+            device.a11y.clone(),
+        );
+        Box::new(move |b| glass_mcp::make_platform(b, &emulators, &agents, &a11y))
+    };
 
     let baselines = tempfile::tempdir().expect("a temp dir for the baseline store");
     let mut glass = Glass::new(
@@ -88,6 +129,10 @@ fn a_session_click_reports_the_native_accessibility_action() {
     await_change("SaveBtn's click to register", &before, || {
         counter(&glass.a11y_snapshot(None).expect("snapshot"))
     });
+
+    // The user's own path; a panic above skips it and the drops do the same work —
+    // `AndroidPlatform` force-stops the app, `Companions` puts the settings back.
+    glass.stop().expect("stop the session");
 }
 
 /// The fixture's click counter, as the a11y tree reports it.
