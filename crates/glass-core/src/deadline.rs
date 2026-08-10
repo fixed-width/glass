@@ -49,9 +49,9 @@ impl Deadline {
     /// A tie is the callee's: one that used exactly its own bound must not be reported as a caller
     /// who ran out of time.
     ///
-    /// The only instant-vs-instant comparison this type makes. [`Self::within`] is the same
-    /// question in duration units; a third spelling of "whichever falls first" is a bug, not a
-    /// convenience (glass#432).
+    /// The only instant-vs-instant comparison this type makes — [`Self::within`] is the same
+    /// question in duration units, and a third spelling of "whichever falls first" is a bug
+    /// (glass#432).
     pub fn resolve(self, own: std::time::Instant) -> (std::time::Instant, Whose) {
         match self.0 {
             Some(d) if d < own => (d, Whose::Caller),
@@ -79,8 +79,8 @@ impl Deadline {
         budget: std::time::Duration,
         now: std::time::Instant,
     ) -> std::time::Duration {
-        // Not `cap(now + budget)`: that materialises an instant, and a budget near
-        // `Duration::MAX` overflows the addition. Same comparison, in duration units.
+        // Not `cap(now + budget)`: materialising the instant overflows the addition for a budget
+        // near `Duration::MAX`.
         self.remaining_at(now)
             .map_or(budget, |left| budget.min(left))
     }
@@ -154,7 +154,7 @@ mod tests {
     }
 
     /// `within` is `resolve` in duration units, so a divergence between them is the split this
-    /// type exists to prevent, coming back in a different shape (glass#432).
+    /// type exists to prevent (glass#432).
     #[test]
     fn every_unit_agrees_with_the_one_comparison() {
         let now = std::time::Instant::now();

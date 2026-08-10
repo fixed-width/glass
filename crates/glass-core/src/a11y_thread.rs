@@ -74,9 +74,8 @@ impl A11yThread {
     /// (glass#341, glass#432).
     ///
     /// One clock read, so the ceiling branch is exactly `ceiling` rather than `ceiling` minus
-    /// whatever fell between two reads. It trades the other way on the caller branch, where the
-    /// wait now expires a read later than the deadline instead of a read earlier; both are
-    /// nanoseconds against a wait the thread spawn below already dominates.
+    /// whatever fell between two reads. It trades the other way by the same nanoseconds on the
+    /// caller branch, where the wait now expires a read after the deadline instead of before.
     fn bounded_wait(&self, deadline: Deadline) -> (Duration, Whose) {
         let now = Instant::now();
         let (ends, whose) = deadline.resolve(now + self.ceiling);
@@ -219,9 +218,8 @@ mod tests {
         assert!(wait <= Duration::from_millis(50), "{wait:?}");
         assert_eq!(ended_by, Whose::Caller);
 
-        // And it is the caller's whole bound, not zero: a Caller branch that waits for nothing
-        // spawns a worker, gives up before it can answer, and reports every read in the window as
-        // the caller running out of time.
+        // And the whole bound, not zero: a Caller branch that waits for nothing spawns a worker,
+        // then reports every read in the window as the caller running out of time.
         let (wait, _) = reader().bounded_wait(Deadline::from_millis(5_000));
         assert!(wait > Duration::from_secs(4), "{wait:?}");
     }
@@ -230,8 +228,8 @@ mod tests {
     #[test]
     fn a_caller_that_names_no_deadline_leaves_the_read_its_own_ceiling() {
         let (wait, ended_by) = reader().bounded_wait(Deadline::UNBOUNDED);
-        // Exactly, not approximately: one clock read makes this branch deterministic, and the
-        // two-read shape it replaced came up short by whatever fell between them.
+        // One clock read makes this branch deterministic; the two-read shape it replaced came up
+        // short by whatever fell between them.
         assert_eq!(wait, CEILING, "{wait:?}");
         assert_eq!(ended_by, Whose::Callee);
     }
