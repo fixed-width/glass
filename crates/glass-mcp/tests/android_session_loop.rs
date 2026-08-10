@@ -31,8 +31,12 @@ fn a_session_click_reports_the_native_accessibility_action() {
     // Under the default attach-or-boot lifecycle a second `EmulatorRegistry` with no device
     // attached boots a second emulator, so the install below and the factory share one.
     let registry = EmulatorRegistry::new();
-    let agents = AgentRegistry::new();
-    let a11y = A11yServiceRegistry::new();
+    // `Arc` only so the teardown below can still reach them: the factory closure takes what it
+    // captures. Both leave state on the *device* that outliving the process does not clear —
+    // an `adb forward`, and the companion installed and enabled as an accessibility service —
+    // and neither registry has a `Drop`, so only `shutdown` takes it back off.
+    let agents = std::sync::Arc::new(AgentRegistry::new());
+    let a11y = std::sync::Arc::new(A11yServiceRegistry::new());
 
     {
         let p = AndroidPlatform::from_env(&registry, &agents).expect("attach to a device");
@@ -46,11 +50,15 @@ fn a_session_click_reports_the_native_accessibility_action() {
     #[cfg(target_os = "macos")]
     let sim = glass_ios::SimulatorRegistry::new();
     #[cfg(target_os = "macos")]
-    let factory: PlatformFactory =
-        Box::new(move |b| glass_mcp::make_platform(b, &registry, &agents, &a11y, &sim));
+    let factory: PlatformFactory = {
+        let (agents, a11y) = (agents.clone(), a11y.clone());
+        Box::new(move |b| glass_mcp::make_platform(b, &registry, &agents, &a11y, &sim))
+    };
     #[cfg(not(target_os = "macos"))]
-    let factory: PlatformFactory =
-        Box::new(move |b| glass_mcp::make_platform(b, &registry, &agents, &a11y));
+    let factory: PlatformFactory = {
+        let (agents, a11y) = (agents.clone(), a11y.clone());
+        Box::new(move |b| glass_mcp::make_platform(b, &registry, &agents, &a11y))
+    };
 
     let baselines = tempfile::tempdir().expect("a temp dir for the baseline store");
     let mut glass = Glass::new(
@@ -72,22 +80,39 @@ fn a_session_click_reports_the_native_accessibility_action() {
         })
         .expect("launch the view fixture");
 
-    let tree = glass.a11y_snapshot(None).expect("snapshot");
-    let before = counter(&tree);
-    let save = find(&tree.root, "SaveBtn").expect("the fixture's SaveBtn is present");
-    let method = glass.click_element(save.id).expect("click SaveBtn");
+    let asserted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let tree = glass.a11y_snapshot(None).expect("snapshot");
+        let before = counter(&tree);
+        let save = find(&tree.root, "SaveBtn").expect("the fixture's SaveBtn is present");
+        let method = glass.click_element(save.id).expect("click SaveBtn");
 
-    // `Pointer`'s `native_fallback` names the error that sent the click down the synthetic path.
-    assert!(
-        matches!(method, ClickMethod::NativeAction { .. }),
-        "a session click on an enabled button must fire the native action, got {method:?}"
-    );
+        // `Pointer`'s `native_fallback` names the error that sent the click down the synthetic
+        // path.
+        assert!(
+            matches!(method, ClickMethod::NativeAction { .. }),
+            "a session click on an enabled button must fire the native action, got {method:?}"
+        );
 
-    // `NativeAction` is the session's claim about which path it took; the counter is the
-    // fixture's report that something actuated.
-    await_change("SaveBtn's click to register", &before, || {
-        counter(&glass.a11y_snapshot(None).expect("snapshot"))
-    });
+        // `NativeAction` is the session's claim about which path it took; the counter is the
+        // fixture's report that something actuated.
+        await_change("SaveBtn's click to register", &before, || {
+            counter(&glass.a11y_snapshot(None).expect("snapshot"))
+        });
+    }));
+
+    // Caught rather than left to unwind, because the device outlives this process and every
+    // line below is what hands it back clean (glass#419). The session alone would survive a
+    // panic — `AndroidPlatform` force-stops on drop — but the registries have no `Drop`, so an
+    // unwind past them leaves the companion enabled for every later reader on this device.
+    let stopped = glass.stop();
+    agents.shutdown();
+    a11y.shutdown();
+
+    // The assertion's own failure first: a teardown error must not displace what it explains.
+    if let Err(payload) = asserted {
+        std::panic::resume_unwind(payload);
+    }
+    stopped.expect("stop the session");
 }
 
 /// The fixture's click counter, as the a11y tree reports it.
