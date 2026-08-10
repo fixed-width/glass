@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::deadline::Deadline;
 use crate::{BoundKind, GlassError, Result};
 
 /// The phrase a timeout error carries, for a reader of the message. What a *caller* keys on is
@@ -58,8 +59,11 @@ const MAX_CAPTURE: usize = 64 * 1024 * 1024;
 ///
 /// Both pipes are drained on their own threads: a child that fills a pipe buffer while the parent
 /// waits blocks in `write` and never exits, putting the deadline itself out of reach.
+///
+/// A zero `budget` is [`BoundKind::NotStarted`] — the command is not spawned at all, rather than
+/// spawned and killed at once.
 pub fn run_bounded(cmd: &mut Command, budget: Duration, op: &str) -> Result<Output> {
-    run_bounded_inner(cmd, budget, op, None)
+    run_bounded_until(cmd, budget, Deadline::UNBOUNDED, op)
 }
 
 /// [`run_bounded`], but waiting no later than `deadline` — the bound of the larger call this one
@@ -72,10 +76,10 @@ pub fn run_bounded(cmd: &mut Command, budget: Duration, op: &str) -> Result<Outp
 pub fn run_bounded_until(
     cmd: &mut Command,
     budget: Duration,
-    deadline: Instant,
+    deadline: Deadline,
     op: &str,
 ) -> Result<Output> {
-    let budget = budget_within(budget, deadline, Instant::now());
+    let budget = deadline.within(budget, Instant::now());
     if budget.is_zero() {
         return Err(GlassError::Bounded {
             kind: BoundKind::NotStarted,
@@ -334,12 +338,6 @@ fn next_wait(previous: Duration) -> Duration {
 /// Whether appending `n` more bytes to a buffer of `len` would pass [`MAX_CAPTURE`].
 fn would_exceed_capture(len: usize, n: usize) -> bool {
     len + n > MAX_CAPTURE
-}
-
-/// The budget a call actually gets: its own, or what is left of the deadline it serves, whichever
-/// is nearer. Its own function so the rule is pinned by a test, which a timing test cannot do.
-fn budget_within(budget: Duration, deadline: Instant, now: Instant) -> Duration {
-    budget.min(deadline.saturating_duration_since(now))
 }
 
 /// Whether `deadline` has arrived. Its own function so the boundary — a deadline exactly reached
@@ -773,29 +771,6 @@ mod tests {
     }
 
     #[test]
-    fn a_call_gets_the_nearer_of_its_own_budget_and_the_deadline_it_serves() {
-        // The rule the deadline-taking runner exists for, pinned where no timing test can reach it.
-        let now = Instant::now();
-        assert_eq!(
-            budget_within(Duration::from_secs(20), now + Duration::from_secs(5), now),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            budget_within(Duration::from_secs(3), now + Duration::from_secs(5), now),
-            Duration::from_secs(3)
-        );
-        assert_eq!(
-            budget_within(Duration::from_secs(20), now, now),
-            Duration::ZERO
-        );
-        let past = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
-        assert_eq!(
-            budget_within(Duration::from_secs(20), past, now),
-            Duration::ZERO
-        );
-    }
-
-    #[test]
     #[cfg(unix)]
     fn a_call_dies_at_the_deadline_it_serves_rather_than_at_its_own_budget() {
         // A step of a longer sequence gets what is left of the sequence's deadline, not the sum of
@@ -804,7 +779,7 @@ mod tests {
         let err = run_bounded_until(
             Command::new("/bin/sh").args(["-c", "sleep 30"]),
             Duration::from_secs(20),
-            Instant::now() + Duration::from_millis(300),
+            Deadline::at(Instant::now() + Duration::from_millis(300)),
             "test:outer-deadline",
         )
         .expect_err("must not wait out its own budget past the deadline it serves");
@@ -824,7 +799,7 @@ mod tests {
         let err = run_bounded_until(
             Command::new("/bin/sh").args(["-c", "sleep 30"]),
             Duration::from_millis(300),
-            Instant::now() + Duration::from_secs(60),
+            Deadline::at(Instant::now() + Duration::from_secs(60)),
             "test:own-budget",
         )
         .expect_err("must time out");
@@ -840,7 +815,7 @@ mod tests {
         let err = run_bounded_until(
             Command::new("/bin/sh").args(["-c", "sleep 30"]),
             Duration::from_secs(20),
-            Instant::now(),
+            Deadline::at(Instant::now()),
             "test:spent-deadline",
         )
         .expect_err("a call with no time left must fail rather than run");
@@ -865,7 +840,7 @@ mod tests {
         let out = run_bounded_until(
             Command::new("/bin/sh").args(["-c", "printf ready; exit 3"]),
             Duration::from_secs(10),
-            Instant::now() + Duration::from_secs(10),
+            Deadline::at(Instant::now() + Duration::from_secs(10)),
             "test:until-fast",
         )
         .expect("a fast command yields its Output");
@@ -895,7 +870,7 @@ mod tests {
         let spent = run_bounded_until(
             &mut Command::new("/nonexistent/glass-test-binary"),
             Duration::from_secs(20),
-            Instant::now(),
+            Deadline::at(Instant::now()),
             "test:kind-not-started",
         )
         .expect_err("a call with no time left must fail rather than run");

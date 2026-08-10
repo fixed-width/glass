@@ -355,14 +355,8 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
         Box::new(move |b| make_platform(b, &reg_factory, &agents_factory, &a11y_factory));
     let mut glass = Glass::new(platform_factory, default, baselines, 10_000);
     glass.set_shutdown_hook(Box::new(move |deadline| {
-        // `Glass::shutdown` keeps `TEARDOWN_HOOK_RESERVE` back from the sessions so these have
-        // time (glass#422). Between themselves it is first-come-first-served, which holds because
-        // at most one of the first three has real work: `kill_all` is empty unless glass booted
-        // the emulator, and if it did, the a11y settings restored before it die with the VM.
-        a11y.shutdown_until(Some(deadline));
-        agents.shutdown_until(Some(deadline));
-        registry.kill_all_until(Some(deadline));
-        // Not under the deadline: it does not wait (see `shutdown_all`).
+        glass_android::hand_the_device_back(&a11y, &agents, &registry, deadline);
+        // Not under the deadline: it does not wait (see `request_shutdown_all`).
         #[cfg(target_os = "macos")]
         sim_registry.request_shutdown_all();
     }));

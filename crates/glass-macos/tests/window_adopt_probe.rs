@@ -59,7 +59,7 @@ mod macos_main {
 
     use glass_a11y_macos::MacosA11y;
     use glass_core::{
-        Accessibility, AppSpec, AxContext, AxDeadline, Platform, SandboxLevel, WalkLimits,
+        Accessibility, AppSpec, AxContext, Deadline, Platform, SandboxLevel, WalkLimits,
         WindowGeometry, WindowInfo, WindowOp,
     };
     use glass_macos::MacosPlatform;
@@ -273,7 +273,7 @@ mod macos_main {
                 // Only Ok/Err is read below, and that outcome turns on root window resolution,
                 // not tree size — cap at 1 node instead of paying for the full tree.
                 limits: WalkLimits::from_max_nodes(Some(1)),
-                deadline: AxDeadline::UNBOUNDED,
+                deadline: Deadline::UNBOUNDED,
             };
             let snapshot_ok = match MacosA11y::new().snapshot(&ctx) {
                 Ok(_) => {

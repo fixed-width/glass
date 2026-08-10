@@ -177,7 +177,7 @@ fn device_check(p: &Probe) -> Check {
     }
 }
 
-/// Deadline for each doctor probe. Doctor reports on the host rather than driving it, so every
+/// Budget for each doctor probe. Doctor reports on the host rather than driving it, so every
 /// probe here is a fast query; a tool that does not answer in this long is itself the finding.
 const PROBE_BUDGET: Duration = Duration::from_secs(10);
 

@@ -1,7 +1,7 @@
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use glass_core::{GlassError, Result, run_bounded, run_bounded_until};
+use glass_core::{Deadline, GlassError, Result, run_bounded_until};
 
 /// What a `simctl` invocation is doing, which is what decides how long it may take.
 ///
@@ -115,13 +115,13 @@ impl Simctl {
 
     /// Run `xcrun simctl <sub...>` and return captured stdout as lossy UTF-8 text.
     pub fn run(&self, sub: &[&str]) -> Result<String> {
-        self.run_until(sub, None)
+        self.run_until(sub, Deadline::UNBOUNDED)
     }
 
-    /// [`Simctl::run`] under a deadline the whole sequence shares, `None` for a call that answers
-    /// to nothing but its own budget. The deadline bounds the run; it does not reserve time for
+    /// [`Simctl::run`] under a deadline the whole sequence shares, [`Deadline::UNBOUNDED`] for a
+    /// call that answers to nothing but its own budget. The deadline bounds the run; it does not reserve time for
     /// the calls behind, which is `Glass::shutdown`'s job (glass#427).
-    pub fn run_until(&self, sub: &[&str], deadline: Option<Instant>) -> Result<String> {
+    pub fn run_until(&self, sub: &[&str], deadline: Deadline) -> Result<String> {
         let out = self.output(sub, deadline)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
@@ -143,14 +143,11 @@ impl Simctl {
         cmd.spawn()
     }
 
-    fn output(&self, sub: &[&str], deadline: Option<Instant>) -> Result<Vec<u8>> {
+    fn output(&self, sub: &[&str], deadline: Deadline) -> Result<Vec<u8>> {
         let op = SimctlOp::for_sub(sub);
         let mut cmd = Command::new(self.program());
         cmd.args(self.full_args(sub));
-        let out = match deadline {
-            Some(d) => run_bounded_until(&mut cmd, op.budget(), d, op.label())?,
-            None => run_bounded(&mut cmd, op.budget(), op.label())?,
-        };
+        let out = run_bounded_until(&mut cmd, op.budget(), deadline, op.label())?;
         if !out.status.success() {
             return Err(GlassError::Backend(format!(
                 "simctl {:?} failed: {}",

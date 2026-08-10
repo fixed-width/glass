@@ -387,7 +387,7 @@ impl Glass {
         let started = std::time::Instant::now();
         // Every read this wait makes carries when the wait stops: the tick is synchronous, so the
         // loop cannot take back a read a reader has started (glass#338).
-        let deadline = AxDeadline::from_millis(params.timeout_ms);
+        let deadline = Deadline::from_millis(params.timeout_ms);
         // Before the first walk, not after: a change landing in that gap is announced to nobody,
         // and the wait then burns its whole budget on a condition that already holds.
         //
@@ -446,7 +446,7 @@ impl Glass {
                 let bound = if looked {
                     deadline
                 } else {
-                    AxDeadline::UNBOUNDED
+                    Deadline::UNBOUNDED
                 };
                 looked = true;
                 let tree = match self.a11y_resnapshot(bound) {
@@ -620,7 +620,7 @@ impl Glass {
         // No deadline, though the sweep has a `timeout_ms`: this read propagates its error with
         // `?`, so a reader giving up at the deadline would turn the sweep's soft `{matched:false}`
         // into an error.
-        let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
+        let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
         let found = match element_match(
             &tree,
             params.name.as_deref(),
@@ -1361,7 +1361,7 @@ mod tests {
                 .as_ref()
                 .expect("the sweep read the tree")
                 .deadline,
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         );
     }
 

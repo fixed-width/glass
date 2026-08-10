@@ -6,9 +6,10 @@ use std::sync::Mutex;
 
 use serde_json::{Value, json};
 
+use glass_core::Deadline;
 use glass_core::accessibility::{
-    Accessibility, AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget,
-    AxTree, Subject, WalkBudget, WalkLimits,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
+    Subject, WalkBudget, WalkLimits,
 };
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result, read_back_failed, write_took_no_effect};
@@ -262,7 +263,7 @@ impl ServiceClient {
     /// Scoped rather than set-and-leave: the connection outlives any one request, so a bound left
     /// behind would apply to a later call that never agreed to it — and to the *reconnect* path,
     /// where a fresh `Conn` starts from the standing timeout again.
-    fn read_within(&self, deadline: AxDeadline) -> ReadBound<'_> {
+    fn read_within(&self, deadline: Deadline) -> ReadBound<'_> {
         if let Ok(mut conn) = self.conn.lock() {
             conn.read_within(deadline.remaining());
         }
@@ -287,14 +288,14 @@ impl ServiceClient {
     /// Serve the tree for `package` on the connection's standing timeout — the readiness probe and
     /// the tests, neither of which has a caller waiting on a clock.
     fn tree(&self, package: &str) -> Result<TreeReply> {
-        self.tree_within(package, AxDeadline::UNBOUNDED)
+        self.tree_within(package, Deadline::UNBOUNDED)
     }
 
     /// Serve the tree for `package`, blocking no longer than `deadline` allows.
     ///
     /// The bound covers the reconnect-and-re-send too, so one call cannot cost two socket
     /// timeouts against a caller who asked for less than one (glass#338).
-    fn tree_within(&self, package: &str, deadline: AxDeadline) -> Result<TreeReply> {
+    fn tree_within(&self, package: &str, deadline: Deadline) -> Result<TreeReply> {
         let _bound = self.read_within(deadline);
         let r = self
             .call(json!({"op": "tree", "package": package}), None)
@@ -642,13 +643,28 @@ pub fn a11y_apk(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     )
 }
 
-struct Active {
+pub(crate) struct Active {
     /// The client the service was enabled through, kept rather than resolved again at teardown:
     /// `Adb::from_env` reads the environment as it is *then*, which need not be what set this up.
     adb: Adb,
     port: u16,
     prior_enabled: String,
     prior_a11y_enabled: String,
+}
+
+// Unix-gated with its only consumer, the `FakeAdb`-backed teardown test — that fake is a
+// `/bin/sh` script.
+#[cfg(all(test, unix))]
+impl Active {
+    /// An enabled service to restore, for a test that needs a registry with work to do.
+    pub(crate) fn for_test(adb: Adb, port: u16) -> Self {
+        Self {
+            adb,
+            port,
+            prior_enabled: String::new(),
+            prior_a11y_enabled: "0".to_string(),
+        }
+    }
 }
 
 /// Owns the installed+enabled state so the shutdown hook can restore it. Cloneable (shared
@@ -704,7 +720,7 @@ impl A11yServiceRegistry {
             &|step| escalate(adb, apk, &want, step, READY_ATTEMPTS),
             // No deadline: this is the rollback for a failed `ensure` during `glass_start`, not
             // teardown, so each call keeps its own budget and answers to no shared one.
-            &|| restore_a11y(adb, prior, prior_a11y, port, None),
+            &|| restore_a11y(adb, prior, prior_a11y, port, Deadline::UNBOUNDED),
         )?;
         *self.state.lock().unwrap() = Some(Active {
             adb: adb.clone(),
@@ -715,16 +731,19 @@ impl A11yServiceRegistry {
         Ok(client)
     }
 
-    /// Restore the device's prior accessibility state and remove the forward. Best-effort,
-    /// idempotent. No process to kill (disabling unbinds the service).
-    pub fn shutdown(&self) {
-        self.shutdown_until(None);
+    /// Plant an active service, for a test that needs a registry with something to restore.
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_active_for_test(&self, active: Active) {
+        *self.state.lock().unwrap() = Some(active);
     }
 
-    /// [`A11yServiceRegistry::shutdown`] under a deadline the rest of teardown shares — the
-    /// process-exit path, where stopping the app has already spent part of
-    /// `glass_core::TEARDOWN_BUDGET` (glass#422).
-    pub fn shutdown_until(&self, deadline: Option<std::time::Instant>) {
+    /// Restore the device's prior accessibility state and remove the forward by `deadline`, which
+    /// the rest of teardown shares — stopping the app has already spent part of
+    /// `glass_core::TEARDOWN_BUDGET` (glass#422). [`Deadline::UNBOUNDED`] off that path, where
+    /// each call keeps its own budget.
+    ///
+    /// Best-effort and idempotent. No process to kill: disabling unbinds the service.
+    pub fn shutdown(&self, deadline: Deadline) {
         if let Ok(mut g) = self.state.lock()
             && let Some(a) = g.take()
         {
@@ -751,31 +770,22 @@ fn escalate(adb: &Adb, apk: &str, want: &str, step: u32, attempts: u32) -> Resul
 }
 
 fn put_secure(adb: &Adb, key: &str, value: &str) -> Result<()> {
-    put_secure_until(adb, key, value, None).map(|_| ())
+    put_secure_until(adb, key, value, Deadline::UNBOUNDED).map(|_| ())
 }
 
 /// [`put_secure`] under a deadline the caller shares with the rest of its sequence.
-fn put_secure_until(
-    adb: &Adb,
-    key: &str,
-    value: &str,
-    deadline: Option<std::time::Instant>,
-) -> Result<String> {
+fn put_secure_until(adb: &Adb, key: &str, value: &str, deadline: Deadline) -> Result<String> {
     adb.run_until(["shell", "settings", "put", "secure", key, value], deadline)
 }
 
 /// Write `enabled_accessibility_services`. An empty list is a `delete`: `settings put ... ""`
 /// errors ("Bad arguments").
 fn put_enabled_services(adb: &Adb, list: &str) -> Result<()> {
-    put_enabled_services_until(adb, list, None)
+    put_enabled_services_until(adb, list, Deadline::UNBOUNDED)
 }
 
 /// [`put_enabled_services`] under a deadline the caller shares with the rest of its sequence.
-fn put_enabled_services_until(
-    adb: &Adb,
-    list: &str,
-    deadline: Option<std::time::Instant>,
-) -> Result<()> {
+fn put_enabled_services_until(adb: &Adb, list: &str, deadline: Deadline) -> Result<()> {
     if list.is_empty() {
         adb.run_until(
             [
@@ -818,7 +828,7 @@ fn restore_a11y(
     prior_enabled: &str,
     prior_a11y_enabled: &str,
     port: u16,
-    deadline: Option<std::time::Instant>,
+    deadline: Deadline,
 ) {
     let services = put_enabled_services_until(adb, prior_enabled, deadline);
     glass_core::note_if_skipped("restoring enabled_accessibility_services", &services);
@@ -1221,7 +1231,7 @@ fn check_timeout(target: u32, act: &Actuated, want: bool, seen: CheckState) -> G
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::accessibility::{AxDeadline, AxRole, TruncationLimit};
+    use glass_core::accessibility::{AxRole, TruncationLimit};
     use serde_json::json;
     use std::io::{BufRead, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1291,7 +1301,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        reg.shutdown_until(Some(Instant::now() + Duration::from_millis(300)));
+        reg.shutdown(Deadline::at(Instant::now() + Duration::from_millis(300)));
 
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -2872,7 +2882,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: AxDeadline::UNBOUNDED,
+            deadline: Deadline::UNBOUNDED,
         }
     }
 
@@ -2891,7 +2901,7 @@ mod tests {
         let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
         let mut a11y = reader(port, std::time::Duration::ZERO);
         let mut ctx = ctx();
-        ctx.deadline = AxDeadline::from_millis(0);
+        ctx.deadline = Deadline::from_millis(0);
 
         let e = a11y
             .snapshot(&ctx)
@@ -3135,7 +3145,7 @@ mod tests {
             fake.calls()
         );
 
-        registry.shutdown();
+        registry.shutdown(Deadline::UNBOUNDED);
 
         // An empty list is a `delete`, and the global flag goes back to off rather than to "null".
         assert!(
@@ -3165,7 +3175,7 @@ mod tests {
         registry
             .ensure(fake.adb(), "/opt/glass/glass-a11y.apk")
             .expect("the service comes up");
-        registry.shutdown();
+        registry.shutdown(Deadline::UNBOUNDED);
 
         assert_eq!(
             enabled_list_written(&fake),
@@ -3174,7 +3184,7 @@ mod tests {
         );
 
         let after = fake.calls().len();
-        registry.shutdown();
+        registry.shutdown(Deadline::UNBOUNDED);
         assert_eq!(
             fake.calls().len(),
             after,
@@ -3265,7 +3275,7 @@ mod tests {
         let (port, _ops) = fake_service(vec![compose_like()], OnAction::Ok);
         let mut a = reader(port, std::time::Duration::ZERO);
         let mut bounded = ctx();
-        bounded.deadline = AxDeadline::from_millis(500);
+        bounded.deadline = Deadline::from_millis(500);
         a.snapshot(&bounded).expect("a bounded snapshot");
 
         let left = a

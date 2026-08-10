@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::error::{GlassError, Result};
 use crate::frame::{Frame, Region};
@@ -256,19 +256,26 @@ pub trait Platform {
     /// return the window's geometry.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry>;
 
-    /// Terminate the running app (idempotent).
-    fn stop_app(&mut self) -> Result<()>;
-
-    /// [`Platform::stop_app`] on the process-exit path, where the whole of teardown shares
-    /// [`TEARDOWN_BUDGET`] and `deadline` is this step's share of it.
+    /// Terminate the running app (idempotent), giving up by `deadline`.
     ///
-    /// The default ignores it, which is what a signal ladder over local processes already asserts
-    /// against [`TEARDOWN_BUDGET`] at compile time (x11, wayland, windows, macos — each with the
-    /// residual its own comment names). A backend that tears down over a link to a device has one
-    /// tool invocation per step, each with its own budget and no sum to assert, so it overrides
-    /// this and spends the shared deadline (glass#422, glass#427).
-    fn stop_app_by(&mut self, _deadline: Instant) -> Result<()> {
-        self.stop_app()
+    /// **Cap every wait of your own by it.** On the process-exit path the whole of teardown shares
+    /// [`TEARDOWN_BUDGET`], and a step that overruns is not merely late — it spends what the steps
+    /// behind it needed, and they are skipped rather than slowed (glass#422, glass#427).
+    ///
+    /// A backend whose teardown is a signal ladder over local processes may ignore it — those
+    /// ladders already assert their own constants against [`TEARDOWN_BUDGET`] at compile time
+    /// (x11, wayland, windows, macos, each with the residual its own comment names). One that
+    /// tears down over a link to a device has a tool invocation per step, each with its own budget
+    /// and no sum to assert, so it has nothing but this deadline.
+    ///
+    /// Required rather than defaulted, so a new device-linked backend cannot inherit an unbounded
+    /// teardown in silence — which is how both device backends came to need glass#422/#427.
+    fn stop_app_by(&mut self, deadline: crate::Deadline) -> Result<()>;
+
+    /// [`Platform::stop_app_by`] with no bound — the tool path, where `glass_stop` waits as long
+    /// as the backend needs.
+    fn stop_app(&mut self) -> Result<()> {
+        self.stop_app_by(crate::Deadline::UNBOUNDED)
     }
 
     /// Capture the current window contents as an RGBA frame. `region` (if set,
@@ -447,7 +454,7 @@ mod tests {
         fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
             Ok(WindowGeometry::default())
         }
-        fn stop_app(&mut self) -> Result<()> {
+        fn stop_app_by(&mut self, _deadline: crate::Deadline) -> Result<()> {
             Ok(())
         }
         fn capture_frame(&mut self, _region: Option<&Region>) -> Result<Frame> {
@@ -483,7 +490,7 @@ mod tests {
         fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
             unimplemented!()
         }
-        fn stop_app(&mut self) -> Result<()> {
+        fn stop_app_by(&mut self, _deadline: crate::Deadline) -> Result<()> {
             unimplemented!()
         }
         fn capture_frame(&mut self, _region: Option<&Region>) -> Result<Frame> {
@@ -523,18 +530,18 @@ mod tests {
         assert_eq!(MinimalPlatform.app_pid(), None);
     }
 
-    /// The default is what the four constant-bounded backends rely on, and it is reached only on
-    /// the exit path — where a body of `Ok(())` would mean they quietly stopped stopping their
-    /// app, with every existing test still green.
+    /// `stop_app` is now the provided half of the pair, so a body of `Ok(())` would mean the tool
+    /// path quietly stopped stopping the app — with every backend still compiling, since they
+    /// implement the other one.
     #[test]
-    fn default_stop_app_by_stops_the_app_and_ignores_the_deadline() {
-        struct CountingPlatform(u32);
+    fn the_default_stop_app_reaches_stop_app_by_with_no_bound() {
+        struct CountingPlatform(Option<crate::Deadline>);
         impl Platform for CountingPlatform {
             fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
                 Ok(WindowGeometry::default())
             }
-            fn stop_app(&mut self) -> Result<()> {
-                self.0 += 1;
+            fn stop_app_by(&mut self, deadline: crate::Deadline) -> Result<()> {
+                self.0 = Some(deadline);
                 Ok(())
             }
             fn capture_frame(&mut self, _region: Option<&Region>) -> Result<Frame> {
@@ -560,12 +567,13 @@ mod tests {
             }
         }
 
-        let mut p = CountingPlatform(0);
-        // A deadline already gone: the default must stop the app regardless, since it does not
-        // spend one.
-        p.stop_app_by(Instant::now() - Duration::from_secs(1))
-            .expect("the default delegates to stop_app");
-        assert_eq!(p.0, 1);
+        let mut p = CountingPlatform(None);
+        p.stop_app().expect("the default delegates");
+        assert_eq!(
+            p.0,
+            Some(crate::Deadline::UNBOUNDED),
+            "the tool path must reach the backend, and with no bound"
+        );
     }
 
     #[test]

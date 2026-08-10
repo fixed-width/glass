@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use glass_core::Deadline;
 use glass_core::{GlassError, Result};
 use serde_json::{Value, json};
 
@@ -325,16 +326,13 @@ impl AgentRegistry {
         Ok(port)
     }
 
-    /// Kill the device agent (via the host child) and remove the forward. Best-effort.
-    pub fn shutdown(&self) {
-        self.shutdown_until(None);
-    }
-
-    /// [`AgentRegistry::shutdown`] under a deadline the rest of teardown shares (glass#422).
+    /// Kill the device agent (via the host child) and remove the forward by `deadline`, which the
+    /// rest of teardown shares (glass#422); [`Deadline::UNBOUNDED`] off that path. Best-effort.
     ///
-    /// Only the forward removal is under it — dropping `p` then kills and reaps the agent with an
-    /// unbounded `wait()`, the gap `AndroidPlatform::stop_app_until` names for logcat.
-    pub fn shutdown_until(&self, deadline: Option<std::time::Instant>) {
+    /// Only the forward removal is under the deadline — dropping `p` then kills and reaps the
+    /// agent with an unbounded `wait()`, the gap `AndroidPlatform::stop_app_until` names for
+    /// logcat.
+    pub fn shutdown(&self, deadline: Deadline) {
         if let Ok(mut guard) = self.state.lock()
             && let Some(p) = guard.take()
         {
@@ -398,7 +396,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        reg.shutdown_until(Some(Instant::now() + Duration::from_millis(300)));
+        reg.shutdown(Deadline::at(Instant::now() + Duration::from_millis(300)));
 
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -610,7 +608,7 @@ mod tests {
         assert!(!child.is_empty(), "the launch should still be running");
         assert!(still_running(&child));
 
-        registry.shutdown();
+        registry.shutdown(Deadline::UNBOUNDED);
         assert!(fake.called("forward --remove"), "{:?}", fake.calls());
         assert!(
             !still_running(&child),

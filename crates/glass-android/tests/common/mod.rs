@@ -13,6 +13,7 @@
 #![allow(dead_code)]
 
 use glass_android::{A11yServiceRegistry, AgentRegistry, EmulatorRegistry};
+use glass_core::Deadline;
 
 /// Kills the launched agent and removes its `adb forward` when it drops.
 pub struct StopAgent<'a>(pub &'a AgentRegistry);
@@ -21,7 +22,7 @@ impl Drop for StopAgent<'_> {
     fn drop(&mut self) {
         // Reached while a panic unwinds, where a second panic aborts the process — nothing here
         // may assert.
-        self.0.shutdown();
+        self.0.shutdown(Deadline::UNBOUNDED);
     }
 }
 
@@ -35,7 +36,7 @@ pub struct RestoreServiceState<'a>(pub &'a A11yServiceRegistry);
 
 impl Drop for RestoreServiceState<'_> {
     fn drop(&mut self) {
-        self.0.shutdown();
+        self.0.shutdown(Deadline::UNBOUNDED);
     }
 }
 
@@ -57,6 +58,6 @@ pub struct KillBootedEmulators<'a>(pub &'a EmulatorRegistry);
 
 impl Drop for KillBootedEmulators<'_> {
     fn drop(&mut self) {
-        self.0.kill_all();
+        self.0.kill_all(Deadline::UNBOUNDED);
     }
 }

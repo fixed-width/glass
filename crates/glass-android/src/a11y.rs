@@ -6,7 +6,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use glass_core::accessibility::{Accessibility, AxContext, AxDeadline, AxNode, AxTarget, AxTree};
+use glass_core::Deadline;
+use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree};
 use glass_core::{
     GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, WindowGeometry,
     read_back_failed, verify_typed_write,
@@ -71,7 +72,7 @@ type AdbRunner<'a> = dyn FnMut(&[&str], Instant) -> Result<(String, String)> + '
 pub(crate) fn adb_runner(
     adb: &Adb,
 ) -> impl FnMut(&[&str], Instant) -> Result<(String, String)> + '_ {
-    move |argv, deadline| adb.run_streams_until(argv.iter().copied(), deadline)
+    move |argv, deadline| adb.run_streams_until(argv.iter().copied(), Deadline::at(deadline))
 }
 
 /// When one whole dump attempt — the dump, the read of what it wrote, and the removal of the file
@@ -82,7 +83,7 @@ pub(crate) fn adb_runner(
 /// the sum of all three, 50s against the 10s a `glass_wait_for_element` asks for by default and
 /// re-snapshots inside.
 ///
-/// A caller that named a deadline gets [`AxDeadline::cap`] of this instead — see
+/// A caller that named a deadline gets [`Deadline::cap`] of this instead — see
 /// [`dump_until_ready`], which needs both to tell which of them ended an attempt.
 pub(crate) fn attempt_deadline() -> Instant {
     Instant::now() + AdbOp::Dump.budget()
@@ -244,7 +245,7 @@ fn dump_until_ready(
     prefix: &str,
     bound: RetryBound,
     interval: Duration,
-    caller: AxDeadline,
+    caller: Deadline,
 ) -> Result<String> {
     let retry_until = caller.cap(Instant::now() + bound.then_within);
     let mut owed = bound.least.max(1);
@@ -330,7 +331,7 @@ const VERIFY_PHASE_BUDGET_MS: u64 = 20_000;
 /// binding to a device.
 ///
 /// Split out so a host test can see the join: inline, replacing `ctx.deadline` with
-/// [`AxDeadline::UNBOUNDED`] left every non-device test green.
+/// [`Deadline::UNBOUNDED`] left every non-device test green.
 fn snapshot_with_runner(
     run: &mut AdbRunner<'_>,
     ctx: &AxContext,
@@ -365,7 +366,7 @@ pub(crate) enum Warmth {
 ///
 /// The cold wait is not capped here: [`dump_until_ready`] caps every wait by the caller, and this
 /// one must still *owe* the two attempts the accessibility bridge's registration needs.
-fn snapshot_bound(warmth: Warmth, deadline: AxDeadline) -> RetryBound {
+fn snapshot_bound(warmth: Warmth, deadline: Deadline) -> RetryBound {
     if warmth == Warmth::Cold {
         return COLD_BOUND;
     }
@@ -606,9 +607,9 @@ mod tests {
         snapshot_with_runner,
     };
     use crate::adb::{AdbOp, a_failed_call, a_real_spawn_failure, a_real_timeout_hinted};
+    use glass_core::Deadline;
     use glass_core::accessibility::{
-        AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
-        WalkLimits,
+        AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree, WalkLimits,
     };
     use glass_core::{BoundKind, GlassError, Result, WindowGeometry};
     use std::collections::HashMap;
@@ -625,7 +626,7 @@ mod tests {
         glass_core::run_bounded_until(
             &mut std::process::Command::new("adb"),
             Duration::from_secs(10),
-            Instant::now(),
+            Deadline::at(Instant::now()),
             "adb:uiautomator dump",
         )
         .expect_err("a spent deadline starts nothing")
@@ -768,7 +769,7 @@ mod tests {
                 then_within: Duration::from_millis(10),
             },
             Duration::ZERO,
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         )
         .expect("the second attempt is owed however long the first took");
 
@@ -810,7 +811,7 @@ mod tests {
                 PREFIX,
                 RetryBound::ONCE,
                 Duration::ZERO,
-                AxDeadline::from_millis(50),
+                Deadline::from_millis(50),
             )
             .expect("the dump succeeds");
         }
@@ -872,7 +873,7 @@ mod tests {
                 PREFIX,
                 RetryBound::ONCE,
                 Duration::ZERO,
-                AxDeadline::UNBOUNDED,
+                Deadline::UNBOUNDED,
             )
             .expect("the dump succeeds");
         }
@@ -897,7 +898,7 @@ mod tests {
             PREFIX,
             patient(),
             Duration::ZERO,
-            AxDeadline::from_millis(0),
+            Deadline::from_millis(0),
         )
         .expect_err("the caller had stopped waiting");
 
@@ -912,13 +913,13 @@ mod tests {
     /// nothing else bounded a retry.
     #[test]
     fn a_warmed_reader_retries_only_inside_the_deadline_the_caller_named() {
-        let told = snapshot_bound(Warmth::Warmed, AxDeadline::from_millis(5_000));
+        let told = snapshot_bound(Warmth::Warmed, Deadline::from_millis(5_000));
         assert!(
             told.then_within > Duration::from_secs(4) && told.then_within <= Duration::from_secs(5),
             "the retry window is not the caller's: {told:?}"
         );
 
-        let untold = snapshot_bound(Warmth::Warmed, AxDeadline::UNBOUNDED);
+        let untold = snapshot_bound(Warmth::Warmed, Deadline::UNBOUNDED);
         assert_eq!(
             untold.then_within,
             Duration::ZERO,
@@ -932,7 +933,7 @@ mod tests {
     /// would apply it twice and leave the attempts the bridge's registration needs unasked.
     #[test]
     fn a_cold_reader_is_owed_its_attempts_however_little_the_caller_allowed() {
-        let bound = snapshot_bound(Warmth::Cold, AxDeadline::from_millis(1));
+        let bound = snapshot_bound(Warmth::Cold, Deadline::from_millis(1));
         assert_eq!(bound.least, COLD_BOUND.least, "{bound:?}");
         assert_eq!(bound.then_within, COLD_BOUND.then_within, "{bound:?}");
     }
@@ -961,7 +962,7 @@ mod tests {
             PREFIX,
             patient(),
             Duration::from_secs(5),
-            AxDeadline::from_millis(10),
+            Deadline::from_millis(10),
         )
         .expect_err("the caller's deadline passed during the attempt");
 
@@ -989,7 +990,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: AxDeadline::from_millis(50),
+            deadline: Deadline::from_millis(50),
         };
         {
             let mut run = recording(&mut seen);
@@ -1049,7 +1050,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: AxDeadline::UNBOUNDED,
+            deadline: Deadline::UNBOUNDED,
         }
     }
 
@@ -1068,7 +1069,7 @@ mod tests {
             PREFIX,
             COLD_BOUND,
             Duration::ZERO,
-            AxDeadline::from_millis(5_000),
+            Deadline::from_millis(5_000),
         )
         .expect("the second attempt runs inside the window the caller is still waiting through");
 
@@ -1092,7 +1093,7 @@ mod tests {
             Duration::ZERO,
             // Nearer than `AdbOp::Dump`'s budget, so the caller's bound governs the attempt —
             // which is true of every read a `wait_for_element` makes.
-            AxDeadline::from_millis(5_000),
+            Deadline::from_millis(5_000),
         )
         .expect_err("the device is gone");
 
@@ -1181,7 +1182,7 @@ mod tests {
             PREFIX,
             RetryBound::ONCE,
             Duration::ZERO,
-            AxDeadline::from_millis(5_000),
+            Deadline::from_millis(5_000),
         )
         .expect_err("the device failed");
 
@@ -1216,7 +1217,7 @@ mod tests {
             PREFIX,
             COLD_BOUND,
             Duration::ZERO,
-            AxDeadline::from_millis(10),
+            Deadline::from_millis(10),
         )
         .expect_err("the caller's deadline passed during the first attempt");
 
@@ -1241,7 +1242,7 @@ mod tests {
             PREFIX,
             RetryBound::ONCE,
             Duration::ZERO,
-            AxDeadline::from_millis(20),
+            Deadline::from_millis(20),
         )
         .expect_err("the attempt was abandoned");
         assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
@@ -1260,7 +1261,7 @@ mod tests {
             PREFIX,
             RetryBound::ONCE,
             Duration::ZERO,
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         )
         .expect_err("the attempt timed out");
         assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
@@ -1470,7 +1471,7 @@ mod tests {
             PREFIX,
             RetryBound::ONCE,
             Duration::ZERO,
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         )
         .unwrap();
 
@@ -1506,7 +1507,7 @@ mod tests {
                 then_within: Duration::from_secs(5),
             },
             Duration::from_millis(1),
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         )
         .expect("the second attempt succeeds");
 
@@ -1540,7 +1541,7 @@ mod tests {
             PREFIX,
             bound,
             Duration::from_secs(2),
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         )
         .expect_err("a device that never becomes ready");
 
@@ -1577,7 +1578,7 @@ mod tests {
             PREFIX,
             patient(),
             Duration::ZERO,
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         )
         .unwrap_err();
 
@@ -1605,7 +1606,7 @@ mod tests {
             PREFIX,
             patient(),
             Duration::ZERO,
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         )
         .expect("a device that becomes ready within the budget must produce a tree");
         assert_eq!(xml, XML);
@@ -1619,7 +1620,7 @@ mod tests {
             PREFIX,
             RetryBound::ONCE,
             Duration::ZERO,
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         )
         .unwrap_err();
         assert!(e.to_string().contains(NOT_READY), "{e}");
@@ -1654,7 +1655,7 @@ mod tests {
             PREFIX,
             patient(),
             Duration::ZERO,
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         )
         .unwrap_err();
         assert!(e.to_string().contains("not found"), "{e}");
@@ -1674,7 +1675,7 @@ mod tests {
             PREFIX,
             patient(),
             Duration::ZERO,
-            AxDeadline::UNBOUNDED,
+            Deadline::UNBOUNDED,
         )
         .expect("a dump that crashed must be retried inside the budget");
         assert_eq!(xml, XML);
@@ -1715,7 +1716,7 @@ mod tests {
                 PREFIX,
                 patient(),
                 Duration::ZERO,
-                AxDeadline::UNBOUNDED,
+                Deadline::UNBOUNDED,
             )
             .expect("the attempt after the crashes dumps");
         }
@@ -1879,7 +1880,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: AxDeadline::from_millis(300),
+            deadline: Deadline::from_millis(300),
         };
 
         let err = reader
@@ -1985,7 +1986,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: AxDeadline::from_millis(30_000),
+            deadline: Deadline::from_millis(30_000),
         };
         // The synthetic Window root is id 0, so the field is id 1.
         let field = AxTarget {
@@ -2043,7 +2044,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: AxDeadline::from_millis(30_000),
+            deadline: Deadline::from_millis(30_000),
         };
         let field = AxTarget {
             id: AxNodeId(1),
@@ -2098,7 +2099,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: AxDeadline::from_millis(30_000),
+            deadline: Deadline::from_millis(30_000),
         };
         let field = AxTarget {
             id: AxNodeId(1),

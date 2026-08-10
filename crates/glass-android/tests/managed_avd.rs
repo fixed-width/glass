@@ -6,6 +6,7 @@
 //! Asserts: boot when none online; reuse on a second resolve (no 2nd boot); cleanup kills it.
 
 use glass_android::EmulatorRegistry;
+use glass_core::Deadline;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -110,9 +111,9 @@ fn boots_reuses_and_cleans_up() {
     drop(_p2);
     // Explicit, and before `kill_all`, because this test goes on to assert the emulator went
     // offline: the guards above only repeat this on the panicking path.
-    agents1.shutdown();
-    agents2.shutdown();
-    registry.kill_all();
+    agents1.shutdown(Deadline::UNBOUNDED);
+    agents2.shutdown(Deadline::UNBOUNDED);
+    registry.kill_all(Deadline::UNBOUNDED);
     let w = await_offline();
     assert!(
         w.confirmed,
