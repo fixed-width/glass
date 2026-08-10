@@ -497,20 +497,8 @@ impl X11Platform {
     /// launches and bwrap-wrapped launches.
     fn discover_window(&mut self, spec: &AppSpec) -> Result<Window> {
         let root_pid = self.child.as_ref().map(|c| c.id());
-        let pid_atom = self
-            .conn
-            .intern_atom(false, b"_NET_WM_PID")
-            .map_err(|e| GlassError::Backend(format!("intern _NET_WM_PID: {e}")))?
-            .reply()
-            .map_err(|e| GlassError::Backend(format!("intern reply: {e}")))?
-            .atom;
-        let client_list_atom = self
-            .conn
-            .intern_atom(false, b"_NET_CLIENT_LIST")
-            .map_err(|e| GlassError::Backend(format!("intern _NET_CLIENT_LIST: {e}")))?
-            .reply()
-            .map_err(|e| GlassError::Backend(format!("intern reply: {e}")))?
-            .atom;
+        let pid_atom = self.intern(b"_NET_WM_PID")?;
+        let client_list_atom = self.intern(b"_NET_CLIENT_LIST")?;
 
         let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
         loop {

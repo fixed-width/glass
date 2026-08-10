@@ -25,9 +25,9 @@ struct GetAtoms {
 
 /// Intern one atom, naming which half of the round trip failed.
 ///
-/// Both halves are named because they fail for different reasons: the request errors when the
-/// connection is already broken, the reply when the server rejected it. `wrap` turns the message
-/// into the caller's error type — the owner thread's has to signal the spawner on its way out.
+/// Both halves are named because a round trip can fail at either end and the remedies differ.
+/// `wrap` turns the message into the caller's error type — the owner thread's has to signal the
+/// spawner on its way out, so it cannot be the one the getter uses.
 fn intern<E>(
     conn: &RustConnection,
     name: &str,
@@ -317,28 +317,56 @@ fn signal_ready(ready: &Arc<(Mutex<ReadyState>, Condvar)>, state: ReadyState) {
     cvar.notify_one();
 }
 
+/// A setup failure that has already been reported to the spawner.
+///
+/// Only [`setup_failed`] constructs one, and [`take_selection`] returns nothing else, so a step in
+/// there cannot report through `GlassError` and leave the spawner waiting out its bound — that
+/// mistake is a compile error rather than a silent two-second stall.
+#[derive(Debug)]
+struct SetupFailed(String);
+
+impl std::fmt::Display for SetupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SetupFailed {}
+
 /// Report a setup failure to the spawner and stop the thread, handing `msg` back as the error.
 ///
 /// Every fallible step before the `ReadyState::Ok` signal must go through this. The spawner blocks
 /// on the condvar, so a step that returns without signalling leaves it waiting out its own timeout
 /// and reporting a timeout for a failure that already had a message.
+#[must_use = "the caller must return this, or the spawner is told a failure the thread ignored"]
 fn setup_failed(
     ready: &Arc<(Mutex<ReadyState>, Condvar)>,
     stop: &AtomicBool,
     msg: String,
-) -> String {
+) -> SetupFailed {
     signal_ready(ready, ReadyState::Err(msg.clone()));
+    // Not read on any path a failed setup can reach — `spawn` returns `Err`, so no
+    // `ClipboardOwner` exists to consult `is_alive`. It is here for a caller added later.
     stop.store(true, Ordering::Relaxed);
-    msg
+    SetupFailed(msg)
 }
 
-fn owner_thread(
+/// What the serve loop needs, once the selection is ours.
+struct Owned {
+    conn: RustConnection,
+    win: Window,
+    utf8_string: Atom,
+    targets_atom: Atom,
+}
+
+/// Connect, intern, create the window and take CLIPBOARD, reporting any failure to the spawner on
+/// the way out. `None` means the spawner gave up first, so the selection must be left alone.
+fn take_selection(
     display: &str,
-    text: Arc<Mutex<String>>,
-    stop: Arc<AtomicBool>,
-    ready: Arc<(Mutex<ReadyState>, Condvar)>,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let failed = |msg| setup_failed(&ready, &stop, msg);
+    stop: &AtomicBool,
+    ready: &Arc<(Mutex<ReadyState>, Condvar)>,
+) -> std::result::Result<Option<Owned>, SetupFailed> {
+    let failed = |msg| setup_failed(ready, stop, msg);
     let (conn, screen_num) =
         x11rb::connect(Some(display)).map_err(|e| failed(format!("X connect: {e}")))?;
     let root = conn.setup().roots[screen_num].root;
@@ -376,7 +404,7 @@ fn owner_thread(
         // Skips the `destroy_window` the normal exit performs: `conn` is dropped on the way out,
         // and an X server destroys everything a client created once its connection closes
         // (close-down mode defaults to DestroyAll).
-        return Ok(());
+        return Ok(None);
     }
 
     // Take ownership of CLIPBOARD.
@@ -387,7 +415,32 @@ fn owner_thread(
     conn.flush()
         .map_err(|e| failed(format!("flush after set_selection_owner: {e}")))?;
 
-    // Signal the spawner that we now own the selection.
+    Ok(Some(Owned {
+        conn,
+        win,
+        utf8_string,
+        targets_atom,
+    }))
+}
+
+fn owner_thread(
+    display: &str,
+    text: Arc<Mutex<String>>,
+    stop: Arc<AtomicBool>,
+    ready: Arc<(Mutex<ReadyState>, Condvar)>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let Some(Owned {
+        conn,
+        win,
+        utf8_string,
+        targets_atom,
+    }) = take_selection(display, &stop, &ready)?
+    else {
+        return Ok(());
+    };
+
+    // Past this point `setup_failed` is out of scope, so a later failure cannot overwrite an `Ok`
+    // the spawner may not have read yet.
     signal_ready(&ready, ReadyState::Ok);
 
     // Event loop: serve SelectionRequest until stopped or SelectionClear arrives.
@@ -732,7 +785,7 @@ mod tests {
 
         let returned = setup_failed(&ready, &stop, "X connect: refused".to_string());
 
-        assert_eq!(returned, "X connect: refused");
+        assert_eq!(returned.to_string(), "X connect: refused");
         assert!(
             stop.load(Ordering::Relaxed),
             "the thread must not go on to take the selection"
