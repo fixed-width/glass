@@ -1,13 +1,12 @@
-//! `WindowsA11y`: the UI Automation `Accessibility` reader. Runs UIA on a fresh
-//! per-snapshot thread (COM-isolated, like the AT-SPI reader's private thread),
-//! finds the app's top-level window by PID (geometry fallback), and walks the bounded Control view
-//! into an `AxTree`. Never returns a stub: failures are `AccessibilityUnavailable`.
+//! `WindowsA11y`: the UI Automation `Accessibility` reader. Runs each bounded call on a detached,
+//! COM-isolated thread (`glass_core::A11yThread`), finds the app's top-level window by PID
+//! (geometry fallback), and walks the bounded Control view into an `AxTree`. Never returns a stub:
+//! failures are `AccessibilityUnavailable`.
 
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    Accessibility, AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal,
+    A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal,
     GlassError, Result, WalkBudget, normalize_description, read_back_confirms,
     write_took_no_effect,
 };
@@ -18,36 +17,10 @@ use uiautomation::patterns::{
 use uiautomation::types::{ExpandCollapseState, Handle, Rect, ToggleState};
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
 
-/// Hard cap so a hung UIA provider can't block the calling tool forever.
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a read may block for its worker, and whether the caller's deadline — not
-/// [`SNAPSHOT_TIMEOUT`] — is what ends the wait.
-///
-/// Both come from one comparison, decided before the wait: a read the *caller* cut short is a
-/// spent budget, a read that used the whole ceiling is UIA that stopped answering, and inferring
-/// which afterwards is the mistake glass#341 recorded.
-fn bounded_wait(deadline: AxDeadline) -> (Duration, bool) {
-    let own = Instant::now() + SNAPSHOT_TIMEOUT;
-    (
-        deadline.cap(own).saturating_duration_since(Instant::now()),
-        deadline.governs(own),
-    )
-}
-
-/// What a read reports when it never answered: the caller's own deadline ending it is
-/// `AccessibilityNotReady`, which [`glass_core::Glass::wait_for_element`] polls through, where UIA
-/// going quiet for a whole [`SNAPSHOT_TIMEOUT`] is not.
-fn never_answered(by_caller: bool) -> GlassError {
-    if by_caller {
-        return GlassError::AccessibilityNotReady(
-            "no accessibility tree within the time this call allowed".into(),
-        );
-    }
-    GlassError::AccessibilityUnavailable(
-        "accessibility snapshot timed out (UIA not responding)".into(),
-    )
-}
+/// Every bounded call runs on a fresh detached thread: UIA is COM and thread-affine, so it must
+/// not run on the caller's. The cap is what stops a hung provider blocking the calling tool for
+/// longer than it.
+static UIA: A11yThread = A11yThread::new("UIA", Duration::from_secs(10));
 /// Per-edge tolerance (px) for the set_value bounds-fingerprint check. Window-relative
 /// bounds are stable for a static element across snapshot→set_value (window moves cancel),
 /// so this only absorbs sub-pixel/timing jitter; a different element that drift landed on
@@ -76,23 +49,8 @@ impl WindowsA11y {
 
 impl Accessibility for WindowsA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        // Checked before the spawn: the worker below is detached and holds its own COM apartment,
-        // so one started for a caller that has stopped waiting outlives the answer nobody reads.
-        if ctx.deadline.has_passed() {
-            return Err(never_answered(true));
-        }
-        let (wait, by_caller) = bounded_wait(ctx.deadline);
         let ctx = ctx.clone();
-        let (tx, rx) = mpsc::channel();
-        // UIA is COM and thread-affine; run it on a fresh OS thread, fully decoupled
-        // from the caller's (possibly tokio) thread — mirrors the AT-SPI reader.
-        std::thread::spawn(move || {
-            let _ = tx.send(run_snapshot(&ctx));
-        });
-        match rx.recv_timeout(wait) {
-            Ok(r) => r,
-            Err(_) => Err(never_answered(by_caller)),
-        }
+        UIA.snapshot(ctx.deadline, move || run_snapshot(&ctx))
     }
 
     fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
@@ -106,37 +64,14 @@ impl Accessibility for WindowsA11y {
         let ctx = ctx.clone();
         let target = target.clone();
         let text = text.to_string();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(run_set_value(&ctx, &target, &text));
-        });
-        match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
-            Ok(r) => r,
-            Err(_) => Err(GlassError::AccessibilityUnavailable(
-                "accessibility set_value timed out (UIA not responding)".into(),
-            )),
-        }
+        UIA.set_value(move || run_set_value(&ctx, &target, &text))
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         let ctx = ctx.clone();
         let target = target.clone();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(run_invoke(&ctx, &target));
-        });
-        match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
-            // This reader actuates the element it resolved, so it never substitutes another.
-            Ok(r) => r.map(|()| None),
-            // The worker thread outlives this timeout, so the pattern call may already have
-            // been dispatched — say so. This error is NOT fallback-eligible (see
-            // `GlassError::invoke_fallback_eligible`), so no pointer click is layered on top.
-            Err(_) => Err(GlassError::AccessibilityUnavailable(
-                "accessibility invoke timed out (UIA not responding); the action may still \
-                 land — re-snapshot before retrying"
-                    .into(),
-            )),
-        }
+        // This reader actuates the element it resolved, so it never substitutes another.
+        UIA.invoke(move || run_invoke(&ctx, &target)).map(|()| None)
     }
 }
 
@@ -196,7 +131,7 @@ fn step(r: uiautomation::Result<UIElement>, budget: &mut WalkBudget) -> Option<U
 }
 
 /// Recursively build a normalized node, bounded by [`WalkBudget`] (node count, nesting depth,
-/// and per-level sibling scan) so a pathological tree can't burn the outer [`SNAPSHOT_TIMEOUT`]
+/// and per-level sibling scan) so a pathological tree can't burn the reader's whole ceiling
 /// with no tree to show for it.
 fn walk(
     walker: &UITreeWalker,
@@ -616,38 +551,6 @@ fn find_nth(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// glass#338: only the reader can hold a read inside the caller's timeout — the worker below
-    /// is detached, so nothing outside it can shorten one that has started.
-    #[test]
-    fn a_read_is_bounded_by_the_caller_when_that_falls_first() {
-        let (wait, by_caller) = bounded_wait(AxDeadline::from_millis(50));
-        assert!(wait <= Duration::from_millis(50), "{wait:?}");
-        assert!(by_caller);
-    }
-
-    /// The other direction: without it the test above passes on a reader that waits for nothing.
-    #[test]
-    fn a_caller_that_names_no_deadline_leaves_the_read_its_own_ceiling() {
-        let (wait, by_caller) = bounded_wait(AxDeadline::UNBOUNDED);
-        assert!(wait > SNAPSHOT_TIMEOUT - Duration::from_secs(1), "{wait:?}");
-        assert!(!by_caller);
-    }
-
-    /// The variant decides whether a wait polls on or fails, so the two causes must not collapse:
-    /// a bus that went quiet for the whole ceiling is a real fault, and a caller that ran out of
-    /// its own time is not.
-    #[test]
-    fn a_read_the_caller_cut_short_reads_as_not_ready_where_a_quiet_bus_does_not() {
-        assert!(matches!(
-            never_answered(true),
-            GlassError::AccessibilityNotReady(_)
-        ));
-        assert!(matches!(
-            never_answered(false),
-            GlassError::AccessibilityUnavailable(_)
-        ));
-    }
 
     /// The failure mode this guards: if an absent child ever stopped arriving as a zero code,
     /// every leaf in every snapshot would report an unreadable subtree. Builds the error

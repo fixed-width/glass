@@ -15,6 +15,9 @@ pub use toolpath::tool_path;
 pub mod bounded;
 pub use bounded::{run_bounded, run_bounded_until, run_bounded_with_stdin};
 
+pub mod a11y_thread;
+pub use a11y_thread::A11yThread;
+
 pub mod set_value;
 pub use set_value::{
     TAP_MAY_HAVE_MISSED, read_back_confirms, read_back_failed, typed_clear_landed,
