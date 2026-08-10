@@ -17,13 +17,12 @@ const AWAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const AWAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// The registries whose `ensure` switches something on for the whole device, put back when this
-/// goes out of scope — a panic unwinds through it, where a trailing `shutdown()` is skipped.
+/// goes out of scope — a trailing `shutdown()` is skipped by a panic. Only `shutdown` restores
+/// the secure settings and removes the `adb forward` each one opened; the APK stays installed,
+/// as glass owns that package (glass#419).
 ///
-/// A guard rather than a block around the assertions, because the state is already on by then:
-/// `Glass::start` runs the factory before `start_app`, and the factory enables the companion. A
-/// launch that fails — the likeliest failure here — panics with it enabled, and only `shutdown`
-/// restores the secure settings and removes the `adb forward` each registry opened. The APK
-/// itself is left installed, as glass owns that package (glass#419).
+/// A guard, not a block around the assertions: `Glass::start` runs the factory — which enables
+/// the companion — before `start_app`, so a failing launch panics with the state already on.
 struct Companions {
     agents: AgentRegistry,
     a11y: A11yServiceRegistry,
@@ -71,8 +70,8 @@ fn a_session_click_reports_the_native_accessibility_action() {
     }
 
     // The two shapes of `boot`'s own factory closure — `make_platform` takes the iOS Simulator
-    // registry on macOS only. Each registry is a handle to shared state, so the clones the
-    // closure moves are the same registries `device` shuts down.
+    // registry on macOS only. The registries are handles to shared state, so the closure's
+    // clones are the ones `device` shuts down.
     #[cfg(target_os = "macos")]
     let sim = glass_ios::SimulatorRegistry::new();
     #[cfg(target_os = "macos")]
@@ -131,8 +130,8 @@ fn a_session_click_reports_the_native_accessibility_action() {
         counter(&glass.a11y_snapshot(None).expect("snapshot"))
     });
 
-    // The path a user takes. An assertion above panics past it, and the drops then do the same
-    // work: `AndroidPlatform` force-stops the app, `Companions` puts the device settings back.
+    // The user's own path; a panic above skips it and the drops do the same work —
+    // `AndroidPlatform` force-stops the app, `Companions` puts the settings back.
     glass.stop().expect("stop the session");
 }
 

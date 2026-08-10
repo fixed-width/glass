@@ -204,8 +204,7 @@ fn visible_window_region(win: &WindowGeometry, disp_w: u32, disp_h: u32) -> Resu
 }
 
 /// Force-stop a launch that failed after `am start` had already put the app on the device, and
-/// hand its error back. The X11 backend reaps the same case; here nothing else would, because
-/// `start_app` records `self.app` only once the launch has fully succeeded.
+/// hand its error back — `start_app` records `self.app` only on success, so nothing else reaps it.
 fn reap_failed_launch(adb: &Adb, package: &str, e: GlassError) -> GlassError {
     let _ = adb.run(force_stop_args(package).iter().map(String::as_str));
     e
@@ -225,8 +224,8 @@ impl Platform for AndroidPlatform {
         let started = adb.run(launch_args(&target.component).iter().map(String::as_str))?;
         check_am_start(&started)?;
 
-        // Past this point the app is on the device while `self.app` — the only thing `stop_app`
-        // and the drop reap — is still `None`, so every failure below has to reap for itself.
+        // The app is on the device from here, but `self.app` is not set until the end, so each
+        // failure below has to reap for itself.
         let (active_id, window) = match self.discover_window(&target.package, spec.timeout_ms) {
             Ok(found) => found,
             Err(e) => return Err(reap_failed_launch(&adb, &target.package, e)),
@@ -397,11 +396,10 @@ impl Platform for AndroidPlatform {
 }
 
 impl Drop for AndroidPlatform {
-    /// Force-stop the app on drop — parity with the X11/Wayland/Windows/macOS backends, for a
-    /// platform dropped without an explicit `stop_app()`: a panic unwinding past it, or an owner
-    /// that simply drops it. The device outlives the process, so the app would otherwise still be
-    /// there for the next run (glass#419). `stop_app` takes `self.app`, so this is a no-op once
-    /// it has run — which every path through `Glass` takes first.
+    /// Force-stop the app on drop, for a platform dropped without an explicit `stop_app()` —
+    /// parity with the X11/Wayland/Windows/macOS backends. The device outlives the process, so
+    /// the app would otherwise still be there for the next run (glass#419). `stop_app` takes
+    /// `self.app`, so this is a no-op once it has run, which every path through `Glass` does.
     fn drop(&mut self) {
         let _ = self.stop_app();
     }
@@ -621,8 +619,8 @@ mod platform_tests {
             .start_app(&spec)
             .expect_err("a launch whose window never appears fails");
 
-        // `am start` put it on the device and the failure left `self.app` unset, so this is the
-        // only reap it will ever get — the drop below passes over it.
+        // `am start` put it on the device and the failure left `self.app` unset, so the drop
+        // below passes over it.
         assert!(
             fake.called("am force-stop com.example.app"),
             "{:?}",
