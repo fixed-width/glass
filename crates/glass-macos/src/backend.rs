@@ -684,7 +684,8 @@ impl Platform for MacosPlatform {
     /// first, per the `adopted` field's doc. This then falls through to the child/pasteboard
     /// cleanup rather than returning early: a session is `adopted` XOR `child`-backed, so the
     /// fall-through is a no-op, and it keeps `stop_app` and `Drop` structurally identical.
-    /// Ignores the deadline: this teardown is an ask-then-signal ladder, already asserted against TEARDOWN_BUDGET.
+    /// Ignores the deadline — the quit-then-signal ladder is asserted against `TEARDOWN_BUDGET`
+    /// instead.
     fn stop_app_by(&mut self, _deadline: glass_core::Deadline) -> Result<()> {
         if let Some(a) = self.adopted.take() {
             a.reap();

@@ -12,10 +12,9 @@
 
 /// When the caller stops waiting.
 ///
-/// An accessibility reader cannot be interrupted mid-read — [`crate::Glass::wait_for_element`]
-/// re-reads from a synchronous tick — so a 20s `uiautomator dump` answered a 10s wait until
-/// readers took this (glass#338). The obligation is stated on
-/// [`crate::Accessibility::snapshot`], where an implementer meets it; teardown's is on
+/// A callee that cannot be interrupted mid-call has to honour this itself: a 20s `uiautomator
+/// dump` answered a 10s wait until the readers took it (glass#338). The obligation is stated where
+/// an implementer meets it — [`crate::Accessibility::snapshot`] and
 /// [`crate::Platform::stop_app_by`].
 ///
 /// [`Self::UNBOUNDED`] leaves the callee its own budget: it is the *widest* value, as `WalkLimits`'
@@ -90,7 +89,7 @@ impl Deadline {
     /// budget would otherwise starve the first step entirely.
     ///
     /// [`Self::UNBOUNDED`] stays unbounded: there is nothing to take a share of. Never lands
-    /// before now, so it cannot underflow the monotonic clock the way a bare subtraction can.
+    /// before now, so it cannot underflow the monotonic clock.
     pub fn reserving(self, reserve: std::time::Duration) -> Self {
         Self(self.0.map(|d| {
             let left = d.saturating_duration_since(std::time::Instant::now());
