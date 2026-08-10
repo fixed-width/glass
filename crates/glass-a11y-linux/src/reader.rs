@@ -2,50 +2,22 @@
 //! current-thread runtime (so it never `block_on`s inside the caller's tokio
 //! runtime), finds the launched app by PID, and walks its subtree into an `AxTree`.
 
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use atspi::connection::AccessibilityConnection;
 use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
-    Accessibility, AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError,
-    Result, WalkBudget, normalize_description,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
+    ThreadBoundReader, WalkBudget, normalize_description,
 };
 
 use crate::mapping::{map_role, map_states};
 
-/// Hard cap so a wedged a11y bus can't hang the calling tool forever.
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a read may block for its worker, and whether the caller's deadline — not
-/// [`SNAPSHOT_TIMEOUT`] — is what ends the wait.
-///
-/// Both come from one comparison, decided before the wait: a read the *caller* cut short is a
-/// spent budget, a read that used the whole ceiling is a bus that stopped answering, and inferring
-/// which afterwards is the mistake glass#341 recorded.
-fn bounded_wait(deadline: AxDeadline) -> (Duration, bool) {
-    let own = Instant::now() + SNAPSHOT_TIMEOUT;
-    (
-        deadline.cap(own).saturating_duration_since(Instant::now()),
-        deadline.governs(own),
-    )
-}
-
-/// What a read reports when it never answered: the caller's own deadline ending it is
-/// `AccessibilityNotReady`, which [`glass_core::Glass::wait_for_element`] polls through, where the
-/// bus going quiet for a whole [`SNAPSHOT_TIMEOUT`] is not.
-fn never_answered(by_caller: bool) -> GlassError {
-    if by_caller {
-        return GlassError::AccessibilityNotReady(
-            "no accessibility tree within the time this call allowed".into(),
-        );
-    }
-    GlassError::AccessibilityUnavailable(
-        "accessibility snapshot timed out (a11y bus not responding)".into(),
-    )
-}
+/// Every call runs on a fresh detached thread: atspi is async and would `block_on` inside the
+/// caller's tokio runtime. Ten seconds is the hard cap, so a wedged bus can't hang the calling tool.
+const BUS: ThreadBoundReader = ThreadBoundReader::new("a11y bus", Duration::from_secs(10));
 
 #[derive(Default)]
 pub struct LinuxA11y;
@@ -62,62 +34,22 @@ impl Accessibility for LinuxA11y {
     }
 
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        // Checked before the spawn: the worker below is detached and holds its own bus
-        // connection, so one started for a caller that has stopped waiting outlives the answer
-        // nobody reads.
-        if ctx.deadline.has_passed() {
-            return Err(never_answered(true));
-        }
-        let (wait, by_caller) = bounded_wait(ctx.deadline);
         let ctx = ctx.clone();
-        let (tx, rx) = mpsc::channel();
-        // atspi is async and may be invoked from within a tokio runtime, where
-        // `block_on` panics. Run on a fresh OS thread with its own current-thread
-        // runtime, fully decoupled from the caller's runtime.
-        std::thread::spawn(move || {
-            let _ = tx.send(run_snapshot(&ctx));
-        });
-        match rx.recv_timeout(wait) {
-            Ok(r) => r,
-            Err(_) => Err(never_answered(by_caller)),
-        }
+        BUS.snapshot(ctx.deadline, move || run_snapshot(&ctx))
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         let ctx = ctx.clone();
         let target = target.clone();
         let text = text.to_string();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(run_set_value(&ctx, &target, &text));
-        });
-        match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
-            Ok(r) => r,
-            Err(_) => Err(GlassError::AccessibilityUnavailable(
-                "accessibility set_value timed out (a11y bus not responding)".into(),
-            )),
-        }
+        BUS.write(move || run_set_value(&ctx, &target, &text))
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         let ctx = ctx.clone();
         let target = target.clone();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(run_invoke(&ctx, &target));
-        });
-        match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
-            // This reader actuates the element it resolved, so it never substitutes another.
-            Ok(r) => r.map(|()| None),
-            // The worker thread outlives this timeout, so the action may already have been
-            // dispatched — say so. This error is NOT fallback-eligible (see
-            // `GlassError::invoke_fallback_eligible`), so no pointer click is layered on top.
-            Err(_) => Err(GlassError::AccessibilityUnavailable(
-                "accessibility invoke timed out (a11y bus not responding); the action may \
-                 still land — re-snapshot before retrying"
-                    .into(),
-            )),
-        }
+        // This reader actuates the element it resolved, so it never substitutes another.
+        BUS.action(move || run_invoke(&ctx, &target)).map(|()| None)
     }
 }
 
@@ -396,8 +328,7 @@ async fn app_matches(app_ref: &ObjectRefOwned, ctx: &AxContext, conn: &zbus::Con
 
 /// Recursively build a normalized node from an AT-SPI accessible, bounded by
 /// [`WalkBudget`] (node count, nesting depth, and per-level sibling scan) so a
-/// pathological tree can't burn the outer [`SNAPSHOT_TIMEOUT`] with no tree to
-/// show for it.
+/// pathological tree can't burn the reader's whole ceiling with no tree to show for it.
 async fn walk(
     proxy: &AccessibleProxy<'_>,
     conn: &zbus::Connection,
@@ -792,36 +723,11 @@ mod toggle_label_tests {
 mod tests {
     use super::*;
 
-    /// glass#338: only the reader can hold a read inside the caller's timeout — the worker below
-    /// is detached, so nothing outside it can shorten one that has started.
+    /// The name this reader hands `glass_core` — it is what a timeout message blames, and nothing
+    /// else in the crate would notice it changing.
     #[test]
-    fn a_read_is_bounded_by_the_caller_when_that_falls_first() {
-        let (wait, by_caller) = bounded_wait(AxDeadline::from_millis(50));
-        assert!(wait <= Duration::from_millis(50), "{wait:?}");
-        assert!(by_caller);
-    }
-
-    /// The other direction: without it the test above passes on a reader that waits for nothing.
-    #[test]
-    fn a_caller_that_names_no_deadline_leaves_the_read_its_own_ceiling() {
-        let (wait, by_caller) = bounded_wait(AxDeadline::UNBOUNDED);
-        assert!(wait > SNAPSHOT_TIMEOUT - Duration::from_secs(1), "{wait:?}");
-        assert!(!by_caller);
-    }
-
-    /// The variant decides whether a wait polls on or fails, so the two causes must not collapse:
-    /// a bus that went quiet for the whole ceiling is a real fault, and a caller that ran out of
-    /// its own time is not.
-    #[test]
-    fn a_read_the_caller_cut_short_reads_as_not_ready_where_a_quiet_bus_does_not() {
-        assert!(matches!(
-            never_answered(true),
-            GlassError::AccessibilityNotReady(_)
-        ));
-        assert!(matches!(
-            never_answered(false),
-            GlassError::AccessibilityUnavailable(_)
-        ));
+    fn a_timeout_from_this_reader_blames_the_a11y_bus() {
+        assert_eq!(BUS.subject(), "a11y bus");
     }
 
     #[test]
