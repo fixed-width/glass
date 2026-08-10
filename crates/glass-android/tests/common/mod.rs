@@ -1,13 +1,15 @@
 //! Teardown guards for the device suites.
 //!
 //! Both registries put state on the device that outlives the process — an `adb forward` each, and
-//! for the companion the secure settings that enable it as an accessibility service — and only
+//! for the companion the secure settings that enable it as an accessibility service — that only
 //! their `shutdown` takes it back off. Neither has a `Drop`, so a test panicking past a trailing
 //! `shutdown()` hands an enabled companion to every later reader on that device (glass#423).
 //! `scripts/test-android.sh` fails a run that ends with any of it still on.
 //!
 //! Declare a guard BEFORE the platform it serves: locals drop in reverse, so the platform's agent
-//! connection closes before the registry that owns the agent.
+//! connection closes before the registry that owns the agent. The two registries are independent
+//! of each other — separate forwards, and the a11y one has no process — so their order between
+//! themselves does not matter, and it differs across the suite.
 
 #![allow(dead_code)]
 
@@ -25,14 +27,29 @@ impl Drop for StopAgent<'_> {
 }
 
 /// Restores the device's accessibility settings — `enabled_accessibility_services`,
-/// `accessibility_enabled` and the `adb forward` — when it drops. `A11yServiceRegistry::ensure`
-/// records the prior values and `shutdown` puts them back, so the only question is whether
-/// `shutdown` is reached.
+/// `accessibility_enabled` and the `adb forward` — when it drops.
+///
+/// Covers a `shutdown` that a panic would skip, not one that has nothing to undo: `ensure`
+/// enables the service on the device before it records anything in `state`, so a failure in that
+/// window leaves the companion on and this a no-op (glass#425). `scripts/test-android.sh` is what
+/// catches that.
 pub struct RestoreServiceState<'a>(pub &'a A11yServiceRegistry);
 
 impl Drop for RestoreServiceState<'_> {
     fn drop(&mut self) {
         self.0.shutdown();
+    }
+}
+
+/// Runs its closure when it drops — for device cleanup with no registry to hang off, such as the
+/// fixture APK a test installs, which is glass's to remove and which the residue check cannot see.
+/// A closure rather than a typed guard because `glass_android`'s `Adb` is not exported, so nothing
+/// here can name what it has to call.
+pub struct OnDrop<F: FnMut()>(pub F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
     }
 }
 

@@ -113,6 +113,9 @@ fn native_invoke_actuates_the_fixture() {
     let adb = p.resolved_adb();
     adb.run(["install", "-r", "-g", &fixture])
         .expect("install fixture");
+    let _uninstall = common::OnDrop(|| {
+        let _ = adb.run(["uninstall", "com.fixedwidth.glassfixture"]);
+    });
 
     let spec = |activity: &str| AppSpec {
         build: None,
@@ -306,7 +309,4 @@ fn native_invoke_actuates_the_fixture() {
 
     p.stop_app().ok();
     drop(p);
-    // The fixture is glass's to install and glass's to remove: leaving it installed lets device
-    // state accumulate across runs.
-    adb.run(["uninstall", "com.fixedwidth.glassfixture"]).ok();
 }

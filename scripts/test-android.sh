@@ -34,9 +34,11 @@ cd "$(dirname "$0")/.."
 
 adb="${GLASS_ADB:-adb}"
 if ! before="$(device_snapshot "$adb")"; then
-    echo "cannot read the device (GLASS_ADB=${GLASS_ADB:-<unset>}); is one attached?" >&2
+    echo "cannot read the device (GLASS_ADB=${GLASS_ADB:-<unset>}, \
+GLASS_ANDROID_SERIAL=${GLASS_ANDROID_SERIAL:-<unset>}); is one attached?" >&2
     exit 1
 fi
+assert_clean_baseline "$before" || exit 1
 
 # Two invocations, not one `-p glass-android -p glass-mcp`: a `--test` filter applies to every
 # `-p` package, so neither package matches the other's targets and the run exits 0 having tested
