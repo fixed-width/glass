@@ -31,8 +31,7 @@ fn agent_clipboard_and_input_roundtrip() {
     // tear the agent down explicitly at the end — in production `Glass`'s shutdown hook does
     // this; a test must not leak the process (the registry doesn't kill on drop).
     let agents = AgentRegistry::new();
-    // Before the platform, so the platform's agent connection closes first — and so a
-    // panicking assertion below cannot skip the teardown (glass#423).
+    // Before the platform — see `common` for why the order matters (glass#423).
     let _stop_agent = common::StopAgent(&agents);
     let mut p = glass_android::AndroidPlatform::from_env(&EmulatorRegistry::new(), &agents)
         .expect("attach + agent");

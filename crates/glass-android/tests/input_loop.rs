@@ -123,8 +123,7 @@ fn assert_screen_changed(p: &mut glass_android::AndroidPlatform, before: &Frame,
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn scroll_and_tap_change_the_screen() {
     let agents = glass_android::AgentRegistry::new();
-    // Before the platform, so the platform's agent connection closes first — and so a
-    // panicking assertion below cannot skip the teardown (glass#423).
+    // Before the platform — see `common` for why the order matters (glass#423).
     let _stop_agent = common::StopAgent(&agents);
     let mut p =
         glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)

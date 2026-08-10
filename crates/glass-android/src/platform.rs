@@ -413,8 +413,11 @@ impl Platform for AndroidPlatform {
 impl Drop for AndroidPlatform {
     /// Force-stop the app on drop, for a platform dropped without an explicit `stop_app()` —
     /// parity with the X11/Wayland/Windows/macOS backends. The device outlives the process, so
-    /// the app would otherwise still be there for the next run (glass#419). `stop_app` takes
-    /// `self.app`, so this is a no-op once it has run, which every path through `Glass` does.
+    /// the app would otherwise still be there for the next run (glass#419).
+    ///
+    /// `stop_app` takes `self.app`, so this is a no-op after it — and `Glass::stop`,
+    /// `Glass::shutdown` and a session replacement all call it. The path they do not reach is a
+    /// launch that failed on the way up, which is [`reap_failed_launch`]'s.
     fn drop(&mut self) {
         let _ = self.stop_app();
     }
