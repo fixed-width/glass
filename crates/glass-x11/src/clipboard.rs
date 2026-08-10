@@ -23,36 +23,30 @@ struct GetAtoms {
     glass_clip: Atom,
 }
 
+/// Intern one atom, naming which half of the round trip failed.
+///
+/// Both halves are named because they fail for different reasons: the request errors when the
+/// connection is already broken, the reply when the server rejected it. `wrap` turns the message
+/// into the caller's error type — the owner thread's has to signal the spawner on its way out.
+fn intern<E>(
+    conn: &RustConnection,
+    name: &str,
+    wrap: impl Fn(String) -> E,
+) -> std::result::Result<Atom, E> {
+    Ok(conn
+        .intern_atom(false, name.as_bytes())
+        .map_err(|e| wrap(format!("intern {name}: {e}")))?
+        .reply()
+        .map_err(|e| wrap(format!("intern {name} reply: {e}")))?
+        .atom)
+}
+
 fn intern_get_atoms(conn: &RustConnection) -> Result<GetAtoms> {
-    let clipboard = conn
-        .intern_atom(false, b"CLIPBOARD")
-        .map_err(|e| GlassError::Backend(format!("intern CLIPBOARD: {e}")))?
-        .reply()
-        .map_err(|e| GlassError::Backend(format!("intern CLIPBOARD reply: {e}")))?
-        .atom;
-    let utf8_string = conn
-        .intern_atom(false, b"UTF8_STRING")
-        .map_err(|e| GlassError::Backend(format!("intern UTF8_STRING: {e}")))?
-        .reply()
-        .map_err(|e| GlassError::Backend(format!("intern UTF8_STRING reply: {e}")))?
-        .atom;
-    let incr = conn
-        .intern_atom(false, b"INCR")
-        .map_err(|e| GlassError::Backend(format!("intern INCR: {e}")))?
-        .reply()
-        .map_err(|e| GlassError::Backend(format!("intern INCR reply: {e}")))?
-        .atom;
-    let glass_clip = conn
-        .intern_atom(false, b"GLASS_CLIP")
-        .map_err(|e| GlassError::Backend(format!("intern GLASS_CLIP: {e}")))?
-        .reply()
-        .map_err(|e| GlassError::Backend(format!("intern GLASS_CLIP reply: {e}")))?
-        .atom;
     Ok(GetAtoms {
-        clipboard,
-        utf8_string,
-        incr,
-        glass_clip,
+        clipboard: intern(conn, "CLIPBOARD", GlassError::Backend)?,
+        utf8_string: intern(conn, "UTF8_STRING", GlassError::Backend)?,
+        incr: intern(conn, "INCR", GlassError::Backend)?,
+        glass_clip: intern(conn, "GLASS_CLIP", GlassError::Backend)?,
     })
 }
 
@@ -323,77 +317,41 @@ fn signal_ready(ready: &Arc<(Mutex<ReadyState>, Condvar)>, state: ReadyState) {
     cvar.notify_one();
 }
 
+/// Report a setup failure to the spawner and stop the thread, handing `msg` back as the error.
+///
+/// Every fallible step before the `ReadyState::Ok` signal must go through this. The spawner blocks
+/// on the condvar, so a step that returns without signalling leaves it waiting out its own timeout
+/// and reporting a timeout for a failure that already had a message.
+fn setup_failed(
+    ready: &Arc<(Mutex<ReadyState>, Condvar)>,
+    stop: &AtomicBool,
+    msg: String,
+) -> String {
+    signal_ready(ready, ReadyState::Err(msg.clone()));
+    stop.store(true, Ordering::Relaxed);
+    msg
+}
+
 fn owner_thread(
     display: &str,
     text: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
     ready: Arc<(Mutex<ReadyState>, Condvar)>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (conn, screen_num) = x11rb::connect(Some(display)).map_err(|e| {
-        let msg = format!("X connect: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?;
+    let failed = |msg| setup_failed(&ready, &stop, msg);
+    let (conn, screen_num) =
+        x11rb::connect(Some(display)).map_err(|e| failed(format!("X connect: {e}")))?;
     let root = conn.setup().roots[screen_num].root;
 
     // Intern atoms on this connection.
-    let clipboard = conn
-        .intern_atom(false, b"CLIPBOARD")
-        .map_err(|e| {
-            let msg = format!("intern CLIPBOARD: {e}");
-            signal_ready(&ready, ReadyState::Err(msg.clone()));
-            stop.store(true, Ordering::Relaxed);
-            msg
-        })?
-        .reply()
-        .map_err(|e| {
-            let msg = format!("intern CLIPBOARD reply: {e}");
-            signal_ready(&ready, ReadyState::Err(msg.clone()));
-            stop.store(true, Ordering::Relaxed);
-            msg
-        })?
-        .atom;
-    let utf8_string = conn
-        .intern_atom(false, b"UTF8_STRING")
-        .map_err(|e| {
-            let msg = format!("intern UTF8_STRING: {e}");
-            signal_ready(&ready, ReadyState::Err(msg.clone()));
-            stop.store(true, Ordering::Relaxed);
-            msg
-        })?
-        .reply()
-        .map_err(|e| {
-            let msg = format!("intern UTF8_STRING reply: {e}");
-            signal_ready(&ready, ReadyState::Err(msg.clone()));
-            stop.store(true, Ordering::Relaxed);
-            msg
-        })?
-        .atom;
-    let targets_atom = conn
-        .intern_atom(false, b"TARGETS")
-        .map_err(|e| {
-            let msg = format!("intern TARGETS: {e}");
-            signal_ready(&ready, ReadyState::Err(msg.clone()));
-            stop.store(true, Ordering::Relaxed);
-            msg
-        })?
-        .reply()
-        .map_err(|e| {
-            let msg = format!("intern TARGETS reply: {e}");
-            signal_ready(&ready, ReadyState::Err(msg.clone()));
-            stop.store(true, Ordering::Relaxed);
-            msg
-        })?
-        .atom;
+    let clipboard = intern(&conn, "CLIPBOARD", failed)?;
+    let utf8_string = intern(&conn, "UTF8_STRING", failed)?;
+    let targets_atom = intern(&conn, "TARGETS", failed)?;
 
     // Create the owner window.
-    let win = conn.generate_id().map_err(|e| {
-        let msg = format!("generate_id: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?;
+    let win = conn
+        .generate_id()
+        .map_err(|e| failed(format!("generate_id: {e}")))?;
     conn.create_window(
         0,
         win,
@@ -407,19 +365,9 @@ fn owner_thread(
         0,
         &CreateWindowAux::default(),
     )
-    .map_err(|e| {
-        let msg = format!("create_window: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?
+    .map_err(|e| failed(format!("create_window: {e}")))?
     .check()
-    .map_err(|e| {
-        let msg = format!("create_window check: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?;
+    .map_err(|e| failed(format!("create_window check: {e}")))?;
 
     // A detached thread (spawn already timed out and returned to the caller) must not take a
     // selection the caller has already been told it failed to get. `spawn`'s detach comment
@@ -433,25 +381,11 @@ fn owner_thread(
 
     // Take ownership of CLIPBOARD.
     conn.set_selection_owner(win, clipboard, x11rb::CURRENT_TIME)
-        .map_err(|e| {
-            let msg = format!("set_selection_owner: {e}");
-            signal_ready(&ready, ReadyState::Err(msg.clone()));
-            stop.store(true, Ordering::Relaxed);
-            msg
-        })?
+        .map_err(|e| failed(format!("set_selection_owner: {e}")))?
         .check()
-        .map_err(|e| {
-            let msg = format!("set_selection_owner check: {e}");
-            signal_ready(&ready, ReadyState::Err(msg.clone()));
-            stop.store(true, Ordering::Relaxed);
-            msg
-        })?;
-    conn.flush().map_err(|e| {
-        let msg = format!("flush after set_selection_owner: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?;
+        .map_err(|e| failed(format!("set_selection_owner check: {e}")))?;
+    conn.flush()
+        .map_err(|e| failed(format!("flush after set_selection_owner: {e}")))?;
 
     // Signal the spawner that we now own the selection.
     signal_ready(&ready, ReadyState::Ok);
@@ -771,10 +705,42 @@ mod tests {
 
     #[test]
     fn spawning_against_an_unreachable_display_fails_instead_of_hanging() {
+        let started = Instant::now();
         let Err(err) = ClipboardOwner::spawn(":9999".to_string(), "text".to_string()) else {
             panic!("there is no server on :9999, so no owner can take its selection");
         };
         assert!(matches!(err, GlassError::Backend(_)), "{err:?}");
+        // The connect failure's own words, not a generic one: a setup step that reported nothing
+        // would leave the spawner to time out and blame the wait instead.
+        assert!(err.to_string().contains("X connect"), "{err}");
+        // And it must arrive by being signalled, not by the 2 s readiness bound expiring — which
+        // is the only difference a caller sees when a setup step forgets to signal.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The one thing every fallible setup step in `owner_thread` must do. A step that returns
+    /// without it leaves the spawner on the condvar until its own bound expires, reporting a
+    /// timeout for a failure that already had a message.
+    #[test]
+    fn a_setup_failure_signals_the_spawner_stops_the_thread_and_keeps_its_message() {
+        let ready = Arc::new((Mutex::new(ReadyState::Pending), Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let returned = setup_failed(&ready, &stop, "X connect: refused".to_string());
+
+        assert_eq!(returned, "X connect: refused");
+        assert!(
+            stop.load(Ordering::Relaxed),
+            "the thread must not go on to take the selection"
+        );
+        match &*recover_readiness("test", ready.0.lock()) {
+            ReadyState::Err(msg) => assert_eq!(msg, "X connect: refused"),
+            _ => panic!("the spawner was left on Pending and will wait out its bound"),
+        }
     }
 
     /// Bind the X11 TCP port of the first free display number, returning a listener and the
