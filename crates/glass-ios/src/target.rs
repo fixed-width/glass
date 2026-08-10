@@ -232,8 +232,8 @@ mod tests {
         assert!(r.udids().is_empty());
     }
 
-    /// Killing the client at spawn leaves the device Booted 30s later (measured), so a Ctrl-C
-    /// reaching glass's group inside that window would strand the simulator.
+    /// A Ctrl-C reaching glass's group inside the window measured on
+    /// [`SimTarget::request_shutdown_all`] would strand the simulator.
     #[test]
     fn the_shutdown_it_asks_for_runs_in_its_own_process_group() {
         let fake = crate::simctl::FakeSimctl::new();
@@ -263,10 +263,9 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// The measured defect (glass#427): a real `simctl shutdown` takes ~3.3s, which is over the
-    /// whole teardown budget on its own, so process exit must not wait for it. The fake sleeps 1s
-    /// rather than 3 so the test does not end with its own `TempDir` deleted under a running
-    /// script.
+    /// Process exit must not wait for the shutdown measured on [`SimTarget::request_shutdown_all`]
+    /// (glass#427). The fake sleeps 1s rather than 3 so the test does not end with its own
+    /// `TempDir` deleted under a running script.
     #[test]
     fn shutdown_all_returns_without_waiting_for_the_simulator_to_go_down() {
         let fake = crate::simctl::FakeSimctl::new();

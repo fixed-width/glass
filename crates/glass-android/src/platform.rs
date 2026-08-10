@@ -243,8 +243,7 @@ impl Platform for AndroidPlatform {
         let started = adb.run(launch_args(&target.component).iter().map(String::as_str))?;
         check_am_start(&started)?;
 
-        // The app is on the device from here, but `self.app` is not set until the end, so each
-        // failure below has to reap for itself.
+        // Each failure from here down reaps for itself — see `reap_failed_launch`.
         let (active_id, window) = match self.discover_window(&target.package, spec.timeout_ms) {
             Ok(found) => found,
             Err(e) => return Err(reap_failed_launch(&adb, &target.package, e)),
@@ -273,10 +272,9 @@ impl Platform for AndroidPlatform {
         Ok(window)
     }
 
-    /// Force-stop measures 101ms median, 267ms worst on an emulator with every core saturated,
-    /// against the 3s all of teardown gets — so the deadline is not expected to bind. It is for
-    /// the device that stopped answering, which would otherwise run out the 10s `AdbOp::Shell`
-    /// budget and leave the hook nothing (glass#422).
+    /// Force-stop measures well inside the 3s all of teardown gets (see [`AdbOp::Launch`]), so the
+    /// deadline is not expected to bind. It is for the device that stopped answering, which would
+    /// otherwise run out the 10s `AdbOp::Shell` budget and leave the hook nothing (glass#422).
     fn stop_app_by(&mut self, deadline: Deadline) -> Result<()> {
         self.stop_app_until(deadline)
     }
@@ -413,8 +411,11 @@ impl Platform for AndroidPlatform {
 impl Drop for AndroidPlatform {
     /// Force-stop the app on drop, for a platform dropped without an explicit `stop_app()` —
     /// parity with the X11/Wayland/Windows/macOS backends. The device outlives the process, so
-    /// the app would otherwise still be there for the next run (glass#419). `stop_app` takes
-    /// `self.app`, so this is a no-op once it has run, which every path through `Glass` does.
+    /// the app would otherwise still be there for the next run (glass#419).
+    ///
+    /// `stop_app` takes `self.app`, so this is a no-op after it — and `Glass::stop`,
+    /// `Glass::shutdown` and a session replacement all call it. The path they do not reach is a
+    /// launch that failed on the way up, which is [`reap_failed_launch`]'s.
     fn drop(&mut self) {
         let _ = self.stop_app();
     }

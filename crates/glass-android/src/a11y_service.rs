@@ -718,8 +718,8 @@ impl A11yServiceRegistry {
             READY_ATTEMPT,
             READY_ATTEMPTS,
             &|step| escalate(adb, apk, &want, step, READY_ATTEMPTS),
-            // No deadline: this is the rollback for a failed `ensure` during `glass_start`, not
-            // teardown, so each call keeps its own budget and answers to no shared one.
+            // Unbounded: this is the rollback for a failed `ensure` during `glass_start`, not
+            // teardown, so each call keeps its own budget.
             &|| restore_a11y(adb, prior, prior_a11y, port, Deadline::UNBOUNDED),
         )?;
         *self.state.lock().unwrap() = Some(Active {
@@ -738,8 +738,7 @@ impl A11yServiceRegistry {
     }
 
     /// Restore the device's prior accessibility state and remove the forward by `deadline`, which
-    /// the rest of teardown shares (glass#422); [`Deadline::UNBOUNDED`] off that path, where each
-    /// call keeps its own budget.
+    /// the rest of teardown shares (glass#422).
     ///
     /// Best-effort and idempotent. No process to kill: disabling unbinds the service.
     pub fn shutdown(&self, deadline: Deadline) {
@@ -772,7 +771,7 @@ fn put_secure(adb: &Adb, key: &str, value: &str) -> Result<()> {
     put_secure_until(adb, key, value, Deadline::UNBOUNDED).map(|_| ())
 }
 
-/// [`put_secure`] under a deadline the caller shares with the rest of its sequence.
+/// [`put_secure`] under `deadline`.
 fn put_secure_until(adb: &Adb, key: &str, value: &str, deadline: Deadline) -> Result<String> {
     adb.run_until(["shell", "settings", "put", "secure", key, value], deadline)
 }
@@ -783,7 +782,7 @@ fn put_enabled_services(adb: &Adb, list: &str) -> Result<()> {
     put_enabled_services_until(adb, list, Deadline::UNBOUNDED)
 }
 
-/// [`put_enabled_services`] under a deadline the caller shares with the rest of its sequence.
+/// [`put_enabled_services`] under `deadline`.
 fn put_enabled_services_until(adb: &Adb, list: &str, deadline: Deadline) -> Result<()> {
     if list.is_empty() {
         adb.run_until(

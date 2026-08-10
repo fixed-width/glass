@@ -12,8 +12,8 @@ use glass_core::{Deadline, GlassError, Result, run_bounded_until};
 /// Budgets are ~4x the slowest healthy run measured on the dogfood simulator, floored at 10s — a
 /// bound on a simulator that has stopped answering, not what a call is expected to cost:
 /// `terminate` measured 101ms median over 25 runs. `shutdown` is the one verb whose *expected*
-/// cost (~3.3s) exceeds `glass_core::TEARDOWN_BUDGET`, which is why nothing waits on one during
-/// teardown (glass#427, `SimulatorRegistry::request_shutdown_all`).
+/// cost exceeds `glass_core::TEARDOWN_BUDGET`, which is why nothing waits on one during teardown
+/// (glass#427, `SimulatorRegistry::request_shutdown_all`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimctlOp {
     /// `bootstatus -b` — waits out the whole boot.
@@ -118,9 +118,8 @@ impl Simctl {
         self.run_until(sub, Deadline::UNBOUNDED)
     }
 
-    /// [`Simctl::run`] under a deadline the whole sequence shares, [`Deadline::UNBOUNDED`] for a
-    /// call that answers to nothing but its own budget. The deadline bounds the run; it does not
-    /// reserve time for the calls behind, which is `Glass::shutdown`'s job (glass#427).
+    /// [`Simctl::run`] under a deadline the whole sequence shares. The deadline bounds the run; it
+    /// does not reserve time for the calls behind, which is `Glass::shutdown`'s job (glass#427).
     pub fn run_until(&self, sub: &[&str], deadline: Deadline) -> Result<String> {
         let out = self.output(sub, deadline)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
@@ -129,9 +128,10 @@ impl Simctl {
     /// Start `xcrun simctl <sub...>` and hand back the child unwaited, in a process group of its
     /// own so a signal to glass's group does not take it too.
     ///
-    /// For the one call costing more than its caller's whole budget (`shutdown`, ~3.3s against a
-    /// 3s teardown), where waiting only delays the exit. stdout is closed rather than inherited —
-    /// on stdio an inherited one corrupts the MCP stream.
+    /// For `shutdown`, whose measured cost exceeds the whole teardown budget
+    /// ([`crate::SimulatorRegistry::request_shutdown_all`]), so waiting only delays the exit.
+    /// stdout is closed rather than inherited — on stdio an inherited one corrupts the MCP
+    /// stream.
     pub fn spawn_detached(&self, sub: &[&str]) -> std::io::Result<std::process::Child> {
         let mut cmd = Command::new(self.program());
         cmd.args(self.full_args(sub))

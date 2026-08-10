@@ -11,11 +11,9 @@ use crate::logbuf::Stream;
 /// on `Glass::shutdown` and then exits regardless, so anything a [`Platform::stop_app`] impl was
 /// still waiting on is abandoned mid-flight: on a Unix backend that orphans the app to init.
 ///
-/// Every backend's teardown must therefore fit inside this, with room for the work that follows
-/// it. A backend that waits on the app being polite has to bound that wait against this constant
-/// — it lives here, rather than as a private number in `glass-mcp`, precisely because the
-/// backends are the ones that have to respect it and they cannot see a private one. Each backend
-/// asserts its own budget against it at compile time; grep for `TEARDOWN_BUDGET` to find them.
+/// Every backend's teardown must therefore fit inside this. The four that wait on a local child
+/// assert their grace constants against it at compile time; the two that tear down over a link to
+/// a device have no constants to sum and spend [`Platform::stop_app_by`]'s deadline instead.
 pub const TEARDOWN_BUDGET: Duration = Duration::from_secs(3);
 
 /// How much of [`TEARDOWN_BUDGET`] is held back from the deadline the steps are given.
@@ -31,15 +29,14 @@ pub const TEARDOWN_REAP_HEADROOM: Duration = Duration::from_millis(750);
 /// A shared deadline bounds a sequence; it does not divide one. Without a reserve, a device that
 /// stops answering during `stop_app` leaves the hook nothing — and `run_bounded_until` does not
 /// start a command with no time left, so its steps are skipped rather than slowed. On Android the
-/// hook is what hands the device back: the companion it enabled, the `adb forward` it opened, the
-/// emulator it booted.
+/// hook is what hands the device back (`glass_android::hand_the_device_back`).
 ///
 /// Five adb calls, the slowest measured at 52ms on an emulator with every core saturated
 /// (glass#422).
 pub const TEARDOWN_HOOK_RESERVE: Duration = Duration::from_millis(750);
 
-// The three have to fit, or the split is a slower way of running out of time. The sessions get
-// what is left — 1.5s, against the ~270ms the slowest measured backend teardown needs.
+// The sessions get what is left — 1.5s, against the ~270ms the slowest measured backend
+// teardown needs.
 const _: () = assert!(
     TEARDOWN_REAP_HEADROOM.as_millis() + TEARDOWN_HOOK_RESERVE.as_millis()
         < TEARDOWN_BUDGET.as_millis(),
@@ -258,15 +255,13 @@ pub trait Platform {
 
     /// Terminate the running app (idempotent), giving up by `deadline`.
     ///
-    /// **Cap every wait of your own by it.** On the process-exit path the whole of teardown shares
-    /// [`TEARDOWN_BUDGET`], and a step that overruns is not merely late — it spends what the steps
-    /// behind it needed, and they are skipped rather than slowed (glass#422, glass#427).
+    /// **Cap every wait of your own by it.** Teardown shares [`TEARDOWN_BUDGET`], so a step that
+    /// overruns spends what the steps behind it needed, and they are skipped rather than slowed
+    /// (glass#422, glass#427).
     ///
-    /// A backend whose teardown is a signal ladder over local processes may ignore it — those
-    /// ladders already assert their own constants against [`TEARDOWN_BUDGET`] at compile time
-    /// (x11, wayland, windows, macos, each with the residual its own comment names). One that
-    /// tears down over a link to a device has a tool invocation per step, each with its own budget
-    /// and no sum to assert, so it has nothing but this deadline.
+    /// A backend whose teardown is a signal ladder over local processes may ignore it, having
+    /// asserted its own constants against [`TEARDOWN_BUDGET`] already. One that tears down over a
+    /// link to a device has a tool invocation per step, no sum to assert, and nothing but this.
     ///
     /// Required rather than defaulted, so a new device-linked backend cannot inherit an unbounded
     /// teardown in silence — which is how both device backends came to need glass#422/#427.

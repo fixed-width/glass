@@ -78,9 +78,9 @@ impl Glass {
     }
 
     /// Best-effort teardown of **all** active sessions for process exit. Idempotent:
-    /// a no-op when nothing is active. Errors are swallowed — we are exiting, so a
-    /// failed `stop_app` must not prevent releasing the rest (the OS reaps anything
-    /// left). Distinct from `stop()`, which reports errors to a tool caller.
+    /// a no-op when nothing is active. Errors are swallowed — we are exiting, so a failed
+    /// `stop_app` must not prevent releasing the rest. Distinct from `stop()`, which reports
+    /// errors to a tool caller.
     ///
     /// `deadline` is when teardown is expected to be done. Stopping the sessions is held
     /// [`crate::TEARDOWN_HOOK_RESERVE`] short of it: a shared deadline bounds a sequence without
@@ -89,10 +89,6 @@ impl Glass {
     ///
     /// A third step between them is bounded by neither — dropping the session reaps the backend
     /// (Xvfb, sway, a Job object) and the log-stream children, each an unbounded `wait()`.
-    ///
-    /// Written to drain the session set so the future multi-session registry (a
-    /// `HashMap` instead of this `Option`) reuses it unchanged — it becomes a `for`
-    /// loop with no other change.
     pub fn shutdown(&mut self, deadline: Deadline) {
         if let Some(mut s) = self.active.take() {
             let _ = s
@@ -147,8 +143,7 @@ mod tests {
         assert_eq!(lines[0].text, "ready");
     }
 
-    /// A deadline far enough out that nothing in these tests is bounded by it — they are about
-    /// what `shutdown` calls, not about what a spent budget does.
+    /// A deadline far enough out that nothing in these tests is bounded by it.
     fn soon() -> Deadline {
         Deadline::at(std::time::Instant::now() + crate::TEARDOWN_BUDGET)
     }
@@ -228,8 +223,7 @@ mod tests {
         );
     }
 
-    /// The budget is only useful if it reaches the code that spends it: a backend that tears down
-    /// over a link, and a hook that does the same for the host's own resources.
+    /// The budget is only useful if it reaches the code that spends it.
     #[test]
     fn shutdown_hands_its_deadline_to_both_the_backend_and_the_hook() {
         let at_stop = Arc::new(Mutex::new(None));
@@ -265,8 +259,8 @@ mod tests {
         );
     }
 
-    /// The other half of the split: the reserve is a fixed 750ms, so without the clamp a caller
-    /// whose whole budget is smaller hands the sessions a deadline already in the past.
+    /// The reserve is a fixed 750ms, so without the clamp a caller whose whole budget is smaller
+    /// hands the sessions a deadline already in the past.
     #[test]
     fn a_budget_smaller_than_the_reserve_still_leaves_the_sessions_time() {
         let at_stop = Arc::new(Mutex::new(None));
@@ -300,9 +294,7 @@ mod tests {
     }
 
     /// The property this whole split exists for (glass#422): a session that spends everything it is
-    /// given must still leave the hook enough to run. Without the reserve the hook is reached with
-    /// a spent deadline, and `run_bounded_until` does not start a command it has no time for — so
-    /// every step behind it is skipped rather than merely slow.
+    /// given must still leave the hook enough to run.
     #[test]
     fn a_session_that_burns_its_deadline_still_leaves_the_hook_time_to_run() {
         let factory: PlatformFactory = Box::new(move |_backend| {

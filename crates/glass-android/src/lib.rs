@@ -97,8 +97,7 @@ pub(crate) fn unsupported_window_move_resize() -> glass_core::GlassError {
 /// measured at 2ms.
 ///
 /// One function rather than three calls in glass-mcp's hook, so a test can watch the deadline
-/// reach all three — collapsing each registry's `shutdown`/`shutdown_until` pair made losing it a
-/// one-token edit.
+/// reach all three.
 pub fn hand_the_device_back(
     a11y: &A11yServiceRegistry,
     agents: &AgentRegistry,

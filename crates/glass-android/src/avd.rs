@@ -186,8 +186,7 @@ impl EmulatorRegistry {
     }
 
     /// Stop every registered emulator (`adb -s <serial> emu kill`) by `deadline` and clear the
-    /// list. Best-effort: a device already gone is fine, and [`Deadline::UNBOUNDED`] off the
-    /// teardown path, where each call keeps its own budget.
+    /// list. Best-effort: a device already gone is fine.
     ///
     /// `adb emu kill` was observed at 2ms: it acknowledges and lets the VM go down on its own
     /// time (glass#422).

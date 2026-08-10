@@ -89,7 +89,7 @@ fn boots_reuses_and_cleans_up() {
     let registry = EmulatorRegistry::new();
     // `kill_all` below is what this test asserts on, so it stays explicit; this only covers the
     // path where an assertion between here and there panics, which would otherwise leave a
-    // booted emulator behind. Idempotent — `kill_all` takes the list.
+    // booted emulator behind.
     let _kill_emulators = common::KillBootedEmulators(&registry);
 
     // First resolve boots the AVD.

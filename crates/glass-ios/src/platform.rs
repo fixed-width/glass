@@ -67,10 +67,8 @@ impl IdbDriver {
 ///
 /// Capture, logs, clipboard, and window queries run over `xcrun simctl` alone. Input
 /// (tap/type/swipe/scroll) and the accessibility tree additionally need an `idb_companion`
-/// [`IdbDriver`]; when the companion isn't available the backend degrades to observe-only:
-/// capture/logs/clipboard keep working, while input and the accessibility tree report a
-/// clear [`GlassError::Unsupported`]. The failure that disabled the driver is kept in
-/// `driver_error` and surfaced in that message.
+/// [`IdbDriver`]; without it the backend degrades to observe-only and those two report a clear
+/// [`GlassError::Unsupported`], carrying the `driver_error` that disabled the driver.
 pub struct IosPlatform {
     target: SimTarget,
     app: Option<RunningApp>,
@@ -1412,8 +1410,7 @@ mod teardown_tests {
         assert_eq!(terminations(&fake).len(), 1, "{:?}", fake.calls());
     }
 
-    /// `simctl launch` reporting failure usually means nothing launched — but not always, and the
-    /// launch whose result this backend never sees is the one that leaves an app up.
+    /// The launch whose result this backend never sees is the one that leaves an app up.
     #[test]
     fn a_launch_simctl_reported_as_failed_is_reaped_too() {
         let fake = FakeSimctl::new();

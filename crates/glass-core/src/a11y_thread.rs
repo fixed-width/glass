@@ -228,8 +228,8 @@ mod tests {
     #[test]
     fn a_caller_that_names_no_deadline_leaves_the_read_its_own_ceiling() {
         let (wait, ended_by) = reader().bounded_wait(Deadline::UNBOUNDED);
-        // One clock read makes this branch deterministic; the two-read shape it replaced came up
-        // short by whatever fell between them.
+        // Exactly `CEILING`: the two-read shape this replaced came up short by whatever fell
+        // between the reads.
         assert_eq!(wait, CEILING, "{wait:?}");
         assert_eq!(ended_by, Whose::Callee);
     }

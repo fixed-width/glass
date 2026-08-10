@@ -1,9 +1,7 @@
 //! One type for "when the caller stops waiting", shared by every bound in glass.
 //!
-//! It began as the accessibility readers' `AxDeadline`. `Adb` then grew two more spellings fifteen
-//! lines apart — a bare `Instant` for the dump sequence (glass#312) and an `Option<Instant>` for
-//! teardown (glass#431) — and `None` reads as "zero" as readily as "unbounded", which is the
-//! direction that fails quietly: a call given zero is not run at all (glass#430).
+//! Not `Option<Instant>`: `None` reads as "zero" as readily as "unbounded", which is the direction
+//! that fails quietly — a call given zero is not run at all (glass#430).
 //!
 //! Where a bound is *required*, a plain `Instant` is still right and is left alone — the wayland
 //! clipboard transfer, `wait_for_agent_until`, `bounded`'s own `poll_until`. This type is for the
@@ -42,8 +40,7 @@ impl Deadline {
     /// bound — and whose bound that is.
     ///
     /// One comparison answers both, so the instant and the blame cannot come from different
-    /// proposals (glass#432), and the blame is settled before the step runs rather than inferred
-    /// from the error it returns (glass#341).
+    /// proposals (glass#432).
     ///
     /// A tie is the callee's: one that used exactly its own bound must not be reported as a caller
     /// who ran out of time.
@@ -129,9 +126,7 @@ mod tests {
         assert!(!Deadline::UNBOUNDED.has_passed());
     }
 
-    /// Both halves agree at every ordering, and the tie is load-bearing: a callee blames its own
-    /// bound when both fall together, so a backend that hung for exactly its ceiling is never
-    /// reported as a caller who ran out of time.
+    /// Both halves agree at every ordering, the tie included.
     #[test]
     fn resolve_answers_both_halves_from_one_comparison() {
         let now = std::time::Instant::now();
@@ -210,7 +205,7 @@ mod tests {
             Deadline::at(past).within(Duration::from_secs(20), now),
             Duration::ZERO
         );
-        // No deadline is the widest value, not a budget of zero.
+        // The widest value, not a budget of zero.
         assert_eq!(
             Deadline::UNBOUNDED.within(Duration::from_secs(20), now),
             Duration::from_secs(20)

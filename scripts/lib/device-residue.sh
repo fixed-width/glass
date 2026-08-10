@@ -4,8 +4,7 @@
 # `A11yServiceRegistry::ensure` enables the companion as an accessibility service and opens an
 # `adb forward`; `AgentRegistry::ensure` opens one too. Only their `shutdown` puts that back, and a
 # test panicking past a trailing `shutdown()` leaves the companion in the tree of every later
-# reader on the device (glass#423). The suite reports green while it happens, hence a check around
-# it rather than an assertion inside one test.
+# reader on the device (glass#423), and the suite reports green while it happens.
 #
 # Compared against a snapshot taken BEFORE the run, never against a fixed "clean" value: a dev box
 # may have its own accessibility service enabled, and asserting `null` would fail there forever.

@@ -327,7 +327,7 @@ impl AgentRegistry {
     }
 
     /// Kill the device agent (via the host child) and remove the forward by `deadline`, which the
-    /// rest of teardown shares (glass#422); [`Deadline::UNBOUNDED`] off that path. Best-effort.
+    /// rest of teardown shares (glass#422). Best-effort.
     ///
     /// Only the forward removal is under the deadline — dropping `p` then kills and reaps the
     /// agent with an unbounded `wait()`, the gap `AndroidPlatform::stop_app_until` names for
