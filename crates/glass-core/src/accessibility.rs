@@ -1053,6 +1053,19 @@ pub trait Accessibility {
     /// Set the editable element identified by `target` to `text`. The backend
     /// re-walks pre-order to `target.id`, verifies role+name, then sets via the
     /// native editable interface. Default: unsupported.
+    ///
+    /// # Error contract
+    ///
+    /// Every failure raised once the write has gone out MUST be a verdict
+    /// [`GlassError::set_value_failed_after_writing`] accepts —
+    /// [`GlassError::AxValueNotApplied`] where the element was read back, and
+    /// [`GlassError::AxWriteUnconfirmed`] where it could not be. That is what drops the value the
+    /// session cached for the element; keeping it makes a field that settled *after* the failure
+    /// look like drift, and the caller's retry is refused for a write that succeeded (glass#405).
+    ///
+    /// A transport failure counts as having written whenever the request may have reached the
+    /// device. Classify at the point that knows — do not flatten it into a generic error on the way
+    /// out, which is how three exits of the Android on-device reader came to be misclassified.
     fn set_value(&mut self, _ctx: &AxContext, _target: &AxTarget, _text: &str) -> Result<()> {
         Err(crate::error::GlassError::AxUnsupported)
     }

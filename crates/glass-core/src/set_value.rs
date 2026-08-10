@@ -53,6 +53,19 @@ pub fn read_back_confirms(read_back: Option<&str>, before: Option<&str>, request
     }
 }
 
+/// Whether a read-back shows the element holding exactly what it held before the write — the one
+/// outcome that means the write never took effect, as against arriving and being transformed.
+///
+/// The caller passes a reading it actually took, with an absent value already normalized to `""`:
+/// a mapper that drops empty values reports an empty field as no value, and a backend whose
+/// read-back *failed* has no reading to compare and must not ask.
+///
+/// What a backend's own explanation of a write hangs on — attach it here and nowhere else, or a
+/// field that transformed the text is handed a remedy for one that never received it.
+pub fn write_took_no_effect(observed: &str, before: Option<&str>) -> bool {
+    before.is_some_and(|b| b == observed)
+}
+
 /// Whether a *typed* write landed, judged from the value read back.
 ///
 /// Exact match, unlike [`read_back_confirms`]: keystrokes can land partially, and a field holding
@@ -90,6 +103,26 @@ pub fn typed_clear_landed(read_back: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_field_still_holding_what_it_held_took_no_effect_from_the_write() {
+        assert!(write_took_no_effect("hello", Some("hello")));
+    }
+
+    #[test]
+    fn a_field_holding_anything_else_took_something_from_the_write() {
+        // Including a transformation: an iOS field that autocapitalized the text it was given
+        // received every keystroke, so a backend's "the tap may have missed" must not attach.
+        assert!(!write_took_no_effect("Hello", Some("hello")));
+    }
+
+    #[test]
+    fn a_read_back_with_no_baseline_cannot_show_a_write_took_no_effect() {
+        // `None` is a pre-write read the backend could not take. Treating it as a match would
+        // attach an explanation of a write that never landed to one nobody can place.
+        assert!(!write_took_no_effect("hello", None));
+        assert!(!write_took_no_effect("", None));
+    }
 
     #[test]
     fn a_write_that_changed_nothing_did_not_take() {

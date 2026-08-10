@@ -472,7 +472,8 @@ impl GlassServer {
                        holds, and which one it is decides your next move: your text in another \
                        form means the element transformed it and writing again will not help; part \
                        of your text means a keystroke was dropped, so write again; what it held \
-                       before means the write never arrived. A separate \
+                       before means the write took no effect, and the error then closes with what \
+                       this backend knows about that. A separate \
                        error says the text WAS typed but the write could not be confirmed — the \
                        read-back failed, or could not tell which element now holds it. Do NOT write \
                        again on that one: the keystrokes already went out, and re-snapshotting is \

@@ -16,6 +16,11 @@ pub enum BoundKind {
     NotStarted,
 }
 
+/// Render a backend's own explanation as the clause closing [`GlassError::AxValueNotApplied`].
+fn render_why(why: &Option<&'static str>) -> String {
+    why.map(|w| format!(" — {w}")).unwrap_or_default()
+}
+
 /// Render a read-back for [`GlassError::AxValueNotApplied`] as the clause following "the element".
 ///
 /// `None` is not an empty element — that reads back as `Some("")` — it is no reading at all: the
@@ -149,8 +154,8 @@ pub enum GlassError {
     /// A write that went out and could not then be confirmed. Distinct from the pre-write
     /// refusals because only this one has dispatched — see `set_value_failed_after_writing`.
     #[error(
-        "element #{0}: the text was typed, but the write could not be confirmed — {1}. Re-snapshot \
-         to see where it landed rather than typing it again"
+        "element #{0}: the write went out, but could not be confirmed — {1}. Re-snapshot to see \
+         where it landed rather than writing it again"
     )]
     AxWriteUnconfirmed(u32, String),
 
@@ -159,15 +164,16 @@ pub enum GlassError {
     /// Carries both values because three outcomes look alike from the id alone: the element
     /// transformed the write and holds it in another form (writing again changes nothing), it holds
     /// part of the request (a keystroke was dropped, so writing again is the fix), or it holds what
-    /// it held before (the write never arrived). Build it with [`GlassError::value_not_applied`].
+    /// it held before (the write took no effect). Build it with [`GlassError::value_not_applied`],
+    /// or [`GlassError::value_not_applied_because`] for the last case, which is the only one a
+    /// backend's own explanation fits — [`crate::write_took_no_effect`] is the test for it.
     #[error(
         "set_value on element #{id} did not take — asked for {requested:?}, the element {}. \
          Holding the request in another form means the element transformed it, and writing again \
-         will not change that. Holding part of it, or none of it, means the write did not arrive: \
-         on a desktop backend the value is often a read-only projection, so focus the element and \
-         type into it instead; on Android or the iOS Simulator the tap may have missed, so write \
-         again",
-        render_observed(.observed)
+         will not change that; holding part of it, or none of it, means the write did not take \
+         effect{}",
+        render_observed(.observed),
+        render_why(.why)
     )]
     AxValueNotApplied {
         id: u32,
@@ -175,6 +181,10 @@ pub enum GlassError {
         /// What the element reads as now: the text for a field — `Some("")` when it is empty — or
         /// `"on"` / `"off"` for a boolean control. `None` only when no reading was obtained.
         observed: Option<String>,
+        /// What this element's own backend knows about a write that does not arrive, which the
+        /// shared message cannot say: it is written for no backend in particular, and a remedy
+        /// aimed at the wrong one sends a caller somewhere futile.
+        why: Option<&'static str>,
     },
 
     #[error("element #{0} exposes no native activation action")]
@@ -308,6 +318,31 @@ impl GlassError {
             id,
             requested: requested.to_string(),
             observed: observed.map(str::to_string),
+            why: None,
+        }
+    }
+
+    /// As [`Self::value_not_applied`], plus what this backend knows about a write of its own that
+    /// takes no effect — the mechanism, and a remedy where there is one, appended to the shared
+    /// message.
+    ///
+    /// Only for a read-back [`crate::write_took_no_effect`] accepts: the clause subordinates to
+    /// that outcome, so attaching it to a transformed value contradicts the sentence before it.
+    /// It is appended after `" — "`, so it reads as a continuation — lowercase, no closing stop.
+    ///
+    /// `&'static str` deliberately: a remedy is a fixed explanation of how this backend writes, not
+    /// a place to format the call's data into.
+    pub fn value_not_applied_because(
+        id: u32,
+        requested: &str,
+        observed: Option<&str>,
+        why: &'static str,
+    ) -> GlassError {
+        GlassError::AxValueNotApplied {
+            id,
+            requested: requested.to_string(),
+            observed: observed.map(str::to_string),
+            why: Some(why),
         }
     }
 
@@ -589,6 +624,32 @@ mod tests {
     }
 
     #[test]
+    fn a_backends_own_explanation_closes_the_message() {
+        // The shared text is written for no backend in particular, so the mechanism and its remedy
+        // come from the site that knows them (glass#405).
+        let msg = GlassError::value_not_applied_because(
+            13,
+            "new",
+            Some("old"),
+            "ACTION_SET_TEXT cannot replace text already in a Compose field",
+        )
+        .to_string();
+        assert!(msg.ends_with("ACTION_SET_TEXT cannot replace text already in a Compose field"));
+        assert!(msg.contains("the write did not take effect —"), "{msg}");
+    }
+
+    #[test]
+    fn a_verdict_with_no_backend_explanation_ends_at_the_shared_text() {
+        // No trailing dash with nothing after it for a site that has nothing to add.
+        let msg = GlassError::value_not_applied(13, "new", Some("old")).to_string();
+        assert!(msg.ends_with("the write did not take effect"), "{msg}");
+        // The three-outcome reading is the reason the variant carries both values; an edit that
+        // trimmed the message back to its last clause would otherwise keep every test green.
+        assert!(msg.contains("in another form"), "{msg}");
+        assert!(msg.contains("holding part of it"), "{msg}");
+    }
+
+    #[test]
     fn an_empty_read_back_renders_as_an_empty_value() {
         // An empty read-back says the write arrived and left nothing — not the same answer as no
         // reading at all.
@@ -644,7 +705,7 @@ mod tests {
             "nothing in the tree carries its role and name".into(),
         );
         let msg = e.to_string();
-        assert!(msg.contains("the text was typed"), "{msg}");
+        assert!(msg.contains("the write went out"), "{msg}");
         assert!(
             msg.contains("nothing in the tree carries its role and name"),
             "{msg}"

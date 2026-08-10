@@ -11,7 +11,7 @@ use glass_core::accessibility::{
     AxTree, Subject, TruncationLimit, WalkBudget, WalkLimits,
 };
 use glass_core::platform::WindowGeometry;
-use glass_core::{GlassError, Result};
+use glass_core::{GlassError, Result, write_took_no_effect};
 
 use crate::axmap::{LabelInputs, class_to_role, labels};
 use crate::conn::{CallFailure, Conn};
@@ -333,13 +333,17 @@ impl ServiceClient {
     /// Fire `ACTION_SET_TEXT` on device node `ref_id`. Idempotent, so this takes the
     /// reconnecting path. `package` never reaches the wire here — it only re-arms a
     /// reconnected connection's `tree` call — see [`Self::call_with`].
-    fn set_text(&self, ref_id: u32, text: &str, package: &str) -> Result<()> {
+    fn set_text(
+        &self,
+        ref_id: u32,
+        text: &str,
+        package: &str,
+    ) -> std::result::Result<(), CallFailure> {
         self.call(
             json!({"op": "action", "ref": ref_id, "action": "set_text", "text": text}),
             Some(package),
         )
         .map(|_| ())
-        .map_err(CallFailure::into_error)
     }
 }
 
@@ -390,6 +394,9 @@ pub struct ServiceA11y {
     package: String,
     /// How long [`Self::wait_for_check`] polls; [`CHECK_TIMEOUT`] outside tests.
     check_timeout: std::time::Duration,
+    /// How long [`Accessibility::set_value`] polls for the write; [`WRITE_VERIFY_BUDGET`] outside
+    /// tests.
+    write_verify_budget: std::time::Duration,
 }
 
 impl ServiceA11y {
@@ -398,6 +405,7 @@ impl ServiceA11y {
             client,
             package,
             check_timeout: CHECK_TIMEOUT,
+            write_verify_budget: WRITE_VERIFY_BUDGET,
         }
     }
 
@@ -485,6 +493,21 @@ impl Drop for ReadBound<'_> {
     }
 }
 
+/// What a write that took no effect looks like on this backend: `ACTION_SET_TEXT` reports success
+/// and silently does nothing when it would *replace* text already in a Compose field.
+///
+/// `GLASS_ANDROID_A11Y=off`, not unsetting `GLASS_ANDROID_A11Y_APK`: the apk is also picked up from
+/// the data dirs and from beside the binary, so unsetting the path leaves this reader selected.
+const COMPOSE_SET_TEXT_NO_OP: &str = "a Compose field that already holds text cannot be replaced via ACTION_SET_TEXT — clear it \
+     first, or set GLASS_ANDROID_A11Y=off to use the uiautomator backend";
+
+/// How long [`ServiceA11y::set_value`] polls for a write to reach the tree, and the gap between
+/// those reads. Separate from [`CHECK_TIMEOUT`]: a recompose reaching accessibility is not the same
+/// wait as a control's state settling, and a test bounding one must not silently bound the other.
+const WRITE_VERIFY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+/// See [`WRITE_VERIFY_BUDGET`].
+const WRITE_VERIFY_POLL: std::time::Duration = std::time::Duration::from_millis(150);
+
 impl Accessibility for ServiceA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         Ok(self.snapshot_with_refs(ctx)?.tree)
@@ -498,42 +521,68 @@ impl Accessibility for ServiceA11y {
         // that ever relaxes into a search cannot dispatch to a node it never approved.
         let device_ref = rt.device_ref(resolved_editable_target(&rt.tree, target)?.id)?;
         self.client
-            .set_text(device_ref, text, rt.acting_on(&self.package))?;
+            .set_text(device_ref, text, rt.acting_on(&self.package))
+            .map_err(|f| write_error(target.id.0, f))?;
         // Verify the value actually took. ACTION_SET_TEXT returns success but silently no-ops when
         // *replacing* existing text in a Compose field, so a bare Ok could lie (glass forbids silent
         // fallbacks). The set is async (Compose recompose → a11y update), so poll briefly for the
         // value to land; error honestly only on timeout.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + self.write_verify_budget;
         loop {
-            let after = self.snapshot(ctx)?;
-            let node = after.find(target.id);
-            let got = node.and_then(|n| n.value.clone());
+            // Every exit below is post-dispatch, so each must be a verdict
+            // `set_value_failed_after_writing` accepts, or the session keeps the value it cached
+            // for a write that went out and refuses the retry as drift (glass#405).
+            let after = self
+                .snapshot(ctx)
+                .map_err(|e| crate::a11y::read_back_failed(target, &e))?;
+            // `find` answers `None` for a node that is gone and for one holding nothing, and
+            // folding them together confirms a clear on the evidence that the element could not be
+            // found. Keep polling — a tree mid-update loses it briefly.
+            let Some(node) = after.find(target.id) else {
+                if std::time::Instant::now() >= deadline {
+                    return Err(GlassError::AxWriteUnconfirmed(
+                        target.id.0,
+                        "the element is no longer in the tree, so its value could not be read back"
+                            .into(),
+                    ));
+                }
+                std::thread::sleep(WRITE_VERIFY_POLL);
+                continue;
+            };
+            // Before the value check, not after: a collapsed row maps its text to `name` and
+            // reports no value, so `"" == ""` would confirm a *clear* on the evidence that the
+            // field stopped being a field. `AndroidA11y`'s `verify_write` re-checks the flag too.
+            if !node.states.editable {
+                return Err(GlassError::AxWriteUnconfirmed(
+                    target.id.0,
+                    "the element no longer reports itself editable, so its value cannot be read \
+                     back"
+                        .into(),
+                ));
+            }
+            let got = node.value.clone();
             // An empty field reports no value (None), not Some(""), so compare against "".
             if got.as_deref().unwrap_or("") == text {
                 return Ok(());
             }
-            // A field that has stopped reporting `editable` — a submit collapsing it to a display
-            // row, focus lost — also reports no value, which reads exactly like a write that never
-            // landed. Spending the rest of the budget to then blame the write would send the
-            // caller to clear a field that is already correct and to switch backends for nothing.
-            // `AndroidA11y`'s `verify_write` re-checks the same flag for the same reason.
-            if node.is_some_and(|n| !n.states.editable) {
-                return Err(GlassError::AccessibilityUnavailable(format!(
-                    "set_value on element {} was sent, but the element no longer reports itself \
-                     editable, so its value cannot be read back; re-snapshot to see what it holds \
-                     rather than retyping",
-                    target.id.0
-                )));
-            }
             if std::time::Instant::now() >= deadline {
-                return Err(GlassError::Backend(format!(
-                    "set_value on element {} did not take (field is {got:?}, wanted {text:?}); a \
-                     Compose field that already holds text can't be replaced via ACTION_SET_TEXT — \
-                     clear it first or unset GLASS_ANDROID_A11Y_APK to use the uiautomator backend",
-                    target.id.0
-                )));
+                // The mapper drops an empty value, so an emptied field arrives as `None` — which
+                // the verdict reserves for a reading nobody took.
+                let observed = got.as_deref().unwrap_or("");
+                // The clause explains a field that never moved; on one holding something else the
+                // write did reach it, and "clear it first" would name a field already empty.
+                return Err(if write_took_no_effect(observed, target.value.as_deref()) {
+                    GlassError::value_not_applied_because(
+                        target.id.0,
+                        text,
+                        Some(observed),
+                        COMPOSE_SET_TEXT_NO_OP,
+                    )
+                } else {
+                    GlassError::value_not_applied(target.id.0, text, Some(observed))
+                });
             }
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            std::thread::sleep(WRITE_VERIFY_POLL);
         }
     }
 
@@ -1075,6 +1124,25 @@ fn disabled_error(target: u32, disabled: AxNodeId) -> GlassError {
             disabled.0
         ),
     )
+}
+
+/// Map a `set_text` failure onto the `set_value` contract. Only `NotSent` proves nothing was
+/// written — the other two may already have set the field, so they answer in a verdict
+/// `set_value_failed_after_writing` accepts (glass#405).
+fn write_error(target: u32, f: CallFailure) -> GlassError {
+    match f {
+        CallFailure::NotSent(e) => GlassError::AccessibilityUnavailable(format!(
+            "the write to element {target} could not be sent: {e}"
+        )),
+        CallFailure::AnswerLost(e) => GlassError::AxWriteUnconfirmed(
+            target,
+            format!("the write was sent and its result was lost ({e})"),
+        ),
+        CallFailure::Refused(e) => GlassError::AxWriteUnconfirmed(
+            target,
+            format!("the device answered the write with something unreadable ({e})"),
+        ),
+    }
 }
 
 /// Map a click failure onto the invoke contract. No arm is fallback-eligible: a refusal may
@@ -2795,9 +2863,10 @@ mod tests {
         );
         let client = ServiceClient::connect(port).expect("connect to the fake service");
         client.tree("com.example.app").expect("primes conn1");
-        client
-            .set_text(1, "hi", "com.example.app")
-            .expect("re-arm confirms the same package, so the resend goes through");
+        assert!(
+            client.set_text(1, "hi", "com.example.app").is_ok(),
+            "re-arm confirms the same package, so the resend goes through"
+        );
         assert_eq!(
             ops_of(&ops),
             vec![
@@ -2824,10 +2893,10 @@ mod tests {
         );
         let client = ServiceClient::connect(port).expect("connect to the fake service");
         client.tree("com.example.app").expect("primes conn1");
-        let e = client
-            .set_text(1, "hi", "com.example.app")
-            .expect_err("a different foreground must refuse the resend");
-        let msg = e.to_string();
+        let Err(f) = client.set_text(1, "hi", "com.example.app") else {
+            panic!("a different foreground must refuse the resend");
+        };
+        let msg = f.into_error().to_string();
         assert!(msg.contains("com.example.app"), "{msg}");
         assert!(msg.contains("com.other.app"), "{msg}");
         assert!(msg.contains("moved"), "{msg}");
@@ -2853,10 +2922,10 @@ mod tests {
         );
         let client = ServiceClient::connect(port).expect("connect to the fake service");
         client.tree("com.example.app").expect("primes conn1");
-        let e = client
-            .set_text(1, "hi", "com.example.app")
-            .expect_err("an unconfirmed foreground must refuse the resend");
-        let msg = e.to_string();
+        let Err(f) = client.set_text(1, "hi", "com.example.app") else {
+            panic!("an unconfirmed foreground must refuse the resend");
+        };
+        let msg = f.into_error().to_string();
         assert!(msg.contains("com.example.app"), "{msg}");
         assert!(msg.contains("could not confirm"), "{msg}");
         assert!(!msg.contains("moved"), "{msg}");
@@ -3589,6 +3658,166 @@ mod tests {
         let mut v = editable_field(value);
         v["children"][0]["bounds"] = json!({"x": dx, "y": 100, "w": 600, "h": 120});
         v
+    }
+
+    /// [`editable_field`] with the field no longer editable — a collapsed display row, whose text
+    /// `labels` maps to `name`, leaving no value to read.
+    fn settled_field(value: &str) -> Value {
+        let mut v = editable_field(value);
+        v["children"][0]["editable"] = json!(false);
+        v
+    }
+
+    /// A reader whose write-verify budget is spent, so a timeout costs no wall clock.
+    fn impatient_writer(port: u16) -> ServiceA11y {
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        a.write_verify_budget = std::time::Duration::ZERO;
+        a
+    }
+
+    #[test]
+    fn a_write_that_never_lands_names_both_values_and_the_compose_no_op() {
+        // The Compose no-op is a fact only this backend knows, and the verdict must also be one
+        // the session reads as post-dispatch, or it keeps its cached value (glass#405).
+        let (port, _ops) = fake_service(vec![editable_field("old")], OnAction::Ok);
+        let mut a = impatient_writer(port);
+        let t = built(&editable_field("old"));
+
+        let err = a
+            .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
+            .expect_err("the field never takes the value");
+        assert!(
+            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed, why }
+                if requested == "new"
+                    && observed.as_deref() == Some("old")
+                    && why.is_some_and(|w| w.contains("ACTION_SET_TEXT")
+                        && w.contains("GLASS_ANDROID_A11Y=off"))),
+            "{err}"
+        );
+        assert!(err.set_value_failed_after_writing(), "{err}");
+    }
+
+    #[test]
+    fn a_field_holding_something_neither_value_gets_no_compose_explanation() {
+        // The clause tells the caller to clear a field that already holds text; a field holding
+        // something the write put there was not refused.
+        let (port, _ops) = fake_service(
+            vec![editable_field("old"), editable_field("filtered")],
+            OnAction::Ok,
+        );
+        let mut a = impatient_writer(port);
+        let t = built(&editable_field("old"));
+        let target = target_for(&t, AxNodeId(1));
+
+        let err = a
+            .set_value(&ctx(), &target, "new")
+            .expect_err("the field holds neither the request nor what it held");
+        assert!(
+            matches!(&err, GlassError::AxValueNotApplied { observed, why: None, .. }
+                if observed.as_deref() == Some("filtered")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_clear_is_not_confirmed_by_a_field_that_stopped_being_editable() {
+        // A collapsed row reports no value, so an unguarded `"" == ""` confirms a clear that may
+        // never have fired. Move the editable check back below the value check and this is the
+        // only test that notices.
+        let (port, _ops) = fake_service(
+            vec![editable_field("old"), settled_field("old")],
+            OnAction::Ok,
+        );
+        let mut a = impatient_writer(port);
+        let t = built(&editable_field("old"));
+
+        let err = a
+            .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "")
+            .expect_err("an element that stopped being a field cannot confirm a clear");
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+    }
+
+    #[test]
+    fn an_element_gone_from_the_tree_is_unconfirmed_rather_than_an_empty_reading() {
+        // `find` answers `None` for a node that is gone and for one holding nothing. Folding them
+        // together reports a reading nobody took — and confirms a clear, since `"" == ""`.
+        let (port, _ops) = fake_service(
+            vec![
+                editable_field("old"),
+                json!({"class": "android.widget.FrameLayout",
+                       "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400}, "children": []}),
+            ],
+            OnAction::Ok,
+        );
+        let mut a = impatient_writer(port);
+        let t = built(&editable_field("old"));
+
+        let err = a
+            .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "")
+            .expect_err("a clear cannot be confirmed by an element that left the tree");
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.to_string().contains("no longer in the tree"), "{err}");
+    }
+
+    #[test]
+    fn a_write_whose_answer_was_lost_is_unconfirmed_rather_than_never_sent() {
+        // `AnswerLost` means the request went out and may have run, so the session must drop the
+        // value it cached — the same reasoning `action_error` applies to a click (glass#405).
+        let (port, _ops) = fake_service_ex(
+            vec![editable_field("old")],
+            vec![OnAction::DropWithoutAnswering],
+            vec![TreePackage::Other("com.other.app".into())],
+        );
+        let mut a = impatient_writer(port);
+        let t = built(&editable_field("old"));
+
+        let err = a
+            .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
+            .expect_err("the reconnect cannot re-send into a different foreground app");
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.set_value_failed_after_writing(), "{err}");
+    }
+
+    #[test]
+    fn a_field_that_stopped_being_editable_is_unconfirmed_and_post_dispatch() {
+        // Its value cannot be read back, so the write is unconfirmed rather than refused — and
+        // `set_text` went out either way, so the session must drop its cached value.
+        let (port, _ops) = fake_service(
+            vec![editable_field("old"), settled_field("old")],
+            OnAction::Ok,
+        );
+        let mut a = impatient_writer(port);
+        let t = built(&editable_field("old"));
+
+        let err = a
+            .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
+            .expect_err("a field that stopped reporting editable cannot confirm the write");
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.set_value_failed_after_writing(), "{err}");
+    }
+
+    #[test]
+    fn a_read_back_that_fails_is_unconfirmed_and_post_dispatch() {
+        // The read-back runs after `set_text`, so its own failure must not propagate raw — the
+        // transport verdicts are classified pre-dispatch, which keeps the stale cached value.
+        let (port, _ops) = fake_service_full(
+            vec![editable_field("old")],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+            vec![OnTree::Serve, OnTree::Refused("no active window")],
+        );
+        let mut a = impatient_writer(port);
+        let t = built(&editable_field("old"));
+
+        let err = a
+            .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
+            .expect_err("the verification read is refused");
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.set_value_failed_after_writing(), "{err}");
+        // The wrap exists to carry the cause; without it the caller learns only that something
+        // could not be confirmed.
+        assert!(err.to_string().contains("no active window"), "{err}");
     }
 
     #[test]

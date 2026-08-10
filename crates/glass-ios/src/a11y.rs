@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use glass_core::{
     GlassError, KeyEvent, MouseButton, PointerEvent, Result, typed_clear_landed, typed_text_landed,
+    write_took_no_effect,
 };
 
 use crate::axmap;
@@ -94,6 +95,11 @@ fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
     node.bounds
         .ok_or(GlassError::AxElementNotClickable(target.id.0))
 }
+
+/// What a write that took no effect looks like on this backend: `set_value` types, so the tap that
+/// aims the keystrokes is the part that can miss. Twin of the const in `glass-android/src/a11y.rs`.
+const TAP_MAY_HAVE_MISSED: &str = "this write is a tap and then keystrokes, so the tap may have missed the element — writing \
+     again is worth one attempt";
 
 /// How long to let the app commit typed text before each read-back attempt. Generous next to a
 /// keystroke and small next to the `describe` that follows it.
@@ -216,11 +222,22 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     } else {
         // The mapper drops an empty value, so an empty field arrives as `None` — which the verdict
         // reserves for a reading nobody took.
-        Err(GlassError::value_not_applied(
-            target.id.0,
-            text,
-            Some(node.value.as_deref().unwrap_or("")),
-        ))
+        let observed = node.value.as_deref().unwrap_or("");
+        // Only where the field never moved: on a value the element transformed — an iOS field
+        // autocapitalizing a typed lowercase letter (glass#363) — the tap landed, so "write again"
+        // would contradict the sentence this clause hangs off.
+        Err(
+            if write_took_no_effect(observed, Some(target.value.as_deref().unwrap_or(""))) {
+                GlassError::value_not_applied_because(
+                    target.id.0,
+                    text,
+                    Some(observed),
+                    TAP_MAY_HAVE_MISSED,
+                )
+            } else {
+                GlassError::value_not_applied(target.id.0, text, Some(observed))
+            },
+        )
     }
 }
 
@@ -407,17 +424,25 @@ mod tests {
     }
 
     /// Pin the whole verdict, not the variant: the two values it names are what a caller acts on
-    /// (glass#363). Twin of the helper in `glass-android/src/a11y.rs`.
+    /// (glass#363), and `why` attaches only to a field that never moved (glass#405). Twin of the
+    /// helper in `glass-android/src/a11y.rs`.
     #[track_caller]
-    fn assert_not_applied(outcome: Result<()>, id: u32, requested: &str, observed: Option<&str>) {
+    fn assert_not_applied(
+        outcome: Result<()>,
+        id: u32,
+        requested: &str,
+        observed: Option<&str>,
+        why: Option<&str>,
+    ) {
         match outcome {
             Err(GlassError::AxValueNotApplied {
                 id: got_id,
                 requested: req,
                 observed: obs,
+                why: got_why,
             }) => assert_eq!(
-                (got_id, req.as_str(), obs.as_deref()),
-                (id, requested, observed)
+                (got_id, req.as_str(), obs.as_deref(), got_why),
+                (id, requested, observed, why)
             ),
             other => panic!("expected a not-applied verdict, got {other:?}"),
         }
@@ -448,6 +473,7 @@ mod tests {
             1,
             "",
             Some("Search settings"),
+            None,
         );
     }
 
@@ -475,6 +501,7 @@ mod tests {
             1,
             "world",
             Some("hello"),
+            None,
         );
     }
 
@@ -490,6 +517,7 @@ mod tests {
             1,
             "glasssmoke3",
             Some("Glasssmoke3"),
+            None,
         );
     }
 
@@ -503,6 +531,9 @@ mod tests {
             1,
             "world",
             Some(""),
+            // The field held nothing before and holds nothing now, so the write took no effect and
+            // the backend's own explanation of that is what closes the message.
+            Some(TAP_MAY_HAVE_MISSED),
         );
     }
 
@@ -516,6 +547,7 @@ mod tests {
             1,
             "world",
             Some("worl"),
+            None,
         );
     }
 
@@ -534,6 +566,7 @@ mod tests {
             1,
             "world",
             Some("hello"),
+            None,
         );
     }
 
@@ -711,10 +744,10 @@ mod tests {
         );
         let err = verify_write(&replaced, &matching_target(), "world").unwrap_err();
         assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
-        // "the text was typed" is common to every AxWriteUnconfirmed arm (it's in the #[error]
+        // "the write went out" is common to every AxWriteUnconfirmed arm (it's in the #[error]
         // template, not this arm's own clause) — assert the Gone arm's own sentence too, or a
         // change to just this arm's message would leave the suite green.
-        assert!(err.to_string().contains("the text was typed"), "{err}");
+        assert!(err.to_string().contains("the write went out"), "{err}");
         assert!(err.to_string().contains("replaced"), "{err}");
     }
 

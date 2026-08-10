@@ -561,18 +561,22 @@ another form and writing again will not change that: a field that reformats (`"1
 `"(123) 456-7890"`), or one that autocapitalizes (an iOS text field returning `"Hello"` for a typed
 `"hello"`, intermittently — it depends on whether the field had finished emptying when the first key
 arrived). An element holding **part** of your text dropped a keystroke, and writing again is the fix.
-An element holding **what it held before** never received the write: on a desktop backend its value
-is usually a read-only projection, so focus it and use `glass_type` instead.
+An element holding **what it held before** took no effect from the write, and only then does the
+error close with what the backend that made it knows about that: a desktop element's value is often
+a read-only projection, so focus it and use `glass_type` instead; a mobile write is a tap and then
+keystrokes, so the tap may have missed; and a *Compose* field driven through Android's on-device
+accessibility service cannot have its text *replaced*, only set into an empty field.
 
 A cleared field (`text: ""`) that reads back holding its placeholder is the one false failure here —
 the clear landed and the accessibility layer substituted the hint. Confirm it with a screenshot
 rather than writing again.
 
-One error is not a refusal: *the text was typed, but the write could not be confirmed*. The
-keystrokes went out and the read-back afterwards could not establish where they landed — it failed
+One error is not a refusal: *the write went out, but could not be confirmed*. The write reached the
+app and the read-back afterwards could not establish where it landed — it failed
 outright, several elements now match the one you named, nothing does, the read was cut short, or the
 element is no longer editable to read back. **Do not call `glass_set_value` again on that error** —
-the app has the text already, and writing again types it twice. Re-snapshot and read the element to
+the app may have the text already, and on a backend that types, writing again types it twice.
+Re-snapshot and read the element to
 see what it holds. When the message names a node cap, raising `max_nodes` on the snapshot is what
 fixes it. Clearing a field (`text: ""`) additionally needs the element to have a `name`: an empty
 field is not by itself evidence the clear landed on the element you meant, so a nameless one reports

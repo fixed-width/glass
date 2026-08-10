@@ -11,7 +11,7 @@ use glass_core::accessibility::{
 };
 use glass_core::{
     GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry, typed_clear_landed,
-    typed_text_landed,
+    typed_text_landed, write_took_no_effect,
 };
 
 use crate::adb::{Adb, AdbOp};
@@ -406,22 +406,38 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     } else {
         // The mapper drops an empty value, so an empty field arrives as `None` — which the verdict
         // reserves for a reading nobody took.
-        Err(GlassError::value_not_applied(
-            target.id.0,
-            text,
-            Some(node.value.as_deref().unwrap_or("")),
-        ))
+        let observed = node.value.as_deref().unwrap_or("");
+        // Only where the field never moved: on a value the element transformed — an iOS field
+        // autocapitalizing a typed lowercase letter (glass#363) — the tap landed, and telling the
+        // caller to write again contradicts the sentence this clause hangs off.
+        Err(
+            if write_took_no_effect(observed, Some(target.value.as_deref().unwrap_or(""))) {
+                GlassError::value_not_applied_because(
+                    target.id.0,
+                    text,
+                    Some(observed),
+                    TAP_MAY_HAVE_MISSED,
+                )
+            } else {
+                GlassError::value_not_applied(target.id.0, text, Some(observed))
+            },
+        )
     }
 }
 
 /// The read-back's own failure, reported as an unconfirmed write.
 ///
-/// Post-dispatch by construction: its only caller is the loop that runs after the keystrokes went
-/// out. A verdict `GlassError::set_value_failed_after_writing` rejects would leave the session
-/// holding the value it cached for a write that already landed, and refuse the retry as drift.
-fn read_back_failed(target: &AxTarget, e: &GlassError) -> GlassError {
+/// For a read-back loop only, which is what makes it post-dispatch: `AndroidA11y`'s keystrokes and
+/// `ServiceA11y`'s `ACTION_SET_TEXT` have both gone out by the time either calls this, so a verdict
+/// `GlassError::set_value_failed_after_writing` rejects would refuse the retry as drift.
+pub(crate) fn read_back_failed(target: &AxTarget, e: &GlassError) -> GlassError {
     GlassError::AxWriteUnconfirmed(target.id.0, format!("reading the element back failed: {e}"))
 }
+
+/// What a write that took no effect looks like on this backend: `set_value` types, so the tap that
+/// aims the keystrokes is the part that can miss. Twin of the const in `glass-ios/src/a11y.rs`.
+const TAP_MAY_HAVE_MISSED: &str = "this write is a tap and then keystrokes, so the tap may have missed the element — writing \
+     again is worth one attempt";
 
 /// How many times to read the element back before reporting the write as not applied. A landed
 /// write confirms on the first read and pays for one; the retries exist for a field that commits a
@@ -731,9 +747,9 @@ impl Accessibility for AndroidA11y {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attempt, COLD_BOUND, RetryBound, Warmth, bound_fired, dump_once, dump_until_ready,
-        editable_target, locate_editable_target, locate_for_write, read_back_failed,
-        snapshot_bound, snapshot_with_runner, verify_write,
+        Attempt, COLD_BOUND, RetryBound, TAP_MAY_HAVE_MISSED, Warmth, bound_fired, dump_once,
+        dump_until_ready, editable_target, locate_editable_target, locate_for_write,
+        read_back_failed, snapshot_bound, snapshot_with_runner, verify_write,
     };
     use crate::adb::{AdbOp, a_failed_call, a_real_spawn_failure, a_real_timeout_hinted};
     use glass_core::accessibility::{
@@ -1955,17 +1971,25 @@ mod tests {
     }
 
     /// Pin the whole verdict, not the variant: the two values it names are what a caller acts on
-    /// (glass#363). Twin of the helper in `glass-ios/src/a11y.rs`.
+    /// (glass#363), and `why` attaches only to a field that never moved (glass#405). Twin of the
+    /// helper in `glass-ios/src/a11y.rs`.
     #[track_caller]
-    fn assert_not_applied(outcome: Result<()>, id: u32, requested: &str, observed: Option<&str>) {
+    fn assert_not_applied(
+        outcome: Result<()>,
+        id: u32,
+        requested: &str,
+        observed: Option<&str>,
+        why: Option<&str>,
+    ) {
         match outcome {
             Err(GlassError::AxValueNotApplied {
                 id: got_id,
                 requested: req,
                 observed: obs,
+                why: got_why,
             }) => assert_eq!(
-                (got_id, req.as_str(), obs.as_deref()),
-                (id, requested, observed)
+                (got_id, req.as_str(), obs.as_deref(), got_why),
+                (id, requested, observed, why)
             ),
             other => panic!("expected a not-applied verdict, got {other:?}"),
         }
@@ -1979,7 +2003,13 @@ mod tests {
         // takes focus, which is the false success this check exists to prevent.
         let after = tree_holding(Some("Search settings"));
         let t = target(0, Some("Search"), Some(BOUNDS));
-        assert_not_applied(verify_write(&after, &t, ""), 0, "", Some("Search settings"));
+        assert_not_applied(
+            verify_write(&after, &t, ""),
+            0,
+            "",
+            Some("Search settings"),
+            None,
+        );
     }
 
     #[test]
@@ -1987,7 +2017,13 @@ mod tests {
         // The case `verify_write`'s doc is about: the field still holds the old text.
         let after = tree_holding(Some("hello"));
         let t = target(0, Some("Search"), Some(BOUNDS));
-        assert_not_applied(verify_write(&after, &t, "world"), 0, "world", Some("hello"));
+        assert_not_applied(
+            verify_write(&after, &t, "world"),
+            0,
+            "world",
+            Some("hello"),
+            None,
+        );
     }
 
     #[test]
@@ -1996,7 +2032,15 @@ mod tests {
         // report as empty, not as a reading nobody took.
         let after = tree_holding(None);
         let t = target(0, Some("Search"), Some(BOUNDS));
-        assert_not_applied(verify_write(&after, &t, "world"), 0, "world", Some(""));
+        assert_not_applied(
+            verify_write(&after, &t, "world"),
+            0,
+            "world",
+            Some(""),
+            // Nothing before, nothing now: the write took no effect, and this backend's own
+            // explanation of that closes the message.
+            Some(TAP_MAY_HAVE_MISSED),
+        );
     }
 
     #[test]
@@ -2004,7 +2048,13 @@ mod tests {
         // The reason the rule is an exact match; `typed_text_landed` carries the argument.
         let after = tree_holding(Some("worl"));
         let t = target(0, Some("Search"), Some(BOUNDS));
-        assert_not_applied(verify_write(&after, &t, "world"), 0, "world", Some("worl"));
+        assert_not_applied(
+            verify_write(&after, &t, "world"),
+            0,
+            "world",
+            Some("worl"),
+            None,
+        );
     }
 
     #[test]
@@ -2019,6 +2069,7 @@ mod tests {
             0,
             "1234567890",
             Some("(123) 456-7890"),
+            None,
         );
     }
 
@@ -2037,11 +2088,17 @@ mod tests {
         // Re-finding must not weaken the value check: the field is found, and holds the wrong text.
         let after = under_a_container(tree_holding(Some("worl")));
         let t = target(0, Some("Search"), Some(BOUNDS));
-        assert_not_applied(verify_write(&after, &t, "world"), 0, "world", Some("worl"));
+        assert_not_applied(
+            verify_write(&after, &t, "world"),
+            0,
+            "world",
+            Some("worl"),
+            None,
+        );
     }
 
     #[test]
-    fn a_write_whose_screen_was_replaced_says_it_was_typed_but_unconfirmed() {
+    fn a_write_whose_screen_was_replaced_says_it_went_out_but_is_unconfirmed() {
         // glass#323's other half: the kill can land between the write and the read-back, which
         // is where four of the nine observed refusals came from.
         let err = verify_write(
@@ -2051,7 +2108,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, GlassError::AxWriteUnconfirmed(0, _)), "{err}");
-        assert!(err.to_string().contains("the text was typed"), "{err}");
+        assert!(err.to_string().contains("the write went out"), "{err}");
         assert!(err.to_string().contains("replaced"), "{err}");
     }
 
@@ -2438,7 +2495,7 @@ mod tests {
             .set_value(&ctx, &field, "world")
             .expect_err("a field still holding the old text has not taken the write");
         assert!(
-            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed }
+            matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed, .. }
                 if requested == "world" && observed.as_deref() == Some("hello")),
             "{err}"
         );
