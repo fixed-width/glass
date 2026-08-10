@@ -36,8 +36,19 @@ internal refactors, CI, or test-only changes.
   so a lowercase value can come back capitalized. It happens intermittently, depending on whether
   the field had finished emptying when the first key arrived, and it read as an unexplained "did
   not take" before.
+- On macOS, glass no longer waits for a Simulator it booted to finish shutting down before it
+  exits. Shutting one down takes about 3.3 seconds — longer than the whole budget glass allows
+  teardown — so it used to overrun that budget and be abandoned partway on every exit. The request
+  is made and glass leaves; CoreSimulator completes it afterwards, which means a Simulator can
+  still read as Booted for a few seconds after glass has gone.
 
 ### Fixed
+- Teardown at process exit now divides its budget instead of letting the first slow step consume
+  it. A device that stopped answering while the app was being stopped could leave glass no time to
+  hand it back: the accessibility companion stayed enabled, the `adb forward` stayed open, and an
+  emulator glass had booted stayed running — silently, because a step skipped for want of time
+  said nothing. Steps that are skipped now say so on stderr, and a tool call still holding the
+  session when the signal arrives is reported rather than quietly consuming the budget.
 - An accessibility reader that crashes on a particular app's tree now says so, instead of reporting
   that the backend stopped responding. On Linux and Windows the reader runs each call on its own
   worker thread; a crash there was indistinguishable from a call that never came back, so a read

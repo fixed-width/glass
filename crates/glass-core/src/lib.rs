@@ -13,7 +13,7 @@ pub mod toolpath;
 pub use toolpath::tool_path;
 
 pub mod bounded;
-pub use bounded::{run_bounded, run_bounded_until, run_bounded_with_stdin};
+pub use bounded::{note_if_skipped, run_bounded, run_bounded_until, run_bounded_with_stdin};
 
 pub mod a11y_thread;
 pub use a11y_thread::A11yThread;
@@ -76,8 +76,8 @@ pub use logbuf::{LogBuffer, LogLine, Stream};
 pub mod platform;
 pub use platform::{
     A11yBind, AppSpec, KeyEvent, MAX_GESTURE_POINTERS, MouseButton, Platform, PointerEvent,
-    SandboxLevel, Segment, TEARDOWN_BUDGET, WindowGeometry, WindowHint, WindowId, WindowInfo,
-    WindowOp,
+    SandboxLevel, Segment, TEARDOWN_BUDGET, TEARDOWN_HOOK_RESERVE, TEARDOWN_REAP_HEADROOM,
+    WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
 };
 
 pub mod accessibility;

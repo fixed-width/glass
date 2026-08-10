@@ -187,13 +187,21 @@ impl EmulatorRegistry {
     /// Stop every registered emulator (`adb -s <serial> emu kill`) and clear the list.
     /// Best-effort: a device already gone is fine.
     pub fn kill_all(&self) {
+        self.kill_all_until(None);
+    }
+
+    /// [`EmulatorRegistry::kill_all`] under a deadline the rest of teardown shares. `adb emu kill`
+    /// was observed at 2ms — it acknowledges and lets the VM go down on its own time — so this is
+    /// the cheapest step in teardown and the worst one to skip (glass#422).
+    pub fn kill_all_until(&self, deadline: Option<std::time::Instant>) {
         let clients = self
             .booted
             .lock()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
         for adb in clients {
-            let _ = adb.run(["emu", "kill"]);
+            let killed = adb.run_until(["emu", "kill"], deadline);
+            glass_core::note_if_skipped("killing a glass-booted emulator", &killed);
         }
     }
 
@@ -397,6 +405,34 @@ mod tests {
         assert_eq!(
             resolve_emulator_bin(&env, &exists),
             format!("{root}/emulator/emulator")
+        );
+    }
+
+    /// The deadline has to reach here, or a wedge earlier in teardown leaves a whole emulator
+    /// running — the cheapest step to make, the worst to skip (glass#422).
+    #[test]
+    #[cfg(unix)]
+    fn a_kill_that_never_answers_gives_up_at_the_shared_deadline() {
+        use crate::adb::{Answer, FakeAdb};
+        use std::time::{Duration, Instant};
+
+        let fake = FakeAdb::new(&[("*", Answer::Lingers)]);
+        let reg = EmulatorRegistry::new();
+        reg.register(fake.adb(), "emulator-5554".into());
+
+        let started = Instant::now();
+        reg.kill_all_until(Some(Instant::now() + Duration::from_millis(300)));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?} on an emulator that never answers — the 10s AdbOp budget was used \
+             instead of the deadline",
+            started.elapsed()
+        );
+        assert!(
+            fake.called("emu kill"),
+            "it still has to ask: {:?}",
+            fake.calls()
         );
     }
 

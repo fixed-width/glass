@@ -283,6 +283,21 @@ pub(crate) fn bundle_id_from_run(run: &[String]) -> Result<(Option<String>, Stri
 }
 
 impl IosPlatform {
+    /// Terminate the app, under `deadline` when the caller has one to share.
+    fn stop_app_until(&mut self, deadline: Option<Instant>) -> Result<()> {
+        if let Some(app) = self.app.take() {
+            // Best-effort teardown: the app may already be gone (it crashed, or a prior
+            // launch's `--terminate-running-process` killed it), so a failing `terminate`
+            // is not an error — dropping the session is the goal, and it is idempotent.
+            let stopped = self
+                .target
+                .simctl()
+                .run_until(&["terminate", self.target.udid(), &app.bundle_id], deadline);
+            glass_core::note_if_skipped("terminating the app", &stopped);
+        }
+        Ok(())
+    }
+
     /// Resolve (attaching to or booting) a simulator per the `GLASS_IOS_*` env vars, then
     /// try to start its `idb_companion` input/accessibility driver.
     ///
@@ -586,16 +601,15 @@ impl Platform for IosPlatform {
     }
 
     fn stop_app(&mut self) -> Result<()> {
-        if let Some(app) = self.app.take() {
-            // Best-effort teardown: the app may already be gone (it crashed, or a prior
-            // launch's `--terminate-running-process` killed it), so a failing `terminate`
-            // is not an error — dropping the session is the goal, and it is idempotent.
-            let _ = self
-                .target
-                .simctl()
-                .run(&["terminate", self.target.udid(), &app.bundle_id]);
-        }
-        Ok(())
+        self.stop_app_until(None)
+    }
+
+    /// `terminate` measures ~101ms against the 3s all of teardown gets, so the deadline is not
+    /// expected to bind. It is for the simulator that stopped answering, which would otherwise run
+    /// out the 10s `SimctlOp::Query` budget and leave nothing for the hook behind it
+    /// (glass#427).
+    fn stop_app_by(&mut self, deadline: Instant) -> Result<()> {
+        self.stop_app_until(Some(deadline))
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
@@ -1306,6 +1320,31 @@ mod teardown_tests {
         drop(p);
 
         assert_eq!(terminations(&fake).len(), 1, "{:?}", fake.calls());
+    }
+
+    /// The iOS half of the composition guarantee: a `terminate` that never answers must not spend
+    /// what the hook behind it needs (glass#427).
+    #[test]
+    fn a_terminate_that_never_answers_gives_up_at_the_shared_deadline() {
+        let fake = FakeSimctl::new();
+        fake.slow("terminate", 5);
+        let mut p = platform(&fake, true);
+
+        let started = std::time::Instant::now();
+        p.stop_app_by(std::time::Instant::now() + std::time::Duration::from_millis(300))
+            .expect("teardown is best-effort and reports success either way");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "waited {waited:?} on a terminate that never answers — the 10s SimctlOp budget was \
+             used instead of the deadline"
+        );
+        assert!(
+            fake.called("terminate test-udid"),
+            "it still has to ask: {:?}",
+            fake.calls()
+        );
     }
 
     /// A `w`x`h` opaque PNG, as `simctl io screenshot` writes one.

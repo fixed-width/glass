@@ -1,4 +1,6 @@
 //! `Glass` session lifecycle: start/stop/shutdown and geometry.
+use std::time::Instant;
+
 use super::*;
 
 impl Glass {
@@ -82,16 +84,28 @@ impl Glass {
     /// failed `stop_app` must not prevent releasing the rest (the OS reaps anything
     /// left). Distinct from `stop()`, which reports errors to a tool caller.
     ///
+    /// `deadline` is when teardown is expected to be done. Stopping the sessions is held
+    /// [`crate::TEARDOWN_HOOK_RESERVE`] short of it: a shared deadline bounds a sequence without
+    /// dividing one, so a device that stops answering during `stop_app` would otherwise leave the
+    /// hook with nothing, and a step with no time left is not run at all (glass#422).
+    ///
+    /// A third step between them is bounded by neither — dropping the session reaps the backend
+    /// (Xvfb, sway, a Job object) and the log-stream children, each an unbounded `wait()`.
+    ///
     /// Written to drain the session set so the future multi-session registry (a
     /// `HashMap` instead of this `Option`) reuses it unchanged — it becomes a `for`
     /// loop with no other change.
-    pub fn shutdown(&mut self) {
+    pub fn shutdown(&mut self, deadline: Instant) {
+        // Never more than half, or a caller whose budget is smaller than the reserve — a test,
+        // a host that shortens it — starves the sessions instead of the hook.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let reserve = crate::TEARDOWN_HOOK_RESERVE.min(remaining / 2);
         if let Some(mut s) = self.active.take() {
-            let _ = s.platform.stop_app();
+            let _ = s.platform.stop_app_by(deadline - reserve);
             // `s` drops here: the backend (Xvfb/sway/Job) is torn down.
         }
         if let Some(hook) = self.shutdown_hook.take() {
-            hook();
+            hook(deadline);
         }
     }
 
@@ -137,6 +151,12 @@ mod tests {
         assert_eq!(lines[0].text, "ready");
     }
 
+    /// A deadline far enough out that nothing in these tests is bounded by it — they are about
+    /// what `shutdown` calls, not about what a spent budget does.
+    fn soon() -> std::time::Instant {
+        std::time::Instant::now() + crate::TEARDOWN_BUDGET
+    }
+
     #[test]
     fn shutdown_runs_the_hook() {
         use std::sync::Arc;
@@ -145,8 +165,8 @@ mod tests {
         let f = fired.clone();
         let mut g =
             glass_with_factory(Box::new(|_b| Err(GlassError::Backend("no backend".into()))));
-        g.set_shutdown_hook(Box::new(move || f.store(true, Ordering::SeqCst)));
-        g.shutdown();
+        g.set_shutdown_hook(Box::new(move |_| f.store(true, Ordering::SeqCst)));
+        g.shutdown(soon());
         assert!(
             fired.load(Ordering::SeqCst),
             "shutdown should invoke the hook"
@@ -193,7 +213,7 @@ mod tests {
         });
         let mut g = glass_with_factory(factory);
         g.start(&spec()).unwrap();
-        g.shutdown();
+        g.shutdown(soon());
         assert_eq!(
             *stops.lock().unwrap(),
             1,
@@ -204,7 +224,7 @@ mod tests {
             "the session is cleared after shutdown"
         );
         // Idempotent: a second shutdown with nothing active is a harmless no-op.
-        g.shutdown();
+        g.shutdown(soon());
         assert_eq!(
             *stops.lock().unwrap(),
             1,
@@ -212,9 +232,106 @@ mod tests {
         );
     }
 
+    /// The budget is only useful if it reaches the code that spends it: a backend that tears down
+    /// over a link, and a hook that does the same for the host's own resources.
+    #[test]
+    fn shutdown_hands_its_deadline_to_both_the_backend_and_the_hook() {
+        let at_stop = Arc::new(Mutex::new(None));
+        let recorded = at_stop.clone();
+        let factory: PlatformFactory = Box::new(move |_backend| {
+            Ok(Backend::display_only(Box::new(
+                FakePlatform::new(10, 10).recording_stop_deadline(recorded.clone()),
+            )))
+        });
+        let at_hook = Arc::new(Mutex::new(None));
+        let hooked = at_hook.clone();
+        let mut g = glass_with_factory(factory);
+        g.set_shutdown_hook(Box::new(move |d| *hooked.lock().unwrap() = Some(d)));
+        g.start(&spec()).unwrap();
+
+        let deadline = soon();
+        g.shutdown(deadline);
+
+        let at_stop = at_stop
+            .lock()
+            .unwrap()
+            .expect("the backend must be stopped through `stop_app_by`, not `stop_app`");
+        assert!(
+            at_stop < deadline,
+            "the session's share must stop short of the hook's, or the reserve is not held back"
+        );
+        assert_eq!(
+            *at_hook.lock().unwrap(),
+            Some(deadline),
+            "the hook gets the whole deadline; the reserve is what the session gave up"
+        );
+    }
+
+    /// The property this whole split exists for (glass#422): a session that spends everything it
+    /// The other half of the split: the reserve is a fixed 750ms, so without the clamp a caller
+    /// whose whole budget is smaller hands the sessions a deadline already in the past.
+    #[test]
+    fn a_budget_smaller_than_the_reserve_still_leaves_the_sessions_time() {
+        let at_stop = Arc::new(Mutex::new(None));
+        let recorded = at_stop.clone();
+        let factory: PlatformFactory = Box::new(move |_backend| {
+            Ok(Backend::display_only(Box::new(
+                FakePlatform::new(10, 10).recording_stop_deadline(recorded.clone()),
+            )))
+        });
+        let mut g = glass_with_factory(factory);
+        g.start(&spec()).unwrap();
+
+        // A fifth of the reserve, so an unclamped subtraction lands well in the past.
+        let budget = crate::TEARDOWN_HOOK_RESERVE / 5;
+        let started = std::time::Instant::now();
+        g.shutdown(started + budget);
+
+        let given = at_stop
+            .lock()
+            .unwrap()
+            .expect("the backend was stopped")
+            .saturating_duration_since(started);
+        assert!(
+            given >= budget / 3,
+            "the sessions were given {given:?} of a {budget:?} budget — the reserve was taken \
+             whole from a budget too small to pay it"
+        );
+    }
+
+    /// is given must still leave the hook enough to run. Without the reserve the hook is reached
+    /// with a spent deadline, and `run_bounded_until` does not start a command it has no time for
+    /// — so every step behind it is skipped rather than merely slow.
+    #[test]
+    fn a_session_that_burns_its_deadline_still_leaves_the_hook_time_to_run() {
+        let factory: PlatformFactory = Box::new(move |_backend| {
+            Ok(Backend::display_only(Box::new(
+                FakePlatform::new(10, 10).burning_its_deadline(),
+            )))
+        });
+        let left = Arc::new(Mutex::new(None));
+        let recorded = left.clone();
+        let mut g = glass_with_factory(factory);
+        g.set_shutdown_hook(Box::new(move |d| {
+            *recorded.lock().unwrap() =
+                Some(d.saturating_duration_since(std::time::Instant::now()));
+        }));
+        g.start(&spec()).unwrap();
+
+        // A tenth of the real budget, so the test costs what it measures rather than 3s.
+        let budget = crate::TEARDOWN_BUDGET / 10;
+        g.shutdown(std::time::Instant::now() + budget);
+
+        let left = left.lock().unwrap().expect("the hook ran at all");
+        assert!(
+            left > std::time::Duration::ZERO,
+            "the hook was handed a spent deadline, so every step behind the session is skipped"
+        );
+    }
+
     #[test]
     fn shutdown_without_active_session_is_noop() {
         let mut g = glass_with(FakePlatform::new(10, 10));
-        g.shutdown(); // must not panic and must not error
+        g.shutdown(soon()); // must not panic and must not error
     }
 }

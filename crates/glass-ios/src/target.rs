@@ -44,17 +44,43 @@ impl SimulatorRegistry {
         }
     }
 
-    /// Shut down every registered simulator (`xcrun simctl shutdown <udid>`) and clear the
-    /// list. Best-effort: a simulator already stopped, or a host with no simulator support at
-    /// all, is fine — each shutdown's result is discarded.
-    pub fn shutdown_all(&self) {
+    /// Ask every registered simulator to shut down (`xcrun simctl shutdown <udid>`) and clear the
+    /// list, without waiting for CoreSimulator to finish.
+    ///
+    /// **Measured at 3.26-3.40s over three rounds on one device** (M4 mini, freshly booted idle
+    /// simulator) — over `glass_core::TEARDOWN_BUDGET` on its own, before stopping the app is
+    /// counted, so waiting it out overran the budget on every exit with a simulator to shut down
+    /// (glass#427).
+    ///
+    /// The request survives this process only once made: killing the client at spawn leaves the
+    /// device Booted 30s later, killing it 0.2s in still shuts down. Hence the child's own process
+    /// group — a Ctrl-C to glass's group would otherwise take it inside that window.
+    ///
+    /// Nothing waits for the result, so the reaper thread reports it.
+    pub fn request_shutdown_all(&self) {
         let udids = self
             .booted
             .lock()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
         for udid in udids {
-            let _ = self.simctl.run(&["shutdown", &udid]);
+            match self.simctl.spawn_detached(&["shutdown", &udid]) {
+                Ok(child) => {
+                    // Reaped on its own thread so a caller that does not exit leaves no zombie.
+                    // On process exit the thread goes too and the child is reparented to launchd,
+                    // which is the point.
+                    std::thread::spawn(move || match child.wait_with_output() {
+                        Ok(out) if !out.status.success() => eprintln!(
+                            "glass-ios: {udid} refused to shut down ({}): {}",
+                            out.status,
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ),
+                        Err(e) => eprintln!("glass-ios: lost track of {udid}'s shutdown: {e}"),
+                        _ => {}
+                    });
+                }
+                Err(e) => eprintln!("glass-ios: could not ask {udid} to shut down: {e}"),
+            }
         }
     }
 
@@ -144,6 +170,7 @@ impl SimTarget {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     fn getter(m: HashMap<&'static str, &'static str>) -> impl Fn(&str) -> Option<String> {
         move |k: &str| m.get(k).map(|s| s.to_string())
@@ -185,30 +212,82 @@ mod tests {
         assert_ne!(SimTarget::for_test().simctl().program(), "xcrun");
     }
 
+    /// Waited for, not read straight away: `shutdown_all` spawns and returns, so the argv lands
+    /// after it.
     #[test]
     fn shutdown_all_shuts_down_what_it_recorded_and_clears_the_registry() {
         let fake = crate::simctl::FakeSimctl::new();
         let r = SimulatorRegistry::at(&fake.program());
         r.register("AAA".into());
 
-        r.shutdown_all();
+        r.request_shutdown_all();
 
+        assert!(
+            fake.wait_called("shutdown AAA", Duration::from_secs(5)),
+            "{:?}",
+            fake.calls()
+        );
+        // The whole list, not a substring — asking twice is as wrong as not asking.
         assert_eq!(fake.calls(), vec!["simctl shutdown AAA"]);
         assert!(r.udids().is_empty());
     }
 
-    /// Shutdown is best-effort — a simulator already stopped answers non-zero — but the registry
-    /// must still be cleared, or a second `shutdown_all` retries a device that is already gone.
+    /// Killing the client at spawn leaves the device Booted 30s later (measured), so a Ctrl-C
+    /// reaching glass's group inside that window would strand the simulator.
     #[test]
-    fn a_shutdown_that_fails_still_clears_the_registry() {
+    fn the_shutdown_it_asks_for_runs_in_its_own_process_group() {
         let fake = crate::simctl::FakeSimctl::new();
-        fake.fails("shutdown");
         let r = SimulatorRegistry::at(&fake.program());
         r.register("AAA".into());
 
-        r.shutdown_all();
+        r.request_shutdown_all();
+        assert!(fake.wait_called("shutdown AAA", Duration::from_secs(5)));
 
-        assert!(fake.called("shutdown AAA"), "{:?}", fake.calls());
-        assert!(r.udids().is_empty());
+        let ours = std::process::id().to_string();
+        let theirs = fake.pgid();
+        assert!(!theirs.is_empty(), "the fake recorded no process group");
+        assert_ne!(
+            theirs,
+            unsafe_pgid_of_self(),
+            "the child shares glass's process group, so a group-directed signal takes it too"
+        );
+        let _ = ours;
+    }
+
+    /// This process's group id, read the way the fake reads its own.
+    fn unsafe_pgid_of_self() -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "pgid=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps answers for this process");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The measured defect (glass#427): a real `simctl shutdown` takes ~3.3s, which is over the
+    /// whole teardown budget on its own, so process exit must not wait for it. The fake sleeps 1s
+    /// rather than 3 so the test does not end with its own `TempDir` deleted under a running
+    /// script.
+    #[test]
+    fn shutdown_all_returns_without_waiting_for_the_simulator_to_go_down() {
+        let fake = crate::simctl::FakeSimctl::new();
+        fake.slow("shutdown", 1);
+        let r = SimulatorRegistry::at(&fake.program());
+        r.register("AAA".into());
+
+        let started = Instant::now();
+        r.request_shutdown_all();
+        let waited = started.elapsed();
+
+        assert!(
+            waited < Duration::from_millis(500),
+            "waited {waited:?} for a shutdown that takes 1s — process exit is blocked on \
+             CoreSimulator"
+        );
+        // And it really did ask, rather than returning fast by doing nothing.
+        assert!(
+            fake.wait_called("shutdown AAA", Duration::from_secs(10)),
+            "{:?}",
+            fake.calls()
+        );
     }
 }

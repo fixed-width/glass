@@ -2,23 +2,49 @@
 //! best-effort `Glass::shutdown()`, plus a cross-platform termination signal.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glass_core::Glass;
 use tokio::sync::Mutex;
+
+/// How long a tool call may hold the session before teardown says so.
+///
+/// The lock is held for a whole tool body and some legitimately outlast the budget — `am start`
+/// gets 60s — which is a different failure from a step that ran and overran, and reads the same
+/// without a line of its own.
+const LOCK_WAIT_WORTH_SAYING: Duration = Duration::from_millis(250);
 
 /// Best-effort, time-bounded teardown of all sessions for process exit. The backend
 /// teardown blocks (it waits on the child), so it runs off the async reactor via
 /// `spawn_blocking`; after `budget` we stop waiting and let the OS reap whatever is
 /// left — we are exiting regardless.
+///
+/// Two bounds, for two failures. `Glass::shutdown`'s deadline is what its steps spend, held
+/// [`glass_core::TEARDOWN_REAP_HEADROOM`] short of `budget` so killing a wedged step — up to
+/// `bounded::KILL_REAP` past its deadline — still lands inside. This `timeout` is the backstop for
+/// a step that ignores the deadline: a `spawn_blocking` task cannot be cancelled, so that step is
+/// still running when the process exits, and its child is orphaned.
 pub async fn run_shutdown(sessions: Arc<Mutex<Glass>>, budget: Duration) {
     let task = tokio::task::spawn_blocking(move || {
+        // Started after the lock: a tool call in flight holds the session, and a deadline
+        // measured across that wait arrives spent — reported downstream as every step skipped,
+        // when what happened is that teardown never got to start.
+        let waiting = Instant::now();
         // On a `spawn_blocking` thread, `blocking_lock` is allowed (it would panic on
         // a reactor worker thread).
-        sessions.blocking_lock().shutdown();
+        let mut glass = sessions.blocking_lock();
+        let waited = waiting.elapsed();
+        if waited > LOCK_WAIT_WORTH_SAYING {
+            eprintln!("glass: a tool call held the session for {waited:?} before teardown started");
+        }
+        glass.shutdown(Instant::now() + budget - glass_core::TEARDOWN_REAP_HEADROOM);
     });
-    if tokio::time::timeout(budget, task).await.is_err() {
-        eprintln!("glass: shutdown exceeded {budget:?}; exiting anyway");
+    match tokio::time::timeout(budget, task).await {
+        Ok(Ok(())) => {}
+        // A panic inside teardown: the steps behind it did not run, and the process is about to
+        // exit past it.
+        Ok(Err(e)) => eprintln!("glass: teardown panicked ({e}); exiting anyway"),
+        Err(_) => eprintln!("glass: shutdown exceeded {budget:?}; exiting anyway"),
     }
 }
 
@@ -126,6 +152,79 @@ mod tests {
             sandbox: glass_core::SandboxLevel::Off,
             a11y: false,
         }
+    }
+
+    /// Nothing else checks that `run_shutdown` subtracts the headroom that pays for killing a
+    /// wedged step — up to `KILL_REAP` past its deadline.
+    #[tokio::test]
+    async fn the_deadline_the_backend_gets_leaves_room_to_kill_a_wedged_step() {
+        struct RecordingBackend(Arc<std::sync::Mutex<Option<Duration>>>);
+        impl Platform for RecordingBackend {
+            fn start_app(&mut self, _s: &AppSpec) -> Result<WindowGeometry> {
+                Ok(WindowGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                })
+            }
+            fn stop_app(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn stop_app_by(&mut self, deadline: Instant) -> Result<()> {
+                *self.0.lock().unwrap() = Some(deadline.saturating_duration_since(Instant::now()));
+                Ok(())
+            }
+            fn capture_frame(&mut self, _r: Option<&Region>) -> Result<Frame> {
+                unimplemented!()
+            }
+            fn send_pointer(&mut self, _e: &PointerEvent) -> Result<()> {
+                unimplemented!()
+            }
+            fn send_key(&mut self, _e: &KeyEvent) -> Result<()> {
+                unimplemented!()
+            }
+            fn window(&mut self, _o: &WindowOp) -> Result<WindowGeometry> {
+                unimplemented!()
+            }
+            fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+                Ok(vec![])
+            }
+            fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+                unimplemented!()
+            }
+            fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+                vec![]
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let recorded = seen.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let factory: PlatformFactory = Box::new(move |_b| {
+            Ok(Backend::display_only(Box::new(RecordingBackend(
+                recorded.clone(),
+            ))))
+        });
+        let mut glass = Glass::new(
+            factory,
+            "x11".into(),
+            BaselineStore::new(dir.path().join("baselines")),
+            100,
+        );
+        glass.start(&spec()).unwrap();
+
+        let budget = Duration::from_secs(3);
+        run_shutdown(Arc::new(Mutex::new(glass)), budget).await;
+
+        let got = seen.lock().unwrap().expect("the backend was stopped");
+        // With a margin: without the subtraction the backend still comes up a few microseconds
+        // short of the budget, which a bare `<` would read as headroom.
+        assert!(
+            got + Duration::from_millis(100) < budget - glass_core::TEARDOWN_REAP_HEADROOM,
+            "the backend was handed {got:?} of a {budget:?} budget — the headroom that pays for \
+             killing a wedged step was not subtracted"
+        );
     }
 
     #[tokio::test]

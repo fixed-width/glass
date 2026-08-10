@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{GlassError, Result};
 use crate::frame::{Frame, Region};
@@ -17,6 +17,38 @@ use crate::logbuf::Stream;
 /// backends are the ones that have to respect it and they cannot see a private one. Each backend
 /// asserts its own budget against it at compile time; grep for `TEARDOWN_BUDGET` to find them.
 pub const TEARDOWN_BUDGET: Duration = Duration::from_secs(3);
+
+/// How much of [`TEARDOWN_BUDGET`] is held back from the deadline the steps are given.
+///
+/// Killing a step that hit its deadline costs up to [`crate::bounded::KILL_REAP`] *after* that
+/// deadline, so without headroom the case this exists for — one step wedges, is cut off, the rest
+/// still run — is itself what overruns the budget.
+pub const TEARDOWN_REAP_HEADROOM: Duration = Duration::from_millis(750);
+
+/// How much of [`TEARDOWN_BUDGET`] is reserved for the host's shutdown hook, so stopping the
+/// sessions cannot spend all of it.
+///
+/// A shared deadline bounds a sequence; it does not divide one. Without a reserve, a device that
+/// stops answering during `stop_app` leaves the hook nothing — and `run_bounded_until` does not
+/// start a command with no time left, so its steps are skipped rather than slowed. On Android the
+/// hook is what hands the device back: the companion it enabled, the `adb forward` it opened, the
+/// emulator it booted.
+///
+/// Five adb calls, the slowest measured at 52ms on an emulator with every core saturated
+/// (glass#422).
+pub const TEARDOWN_HOOK_RESERVE: Duration = Duration::from_millis(750);
+
+// The three have to fit, or the split is a slower way of running out of time. The sessions get
+// what is left — 1.5s, against the ~270ms the slowest measured backend teardown needs.
+const _: () = assert!(
+    TEARDOWN_REAP_HEADROOM.as_millis() + TEARDOWN_HOOK_RESERVE.as_millis()
+        < TEARDOWN_BUDGET.as_millis(),
+    "the reap headroom and the hook's reserve must leave the sessions something to stop with"
+);
+const _: () = assert!(
+    crate::bounded::KILL_REAP.as_millis() < TEARDOWN_REAP_HEADROOM.as_millis(),
+    "the headroom must cover a killed step's reap, or the kill itself overruns the budget"
+);
 
 /// How aggressively to contain the process tree a backend launches. Platform-agnostic
 /// *policy*; the Linux mechanism (bubblewrap) lives in the `glass-sandbox-linux` crate.
@@ -226,6 +258,18 @@ pub trait Platform {
 
     /// Terminate the running app (idempotent).
     fn stop_app(&mut self) -> Result<()>;
+
+    /// [`Platform::stop_app`] on the process-exit path, where the whole of teardown shares
+    /// [`TEARDOWN_BUDGET`] and `deadline` is this step's share of it.
+    ///
+    /// The default ignores it, which is what a signal ladder over local processes already asserts
+    /// against [`TEARDOWN_BUDGET`] at compile time (x11, wayland, windows, macos — each with the
+    /// residual its own comment names). A backend that tears down over a link to a device has one
+    /// tool invocation per step, each with its own budget and no sum to assert, so it overrides
+    /// this and spends the shared deadline (glass#422, glass#427).
+    fn stop_app_by(&mut self, _deadline: Instant) -> Result<()> {
+        self.stop_app()
+    }
 
     /// Capture the current window contents as an RGBA frame. `region` (if set,
     /// window-relative) captures only that sub-rectangle; `None` captures the
@@ -477,6 +521,51 @@ mod tests {
     #[test]
     fn default_app_pid_is_unknown() {
         assert_eq!(MinimalPlatform.app_pid(), None);
+    }
+
+    /// The default is what the four constant-bounded backends rely on, and it is reached only on
+    /// the exit path — where a body of `Ok(())` would mean they quietly stopped stopping their
+    /// app, with every existing test still green.
+    #[test]
+    fn default_stop_app_by_stops_the_app_and_ignores_the_deadline() {
+        struct CountingPlatform(u32);
+        impl Platform for CountingPlatform {
+            fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
+                Ok(WindowGeometry::default())
+            }
+            fn stop_app(&mut self) -> Result<()> {
+                self.0 += 1;
+                Ok(())
+            }
+            fn capture_frame(&mut self, _region: Option<&Region>) -> Result<Frame> {
+                unimplemented!()
+            }
+            fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
+                unimplemented!()
+            }
+            fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
+                unimplemented!()
+            }
+            fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
+                unimplemented!()
+            }
+            fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+                unimplemented!()
+            }
+            fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+                unimplemented!()
+            }
+            fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+                vec![]
+            }
+        }
+
+        let mut p = CountingPlatform(0);
+        // A deadline already gone: the default must stop the app regardless, since it does not
+        // spend one.
+        p.stop_app_by(Instant::now() - Duration::from_secs(1))
+            .expect("the default delegates to stop_app");
+        assert_eq!(p.0, 1);
     }
 
     #[test]

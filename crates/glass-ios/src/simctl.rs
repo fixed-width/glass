@@ -1,7 +1,7 @@
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use glass_core::{GlassError, Result, run_bounded};
+use glass_core::{GlassError, Result, run_bounded, run_bounded_until};
 
 /// What a `simctl` invocation is doing, which is what decides how long it may take.
 ///
@@ -9,7 +9,11 @@ use glass_core::{GlassError, Result, run_bounded};
 /// simulator finishes booting — minutes on a cold machine — so it is bounded generously rather
 /// than left unbounded, because a boot that never completes must still end as an error.
 ///
-/// Budgets are ~4x the slowest healthy run measured on the dogfood simulator, floored at 10s.
+/// Budgets are ~4x the slowest healthy run measured on the dogfood simulator, floored at 10s — a
+/// bound on a simulator that has stopped answering, not what a call is expected to cost:
+/// `terminate` measured 101ms median over 25 runs. `shutdown` is the one verb whose *expected*
+/// cost (~3.3s) exceeds `glass_core::TEARDOWN_BUDGET`, which is why nothing waits on one during
+/// teardown (glass#427, `SimulatorRegistry::request_shutdown_all`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimctlOp {
     /// `bootstatus -b` — waits out the whole boot.
@@ -21,7 +25,9 @@ pub enum SimctlOp {
     Install,
     /// `io <udid> screenshot` — encodes a frame.
     Screenshot,
-    /// Everything else: `list`, `pbcopy`, `pbpaste`, `terminate`, `spawn`.
+    /// Everything else: `list`, `pbcopy`, `pbpaste`, `terminate`, `spawn`. `terminate` measures
+    /// ~101ms, so the 10s here is headroom for a wedged simulator; a teardown *sequence* is
+    /// bounded by the deadline [`Simctl::run_until`] carries instead.
     Query,
 }
 
@@ -109,15 +115,42 @@ impl Simctl {
 
     /// Run `xcrun simctl <sub...>` and return captured stdout as lossy UTF-8 text.
     pub fn run(&self, sub: &[&str]) -> Result<String> {
-        let out = self.output(sub)?;
+        self.run_until(sub, None)
+    }
+
+    /// [`Simctl::run`] under a deadline the whole sequence shares, `None` for a call that answers
+    /// to nothing but its own budget. The deadline bounds the run; it does not reserve time for
+    /// the calls behind, which is `Glass::shutdown`'s job (glass#427).
+    pub fn run_until(&self, sub: &[&str], deadline: Option<Instant>) -> Result<String> {
+        let out = self.output(sub, deadline)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
-    fn output(&self, sub: &[&str]) -> Result<Vec<u8>> {
+    /// Start `xcrun simctl <sub...>` and hand back the child unwaited, in a process group of its
+    /// own so a signal to glass's group does not take it too.
+    ///
+    /// For the one call costing more than its caller's whole budget (`shutdown`, ~3.3s against a
+    /// 3s teardown), where waiting only delays the exit. stdout is closed rather than inherited —
+    /// on stdio an inherited one corrupts the MCP stream.
+    pub fn spawn_detached(&self, sub: &[&str]) -> std::io::Result<std::process::Child> {
+        let mut cmd = Command::new(self.program());
+        cmd.args(self.full_args(sub))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        cmd.spawn()
+    }
+
+    fn output(&self, sub: &[&str], deadline: Option<Instant>) -> Result<Vec<u8>> {
         let op = SimctlOp::for_sub(sub);
         let mut cmd = Command::new(self.program());
         cmd.args(self.full_args(sub));
-        let out = run_bounded(&mut cmd, op.budget(), op.label())?;
+        let out = match deadline {
+            Some(d) => run_bounded_until(&mut cmd, op.budget(), d, op.label())?,
+            None => run_bounded(&mut cmd, op.budget(), op.label())?,
+        };
         if !out.status.success() {
             return Err(GlassError::Backend(format!(
                 "simctl {:?} failed: {}",
@@ -145,8 +178,12 @@ const FAKE_SIMCTL_SCRIPT: &str = "\
 # Stand-in for xcrun; see FakeSimctl in simctl.rs.
 [ \"$1\" = --glass-probe ] && exit 0
 dir=$(dirname \"$0\")
+# Before the argv line, so a test that waits for the call can then read this without racing it.
+printf '%s' \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$dir/pgid\"
 printf '%s\\n' \"$*\" >> \"$dir/calls\"
 # `$2` is the simctl verb, since `$1` is always `simctl`.
+# Recorded before sleeping, so a test can see the call while this one is still running.
+[ -f \"$dir/slow-$2\" ] && sleep \"$(cat \"$dir/slow-$2\")\"
 if [ -f \"$dir/fail-$2\" ]; then
     printf 'the fake xcrun was told to fail %s\\n' \"$2\" >&2
     exit 1
@@ -214,6 +251,16 @@ impl FakeSimctl {
             .expect("tell the fake to fail");
     }
 
+    /// Make every `simctl <verb>` call take `seconds`, for a test about whether the caller waits.
+    /// The call is recorded before the sleep starts.
+    pub(crate) fn slow(&self, verb: &str, seconds: u32) {
+        std::fs::write(
+            self.dir.path().join(format!("slow-{verb}")),
+            seconds.to_string(),
+        )
+        .expect("tell the fake to be slow");
+    }
+
     /// The argv of every invocation so far, in order, joined by spaces.
     pub(crate) fn calls(&self) -> Vec<String> {
         // An unreadable `calls` is "nothing run yet" only while the directory is there; gone,
@@ -232,6 +279,26 @@ impl FakeSimctl {
     /// Whether any invocation's argv contains `needle`.
     pub(crate) fn called(&self, needle: &str) -> bool {
         self.calls().iter().any(|c| c.contains(needle))
+    }
+
+    /// The process group the last invocation ran in, as it saw it.
+    pub(crate) fn pgid(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("pgid")).unwrap_or_default()
+    }
+
+    /// [`FakeSimctl::called`], waiting up to `within` for the call to arrive — for a caller that
+    /// spawns rather than waits, where the argv lands after the call under test has returned.
+    pub(crate) fn wait_called(&self, needle: &str, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if self.called(needle) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -348,6 +415,27 @@ mod tests {
             vec!["simctl terminate UDID app.id", "simctl list devices"]
         );
         assert!(!fake.called("boot"), "{:?}", fake.calls());
+    }
+
+    /// `slow` is what lets every "does it wait?" test fail: without the sleep landing, a caller
+    /// that waits looks exactly like one that does not.
+    #[test]
+    fn a_fake_told_to_be_slow_actually_takes_that_long() {
+        let fake = FakeSimctl::new();
+        let simctl = Simctl::at(fake.program());
+        fake.slow("terminate", 1);
+
+        let started = std::time::Instant::now();
+        simctl.run(&["terminate", "UDID", "app.id"]).unwrap();
+        let slept = started.elapsed();
+        assert!(slept >= Duration::from_millis(900), "returned in {slept:?}");
+
+        let started = std::time::Instant::now();
+        simctl.run(&["list", "devices"]).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "an unmarked verb must not be slowed too"
+        );
     }
 
     #[test]

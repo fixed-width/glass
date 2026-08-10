@@ -94,7 +94,7 @@ pub struct Glass {
     log_capacity: usize,
     active: Option<ActiveSession>,
     audit: Option<Box<dyn crate::audit::AuditSink>>,
-    shutdown_hook: Option<Box<dyn FnOnce() + Send>>,
+    shutdown_hook: Option<Box<dyn FnOnce(std::time::Instant) + Send>>,
 }
 
 impl Glass {
@@ -122,7 +122,12 @@ impl Glass {
 
     /// Install a teardown callback run once at the end of `shutdown()` — used by the host
     /// (glass-mcp) for resource cleanup it owns (e.g. stopping a glass-booted emulator).
-    pub fn set_shutdown_hook(&mut self, hook: Box<dyn FnOnce() + Send>) {
+    ///
+    /// It gets the whole deadline, the sessions before it having been held
+    /// [`crate::TEARDOWN_HOOK_RESERVE`] short so this still has time. A hook whose cleanup is
+    /// local can ignore it; one that talks to a device spends it, and gets
+    /// `BoundKind::NotStarted` for whatever it reaches with nothing left.
+    pub fn set_shutdown_hook(&mut self, hook: Box<dyn FnOnce(std::time::Instant) + Send>) {
         self.shutdown_hook = Some(hook);
     }
 

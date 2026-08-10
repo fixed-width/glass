@@ -45,6 +45,24 @@ pub struct AndroidPlatform {
 }
 
 impl AndroidPlatform {
+    /// Stop the app, under `deadline` when the caller has one to share.
+    ///
+    /// The logcat reap comes first and is unbounded, measured at 0-1ms — a kill and reap of a
+    /// direct child, which only uninterruptible sleep can hold up.
+    fn stop_app_until(&mut self, deadline: Option<Instant>) -> Result<()> {
+        if let Some(mut app) = self.app.take() {
+            if let Some(mut logcat) = app.logcat.take() {
+                logcat.stop();
+            }
+            let stopped = self.adb().run_until(
+                force_stop_args(&app.package).iter().map(String::as_str),
+                deadline,
+            );
+            glass_core::note_if_skipped("the app force-stop", &stopped);
+        }
+        Ok(())
+    }
+
     /// Attach to (or boot) an emulator, and connect the on-device agent if enabled.
     pub fn from_env(
         emulators: &crate::avd::EmulatorRegistry,
@@ -255,15 +273,15 @@ impl Platform for AndroidPlatform {
     }
 
     fn stop_app(&mut self) -> Result<()> {
-        if let Some(mut app) = self.app.take() {
-            if let Some(mut logcat) = app.logcat.take() {
-                logcat.stop();
-            }
-            let _ = self
-                .adb()
-                .run(force_stop_args(&app.package).iter().map(String::as_str));
-        }
-        Ok(())
+        self.stop_app_until(None)
+    }
+
+    /// Force-stop measures 101ms median, 267ms worst on an emulator with every core saturated,
+    /// against the 3s all of teardown gets — so the deadline is not expected to bind. It is for
+    /// the device that stopped answering, which would otherwise run out the 10s `AdbOp::Shell`
+    /// budget and leave the hook nothing (glass#422).
+    fn stop_app_by(&mut self, deadline: Instant) -> Result<()> {
+        self.stop_app_until(Some(deadline))
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
@@ -638,6 +656,43 @@ mod platform_tests {
         assert!(
             fake.called("am force-stop com.example.app"),
             "{:?}",
+            fake.calls()
+        );
+    }
+
+    /// The composition guarantee (glass#422): a force-stop that never answers must not spend the
+    /// budget the shutdown hook's own steps need. `Lingers` is a device that stopped answering.
+    #[test]
+    #[cfg(unix)]
+    fn a_force_stop_that_never_answers_gives_up_at_the_shared_deadline() {
+        // `launchable`'s rules, with a force-stop that never returns in front of them.
+        let fake = FakeAdb::new(&[
+            ("shell am force-stop *", Answer::Lingers),
+            (
+                "shell am start *",
+                Answer::says("Starting: Intent {...}\nStatus: ok\n"),
+            ),
+            ("shell dumpsys window windows", Answer::says(WINDOWS)),
+            ("shell pidof *", Answer::says("4321\n")),
+            ("exec-out screencap", Answer::says(frame_bytes(1080, 2400))),
+            ("*", Answer::Silent),
+        ]);
+        let mut platform = started(&fake);
+
+        let started_at = Instant::now();
+        platform
+            .stop_app_by(Instant::now() + Duration::from_millis(300))
+            .expect("teardown is best-effort and reports success either way");
+        let waited = started_at.elapsed();
+
+        assert!(
+            waited < Duration::from_secs(2),
+            "waited {waited:?} on a force-stop that never answers — the AdbOp budget (10s) was \
+             used instead of the deadline, and the hook behind this gets nothing"
+        );
+        assert!(
+            fake.called("am force-stop com.example.app"),
+            "it still has to have asked: {:?}",
             fake.calls()
         );
     }

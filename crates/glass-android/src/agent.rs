@@ -327,12 +327,22 @@ impl AgentRegistry {
 
     /// Kill the device agent (via the host child) and remove the forward. Best-effort.
     pub fn shutdown(&self) {
+        self.shutdown_until(None);
+    }
+
+    /// [`AgentRegistry::shutdown`] under a deadline the rest of teardown shares (glass#422).
+    ///
+    /// Only the forward removal is under it — dropping `p` then kills and reaps the agent with an
+    /// unbounded `wait()`, the gap `AndroidPlatform::stop_app_until` names for logcat.
+    pub fn shutdown_until(&self, deadline: Option<std::time::Instant>) {
         if let Ok(mut guard) = self.state.lock()
             && let Some(p) = guard.take()
         {
-            let _ = p
-                .adb
-                .run(["forward", "--remove", &format!("tcp:{}", p.port)]);
+            let removed = p.adb.run_until(
+                ["forward", "--remove", &format!("tcp:{}", p.port)],
+                deadline,
+            );
+            glass_core::note_if_skipped("removing the agent's adb forward", &removed);
             // p drops here → Drop kills + reaps the child
         }
     }
@@ -367,6 +377,40 @@ fn wait_for_agent_until(port: u16, deadline: Instant) -> Result<AgentClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deadline-bearing half of the agent's teardown — without it a wedged device leaks an
+    /// `adb forward` into a server that outlives glass (glass#422).
+    #[test]
+    #[cfg(unix)]
+    fn a_forward_removal_that_never_answers_gives_up_at_the_shared_deadline() {
+        use crate::adb::{Answer, FakeAdb};
+        use std::time::{Duration, Instant};
+
+        let fake = FakeAdb::new(&[("*", Answer::Lingers)]);
+        let reg = AgentRegistry::new();
+        *reg.state.lock().unwrap() = Some(AgentProc {
+            child: std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("a child to stand in for the agent"),
+            port: 1234,
+            adb: fake.adb().clone(),
+        });
+
+        let started = Instant::now();
+        reg.shutdown_until(Some(Instant::now() + Duration::from_millis(300)));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?} on a device that never answers",
+            started.elapsed()
+        );
+        assert!(
+            fake.called("forward --remove"),
+            "it still has to ask: {:?}",
+            fake.calls()
+        );
+    }
     use std::io::Write;
     use std::net::TcpListener;
 

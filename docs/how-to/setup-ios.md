@@ -46,8 +46,9 @@ xcrun simctl create "iPhone glass" "iPhone 17"
 ## Attach-or-boot
 
 Like the Android backend, glass prefers to attach: if a Simulator is already booted it uses it;
-otherwise it boots the newest available iPhone simulator itself and shuts it down again on
-shutdown.
+otherwise it boots the newest available iPhone simulator itself and asks it to shut down again
+when glass exits. The request is handed to CoreSimulator, which takes a few seconds and finishes
+after glass has gone — so `xcrun simctl list devices` can still show it Booted for a moment.
 
 - `GLASS_IOS_UDID` — drive an exact device by UDID (see `xcrun simctl list devices`).
 - `GLASS_IOS_DEVICE` — boot a device by name, e.g. `"iPhone 17"` or `"iPad Pro 13-inch"`, when
