@@ -213,15 +213,26 @@ impl Diagnosis {
     /// Human-readable report. Non-default backend sections are flagged, and their
     /// failures shown as warnings, to match [`Diagnosis::overall`].
     pub fn render_text(&self, default_backend: &str) -> String {
-        let mut out = String::from("glass doctor\n");
+        self.render_styled(default_backend, &Palette::PLAIN)
+    }
+
+    /// [`Diagnosis::render_text`] drawn with `palette`. Through [`Palette::PLAIN`] the two are
+    /// byte-identical; a color palette only wraps spans of the same text in escapes.
+    pub fn render_styled(&self, default_backend: &str, palette: &Palette) -> String {
+        let mut out = format!("{}\n", palette.paint(palette.bold, "glass doctor"));
         let (mut ok, mut warn, mut fail) = (0u32, 0u32, 0u32);
         for s in &self.sections {
             let critical = Self::is_critical(s, default_backend);
             let note = match &s.backend {
-                Some(b) if !critical => format!("  (only needed for backend={b})"),
+                Some(b) if !critical => {
+                    palette.paint(palette.dim, &format!("  (only needed for backend={b})"))
+                }
                 _ => String::new(),
             };
-            out.push_str(&format!("\n[{}]{note}\n", s.title));
+            out.push_str(&format!(
+                "\n{}{note}\n",
+                palette.paint(palette.heading, &format!("[{}]", s.title))
+            ));
             for c in &s.checks {
                 let eff = Self::effective(c.status, critical);
                 match eff {
@@ -230,28 +241,63 @@ impl Diagnosis {
                     CheckStatus::Fail => fail += 1,
                     CheckStatus::Skip => {}
                 }
-                out.push_str(&format!("  {} {}: {}\n", eff.glyph(), c.name, c.detail));
+                let attr = palette.for_status(eff);
+                let glyph = eff.glyph().to_string();
+                out.push_str(&match eff {
+                    // Dim in full: a skipped check reports something that did not run.
+                    CheckStatus::Skip => {
+                        palette.paint(attr, &format!("  {glyph} {}: {}", c.name, c.detail))
+                    }
+                    // The name carries the color too, because the name is what you scan a
+                    // failing report for; a lone glyph at a fixed column is easy to miss.
+                    CheckStatus::Warn | CheckStatus::Fail => format!(
+                        "  {} {}: {}",
+                        palette.paint(attr, &glyph),
+                        palette.paint(attr, &c.name),
+                        c.detail
+                    ),
+                    // Glyph only, so a healthy report is not a wall of green.
+                    CheckStatus::Ok => {
+                        format!("  {} {}: {}", palette.paint(attr, &glyph), c.name, c.detail)
+                    }
+                });
+                out.push('\n');
                 if eff != CheckStatus::Ok {
                     if let Some(r) = &c.remedy {
-                        out.push_str(&format!("      → {r}\n"));
+                        out.push_str(&palette.paint(palette.dim, &format!("      → {r}")));
+                        out.push('\n');
                     }
                     if let Some(a) = &c.remedy_action {
-                        out.push_str(&format!("      ↪ {a}\n"));
+                        out.push_str(&palette.paint(palette.dim, &format!("      ↪ {a}")));
+                        out.push('\n');
                     }
                 }
             }
         }
         let overall = self.overall(default_backend);
         out.push_str(&format!(
-            "\nSummary: {ok} ok, {warn} warning(s), {fail} failure(s) — {}\n",
-            match overall {
-                CheckStatus::Fail => "FAIL",
-                CheckStatus::Warn => "OK (with warnings)",
-                _ => "OK",
-            }
+            "\nSummary: {}, {}, {} — {}\n",
+            summary_count(palette, ok, palette.ok, "ok"),
+            summary_count(palette, warn, palette.warn, "warning(s)"),
+            summary_count(palette, fail, palette.fail, "failure(s)"),
+            palette.paint(
+                &format!("{}{}", palette.bold, palette.for_status(overall)),
+                match overall {
+                    CheckStatus::Fail => "FAIL",
+                    CheckStatus::Warn => "OK (with warnings)",
+                    _ => "OK",
+                }
+            ),
         ));
         out
     }
+}
+
+/// One `N label` cell of the summary line, in `attr` when `n` is non-zero and dim when it is
+/// zero — a red `0 failure(s)` reads as an alarm about a number that means "fine".
+fn summary_count(palette: &Palette, n: u32, attr: &str, label: &str) -> String {
+    let attr = if n == 0 { palette.dim } else { attr };
+    palette.paint(attr, &format!("{n} {label}"))
 }
 
 #[cfg(test)]
@@ -452,5 +498,113 @@ mod tests {
         assert_ne!(p.ok, p.warn);
         assert_ne!(p.warn, p.fail);
         assert_ne!(p.fail, p.dim);
+    }
+
+    #[test]
+    fn the_plain_palette_renders_the_same_bytes_as_render_text() {
+        let d = diag();
+        assert_eq!(
+            d.render_styled("x11", &Palette::PLAIN),
+            d.render_text("x11")
+        );
+    }
+
+    #[test]
+    fn color_adds_escapes_and_changes_nothing_else() {
+        // The load-bearing property. Strip the escapes from a colored render and it must equal
+        // the plain one byte for byte — this fails if color adds, drops, or reorders a single
+        // text byte. Both backends, so the non-default-section path is covered too.
+        let d = diag();
+        for backend in ["x11", "wayland"] {
+            assert_eq!(
+                strip_ansi(&d.render_styled(backend, &Palette::ANSI)),
+                d.render_text(backend),
+                "backend {backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_check_is_dim_across_its_whole_line() {
+        let p = Palette::ANSI;
+        let d = Diagnosis::new(vec![Section::new(
+            "android",
+            None,
+            vec![Check::new("agent", CheckStatus::Skip, "not configured")],
+        )]);
+        let out = d.render_styled("x11", &p);
+        assert!(
+            out.contains(&format!("{}  – agent: not configured{}", p.dim, p.reset)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_warning_colors_its_name_but_a_passing_check_does_not() {
+        let p = Palette::ANSI;
+        let d = Diagnosis::new(vec![Section::new(
+            "general",
+            None,
+            vec![
+                Check::new("device", CheckStatus::Warn, "none online"),
+                Check::new("glass", CheckStatus::Ok, "1.2.0"),
+            ],
+        )]);
+        let out = d.render_styled("x11", &p);
+        // Warn: the name carries the color too — it is what you scan a failing report for.
+        assert!(
+            out.contains(&format!("{}device{}", p.warn, p.reset)),
+            "{out:?}"
+        );
+        // Ok: glyph only, so a healthy report is not a wall of green.
+        assert!(
+            out.contains(&format!("{}✓{} glass: 1.2.0", p.ok, p.reset)),
+            "{out:?}"
+        );
+        assert!(
+            !out.contains(&format!("{}glass{}", p.ok, p.reset)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_count_is_dim_and_a_non_zero_one_takes_its_status_color() {
+        // diag() under x11 is 2 ok, 1 warning, 0 failures.
+        let p = Palette::ANSI;
+        let out = diag().render_styled("x11", &p);
+        assert!(out.contains(&format!("{}2 ok{}", p.ok, p.reset)), "{out:?}");
+        assert!(
+            out.contains(&format!("{}1 warning(s){}", p.warn, p.reset)),
+            "{out:?}"
+        );
+        // Red on a zero would read as an alarm about a number that means "fine".
+        assert!(
+            out.contains(&format!("{}0 failure(s){}", p.dim, p.reset)),
+            "{out:?}"
+        );
+        assert!(
+            !out.contains(&format!("{}0 failure(s){}", p.fail, p.reset)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn the_verdict_is_bold_in_the_overall_status_color() {
+        let p = Palette::ANSI;
+        let out = diag().render_styled("wayland", &p);
+        assert!(
+            out.contains(&format!("{}{}FAIL{}", p.bold, p.fail, p.reset)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn the_mcp_and_json_renderings_carry_no_escapes() {
+        // `render_text` is what server.rs hands the glass_doctor MCP tool, and the same Diagnosis
+        // is what --json serializes. Either carrying an escape would put terminal control bytes
+        // into an agent's JSON.
+        let d = diag();
+        assert!(!d.render_text("x11").contains('\x1b'));
+        assert!(!serde_json::to_string(&d).unwrap().contains('\x1b'));
     }
 }
