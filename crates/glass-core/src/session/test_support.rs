@@ -114,8 +114,7 @@ impl FakePlatform {
         self.stop_count = Some(c);
         self
     }
-    /// Spend the whole deadline in `stop_app_by`, so a test can ask what is left for the step
-    /// behind it.
+    /// Spend the whole deadline in `stop_app_by`.
     pub(crate) fn burning_its_deadline(mut self) -> Self {
         self.stop_burns_deadline = true;
         self

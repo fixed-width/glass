@@ -63,7 +63,7 @@ cargo test --no-fail-fast -p glass-mcp \
   -- --ignored --test-threads=1 "$@" || rc=$?
 
 # After the suite, not per test: the check costs a settle wait, and a test that leaks hands the
-# device to every test after it anyway, so the run is the unit worth reporting on.
+# device to every test after it anyway.
 residue=0
 report_device_residue "$adb" "$before" || residue=1
 # Only when the suite itself passed, so a leak does not overwrite cargo's 101 with a 1 and hide

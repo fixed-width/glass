@@ -1410,8 +1410,7 @@ mod teardown_tests {
         assert_eq!(terminations(&fake).len(), 1, "{:?}", fake.calls());
     }
 
-    /// `simctl launch` reporting failure usually means nothing launched — but not always, and the
-    /// launch whose result this backend never sees is the one that leaves an app up.
+    /// The launch whose result this backend never sees is the one that leaves an app up.
     #[test]
     fn a_launch_simctl_reported_as_failed_is_reaped_too() {
         let fake = FakeSimctl::new();

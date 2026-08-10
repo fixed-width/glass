@@ -772,7 +772,7 @@ fn put_secure(adb: &Adb, key: &str, value: &str) -> Result<()> {
     put_secure_until(adb, key, value, Deadline::UNBOUNDED).map(|_| ())
 }
 
-/// [`put_secure`] under a deadline the caller shares with the rest of its sequence.
+/// [`put_secure`] under `deadline`.
 fn put_secure_until(adb: &Adb, key: &str, value: &str, deadline: Deadline) -> Result<String> {
     adb.run_until(["shell", "settings", "put", "secure", key, value], deadline)
 }
@@ -783,7 +783,7 @@ fn put_enabled_services(adb: &Adb, list: &str) -> Result<()> {
     put_enabled_services_until(adb, list, Deadline::UNBOUNDED)
 }
 
-/// [`put_enabled_services`] under a deadline the caller shares with the rest of its sequence.
+/// [`put_enabled_services`] under `deadline`.
 fn put_enabled_services_until(adb: &Adb, list: &str, deadline: Deadline) -> Result<()> {
     if list.is_empty() {
         adb.run_until(

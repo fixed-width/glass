@@ -93,8 +93,8 @@ fn a11y_service_snapshot_and_actions() {
     }
 
     p.stop_app().ok();
-    // The guards above restore the service settings and the forwards as they drop, and
-    // scripts/test-android.sh re-reads the device after the suite to confirm they did.
+    // scripts/test-android.sh re-reads the device after the suite to confirm the guards above
+    // restored it.
 }
 
 /// Native invoke against the fixture. Ignored; same environment as the test above.

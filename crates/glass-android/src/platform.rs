@@ -243,8 +243,7 @@ impl Platform for AndroidPlatform {
         let started = adb.run(launch_args(&target.component).iter().map(String::as_str))?;
         check_am_start(&started)?;
 
-        // The app is on the device from here, but `self.app` is not set until the end, so each
-        // failure below has to reap for itself.
+        // Each failure from here down reaps for itself — see `reap_failed_launch`.
         let (active_id, window) = match self.discover_window(&target.package, spec.timeout_ms) {
             Ok(found) => found,
             Err(e) => return Err(reap_failed_launch(&adb, &target.package, e)),

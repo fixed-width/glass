@@ -143,8 +143,7 @@ mod tests {
         assert_eq!(lines[0].text, "ready");
     }
 
-    /// A deadline far enough out that nothing in these tests is bounded by it — they are about
-    /// what `shutdown` calls, not about what a spent budget does.
+    /// A deadline far enough out that nothing in these tests is bounded by it.
     fn soon() -> Deadline {
         Deadline::at(std::time::Instant::now() + crate::TEARDOWN_BUDGET)
     }
@@ -224,8 +223,7 @@ mod tests {
         );
     }
 
-    /// The budget is only useful if it reaches the code that spends it: a backend that tears down
-    /// over a link, and a hook that does the same for the host's own resources.
+    /// The budget is only useful if it reaches the code that spends it.
     #[test]
     fn shutdown_hands_its_deadline_to_both_the_backend_and_the_hook() {
         let at_stop = Arc::new(Mutex::new(None));
@@ -261,8 +259,8 @@ mod tests {
         );
     }
 
-    /// The other half of the split: the reserve is a fixed 750ms, so without the clamp a caller
-    /// whose whole budget is smaller hands the sessions a deadline already in the past.
+    /// The reserve is a fixed 750ms, so without the clamp a caller whose whole budget is smaller
+    /// hands the sessions a deadline already in the past.
     #[test]
     fn a_budget_smaller_than_the_reserve_still_leaves_the_sessions_time() {
         let at_stop = Arc::new(Mutex::new(None));

@@ -35,8 +35,8 @@ pub const TEARDOWN_REAP_HEADROOM: Duration = Duration::from_millis(750);
 /// (glass#422).
 pub const TEARDOWN_HOOK_RESERVE: Duration = Duration::from_millis(750);
 
-// The three have to fit, or the split is a slower way of running out of time. The sessions get
-// what is left — 1.5s, against the ~270ms the slowest measured backend teardown needs.
+// The sessions get what is left — 1.5s, against the ~270ms the slowest measured backend
+// teardown needs.
 const _: () = assert!(
     TEARDOWN_REAP_HEADROOM.as_millis() + TEARDOWN_HOOK_RESERVE.as_millis()
         < TEARDOWN_BUDGET.as_millis(),

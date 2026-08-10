@@ -232,8 +232,8 @@ mod tests {
         assert!(r.udids().is_empty());
     }
 
-    /// Killing the client at spawn leaves the device Booted 30s later (measured), so a Ctrl-C
-    /// reaching glass's group inside that window would strand the simulator.
+    /// A Ctrl-C reaching glass's group inside the window measured on
+    /// [`SimTarget::request_shutdown_all`] would strand the simulator.
     #[test]
     fn the_shutdown_it_asks_for_runs_in_its_own_process_group() {
         let fake = crate::simctl::FakeSimctl::new();
