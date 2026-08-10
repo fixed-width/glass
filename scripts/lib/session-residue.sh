@@ -5,29 +5,42 @@
 # the same teardown that reaps their processes, so one surviving a run is a live sway or
 # dbus-daemon nobody owns (glass#415, glass#418). The tests pass while it happens, which is why
 # this is checked around a suite rather than asserted inside one.
+#
+# Both dirs are `tempfile` temp dirs, so they follow `$TMPDIR` exactly as `mktemp` does — scan
+# where they are actually created, or the check silently passes forever.
 
-# A file whose mtime is "now". Pass it to `session_residue`, then delete it.
-residue_marker() { mktemp; }
-
-# Print the session dirs created since $1, one per line. Empty means none. Scoping to "newer
-# than the marker" keeps an earlier run's residue from failing this one.
-session_residue() {
-    find /tmp -maxdepth 1 \
-        \( -name 'glass-wl.*' -o -name 'glass-a11y-*' \) \
-        -newer "$1" 2>/dev/null || true
+# A marker file whose mtime is "now". The caller owns removing it — do NOT trap EXIT in here:
+# callers read this through `$(…)`, whose subshell would fire the trap and delete the marker
+# before it is ever compared against, leaving a scan that finds nothing and passes.
+residue_marker() {
+    mktemp "${TMPDIR:-/tmp}/glass-residue-marker.XXXXXX"
 }
 
-# Run `session_residue`, report to stderr, and echo the exit status the caller should use:
-# $1 marker, $2 the status the suite itself produced.
+# Report session dirs modified since marker $1; non-zero if there were any. The remaining args
+# are the globs this suite can itself produce — matching one it cannot lets a concurrent suite's
+# live scratch read as this one's leak.
+#
+# Six `?` matches `tempfile`'s random suffix and nothing else: `test-a11y.sh` names its own
+# runtime dir `glass-a11y-test-rt.XXXXXX`, which is deliberate scratch rather than residue.
 report_residue() {
-    local marker="$1" status="$2" leaked
-    leaked=$(session_residue "$marker")
-    rm -f "$marker"
-    if [ -n "$leaked" ]; then
-        echo "FAIL: the suite leaked $(printf '%s\n' "$leaked" | wc -l) session(s):" >&2
-        printf '%s\n' "$leaked" >&2
-        echo "Each is a live compositor or a11y bus; a test never stopped its session." >&2
-        status=1
+    local marker="$1" leaked="" glob hits
+    shift
+    for glob in "$@"; do
+        # A failed scan must not read as a clean one — that is how a leak detector goes quiet.
+        if ! hits=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name "$glob" -newer "$marker"); then
+            echo "FAIL: could not scan for session residue (marker $marker)" >&2
+            return 1
+        fi
+        if [ -n "$hits" ]; then
+            leaked="${leaked}${hits}"$'\n'
+        fi
+    done
+    leaked="${leaked%$'\n'}"
+    if [ -z "$leaked" ]; then
+        return 0
     fi
-    echo "$status"
+    echo "FAIL: the suite leaked $(printf '%s\n' "$leaked" | wc -l) session(s):" >&2
+    printf '%s\n' "$leaked" >&2
+    echo "Each is a live compositor or a11y bus; a test never stopped its session." >&2
+    return 1
 }

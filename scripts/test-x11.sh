@@ -27,7 +27,10 @@ cd "$(dirname "$0")/.."
 # — otherwise the test can't find it in a clean checkout (e.g. CI, which runs only this script).
 cargo build -p glass-mcp --bin glass-mcp
 marker="$(residue_marker)"
+trap 'rm -f "$marker"' EXIT
 status=0
 cargo test -p glass-testapp --test integration --test network --test ignore_regions_e2e --test host_conformance --test software_render -- --ignored --test-threads=1 "$@" || status=$?
-status=$(report_residue "$marker" "$status")
+# No compositor glob: this suite cannot create one, so matching it would only let a concurrent
+# Wayland run read as this suite's leak.
+report_residue "$marker" 'glass-a11y-??????' || status=1
 exit "$status"

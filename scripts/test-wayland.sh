@@ -21,7 +21,8 @@ fi
 # --test-threads=1: each test spawns its own sway (and Xwayland); serialize
 # so concurrent compositors don't contend for the display.
 marker="$(residue_marker)"
+trap 'rm -f "$marker"' EXIT
 status=0
 cargo test -p glass-testapp --test wayland --test wayland_ignore_regions_e2e -- --ignored --test-threads=1 "$@" || status=$?
-status=$(report_residue "$marker" "$status")
+report_residue "$marker" 'glass-wl.??????' 'glass-a11y-??????' || status=1
 exit "$status"
