@@ -392,9 +392,12 @@ mod reap_tests {
 
     #[test]
     fn reap_graceful_sigkills_after_grace_when_sigterm_ignored() {
-        // Echo "ready" after the trap is installed so we don't race the signal.
+        // Echo "ready" after the trap is installed so we don't race the signal. `exec` keeps the
+        // TERM-ignoring process the direct child — SIG_IGN survives execve. Drop it and `sleep` is
+        // a grandchild `reap_graceful` never signals, outliving the test on the inherited stderr
+        // pipe, which nextest reports as LEAK.
         let mut c = Command::new("sh")
-            .args(["-c", "trap '' TERM; echo ready; sleep 30"])
+            .args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
