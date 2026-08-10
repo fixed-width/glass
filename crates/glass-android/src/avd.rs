@@ -189,8 +189,8 @@ impl EmulatorRegistry {
     /// list. Best-effort: a device already gone is fine, and [`Deadline::UNBOUNDED`] off the
     /// teardown path, where each call keeps its own budget.
     ///
-    /// `adb emu kill` was observed at 2ms — it acknowledges and lets the VM go down on its own
-    /// time — so this is the cheapest step in teardown and the worst one to skip (glass#422).
+    /// `adb emu kill` was observed at 2ms: it acknowledges and lets the VM go down on its own
+    /// time (glass#422).
     pub fn kill_all(&self, deadline: Deadline) {
         let clients = self
             .booted

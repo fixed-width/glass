@@ -83,8 +83,9 @@ pub(crate) fn adb_runner(
 /// the sum of all three, 50s against the 10s a `glass_wait_for_element` asks for by default and
 /// re-snapshots inside.
 ///
-/// A caller that named a deadline gets [`Deadline::cap`] of this instead — see
-/// [`dump_until_ready`], which needs both to tell which of them ended an attempt.
+/// A caller that named a deadline gets [`Deadline::resolve`] of this instead — see
+/// [`dump_until_ready`], which needs the verdict it returns to tell which bound ended an
+/// attempt.
 pub(crate) fn attempt_deadline() -> Instant {
     Instant::now() + AdbOp::Dump.budget()
 }

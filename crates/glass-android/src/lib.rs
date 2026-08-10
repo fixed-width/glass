@@ -92,9 +92,9 @@ pub(crate) fn unsupported_window_move_resize() -> glass_core::GlassError {
 ///
 /// `Glass::shutdown` keeps `TEARDOWN_HOOK_RESERVE` back from the sessions so these have time
 /// (glass#422). Between themselves it is first-come-first-served, which makes the order
-/// load-bearing: the emulator goes first, being both the cheapest step (`adb emu kill` measured at
-/// 2ms) and the largest leak. Put it last and a wedged device spends the whole deadline on the
-/// settings restore, leaving a ~2GB VM that was never asked to stop.
+/// load-bearing: put the emulator last and a wedged device spends the whole deadline on the
+/// settings restore, leaving a ~2GB VM that was never asked to stop — for the sake of a step
+/// measured at 2ms.
 ///
 /// One function rather than three calls in glass-mcp's hook, so a test can watch the deadline
 /// reach all three — collapsing each registry's `shutdown`/`shutdown_until` pair made losing it a

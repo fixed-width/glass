@@ -90,7 +90,7 @@ impl Deadline {
     /// budget would otherwise starve the first step entirely.
     ///
     /// [`Self::UNBOUNDED`] stays unbounded: there is nothing to take a share of. Never lands
-    /// before now, so it cannot underflow the monotonic clock the way a bare subtraction can.
+    /// before now, so it cannot underflow the monotonic clock.
     pub fn reserving(self, reserve: std::time::Duration) -> Self {
         Self(self.0.map(|d| {
             let left = d.saturating_duration_since(std::time::Instant::now());
