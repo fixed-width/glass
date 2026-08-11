@@ -733,10 +733,109 @@ mod tests {
             out.contains(&format!("{}current: strict (override){}", p.ok, p.reset)),
             "{out:?}"
         );
-        // GLASS_BACKEND is unset.
+        // GLASS_BACKEND is unset. The whole cell plus the reset, so this half is no weaker
+        // than the set half above.
         assert!(
-            out.contains(&format!("{}current: (unset \u{2192} x11", p.dim)),
+            out.contains(&format!(
+                "{}current: (unset \u{2192} x11 (or windows on Windows, macos on macOS)){}",
+                p.dim, p.reset
+            )),
             "{out:?}"
+        );
+    }
+
+    #[test]
+    fn the_purpose_column_starts_at_a_fixed_offset() {
+        // `color_adds_escapes_and_changes_nothing_else` compares an ANSI-stripped render against
+        // a PLAIN one, and both sides pad with the same constant — so it is blind to the constant
+        // itself being wrong. Pin the absolute geometry instead, with the offset written as a
+        // literal: deriving it from NAME_COL would inherit exactly the error guarded against.
+        let out = render_styled(&stub, &Palette::PLAIN);
+        let line = |starts: &str| {
+            out.lines()
+                .find(|l| l.starts_with(starts))
+                .unwrap_or_else(|| panic!("no {starts:?} line in:\n{out}"))
+                .to_string()
+        };
+        // 29 = the two-space indent + the 26-column name field + one separating space.
+        let name_line = line("  GLASS_AVD");
+        assert_eq!(
+            name_line.find("which AVD to boot when none is running"),
+            Some(29),
+            "{name_line:?}"
+        );
+        // The second line of the pair puts `default:` in that same column.
+        let default_line = out
+            .lines()
+            .find(|l| l.contains("default: the sole AVD"))
+            .unwrap_or_else(|| panic!("no GLASS_AVD default line in:\n{out}"));
+        assert_eq!(default_line.find("default: "), Some(29), "{default_line:?}");
+    }
+
+    #[test]
+    fn a_name_wider_than_the_column_keeps_exactly_one_space() {
+        // GLASS_EMULATOR_BOOT_TIMEOUT_MS is 30 chars, the only name that reaches the
+        // saturating_sub clamp: the pad is empty and only the separating space remains.
+        let out = render_styled(&stub, &Palette::PLAIN);
+        assert!(
+            out.contains(
+                "\n  GLASS_EMULATOR_BOOT_TIMEOUT_MS max wait for the booting emulator to reach \
+                 sys.boot_completed\n"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn every_span_of_the_colored_listing_is_painted_as_written_here() {
+        // Stripping escapes cannot see a *missing* escape, so the byte-identity test above passes
+        // with any span left unpainted. One golden over two adjacent lines pins them literally —
+        // the bold name, the dim `default:` cell, the current cell — plus the title, a group
+        // heading, the standard-env heading and the closing note. Escape literals on purpose:
+        // an expectation built from `palette.*` would pass against any palette at all.
+        let out = render_styled(&stub, &Palette::ANSI);
+        assert!(
+            out.starts_with("\x1b[1mglass environment\x1b[0m\n\n\x1b[1;36m[all]\x1b[0m\n"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(concat!(
+                "  \x1b[1mGLASS_AVD\x1b[0m                  which AVD to boot when none is running\n",
+                "                             \x1b[2mdefault: the sole AVD\x1b[0m | \x1b[2mcurrent: (unset \u{2192} the sole AVD)\x1b[0m\n",
+            )),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("\n\x1b[1;36mstandard env (read, not glass-specific)\x1b[0m\n"),
+            "{out:?}"
+        );
+        assert!(
+            out.ends_with(
+                "\n\x1b[2mnote: the X11 backend ignores ambient DISPLAY; set GLASS_DISPLAY \
+                 instead.\x1b[0m\n"
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_standard_variable_that_is_set_is_green_and_an_unset_one_is_dim() {
+        // The GLASS_* loop and the STD_ENV loop each decide this for themselves; the test above
+        // only exercises the first. `stub` sets PATH and nothing else in STD_ENV.
+        let out = render_styled(&stub, &Palette::ANSI);
+        let line = |name: &str| {
+            let head = format!("  \x1b[1m{name}\x1b[0m");
+            out.lines()
+                .find(|l| l.starts_with(&head))
+                .unwrap_or_else(|| panic!("no {name} line in:\n{out:?}"))
+                .to_string()
+        };
+        let path = line("PATH");
+        assert!(path.ends_with("\x1b[32mcurrent: set\x1b[0m"), "{path:?}");
+        let windir = line("WINDIR");
+        assert!(
+            windir.ends_with("\x1b[2mcurrent: (unset)\x1b[0m"),
+            "{windir:?}"
         );
     }
 
