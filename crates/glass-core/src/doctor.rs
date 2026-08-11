@@ -590,6 +590,57 @@ mod tests {
     }
 
     #[test]
+    fn every_span_of_a_colored_report_is_painted_as_written_here() {
+        // The escape-stripping byte-identity test above cannot see a *missing* escape: deleting
+        // one leaves the stripped text unchanged. So one golden, over a fixture small enough to
+        // read, pinning each structural span literally — the title, the section heading, the
+        // glyph and name of a Warn and a Fail, both remedy lines, every summary cell, and the
+        // verdict. Written as escape literals on purpose: building the expectation from
+        // `palette.*` would make it pass against any palette, which is the hole it closes.
+        let d = Diagnosis::new(vec![Section::new(
+            "general",
+            None,
+            vec![
+                Check::new("device", CheckStatus::Warn, "none online"),
+                Check::new("sway", CheckStatus::Fail, "not found")
+                    .with_remedy("build it")
+                    .with_remedy_action("open: https://example.invalid/sway"),
+            ],
+        )]);
+        assert_eq!(
+            d.render_styled("x11", &Palette::ANSI),
+            concat!(
+                "\x1b[1mglass doctor\x1b[0m\n",
+                "\n\x1b[1;36m[general]\x1b[0m\n",
+                "  \x1b[33m⚠\x1b[0m \x1b[33mdevice\x1b[0m: none online\n",
+                "  \x1b[31m✗\x1b[0m \x1b[31msway\x1b[0m: not found\n",
+                "\x1b[2m      → build it\x1b[0m\n",
+                "\x1b[2m      ↪ open: https://example.invalid/sway\x1b[0m\n",
+                "\nSummary: \x1b[2m0 ok\x1b[0m, \x1b[33m1 warning(s)\x1b[0m, ",
+                "\x1b[31m1 failure(s)\x1b[0m — \x1b[1m\x1b[31mFAIL\x1b[0m\n",
+            )
+        );
+    }
+
+    #[test]
+    fn the_non_default_backend_note_is_dim() {
+        // The one structural span the golden above cannot carry: it needs a section for a
+        // backend other than the default.
+        let d = Diagnosis::new(vec![Section::new(
+            "wayland",
+            Some("wayland".into()),
+            vec![Check::new("sway >=1.12", CheckStatus::Ok, "found")],
+        )]);
+        let out = d.render_styled("x11", &Palette::ANSI);
+        assert!(
+            out.contains(
+                "\x1b[1;36m[wayland]\x1b[0m\x1b[2m  (only needed for backend=wayland)\x1b[0m\n"
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
     fn the_mcp_and_json_renderings_carry_no_escapes() {
         // `render_text` is what server.rs hands the glass_doctor MCP tool, and the same Diagnosis
         // is what --json serializes. Either carrying an escape would put terminal control bytes
