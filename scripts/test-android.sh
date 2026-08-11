@@ -10,6 +10,9 @@
 #     GLASS_ANDROID_FIXTURE_APK=/path/to/fixture-compose-debug.apk \
 #     ./scripts/test-android.sh
 #
+# `--build-only` compiles the suite's test binaries and stops, touching no device — CI runs it
+# before any emulator exists, because a build beside a booted AVD ANRs the device (glass#439).
+#
 # Every test needing the jar, the a11y APK or the fixture APK fails loudly without it rather than
 # self-skipping, so all three are required.
 #
@@ -32,6 +35,31 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib/device-residue.sh
 
+build_only=0
+if [ "${1:-}" = "--build-only" ]; then
+  build_only=1
+  shift
+fi
+
+# One list for both the build and the run — a target added to only one gets compiled during the
+# suite, with the device up.
+android_targets=(
+  --test a11y_loop
+  --test a11y_service_loop
+  --test agent_loop
+  --test doctor_loop
+  --test input_loop
+  --test see_loop
+  --test window_loop
+)
+
+# Before the device checks: this runs with no emulator up.
+if [ "$build_only" -eq 1 ]; then
+  cargo test --no-run -p glass-android "${android_targets[@]}"
+  cargo test --no-run -p glass-mcp --test android_session_loop
+  exit 0
+fi
+
 adb="${GLASS_ADB:-adb}"
 if ! before="$(device_snapshot "$adb")"; then
     echo "cannot read the device (GLASS_ADB=${GLASS_ADB:-<unset>}, \
@@ -45,14 +73,7 @@ assert_clean_baseline "$before" || exit 1
 # nothing.
 rc=0
 
-cargo test --no-fail-fast -p glass-android \
-  --test a11y_loop \
-  --test a11y_service_loop \
-  --test agent_loop \
-  --test doctor_loop \
-  --test input_loop \
-  --test see_loop \
-  --test window_loop \
+cargo test --no-fail-fast -p glass-android "${android_targets[@]}" \
   -- --ignored --test-threads=1 "$@" || rc=$?
 
 # The session-level click leg (glass#287): it lives in glass-mcp because that crate owns the

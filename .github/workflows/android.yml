@@ -127,6 +127,11 @@ jobs:
           test -f "$apk"
           echo "GLASS_ANDROID_FIXTURE_APK=$apk" >> "$GITHUB_ENV"
 
+      - name: Build the device suite's test binaries
+        # Ahead of every step that can have an emulator running — the AVD snapshot below boots
+        # one too. A build beside a booted AVD ANRs the device (glass#439).
+        run: ./scripts/test-android.sh --build-only
+
       - name: Restore the AVD cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: avd-cache
