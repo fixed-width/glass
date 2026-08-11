@@ -9,6 +9,7 @@ pub const VERSION: &str = env!("GLASS_VERSION");
 pub mod audit;
 pub mod capabilities;
 pub mod cli;
+pub mod color;
 pub mod doctor;
 mod env;
 pub(crate) mod health;
