@@ -719,11 +719,6 @@ mod tests {
     }
 
     #[test]
-    fn the_plain_palette_renders_the_same_bytes_as_render_text() {
-        assert_eq!(render_styled(&stub, &Palette::PLAIN), render_text(&stub));
-    }
-
-    #[test]
     fn color_adds_escapes_and_changes_nothing_else() {
         // Also the column guard: painting a name before padding it would push the purpose column
         // right by the width of the escapes, and that shows up here as a byte difference.

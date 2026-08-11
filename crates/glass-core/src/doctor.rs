@@ -501,15 +501,6 @@ mod tests {
     }
 
     #[test]
-    fn the_plain_palette_renders_the_same_bytes_as_render_text() {
-        let d = diag();
-        assert_eq!(
-            d.render_styled("x11", &Palette::PLAIN),
-            d.render_text("x11")
-        );
-    }
-
-    #[test]
     fn color_adds_escapes_and_changes_nothing_else() {
         // The load-bearing property. Strip the escapes from a colored render and it must equal
         // the plain one byte for byte — this fails if color adds, drops, or reorders a single
