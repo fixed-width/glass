@@ -40,10 +40,9 @@ impl CheckStatus {
     }
 }
 
-/// ANSI attributes for the human `doctor` and `env` renderings — a table of escape-sequence
-/// prefixes plus one reset. [`Palette::PLAIN`] leaves every field empty, so rendering through it
-/// emits no escapes at all and is byte-identical to the uncolored form. Deciding *whether* a
-/// terminal wants color is the caller's job; this type only says what the escapes are.
+/// ANSI attributes for the human `doctor` and `env` renderings — a table of SGR prefixes plus one
+/// reset. [`Palette::PLAIN`] leaves every field empty, so rendering through it is byte-identical
+/// to the uncolored form. Whether a terminal wants color is the caller's decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
     pub ok: &'static str,
@@ -78,8 +77,9 @@ impl Palette {
         reset: "\x1b[0m",
     };
 
-    /// `text` wrapped in `attr` and this palette's reset. An empty `attr` returns `text`
-    /// unchanged — with no reset appended, which is what keeps [`Palette::PLAIN`] byte-identical.
+    /// `text` wrapped in `attr` and this palette's reset. An empty `attr` returns `text` with no
+    /// reset appended; appending one unconditionally would cost [`Palette::PLAIN`] its
+    /// byte-identity.
     pub fn paint(&self, attr: &str, text: &str) -> String {
         if attr.is_empty() {
             text.to_string()
@@ -88,8 +88,7 @@ impl Palette {
         }
     }
 
-    /// The attribute a check of this status is drawn in. `Skip` shares `dim`: it reports
-    /// something that did not run, so nothing in it should draw the eye.
+    /// The attribute a check of this status is drawn in.
     pub fn for_status(&self, status: CheckStatus) -> &'static str {
         match status {
             CheckStatus::Ok => self.ok,
@@ -216,8 +215,8 @@ impl Diagnosis {
         self.render_styled(default_backend, &Palette::PLAIN)
     }
 
-    /// [`Diagnosis::render_text`] drawn with `palette`. Through [`Palette::PLAIN`] the two are
-    /// byte-identical; a color palette only wraps spans of the same text in escapes.
+    /// [`Diagnosis::render_text`] drawn with `palette` — the same text, with spans wrapped in
+    /// escapes.
     pub fn render_styled(&self, default_backend: &str, palette: &Palette) -> String {
         let mut out = format!("{}\n", palette.paint(palette.bold, "glass doctor"));
         let (mut ok, mut warn, mut fail) = (0u32, 0u32, 0u32);
@@ -248,8 +247,7 @@ impl Diagnosis {
                     CheckStatus::Skip => {
                         palette.paint(attr, &format!("  {glyph} {}: {}", c.name, c.detail))
                     }
-                    // The name carries the color too, because the name is what you scan a
-                    // failing report for; a lone glyph at a fixed column is easy to miss.
+                    // The name is painted too: it is what you scan a failing report for.
                     CheckStatus::Warn | CheckStatus::Fail => format!(
                         "  {} {}: {}",
                         palette.paint(attr, &glyph),
@@ -293,8 +291,8 @@ impl Diagnosis {
     }
 }
 
-/// One `N label` cell of the summary line, in `attr` when `n` is non-zero and dim when it is
-/// zero — a red `0 failure(s)` reads as an alarm about a number that means "fine".
+/// One `N label` cell of the summary line, in `attr` or dim when `n` is zero — a red
+/// `0 failure(s)` reads as an alarm about a number that means "fine".
 fn summary_count(palette: &Palette, n: u32, attr: &str, label: &str) -> String {
     let attr = if n == 0 { palette.dim } else { attr };
     palette.paint(attr, &format!("{n} {label}"))
@@ -425,10 +423,10 @@ mod tests {
         ));
     }
 
-    /// Drop every `\x1b[…m` SGR sequence, leaving the text bytes behind. Test-only: the
-    /// byte-identity assertions compare a colored render against a plain one through it.
+    /// Drop every `\x1b[…m` SGR sequence, leaving the text bytes behind — how the byte-identity
+    /// assertions compare a colored render against a plain one.
     ///
-    /// Deliberately duplicated in glass-mcp's `env` tests rather than shared — exporting a
+    /// Deliberately duplicated in glass-mcp's `env` tests rather than shared: exporting a
     /// test-only helper from this crate's public API to serve one consumer is the worse trade.
     /// Leave both copies alone.
     fn strip_ansi(s: &str) -> String {
@@ -458,9 +456,8 @@ mod tests {
 
     #[test]
     fn strip_ansi_is_not_the_identity_function() {
-        // The byte-identity tests compare `strip_ansi(colored)` against `plain`. A helper that
-        // returned its input unchanged would make them pass against an implementation that
-        // emitted no color at all, so pin that it actually removes something.
+        // A `strip_ansi` that returned its input would make the byte-identity tests pass against
+        // an implementation that emitted no color at all.
         let colored = Palette::ANSI.paint(Palette::ANSI.ok, "x");
         assert!(colored.len() > "x".len(), "expected escapes: {colored:?}");
         assert_eq!(strip_ansi(&colored), "x");
@@ -468,15 +465,13 @@ mod tests {
 
     #[test]
     fn a_plain_paint_appends_nothing_at_all() {
-        // Not merely "looks the same": an implementation that always appended `reset` would
-        // render identically to the eye while adding an escape to every painted span, and every
-        // byte-identity assertion downstream rests on this.
+        // An implementation that always appended `reset` would look the same while adding an
+        // escape to every painted span, and every byte-identity assertion downstream rests on this.
         let p = Palette::PLAIN;
         assert_eq!(p.paint(p.bold, "text"), "text");
         assert_eq!(p.paint(p.ok, "✓"), "✓");
-        // The PLAIN assertions above cannot discriminate on their own: PLAIN's `reset` is empty
-        // too, so appending it appends nothing. Only an empty attribute against a palette with a
-        // real reset separates "skip the reset" from "append it unconditionally".
+        // PLAIN's `reset` is empty too, so the assertions above cannot discriminate on their own;
+        // only an empty attribute against a palette with a real reset can.
         assert_eq!(Palette::ANSI.paint("", "text"), "text");
     }
 
@@ -502,9 +497,8 @@ mod tests {
 
     #[test]
     fn color_adds_escapes_and_changes_nothing_else() {
-        // The load-bearing property. Strip the escapes from a colored render and it must equal
-        // the plain one byte for byte — this fails if color adds, drops, or reorders a single
-        // text byte. Both backends, so the non-default-section path is covered too.
+        // The load-bearing property: escapes aside, colored and plain must agree byte for byte.
+        // Both backends, so the non-default-section path is covered too.
         let d = diag();
         for backend in ["x11", "wayland"] {
             assert_eq!(
@@ -542,12 +536,12 @@ mod tests {
             ],
         )]);
         let out = d.render_styled("x11", &p);
-        // Warn: the name carries the color too — it is what you scan a failing report for.
+        // Warn: the name is painted as well as the glyph.
         assert!(
             out.contains(&format!("{}device{}", p.warn, p.reset)),
             "{out:?}"
         );
-        // Ok: glyph only, so a healthy report is not a wall of green.
+        // Ok: the glyph only; the third assertion pins that the name is not painted.
         assert!(
             out.contains(&format!("{}✓{} glass: 1.2.0", p.ok, p.reset)),
             "{out:?}"
@@ -568,7 +562,6 @@ mod tests {
             out.contains(&format!("{}1 warning(s){}", p.warn, p.reset)),
             "{out:?}"
         );
-        // Red on a zero would read as an alarm about a number that means "fine".
         assert!(
             out.contains(&format!("{}0 failure(s){}", p.dim, p.reset)),
             "{out:?}"
@@ -591,12 +584,9 @@ mod tests {
 
     #[test]
     fn every_span_of_a_colored_report_is_painted_as_written_here() {
-        // The escape-stripping byte-identity test above cannot see a *missing* escape: deleting
-        // one leaves the stripped text unchanged. So one golden, over a fixture small enough to
-        // read, pinning each structural span literally — the title, the section heading, the
-        // glyph and name of a Warn and a Fail, both remedy lines, every summary cell, and the
-        // verdict. Written as escape literals on purpose: building the expectation from
-        // `palette.*` would make it pass against any palette, which is the hole it closes.
+        // The byte-identity test above cannot see a *missing* escape — stripping one leaves the
+        // text unchanged — so one golden pins every structural span literally. Escape literals on
+        // purpose: an expectation built from `palette.*` would pass against any palette.
         let d = Diagnosis::new(vec![Section::new(
             "general",
             None,
@@ -642,9 +632,8 @@ mod tests {
 
     #[test]
     fn the_mcp_and_json_renderings_carry_no_escapes() {
-        // `render_text` is what server.rs hands the glass_doctor MCP tool, and the same Diagnosis
-        // is what --json serializes. Either carrying an escape would put terminal control bytes
-        // into an agent's JSON.
+        // `render_text` feeds the glass_doctor MCP tool and the same Diagnosis feeds --json; an
+        // escape in either would land in an agent's JSON.
         let d = diag();
         assert!(!d.render_text("x11").contains('\x1b'));
         assert!(!serde_json::to_string(&d).unwrap().contains('\x1b'));

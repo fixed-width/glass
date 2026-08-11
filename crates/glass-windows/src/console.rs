@@ -1,12 +1,11 @@
-//! Console mode: switch a Windows console into ANSI-interpreting mode.
+//! Switching a Windows console into ANSI-interpreting mode.
 //!
 //! A Windows console does not interpret ANSI escapes until
 //! `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is set on its output handle. Windows Terminal sets it for
 //! its own sessions; legacy conhost does not, and renders escapes as visible text.
 
-/// Turn on `ENABLE_VIRTUAL_TERMINAL_PROCESSING` for stdout, reporting whether it took. `false`
-/// for a redirected handle (which has no console mode to set) or a host that refuses the mode —
-/// the caller then suppresses color rather than printing escapes as text.
+/// Turn on `ENABLE_VIRTUAL_TERMINAL_PROCESSING` for stdout, reporting whether it took: `false` for
+/// a redirected handle (which has no console mode to set) or a host that refuses the mode.
 #[cfg(windows)]
 pub fn enable_vt_processing() -> bool {
     use windows::Win32::System::Console::{

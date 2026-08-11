@@ -418,11 +418,10 @@ fn current_cell(doc: &EnvVarDoc, current: Option<&str>) -> String {
     }
 }
 
-/// Render the listing with `palette`. Callers that want the plain text pass [`Palette::PLAIN`],
-/// which produces byte-identical output to painting nothing at all.
+/// Render the listing with `palette`; [`Palette::PLAIN`] gives the uncolored text.
 ///
-/// Names are padded *before* they are painted: `{:<26}` counts escape bytes toward the column
-/// width, so painting first would push every purpose one column right per escape.
+/// Pad names *before* painting them: `{:<26}` counts an escape's characters toward the width, so
+/// painting first pulls the purpose column left by the width of the escapes.
 pub(crate) fn render_styled(current: &dyn Fn(&str) -> Option<String>, palette: &Palette) -> String {
     /// Width of the name column, matching the `{:<26}` this replaced.
     const NAME_COL: usize = 26;
@@ -686,7 +685,7 @@ mod tests {
 
     /// Drop every `\x1b[…m` SGR sequence, leaving the text bytes behind.
     ///
-    /// Deliberately duplicated from glass-core's `doctor` tests rather than shared — exporting a
+    /// Deliberately duplicated from glass-core's `doctor` tests rather than shared: exporting a
     /// test-only helper from glass-core's public API to serve one consumer is the worse trade.
     /// Leave both copies alone.
     fn strip_ansi(s: &str) -> String {
@@ -716,8 +715,8 @@ mod tests {
 
     #[test]
     fn color_adds_escapes_and_changes_nothing_else() {
-        // Also the column guard: painting a name before padding it would push the purpose column
-        // right by the width of the escapes, and that shows up here as a byte difference.
+        // Also the column guard: painting a name before padding it would pull the purpose column
+        // left by the width of the escapes, which shows up here as a byte difference.
         assert_eq!(
             strip_ansi(&render_styled(&stub, &Palette::ANSI)),
             render_styled(&stub, &Palette::PLAIN)
@@ -733,7 +732,7 @@ mod tests {
             out.contains(&format!("{}current: strict (override){}", p.ok, p.reset)),
             "{out:?}"
         );
-        // GLASS_BACKEND is unset. The whole cell plus the reset, so this half is no weaker
+        // GLASS_BACKEND is unset — the whole cell plus the reset, so this half is no weaker
         // than the set half above.
         assert!(
             out.contains(&format!(
@@ -746,10 +745,9 @@ mod tests {
 
     #[test]
     fn the_purpose_column_starts_at_a_fixed_offset() {
-        // `color_adds_escapes_and_changes_nothing_else` compares an ANSI-stripped render against
-        // a PLAIN one, and both sides pad with the same constant — so it is blind to the constant
-        // itself being wrong. Pin the absolute geometry instead, with the offset written as a
-        // literal: deriving it from NAME_COL would inherit exactly the error guarded against.
+        // The byte-identity test pads both sides with the same constant, so it is blind to the
+        // constant itself being wrong. The offset here is a literal: deriving it from NAME_COL
+        // would inherit exactly the error guarded against.
         let out = render_styled(&stub, &Palette::PLAIN);
         let line = |starts: &str| {
             out.lines()
@@ -775,7 +773,7 @@ mod tests {
     #[test]
     fn a_name_wider_than_the_column_keeps_exactly_one_space() {
         // GLASS_EMULATOR_BOOT_TIMEOUT_MS is 30 chars, the only name that reaches the
-        // saturating_sub clamp: the pad is empty and only the separating space remains.
+        // saturating_sub clamp.
         let out = render_styled(&stub, &Palette::PLAIN);
         assert!(
             out.contains(
@@ -788,11 +786,9 @@ mod tests {
 
     #[test]
     fn every_span_of_the_colored_listing_is_painted_as_written_here() {
-        // Stripping escapes cannot see a *missing* escape, so the byte-identity test above passes
-        // with any span left unpainted. One golden over two adjacent lines pins them literally —
-        // the bold name, the dim `default:` cell, the current cell — plus the title, a group
-        // heading, the standard-env heading and the closing note. Escape literals on purpose:
-        // an expectation built from `palette.*` would pass against any palette at all.
+        // Same hole as glass-core's golden: stripping escapes cannot see a *missing* one, so the
+        // byte-identity test above passes with any span left unpainted. Escape literals on
+        // purpose — an expectation built from `palette.*` would pass against any palette.
         let out = render_styled(&stub, &Palette::ANSI);
         assert!(
             out.starts_with("\x1b[1mglass environment\x1b[0m\n\n\x1b[1;36m[all]\x1b[0m\n"),

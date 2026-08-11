@@ -41,10 +41,9 @@ pub(crate) fn resolve(
 
 /// [`resolve`], with `NO_COLOR` and `TERM` looked up **by name** through `env`.
 ///
-/// Split out from [`resolve`] so the names are pinned by a test rather than by argument order:
-/// `resolve` takes the two values positionally, so swapping them at the call site type-checks,
-/// and `TERM` in the `no_color` slot is non-empty on any real terminal — `auto` would then never
-/// color anything.
+/// Split out so the names are pinned by a test rather than by argument order: `resolve` takes the
+/// two values positionally, so swapping them at the call site type-checks, and `TERM` in the
+/// `no_color` slot is non-empty on any real terminal — `auto` would then never color anything.
 fn resolve_from_env(
     choice: ColorChoice,
     is_tty: bool,
@@ -62,12 +61,11 @@ fn env_lookup(name: &str) -> Option<String> {
 
 /// A `VarError` mapped to what [`resolve`] means by "present".
 ///
-/// A variable set to non-UTF-8 bytes is *set*, and by construction non-empty, so it must arrive
-/// as a non-empty `Some` and suppress color. `std::env::var(..).ok()` instead collapses it into
-/// `None`, indistinguishable from truly unset — the fail-open `tools::floor_from_var` avoids for
-/// `GLASS_SANDBOX_FLOOR`, here enabling color for a `NO_COLOR` that asked for the opposite. The
-/// lossy conversion cannot yield an empty string, since an empty `OsString` is valid UTF-8 and
-/// never reaches this arm.
+/// A variable set to non-UTF-8 bytes is *set*, and by construction non-empty, so it must arrive as
+/// a non-empty `Some` and suppress color. `std::env::var(..).ok()` instead collapses it into
+/// `None`, indistinguishable from truly unset — fail-open, enabling color for a `NO_COLOR` that
+/// asked for the opposite. The lossy conversion cannot yield an empty string: an empty `OsString`
+/// is valid UTF-8 and never reaches this arm.
 fn value_of(v: Result<String, VarError>) -> Option<String> {
     match v {
         Ok(s) => Some(s),
@@ -91,9 +89,8 @@ fn vt_ready() -> bool {
 /// Whether a console that reports it will not interpret ANSI should be given it anyway.
 ///
 /// `vt_ready` is `false` for a console that *refuses* the mode (legacy conhost), where escapes
-/// really do show up as visible text. `Always` ignores that — the user asked for color
-/// explicitly, so refusing consoles get escapes rather than a silent downgrade to plain — while
-/// `Auto` defers to it.
+/// really do show up as visible text. `Auto` defers to that; `Always` ignores it, so an explicit
+/// request gets escapes rather than a silent downgrade to plain.
 fn vt_gate_allows(vt_ready: bool, choice: ColorChoice) -> bool {
     vt_ready || choice != ColorChoice::Auto
 }
@@ -111,12 +108,11 @@ pub(crate) fn palette(choice: ColorChoice) -> &'static Palette {
 /// [`palette`] with every process fact injected, so the decision is testable without a pty, a
 /// console, or a mutated process environment.
 ///
-/// `vt_ready` is reached only after the want-color decision, and deliberately so: on Windows the
-/// call MUTATES the console mode, so a `--color never` run — a flag whose whole meaning is "don't
-/// do color things" — must never get that far. Past that point it is called for exactly that side
-/// effect: switching a VT-capable Windows console into VT mode is what makes `--color always`
-/// produce color there instead of visible escape text. Only its *return value* is ignored for
-/// `Always`, which is the console that refuses the mode outright (see [`vt_gate_allows`]).
+/// `vt_ready` is reached only after the want-color decision: on Windows the call MUTATES the
+/// console mode, so a `--color never` run must never get that far. Past that point it is called
+/// for exactly that side effect — switching a VT-capable Windows console into VT mode is what
+/// makes `--color always` produce color there instead of visible escape text. Its *return value*
+/// is [`vt_gate_allows`]'s business.
 fn palette_with(
     choice: ColorChoice,
     is_tty: bool,
@@ -201,8 +197,7 @@ mod tests {
 
     #[test]
     fn an_empty_no_color_does_not_suppress() {
-        // no-color.org: the variable suppresses when present *and non-empty*. Easy to write
-        // backwards, so it gets its own test rather than riding along in the one above.
+        // no-color.org: suppresses when present *and non-empty* — easy to write backwards.
         assert!(resolve(ColorChoice::Auto, true, Some(""), Some("xterm")));
     }
 
@@ -225,8 +220,7 @@ mod tests {
 
     #[test]
     fn an_explicit_always_ignores_a_console_that_cannot_render() {
-        // The legacy-conhost case: the user asked for color, so a console that refuses VT mode
-        // still gets escapes rather than a silent downgrade to plain.
+        // The legacy-conhost case: a console that refuses VT mode still gets escapes.
         assert!(vt_gate_allows(false, ColorChoice::Always));
     }
 
@@ -239,9 +233,8 @@ mod tests {
 
     #[test]
     fn the_suppressing_variable_is_the_one_named_no_color() {
-        // `resolve` takes the two values positionally, so swapping them at the call site
-        // type-checks and every decision-table test above still passes. In production TERM is
-        // non-empty on any real terminal, so a swap would suppress color forever.
+        // A swapped call site would still pass every decision-table test above; this one names
+        // the variable.
         assert!(!resolve_from_env(
             ColorChoice::Auto,
             true,
@@ -275,8 +268,7 @@ mod tests {
 
     #[test]
     fn a_variable_set_to_non_utf8_bytes_reads_as_set_and_non_empty() {
-        // `.ok()` would report this as unset, which for NO_COLOR is fail-open: the variable is
-        // set, so it must suppress.
+        // `.ok()` would report this as unset — fail-open for NO_COLOR, which is set here.
         let v = value_of(Err(VarError::NotUnicode(not_unicode())));
         assert!(
             v.as_deref().is_some_and(|s| !s.is_empty()),

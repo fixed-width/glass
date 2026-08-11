@@ -807,9 +807,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["tool"], "glass_doctor");
-        // Escape-free as well as non-empty: this is the seam that carries the risk. Handing the
-        // tool a `render_styled(backend, &Palette::ANSI)` here would put raw terminal control
-        // bytes into an agent's JSON, and nothing else in the suite would notice.
+        // Escape-free as well as non-empty — this is the seam where a styled render would reach
+        // an agent's JSON.
         assert!(
             v["result"]["report"]
                 .as_str()

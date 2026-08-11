@@ -1,19 +1,18 @@
 //! `--color` end to end through the real binary — the tty detection and palette wiring that a
 //! unit test calling `render_styled` directly cannot reach.
 //!
-//! `env` rather than `doctor` for most cases: it runs no probes, so it is fast and its output
-//! does not depend on what the host has installed.
+//! `env` rather than `doctor` for most cases: it runs no probes, so it is fast and
+//! host-independent.
 
 use std::process::Command;
 
 const GLASS: &str = env!("CARGO_BIN_EXE_glass-mcp");
 
-/// Run glass-mcp and return its stdout, having first confirmed the command actually produced its
-/// report. `banner` is text the subcommand always prints, colored or not — asserting it stops the
-/// escape assertions below from passing vacuously on the empty output of a crashed or
-/// silently-exiting binary.
+/// Run glass-mcp and return its stdout. `banner` is text the subcommand always prints, colored or
+/// not; asserting it keeps the escape assertions below from passing vacuously on the empty output
+/// of a crashed or silently-exiting binary.
 ///
-/// `NO_COLOR` is cleared so a developer who sets it in their own shell doesn't quietly turn these
+/// `NO_COLOR` is cleared so a developer who sets it in their own shell doesn't turn these
 /// assertions into no-ops.
 fn stdout_of(args: &[&str], banner: &str) -> String {
     let out = Command::new(GLASS)
@@ -41,8 +40,7 @@ fn color_never_emits_none() {
 
 #[test]
 fn the_default_is_plain_when_stdout_is_not_a_terminal() {
-    // The harness captures stdout through a pipe — exactly the redirected case auto must not
-    // color, and the reason `glass-mcp env > file` stays machine-readable.
+    // The harness captures stdout through a pipe — the redirected case auto must not color.
     assert!(!stdout_of(&["env"], "glass environment").contains('\x1b'));
 }
 
@@ -58,9 +56,7 @@ fn an_explicit_always_overrides_no_color() {
 
 #[test]
 fn json_is_never_colored_even_when_color_is_forced() {
-    // `serde_json::from_str` below already fails on empty input, so this call doesn't need the
-    // `stdout_of` banner guard to avoid a vacuous pass — but the `"glass"` top-level key is real
-    // JSON output, so it doubles as a cheap sanity check on top of that.
+    // The banner here is a top-level JSON key rather than plain text.
     let out = stdout_of(&["env", "--json", "--color", "always"], "\"glass\"");
     assert!(!out.contains('\x1b'), "{out}");
     serde_json::from_str::<serde_json::Value>(&out).expect("still valid json");
