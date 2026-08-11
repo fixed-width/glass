@@ -3,6 +3,7 @@
 //! distinct from `doctor` (health). The registry and rendering are pure so they are
 //! unit-tested without mutating the process environment.
 
+use glass_core::Palette;
 use serde::Serialize;
 
 /// Which part of glass a variable affects (controls grouping in the listing).
@@ -389,6 +390,14 @@ pub(crate) const STD_ENV: &[(&str, &str)] = &[
         "Linux accessibility (AT-SPI) bus",
     ),
     ("WINDIR", "Windows system directory"),
+    (
+        "NO_COLOR",
+        "Suppress color in doctor/env human output when set to a non-empty value (no-color.org)",
+    ),
+    (
+        "TERM",
+        "Terminal type; `dumb` suppresses color in doctor/env human output",
+    ),
 ];
 
 const DISPLAY_NOTE: &str =
@@ -409,36 +418,66 @@ fn current_cell(doc: &EnvVarDoc, current: Option<&str>) -> String {
     }
 }
 
-/// Render the text listing. `current` returns the live value of a var (`None` = unset).
-pub(crate) fn render_text(current: &dyn Fn(&str) -> Option<String>) -> String {
-    let mut out = String::from("glass environment\n");
+/// Render the listing with `palette`; [`Palette::PLAIN`] gives the uncolored text.
+///
+/// Pad names *before* painting them: `{:<26}` counts an escape's characters toward the width, so
+/// painting first pulls the purpose column left by the width of the escapes.
+pub(crate) fn render_styled(current: &dyn Fn(&str) -> Option<String>, palette: &Palette) -> String {
+    /// Width of the name column, matching the `{:<26}` this replaced.
+    const NAME_COL: usize = 26;
+    let pad_to_col = |name: &str| " ".repeat(NAME_COL.saturating_sub(name.chars().count()));
+
+    let mut out = format!("{}\n", palette.paint(palette.bold, "glass environment"));
     for scope in SCOPE_ORDER {
         let group: Vec<&EnvVarDoc> = GLASS_ENV.iter().filter(|d| d.scope == scope).collect();
         if group.is_empty() {
             continue;
         }
-        out.push_str(&format!("\n[{}]\n", scope.label()));
+        out.push_str(&format!(
+            "\n{}\n",
+            palette.paint(palette.heading, &format!("[{}]", scope.label()))
+        ));
         for d in group {
             let cur = current(d.name);
-            out.push_str(&format!("  {:<26} {}\n", d.name, d.purpose));
             out.push_str(&format!(
-                "  {:<26} default: {} | current: {}\n",
+                "  {}{} {}\n",
+                palette.paint(palette.bold, d.name),
+                pad_to_col(d.name),
+                d.purpose
+            ));
+            let cur_attr = if cur.is_some() {
+                palette.ok
+            } else {
+                palette.dim
+            };
+            out.push_str(&format!(
+                "  {:<width$} {} | {}\n",
                 "",
-                d.default,
-                current_cell(d, cur.as_deref()),
+                palette.paint(palette.dim, &format!("default: {}", d.default)),
+                palette.paint(
+                    cur_attr,
+                    &format!("current: {}", current_cell(d, cur.as_deref()))
+                ),
+                width = NAME_COL,
             ));
         }
     }
-    out.push_str("\nstandard env (read, not glass-specific)\n");
+    out.push_str(&format!(
+        "\n{}\n",
+        palette.paint(palette.heading, "standard env (read, not glass-specific)")
+    ));
     for (name, purpose) in STD_ENV {
-        let cur = if current(name).is_some() {
-            "set"
-        } else {
-            "(unset)"
-        };
-        out.push_str(&format!("  {name:<26} {purpose} | current: {cur}\n"));
+        let set = current(name).is_some();
+        let cur = if set { "set" } else { "(unset)" };
+        let attr = if set { palette.ok } else { palette.dim };
+        out.push_str(&format!(
+            "  {}{} {purpose} | {}\n",
+            palette.paint(palette.bold, name),
+            pad_to_col(name),
+            palette.paint(attr, &format!("current: {cur}")),
+        ));
     }
-    out.push_str(&format!("\n{DISPLAY_NOTE}\n"));
+    out.push_str(&format!("\n{}\n", palette.paint(palette.dim, DISPLAY_NOTE)));
     out
 }
 
@@ -574,7 +613,7 @@ mod tests {
 
     #[test]
     fn text_shows_default_override_and_unset_markers() {
-        let out = render_text(&stub);
+        let out = render_styled(&stub, &Palette::PLAIN);
         // a set non-secret shows value + (override)
         assert!(out.contains("current: strict (override)"), "{out}");
         // an unset non-secret shows (unset → default)
@@ -593,7 +632,7 @@ mod tests {
 
     #[test]
     fn text_groups_are_in_fixed_scope_order() {
-        let out = render_text(&stub);
+        let out = render_styled(&stub, &Palette::PLAIN);
         let idx = |s: &str| {
             out.find(s)
                 .unwrap_or_else(|| panic!("missing {s} in:\n{out}"))
@@ -622,7 +661,7 @@ mod tests {
 
     #[test]
     fn secret_value_is_never_emitted() {
-        let text = render_text(&stub);
+        let text = render_styled(&stub, &Palette::PLAIN);
         let json = render_json(&stub);
         assert!(
             !text.contains("supersecret"),
@@ -642,6 +681,183 @@ mod tests {
             .map(|(_, b)| b)
             .unwrap();
         assert!(token_line.contains("current: set"), "{token_line}");
+    }
+
+    /// Drop every `\x1b[…m` SGR sequence, leaving the text bytes behind.
+    ///
+    /// Deliberately duplicated from glass-core's `doctor` tests rather than shared: exporting a
+    /// test-only helper from glass-core's public API to serve one consumer is the worse trade.
+    /// Leave both copies alone.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn strip_ansi_removes_escapes_and_is_not_the_identity() {
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\x1b[1mGLASS_BACKEND\x1b[0m"), "GLASS_BACKEND");
+        let colored = Palette::ANSI.paint(Palette::ANSI.bold, "x");
+        assert!(colored.len() > "x".len(), "expected escapes: {colored:?}");
+    }
+
+    #[test]
+    fn color_adds_escapes_and_changes_nothing_else() {
+        // Also the column guard: painting a name before padding it would pull the purpose column
+        // left by the width of the escapes, which shows up here as a byte difference.
+        assert_eq!(
+            strip_ansi(&render_styled(&stub, &Palette::ANSI)),
+            render_styled(&stub, &Palette::PLAIN)
+        );
+    }
+
+    #[test]
+    fn a_set_variable_is_green_and_an_unset_one_is_dim() {
+        let p = Palette::ANSI;
+        let out = render_styled(&stub, &p);
+        // GLASS_SANDBOX is set to "strict" by `stub`.
+        assert!(
+            out.contains(&format!("{}current: strict (override){}", p.ok, p.reset)),
+            "{out:?}"
+        );
+        // GLASS_BACKEND is unset — the whole cell plus the reset, so this half is no weaker
+        // than the set half above.
+        assert!(
+            out.contains(&format!(
+                "{}current: (unset \u{2192} x11 (or windows on Windows, macos on macOS)){}",
+                p.dim, p.reset
+            )),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn the_purpose_column_starts_at_a_fixed_offset() {
+        // The byte-identity test pads both sides with the same constant, so it is blind to the
+        // constant itself being wrong. The offset here is a literal: deriving it from NAME_COL
+        // would inherit exactly the error guarded against.
+        let out = render_styled(&stub, &Palette::PLAIN);
+        let line = |starts: &str| {
+            out.lines()
+                .find(|l| l.starts_with(starts))
+                .unwrap_or_else(|| panic!("no {starts:?} line in:\n{out}"))
+                .to_string()
+        };
+        // 29 = the two-space indent + the 26-column name field + one separating space.
+        let name_line = line("  GLASS_AVD");
+        assert_eq!(
+            name_line.find("which AVD to boot when none is running"),
+            Some(29),
+            "{name_line:?}"
+        );
+        // The second line of the pair puts `default:` in that same column.
+        let default_line = out
+            .lines()
+            .find(|l| l.contains("default: the sole AVD"))
+            .unwrap_or_else(|| panic!("no GLASS_AVD default line in:\n{out}"));
+        assert_eq!(default_line.find("default: "), Some(29), "{default_line:?}");
+    }
+
+    #[test]
+    fn a_name_wider_than_the_column_keeps_exactly_one_space() {
+        // GLASS_EMULATOR_BOOT_TIMEOUT_MS is 30 chars, the only name that reaches the
+        // saturating_sub clamp.
+        let out = render_styled(&stub, &Palette::PLAIN);
+        assert!(
+            out.contains(
+                "\n  GLASS_EMULATOR_BOOT_TIMEOUT_MS max wait for the booting emulator to reach \
+                 sys.boot_completed\n"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn every_span_of_the_colored_listing_is_painted_as_written_here() {
+        // Same hole as glass-core's golden: stripping escapes cannot see a *missing* one, so the
+        // byte-identity test above passes with any span left unpainted. Escape literals on
+        // purpose — an expectation built from `palette.*` would pass against any palette.
+        let out = render_styled(&stub, &Palette::ANSI);
+        assert!(
+            out.starts_with("\x1b[1mglass environment\x1b[0m\n\n\x1b[1;36m[all]\x1b[0m\n"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(concat!(
+                "  \x1b[1mGLASS_AVD\x1b[0m                  which AVD to boot when none is running\n",
+                "                             \x1b[2mdefault: the sole AVD\x1b[0m | \x1b[2mcurrent: (unset \u{2192} the sole AVD)\x1b[0m\n",
+            )),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("\n\x1b[1;36mstandard env (read, not glass-specific)\x1b[0m\n"),
+            "{out:?}"
+        );
+        assert!(
+            out.ends_with(
+                "\n\x1b[2mnote: the X11 backend ignores ambient DISPLAY; set GLASS_DISPLAY \
+                 instead.\x1b[0m\n"
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_standard_variable_that_is_set_is_green_and_an_unset_one_is_dim() {
+        // The GLASS_* loop and the STD_ENV loop each decide this for themselves; the test above
+        // only exercises the first. `stub` sets PATH and nothing else in STD_ENV.
+        let out = render_styled(&stub, &Palette::ANSI);
+        let line = |name: &str| {
+            let head = format!("  \x1b[1m{name}\x1b[0m");
+            out.lines()
+                .find(|l| l.starts_with(&head))
+                .unwrap_or_else(|| panic!("no {name} line in:\n{out:?}"))
+                .to_string()
+        };
+        let path = line("PATH");
+        assert!(path.ends_with("\x1b[32mcurrent: set\x1b[0m"), "{path:?}");
+        let windir = line("WINDIR");
+        assert!(
+            windir.ends_with("\x1b[2mcurrent: (unset)\x1b[0m"),
+            "{windir:?}"
+        );
+    }
+
+    #[test]
+    fn a_secret_value_never_leaks_through_the_styled_rendering_either() {
+        // A coloring bug that painted the raw value would be a leak, and the existing
+        // `secret_value_is_never_emitted` only looks at the plain and JSON forms.
+        let out = render_styled(&stub, &Palette::ANSI);
+        assert!(
+            !out.contains("supersecret"),
+            "secret leaked in styled:\n{out}"
+        );
+        let p = Palette::ANSI;
+        assert!(
+            out.contains(&format!("{}current: set{}", p.ok, p.reset)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn the_standard_env_list_documents_the_color_variables() {
+        // `color::palette` reads NO_COLOR and TERM, so `glass-mcp env` must say so — STD_ENV is
+        // the inventory of non-GLASS_* env glass reads.
+        let out = render_styled(&stub, &Palette::PLAIN);
+        assert!(out.contains("NO_COLOR"), "{out}");
+        assert!(out.contains("TERM"), "{out}");
     }
 
     #[test]

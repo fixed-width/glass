@@ -807,11 +807,13 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["tool"], "glass_doctor");
+        // Escape-free as well as non-empty — this is the seam where a styled render would reach
+        // an agent's JSON.
         assert!(
             v["result"]["report"]
                 .as_str()
-                .is_some_and(|s| !s.is_empty()),
-            "expected a non-empty result.report string, got {v}"
+                .is_some_and(|s| !s.is_empty() && !s.contains('\x1b')),
+            "expected a non-empty, escape-free result.report string, got {v}"
         );
     }
 

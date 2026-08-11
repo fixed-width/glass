@@ -43,6 +43,8 @@ if the default backend can't run (CI-friendly). The agent can run the same check
 
 - `--deep` — additionally spawn and tear down the display to prove it starts.
 - `--json` — machine-readable output.
+- `--color <when>` — `auto` (default; color only when writing to a terminal), `always`, or `never`.
+  Ignored with `--json`. A non-empty `NO_COLOR`, or `TERM=dumb`, suppresses `auto`.
 
 ## `env`
 
@@ -50,6 +52,8 @@ List every `GLASS_*` variable with its purpose, default, and current value (see
 [reference/environment.md](environment.md)). `GLASS_TOKEN` is shown only as `set`/`(unset)`.
 
 - `--json` — machine-readable output.
+- `--color <when>` — `auto` (default; color only when writing to a terminal), `always`, or `never`.
+  Ignored with `--json`. A non-empty `NO_COLOR`, or `TERM=dumb`, suppresses `auto`.
 
 ## `status`
 

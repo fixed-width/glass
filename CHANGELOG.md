@@ -19,6 +19,13 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Added
+- `glass-mcp doctor` and `glass-mcp env` colorize their output when writing to a terminal: the
+  status glyphs take their status's color, a warning or failure colors the check's name so it is
+  findable in a long report, and skipped checks and remedies recede. Piped or redirected output is
+  unchanged, byte for byte, as is `--json`. `--color always|never` overrides the detection, and
+  a non-empty `NO_COLOR` or `TERM=dumb` suppresses it.
+
 ### Changed
 - `glass_set_value`'s "did not take" error now names both what you asked for and what the element
   holds, and closes with what the backend that made the write knows about it. Three outcomes used
