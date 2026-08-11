@@ -24,7 +24,7 @@ internal refactors, CI, or test-only changes.
   status glyphs take their status's color, a warning or failure colors the check's name so it is
   findable in a long report, and skipped checks and remedies recede. Piped or redirected output is
   unchanged, byte for byte, as is `--json`. `--color always|never` overrides the detection, and
-  `NO_COLOR` or `TERM=dumb` suppresses it.
+  a non-empty `NO_COLOR` or `TERM=dumb` suppresses it.
 
 ### Changed
 - `glass_set_value`'s "did not take" error now names both what you asked for and what the element
