@@ -13,6 +13,7 @@
 
 use glass_core::capability::{CapabilityMap, CapabilityStatus};
 
+pub mod console; // cfg(windows) console-mode switch for ANSI output; no host-testable surface
 pub mod containment; // Windows containment provider seam (pure config is host-tested)
 pub mod discovery; // pure window-discovery poll-loop decision — cross-platform, host-tested
 pub mod doctor; // pure check-mapping cross-platform; Windows fact-gathering is cfg(windows)
