@@ -35,12 +35,18 @@ pub enum Command {
         /// Machine-readable JSON output.
         #[arg(long)]
         json: bool,
+        /// Colorize human output: auto (only a terminal), always, or never. Ignored with --json.
+        #[arg(long, value_enum, default_value_t, value_name = "WHEN")]
+        color: crate::color::ColorChoice,
     },
     /// List glass's configuration environment variables (purpose, default, current).
     Env {
         /// Machine-readable JSON output.
         #[arg(long)]
         json: bool,
+        /// Colorize human output: auto (only a terminal), always, or never. Ignored with --json.
+        #[arg(long, value_enum, default_value_t, value_name = "WHEN")]
+        color: crate::color::ColorChoice,
     },
     /// Serve MCP over the network via Streamable HTTP.
     Serve {
@@ -119,7 +125,8 @@ mod tests {
             cli.command,
             Some(Command::Doctor {
                 deep: true,
-                json: true
+                json: true,
+                ..
             })
         ));
         // flags default to false
@@ -128,7 +135,8 @@ mod tests {
             cli.command,
             Some(Command::Doctor {
                 deep: false,
-                json: false
+                json: false,
+                ..
             })
         ));
     }
@@ -136,7 +144,42 @@ mod tests {
     #[test]
     fn env_json_parses() {
         let cli = Cli::try_parse_from(["glass-mcp", "env", "--json"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Env { json: true })));
+        assert!(matches!(cli.command, Some(Command::Env { json: true, .. })));
+    }
+
+    #[test]
+    fn color_defaults_to_auto_and_parses_each_choice() {
+        use crate::color::ColorChoice;
+        let cli = Cli::try_parse_from(["glass-mcp", "doctor"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Doctor {
+                color: ColorChoice::Auto,
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from(["glass-mcp", "doctor", "--color", "always"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Doctor {
+                color: ColorChoice::Always,
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from(["glass-mcp", "env", "--color", "never"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Env {
+                color: ColorChoice::Never,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_unknown_color_choice_is_rejected() {
+        let err = Cli::try_parse_from(["glass-mcp", "doctor", "--color", "rainbow"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]

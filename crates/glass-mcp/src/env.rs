@@ -418,12 +418,8 @@ fn current_cell(doc: &EnvVarDoc, current: Option<&str>) -> String {
     }
 }
 
-/// Render the text listing. `current` returns the live value of a var (`None` = unset).
-pub(crate) fn render_text(current: &dyn Fn(&str) -> Option<String>) -> String {
-    render_styled(current, &Palette::PLAIN)
-}
-
-/// [`render_text`] drawn with `palette`. Through [`Palette::PLAIN`] the two are byte-identical.
+/// Render the listing with `palette`. Callers that want the plain text pass [`Palette::PLAIN`],
+/// which produces byte-identical output to painting nothing at all.
 ///
 /// Names are padded *before* they are painted: `{:<26}` counts escape bytes toward the column
 /// width, so painting first would push every purpose one column right per escape.
@@ -618,7 +614,7 @@ mod tests {
 
     #[test]
     fn text_shows_default_override_and_unset_markers() {
-        let out = render_text(&stub);
+        let out = render_styled(&stub, &Palette::PLAIN);
         // a set non-secret shows value + (override)
         assert!(out.contains("current: strict (override)"), "{out}");
         // an unset non-secret shows (unset → default)
@@ -637,7 +633,7 @@ mod tests {
 
     #[test]
     fn text_groups_are_in_fixed_scope_order() {
-        let out = render_text(&stub);
+        let out = render_styled(&stub, &Palette::PLAIN);
         let idx = |s: &str| {
             out.find(s)
                 .unwrap_or_else(|| panic!("missing {s} in:\n{out}"))
@@ -666,7 +662,7 @@ mod tests {
 
     #[test]
     fn secret_value_is_never_emitted() {
-        let text = render_text(&stub);
+        let text = render_styled(&stub, &Palette::PLAIN);
         let json = render_json(&stub);
         assert!(
             !text.contains("supersecret"),
@@ -724,7 +720,7 @@ mod tests {
         // right by the width of the escapes, and that shows up here as a byte difference.
         assert_eq!(
             strip_ansi(&render_styled(&stub, &Palette::ANSI)),
-            render_text(&stub)
+            render_styled(&stub, &Palette::PLAIN)
         );
     }
 
@@ -764,7 +760,7 @@ mod tests {
     fn the_standard_env_list_documents_the_color_variables() {
         // `color::palette` reads NO_COLOR and TERM, so `glass-mcp env` must say so — STD_ENV is
         // the inventory of non-GLASS_* env glass reads.
-        let out = render_text(&stub);
+        let out = render_styled(&stub, &Palette::PLAIN);
         assert!(out.contains("NO_COLOR"), "{out}");
         assert!(out.contains("TERM"), "{out}");
     }

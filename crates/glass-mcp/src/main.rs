@@ -33,8 +33,10 @@ async fn main() -> anyhow::Result<()> {
                 run_stdio(boot(sink), report).await
             }
         },
-        Some(Command::Doctor { deep, json }) => run_doctor(deep, json, audit_log.as_deref()),
-        Some(Command::Env { json }) => run_env(json),
+        Some(Command::Doctor { deep, json, color }) => {
+            run_doctor(deep, json, audit_log.as_deref(), color)
+        }
+        Some(Command::Env { json, color }) => run_env(json, color),
         Some(Command::Serve {
             http,
             addr,

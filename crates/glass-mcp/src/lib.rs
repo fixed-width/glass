@@ -177,12 +177,12 @@ pub(crate) fn backend_env_unrecognized(env: Option<&str>) -> bool {
 }
 
 /// `glass-mcp env [--json]`: print glass's configuration env vars (secrets redacted).
-pub fn run_env(json: bool) -> ! {
+pub fn run_env(json: bool, color: color::ColorChoice) -> ! {
     let current = |name: &str| env::current_from_env(name);
     let out = if json {
         env::render_json(&current)
     } else {
-        env::render_text(&current)
+        env::render_styled(&current, color::palette(color))
     };
     print!("{out}");
     std::process::exit(0);
@@ -278,7 +278,7 @@ pub fn run_debug_checklist() -> anyhow::Result<()> {
 }
 
 /// Run the `doctor` subcommand and exit.
-pub fn run_doctor(deep: bool, json: bool, audit_log: Option<&str>) -> ! {
+pub fn run_doctor(deep: bool, json: bool, audit_log: Option<&str>, color: color::ColorChoice) -> ! {
     let backend = default_backend(std::env::var("GLASS_BACKEND").ok().as_deref());
     let report = audit::report_from_config(audit_log, |k| std::env::var(k).ok());
     let diag = doctor::diagnose_with_audit(deep, &report);
@@ -288,7 +288,7 @@ pub fn run_doctor(deep: bool, json: bool, audit_log: Option<&str>) -> ! {
             serde_json::to_string_pretty(&diag).expect("serialize diagnosis")
         );
     } else {
-        print!("{}", diag.render_text(backend));
+        print!("{}", diag.render_styled(backend, color::palette(color)));
     }
     std::process::exit(diag.exit_code(backend));
 }
