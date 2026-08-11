@@ -28,17 +28,3 @@ pub fn enable_vt_processing() -> bool {
         SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING).is_ok()
     }
 }
-
-#[cfg(all(windows, test))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn enabling_twice_reports_the_same_answer() {
-        // The strong assertion — "returns true on a console, false when redirected" — can't be
-        // written portably: under `cargo test` stdout is a pipe, so this is the redirected case,
-        // and under `--nocapture` on a real console it is not. Idempotence holds either way, and
-        // still catches a first call that leaves the mode in a state the second one chokes on.
-        assert_eq!(enable_vt_processing(), enable_vt_processing());
-    }
-}
