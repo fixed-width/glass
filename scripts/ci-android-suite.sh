@@ -111,6 +111,14 @@ fi
 ./scripts/test-android.sh "$@" 2>&1 | tee diagnostics/test-output.txt
 rc=${PIPESTATUS[0]}
 
+# The workflow builds these before booting anything, so a `Compiling` line here means the
+# pre-build missed a target and this run competed with a compiler — the failure mode of
+# glass#439.
+if grep -q '^ *Compiling ' diagnostics/test-output.txt; then
+  echo "ci-android-suite: the suite compiled with the device up — the pre-build did not cover \
+every target, so this run's load is not what the settle gate measured" >&2
+fi
+
 if [ "$rc" -ne 0 ]; then
   "$adb" shell dumpsys window        > diagnostics/dumpsys-window.txt 2>&1
   "$adb" shell dumpsys activity top  > diagnostics/dumpsys-top.txt    2>&1
