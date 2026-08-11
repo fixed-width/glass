@@ -176,7 +176,8 @@ pub(crate) fn backend_env_unrecognized(env: Option<&str>) -> bool {
     matches!(env, Some(v) if recognized_backend(v).is_none())
 }
 
-/// `glass-mcp env [--json]`: print glass's configuration env vars (secrets redacted).
+/// `glass-mcp env [--json] [--color <auto|always|never>]`: print glass's configuration env vars
+/// (secrets redacted).
 pub fn run_env(json: bool, color: color::ColorChoice) -> ! {
     let current = |name: &str| env::current_from_env(name);
     let out = if json {
