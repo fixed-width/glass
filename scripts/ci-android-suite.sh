@@ -108,6 +108,29 @@ else
 running the suite anyway" >&2
 fi
 
+collect_device_state() {
+  "$adb" shell dumpsys window        > diagnostics/dumpsys-window.txt 2>&1
+  "$adb" shell dumpsys activity top  > diagnostics/dumpsys-top.txt    2>&1
+  "$adb" exec-out screencap -p       > diagnostics/screen-after-teardown.png 2>/dev/null
+}
+
+# A device is also quiet when it is wedged: an ANR dialog stops the app behind it from logging,
+# which the settle window above reads as calm. Checked by focused window rather than logcat's
+# `ANR in`, which reports one that happened and may since have been dismissed.
+#
+# `window displays`, not the full `window`: that dump leads with a WINDOW MANAGER LAST ANR section
+# carrying its own mCurrentFocus from the moment of the ANR, so on a wedged device it names the
+# healthy app first and on a recovered one it still shows the dialog.
+focus="$("$adb" shell dumpsys window displays 2>/dev/null | grep 'mCurrentFocus=')"
+case "$focus" in
+  *"Application Not Responding"*)
+    echo "ci-android-suite: an app stopped responding while the device came up, so the suite \
+would drive a device showing its dialog: ${focus#*mCurrentFocus=}" >&2
+    collect_device_state
+    exit 1
+    ;;
+esac
+
 ./scripts/test-android.sh "$@" 2>&1 | tee diagnostics/test-output.txt
 rc=${PIPESTATUS[0]}
 
@@ -120,9 +143,7 @@ every target, so this run's load is not what the settle gate measured" >&2
 fi
 
 if [ "$rc" -ne 0 ]; then
-  "$adb" shell dumpsys window        > diagnostics/dumpsys-window.txt 2>&1
-  "$adb" shell dumpsys activity top  > diagnostics/dumpsys-top.txt    2>&1
-  "$adb" exec-out screencap -p       > diagnostics/screen-after-teardown.png 2>/dev/null
+  collect_device_state
 fi
 
 # Stopped last: the capture then covers the collection above, and that collection is also the
