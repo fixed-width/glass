@@ -44,6 +44,11 @@ jobs:
     name: Android device suite (AVD)
     runs-on: Android-CI
     timeout-minutes: 45
+    env:
+      # avdmanager and the `emulator` binary default to different AVD directories on this runner,
+      # so an unpinned AVD lands where the emulator will not look. Job-level: a step's env does
+      # not reach the next, and the create and boot steps must agree.
+      ANDROID_AVD_HOME: ${{ github.workspace }}/.android-avd
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -128,56 +133,49 @@ jobs:
           echo "GLASS_ANDROID_FIXTURE_APK=$apk" >> "$GITHUB_ENV"
 
       - name: Build the device suite's test binaries
-        # Ahead of every step that can have an emulator running — the AVD snapshot below boots
-        # one too. A build beside a booted AVD ANRs the device (glass#439).
+        # Ahead of every step that can have an emulator running. A build beside a booted AVD ANRs
+        # the device (glass#439).
         run: ./scripts/test-android.sh --build-only
 
-      - name: Restore the AVD cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: avd-cache
-        with:
-          path: |
-            ~/.android/avd/*
-            ~/.android/adb*
-          # Every input that decides what the cached AVD *is* must appear here — the profile, and
-          # via the workflow hash the action SHA, emulator-options and disable-animations.
-          # Otherwise a changed device restores the old snapshot forever: the nightly refreshes
-          # the LRU clock and save is skipped on a hit, so the entry never self-corrects.
-          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}-${{ env.EMULATOR_PROFILE }}-${{ hashFiles('.github/workflows/android.yml') }}
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
 
-      - name: Create the AVD snapshot (cache miss only)
-        if: steps.avd-cache.outputs.cache-hit != 'true'
-        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
-        with:
-          api-level: ${{ env.API_LEVEL }}
-          target: ${{ env.EMULATOR_TARGET }}
-          arch: ${{ env.EMULATOR_ARCH }}
-          profile: ${{ env.EMULATOR_PROFILE }}
-          force-avd-creation: false
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: false
-          script: echo "AVD snapshot generated."
+      - name: Define the AVD
+        # Created, not restored from a cache: a cached snapshot resumes mid-churn, the state
+        # ci-android-suite.sh's settle gate has to wait out. avdmanager takes seconds.
+        run: |
+          img="system-images;android-${API_LEVEL};${EMULATOR_TARGET};${EMULATOR_ARCH}"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "emulator" "$img"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | avdmanager create avd -n glass -k "$img" --device "$EMULATOR_PROFILE" --force
+          # Two cores starved the boot badly enough that the launcher could not take focus before
+          # the 5s input-dispatch timeout (glass#441). Capped: the emulator gains nothing from
+          # more cores than it can schedule.
+          cores=$(( $(nproc) / 2 )); [ "$cores" -gt 8 ] && cores=8; [ "$cores" -lt 2 ] && cores=2
+          printf 'hw.cpu.ncore=%s\n' "$cores" >> "$ANDROID_AVD_HOME/glass.avd/config.ini"
+          # avdmanager warns and continues rather than failing, so ask the binary that boots it.
+          "$ANDROID_SDK_ROOT/emulator/emulator" -list-avds | grep -qx glass \
+            || { echo "::error::AVD 'glass' is not visible to the emulator binary"; exit 1; }
+
+      - name: Boot the emulator
+        # Not android-emulator-runner: it waits on sys.boot_completed alone, then sends
+        # `input keyevent 82` with no way to disable it, and input dispatched at that moment ANRs
+        # the launcher (glass#441).
+        run: ./scripts/ci-android-boot.sh glass
 
       - name: Run the device suite
-        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         env:
           # The 120s default was tuned on a warm dev box, not a cold runner.
           GLASS_EMULATOR_BOOT_TIMEOUT_MS: '300000'
-          # This job's device is the action's. glass defaults to attach-or-boot, so if that
-          # emulator dies mid-suite glass would quietly boot its own and the remaining tests
-          # would pass against a different device.
+          # The device is the one booted above. glass defaults to attach-or-boot, so if it died
+          # mid-suite glass would quietly boot its own and the remaining tests would pass against
+          # a different device.
           GLASS_ANDROID_LIFECYCLE: attach
-        with:
-          api-level: ${{ env.API_LEVEL }}
-          target: ${{ env.EMULATOR_TARGET }}
-          arch: ${{ env.EMULATOR_ARCH }}
-          profile: ${{ env.EMULATOR_PROFILE }}
-          force-avd-creation: false
-          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: true
-          # Do not inline this script's contents here, and do not move the diagnostics into a
-          # later `if: failure()` step — scripts/ci-android-suite.sh's header says why both fail.
-          script: ./scripts/ci-android-suite.sh
+        run: ./scripts/ci-android-suite.sh
+
+      - name: Stop the emulator
+        if: always()
+        run: adb -s emulator-5554 emu kill || true
 
       - name: Save the fixture APK cache
         # Runs on a failed suite: the APK comes from the build step, not the test run. Skipping on
@@ -188,18 +186,6 @@ jobs:
         with:
           path: ~/glass-fixture
           key: glass-fixture-${{ env.AGENT_TAG }}
-
-      - name: Save the AVD cache
-        # Runs even on a failed suite: the snapshot comes from "Create the AVD snapshot", not the
-        # test run, so a red suite would otherwise re-pay full AVD creation every run. Skipping on
-        # a hit is no longer automatic once restore/save are split.
-        if: always() && steps.avd-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.android/avd/*
-            ~/.android/adb*
-          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}-${{ env.EMULATOR_PROFILE }}-${{ hashFiles('.github/workflows/android.yml') }}
 
       - name: Upload failure diagnostics
         if: failure()
