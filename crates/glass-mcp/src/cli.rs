@@ -91,9 +91,8 @@ pub enum Command {
         #[arg(long)]
         addr: Option<String>,
     },
-    /// Update this binary to the latest release. Downloads the asset for this platform, verifies
-    /// its checksum (and its build provenance, when the GitHub CLI is installed), and replaces
-    /// this binary in place.
+    /// Update this binary to the latest release. Verifies the downloaded asset's checksum, and its
+    /// build provenance when the GitHub CLI is installed.
     #[cfg(feature = "self-update")]
     Update {
         /// Report the current and latest version without changing anything.
