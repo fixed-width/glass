@@ -19,6 +19,8 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-17
+
 ### Added
 - `glass-mcp update` updates the binary in place: it downloads the latest release for your
   platform, verifies its checksum and (when the GitHub CLI is installed) its build provenance,
@@ -26,6 +28,9 @@ internal refactors, CI, or test-only changes.
   `--yes` skips the confirmation prompt. It never asks for elevated privileges — if the install
   directory isn't writable it prints the release URL instead so you can move the binary into
   place yourself.
+- Releases now publish the bare Linux and Windows binaries next to the archives, each with its
+  own `.sha256` — a direct download with nothing to unpack. The archives are unchanged, and the
+  macOS artifacts stay the notarized `.dmg` and `.zip`.
 
 ## [1.3.0] - 2026-08-11
 
@@ -1107,7 +1112,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/fixed-width/glass/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/fixed-width/glass/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/fixed-width/glass/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/fixed-width/glass/compare/v1.0.1...v1.1.0
