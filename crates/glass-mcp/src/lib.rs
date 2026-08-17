@@ -30,6 +30,8 @@ pub(crate) mod shutdown;
 pub(crate) mod status;
 mod tools;
 mod untrusted;
+#[cfg(feature = "self-update")]
+pub(crate) mod update;
 
 use anyhow::Context;
 use glass_core::{Backend, BaselineStore, Glass, GlassError, Platform, Result};

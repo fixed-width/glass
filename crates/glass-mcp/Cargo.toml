@@ -7,7 +7,7 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-default = ["network"]
+default = ["network", "self-update"]
 network = [
     "dep:axum",
     "dep:tower",
@@ -15,6 +15,7 @@ network = [
     "dep:futures",
     "rmcp/transport-streamable-http-server",
 ]
+self-update = []
 
 [dependencies]
 glass-android.workspace = true
