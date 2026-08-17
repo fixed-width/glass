@@ -81,6 +81,22 @@ Exit code: `0` for a successful update, for "already up to date", and for every 
 (whether or not a newer release exists) — a script should read `--json`'s `update_available` field,
 not the exit code, to learn whether news exists. `1` for a refusal or any other error.
 
+`--json` always prints exactly one object, whatever happened. Its fields:
+
+| Field | Meaning |
+|---|---|
+| `action` | `checked`, `updated`, `refused`, or `error` (the release could not be resolved, downloaded, or installed at all) |
+| `current` | the version of the binary that is running |
+| `latest` | the latest published release, or `null` if it was never resolved |
+| `update_available` | `true` only when `latest` is known **and** strictly newer than `current` |
+| `current_comparable` | `false` when `current` is not a released version (a from-source build), so `update_available: false` means "unknown", not "up to date" |
+| `supported` | whether this platform is one `update` can replace in place at all |
+| `asset` · `url` | the release asset chosen for this platform, and where it lives — `null` before they are resolved |
+| `install_path` | the binary that would be, or was, replaced |
+| `attestation` | `not_checked`, `verified`, `unavailable` (no `gh` on `PATH`), `skipped` (`--skip-attestation`), or `failed` |
+| `running_server` | whether a `glass-mcp serve --http` is answering on `127.0.0.1:7300` and therefore still running the previous build |
+| `reason` | present only for `refused` and `error`: the same text the human output prints |
+
 `update` refuses to run rather than guess in several cases:
 - **A from-source build.** A binary built locally (its version carries a `git describe` suffix)
   is not something a release binary should silently replace — rebuild it with `git pull && cargo
@@ -89,9 +105,12 @@ not the exit code, to learn whether news exists. `1` for a refusal or any other 
   instead (see [how-to/setup-macos.md](../how-to/setup-macos.md)).
 - **An unsupported architecture**, where no release asset is published — build from source instead
   (see [how-to/build-from-source.md](../how-to/build-from-source.md)).
-- **An install directory that is not writable** by the current user. `update` never escalates
-  privileges to get around this (no `sudo` re-exec) — it prints the release URL so you can download
-  and move the binary into place by hand.
+- **An install directory it cannot stage the download in.** Before downloading anything, `update`
+  creates the temporary file it is about to download into, beside the installed binary. If that
+  fails it reports the operating system's own error — a read-only directory is the usual reason,
+  but a full disk or a quota lands here too — and stops. It never escalates privileges to get
+  around this (no `sudo` re-exec); it prints the release URL so you can download and move the
+  binary into place by hand.
 - **A non-interactive run without `--yes`.** With no terminal to confirm on and no `--yes`, `update`
   declines rather than assuming consent.
 

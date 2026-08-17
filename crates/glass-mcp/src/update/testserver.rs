@@ -1,7 +1,7 @@
-//! A four-route HTTP server for the update tests, hand-rolled over `std::net::TcpListener`.
+//! A tiny HTTP server for the update tests, hand-rolled over `std::net::TcpListener`.
 //!
 //! Deliberately not axum: that would tie these tests to the optional `network` feature, and glass
-//! already hand-rolls loopback HTTP in `setup::fetch_health`. Four routes, one thread, no
+//! already hand-rolls loopback HTTP in `setup::fetch_health`. A handful of routes, one thread, no
 //! dependencies — and because the base URL is a `ReleaseSource` constructor argument, the tests
 //! drive the real code path rather than a mock of it.
 
@@ -91,6 +91,22 @@ fn serve_one(mut stream: TcpStream, routes: &Routes, port: u16) {
             stream,
             "HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:{port}/fixed-width/glass/releases/latest\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
+        let _ = stream.flush();
+        return;
+    }
+    // A response that promises more body than it delivers, then hangs up. This is the only route
+    // here that fails AFTER the destination file has been created: 404s and refused redirects all
+    // fail while `download_to` is still in `send()`, so they cannot exercise its cleanup arm at
+    // all. `Content-Length` is deliberately larger than the bytes written, which makes the client
+    // see the close as a truncated message rather than a complete one.
+    if path == "/truncated" {
+        let body = b"the first half of a binary";
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len() + 4096
+        );
+        let _ = stream.write_all(body);
         let _ = stream.flush();
         return;
     }

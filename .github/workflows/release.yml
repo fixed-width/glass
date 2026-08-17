@@ -176,8 +176,10 @@ jobs:
           Copy-Item target/release/glass-mcp.exe "dist/$name/glass-mcp.exe"
           Copy-Item packaging/README-windows.md  "dist/$name/README.md"
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -Force
-          # The bare, signed .exe `glass-mcp update` downloads — the same signed binary the
-          # archive carries, published flat so the updater needs no archive-extraction code.
+          # The bare .exe `glass-mcp update` downloads — the very same file the archive above
+          # carries, published flat so the updater needs no archive-extraction code. Copied from
+          # target/release after the sign step, so it is Authenticode-signed exactly when the
+          # archived copy is: only when the signing secrets are configured (see `creds` above).
           Copy-Item target/release/glass-mcp.exe "dist/$name.exe"
           foreach ($f in Get-ChildItem dist/*.zip, dist/*.exe) {
             $hash = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()

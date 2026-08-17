@@ -1,8 +1,9 @@
 //! `glass-mcp update`: fetch the latest release, verify it, and replace this binary.
 //!
 //! The step order below is a contract, not an implementation detail, and the tests assert it: the
-//! from-source refusal happens before any network request, writability is proved before anything
-//! is downloaded, and consent is taken before the download rather than before the swap.
+//! from-source refusal happens before any network request, the file the download will land in is
+//! created before anything is downloaded, and consent is taken before the download rather than
+//! before the swap.
 
 mod release;
 mod swap;
@@ -20,9 +21,11 @@ use verify::Attestation;
 
 /// Everything the flow needs to know that is not the release itself.
 ///
-/// `interactive` and `smoke` are separate from the CLI flags so the tests can drive the
-/// non-interactive path and skip executing a fixture that is not a real binary; the binary always
-/// sets them from the real terminal and always leaves `smoke` on.
+/// `interactive`, `smoke` and `attest_program` are separate from the CLI flags so the tests can
+/// drive the non-interactive path, skip executing a fixture that is not a real binary, and reach
+/// step 8b without running the real `gh attestation verify` — which queries GitHub, and nothing in
+/// this suite touches the network. The binary sets `interactive` from the real terminal, always
+/// leaves `smoke` on, and always points `attest_program` at the real `gh`.
 #[derive(Debug, Clone)]
 pub(crate) struct Options {
     pub(crate) check: bool,
@@ -32,6 +35,7 @@ pub(crate) struct Options {
     pub(crate) color: ColorChoice,
     pub(crate) interactive: bool,
     pub(crate) smoke: bool,
+    pub(crate) attest_program: &'static str,
 }
 
 impl Options {
@@ -53,6 +57,7 @@ impl Options {
             // `--json` comes from `--yes` alone.
             interactive: !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
             smoke: true,
+            attest_program: verify::GH,
         }
     }
 }
@@ -65,13 +70,23 @@ pub(crate) enum Refusal {
     UnsupportedTarget,
     /// macOS installs are an app bundle, not a bare binary.
     MacosBundle,
-    NotWritable(PathBuf),
+    /// The temp file step 6 creates beside the installed binary could not be created. Named for
+    /// what failed rather than for a diagnosis: a read-only directory is the common cause, but
+    /// `ENOSPC`, a disk quota, a path-length limit and an `EEXIST` race all land here too, and the
+    /// `io::Error` is the only thing that can tell them apart.
+    CannotStage {
+        dir: PathBuf,
+        why: String,
+    },
     NeedsConsent,
     ChecksumMismatch {
         expected: String,
         got: String,
     },
-    BadSidecar(String),
+    /// The `.sha256` sidecar could not be used. Carries the parse error itself rather than its
+    /// text, because "unreadable" and "for a different asset" are different failures and the
+    /// message has to tell them apart.
+    BadSidecar(verify::SidecarError),
     AttestationFailed(String),
     SmokeCheckFailed(String),
 }
@@ -82,6 +97,11 @@ pub(crate) enum Outcome {
     UpToDate,
     Updated,
     Refused(Refusal),
+    /// The flow could not finish: the release endpoint was unreachable, answered with something
+    /// that is not a release, or a download/swap failed. Distinct from `Refused` — a refusal is a
+    /// decision this command made about this install, while this is the command not getting far
+    /// enough to make one.
+    Error(String),
 }
 
 /// What happened, and everything the renderer needs to say so. One struct rather than data hung
@@ -128,6 +148,26 @@ pub(crate) enum AttestationStatus {
 }
 
 impl Report {
+    /// The report before anything has been resolved: everything knowable from the process itself,
+    /// with every field that needs the network still unset. [`run`] starts from this, and
+    /// [`run_cli`] reuses it to render a failure that stopped `run` outright — so a caller parsing
+    /// `--json` sees the same field set whether the run succeeded, refused, or failed.
+    fn initial(current: &str, exe: &Path) -> Report {
+        Report {
+            outcome: Outcome::Checked,
+            current: current.to_string(),
+            latest: None,
+            update_available: false,
+            asset: None,
+            url: None,
+            install_path: exe.to_path_buf(),
+            attestation: AttestationStatus::NotChecked,
+            supported: !cfg!(target_os = "macos") && release::asset_suffix().is_some(),
+            current_comparable: version::Version::parse_released(current).is_some(),
+            running_server: false,
+        }
+    }
+
     fn refused(mut self, why: Refusal) -> Report {
         self.outcome = Outcome::Refused(why);
         self
@@ -148,19 +188,7 @@ pub(crate) async fn run(
     exe: &Path,
 ) -> anyhow::Result<Report> {
     let current_version = version::Version::parse_released(current);
-    let mut report = Report {
-        outcome: Outcome::Checked,
-        current: current.to_string(),
-        latest: None,
-        update_available: false,
-        asset: None,
-        url: None,
-        install_path: exe.to_path_buf(),
-        attestation: AttestationStatus::NotChecked,
-        supported: !cfg!(target_os = "macos") && release::asset_suffix().is_some(),
-        current_comparable: current_version.is_some(),
-        running_server: false,
-    };
+    let mut report = Report::initial(current, exe);
 
     // 1. From-source, before any network request. A `--check` still reports.
     if !opts.check && current_version.is_none() {
@@ -195,16 +223,17 @@ pub(crate) async fn run(
         return Ok(report.finished(Outcome::UpToDate));
     }
 
-    // 5. What we are about to fetch. Resolved before the writability check so a refusal there can
-    //    still print the URL to download by hand.
+    // 5. What we are about to fetch. Resolved before the staging step below so a refusal there
+    //    can still print the URL to download by hand.
     let asset = release::asset_name(&tag).ok_or_else(|| anyhow::anyhow!("unsupported target"))?;
     let url = source.asset_url(&tag, &asset);
     report.asset = Some(asset.clone());
     report.url = Some(url.clone());
 
-    // 6. Writability, proved by creating the temp file we are about to download into rather than
-    //    by inspecting permissions — the same act, so there is no window between the check and
-    //    the use, and no way for the two to disagree.
+    // 6. Stage: create the temp file the download will land in, rather than inspect the
+    //    directory's permissions — the same act as the use, so there is no window between the two
+    //    and no way for them to disagree. Whatever the OS says when it fails is what gets
+    //    reported; this step does not try to work out why.
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
     let temp = dir.join(format!(".glass-mcp.update-{:016x}", rand::random::<u64>()));
     let mut open = std::fs::OpenOptions::new();
@@ -217,11 +246,20 @@ pub(crate) async fn run(
         // gate that exists to prove the binary runs, with `execve` returning EACCES.
         open.mode(0o755);
     }
-    if open.open(&temp).is_err() {
-        return Ok(report.refused(Refusal::NotWritable(dir.to_path_buf())));
+    if let Err(e) = open.open(&temp) {
+        return Ok(report.refused(Refusal::CannotStage {
+            dir: dir.to_path_buf(),
+            why: e.to_string(),
+        }));
     }
-    // From here on every exit must remove `temp`: a refusal that leaves a stray half-download
+    // From here on every exit tries to remove `temp`: a refusal that leaves a stray half-download
     // beside the binary is not the no-op it claims to be, and a test asserts there are none.
+    //
+    // Best-effort, deliberately: the `remove_file` result is dropped because a failed unlink is
+    // not something this command can act on, and surfacing it would replace the real reason for
+    // the exit (a bad checksum, a refused attestation) with a secondary filesystem complaint
+    // about a file the user did not ask about. The one exit that deliberately does NOT remove
+    // `temp` is a failed `swap` at step 9 — see the comment there.
     let discard = |report: Report, why: Refusal| -> anyhow::Result<Report> {
         let _ = std::fs::remove_file(&temp);
         Ok(report.refused(why))
@@ -254,7 +292,7 @@ pub(crate) async fn run(
         .map_err(abort)?;
     let expected = match verify::parse_sidecar(&sidecar_text, &asset) {
         Ok(h) => h,
-        Err(e) => return discard(report, Refusal::BadSidecar(format!("{e:?}"))),
+        Err(e) => return discard(report, Refusal::BadSidecar(e)),
     };
     if expected != got {
         return discard(report, Refusal::ChecksumMismatch { expected, got });
@@ -264,7 +302,7 @@ pub(crate) async fn run(
     if opts.skip_attestation {
         report.attestation = AttestationStatus::Skipped;
     } else {
-        match verify::attest(&temp) {
+        match verify::attest(opts.attest_program, &temp) {
             Attestation::Verified => report.attestation = AttestationStatus::Verified,
             Attestation::Unavailable => report.attestation = AttestationStatus::Unavailable,
             Attestation::Failed(why) => {
@@ -281,8 +319,18 @@ pub(crate) async fn run(
         return discard(report, Refusal::SmokeCheckFailed(why));
     }
 
-    // 9. Swap.
-    swap::swap(&temp, exe).map_err(abort)?;
+    // 9. Swap. Not through `abort`: by this point `temp` has been downloaded, checksummed,
+    //    attested and proved to run, and if the swap fails it is the only copy of the new binary
+    //    on the machine. On Windows's double-failure path — the old binary moved aside and the
+    //    restore also failing — recovery means putting a working binary back at `exe`, and
+    //    keeping this one is what makes that possible without a second download. So it stays, and
+    //    the error names where it is; `swap`'s own message names the displaced old binary.
+    swap::swap(&temp, exe).with_context(|| {
+        format!(
+            "the verified new binary is still at {} — move it into place by hand",
+            temp.display()
+        )
+    })?;
     Ok(report.finished(Outcome::Updated))
 }
 
@@ -308,7 +356,7 @@ pub(crate) async fn run_cli(
     json: bool,
     color: ColorChoice,
 ) -> anyhow::Result<()> {
-    // `with_context` rather than folding the io::Error into the message with `{e}`: the latter
+    // `.context` rather than folding the io::Error into the message with `{e}`: the latter
     // discards it as this error's `source()`, which is exactly the mistake release.rs's
     // `with_context` calls exist to avoid (see the comment on `fetch_text`).
     let exe = std::env::current_exe()
@@ -316,7 +364,11 @@ pub(crate) async fn run_cli(
         .context("could not resolve this binary's path")?;
     let opts = Options::from_flags(check, yes, skip_attestation, json, color);
     let source = ReleaseSource::github();
-    let mut report = run(opts.clone(), &source, crate::VERSION, &exe).await?;
+    let mut report = or_error(
+        run(opts.clone(), &source, crate::VERSION, &exe).await,
+        crate::VERSION,
+        &exe,
+    );
     // A running `serve --http` keeps its own inode, so it goes on serving the OLD build until it
     // is restarted — which reads to a connected agent as "the update did nothing". Carried on the
     // report (rather than printed separately) so `--json` stays one parseable object; reusing the
@@ -325,10 +377,24 @@ pub(crate) async fn run_cli(
         report.running_server = crate::setup::fetch_health("127.0.0.1:7300").is_some();
     }
     print!("{}", render(&report, &opts));
-    if matches!(report.outcome, Outcome::Refused(_)) {
+    if matches!(report.outcome, Outcome::Refused(_) | Outcome::Error(_)) {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Fold a failure out of [`run`] into a report, so every exit from this command renders through
+/// the same path.
+///
+/// Without this, a transport failure propagated out of `run_cli` as `Err` and `main` printed it as
+/// a bare anyhow message — which under `--json` means no JSON object at all, contradicting the
+/// documented contract that `--json` always emits one parseable object. `{e:#}` rather than `{e}`
+/// so the whole source chain survives: release.rs keeps the real cause (a redirect-policy refusal,
+/// a connect error) on `source()` rather than in the top-level message.
+fn or_error(result: anyhow::Result<Report>, current: &str, exe: &Path) -> Report {
+    result.unwrap_or_else(|e| {
+        Report::initial(current, exe).finished(Outcome::Error(format!("{e:#}")))
+    })
 }
 
 /// Human text, or the JSON object under `--json`. Pure in `report` and `opts`, so the whole
@@ -398,6 +464,9 @@ fn render(report: &Report, opts: &Options) -> String {
             p.paint(p.fail, "cannot update:"),
             refusal_message(why, report)
         ),
+        // A different prefix from a refusal on purpose: "cannot update" says a decision was made
+        // about this install, and nothing was decided here.
+        Outcome::Error(why) => format!("{} {why}\n", p.paint(p.fail, "update failed:")),
     }
 }
 
@@ -415,9 +484,12 @@ fn refusal_message(why: &Refusal, report: &Report) -> String {
         Refusal::UnsupportedTarget => "no release asset is published for this platform. \
              Build from source — see docs/how-to/build-from-source.md."
             .to_string(),
-        Refusal::NotWritable(dir) => format!(
-            "{} is not writable by this user. Download the new binary and move it into place \
-             yourself:\n  {}",
+        // Reports the OS error and stops. Naming a cause here would be a guess: the same branch
+        // is reached by a read-only directory, a full disk, a quota, a path-length limit and an
+        // `EEXIST` race, and only the error text distinguishes them.
+        Refusal::CannotStage { dir, why } => format!(
+            "could not create the temporary file to download into, in {}: {why}\n  \
+             Download the new binary and move it into place yourself:\n  {}",
             dir.display(),
             report.url.as_deref().unwrap_or("(url unresolved)")
         ),
@@ -428,34 +500,46 @@ fn refusal_message(why: &Refusal, report: &Report) -> String {
             "the downloaded asset does not match the checksum the release published.\n  \
              expected {expected}\n  got      {got}"
         ),
-        Refusal::BadSidecar(e) => {
-            format!("the release's checksum file could not be read ({e}).")
+        Refusal::BadSidecar(verify::SidecarError::Malformed) => {
+            "the release's checksum file is not a `sha256sum` line this can read.".to_string()
         }
+        Refusal::BadSidecar(verify::SidecarError::WrongAsset(named)) => format!(
+            "the release's checksum file is for a different asset: it names {named}, not {}.",
+            report.asset.as_deref().unwrap_or("the asset downloaded")
+        ),
+        // `gh` exits non-zero for more than a bad artifact, and the text it printed is the only
+        // thing that says which — so name the other causes rather than let the reader assume the
+        // artifact is bad.
         Refusal::AttestationFailed(why) => format!(
             "build provenance could not be verified: {why}\n  \
-             If GitHub is unreachable rather than the artifact being wrong, retry later — or pass \
-             --skip-attestation to accept the checksum alone."
+             If GitHub is unreachable, or `gh` is installed but not signed in \
+             (check with `gh auth status`), rather than the artifact being wrong, fix that and \
+             retry — or pass --skip-attestation to accept the checksum alone."
         ),
         Refusal::SmokeCheckFailed(why) => format!(
             "the downloaded binary did not run: {why}\n  \
-             The error above is from the binary itself. Build variants for this platform are \
-             listed in docs/reference/platforms.md."
+             Build variants for this platform are listed in docs/reference/platforms.md."
         ),
     }
 }
 
-/// The machine-readable form. `reason` appears only on a refusal.
+/// The machine-readable form. `reason` appears only on a refusal or a failure.
 fn render_json(report: &Report) -> String {
     let (action, reason) = match &report.outcome {
         Outcome::Checked | Outcome::UpToDate => ("checked", None),
         Outcome::Updated => ("updated", None),
         Outcome::Refused(why) => ("refused", Some(refusal_message(why, report))),
+        Outcome::Error(why) => ("error", Some(why.clone())),
     };
     let mut obj = serde_json::json!({
         "action": action,
         "current": report.current,
         "latest": report.latest,
         "update_available": report.update_available,
+        // Without this, `--check --json` on a from-source build reports `update_available: false`
+        // with nothing to say the version was never comparable in the first place — exactly the
+        // "unknown" / "you are up to date" conflation the human renderer above avoids.
+        "current_comparable": report.current_comparable,
         "supported": report.supported,
         "asset": report.asset,
         "url": report.url,
@@ -487,6 +571,11 @@ mod tests {
     /// sha256 of BODY. Recompute with `printf '%s' 'pretend binary' | sha256sum` if BODY changes.
     const BODY_SHA: &str = "9f05ef97cc90b003959b48cd01b637658368bdfc78fe54c1a061d5eff0c46104";
 
+    /// A program name no host has on `PATH`, so `attest` reports `Unavailable` deterministically.
+    /// Used instead of the real `gh` by every test that lets step 8b run: `gh attestation verify`
+    /// makes a request to GitHub, and nothing in this suite touches the network.
+    const ABSENT_GH: &str = "glass-mcp-test-no-such-attestation-tool";
+
     /// The apply path, non-interactive, with the two gates that need a real network or a real
     /// executable turned off. Each test that cares re-enables or re-disables what it is testing.
     fn opts() -> Options {
@@ -498,6 +587,7 @@ mod tests {
             color: Default::default(),
             interactive: false,
             smoke: true,
+            attest_program: ABSENT_GH,
         }
     }
 
@@ -600,9 +690,58 @@ mod tests {
         );
         let src = ReleaseSource::with_base(server.base());
         // opts() already has smoke: true — that is the point of this test.
-        let out = run(opts(), &src, "1.3.0", &exe).await.unwrap().outcome;
+        //
+        // Retried only on ETXTBSY: `download_to` writes the file that step 8c then executes, and
+        // a `fork` in any other test thread briefly inherits the write handle, which makes that
+        // `execve` fail with "Text file busy". See the note on `verify`'s `is_etxtbsy` — the
+        // window belongs to this multi-threaded test binary, not to the updater. Any other
+        // outcome breaks out on the first attempt.
+        let mut attempts = 0;
+        let out = loop {
+            let out = run(opts(), &src, "1.3.0", &exe).await.unwrap().outcome;
+            let busy = matches!(
+                &out,
+                Outcome::Refused(Refusal::SmokeCheckFailed(why)) if why.contains("os error 26")
+            );
+            if !busy {
+                break out;
+            }
+            attempts += 1;
+            assert!(
+                attempts < 20,
+                "the smoke gate kept hitting ETXTBSY: {out:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert!(matches!(out, Outcome::Updated), "{out:?}");
         assert_eq!(std::fs::read(&exe).unwrap(), SCRIPT);
+    }
+
+    /// Step 8b, actually executed.
+    ///
+    /// Every other apply-path test sets `skip_attestation: true`, so the whole `else` arm — the
+    /// three-way match on `verify::attest` — never ran in any test: swap its `Verified` and
+    /// `Unavailable` arms and the suite stayed green. This drives it with `gh` pointed at a
+    /// program that does not exist, which is the one `attest` outcome reachable without making a
+    /// request to GitHub, and asserts the update still completes with the absence recorded rather
+    /// than passed off as a verification.
+    #[tokio::test]
+    async fn a_missing_gh_is_recorded_rather_than_treated_as_verified() {
+        if !apply_path_exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exe = install(dir.path(), b"old");
+        let asset = release::asset_name("v1.4.0").expect("supported target");
+        let server = FakeRelease::start("v1.4.0", &asset, BODY, &sidecar(&asset));
+        let src = ReleaseSource::with_base(server.base());
+        let mut o = opts();
+        o.skip_attestation = false; // the point of this test
+        o.smoke = false; // the served bytes are not a runnable binary
+        let report = run(o, &src, "1.3.0", &exe).await.unwrap();
+        assert!(matches!(report.outcome, Outcome::Updated), "{report:?}");
+        assert_eq!(report.attestation, AttestationStatus::Unavailable);
+        assert_eq!(std::fs::read(&exe).unwrap(), BODY);
     }
 
     /// The assertion that matters is the second one: "it errored" says nothing about what it
@@ -688,7 +827,7 @@ mod tests {
 
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            matches!(out, Outcome::Refused(Refusal::NotWritable(_))),
+            matches!(out, Outcome::Refused(Refusal::CannotStage { .. })),
             "{out:?}"
         );
         assert_eq!(std::fs::read(&exe).unwrap(), b"old");
@@ -761,6 +900,7 @@ mod tests {
         assert_eq!(v["current"], "1.3.0");
         assert_eq!(v["latest"], "1.4.0");
         assert_eq!(v["update_available"], true);
+        assert_eq!(v["current_comparable"], true);
         assert_eq!(v["supported"], true);
         assert_eq!(v["attestation"], "verified");
         assert_eq!(v["install_path"], "/opt/bin/glass-mcp");
@@ -768,13 +908,162 @@ mod tests {
         assert!(v.get("reason").is_none(), "reason is refusal-only");
     }
 
+    /// `update_available: false` has two quite different causes, and the JSON has to separate them
+    /// the way the human renderer does: `cli.md` tells scripts to branch on `update_available`, so
+    /// a from-source build that emitted only `update_available: false` would read to every one of
+    /// them as "you are up to date".
+    #[test]
+    fn the_json_report_separates_a_from_source_build_from_being_up_to_date() {
+        let mut r = report_fixture();
+        r.current = "1.3.0-5-g563feea".into();
+        r.current_comparable = false;
+        r.update_available = false;
+        let v: serde_json::Value = serde_json::from_str(&render(&r, &plain(true))).unwrap();
+        assert_eq!(v["update_available"], false);
+        assert_eq!(
+            v["current_comparable"], false,
+            "a from-source build's version is not comparable, and the object must say so"
+        );
+    }
+
+    /// `--json`'s contract is one parseable object per run, and a transport failure used to break
+    /// it: `run` returned `Err`, `run_cli` propagated it, and the command printed a bare anyhow
+    /// message with no object at all. The fake server here answers `/releases/latest` with a
+    /// redirect to an empty tag — the shape a repo with nothing published produces — so `run`
+    /// fails for a real reason without any request leaving the loopback interface.
+    #[tokio::test]
+    async fn a_failure_to_resolve_the_release_still_renders_one_json_object() {
+        if !apply_path_exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exe = install(dir.path(), b"old");
+        let server = FakeRelease::start("", "asset", BODY, "");
+        let src = ReleaseSource::with_base(server.base());
+        let result = run(opts(), &src, "1.3.0", &exe).await;
+        assert!(result.is_err(), "the fixture must actually fail `run`");
+
+        let report = or_error(result, "1.3.0", &exe);
+        let v: serde_json::Value = serde_json::from_str(&render(&report, &plain(true)))
+            .expect("a failed run still emits one json object");
+        assert_eq!(v["action"], "error");
+        assert_eq!(v["current"], "1.3.0");
+        assert!(
+            v["reason"].as_str().is_some_and(|s| !s.is_empty()),
+            "the failure has to say what went wrong: {v}"
+        );
+        // Not a refusal: nothing was decided about this install.
+        let human = render(&report, &plain(false));
+        assert!(human.contains("update failed:"), "{human}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old");
+    }
+
+    /// `Options::from_flags` is the only place the running binary's `Options` are built, and the
+    /// only place `smoke` is ever set to `true` — flip it to `false` and every real update skips
+    /// the gate that proves the downloaded binary runs, with the whole suite still green, because
+    /// each test constructs `Options` literally. Same for `attest_program`: the tests point it at
+    /// a program that does not exist, so nothing else pins that the binary uses the real `gh`.
+    ///
+    /// `interactive` is asserted only for `json: true`, where `!json` makes it `false` whatever
+    /// the terminal is. Its value with `--json` off depends on whether the test process has a tty
+    /// on both stdin and stdout, which is not something a test can pin.
+    #[test]
+    fn from_flags_passes_the_cli_flags_through_and_always_verifies() {
+        let o = Options::from_flags(true, false, true, false, ColorChoice::Never);
+        assert!(o.check);
+        assert!(!o.yes);
+        assert!(o.skip_attestation);
+        assert!(!o.json);
+        assert_eq!(o.color, ColorChoice::Never);
+        assert!(
+            o.smoke,
+            "the apply path must always execute what it fetched"
+        );
+        assert_eq!(o.attest_program, verify::GH);
+
+        // Every flag the other way round, so a field wired to a constant is caught whichever
+        // constant it was wired to.
+        let o = Options::from_flags(false, true, false, true, ColorChoice::Always);
+        assert!(!o.check);
+        assert!(o.yes);
+        assert!(!o.skip_attestation);
+        assert!(o.json);
+        assert_eq!(o.color, ColorChoice::Always);
+        assert!(o.smoke);
+        assert_eq!(o.attest_program, verify::GH);
+        assert!(!o.interactive, "--json must never prompt");
+    }
+
+    /// Each `AttestationStatus` an `Updated` report can carry renders as its own claim.
+    ///
+    /// No test rendered `Outcome::Updated` at all before this, so the three arms were
+    /// interchangeable: swapping `Verified` and `Skipped` would have made `--skip-attestation`
+    /// print "build provenance verified." with nothing to catch it. Each case therefore asserts
+    /// both what must appear and what must not.
+    #[test]
+    fn an_updated_report_states_what_was_done_about_provenance() {
+        let rendered = |status: AttestationStatus| {
+            let mut r = report_fixture();
+            r.outcome = Outcome::Updated;
+            r.attestation = status;
+            render(&r, &plain(false))
+        };
+
+        let verified = rendered(AttestationStatus::Verified);
+        assert!(
+            verified.contains("build provenance verified."),
+            "{verified}"
+        );
+
+        let unavailable = rendered(AttestationStatus::Unavailable);
+        assert!(unavailable.contains("not checked"), "{unavailable}");
+        assert!(
+            unavailable.contains("gh"),
+            "it must say what to install: {unavailable}"
+        );
+        assert!(
+            !unavailable.contains("provenance verified."),
+            "a missing gh must never read as a verification: {unavailable}"
+        );
+
+        let skipped = rendered(AttestationStatus::Skipped);
+        assert!(skipped.contains("--skip-attestation"), "{skipped}");
+        assert!(
+            !skipped.contains("provenance verified."),
+            "an explicit skip must never read as a verification: {skipped}"
+        );
+
+        // The two states 8b cannot leave behind on an update. They print nothing extra rather
+        // than a claim, and the "updated" line itself still appears.
+        for unreachable in [AttestationStatus::NotChecked, AttestationStatus::Failed] {
+            let out = rendered(unreachable);
+            assert!(out.contains("updated"), "{out}");
+            assert!(!out.contains("provenance"), "{out}");
+        }
+    }
+
     #[test]
     fn a_refusal_names_the_condition_and_never_suggests_sudo() {
         let mut r = report_fixture();
-        r.outcome = Outcome::Refused(Refusal::NotWritable("/usr/local/bin".into()));
+        r.outcome = Outcome::Refused(Refusal::CannotStage {
+            dir: "/usr/local/bin".into(),
+            why: "No space left on device (os error 28)".into(),
+        });
 
         let human = render(&r, &plain(false));
         assert!(human.contains("/usr/local/bin"), "{human}");
+        // The OS error, not a diagnosis of it. `create_new` also fails on a full disk, a quota,
+        // a path-length limit and an EEXIST race, so a message that named permissions would be
+        // wrong for exactly the case this fixture uses.
+        assert!(
+            human.contains("No space left on device"),
+            "the OS error must survive into the message: {human}"
+        );
+        assert!(
+            !human.to_lowercase().contains("not writable")
+                && !human.to_lowercase().contains("permission"),
+            "must not diagnose a cause it did not establish: {human}"
+        );
         assert!(
             human.contains("https://example.invalid/asset"),
             "the manual URL: {human}"

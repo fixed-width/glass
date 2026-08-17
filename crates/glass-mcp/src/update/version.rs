@@ -149,10 +149,10 @@ mod tests {
     /// The `starts_with(alphabetic)` clause's own case, and the only one that exercises it.
     ///
     /// Every `git describe` suffix in real use carries an internal dash (`5-g563feea`), which the
-    /// byte-class guard rejects by itself — so without a dash-free, digit-initial input that clause
-    /// is redundant against the whole suite, and the mutation gate would rightly flag it as a
-    /// survivor. These two inputs are what make the stated rule ("the first character decides")
-    /// actually load-bearing.
+    /// byte-class guard rejects by itself — so a dash-free, digit-initial input is the only kind
+    /// that reaches the `starts_with(alphabetic)` clause at all. Delete that clause and every
+    /// other case in this file still passes; these two are what make the stated rule ("the first
+    /// character decides") load-bearing.
     #[test]
     fn a_digit_initial_suffix_is_not_a_release_prerelease() {
         assert!(Version::parse_released("1.3.0-5").is_none());

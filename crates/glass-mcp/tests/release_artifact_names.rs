@@ -20,13 +20,23 @@ fn repo_root() -> PathBuf {
         .expect("resolve repo root from CARGO_MANIFEST_DIR")
 }
 
-/// Platform suffixes documented as `glass-mcp-<tag>-<suffix>.<ext>` in platforms.md, excluding the
-/// `<platform>` placeholder used in prose.
+/// Platform suffixes documented as `glass-mcp-<tag>-<suffix>` in platforms.md, with any `.<ext>`
+/// trimmed off, and excluding the `<platform>` placeholder used in prose.
+///
+/// The suffix ends at the first `.`, whitespace, or closing backtick — whichever comes first. All
+/// three bounds are load-bearing: the bare Linux assets are documented with no extension at all,
+/// so a scan that only stopped at `.` would run straight past the closing backtick and swallow
+/// whatever prose followed until the next full stop anywhere later in the file. That made the
+/// wording of the docs a constraint on this test rather than the other way round.
 fn documented_suffixes(platforms_md: &str) -> BTreeSet<String> {
     platforms_md
         .split("glass-mcp-<tag>-")
         .skip(1)
-        .map(|rest| rest.chars().take_while(|c| *c != '.').collect::<String>())
+        .map(|rest| {
+            rest.chars()
+                .take_while(|c| *c != '.' && *c != '`' && !c.is_whitespace())
+                .collect::<String>()
+        })
         .filter(|s| !s.is_empty() && !s.contains('<') && !s.contains('>'))
         .collect()
 }
@@ -54,6 +64,28 @@ fn documented_release_suffixes_are_produced_by_the_workflow() {
     }
 }
 
+/// The one line of `release.yml` that satisfies `pred`, trimmed. Panics unless exactly one line
+/// matches, so a needle that has silently become ambiguous is a failure rather than a coin toss.
+///
+/// The whole reason this test works line-by-line instead of with `release_yml.contains(..)` is
+/// that the interesting strings are not unique in the file: `dist/glass-mcp-*` also appears in the
+/// Linux attestation block and `dist/*.exe` appears three times, so a whole-file `contains` for
+/// either stays green with the *upload* line deleted — and a release with no bare assets 404s
+/// every `glass-mcp update`. Each assertion below therefore names the line that has to carry the
+/// string, not the file.
+fn the_line<'a>(release_yml: &'a str, what: &str, pred: impl Fn(&str) -> bool) -> &'a str {
+    let mut hits = release_yml.lines().map(str::trim).filter(|l| pred(l));
+    let first = hits
+        .next()
+        .unwrap_or_else(|| panic!("release.yml no longer has {what}"));
+    assert!(
+        hits.next().is_none(),
+        "more than one line of release.yml looks like {what} — this guard can no longer tell \
+         which one it is checking"
+    );
+    first
+}
+
 /// The bare, uncompressed binary assets `glass-mcp update` downloads. The archives stay — these
 /// are additional — so this is a second, independent direction of the same doc↔workflow guard:
 /// documenting an updater asset the workflow never builds would leave `update` fetching a 404.
@@ -65,23 +97,63 @@ fn the_bare_binary_assets_are_documented_and_produced() {
     let release_yml = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
         .expect("read .github/workflows/release.yml");
 
-    // Assert on text the workflow literally contains. The per-platform suffixes never appear
-    // inside a full asset name there — `pkg` takes the suffix as an argument and builds the name
-    // at run time — so this checks the lines that emit and upload the bare files instead.
-    for needle in [
-        // Linux: the bare copy out of the staging dir, and an upload glob wide enough to carry it.
-        r#"cp "$dir/glass-mcp" "dist/$name""#,
-        r#"dist/glass-mcp-*"#,
-        // Windows: the bare copy of the signed .exe, and its upload glob.
-        r#"Copy-Item target/release/glass-mcp.exe "dist/$name.exe""#,
-        r#"dist/*.exe"#,
-    ] {
+    // The per-platform suffixes never appear inside a full asset name in the workflow — `pkg`
+    // takes the suffix as an argument and builds the name at run time — so what is checkable here
+    // is the set of lines that produce, hash and upload the bare files.
+
+    // Linux: produced by copying the staged binary flat beside the archive...
+    assert!(
+        release_yml.contains(r#"cp "$dir/glass-mcp" "dist/$name""#),
+        "release.yml no longer copies the bare linux binary into dist/"
+    );
+    // ...hashed by a loop whose glob covers it. Narrowed back to `*.tar.gz` and the bare assets
+    // ship with no `.sha256`, which is a 404 at `update`'s sidecar fetch.
+    let linux_sidecars = the_line(&release_yml, "the linux sha256sum loop", |l| {
+        l.contains("sha256sum")
+    });
+    assert!(
+        linux_sidecars.contains("for f in glass-mcp-*"),
+        "the linux checksum loop no longer covers the bare binaries: {linux_sidecars}"
+    );
+    // ...and uploaded by a glob wide enough to carry it.
+    let linux_upload = the_line(&release_yml, "the linux release upload", |l| {
+        l.contains("gh release upload") && l.contains("$TAG") && !l.contains("dmg")
+    });
+    assert!(
+        linux_upload.contains("dist/glass-mcp-*"),
+        "the linux upload no longer publishes the bare binaries: {linux_upload}"
+    );
+
+    // Windows: the same three steps, in PowerShell.
+    assert!(
+        release_yml.contains(r#"Copy-Item target/release/glass-mcp.exe "dist/$name.exe""#),
+        "release.yml no longer copies the bare glass-mcp.exe into dist/"
+    );
+    let windows_sidecars = the_line(&release_yml, "the windows Get-FileHash loop", |l| {
+        l.starts_with("foreach ($f in Get-ChildItem")
+    });
+    assert!(
+        windows_sidecars.contains("dist/*.exe"),
+        "the windows checksum loop no longer covers the bare .exe: {windows_sidecars}"
+    );
+    // The windows upload passes `$files`, so the assignment is what decides the asset set.
+    let windows_upload = the_line(&release_yml, "the windows upload file list", |l| {
+        l.starts_with("$files = ")
+    });
+    for needle in ["dist/*.exe", "dist/*.exe.sha256"] {
         assert!(
-            release_yml.contains(needle),
-            "release.yml no longer contains {needle:?} — `glass-mcp update` downloads the bare \
-             binary assets those lines publish"
+            windows_upload.contains(needle),
+            "the windows upload no longer publishes {needle}: {windows_upload}"
         );
     }
+    let windows_gh = the_line(&release_yml, "the windows release upload", |l| {
+        l.contains("gh release upload") && l.contains("GITHUB_REF_NAME")
+    });
+    assert!(
+        windows_gh.contains("$files"),
+        "the windows upload no longer uses the file list above: {windows_gh}"
+    );
+
     assert!(
         platforms.contains("uncompressed"),
         "platforms.md must document the bare binary assets as what `update` fetches"

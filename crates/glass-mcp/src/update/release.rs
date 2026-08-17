@@ -143,11 +143,14 @@ impl ReleaseSource {
             .timeout(META_TIMEOUT)
             .user_agent(concat!("glass-mcp/", env!("GLASS_VERSION")))
             .build()?;
+        // `with_context`, not `anyhow!("...: {e}")`: folding reqwest's `Display` into the message
+        // discards `e` as this error's `source()`, and the useful detail (a DNS failure, a TLS
+        // handshake error, a connect timeout) only lives on that chain.
         let resp = client
             .get(&url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("could not reach {url}: {e}"))?;
+            .with_context(|| format!("could not reach {url}"))?;
         let location = resp
             .headers()
             .get(reqwest::header::LOCATION)
@@ -175,19 +178,20 @@ impl ReleaseSource {
 
     /// Build the client used for asset and sidecar fetches. Redirects ARE followed here (GitHub
     /// sends release downloads to objects.githubusercontent.com), bounded to
-    /// [`MAX_REDIRECTS`] hops, and a hop that downgrades the scheme is refused — over https that
-    /// is the "https all the way" rule, and over the tests' loopback http it is the same rule, so
-    /// production's guard is the one under test.
+    /// [`MAX_REDIRECTS`] hops, and a hop that *changes* the scheme is refused — the check is a
+    /// symmetric equality test, so an http→https upgrade is refused exactly as an https→http
+    /// downgrade is. Over https that is the "https all the way" rule, and over the tests' loopback
+    /// http it is the same rule, so production's guard is the one under test.
     fn following_client(&self, timeout: Duration) -> anyhow::Result<reqwest::Client> {
         let policy = reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() > MAX_REDIRECTS {
                 return attempt.error("too many redirects");
             }
-            let downgraded = attempt
+            let scheme_changed = attempt
                 .previous()
                 .first()
                 .is_some_and(|first| first.scheme() != attempt.url().scheme());
-            if downgraded {
+            if scheme_changed {
                 return attempt.error("refusing a redirect that changes the URL scheme");
             }
             attempt.follow()
@@ -225,7 +229,9 @@ impl ReleaseSource {
     /// describes the bytes that actually landed rather than a re-read of the file.
     ///
     /// On any failure the partial file is removed, so a failed download leaves nothing behind for
-    /// a later run to trip over.
+    /// a later run to trip over. The removal is best-effort: its result is dropped because a
+    /// failed unlink says nothing the caller can act on, and reporting it would hide the download
+    /// error that is the actual reason for the failure.
     pub(crate) async fn download_to(&self, url: &str, dest: &Path) -> anyhow::Result<String> {
         match self.download_inner(url, dest).await {
             Ok(digest) => Ok(digest),
@@ -251,8 +257,10 @@ impl ReleaseSource {
         if !status.is_success() {
             anyhow::bail!("{url} returned HTTP {status}");
         }
+        // Same reason as `fetch_text`: keep the `io::Error` on the source chain rather than
+        // flattening it into the message, so the errno behind "could not write" survives.
         let mut file = std::fs::File::create(dest)
-            .map_err(|e| anyhow::anyhow!("could not write {}: {e}", dest.display()))?;
+            .with_context(|| format!("could not write {}", dest.display()))?;
         let mut hasher = Sha256::new();
         while let Some(chunk) = resp.chunk().await? {
             hasher.update(&chunk);
@@ -459,6 +467,32 @@ mod tests {
         assert!(
             !dest.exists(),
             "a failed download must leave nothing behind"
+        );
+    }
+
+    /// The cleanup arm in `download_to`, actually exercised.
+    ///
+    /// The other three "leaves nothing behind" assertions in this file (a 404, a refused redirect,
+    /// an endless chain) are all satisfied for the wrong reason: every one of them fails inside
+    /// `send()`, before `File::create` has run, so `dest` never existed and deleting the cleanup
+    /// arm keeps all three green. This case fails mid-body instead — the server declares a
+    /// `Content-Length` larger than the body it sends and then closes — which means the file has
+    /// been created and partly written by the time the error surfaces. Remove the `remove_file`
+    /// in `download_to` and only this test goes red.
+    #[tokio::test]
+    async fn a_download_that_dies_mid_body_removes_the_partial_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("downloaded");
+        let server = FakeRelease::start("v1.4.0", "asset", BODY, "");
+        let src = ReleaseSource::with_base(server.base());
+        let url = format!("{}/truncated", server.base());
+        assert!(
+            src.download_to(&url, &dest).await.is_err(),
+            "a truncated body must not be reported as a completed download"
+        );
+        assert!(
+            !dest.exists(),
+            "a download that failed after the file was created must still leave nothing behind"
         );
     }
 
