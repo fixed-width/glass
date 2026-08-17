@@ -15,8 +15,6 @@ pub(crate) const REPO_PATH: &str = "/fixed-width/glass";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LocationError {
-    /// No `Location` header on a response that should have redirected.
-    Missing,
     /// The redirect did not land on this repo's `/releases/tag/` path — a repo with no published
     /// release (GitHub redirects to `/releases`), an error page, or a foreign origin.
     NotATagRedirect,
@@ -161,7 +159,7 @@ impl ReleaseSource {
                 )
             })?;
         tag_from_location(&self.base, location).map_err(|e| match e {
-            LocationError::Missing | LocationError::NotATagRedirect => anyhow::anyhow!(
+            LocationError::NotATagRedirect => anyhow::anyhow!(
                 "{url} redirected to {location}, which is not a release tag page — \
                  the repo may have no published release, or GitHub may be returning an error page"
             ),

@@ -69,9 +69,11 @@ fn displaced_path(target: &Path, pid: u32) -> std::path::PathBuf {
 
 /// Is `entry` a binary `swap` displaced — `<exe name>.old-<pid>`?
 ///
-/// Pure, and deliberately NOT cfg-gated: the Windows sweep cannot run on a Linux dev box, so this
-/// keeps the part of it that is ordinary string matching testable everywhere. Requiring the suffix
-/// to be all digits is what stops a user's own `glass-mcp.exe.old-notes.txt` being deleted.
+/// Pure, and gated to `windows` OR `test` rather than to `windows` alone: the Windows sweep cannot
+/// run on a Linux dev box, so this keeps the part of it that is ordinary string matching testable
+/// there. Requiring the suffix to be all digits is what stops a user's own
+/// `glass-mcp.exe.old-notes.txt` being deleted.
+#[cfg(any(windows, test))]
 fn is_displaced(entry: &str, exe_name: &str) -> bool {
     entry
         .strip_prefix(&format!("{exe_name}.old-"))
