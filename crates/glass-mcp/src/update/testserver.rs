@@ -1,9 +1,7 @@
 //! A tiny HTTP server for the update tests, hand-rolled over `std::net::TcpListener`.
 //!
 //! Deliberately not axum: that would tie these tests to the optional `network` feature, and glass
-//! already hand-rolls loopback HTTP in `setup::fetch_health`. A handful of routes, one thread, no
-//! dependencies — and because the base URL is a `ReleaseSource` constructor argument, the tests
-//! drive the real code path rather than a mock of it.
+//! already hand-rolls loopback HTTP in `setup::fetch_health`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -37,8 +35,8 @@ impl FakeRelease {
         let handle = thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let routes = Arc::clone(&routes);
-                // Serve sequentially: the update flow makes its requests one at a time, and a
-                // single-threaded server makes a hung request obvious rather than hidden.
+                // Serve sequentially — the update flow makes its requests one at a time, and a
+                // hung request is then obvious.
                 serve_one(stream, &routes, port);
             }
         });
@@ -84,8 +82,7 @@ fn serve_one(mut stream: TcpStream, routes: &Routes, port: u16) {
     let sidecar = format!("{download}.sha256");
 
     // Two routes that exist only to drive `following_client`'s security policy: one redirect that
-    // changes the scheme, and one that never terminates. Without them the hop cap and the
-    // scheme-downgrade refusal have no committed coverage at all.
+    // changes the scheme, and one that never terminates.
     if path == "/redirect/scheme" {
         let _ = write!(
             stream,
@@ -94,11 +91,10 @@ fn serve_one(mut stream: TcpStream, routes: &Routes, port: u16) {
         let _ = stream.flush();
         return;
     }
-    // A response that promises more body than it delivers, then hangs up. This is the only route
-    // here that fails AFTER the destination file has been created: 404s and refused redirects all
-    // fail while `download_to` is still in `send()`, so they cannot exercise its cleanup arm at
-    // all. `Content-Length` is deliberately larger than the bytes written, which makes the client
-    // see the close as a truncated message rather than a complete one.
+    // A response that promises more body than it delivers, then hangs up: `Content-Length` is
+    // deliberately larger than the bytes written, which makes the client see the close as a
+    // truncated message rather than a complete one. The only route here that fails AFTER the
+    // destination file has been created.
     if path == "/truncated" {
         let body = b"the first half of a binary";
         let _ = write!(

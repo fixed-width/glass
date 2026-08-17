@@ -26,8 +26,7 @@ fn repo_root() -> PathBuf {
 /// The suffix ends at the first `.`, whitespace, or closing backtick — whichever comes first. All
 /// three bounds are load-bearing: the bare Linux assets are documented with no extension at all,
 /// so a scan that only stopped at `.` would run straight past the closing backtick and swallow
-/// whatever prose followed until the next full stop anywhere later in the file. That made the
-/// wording of the docs a constraint on this test rather than the other way round.
+/// whatever prose followed until the next full stop anywhere later in the file.
 fn documented_suffixes(platforms_md: &str) -> BTreeSet<String> {
     platforms_md
         .split("glass-mcp-<tag>-")
@@ -71,8 +70,7 @@ fn documented_release_suffixes_are_produced_by_the_workflow() {
 /// that the interesting strings are not unique in the file: `dist/glass-mcp-*` also appears in the
 /// Linux attestation block and `dist/*.exe` appears three times, so a whole-file `contains` for
 /// either stays green with the *upload* line deleted — and a release with no bare assets 404s
-/// every `glass-mcp update`. Each assertion below therefore names the line that has to carry the
-/// string, not the file.
+/// every `glass-mcp update`.
 fn the_line<'a>(release_yml: &'a str, what: &str, pred: impl Fn(&str) -> bool) -> &'a str {
     let mut hits = release_yml.lines().map(str::trim).filter(|l| pred(l));
     let first = hits
@@ -91,9 +89,8 @@ fn the_line<'a>(release_yml: &'a str, what: &str, pred: impl Fn(&str) -> bool) -
 /// Anchoring to the right line is only half the job: every glob this test looks for is a *prefix*
 /// of a longer token that legitimately sits on the same line — `dist/*.exe` of
 /// `dist/*.exe.sha256`, `dist/glass-mcp-*` of `dist/glass-mcp-*.tar.gz`, `glass-mcp-*` of
-/// `glass-mcp-*.tar.gz`. A `contains` check is therefore satisfied by the *narrowed* form, which
-/// is exactly the edit that stops the bare binaries being published and 404s every
-/// `glass-mcp update`. Comparing whole tokens is what makes the narrowing fail.
+/// `glass-mcp-*.tar.gz`. A `contains` check is therefore satisfied by the *narrowed* form;
+/// comparing whole tokens is what makes the narrowing fail.
 ///
 /// Tokens are split on whitespace, `,`, and parentheses — the last because PowerShell writes
 /// `(Get-ChildItem …).FullName`, so the final path would otherwise carry `).FullName` with it.
@@ -151,8 +148,7 @@ fn the_bare_binary_assets_are_documented_and_produced() {
     // Two lines copy the built .exe — one into the archive's staging directory
     // (`dist/$name/glass-mcp.exe`), one flat beside it (`dist/$name.exe`) — so this cannot anchor
     // on a single line the way the others do. It asserts instead that among all of those copies,
-    // one lands flat. Whole-token comparison is what tells the two destinations apart; a
-    // `contains` would let the staging copy satisfy the check for the flat one.
+    // one lands flat.
     let exe_copies: Vec<&str> = release_yml
         .lines()
         .map(str::trim)

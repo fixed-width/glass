@@ -1,8 +1,8 @@
 //! The three gates a downloaded asset passes before it is allowed to replace this binary.
 //!
-//! They run in this order and the order is the point: the checksum proves the bytes are the ones
-//! the release published, the attestation proves the release built them, and only then is the
-//! file executed for the smoke check. Nothing unverified is ever run.
+//! They run in this order: the checksum proves the bytes are the ones the release published, the
+//! attestation proves the release built them, and only then is the file executed for the smoke
+//! check.
 
 use std::path::Path;
 use std::process::Command;
@@ -35,7 +35,7 @@ pub(crate) enum Attestation {
 ///
 /// `sha256sum` writes `<hex>  <name>` in text mode and `<hex> *<name>` in binary mode; the
 /// release workflow produces the former, but both are accepted because both are what the tool
-/// emits and neither is ambiguous.
+/// emits.
 pub(crate) fn parse_sidecar(text: &str, asset: &str) -> Result<String, SidecarError> {
     let line = text
         .lines()
@@ -54,11 +54,8 @@ pub(crate) fn parse_sidecar(text: &str, asset: &str) -> Result<String, SidecarEr
     Ok(hexpart.to_ascii_lowercase())
 }
 
-/// The GitHub CLI, as the binary invokes it. Named here and passed in as an argument rather than
-/// written as a literal inside [`attest`], so a test can point the same code at a program that is
-/// guaranteed absent (or guaranteed to fail) instead of depending on whether the host happens to
-/// have `gh` installed — and, more importantly, without any test ever running the real
-/// `gh attestation verify`, which queries GitHub over the network.
+/// The GitHub CLI, as the binary invokes it. An argument to [`attest`] rather than a literal
+/// inside it, so no test ever runs the real `gh attestation verify`, which queries GitHub.
 pub(crate) const GH: &str = "gh";
 
 /// Verify the artifact's build provenance with the GitHub CLI, when it is available.
@@ -220,11 +217,10 @@ mod tests {
     /// not be verified: " — a refusal with no reason at all. Unix-only, because `false` is what
     /// makes a silent non-zero exit available without shipping a fixture.
     ///
-    /// The `Unavailable` arm has its own coverage through the whole flow, in `mod.rs`'s
-    /// `a_missing_gh_is_recorded_rather_than_treated_as_verified`. It is not duplicated here on
-    /// purpose: spawning a program that does *not* exist leaves the forked child holding every
-    /// inherited descriptor until its failed `execve` returns, and this test binary has other
-    /// threads writing files they are about to execute — see [`is_etxtbsy`] below.
+    /// The `Unavailable` arm is covered through the whole flow by `mod.rs`'s
+    /// `a_missing_gh_is_recorded_rather_than_treated_as_verified`, not duplicated here: spawning a
+    /// program that does *not* exist leaves the forked child holding every inherited descriptor
+    /// until its failed `execve` returns — see [`is_etxtbsy`] below.
     #[cfg(unix)]
     #[test]
     fn a_silent_non_zero_exit_still_says_something() {
@@ -251,22 +247,20 @@ mod tests {
 
     /// Is this failure the test harness rather than the code under test?
     ///
-    /// Writing a file and then executing it inside one multi-threaded process is racy on Linux
-    /// through no fault of either step: `cargo test` runs these tests in threads, a `fork` in any
-    /// other thread inherits every descriptor open at that instant — including the write handle
-    /// this thread still holds on the fixture — and the child keeps it until its own `execve`
-    /// returns. `execve` on a file some process holds open for writing fails with ETXTBSY. The
-    /// updater itself is one sequential flow that never forks while its download is open, so this
-    /// window exists only inside the test binary — but it is wide enough to fail runs, which is
-    /// why [`retry_etxtbsy`] exists.
+    /// Writing a file and then executing it inside one multi-threaded process is racy on Linux:
+    /// `cargo test` runs these tests in threads, a `fork` in any other thread inherits every
+    /// descriptor open at that instant — including the write handle this thread still holds on the
+    /// fixture — and the child keeps it until its own `execve` returns. `execve` on a file some
+    /// process holds open for writing fails with ETXTBSY. The updater itself is one sequential
+    /// flow that never forks while its download is open, so this window exists only inside the
+    /// test binary — but it is wide enough to fail runs, which is why [`retry_etxtbsy`] exists.
     #[cfg(unix)]
     fn is_etxtbsy(message: &str) -> bool {
         message.contains("Text file busy") || message.contains("os error 26")
     }
 
     /// Call `f` until it stops reporting ETXTBSY. Bounded, and every other error is returned on
-    /// the first attempt — this retries the harness race described above and nothing else, so a
-    /// smoke check that genuinely fails still fails immediately.
+    /// the first attempt, so a smoke check that genuinely fails still fails immediately.
     #[cfg(unix)]
     fn retry_etxtbsy(mut f: impl FnMut() -> Result<(), String>) -> Result<(), String> {
         for _ in 0..20 {
@@ -295,8 +289,8 @@ mod tests {
         std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(smoke_check(&bad, "1.4.0").is_err());
 
-        // Exits 0 — a naive check that only looked at the exit status would pass this — but
-        // prints the wrong version, which is exactly the mismatch the gate exists to catch.
+        // Exits 0 — a check that only looked at the exit status would pass this — but prints the
+        // wrong version.
         let wrong_version = dir.path().join("wrong-version");
         std::fs::write(&wrong_version, "#!/bin/sh\necho 1.3.0\n").unwrap();
         std::fs::set_permissions(&wrong_version, std::fs::Permissions::from_mode(0o755)).unwrap();

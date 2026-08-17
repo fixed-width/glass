@@ -3,8 +3,7 @@
 //! provable here is the refusal ORDER — that a from-source build is turned away before any
 //! request is made — and CI builds glass-mcp from a git checkout, so `crate::VERSION` carries a
 //! `git describe` suffix and this is ordinarily exactly that case. The one test that exercises it
-//! checks the built binary's actual version first and skips rather than assume, since a checkout
-//! sitting exactly on a tag would otherwise drive a real request.
+//! skips a checkout sitting exactly on a tag, which would drive a real request.
 
 use std::process::Command;
 
@@ -61,13 +60,12 @@ fn looks_released_matches_the_release_shape() {
 fn update_refuses_a_from_source_build_without_touching_the_network() {
     // A checkout sitting exactly on a released tag reports a plain MAJOR.MINOR.PATCH (or a real
     // prerelease tag like `1.2.0-rc1`) — the one shape `update` treats as a real release, which
-    // would send it resolving a real latest tag over the network. Every other shape (a commit
-    // count, `-dirty`, or a bare SHA) is guaranteed to hit the from-source refusal before any
-    // request. Skip rather than let a from-a-tag checkout reach github.com.
+    // would send it resolving a real latest tag over the network. Skip rather than let that reach
+    // github.com; every other shape (a commit count, `-dirty`, a bare SHA) is guaranteed to hit
+    // the from-source refusal before any request.
     //
-    // `--version` renders as `glass-mcp <version>` — take the LAST whitespace-separated token,
-    // not the whole line: the binary's own name contains a hyphen, so a naive `.contains('-')`
-    // check against the full stdout is unconditionally true regardless of the version.
+    // `--version` renders as `glass-mcp <version>`, so take the LAST whitespace-separated token
+    // rather than matching against the whole line.
     let version_out = Command::new(GLASS)
         .arg("--version")
         .output()

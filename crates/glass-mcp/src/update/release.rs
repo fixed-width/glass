@@ -3,11 +3,11 @@
 //! "Latest" is resolved by following `/releases/latest`'s redirect rather than through the REST
 //! API: no token, no 60/hr unauthenticated rate limit, no JSON, and GitHub already excludes
 //! prereleases from that endpoint. The cost is that the `Location` header is attacker-influenced
-//! input which then gets interpolated into a download URL, so it is validated twice here — once
-//! for the redirect target's prefix, once for the tag's own shape.
+//! input which then gets interpolated into a download URL; [`tag_from_location`] is what
+//! validates it.
 
-/// Where releases live. A constructor argument on `ReleaseSource` rather than a hardcoded
-/// literal at the call site, so tests can drive the real code path against a local server.
+/// Where releases live. Reached through `ReleaseSource::with_base` rather than read at the call
+/// site — see [`ReleaseSource`].
 pub(crate) const GITHUB_BASE: &str = "https://github.com";
 
 /// The repo path under the base. Part of the redirect prefix check.
@@ -82,10 +82,9 @@ pub(crate) fn is_valid_tag(tag: &str) -> bool {
 
 /// Pull the release tag out of `/releases/latest`'s redirect target.
 ///
-/// Both halves matter. The prefix check pins origin *and* repo path, so a redirect to another
-/// host — or to `/releases`, which is what a repo with no published release returns — cannot be
-/// mistaken for a release. The tag check then pins the remaining segment's shape, so nothing that
-/// could escape the download path survives.
+/// The prefix check pins origin *and* repo path, so nothing [`LocationError::NotATagRedirect`]
+/// lists can be mistaken for a release. The tag check then pins the remaining segment's shape, so
+/// nothing that could escape the download path survives.
 pub(crate) fn tag_from_location(base: &str, location: &str) -> Result<String, LocationError> {
     let prefix = format!("{base}{REPO_PATH}/releases/tag/");
     let tag = location
@@ -102,8 +101,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::Duration;
 
-/// How long to wait for a connection before giving up. Short: the endpoint is either reachable
-/// or it is not, and a stalled connect should report rather than hang.
+/// How long to wait for a connection. Short — a stalled connect should report rather than hang.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Whole-request budget for the two small metadata requests (the redirect, the sidecar).
 const META_TIMEOUT: Duration = Duration::from_secs(60);
@@ -112,8 +110,7 @@ const META_TIMEOUT: Duration = Duration::from_secs(60);
 const ASSET_TIMEOUT: Duration = Duration::from_secs(600);
 /// How many redirects an asset fetch may follow. GitHub's real flow uses exactly one (to
 /// `objects.githubusercontent.com`); the bound is what stops a redirect loop. Compared with `>`,
-/// matching reqwest's own `Policy::limited` semantics, so "at most MAX_REDIRECTS followed" is
-/// literally what the code does.
+/// matching reqwest's own `Policy::limited` semantics.
 const MAX_REDIRECTS: usize = 5;
 
 /// Where to fetch releases from. The base is a constructor argument rather than a constant at
@@ -180,8 +177,8 @@ impl ReleaseSource {
     /// sends release downloads to objects.githubusercontent.com), bounded to
     /// [`MAX_REDIRECTS`] hops, and a hop that *changes* the scheme is refused — the check is a
     /// symmetric equality test, so an http→https upgrade is refused exactly as an https→http
-    /// downgrade is. Over https that is the "https all the way" rule, and over the tests' loopback
-    /// http it is the same rule, so production's guard is the one under test.
+    /// downgrade is. The same rule over the tests' loopback http, so production's guard is the
+    /// one under test.
     fn following_client(&self, timeout: Duration) -> anyhow::Result<reqwest::Client> {
         let policy = reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() > MAX_REDIRECTS {
@@ -209,8 +206,7 @@ impl ReleaseSource {
         // `with_context` rather than folding `e` into the message with `{e}`: reqwest's `Display`
         // for a redirect-policy refusal is just "error following redirect for url (...)" — the
         // policy's own message ("too many redirects", "refusing a redirect that changes the URL
-        // scheme") only exists on `e`'s `source()`. `with_context` keeps `e` as the source instead
-        // of discarding it, so that text is still reachable from the returned error.
+        // scheme") only exists on `e`'s `source()`.
         let resp = self
             .following_client(META_TIMEOUT)?
             .get(url)
@@ -228,10 +224,8 @@ impl ReleaseSource {
     /// what was written. One pass: the binary is never fully buffered in memory, and the digest
     /// describes the bytes that actually landed rather than a re-read of the file.
     ///
-    /// On any failure the partial file is removed, so a failed download leaves nothing behind for
-    /// a later run to trip over. The removal is best-effort: its result is dropped because a
-    /// failed unlink says nothing the caller can act on, and reporting it would hide the download
-    /// error that is the actual reason for the failure.
+    /// On any failure the partial file is removed, best-effort — reporting a failed unlink would
+    /// hide the download error that is the actual reason for the failure.
     pub(crate) async fn download_to(&self, url: &str, dest: &Path) -> anyhow::Result<String> {
         match self.download_inner(url, dest).await {
             Ok(digest) => Ok(digest),
@@ -245,8 +239,7 @@ impl ReleaseSource {
     async fn download_inner(&self, url: &str, dest: &Path) -> anyhow::Result<String> {
         use std::io::Write;
 
-        // See the matching comment on `fetch_text`: `with_context` keeps the redirect policy's
-        // refusal message reachable via the error's source chain instead of discarding it.
+        // See `fetch_text`: `with_context` keeps the policy's refusal message on the source chain.
         let mut resp = self
             .following_client(ASSET_TIMEOUT)?
             .get(url)
@@ -257,8 +250,7 @@ impl ReleaseSource {
         if !status.is_success() {
             anyhow::bail!("{url} returned HTTP {status}");
         }
-        // Same reason as `fetch_text`: keep the `io::Error` on the source chain rather than
-        // flattening it into the message, so the errno behind "could not write" survives.
+        // Same reason as `fetch_text`: keep the `io::Error`'s errno on the source chain.
         let mut file = std::fs::File::create(dest)
             .with_context(|| format!("could not write {}", dest.display()))?;
         let mut hasher = Sha256::new();
@@ -321,7 +313,7 @@ mod tests {
     }
 
     /// A repo with no published release redirects to `/releases`, and a GitHub error page during
-    /// an incident lands here too. Neither may be reported as "you are up to date".
+    /// an incident lands here too — neither may be reported as "you are up to date".
     #[test]
     fn a_redirect_without_a_tag_segment_is_an_error() {
         assert!(matches!(
@@ -370,8 +362,8 @@ mod tests {
         ));
     }
 
-    /// The base is a constructor argument so tests can point at a local server; the prefix check
-    /// has to follow it, or the production origin check would be untested.
+    /// The prefix check has to follow the configured base, or the production origin check would
+    /// be untested.
     #[test]
     fn the_prefix_check_follows_the_configured_base() {
         let base = "http://127.0.0.1:8080";
@@ -388,9 +380,8 @@ mod tests {
 
     /// Asset names embed the tag WITH its `v` — `release.yml` builds them from GITHUB_REF_NAME.
     ///
-    /// Skips where no asset is published (macOS, non-x86_64): CI's macOS job runs
-    /// `cargo test --workspace --lib`, so this module executes there, and `asset_name` correctly
-    /// returns `None`. `the_asset_suffix_matches_this_build` is what asserts that case.
+    /// Returns early where no asset is published (macOS, non-x86_64);
+    /// `the_asset_suffix_matches_this_build` is what asserts that case.
     #[test]
     fn the_asset_name_keeps_the_tags_v() {
         let Some(name) = asset_name("v1.4.0") else {
@@ -437,8 +428,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_release_is_an_error_not_an_up_to_date_report() {
         // An empty tag makes the redirect land on `/releases/tag/` with nothing after it — the
-        // same shape as a repo with nothing published, or a GitHub error page. It must be an
-        // error, never a quiet "you are up to date".
+        // shape a repo with nothing published, or a GitHub error page, produces.
         let server = FakeRelease::start("", "asset", BODY, "");
         let src = ReleaseSource::with_base(server.base());
         assert!(src.latest_tag().await.is_err());
@@ -504,10 +494,9 @@ mod tests {
         assert_eq!(src.fetch_text(&url).await.unwrap(), "abc123  asset\n");
     }
 
-    /// The scheme guard, which is the reason `following_client` has a custom policy at all. The
-    /// error must be ours, not a TLS/connect failure — asserting on the word "scheme" is what
-    /// distinguishes "the policy refused it" from "it tried https on a plaintext port and
-    /// failed". Two things have to hold for that assertion to mean anything:
+    /// The scheme guard. The error must be ours, not a TLS/connect failure — asserting on the
+    /// word "scheme" is what distinguishes "the policy refused it" from "it tried https on a
+    /// plaintext port and failed". Two things have to hold for that assertion to mean anything:
     ///
     /// - It has to inspect the *root cause*, not `.to_string()` — `anyhow::Error`'s `Display`
     ///   only shows the top-level context ("could not fetch {url}"), never the policy's own
@@ -539,8 +528,7 @@ mod tests {
 
     /// The hop cap. Pins that a bound exists, not its exact value — the value is arbitrary, but a
     /// redirect loop with no bound is a hang. Root cause, not `.to_string()`, for the same reason
-    /// as the scheme test above: the top-level context and reqwest's own `Display` both only
-    /// report a URL, never the policy's "too many redirects" message.
+    /// as the scheme test above.
     #[tokio::test]
     async fn an_endless_redirect_chain_is_cut_off() {
         let dir = tempfile::tempdir().expect("tempdir");

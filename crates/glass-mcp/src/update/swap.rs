@@ -1,7 +1,6 @@
 //! Putting the new binary where the old one was.
 //!
-//! The two platforms need genuinely different mechanisms, so they are two functions with one
-//! signature rather than one function with an internal branch.
+//! The two platforms need genuinely different mechanisms — two functions with one signature.
 
 use std::path::Path;
 
@@ -38,7 +37,7 @@ pub(crate) fn swap(temp: &Path, target: &Path) -> anyhow::Result<()> {
     if let Err(e) = std::fs::rename(temp, target) {
         // Put it back — and check that it worked. If the restore ALSO fails, the target path now
         // holds nothing at all, and reporting "the install is intact" would be a lie at the worst
-        // possible moment. Say what happened and name where the old binary actually is.
+        // possible moment.
         if let Err(restore) = std::fs::rename(&displaced, target) {
             return Err(anyhow::anyhow!(
                 "could not put the new binary in place ({e}), and could not restore the old one \
@@ -86,8 +85,8 @@ fn is_displaced(entry: &str, exe_name: &str) -> bool {
 /// process's running image, which is exactly the case during the update that created it. The next
 /// run is when it goes away, so failure here is expected and silent.
 ///
-/// Takes the executable's path rather than its directory, so the prefix it matches is derived from
-/// the same name `swap` displaced rather than hardcoded a second time.
+/// Takes the executable's path rather than its directory, so the prefix comes from the same name
+/// `swap` displaced.
 #[cfg(windows)]
 pub(crate) fn sweep_old(exe: &Path) {
     let (Some(dir), Some(exe_name)) = (exe.parent(), exe.file_name()) else {
@@ -157,9 +156,8 @@ mod tests {
         );
     }
 
-    /// `is_displaced` is pure and not cfg-gated precisely so this can run on the Linux dev box —
-    /// the Windows sweep itself never executes here, so without this the matching rule would ship
-    /// with no test on any machine a developer actually uses.
+    /// `is_displaced` is pure and not `windows`-gated precisely so this runs on the Linux dev box,
+    /// where the Windows sweep itself never executes.
     #[test]
     fn only_a_pid_suffixed_sibling_counts_as_displaced() {
         assert!(is_displaced("glass-mcp.exe.old-1234", "glass-mcp.exe"));
@@ -184,10 +182,8 @@ mod tests {
         let temp = dir.path().join(".glass-mcp.update-1");
         std::fs::write(&target, b"old").unwrap();
         std::fs::write(&temp, b"new").unwrap();
-        // `mod.rs` creates the temp file 0755 up front (the smoke check has to execute it before
-        // `swap` ever runs), so `swap`'s own chmod is normally a no-op backstop. Set 0644 here
-        // anyway to test that backstop in isolation: without it, a temp file that somehow arrived
-        // non-executable would swap into place unable to run.
+        // `mod.rs` creates the temp file 0755 up front, so `swap`'s own chmod is normally a no-op
+        // backstop. Set 0644 here to test that backstop in isolation.
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         swap(&temp, &target).expect("swap");

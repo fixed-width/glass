@@ -40,15 +40,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 futures = { version = "0.3", optional = true }
 # `update`: the only outbound HTTP glass makes. reqwest rather than a lighter client because it
 # is already in Cargo.lock (pinned to rmcp's line below) and hyper/http/tower/tokio are already
-# linked via axum — a second HTTP stack alongside the one already present is the larger cost.
-# Native roots rather than a bundled store so a TLS-inspecting corporate proxy works; a musl
-# static build therefore needs ca-certificates present.
+# linked via axum. Native roots rather than a bundled store so a TLS-inspecting corporate proxy
+# works; a musl static build therefore needs ca-certificates present.
 #
-# reqwest 0.13 dropped the old `rustls-tls`/`rustls-tls-native-roots`/`rustls-tls-webpki-roots`
-# split: `rustls` is now the only rustls feature, and it always pulls in
-# `rustls-platform-verifier`, which verifies against the OS's own trust store (Keychain,
-# CryptoAPI, or the system's ca-certificates) rather than a bundled webpki set — i.e. it already
-# *is* the native-roots behavior this dependency was chosen for.
+# reqwest 0.13 collapsed the old `rustls-tls*` feature split: `rustls` is now the only rustls
+# feature, and it always pulls in `rustls-platform-verifier`, which verifies against the OS's own
+# trust store (Keychain, CryptoAPI, or the system's ca-certificates) rather than a bundled webpki
+# set.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

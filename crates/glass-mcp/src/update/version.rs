@@ -80,9 +80,8 @@ impl Ord for Version {
     /// Deliberately **not** general semver. The only comparison production ever performs is a
     /// local version against `/releases/latest`, which never returns a prerelease — so the
     /// both-are-prereleases arm below cannot fire in production and exists for totality. Its
-    /// lexicographic order would sort `rc10` before `rc2`; that is acceptable precisely because
-    /// nothing reaches it, and it is documented here so no one later mistakes this for a complete
-    /// semver implementation.
+    /// lexicographic order would sort `rc10` before `rc2`, which is acceptable precisely because
+    /// nothing reaches it.
     fn cmp(&self, other: &Self) -> Ordering {
         (self.major, self.minor, self.patch)
             .cmp(&(other.major, other.minor, other.patch))
@@ -129,10 +128,8 @@ mod tests {
 
     /// The discriminating pair for the *shape* rule. `1.2.0-rc1` and `1.3.0-5-g563feea` BOTH carry
     /// a `-` suffix, so a classifier that merely looks for a dash gets one of them wrong whichever
-    /// way it guesses.
-    ///
-    /// What rejects the describe suffix here is the byte-class guard — `5-g563feea` holds an
-    /// internal dash — not the first-character rule. The first-character rule is covered by
+    /// way it guesses. What rejects the describe suffix here is the byte-class guard, not the
+    /// first-character rule — that one is covered by
     /// `a_digit_initial_suffix_is_not_a_release_prerelease`.
     #[test]
     fn a_describe_suffix_is_rejected_while_an_rc_tag_is_accepted() {
@@ -146,13 +143,9 @@ mod tests {
         assert!(Version::parse_released("1.3.0-5-g563feea-dirty").is_none());
     }
 
-    /// The `starts_with(alphabetic)` clause's own case, and the only one that exercises it.
-    ///
-    /// Every `git describe` suffix in real use carries an internal dash (`5-g563feea`), which the
-    /// byte-class guard rejects by itself — so a dash-free, digit-initial input is the only kind
-    /// that reaches the `starts_with(alphabetic)` clause at all. Delete that clause and every
-    /// other case in this file still passes; these two are what make the stated rule ("the first
-    /// character decides") load-bearing.
+    /// The `starts_with(alphabetic)` clause's own case, and the only one that exercises it: a
+    /// dash-free, digit-initial suffix is the only kind the byte-class guard does not reject
+    /// first. Delete the clause and every other case in this file still passes.
     #[test]
     fn a_digit_initial_suffix_is_not_a_release_prerelease() {
         assert!(Version::parse_released("1.3.0-5").is_none());
