@@ -127,9 +127,13 @@ mod tests {
         assert_eq!(v.to_string(), "1.2.0-rc1");
     }
 
-    /// The discriminating pair. `1.2.0-rc1` and `1.3.0-5-g563feea` BOTH carry a `-` suffix, so a
-    /// classifier that merely looks for a dash gets one of them wrong whichever way it guesses.
-    /// Only asserting both in one test proves the rule keys on the suffix's first character.
+    /// The discriminating pair for the *shape* rule. `1.2.0-rc1` and `1.3.0-5-g563feea` BOTH carry
+    /// a `-` suffix, so a classifier that merely looks for a dash gets one of them wrong whichever
+    /// way it guesses.
+    ///
+    /// What rejects the describe suffix here is the byte-class guard — `5-g563feea` holds an
+    /// internal dash — not the first-character rule. The first-character rule is covered by
+    /// `a_digit_initial_suffix_is_not_a_release_prerelease`.
     #[test]
     fn a_describe_suffix_is_rejected_while_an_rc_tag_is_accepted() {
         assert!(Version::parse_released("1.3.0-5-g563feea").is_none());
