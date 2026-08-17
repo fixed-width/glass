@@ -63,10 +63,11 @@ fn parse_number(s: &str) -> Option<u64> {
 
 /// Is this suffix a real prerelease tag rather than a `git describe` artifact?
 ///
-/// The whole classification turns on the first character: a release tag's suffix starts with a
-/// letter (`rc1`), while `describe` always starts with the commit count (`5-g563feea`). `dirty`
-/// starts with a letter too, so it is excluded by name — it is the one `describe` suffix that
-/// would otherwise slip through.
+/// In practice a `describe` suffix (`5-g563feea`) is rejected by its internal dash, which the
+/// byte-class check below catches on its own. The first-character check exists for the case the
+/// byte-class check can't reach: a dash-free, digit-initial suffix (`5`, `563feea`) that would
+/// otherwise pass as a prerelease tag. `dirty` starts with a letter too, so it is excluded by
+/// name — it is the one `describe` suffix the other two checks would let through.
 fn is_release_prerelease(p: &str) -> bool {
     p != "dirty"
         && p.starts_with(|c: char| c.is_ascii_alphabetic())
@@ -139,6 +140,19 @@ mod tests {
     fn a_dirty_tree_is_rejected() {
         assert!(Version::parse_released("1.3.0-dirty").is_none());
         assert!(Version::parse_released("1.3.0-5-g563feea-dirty").is_none());
+    }
+
+    /// The `starts_with(alphabetic)` clause's own case, and the only one that exercises it.
+    ///
+    /// Every `git describe` suffix in real use carries an internal dash (`5-g563feea`), which the
+    /// byte-class guard rejects by itself — so without a dash-free, digit-initial input that clause
+    /// is redundant against the whole suite, and the mutation gate would rightly flag it as a
+    /// survivor. These two inputs are what make the stated rule ("the first character decides")
+    /// actually load-bearing.
+    #[test]
+    fn a_digit_initial_suffix_is_not_a_release_prerelease() {
+        assert!(Version::parse_released("1.3.0-5").is_none());
+        assert!(Version::parse_released("1.3.0-563feea").is_none());
     }
 
     /// `git describe --always` with no tags in reach emits a bare short SHA.
