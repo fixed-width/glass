@@ -421,10 +421,9 @@ fn refusal_message(why: &Refusal, report: &Report) -> String {
             dir.display(),
             report.url.as_deref().unwrap_or("(url unresolved)")
         ),
-        Refusal::NeedsConsent => {
-            "declined. Pass --yes to update without a prompt (there is no terminal to ask on)."
-                .to_string()
-        }
+        Refusal::NeedsConsent => "declined, or no way to ask. Pass --yes to update without a \
+             prompt (required with --json, which never prompts)."
+            .to_string(),
         Refusal::ChecksumMismatch { expected, got } => format!(
             "the downloaded asset does not match the checksum the release published.\n  \
              expected {expected}\n  got      {got}"

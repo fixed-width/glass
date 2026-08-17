@@ -10,24 +10,74 @@ use std::process::Command;
 
 const GLASS: &str = env!("CARGO_BIN_EXE_glass-mcp");
 
+/// Is this the version shape `build.rs` emits for a real release build?
+///
+/// Mirrors `update::version::Version::parse_released`, which an integration test cannot reach —
+/// it is `pub(crate)`. Deliberately conservative: anything that might be a released version
+/// causes a skip, because being wrong here means a real network request from the test suite.
+fn looks_released(version: &str) -> bool {
+    if version == "0.0.0" {
+        return false;
+    }
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (version, None),
+    };
+    let mut parts = core.split('.');
+    let triple_ok = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    }) && parts.next().is_none();
+    let pre_ok = match pre {
+        None => true,
+        Some(p) => p != "dirty" && p.starts_with(|c: char| c.is_ascii_alphabetic()),
+    };
+    triple_ok && pre_ok
+}
+
+/// The guard this whole suite depends on to never reach the network: a guard whose own logic is
+/// untested is how the `.contains('-')` version of it shipped inert (`glass-mcp` itself has a
+/// hyphen in its name, so that check was unconditionally true against the whole `--version` line).
+#[test]
+fn looks_released_matches_the_release_shape() {
+    // Not released: every shape build.rs's local-build path can actually produce.
+    assert!(
+        !looks_released("1.3.0-18-g5579f99"),
+        "a git-describe commit-count suffix"
+    );
+    assert!(!looks_released("1.3.0-dirty"), "a dirty working tree");
+    assert!(!looks_released("0.0.0"), "the no-VCS fallback");
+    assert!(
+        !looks_released("5579f99"),
+        "a bare SHA with no reachable tag"
+    );
+    // Released: what a CI tag build, or a checkout sitting exactly on a tag, reports.
+    assert!(looks_released("1.3.0"), "a plain released version");
+    assert!(looks_released("1.2.0-rc1"), "a real prerelease tag");
+}
+
 #[test]
 fn update_refuses_a_from_source_build_without_touching_the_network() {
-    // A checkout sitting exactly on a released tag reports a plain MAJOR.MINOR.PATCH with no
-    // `git describe` suffix — the one shape `update` treats as a real release, which would send
-    // it resolving a real latest tag over the network. Every other shape (a commit count,
-    // `-dirty`, or a bare SHA) carries a dash and is guaranteed to hit the from-source refusal
-    // before any request. Skip rather than let a from-a-tag checkout reach github.com.
+    // A checkout sitting exactly on a released tag reports a plain MAJOR.MINOR.PATCH (or a real
+    // prerelease tag like `1.2.0-rc1`) — the one shape `update` treats as a real release, which
+    // would send it resolving a real latest tag over the network. Every other shape (a commit
+    // count, `-dirty`, or a bare SHA) is guaranteed to hit the from-source refusal before any
+    // request. Skip rather than let a from-a-tag checkout reach github.com.
+    //
+    // `--version` renders as `glass-mcp <version>` — take the LAST whitespace-separated token,
+    // not the whole line: the binary's own name contains a hyphen, so a naive `.contains('-')`
+    // check against the full stdout is unconditionally true regardless of the version.
     let version_out = Command::new(GLASS)
         .arg("--version")
         .output()
         .expect("run glass-mcp");
-    let version = String::from_utf8_lossy(&version_out.stdout)
-        .trim()
-        .to_string();
-    if !version.contains('-') {
+    let stdout = String::from_utf8_lossy(&version_out.stdout);
+    let version = stdout.split_whitespace().last().unwrap_or_default();
+    if looks_released(version) {
         eprintln!(
-            "skipping: version {version:?} carries no git-describe suffix (checkout is exactly \
-             on a tag) — running `update` here would reach github.com"
+            "skipping: this build reports a released version ({version}), so `update` would \
+             resolve a real release — see looks_released"
         );
         return;
     }

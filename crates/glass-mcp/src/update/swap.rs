@@ -184,7 +184,10 @@ mod tests {
         let temp = dir.path().join(".glass-mcp.update-1");
         std::fs::write(&target, b"old").unwrap();
         std::fs::write(&temp, b"new").unwrap();
-        // Downloaded files land 0644; without the chmod the swapped-in binary cannot be run.
+        // `mod.rs` creates the temp file 0755 up front (the smoke check has to execute it before
+        // `swap` ever runs), so `swap`'s own chmod is normally a no-op backstop. Set 0644 here
+        // anyway to test that backstop in isolation: without it, a temp file that somehow arrived
+        // non-executable would swap into place unable to run.
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         swap(&temp, &target).expect("swap");
