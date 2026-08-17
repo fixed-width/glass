@@ -99,6 +99,170 @@ pub(crate) fn tag_from_location(base: &str, location: &str) -> Result<String, Lo
     Ok(tag.to_string())
 }
 
+use sha2::{Digest, Sha256};
+use std::path::Path;
+use std::time::Duration;
+
+/// How long to wait for a connection before giving up. Short: the endpoint is either reachable
+/// or it is not, and a stalled connect should report rather than hang.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole-request budget for the two small metadata requests (the redirect, the sidecar).
+const META_TIMEOUT: Duration = Duration::from_secs(60);
+/// Whole-request budget for the asset body. Generous, but bounded — a stalled download must not
+/// hang forever.
+const ASSET_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Where to fetch releases from. The base is a constructor argument rather than a constant at
+/// the call site so the tests drive this exact code against a local server; there is deliberately
+/// no environment variable, which would ship a knob that repoints the updater at any host.
+pub(crate) struct ReleaseSource {
+    base: String,
+}
+
+impl ReleaseSource {
+    pub(crate) fn github() -> Self {
+        Self::with_base(GITHUB_BASE)
+    }
+
+    pub(crate) fn with_base(base: impl Into<String>) -> Self {
+        ReleaseSource { base: base.into() }
+    }
+
+    /// The newest published release's tag. `/releases/latest` redirects to the tag page and
+    /// already excludes prereleases and drafts, so the redirect target is the whole answer.
+    pub(crate) async fn latest_tag(&self) -> anyhow::Result<String> {
+        let url = format!("{}{REPO_PATH}/releases/latest", self.base);
+        // Redirects OFF: the Location header IS the result here, not something to follow.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(META_TIMEOUT)
+            .user_agent(concat!("glass-mcp/", env!("GLASS_VERSION")))
+            .build()?;
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("could not reach {url}: {e}"))?;
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{url} did not redirect to a release (HTTP {})",
+                    resp.status()
+                )
+            })?;
+        tag_from_location(&self.base, location).map_err(|e| match e {
+            LocationError::Missing | LocationError::NotATagRedirect => anyhow::anyhow!(
+                "{url} redirected to {location}, which is not a release tag page — \
+                 the repo may have no published release, or GitHub may be returning an error page"
+            ),
+            LocationError::MalformedTag(t) => {
+                anyhow::anyhow!("{url} redirected to an unexpected release tag {t:?}")
+            }
+        })
+    }
+
+    pub(crate) fn asset_url(&self, tag: &str, asset: &str) -> String {
+        format!("{}{REPO_PATH}/releases/download/{tag}/{asset}", self.base)
+    }
+
+    /// Build the client used for asset and sidecar fetches. Redirects ARE followed here (GitHub
+    /// sends release downloads to objects.githubusercontent.com), bounded to five hops, and a
+    /// hop that downgrades the scheme is refused — over https that is the "https all the way"
+    /// rule, and over the tests' loopback http it is the same rule, so production's guard is the
+    /// one under test.
+    fn following_client(&self, timeout: Duration) -> anyhow::Result<reqwest::Client> {
+        let policy = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many redirects");
+            }
+            let downgraded = attempt
+                .previous()
+                .first()
+                .is_some_and(|first| first.scheme() != attempt.url().scheme());
+            if downgraded {
+                return attempt.error("refusing a redirect that changes the URL scheme");
+            }
+            attempt.follow()
+        });
+        Ok(reqwest::Client::builder()
+            .redirect(policy)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(timeout)
+            .user_agent(concat!("glass-mcp/", env!("GLASS_VERSION")))
+            .build()?)
+    }
+
+    /// Fetch a small text resource — the checksum sidecar.
+    pub(crate) async fn fetch_text(&self, url: &str) -> anyhow::Result<String> {
+        let resp = self
+            .following_client(META_TIMEOUT)?
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("could not fetch {url}: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("{url} returned HTTP {status}");
+        }
+        Ok(resp.text().await?)
+    }
+
+    /// Stream the asset to `dest`, hashing as it goes, and return the lowercase hex SHA-256 of
+    /// what was written. One pass: the binary is never fully buffered in memory, and the digest
+    /// describes the bytes that actually landed rather than a re-read of the file.
+    ///
+    /// On any failure the partial file is removed, so a failed download leaves nothing behind for
+    /// a later run to trip over.
+    pub(crate) async fn download_to(&self, url: &str, dest: &Path) -> anyhow::Result<String> {
+        match self.download_inner(url, dest).await {
+            Ok(digest) => Ok(digest),
+            Err(e) => {
+                let _ = std::fs::remove_file(dest);
+                Err(e)
+            }
+        }
+    }
+
+    async fn download_inner(&self, url: &str, dest: &Path) -> anyhow::Result<String> {
+        use std::io::Write;
+
+        let mut resp = self
+            .following_client(ASSET_TIMEOUT)?
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("could not fetch {url}: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("{url} returned HTTP {status}");
+        }
+        let mut file = std::fs::File::create(dest)
+            .map_err(|e| anyhow::anyhow!("could not write {}: {e}", dest.display()))?;
+        let mut hasher = Sha256::new();
+        while let Some(chunk) = resp.chunk().await? {
+            hasher.update(&chunk);
+            file.write_all(&chunk)?;
+        }
+        file.sync_all()?;
+        Ok(hex(&hasher.finalize()))
+    }
+}
+
+/// Lowercase hex, to match `sha256sum`'s output — which is what the sidecar contains.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +328,20 @@ mod tests {
         }
     }
 
+    /// De-anchoring regression. `strip_prefix` is anchored at byte 0, which is the only reason a
+    /// URL that merely *contains* the expected prefix is rejected. Nothing else in the suite pins
+    /// that, and cargo-mutants cannot generate a de-anchoring mutant — so without this, an
+    /// accidental switch to a substring match would pass every committed test.
+    #[test]
+    fn a_prefix_appearing_mid_url_is_not_a_tag_redirect() {
+        let loc =
+            "https://attacker.example/x/https://github.com/fixed-width/glass/releases/tag/v1.4.0";
+        assert!(matches!(
+            tag_from_location(BASE, loc),
+            Err(LocationError::NotATagRedirect)
+        ));
+    }
+
     #[test]
     fn a_malformed_tag_in_an_otherwise_valid_location_is_an_error() {
         let loc = "https://github.com/fixed-width/glass/releases/tag/v1.4.0/../../evil";
@@ -222,5 +400,62 @@ mod tests {
         } else {
             assert_eq!(suffix, None, "unsupported targets must refuse, not guess");
         }
+    }
+
+    use crate::update::testserver::FakeRelease;
+
+    const BODY: &[u8] = b"not really a binary, but it hashes just the same";
+    /// sha256 of BODY. Recompute with `printf '%s' '<BODY>' | sha256sum` if BODY changes.
+    const BODY_SHA: &str = "24c71201dd8f823148c6c782b5d0b288376212d1b8669a0ebdefd3c5b3b623fe";
+
+    #[tokio::test]
+    async fn latest_tag_follows_the_redirect() {
+        let server = FakeRelease::start("v1.4.0", "asset", BODY, "");
+        let src = ReleaseSource::with_base(server.base());
+        assert_eq!(src.latest_tag().await.unwrap(), "v1.4.0");
+    }
+
+    #[tokio::test]
+    async fn a_missing_release_is_an_error_not_an_up_to_date_report() {
+        // An empty tag makes the redirect land on `/releases/tag/` with nothing after it — the
+        // same shape as a repo with nothing published, or a GitHub error page. It must be an
+        // error, never a quiet "you are up to date".
+        let server = FakeRelease::start("", "asset", BODY, "");
+        let src = ReleaseSource::with_base(server.base());
+        assert!(src.latest_tag().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn download_writes_the_bytes_and_returns_their_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("downloaded");
+        let server = FakeRelease::start("v1.4.0", "asset", BODY, "");
+        let src = ReleaseSource::with_base(server.base());
+        let url = src.asset_url("v1.4.0", "asset");
+        let digest = src.download_to(&url, &dest).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+        assert_eq!(digest, BODY_SHA);
+    }
+
+    #[tokio::test]
+    async fn a_404_asset_is_an_error_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("downloaded");
+        let server = FakeRelease::start("v1.4.0", "asset", BODY, "");
+        let src = ReleaseSource::with_base(server.base());
+        let url = src.asset_url("v1.4.0", "no-such-asset");
+        assert!(src.download_to(&url, &dest).await.is_err());
+        assert!(
+            !dest.exists(),
+            "a failed download must leave nothing behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_text_reads_the_sidecar() {
+        let server = FakeRelease::start("v1.4.0", "asset", BODY, "abc123  asset\n");
+        let src = ReleaseSource::with_base(server.base());
+        let url = format!("{}.sha256", src.asset_url("v1.4.0", "asset"));
+        assert_eq!(src.fetch_text(&url).await.unwrap(), "abc123  asset\n");
     }
 }
