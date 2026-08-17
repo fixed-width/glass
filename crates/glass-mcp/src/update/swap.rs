@@ -84,6 +84,37 @@ mod tests {
         assert!(!temp.exists(), "the temp file is consumed by the swap");
     }
 
+    /// `rename` vs `copy`: the target must end up being the temp file's inode, not its own with
+    /// new contents. This is the only assertion here that distinguishes an atomic rename from a
+    /// copy-then-delete — `the_target_ends_up_holding_the_new_bytes` passes identically for both.
+    ///
+    /// It also pins the behavior the post-update notice describes: because the old inode survives
+    /// unlinked, an already-running `serve --http` goes on serving the OLD build until restarted.
+    #[cfg(unix)]
+    #[test]
+    fn the_swap_moves_the_temp_files_inode_into_place() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("glass-mcp");
+        let temp = dir.path().join(".glass-mcp.update-1");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::write(&temp, b"new").unwrap();
+        let old_ino = std::fs::metadata(&target).unwrap().ino();
+        let temp_ino = std::fs::metadata(&temp).unwrap().ino();
+
+        swap(&temp, &target).expect("swap");
+
+        let new_ino = std::fs::metadata(&target).unwrap().ino();
+        assert_eq!(
+            new_ino, temp_ino,
+            "the temp file's inode must land at the target path"
+        );
+        assert_ne!(
+            new_ino, old_ino,
+            "a copy would have kept the target's original inode"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_swapped_binary_is_executable() {
