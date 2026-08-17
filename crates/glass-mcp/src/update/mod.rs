@@ -3,4 +3,5 @@
 mod release;
 #[cfg(test)]
 mod testserver;
+mod verify;
 mod version;
