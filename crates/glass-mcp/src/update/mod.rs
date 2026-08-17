@@ -12,6 +12,7 @@ mod verify;
 mod version;
 
 use crate::color::ColorChoice;
+use anyhow::Context as _;
 use release::ReleaseSource;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -276,9 +277,12 @@ pub(crate) async fn run_cli(
     json: bool,
     color: ColorChoice,
 ) -> anyhow::Result<()> {
+    // `with_context` rather than folding the io::Error into the message with `{e}`: the latter
+    // discards it as this error's `source()`, which is exactly the mistake release.rs's
+    // `with_context` calls exist to avoid (see the comment on `fetch_text`).
     let exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
-        .map_err(|e| anyhow::anyhow!("could not resolve this binary's path: {e}"))?;
+        .context("could not resolve this binary's path")?;
     let opts = Options::from_flags(check, yes, skip_attestation, json, color);
     let source = ReleaseSource::github();
     let report = run(opts.clone(), &source, crate::VERSION, &exe).await?;
