@@ -83,6 +83,26 @@ fn serve_one(mut stream: TcpStream, routes: &Routes, port: u16) {
     );
     let sidecar = format!("{download}.sha256");
 
+    // Two routes that exist only to drive `following_client`'s security policy: one redirect that
+    // changes the scheme, and one that never terminates. Without them the hop cap and the
+    // scheme-downgrade refusal have no committed coverage at all.
+    if path == "/redirect/scheme" {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:{port}/fixed-width/glass/releases/latest\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.flush();
+        return;
+    }
+    if let Some(n) = path.strip_prefix("/redirect/chain/") {
+        let next = n.parse::<u32>().unwrap_or(0) + 1;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/redirect/chain/{next}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.flush();
+        return;
+    }
     if path == latest {
         let location = format!(
             "http://127.0.0.1:{port}/fixed-width/glass/releases/tag/{}",

@@ -99,6 +99,7 @@ pub(crate) fn tag_from_location(base: &str, location: &str) -> Result<String, Lo
     Ok(tag.to_string())
 }
 
+use anyhow::Context as _;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::Duration;
@@ -111,6 +112,11 @@ const META_TIMEOUT: Duration = Duration::from_secs(60);
 /// Whole-request budget for the asset body. Generous, but bounded — a stalled download must not
 /// hang forever.
 const ASSET_TIMEOUT: Duration = Duration::from_secs(600);
+/// How many redirects an asset fetch may follow. GitHub's real flow uses exactly one (to
+/// `objects.githubusercontent.com`); the bound is what stops a redirect loop. Compared with `>`,
+/// matching reqwest's own `Policy::limited` semantics, so "at most MAX_REDIRECTS followed" is
+/// literally what the code does.
+const MAX_REDIRECTS: usize = 5;
 
 /// Where to fetch releases from. The base is a constructor argument rather than a constant at
 /// the call site so the tests drive this exact code against a local server; there is deliberately
@@ -170,13 +176,13 @@ impl ReleaseSource {
     }
 
     /// Build the client used for asset and sidecar fetches. Redirects ARE followed here (GitHub
-    /// sends release downloads to objects.githubusercontent.com), bounded to five hops, and a
-    /// hop that downgrades the scheme is refused — over https that is the "https all the way"
-    /// rule, and over the tests' loopback http it is the same rule, so production's guard is the
-    /// one under test.
+    /// sends release downloads to objects.githubusercontent.com), bounded to
+    /// [`MAX_REDIRECTS`] hops, and a hop that downgrades the scheme is refused — over https that
+    /// is the "https all the way" rule, and over the tests' loopback http it is the same rule, so
+    /// production's guard is the one under test.
     fn following_client(&self, timeout: Duration) -> anyhow::Result<reqwest::Client> {
         let policy = reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 {
+            if attempt.previous().len() > MAX_REDIRECTS {
                 return attempt.error("too many redirects");
             }
             let downgraded = attempt
@@ -198,12 +204,17 @@ impl ReleaseSource {
 
     /// Fetch a small text resource — the checksum sidecar.
     pub(crate) async fn fetch_text(&self, url: &str) -> anyhow::Result<String> {
+        // `with_context` rather than folding `e` into the message with `{e}`: reqwest's `Display`
+        // for a redirect-policy refusal is just "error following redirect for url (...)" — the
+        // policy's own message ("too many redirects", "refusing a redirect that changes the URL
+        // scheme") only exists on `e`'s `source()`. `with_context` keeps `e` as the source instead
+        // of discarding it, so that text is still reachable from the returned error.
         let resp = self
             .following_client(META_TIMEOUT)?
             .get(url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("could not fetch {url}: {e}"))?;
+            .with_context(|| format!("could not fetch {url}"))?;
         let status = resp.status();
         if !status.is_success() {
             anyhow::bail!("{url} returned HTTP {status}");
@@ -230,12 +241,14 @@ impl ReleaseSource {
     async fn download_inner(&self, url: &str, dest: &Path) -> anyhow::Result<String> {
         use std::io::Write;
 
+        // See the matching comment on `fetch_text`: `with_context` keeps the redirect policy's
+        // refusal message reachable via the error's source chain instead of discarding it.
         let mut resp = self
             .following_client(ASSET_TIMEOUT)?
             .get(url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("could not fetch {url}: {e}"))?;
+            .with_context(|| format!("could not fetch {url}"))?;
         let status = resp.status();
         if !status.is_success() {
             anyhow::bail!("{url} returned HTTP {status}");
@@ -457,5 +470,61 @@ mod tests {
         let src = ReleaseSource::with_base(server.base());
         let url = format!("{}.sha256", src.asset_url("v1.4.0", "asset"));
         assert_eq!(src.fetch_text(&url).await.unwrap(), "abc123  asset\n");
+    }
+
+    /// The scheme guard, which is the reason `following_client` has a custom policy at all. The
+    /// error must be ours, not a TLS/connect failure — asserting on the word "scheme" is what
+    /// distinguishes "the policy refused it" from "it tried https on a plaintext port and
+    /// failed". Two things have to hold for that assertion to mean anything:
+    ///
+    /// - It has to inspect the *root cause*, not `.to_string()` — `anyhow::Error`'s `Display`
+    ///   only shows the top-level context ("could not fetch {url}"), never the policy's own
+    ///   message, which lives on the source chain (see the `with_context` calls in `fetch_text`
+    ///   and `download_inner`).
+    /// - It has to inspect the *last* link in that chain, not "does any link contain the word" —
+    ///   both the context string and reqwest's own `Display` for the failure echo the request
+    ///   URL, and this test's URL is `/redirect/scheme`, which trivially contains "scheme" on its
+    ///   own. Only the deepest cause — the literal string passed to `attempt.error(...)`, which
+    ///   never carries a URL — is guaranteed free of that coincidence.
+    #[tokio::test]
+    async fn a_redirect_that_changes_the_scheme_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("downloaded");
+        let server = FakeRelease::start("v1.4.0", "asset", BODY, "");
+        let src = ReleaseSource::with_base(server.base());
+        let url = format!("{}/redirect/scheme", server.base());
+        let err = src.download_to(&url, &dest).await.unwrap_err();
+        let root_cause = err.chain().last().expect("at least one link").to_string();
+        assert!(
+            root_cause.contains("scheme"),
+            "expected the scheme guard as the root cause, got: {root_cause}"
+        );
+        assert!(
+            !dest.exists(),
+            "a refused redirect must leave nothing behind"
+        );
+    }
+
+    /// The hop cap. Pins that a bound exists, not its exact value — the value is arbitrary, but a
+    /// redirect loop with no bound is a hang. Root cause, not `.to_string()`, for the same reason
+    /// as the scheme test above: the top-level context and reqwest's own `Display` both only
+    /// report a URL, never the policy's "too many redirects" message.
+    #[tokio::test]
+    async fn an_endless_redirect_chain_is_cut_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("downloaded");
+        let server = FakeRelease::start("v1.4.0", "asset", BODY, "");
+        let src = ReleaseSource::with_base(server.base());
+        let url = format!("{}/redirect/chain/0", server.base());
+        let err = src.download_to(&url, &dest).await.unwrap_err();
+        let root_cause = err.chain().last().expect("at least one link").to_string();
+        assert!(
+            root_cause.contains("too many redirects"),
+            "expected the hop cap as the root cause, got: {root_cause}"
+        );
+        assert!(
+            !dest.exists(),
+            "a refused redirect must leave nothing behind"
+        );
     }
 }
