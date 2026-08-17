@@ -437,18 +437,11 @@ fn refusal_message(why: &Refusal, report: &Report) -> String {
              If GitHub is unreachable rather than the artifact being wrong, retry later — or pass \
              --skip-attestation to accept the checksum alone."
         ),
-        Refusal::SmokeCheckFailed(why) => {
-            let mut msg = format!("the downloaded binary did not run: {why}");
-            // Only suggest musl when the gnu asset is what was fetched — a too-old glibc is the
-            // overwhelmingly likely cause there, and nonsense advice everywhere else.
-            if report.asset.as_deref().is_some_and(|a| a.ends_with("-gnu")) {
-                msg.push_str(
-                    "\n  If that is a glibc error, use the musl build instead — \
-                     see docs/reference/platforms.md.",
-                );
-            }
-            msg
-        }
+        Refusal::SmokeCheckFailed(why) => format!(
+            "the downloaded binary did not run: {why}\n  \
+             The error above is from the binary itself. Build variants for this platform are \
+             listed in docs/reference/platforms.md."
+        ),
     }
 }
 
@@ -799,17 +792,6 @@ mod tests {
                 .as_str()
                 .is_some_and(|s| s.contains("/usr/local/bin"))
         );
-    }
-
-    /// The glibc hint is only correct advice when the gnu asset is what failed to run.
-    #[test]
-    fn the_glibc_hint_appears_only_for_the_gnu_asset() {
-        let mut r = report_fixture();
-        r.outcome = Outcome::Refused(Refusal::SmokeCheckFailed("exited 1".into()));
-        assert!(render(&r, &plain(false)).contains("musl build"));
-
-        r.asset = Some("glass-mcp-v1.4.0-x86_64-linux-musl".into());
-        assert!(!render(&r, &plain(false)).contains("musl build"));
     }
 
     /// The macOS behavior the guard above skips: refusing is the feature, not a gap. Asserted on
