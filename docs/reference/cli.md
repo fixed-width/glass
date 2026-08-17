@@ -81,7 +81,10 @@ Exit code: `0` for a successful update, for "already up to date", and for every 
 (whether or not a newer release exists) — a script should read `--json`'s `update_available` field,
 not the exit code, to learn whether news exists. `1` for a refusal or any other error.
 
-`--json` always prints exactly one object, whatever happened. Its fields:
+`--json` prints exactly one object for every outcome of the update itself — including a refusal,
+and including a failure to reach or resolve the release. (The exception is a failure before the
+update starts at all, such as `glass-mcp` being unable to resolve its own path; that reports as a
+plain error message with no JSON.) Its fields:
 
 | Field | Meaning |
 |---|---|

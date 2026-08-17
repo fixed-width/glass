@@ -231,8 +231,12 @@ pub(crate) async fn run(
     report.url = Some(url.clone());
 
     // 6. Stage: create the temp file the download will land in, rather than inspect the
-    //    directory's permissions — the same act as the use, so there is no window between the two
-    //    and no way for them to disagree. Whatever the OS says when it fails is what gets
+    //    directory's permissions. Opening it is the operation the download will actually perform,
+    //    so a directory this user cannot write to is caught here rather than guessed at from a
+    //    permission bit that may not be what the kernel enforces. It is NOT the same moment,
+    //    though: `download_inner` creates the file again after the consent prompt, and the disk
+    //    can fill or the directory can go away in between — this rules out the permission
+    //    mismatch, not every later failure. Whatever the OS says when it fails is what gets
     //    reported; this step does not try to work out why.
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
     let temp = dir.join(format!(".glass-mcp.update-{:016x}", rand::random::<u64>()));
@@ -516,8 +520,12 @@ fn refusal_message(why: &Refusal, report: &Report) -> String {
              (check with `gh auth status`), rather than the artifact being wrong, fix that and \
              retry — or pass --skip-attestation to accept the checksum alone."
         ),
+        // "failed the run check", not "did not run": only one of `smoke_check`'s six failure
+        // paths is a spawn failure. On the other five the binary ran — it hung, exited non-zero,
+        // or printed the wrong version — so any lead-in claiming it did not run contradicts the
+        // very error it introduces. Say what the gate concluded and let `why` say the rest.
         Refusal::SmokeCheckFailed(why) => format!(
-            "the downloaded binary did not run: {why}\n  \
+            "the downloaded binary failed the run check: {why}\n  \
              Build variants for this platform are listed in docs/reference/platforms.md."
         ),
     }
@@ -826,9 +834,17 @@ mod tests {
         let out = run(opts(), &src, "1.3.0", &exe).await.unwrap().outcome;
 
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Bind the fields rather than `{ .. }`: the variant alone says nothing about whether the
+        // `io::Error` was actually captured. Replacing the capture with `String::new()` leaves a
+        // `matches!` on the variant green, and the refusal then prints a trailing colon with
+        // nothing after it — which is the whole defect the rename was meant to fix.
+        let Outcome::Refused(Refusal::CannotStage { dir: named, why }) = &out else {
+            panic!("expected a staging refusal, got {out:?}");
+        };
+        assert_eq!(named, dir.path(), "the refusal must name the directory");
         assert!(
-            matches!(out, Outcome::Refused(Refusal::CannotStage { .. })),
-            "{out:?}"
+            !why.is_empty(),
+            "the OS error must be carried into the refusal, not discarded"
         );
         assert_eq!(std::fs::read(&exe).unwrap(), b"old");
     }
@@ -1040,6 +1056,42 @@ mod tests {
             assert!(out.contains("updated"), "{out}");
             assert!(!out.contains("provenance"), "{out}");
         }
+    }
+
+    /// The two `BadSidecar` messages describe genuinely different failures — a file this cannot
+    /// parse, and a file that parsed fine but names another asset — and nothing pinned which
+    /// message went with which. Swapping them puts "could not be read" on a sidecar that read
+    /// perfectly, which is the wrong label the split was made to remove. Each case asserts what
+    /// must appear and what must not, so a swap fails both halves.
+    #[test]
+    fn the_two_sidecar_failures_are_not_described_as_each_other() {
+        let rendered = |e: verify::SidecarError| {
+            let mut r = report_fixture();
+            r.outcome = Outcome::Refused(Refusal::BadSidecar(e));
+            render(&r, &plain(false))
+        };
+
+        let malformed = rendered(verify::SidecarError::Malformed);
+        assert!(malformed.contains("not a `sha256sum` line"), "{malformed}");
+        assert!(
+            !malformed.contains("different asset"),
+            "an unparseable sidecar is not a wrong-asset sidecar: {malformed}"
+        );
+
+        let wrong = rendered(verify::SidecarError::WrongAsset("some-other-asset".into()));
+        assert!(wrong.contains("different asset"), "{wrong}");
+        assert!(
+            wrong.contains("some-other-asset"),
+            "it must name what the sidecar claims: {wrong}"
+        );
+        assert!(
+            wrong.contains("glass-mcp-v1.4.0-x86_64-linux-gnu"),
+            "and what was actually downloaded: {wrong}"
+        );
+        assert!(
+            !wrong.contains("not a `sha256sum` line"),
+            "a sidecar that parsed must not be reported as unreadable: {wrong}"
+        );
     }
 
     #[test]

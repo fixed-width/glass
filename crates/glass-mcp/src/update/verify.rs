@@ -200,9 +200,12 @@ mod tests {
             // so this one is the only case that exercises the hex-digit check rather than the
             // length check.
             "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg  glass-mcp-v1.4.0-x86_64-linux-gnu\n",
-            // 65 hex chars — the only over-length case here. Every other input in this list is
-            // either too short or not hex, so all of them are still rejected if `len() != 64` is
-            // weakened to `len() < 64`; this is the one that stops that weakening passing.
+            // 65 hex chars — the only over-length case here, and the only one that reaches the
+            // length check with too MANY characters. Of the rest: the empty and blank inputs stop
+            // at the "no non-empty line" guard, the bare 64-char digest has no filename and so
+            // stops at `split_once`, and the others are too short or not hex. Every one of them is
+            // therefore still rejected if `len() != 64` is weakened to `len() < 64` — this input
+            // is what stops that weakening passing.
             "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08a  glass-mcp-v1.4.0-x86_64-linux-gnu\n",
         ] {
             assert!(

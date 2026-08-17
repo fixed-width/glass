@@ -86,6 +86,25 @@ fn the_line<'a>(release_yml: &'a str, what: &str, pred: impl Fn(&str) -> bool) -
     first
 }
 
+/// Is `needle` one of `line`'s whole tokens?
+///
+/// Anchoring to the right line is only half the job: every glob this test looks for is a *prefix*
+/// of a longer token that legitimately sits on the same line — `dist/*.exe` of
+/// `dist/*.exe.sha256`, `dist/glass-mcp-*` of `dist/glass-mcp-*.tar.gz`, `glass-mcp-*` of
+/// `glass-mcp-*.tar.gz`. A `contains` check is therefore satisfied by the *narrowed* form, which
+/// is exactly the edit that stops the bare binaries being published and 404s every
+/// `glass-mcp update`. Comparing whole tokens is what makes the narrowing fail.
+///
+/// Tokens are split on whitespace, `,`, and parentheses — the last because PowerShell writes
+/// `(Get-ChildItem …).FullName`, so the final path would otherwise carry `).FullName` with it.
+/// Quotes, `;` and braces are trimmed off each end for the same reason: `sh` writes
+/// `for f in glass-mcp-*;`.
+fn has_token(line: &str, needle: &str) -> bool {
+    line.split([' ', '\t', ',', '(', ')'])
+        .map(|t| t.trim_matches(['"', '\'', ';', '`', '{', '}']))
+        .any(|t| t == needle)
+}
+
 /// The bare, uncompressed binary assets `glass-mcp update` downloads. The archives stay — these
 /// are additional — so this is a second, independent direction of the same doc↔workflow guard:
 /// documenting an updater asset the workflow never builds would leave `update` fetching a 404.
@@ -102,9 +121,12 @@ fn the_bare_binary_assets_are_documented_and_produced() {
     // is the set of lines that produce, hash and upload the bare files.
 
     // Linux: produced by copying the staged binary flat beside the archive...
+    let linux_copy = the_line(&release_yml, "the bare linux binary copy", |l| {
+        l.starts_with(r#"cp "$dir/glass-mcp""#)
+    });
     assert!(
-        release_yml.contains(r#"cp "$dir/glass-mcp" "dist/$name""#),
-        "release.yml no longer copies the bare linux binary into dist/"
+        has_token(linux_copy, "dist/$name"),
+        "the bare linux binary no longer lands at dist/<asset name>: {linux_copy}"
     );
     // ...hashed by a loop whose glob covers it. Narrowed back to `*.tar.gz` and the bare assets
     // ship with no `.sha256`, which is a 404 at `update`'s sidecar fetch.
@@ -112,7 +134,7 @@ fn the_bare_binary_assets_are_documented_and_produced() {
         l.contains("sha256sum")
     });
     assert!(
-        linux_sidecars.contains("for f in glass-mcp-*"),
+        has_token(linux_sidecars, "glass-mcp-*"),
         "the linux checksum loop no longer covers the bare binaries: {linux_sidecars}"
     );
     // ...and uploaded by a glob wide enough to carry it.
@@ -120,20 +142,31 @@ fn the_bare_binary_assets_are_documented_and_produced() {
         l.contains("gh release upload") && l.contains("$TAG") && !l.contains("dmg")
     });
     assert!(
-        linux_upload.contains("dist/glass-mcp-*"),
+        has_token(linux_upload, "dist/glass-mcp-*"),
         "the linux upload no longer publishes the bare binaries: {linux_upload}"
     );
 
     // Windows: the same three steps, in PowerShell.
+    //
+    // Two lines copy the built .exe — one into the archive's staging directory
+    // (`dist/$name/glass-mcp.exe`), one flat beside it (`dist/$name.exe`) — so this cannot anchor
+    // on a single line the way the others do. It asserts instead that among all of those copies,
+    // one lands flat. Whole-token comparison is what tells the two destinations apart; a
+    // `contains` would let the staging copy satisfy the check for the flat one.
+    let exe_copies: Vec<&str> = release_yml
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("Copy-Item target/release/glass-mcp.exe"))
+        .collect();
     assert!(
-        release_yml.contains(r#"Copy-Item target/release/glass-mcp.exe "dist/$name.exe""#),
-        "release.yml no longer copies the bare glass-mcp.exe into dist/"
+        exe_copies.iter().any(|l| has_token(l, "dist/$name.exe")),
+        "nothing copies the bare .exe flat into dist/ — the copies are {exe_copies:?}"
     );
     let windows_sidecars = the_line(&release_yml, "the windows Get-FileHash loop", |l| {
         l.starts_with("foreach ($f in Get-ChildItem")
     });
     assert!(
-        windows_sidecars.contains("dist/*.exe"),
+        has_token(windows_sidecars, "dist/*.exe"),
         "the windows checksum loop no longer covers the bare .exe: {windows_sidecars}"
     );
     // The windows upload passes `$files`, so the assignment is what decides the asset set.
@@ -142,7 +175,7 @@ fn the_bare_binary_assets_are_documented_and_produced() {
     });
     for needle in ["dist/*.exe", "dist/*.exe.sha256"] {
         assert!(
-            windows_upload.contains(needle),
+            has_token(windows_upload, needle),
             "the windows upload no longer publishes {needle}: {windows_upload}"
         );
     }
@@ -150,7 +183,7 @@ fn the_bare_binary_assets_are_documented_and_produced() {
         l.contains("gh release upload") && l.contains("GITHUB_REF_NAME")
     });
     assert!(
-        windows_gh.contains("$files"),
+        has_token(windows_gh, "$files"),
         "the windows upload no longer uses the file list above: {windows_gh}"
     );
 
