@@ -91,6 +91,26 @@ pub enum Command {
         #[arg(long)]
         addr: Option<String>,
     },
+    /// Update this binary to the latest release. Verifies the downloaded asset's checksum, and its
+    /// build provenance when the GitHub CLI is installed.
+    #[cfg(feature = "self-update")]
+    Update {
+        /// Report the current and latest version without changing anything.
+        #[arg(long)]
+        check: bool,
+        /// Skip the confirmation prompt. Does not skip any verification.
+        #[arg(long)]
+        yes: bool,
+        /// Proceed even if `gh attestation verify` fails.
+        #[arg(long)]
+        skip_attestation: bool,
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+        /// Colorize human output: auto (only a terminal), always, or never. Ignored with --json.
+        #[arg(long, value_enum, default_value_t, value_name = "WHEN")]
+        color: crate::color::ColorChoice,
+    },
     /// Remove the login LaunchAgent so glass stops starting at login (macOS). Then drag
     /// GlassMcp.app to the Trash to remove the app itself.
     Uninstall,
@@ -313,6 +333,47 @@ mod tests {
     fn uninstall_subcommand_parses() {
         let cli = Cli::try_parse_from(["glass-mcp", "uninstall"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Uninstall)));
+    }
+
+    #[cfg(feature = "self-update")]
+    #[test]
+    fn update_flags_parse_and_default_to_false() {
+        let cli = Cli::try_parse_from(["glass-mcp", "update"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                check: false,
+                yes: false,
+                skip_attestation: false,
+                json: false,
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from(["glass-mcp", "update", "--check", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                check: true,
+                json: true,
+                ..
+            })
+        ));
+    }
+
+    /// `--skip-attestation` is kebab-case and is NOT implied by `--yes`.
+    #[cfg(feature = "self-update")]
+    #[test]
+    fn yes_does_not_imply_skipping_attestation() {
+        let cli = Cli::try_parse_from(["glass-mcp", "update", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                yes: true,
+                skip_attestation: false,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["glass-mcp", "update", "--skip-attestation"]).is_ok());
     }
 
     #[test]

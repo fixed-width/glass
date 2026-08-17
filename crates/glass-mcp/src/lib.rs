@@ -30,6 +30,8 @@ pub(crate) mod shutdown;
 pub(crate) mod status;
 mod tools;
 mod untrusted;
+#[cfg(feature = "self-update")]
+pub(crate) mod update;
 
 use anyhow::Context;
 use glass_core::{Backend, BaselineStore, Glass, GlassError, Platform, Result};
@@ -197,6 +199,20 @@ pub fn run_env(json: bool, color: color::ColorChoice) -> ! {
 /// can't name a `pub(crate)` item directly.
 pub fn run_status(addr: Option<&str>) -> anyhow::Result<()> {
     status::run(addr)
+}
+
+/// `glass-mcp update [--check] [--yes] [--skip-attestation] [--json] [--color WHEN]`: replace this
+/// binary with the latest release. A thin `pub` forwarder to the crate-private module, the same
+/// shape as [`run_status`] over `status`.
+#[cfg(feature = "self-update")]
+pub async fn run_update(
+    check: bool,
+    yes: bool,
+    skip_attestation: bool,
+    json: bool,
+    color: color::ColorChoice,
+) -> anyhow::Result<()> {
+    update::run_cli(check, yes, skip_attestation, json, color).await
 }
 
 /// Run the `uninstall` subcommand: stop + remove the login LaunchAgent, then print the "drag

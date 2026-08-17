@@ -27,10 +27,18 @@ If `glass-mcp` is not found afterwards, start a new login shell — many distrib
 yourself.
 
 Use the `…-x86_64-linux-musl.tar.gz` build instead if you need a fully static binary with no glibc
-dependency — Alpine, or any musl distro. If you are on an architecture with no published asset (an
-aarch64 host, say), [build from source](build-from-source.md) instead; that is also the path if you
-want to hack on glass. The full asset list is in
+dependency — Alpine, or any musl distro. It still needs the distro's CA certificates installed
+(`apk add ca-certificates` on Alpine) for `glass-mcp update`: HTTPS verification goes through the
+system trust store, with no built-in certificate bundle to fall back on, so on a bare install
+`update` cannot reach the release endpoint. `update` is the only thing in glass that makes an
+outbound HTTPS request; everything else works without it.
+
+If you are on an architecture with no published asset (an aarch64 host, say),
+[build from source](build-from-source.md) instead; that is also the path if you want to hack on
+glass. The full asset list is in
 [reference/platforms.md](../reference/platforms.md#release-artifacts).
+
+Subsequent upgrades can use `glass-mcp update` instead of repeating these steps by hand.
 
 ## Prerequisites
 

@@ -86,6 +86,8 @@ remove glass entirely.
   take effect — is explained in [the permission model](../explanation/macos-permissions.md).
 - **Sandboxing:** launched apps run under Seatbelt by default; the profile and the clipboard-isolation
   behaviour are in [explanation/containment.md](../explanation/containment.md).
+- **Checking for updates:** `glass-mcp update --check` reports whether a newer release exists, but
+  upgrading itself means downloading and opening a newer `.dmg` — there is no in-place update on macOS.
 - **Building from source** (contributors, unreleased checkouts): [build-from-source.md](build-from-source.md).
 - **Android** from a macOS host: [setup-android.md](setup-android.md).
 - **iOS** (the Simulator, on this macOS host): [setup-ios.md](setup-ios.md).
