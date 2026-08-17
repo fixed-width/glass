@@ -60,6 +60,44 @@ List every `GLASS_*` variable with its purpose, default, and current value (see
 Report whether glass is running and at what endpoint (reads `/healthz`). Primarily used with the
 macOS menu-bar LaunchAgent — see [how-to/setup-macos.md](../how-to/setup-macos.md).
 
+## `update`
+
+Update this binary to the latest published release: resolve the latest tag, download the asset for
+this platform, verify its checksum, and replace this binary in place. Verifies build provenance with
+the GitHub CLI (`gh attestation verify`) when it is installed; if `gh` is not on `PATH` the update
+still proceeds, but says so.
+
+- `--check` — report the current and latest version without changing anything. Refuses nothing:
+  unlike a real update, `--check` works on every platform, including macOS and a from-source build.
+- `--yes` — skip the confirmation prompt. Does **not** skip any verification (checksum, provenance,
+  or the post-download smoke check) — pair it with `--skip-attestation` explicitly if that is also
+  wanted.
+- `--skip-attestation` — proceed even if `gh attestation verify` fails or `gh` is unavailable.
+- `--json` — machine-readable output.
+- `--color <when>` — `auto` (default; color only when writing to a terminal), `always`, or `never`.
+  Ignored with `--json`. A non-empty `NO_COLOR`, or `TERM=dumb`, suppresses `auto`.
+
+Exit code: `0` for a successful update, for "already up to date", and for every `--check` run
+(whether or not a newer release exists) — a script should read `--json`'s `update_available` field,
+not the exit code, to learn whether news exists. `1` for a refusal or any other error.
+
+`update` refuses to run rather than guess in several cases:
+- **A from-source build.** A binary built locally (its version carries a `git describe` suffix)
+  is not something a release binary should silently replace — rebuild it with `git pull && cargo
+  build --release` instead.
+- **macOS.** glass installs there as `GlassMcp.app`, not a bare binary — download the latest `.dmg`
+  instead (see [how-to/setup-macos.md](../how-to/setup-macos.md)).
+- **An unsupported architecture**, where no release asset is published — build from source instead
+  (see [how-to/build-from-source.md](../how-to/build-from-source.md)).
+- **An install directory that is not writable** by the current user. `update` never escalates
+  privileges to get around this (no `sudo` re-exec) — it prints the release URL so you can download
+  and move the binary into place by hand.
+- **A non-interactive run without `--yes`.** With no terminal to confirm on and no `--yes`, `update`
+  declines rather than assuming consent.
+
+If a `glass-mcp serve --http` process is already running, it keeps serving the previous build in
+memory until it is restarted — `update` replaces the file on disk, not the running process.
+
 ## `uninstall`
 
 Stop glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does

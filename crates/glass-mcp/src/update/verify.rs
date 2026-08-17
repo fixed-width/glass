@@ -183,6 +183,9 @@ mod tests {
             // so this one is the only case that exercises the hex-digit check rather than the
             // length check.
             "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg  glass-mcp-v1.4.0-x86_64-linux-gnu\n",
+            // 65 hex chars. Without an over-length case, weakening `len() != 64` to `len() < 64`
+            // survives the whole suite — and this crate is mutation-gated in CI.
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08a  glass-mcp-v1.4.0-x86_64-linux-gnu\n",
         ] {
             assert!(
                 parse_sidecar(text, ASSET).is_err(),

@@ -19,6 +19,14 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Added
+- `glass-mcp update` updates the binary in place: it downloads the latest release for your
+  platform, verifies its checksum and (when the GitHub CLI is installed) its build provenance,
+  and swaps it in. `--check` reports the current and latest version without changing anything;
+  `--yes` skips the confirmation prompt. It never asks for elevated privileges — if the install
+  directory isn't writable it prints the release URL instead so you can move the binary into
+  place yourself.
+
 ## [1.3.0] - 2026-08-11
 
 ### Added

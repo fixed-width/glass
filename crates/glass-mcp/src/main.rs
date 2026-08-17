@@ -126,6 +126,14 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::Status { addr }) => run_status(addr.as_deref()),
+        #[cfg(feature = "self-update")]
+        Some(Command::Update {
+            check,
+            yes,
+            skip_attestation,
+            json,
+            color,
+        }) => glass_mcp::run_update(check, yes, skip_attestation, json, color).await,
         Some(Command::Uninstall) => run_uninstall(),
         Some(Command::DebugGrants) => run_debug_grants(),
         Some(Command::DebugChecklist) => run_debug_checklist(),
