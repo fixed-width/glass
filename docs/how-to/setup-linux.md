@@ -32,6 +32,8 @@ aarch64 host, say), [build from source](build-from-source.md) instead; that is a
 want to hack on glass. The full asset list is in
 [reference/platforms.md](../reference/platforms.md#release-artifacts).
 
+Subsequent upgrades can use `glass-mcp update` instead of repeating these steps by hand.
+
 ## Prerequisites
 
 glass needs a display dependency for your backend and a containment runtime, both covered below.

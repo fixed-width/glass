@@ -77,29 +77,35 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          mkdir -p dist
+          mkdir -p dist stage
           pkg() { # <built-binary> <readme> <suffix>
             local name="glass-mcp-${tag}-$3" dir
-            dir="dist/$name"
+            dir="stage/$name"
             mkdir -p "$dir"
             install -m0755 "$1" "$dir/glass-mcp"
             strip "$dir/glass-mcp"
             cp "packaging/$2" "$dir/README.md"
-            tar -C dist -czf "dist/$name.tar.gz" "$name"
+            tar -C stage -czf "dist/$name.tar.gz" "$name"
+            # The bare, uncompressed binary `glass-mcp update` downloads. Same stripped file the
+            # archive carries, published flat so the updater needs no archive-extraction code.
+            cp "$dir/glass-mcp" "dist/$name"
           }
           pkg target/release/glass-mcp                          README-gnu.md  x86_64-linux-gnu
           pkg target/x86_64-unknown-linux-musl/release/glass-mcp README-musl.md x86_64-linux-musl
-          ( cd dist && for f in *.tar.gz; do sha256sum "$f" > "$f.sha256"; done )
+          ( cd dist && for f in glass-mcp-*; do case "$f" in *.sha256) ;; *) sha256sum "$f" > "$f.sha256";; esac; done )
       - name: Attest build provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: 'dist/*.tar.gz'
+          subject-path: |
+            dist/*.tar.gz
+            dist/glass-mcp-*-x86_64-linux-gnu
+            dist/glass-mcp-*-x86_64-linux-musl
       - name: Upload to draft release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+        run: gh release upload "$TAG" dist/glass-mcp-* --clobber
 
   windows:
     needs: create-release
@@ -170,19 +176,26 @@ jobs:
           Copy-Item target/release/glass-mcp.exe "dist/$name/glass-mcp.exe"
           Copy-Item packaging/README-windows.md  "dist/$name/README.md"
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -Force
-          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name.zip" | Out-File "dist/$name.zip.sha256" -Encoding ascii
+          # The bare, signed .exe `glass-mcp update` downloads — the same signed binary the
+          # archive carries, published flat so the updater needs no archive-extraction code.
+          Copy-Item target/release/glass-mcp.exe "dist/$name.exe"
+          foreach ($f in Get-ChildItem dist/*.zip, dist/*.exe) {
+            $hash = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($f.Name)" | Out-File "$($f.FullName).sha256" -Encoding ascii
+          }
       - name: Attest build provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: 'dist/*.zip'
+          subject-path: |
+            dist/*.zip
+            dist/*.exe
       - name: Upload to draft release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          $files = (Get-ChildItem dist/*.zip, dist/*.zip.sha256).FullName
+          $files = (Get-ChildItem dist/*.zip, dist/*.zip.sha256, dist/*.exe, dist/*.exe.sha256).FullName
           gh release upload $env:GITHUB_REF_NAME $files --clobber
 
   macos:

@@ -53,3 +53,37 @@ fn documented_release_suffixes_are_produced_by_the_workflow() {
         );
     }
 }
+
+/// The bare, uncompressed binary assets `glass-mcp update` downloads. The archives stay — these
+/// are additional — so this is a second, independent direction of the same doc↔workflow guard:
+/// documenting an updater asset the workflow never builds would leave `update` fetching a 404.
+#[test]
+fn the_bare_binary_assets_are_documented_and_produced() {
+    let root = repo_root();
+    let platforms = std::fs::read_to_string(root.join("docs/reference/platforms.md"))
+        .expect("read docs/reference/platforms.md");
+    let release_yml = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+        .expect("read .github/workflows/release.yml");
+
+    // Assert on text the workflow literally contains. The per-platform suffixes never appear
+    // inside a full asset name there — `pkg` takes the suffix as an argument and builds the name
+    // at run time — so this checks the lines that emit and upload the bare files instead.
+    for needle in [
+        // Linux: the bare copy out of the staging dir, and an upload glob wide enough to carry it.
+        r#"cp "$dir/glass-mcp" "dist/$name""#,
+        r#"dist/glass-mcp-*"#,
+        // Windows: the bare copy of the signed .exe, and its upload glob.
+        r#"Copy-Item target/release/glass-mcp.exe "dist/$name.exe""#,
+        r#"dist/*.exe"#,
+    ] {
+        assert!(
+            release_yml.contains(needle),
+            "release.yml no longer contains {needle:?} — `glass-mcp update` downloads the bare \
+             binary assets those lines publish"
+        );
+    }
+    assert!(
+        platforms.contains("uncompressed"),
+        "platforms.md must document the bare binary assets as what `update` fetches"
+    );
+}

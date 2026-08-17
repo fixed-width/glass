@@ -54,9 +54,22 @@ Every tagged release attaches these assets, where `<tag>` is the release tag (e.
 | Linux x86-64 (static) | `glass-mcp-<tag>-x86_64-linux-musl.tar.gz` — no glibc dependency (Alpine and other musl distros) |
 | Windows x86-64 | `glass-mcp-<tag>-x86_64-windows.zip` |
 
-Each asset is accompanied by a `.sha256` checksum file, and every release carries Sigstore build
-provenance attestations. No aarch64 Linux asset is published; that architecture is built from source
-(see [how-to/build-from-source.md](../how-to/build-from-source.md)).
+`glass-mcp update` fetches a second, **uncompressed** kind of asset instead of an archive — the same
+binary the matching archive carries, published flat with no wrapping `.tar.gz`/`.zip` so the updater
+needs no archive-extraction code:
+
+| Platform | Uncompressed asset |
+|---|---|
+| Linux x86-64 (glibc) | the bare binary; checksum sidecar `glass-mcp-<tag>-x86_64-linux-gnu.sha256` |
+| Linux x86-64 (static) | the bare binary; checksum sidecar `glass-mcp-<tag>-x86_64-linux-musl.sha256` |
+| Windows x86-64 | the bare, Authenticode-signed `.exe`; checksum sidecar `glass-mcp-<tag>-x86_64-windows.exe.sha256` |
+
+No uncompressed macOS asset is published — upgrading there means the `.dmg` (see
+[setup-macos.md](../how-to/setup-macos.md)).
+
+Every asset, compressed or bare, is accompanied by a `.sha256` checksum file and carries a Sigstore
+build provenance attestation. No aarch64 Linux asset is published; that architecture is built from
+source (see [how-to/build-from-source.md](../how-to/build-from-source.md)).
 
 These asset names are **stable across the 1.x series** — an installer or script can depend on the
 `glass-mcp-<tag>-<platform>.<ext>` pattern and the per-platform suffixes above. See
