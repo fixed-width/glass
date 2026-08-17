@@ -72,7 +72,7 @@ still proceeds, but says so.
 - `--yes` — skip the confirmation prompt. Does **not** skip any verification (checksum, provenance,
   or the post-download smoke check) — pair it with `--skip-attestation` explicitly if that is also
   wanted.
-- `--skip-attestation` — proceed even if `gh attestation verify` fails or `gh` is unavailable.
+- `--skip-attestation` — proceed even if `gh attestation verify` fails.
 - `--json` — machine-readable output.
 - `--color <when>` — `auto` (default; color only when writing to a terminal), `always`, or `never`.
   Ignored with `--json`. A non-empty `NO_COLOR`, or `TERM=dumb`, suppresses `auto`.

@@ -48,7 +48,10 @@ impl Options {
             skip_attestation,
             json,
             color,
-            interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+            // `--json` is a machine-facing mode: it must never block on a prompt, and its output
+            // must never share stdout with the three human lines `confirm` prints. Consent under
+            // `--json` comes from `--yes` alone.
+            interactive: !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
             smoke: true,
         }
     }
@@ -99,13 +102,25 @@ pub(crate) struct Report {
     /// Whether the apply path can run on this target at all. Independent of `outcome` because
     /// `--check` reports it on macOS without refusing.
     pub(crate) supported: bool,
+    /// Whether `current` parsed as a released version at all. `false` for a from-source build —
+    /// distinct from `update_available`, which is also `false` there but for a reason a renderer
+    /// must not conflate with "you are up to date": one is "unknown", the other is a fact.
+    pub(crate) current_comparable: bool,
+    /// Whether a `glass-mcp serve --http` process is currently answering `/healthz`. Only ever set
+    /// after a successful update (by `run_cli`, which is the only caller that can actually probe
+    /// the real process) — carried on the report rather than printed as a side note so `--json`
+    /// stays the one, complete, parseable object.
+    pub(crate) running_server: bool,
 }
 
-/// The `attestation` field of the JSON output. `Skipped` is `--skip-attestation`; `Unavailable`
-/// is `gh` not being installed. Keeping them distinct is the point — "we did not check" and "you
-/// told us not to" are different things for a reader auditing an update.
+/// The `attestation` field of the JSON output. `NotChecked` is the initial state — reached only by
+/// `--check` and every refusal before step 8b, none of which touch provenance at all. `Skipped` is
+/// `--skip-attestation`; `Unavailable` is `gh` not being installed. Keeping these distinct is the
+/// point — "we did not check", "you told us not to", and "we tried and couldn't" are different
+/// things for a reader auditing an update.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AttestationStatus {
+    NotChecked,
     Verified,
     Unavailable,
     Skipped,
@@ -132,6 +147,7 @@ pub(crate) async fn run(
     current: &str,
     exe: &Path,
 ) -> anyhow::Result<Report> {
+    let current_version = version::Version::parse_released(current);
     let mut report = Report {
         outcome: Outcome::Checked,
         current: current.to_string(),
@@ -140,10 +156,11 @@ pub(crate) async fn run(
         asset: None,
         url: None,
         install_path: exe.to_path_buf(),
-        attestation: AttestationStatus::Skipped,
+        attestation: AttestationStatus::NotChecked,
         supported: !cfg!(target_os = "macos") && release::asset_suffix().is_some(),
+        current_comparable: current_version.is_some(),
+        running_server: false,
     };
-    let current_version = version::Version::parse_released(current);
 
     // 1. From-source, before any network request. A `--check` still reports.
     if !opts.check && current_version.is_none() {
@@ -161,7 +178,9 @@ pub(crate) async fn run(
 
     // 3. Resolve the latest release. First network call.
     let tag = source.latest_tag().await?;
-    let latest = version::Version::parse_released(tag.trim_start_matches('v'))
+    // `strip_prefix`, not `trim_start_matches`: the latter strips repeated leading `v`s, which
+    // would silently accept a malformed tag `build.rs`'s own `glass_version()` would not.
+    let latest = version::Version::parse_released(tag.strip_prefix('v').unwrap_or(&tag))
         .ok_or_else(|| anyhow::anyhow!("the latest release tag {tag:?} is not a version"))?;
     report.latest = Some(latest.to_string());
     report.update_available = current_version.as_ref().is_some_and(|c| latest > *c);
@@ -187,14 +206,18 @@ pub(crate) async fn run(
     //    by inspecting permissions — the same act, so there is no window between the check and
     //    the use, and no way for the two to disagree.
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
-    swap::sweep_old(exe);
     let temp = dir.join(format!(".glass-mcp.update-{:016x}", rand::random::<u64>()));
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .is_err()
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // 0755 at creation, not left for `swap` (step 9) to set. The smoke check (8c) EXECUTES
+        // this file, and `swap` runs after it — a 0644 temp makes every real update fail at the
+        // gate that exists to prove the binary runs, with `execve` returning EACCES.
+        open.mode(0o755);
+    }
+    if open.open(&temp).is_err() {
         return Ok(report.refused(Refusal::NotWritable(dir.to_path_buf())));
     }
     // From here on every exit must remove `temp`: a refusal that leaves a stray half-download
@@ -212,9 +235,16 @@ pub(crate) async fn run(
     if !opts.yes && !opts.interactive {
         return discard(report, Refusal::NeedsConsent);
     }
-    if !opts.yes && !confirm(&current_version.to_string(), &latest.to_string(), &url)? {
+    if !opts.yes
+        && !confirm(&current_version.to_string(), &latest.to_string(), &url).map_err(abort)?
+    {
         return discard(report, Refusal::NeedsConsent);
     }
+
+    // Sweep any binary a previous update left displaced (Windows only, best-effort) now that we
+    // are committed to proceeding — not at step 6, where a refusal must not have already mutated
+    // the filesystem.
+    swap::sweep_old(exe);
 
     // 8a. Download, hashing in one pass.
     let got = source.download_to(&url, &temp).await.map_err(abort)?;
@@ -265,7 +295,8 @@ fn confirm(current: &str, latest: &str, url: &str) -> anyhow::Result<bool> {
     std::io::stdout().flush()?;
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+    let line = line.trim();
+    Ok(line.eq_ignore_ascii_case("y") || line.eq_ignore_ascii_case("yes"))
 }
 
 /// Resolve what `run` needs from the process itself, then render. Split from [`run`] so the flow
@@ -285,27 +316,19 @@ pub(crate) async fn run_cli(
         .context("could not resolve this binary's path")?;
     let opts = Options::from_flags(check, yes, skip_attestation, json, color);
     let source = ReleaseSource::github();
-    let report = run(opts.clone(), &source, crate::VERSION, &exe).await?;
-    print!("{}", render(&report, &opts));
+    let mut report = run(opts.clone(), &source, crate::VERSION, &exe).await?;
+    // A running `serve --http` keeps its own inode, so it goes on serving the OLD build until it
+    // is restarted — which reads to a connected agent as "the update did nothing". Carried on the
+    // report (rather than printed separately) so `--json` stays one parseable object; reusing the
+    // same loopback probe `status` uses. Only worth checking after a real swap.
     if matches!(report.outcome, Outcome::Updated) {
-        report_running_server();
+        report.running_server = crate::setup::fetch_health("127.0.0.1:7300").is_some();
     }
+    print!("{}", render(&report, &opts));
     if matches!(report.outcome, Outcome::Refused(_)) {
         std::process::exit(1);
     }
     Ok(())
-}
-
-/// A running `serve --http` keeps its own inode, so it goes on serving the OLD build until it is
-/// restarted — which reads to a connected agent as "the update did nothing". Only says so when a
-/// server actually answers, reusing the same loopback probe `status` uses.
-fn report_running_server() {
-    if crate::setup::fetch_health("127.0.0.1:7300").is_some() {
-        println!(
-            "note: a glass server is running on 127.0.0.1:7300 and keeps the previous build \
-             until it is restarted."
-        );
-    }
 }
 
 /// Human text, or the JSON object under `--json`. Pure in `report` and `opts`, so the whole
@@ -327,11 +350,18 @@ fn render(report: &Report, opts: &Options) -> String {
                 "This install is not replaced in place — see the setup guide for your platform."
             }
         ),
+        // A from-source build's version is not comparable, so `update_available` is always
+        // `false` here regardless of whether a newer release exists — printing "is the latest
+        // release" (the arm below) would be a claim we cannot back. Say what we actually know.
+        Outcome::Checked if !report.current_comparable => format!(
+            "glass-mcp {} is a from-source build; the latest release is {}.\n",
+            report.current, latest
+        ),
         Outcome::Checked | Outcome::UpToDate => {
             format!("glass-mcp {} is the latest release.\n", report.current)
         }
         Outcome::Updated => format!(
-            "{} glass-mcp {} → {}\n{}",
+            "{} glass-mcp {} → {}\n{}{}",
             p.paint(p.ok, "updated"),
             report.current,
             latest,
@@ -351,8 +381,16 @@ fn render(report: &Report, opts: &Options) -> String {
                         "build provenance NOT verified (--skip-attestation)."
                     )
                 ),
-                // Unreachable: a failed attestation refuses rather than updating.
-                AttestationStatus::Failed => String::new(),
+                // Unreachable: 8b always sets Verified/Unavailable/Skipped/Failed before an
+                // Outcome::Updated can be produced, and a Failed attestation refuses rather than
+                // updating — so neither NotChecked nor Failed can appear here.
+                AttestationStatus::NotChecked | AttestationStatus::Failed => String::new(),
+            },
+            if report.running_server {
+                "note: a glass server is running on 127.0.0.1:7300 and keeps the previous build \
+                 until it is restarted.\n"
+            } else {
+                ""
             }
         ),
         Outcome::Refused(why) => format!(
@@ -431,11 +469,13 @@ fn render_json(report: &Report) -> String {
         "url": report.url,
         "install_path": report.install_path.display().to_string(),
         "attestation": match report.attestation {
+            AttestationStatus::NotChecked => "not_checked",
             AttestationStatus::Verified => "verified",
             AttestationStatus::Unavailable => "unavailable",
             AttestationStatus::Skipped => "skipped",
             AttestationStatus::Failed => "failed",
         },
+        "running_server": report.running_server,
     });
     if let Some(reason) = reason {
         obj["reason"] = serde_json::Value::String(reason);
@@ -544,6 +584,35 @@ mod tests {
         assert_eq!(std::fs::read(&exe).unwrap(), BODY);
     }
 
+    /// The apply path with the smoke gate ON, against a body that is actually runnable.
+    ///
+    /// Every other apply-path test sets `smoke: false`, so this is the only one that exercises
+    /// step 8c — and 8c executes the temp file, which means it also pins the file's MODE. With the
+    /// temp created 0644 this fails with EACCES, which is exactly what shipped before this test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_smoke_gate_runs_the_downloaded_binary() {
+        if !apply_path_exists() {
+            return;
+        }
+        const SCRIPT: &[u8] = b"#!/bin/sh\necho glass-mcp 1.4.0\n";
+        const SCRIPT_SHA: &str = "4605fe04920b0a38e4b11a2b08453755ecae4319cafb5069a19253d0a1ce0cc2";
+        let dir = tempfile::tempdir().unwrap();
+        let exe = install(dir.path(), b"old");
+        let asset = release::asset_name("v1.4.0").expect("supported target");
+        let server = FakeRelease::start(
+            "v1.4.0",
+            &asset,
+            SCRIPT,
+            &format!("{SCRIPT_SHA}  {asset}\n"),
+        );
+        let src = ReleaseSource::with_base(server.base());
+        // opts() already has smoke: true — that is the point of this test.
+        let out = run(opts(), &src, "1.3.0", &exe).await.unwrap().outcome;
+        assert!(matches!(out, Outcome::Updated), "{out:?}");
+        assert_eq!(std::fs::read(&exe).unwrap(), SCRIPT);
+    }
+
     /// The assertion that matters is the second one: "it errored" says nothing about what it
     /// left behind.
     #[tokio::test]
@@ -633,25 +702,39 @@ mod tests {
         assert_eq!(std::fs::read(&exe).unwrap(), b"old");
     }
 
-    /// `--check` reports on every platform and refuses nothing, including on a from-source build.
+    /// `--check` reports on every platform and refuses nothing, including on a from-source build —
+    /// so, unlike the apply-path tests, this one carries no `apply_path_exists()` guard and no
+    /// `release::asset_name(...)` (which would return `None` and skip the test on macOS, exactly
+    /// the platform this contract most needs covering). The asset name is a literal because
+    /// `--check` never reaches step 5 — it resolves only the tag, never an asset — so the fake
+    /// server's asset/sidecar routes are never hit.
     #[tokio::test]
     async fn check_reports_on_a_from_source_build() {
-        if !apply_path_exists() {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let exe = install(dir.path(), b"old");
-        let asset = release::asset_name("v1.4.0").expect("supported target");
-        let server = FakeRelease::start("v1.4.0", &asset, BODY, &sidecar(&asset));
+        let asset = "glass-mcp-v1.4.0-x86_64-linux-gnu";
+        let server = FakeRelease::start("v1.4.0", asset, BODY, &sidecar(asset));
         let src = ReleaseSource::with_base(server.base());
         let mut o = opts();
         o.check = true;
-        let out = run(o, &src, "1.3.0-5-g563feea", &exe)
-            .await
-            .unwrap()
-            .outcome;
-        assert!(matches!(out, Outcome::Checked), "{out:?}");
+        let report = run(o, &src, "1.3.0-5-g563feea", &exe).await.unwrap();
+        assert!(
+            matches!(report.outcome, Outcome::Checked),
+            "{:?}",
+            report.outcome
+        );
         assert_eq!(std::fs::read(&exe).unwrap(), b"old");
+        // The outcome alone does not distinguish "up to date" from "we don't know" — assert the
+        // actual rendered claim, not just that nothing was refused.
+        let human = render(&report, &plain(false));
+        assert!(
+            human.contains("from-source build"),
+            "must not claim to be the latest release: {human}"
+        );
+        assert!(
+            human.contains("1.4.0"),
+            "must name the real latest release: {human}"
+        );
     }
 
     fn report_fixture() -> Report {
@@ -665,6 +748,8 @@ mod tests {
             install_path: std::path::PathBuf::from("/opt/bin/glass-mcp"),
             attestation: AttestationStatus::Verified,
             supported: true,
+            current_comparable: true,
+            running_server: false,
         }
     }
 
@@ -687,6 +772,7 @@ mod tests {
         assert_eq!(v["supported"], true);
         assert_eq!(v["attestation"], "verified");
         assert_eq!(v["install_path"], "/opt/bin/glass-mcp");
+        assert_eq!(v["running_server"], false);
         assert!(v.get("reason").is_none(), "reason is refusal-only");
     }
 
