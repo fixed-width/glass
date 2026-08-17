@@ -315,10 +315,25 @@ pub(crate) async fn run(
     swap::swap(&temp, exe).with_context(|| {
         format!(
             "the verified new binary is still at {} — move it into place by hand",
-            temp.display()
+            for_display(&temp)
         )
     })?;
     Ok(report.finished(Outcome::Updated))
+}
+
+/// A path as a user should see it. `canonicalize` yields Windows extended-length paths
+/// (`\\?\C:\…`), which every filesystem call accepts but Explorer rejects — and one caller is the
+/// swap-failure message naming a binary the user has to move by hand.
+///
+/// Display only: the stripped string never goes back to the filesystem. Not `cfg(windows)`,
+/// because it is string work and stays testable on a Linux dev box.
+fn for_display(path: &Path) -> String {
+    let s = path.display().to_string();
+    // `\\?\UNC\server\share` is a UNC path; stripping the whole prefix would leave `UNC\…`.
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
 }
 
 /// Ask on the terminal. Only reached when stdin and stdout are both a tty.
@@ -468,7 +483,7 @@ fn refusal_message(why: &Refusal, report: &Report) -> String {
         Refusal::CannotStage { dir, why } => format!(
             "could not create the temporary file to download into, in {}: {why}\n  \
              Download the new binary and move it into place yourself:\n  {}",
-            dir.display(),
+            for_display(dir),
             report.url.as_deref().unwrap_or("(url unresolved)")
         ),
         Refusal::NeedsConsent => "declined, or no way to ask. Pass --yes to update without a \
@@ -523,7 +538,7 @@ fn render_json(report: &Report) -> String {
         "supported": report.supported,
         "asset": report.asset,
         "url": report.url,
-        "install_path": report.install_path.display().to_string(),
+        "install_path": for_display(&report.install_path),
         "attestation": match report.attestation {
             AttestationStatus::NotChecked => "not_checked",
             AttestationStatus::Verified => "verified",
@@ -1021,6 +1036,31 @@ mod tests {
             assert!(out.contains("updated"), "{out}");
             assert!(!out.contains("provenance"), "{out}");
         }
+    }
+
+    /// `canonicalize` hands back `\\?\C:\…` on Windows, and Explorer will not take it — which
+    /// matters most in the swap-failure message, whose whole job is a path the user can act on.
+    #[test]
+    fn display_paths_drop_the_windows_extended_length_prefix() {
+        use std::path::PathBuf;
+        assert_eq!(
+            for_display(&PathBuf::from(r"\\?\C:\Users\mpd\glass-mcp.exe")),
+            r"C:\Users\mpd\glass-mcp.exe"
+        );
+        // A UNC path must come back as a UNC path, not as `UNC\…`.
+        assert_eq!(
+            for_display(&PathBuf::from(r"\\?\UNC\server\share\glass-mcp.exe")),
+            r"\\server\share\glass-mcp.exe"
+        );
+        // No prefix: unchanged. The Unix case is the only shape this sees on the dev box.
+        assert_eq!(
+            for_display(&PathBuf::from(r"C:\Users\mpd\glass-mcp.exe")),
+            r"C:\Users\mpd\glass-mcp.exe"
+        );
+        assert_eq!(
+            for_display(&PathBuf::from("/opt/bin/glass-mcp")),
+            "/opt/bin/glass-mcp"
+        );
     }
 
     /// The two `BadSidecar` messages describe genuinely different failures — a file this cannot
