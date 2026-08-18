@@ -3,7 +3,7 @@
 //! binary from an installed one it cannot spawn.
 //!
 //! One gap against `execvp` remains: with `$PATH` unset `execvp` searches `confstr(_CS_PATH)`,
-//! while [`resolve_bin`] given no search list reports [`Resolved::Absent`].
+//! while [`resolve_bin`] given no search list reports [`Resolved::NoSearchPath`].
 //!
 //! Consumers: the X11 and Wayland backends (`glass-x11`, `glass-wayland`), the AT-SPI bus launcher
 //! and its doctor check (`glass-dbus-linux`, `glass-a11y-linux`), and the sandbox backends
@@ -66,9 +66,11 @@ pub enum Resolved {
     Found(PathBuf),
     /// A regular file is there, and this process may not execute it.
     NotExecutable(PathBuf),
-    /// Nothing to point the user at: no such path, a directory, a path that cannot be stat'd, or
-    /// — from [`resolve_bin`] — a bare name with no search list to look it up in.
+    /// Nothing to point the user at: no such path, a directory, or a path that cannot be stat'd.
     Absent,
+    /// A bare name and no `$PATH` to look it up in. Distinct from [`Resolved::Absent`] because the
+    /// tool may well be installed: what is missing is the environment glass was spawned with.
+    NoSearchPath,
 }
 
 /// Resolve a configured tool the way the child will be exec'd: a token containing `/` is an
@@ -83,8 +85,10 @@ pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Resolved {
     if bin.contains('/') {
         return resolve_path(Path::new(bin));
     }
-    let Some(path) = path else {
-        return Resolved::Absent;
+    // `PATH=` is treated as the unset case, not as the one-entry list naming the current
+    // directory that `split_paths` reads it as.
+    let Some(path) = path.filter(|p| !p.is_empty()) else {
+        return Resolved::NoSearchPath;
     };
     let mut first_non_executable = None;
     for cand in std::env::split_paths(path).map(|dir| dir.join(bin)) {
@@ -93,7 +97,9 @@ pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Resolved {
             Resolved::NotExecutable(p) => {
                 first_non_executable.get_or_insert(p);
             }
-            Resolved::Absent => {}
+            // `resolve_path` judges one path and never wants a search list, so `NoSearchPath`
+            // cannot come from it; both mean "nothing here" to the walk.
+            Resolved::Absent | Resolved::NoSearchPath => {}
         }
     }
     first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
@@ -326,9 +332,21 @@ mod tests {
         );
     }
 
+    /// glass#373: MCP clients routinely spawn glass-mcp with a stripped environment, and "not
+    /// found" then sends the user to install a tool that is already there.
     #[test]
-    fn a_bare_name_with_no_search_list_is_absent() {
-        assert_eq!(resolve_bin("Xvfb", None), Resolved::Absent);
+    fn a_bare_name_with_no_search_list_is_not_reported_as_missing() {
+        assert_eq!(resolve_bin("Xvfb", None), Resolved::NoSearchPath);
+    }
+
+    /// `PATH=` carries the same fact as an unset `PATH`, and must not be read as a one-entry list
+    /// naming the current directory — which is what `split_paths` makes of it.
+    #[test]
+    fn an_empty_search_list_is_no_search_list() {
+        assert_eq!(
+            resolve_bin("Xvfb", Some(OsStr::new(""))),
+            Resolved::NoSearchPath
+        );
     }
 
     #[test]

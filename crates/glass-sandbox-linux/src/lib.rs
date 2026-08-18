@@ -419,6 +419,11 @@ fn resolved_bwrap(bin: &str, bwrap: Resolved) -> std::result::Result<PathBuf, No
             p.display()
         ))),
         Resolved::Absent => Err(NoSandbox::Missing(format!("bubblewrap ({bin}) not found"))),
+        // Not "not found": nothing was searched, and installing bubblewrap cannot restore a
+        // `PATH`.
+        Resolved::NoSearchPath => Err(NoSandbox::Missing(format!(
+            "bubblewrap ({bin}) could not be looked up — PATH is unset in glass's environment"
+        ))),
     }
 }
 
@@ -1195,6 +1200,23 @@ mod tests {
         assert!(
             no.why().contains("bwrap") && no.why().contains("not found"),
             "actionable message: {no:?}"
+        );
+    }
+
+    /// glass#373: a stripped environment leaves nothing to look a bare `bwrap` up in, and "not
+    /// found" sends the user to install a package they already have.
+    #[test]
+    fn a_bwrap_that_could_not_be_looked_up_is_not_reported_as_missing() {
+        let Err(no) = resolved_bwrap("bwrap", Resolved::NoSearchPath) else {
+            panic!("a bwrap that never resolved must not be probed");
+        };
+        assert!(
+            no.why().contains("PATH"),
+            "the environment is what is missing: {no:?}"
+        );
+        assert!(
+            no.remedy(false).contains("GLASS_BWRAP"),
+            "an absolute path is the other way out: {no:?}"
         );
     }
 

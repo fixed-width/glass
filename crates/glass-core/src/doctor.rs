@@ -5,6 +5,9 @@
 //! present); `glass-mcp` aggregates them into a [`Diagnosis`] and drives the CLI
 //! subcommand and the `glass_doctor` MCP tool.
 
+use std::sync::mpsc;
+use std::time::Duration;
+
 use serde::Serialize;
 
 /// Outcome of a single check.
@@ -133,6 +136,67 @@ impl Check {
     pub fn with_remedy_action(mut self, action: impl Into<String>) -> Self {
         self.remedy_action = Some(action.into());
         self
+    }
+}
+
+/// Why a deep probe — doctor starting the real thing and taking it straight back down — produced
+/// no working backend.
+///
+/// Four outcomes, because they are answers about different machines: two are the backend's and
+/// two are this host's. Collapsing them is how a probe killed on the spot by a `pids` limit came
+/// to report a 24-second wait against Xvfb (glass#373).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProbeFailure {
+    /// The probe was never started — the host refused the thread or process, so nothing was
+    /// learned about the backend.
+    NotStarted(String),
+    /// The probe ran and the backend failed, carrying what failed.
+    Failed(String),
+    /// The probe was still running, and still not ready, when its budget ran out.
+    TimedOut(Duration),
+    /// The probe ended without answering: its thread unwound.
+    Vanished,
+}
+
+impl ProbeFailure {
+    /// A bounded wait on the probe thread's channel, mapped. `Disconnected` means the sender went
+    /// with a thread that unwound and arrives at once — reported as a timeout it claims a wait
+    /// nobody did.
+    pub fn from_recv(err: mpsc::RecvTimeoutError, budget: Duration) -> Self {
+        match err {
+            mpsc::RecvTimeoutError::Timeout => ProbeFailure::TimedOut(budget),
+            mpsc::RecvTimeoutError::Disconnected => ProbeFailure::Vanished,
+        }
+    }
+
+    /// The detail doctor prints, `what` naming the thing probed ("Xvfb", "headless sway").
+    pub fn detail(&self, what: &str) -> String {
+        match self {
+            ProbeFailure::NotStarted(why) => format!("could not start the {what} probe: {why}"),
+            ProbeFailure::Failed(why) => format!("{what} failed to come up: {why}"),
+            // The budget that was actually waited, passed in — a renderer holding its own copy of
+            // the constant is free to drift from the wait it describes.
+            ProbeFailure::TimedOut(budget) => {
+                format!("{what} was still not ready {budget:?} later")
+            }
+            ProbeFailure::Vanished => {
+                format!("the {what} probe ended without an answer — its thread unwound")
+            }
+        }
+    }
+
+    /// The remedy. `hint` is the backend's own advice, used only for the two outcomes that
+    /// reached the backend; a probe the host stopped taught nothing about it, so that remedy names
+    /// this host instead.
+    pub fn remedy(&self, hint: &str) -> String {
+        match self {
+            ProbeFailure::Failed(_) | ProbeFailure::TimedOut(_) => hint.to_string(),
+            ProbeFailure::NotStarted(_) | ProbeFailure::Vanished => {
+                "the host stopped the probe before it could answer — check this process's thread \
+                 and memory limits (a low `pids` cgroup limit is the usual cause)"
+                    .into()
+            }
+        }
     }
 }
 
@@ -301,6 +365,63 @@ fn summary_count(palette: &Palette, n: u32, attr: &str, label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// glass#373: a probe thread that died on `EAGAIN` was reported as a budget that elapsed — a
+    /// 24-second timeout that took no time at all, pointing at the backend rather than the host
+    /// limit that stopped it.
+    #[test]
+    fn a_probe_that_ended_without_answering_is_not_a_timeout() {
+        let budget = Duration::from_secs(24);
+        assert_eq!(
+            ProbeFailure::from_recv(mpsc::RecvTimeoutError::Disconnected, budget),
+            ProbeFailure::Vanished
+        );
+        assert_eq!(
+            ProbeFailure::from_recv(mpsc::RecvTimeoutError::Timeout, budget),
+            ProbeFailure::TimedOut(budget)
+        );
+    }
+
+    #[test]
+    fn each_probe_failure_says_something_different() {
+        let details = [
+            ProbeFailure::NotStarted("Resource temporarily unavailable".into()),
+            ProbeFailure::Failed("Xvfb exited during startup".into()),
+            ProbeFailure::TimedOut(Duration::from_secs(24)),
+            ProbeFailure::Vanished,
+        ]
+        .map(|f| f.detail("Xvfb"));
+        assert!(details.iter().all(|d| d.contains("Xvfb")), "{details:?}");
+        let unique: std::collections::BTreeSet<&String> = details.iter().collect();
+        assert_eq!(unique.len(), details.len(), "{details:?}");
+    }
+
+    /// The wait must be the one given, not a constant the renderer holds — the two drifting apart
+    /// is how a zero-second failure came to claim 24 seconds.
+    #[test]
+    fn a_timeout_reports_the_budget_it_was_given() {
+        let d = ProbeFailure::TimedOut(Duration::from_millis(1500)).detail("headless sway");
+        assert!(d.contains("1.5s"), "{d}");
+    }
+
+    /// A host that refused the probe taught nothing about the backend, so its advice would be a
+    /// guess; the two outcomes that did run get it.
+    #[test]
+    fn only_a_probe_that_ran_gets_the_backend_hint() {
+        const HINT: &str = "check Mesa software GL";
+        assert!(ProbeFailure::Failed("x".into()).remedy(HINT).contains(HINT));
+        assert!(
+            ProbeFailure::TimedOut(Duration::from_secs(1))
+                .remedy(HINT)
+                .contains(HINT)
+        );
+        assert!(!ProbeFailure::Vanished.remedy(HINT).contains(HINT));
+        assert!(
+            !ProbeFailure::NotStarted("x".into())
+                .remedy(HINT)
+                .contains(HINT)
+        );
+    }
 
     fn diag() -> Diagnosis {
         Diagnosis::new(vec![

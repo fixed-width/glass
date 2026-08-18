@@ -56,7 +56,7 @@ pub use diff::{
     diff_with_mask, region_satisfied,
 };
 pub mod doctor;
-pub use doctor::{Check, CheckStatus, Diagnosis, Palette, Section};
+pub use doctor::{Check, CheckStatus, Diagnosis, Palette, ProbeFailure, Section};
 
 pub mod capability;
 pub use capability::{CapabilityMap, CapabilityStatus, Support};

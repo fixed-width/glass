@@ -19,6 +19,16 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Fixed
+- `glass doctor` no longer flattens distinct environment failures into one message with a remedy
+  for a different problem. An X display that answers and refuses the connection is reported as an
+  authorisation failure, pointing at `XAUTHORITY`, instead of one that needs starting; a tool that
+  could not be looked up because `PATH` is unset (common when an MCP client spawns glass-mcp with a
+  stripped environment) is no longer reported as not installed; and a deep probe the host stopped —
+  a thread refused or killed under a low `pids` limit — is no longer reported as its full timeout
+  elapsing. The Wayland backend gets the same treatment: a headless sway that exits immediately is
+  reported as an exit rather than as an eight-second wait.
+
 ## [1.4.0] - 2026-08-17
 
 ### Added

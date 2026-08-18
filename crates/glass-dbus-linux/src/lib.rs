@@ -287,7 +287,9 @@ fn find_launcher_with(
             Resolved::NotExecutable(p) => {
                 first_non_executable.get_or_insert(p);
             }
-            Resolved::Absent => {}
+            // A candidate is one path, judged on its own: `resolve_path` has no search list to
+            // lack, so `NoSearchPath` cannot come from it. Both mean "nothing here" to the walk.
+            Resolved::Absent | Resolved::NoSearchPath => {}
         }
     }
     first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
@@ -375,6 +377,14 @@ fn launcher_or_reason(resolved: Resolved) -> std::result::Result<PathBuf, String
             "at-spi-bus-launcher not found (install at-spi2-core), or set GLASS_ATSPI_LAUNCHER"
                 .into(),
         ),
+        // Unreachable from `find_launcher`, which walks fixed paths — given its own answer so a
+        // caller that does search one day inherits the distinction, not the misdirection
+        // (glass#373).
+        Resolved::NoSearchPath => Err(
+            "at-spi-bus-launcher could not be looked up — PATH is unset in glass's environment; \
+             set GLASS_ATSPI_LAUNCHER to its path"
+                .into(),
+        ),
     }
 }
 
@@ -408,6 +418,12 @@ fn available_with(
         }
         Resolved::Absent => Err(format!(
             "dbus-daemon ({dbus}) not found (install dbus, or set GLASS_DBUS_DAEMON to its path)"
+        )),
+        // dbus may well be installed; what is missing is the environment glass was spawned
+        // with.
+        Resolved::NoSearchPath => Err(format!(
+            "dbus-daemon ({dbus}) could not be looked up — PATH is unset in glass's environment; \
+             set GLASS_DBUS_DAEMON to its path"
         )),
     }
 }
@@ -925,6 +941,27 @@ mod tests {
         assert!(
             !err.contains("install at-spi2-core"),
             "the package is installed; sending the user to reinstall it is the misdirection: {err}"
+        );
+    }
+
+    /// glass#373: a bare `dbus-daemon` and no `$PATH` to look it up in. Reported as "not found",
+    /// it sends the user to install dbus; what is missing is the environment glass was spawned
+    /// with.
+    #[test]
+    fn a_dbus_daemon_that_could_not_be_looked_up_is_not_reported_as_missing() {
+        let err = available_with(
+            Resolved::Found(PathBuf::from("/bin/true")),
+            "dbus-daemon",
+            None,
+        )
+        .expect_err("a bare name with no search list cannot resolve");
+        assert!(
+            err.contains("PATH"),
+            "name the fact the user can act on: {err}"
+        );
+        assert!(
+            !err.contains("install dbus"),
+            "dbus may well be installed: {err}"
         );
     }
 
