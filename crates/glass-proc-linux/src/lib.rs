@@ -50,6 +50,15 @@ pub const CLOSE_GRACE: Duration = Duration::from_millis(1500);
 /// making sure it is gone.
 pub const APP_REAP_GRACE: Duration = Duration::from_millis(1000);
 
+/// How long [`reap_launch`] waits for a signalled process to actually leave before naming it a
+/// survivor.
+///
+/// A signal lands when its target is next scheduled, so a `/proc` check taken straight after one
+/// still sees pids that are already dying. Small because it is spent only where something is
+/// still there — a launch that went away is confirmed gone on the first look — and because each
+/// backend counts it into the ladder it asserts against `glass_core::TEARDOWN_BUDGET`.
+pub const KILL_CONFIRM: Duration = Duration::from_millis(50);
+
 /// How a launched app actually went away, so the backend can say so rather than reporting
 /// every teardown as an unqualified success. Signalling an app that was never asked destroys
 /// whatever it would have flushed on exit, and the user only learns of it the next time the
@@ -196,6 +205,17 @@ pub fn await_condition(grace: Duration, mut done: impl FnMut() -> bool) -> bool 
     }
 }
 
+/// Which of `pids` are still live processes — [`any_alive`]'s answer, named.
+///
+/// A caller that reports a teardown needs the list rather than the bool: an operator can kill a
+/// pid, and cannot act on "something survived".
+pub fn still_alive(pids: &[u32]) -> Vec<u32> {
+    pids.iter()
+        .copied()
+        .filter(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+        .collect()
+}
+
 /// Whether any of `pids` is still a live process.
 pub fn any_alive(pids: &[u32]) -> bool {
     pids.iter()
@@ -218,7 +238,12 @@ pub fn any_alive(pids: &[u32]) -> bool {
 /// A pid is only signalled while `/proc/<pid>` still exists. That check races pid reuse the same
 /// way every `kill`-based reaper on Linux does; the alternative is leaking the app's children on
 /// every teardown.
-pub fn reap_launch(child: &mut Child, tree: &[u32], grace: Duration) {
+///
+/// Returns the pids still running [`KILL_CONFIRM`] after the ladder ran — empty on the ordinary
+/// path. A caller that reports the teardown must report these too, or it claims a stop that did
+/// not happen (glass#380).
+#[must_use = "a launch that outlived its reap is what the caller has to report"]
+pub fn reap_launch(child: &mut Child, tree: &[u32], grace: Duration) -> Vec<u32> {
     let leader = Pid::from_raw(child.id() as i32);
     let signal_all = |signal| {
         if let Some(leader) = leader {
@@ -241,6 +266,9 @@ pub fn reap_launch(child: &mut Child, tree: &[u32], grace: Duration) {
         let _ = child.kill();
     }
     let _ = child.wait();
+    // Asked after the wait, because until the child is reaped its own zombie is still in /proc.
+    await_condition(KILL_CONFIRM, || !any_alive(tree));
+    still_alive(tree)
 }
 
 /// Gracefully reap a single child: SIGTERM, poll for exit up to `grace`, then
@@ -593,6 +621,22 @@ mod reap_tests {
         assert!(super::CLOSE_GRACE > super::APP_REAP_GRACE);
     }
 
+    /// glass#380: the reaper computed whether the launch went away and discarded the answer, so
+    /// its callers could only report the stop they asked for. A list rather than a bool because
+    /// naming a survivor is what an operator can act on.
+    #[test]
+    fn still_alive_names_the_processes_that_are_there() {
+        let mut child = Command::new("sleep").arg("5").spawn().expect("spawn sleep");
+        let pid = child.id();
+        assert_eq!(super::still_alive(&[pid]), vec![pid]);
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        assert!(
+            super::still_alive(&[pid]).is_empty(),
+            "a child that was killed and reaped is not alive"
+        );
+    }
+
     #[test]
     fn reap_launch_reaps_a_child_that_left_the_process_group() {
         // sway does exactly this to every app it execs: `setsid` puts the app in its own group
@@ -616,7 +660,11 @@ mod reap_tests {
             !escaped.is_empty(),
             "the launch should have a child to reap"
         );
-        super::reap_launch(&mut leader, &tree, Duration::from_secs(5));
+        let left = super::reap_launch(&mut leader, &tree, Duration::from_secs(5));
+        assert!(
+            left.is_empty(),
+            "a launch that was reaped has no survivors to report: {left:?}"
+        );
         std::thread::sleep(Duration::from_millis(100));
         assert!(
             !super::any_alive(&escaped),

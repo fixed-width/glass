@@ -48,7 +48,10 @@ use crate::swayipc::{Ipc, Window as SwayWindow};
 // reaps at `REAP_GRACE`, so a helper that ignores SIGTERM can take the whole teardown past the
 // budget; that is pre-existing and not what this assertion is about.
 const _: () = assert!(
-    CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis() < TEARDOWN_BUDGET.as_millis(),
+    CLOSE_GRACE.as_millis()
+        + APP_REAP_GRACE.as_millis()
+        + glass_proc_linux::KILL_CONFIRM.as_millis()
+        < TEARDOWN_BUDGET.as_millis(),
     "the close request + compositor reap must finish inside glass_core::TEARDOWN_BUDGET"
 );
 
@@ -127,7 +130,13 @@ impl WaylandPlatform {
                     !glass_proc_linux::any_alive(&app)
                 }
             });
-            glass_proc_linux::reap_launch(&mut s.child, &tree, glass_proc_linux::APP_REAP_GRACE);
+            // Teardown reports what it asked, not what survived — doctor's deep probe is the
+            // caller that reads this (glass#380).
+            let _ = glass_proc_linux::reap_launch(
+                &mut s.child,
+                &tree,
+                glass_proc_linux::APP_REAP_GRACE,
+            );
             glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
         }
         self.dbus = None;

@@ -24,7 +24,10 @@ use x11rb::wrapper::ConnectionExt as _;
 // private Xvfb — still reaps at `REAP_GRACE` each, so a helper that ignores SIGTERM can take the
 // whole teardown past the budget; that is pre-existing and not what this assertion is about.
 const _: () = assert!(
-    ASK_BUDGET.as_millis() + CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis()
+    ASK_BUDGET.as_millis()
+        + CLOSE_GRACE.as_millis()
+        + APP_REAP_GRACE.as_millis()
+        + glass_proc_linux::KILL_CONFIRM.as_millis()
         < TEARDOWN_BUDGET.as_millis(),
     "sending the close request, waiting it out and the signal ladder must all finish inside \
      glass_core::TEARDOWN_BUDGET"
@@ -475,7 +478,9 @@ impl X11Platform {
             // The sweep runs either way: an app that closed itself can still have forked children
             // it never cleaned up, and on the graceful path the signals land on processes that
             // are already gone and cost nothing.
-            glass_proc_linux::reap_launch(&mut child, &tree, APP_REAP_GRACE);
+            // Teardown reports what it asked, not what survived — doctor's deep probe is the
+            // caller that reads this (glass#380).
+            let _ = glass_proc_linux::reap_launch(&mut child, &tree, APP_REAP_GRACE);
             glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
         }
         self.window = None;
