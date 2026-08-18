@@ -1,11 +1,10 @@
-//! glass#455: a desktop a11y bus that takes `org.a11y.Bus.GetAddress` and never answers is the one
-//! host state this check exists to surface, and the one that was reported in green as "no desktop
-//! a11y bus running" — the state where nothing is wrong. Nothing had ever driven it: the unit tests
-//! classify facts, and no test had produced the fact.
+//! glass#455: a desktop a11y bus that takes `org.a11y.Bus.GetAddress` and never answers was
+//! reported in green as "no desktop a11y bus running". Nothing had driven that state: the unit
+//! tests classify facts, and no test had produced the fact.
 //!
-//! Its own test binary, holding this one test, because it repoints `DBUS_SESSION_BUS_ADDRESS` for
-//! the whole process — the variable every other test's glass session reads. The operator's real
-//! a11y bus is never touched; the bus wedged here is spawned, wedged and killed by this file.
+//! Its own test binary because it repoints `DBUS_SESSION_BUS_ADDRESS` for the whole process — the
+//! variable every other test's glass session reads. The operator's real a11y bus is never touched:
+//! the one wedged here is spawned and killed by this file.
 
 #![cfg(target_os = "linux")]
 
@@ -18,8 +17,8 @@ use std::time::{Duration, Instant};
 use glass_a11y_linux::doctor::PROBE_BUDGET;
 use glass_core::CheckStatus;
 
-/// How long the private bus gets to print its address, and its wedge to own the name. Generous:
-/// it bounds a setup failure, and the thing under test has its own much tighter budget.
+/// How long the private bus gets to print its address, and its wedge to own the name — a bound on
+/// setup failure, not the one under test.
 const SETUP_BUDGET: Duration = Duration::from_secs(10);
 
 /// Restores the variable's prior value, not "unset" — this suite runs inside a desktop session
@@ -69,8 +68,7 @@ impl PrivateBus {
             .expect("spawn dbus-daemon");
         let stdout = child.stdout.take().expect("dbus-daemon stdout");
         let bus = PrivateBus(child);
-        // Bounded: a daemon that starts and prints nothing would otherwise hang the suite, in a
-        // test whose whole subject is not waiting on something that never answers.
+        // Bounded: a daemon that starts and prints nothing would otherwise hang the suite.
         let (tx, rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut line = String::new();
@@ -159,8 +157,7 @@ fn a_host_bus_that_never_answers_is_not_reported_as_a_host_without_one() {
         host.remedy.is_some(),
         "a warning about a bus that answers nothing has to say what to do about it"
     );
-    // One budget, not two: the connection is only attempted once an address has been answered,
-    // and here nothing ever answers. Doctor waiting with the bus is the other way this fails.
+    // One budget, not two: the connection is only attempted once an address has been answered.
     assert!(
         waited < PROBE_BUDGET + PROBE_BUDGET / 2,
         "doctor waited {waited:?} on a bus that never answers"
