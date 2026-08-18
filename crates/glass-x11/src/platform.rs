@@ -2694,6 +2694,35 @@ mod display_tests {
         assert_eq!(plat.get_clipboard().expect("get"), "ours again");
     }
 
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn a_copy_after_the_owner_thread_died_starts_a_fresh_owner() {
+        // glass#371's symptom, in the terms an agent meets it: the copy reports success and
+        // the paste comes back empty. The sibling above covers the SelectionClear route; this
+        // covers a thread that died mid-life.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        plat.set_clipboard("ours").expect("set");
+        assert_eq!(plat.get_clipboard().expect("get"), "ours");
+
+        let owner_win = x.clipboard_owner();
+        assert_ne!(owner_win, x11rb::NONE, "the first copy takes the selection");
+        x.kill_client(owner_win);
+
+        // Wait for the owner to RETIRE, not merely for the selection to change hands: copying
+        // before it does is what put the text somewhere nothing served it.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && plat.clipboard_owner.as_ref().is_some_and(|o| o.is_alive())
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        plat.set_clipboard("ours again")
+            .expect("set after the owner died");
+        assert_eq!(plat.get_clipboard().expect("get"), "ours again");
+    }
+
     // --- the close ladder ------------------------------------------------------------
 
     #[test]
