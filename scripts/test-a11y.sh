@@ -53,3 +53,5 @@ cargo test -p glass-dbus-linux --lib -- --ignored --test-threads=1 "$TEST_FILTER
 cargo test -p glass-a11y-linux --test integration -- --ignored --test-threads=1 "${SKIP_ARGS[@]}" "$TEST_FILTER"
 # Its own binary, so the environment it mutates is nothing else's (see the file's header).
 cargo test -p glass-a11y-linux --test launcher_override -- --ignored "$TEST_FILTER"
+# Likewise: it points DBUS_SESSION_BUS_ADDRESS at a private bus it wedges on purpose.
+cargo test -p glass-a11y-linux --test host_bus_unresponsive -- --ignored "$TEST_FILTER"
