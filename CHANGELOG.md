@@ -19,6 +19,21 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Fixed
+- `glass doctor` tells apart the ways attaching to an X display can fail, instead of reporting
+  every one as "cannot connect" with "start that display". A server that answers and refuses the
+  connection now says so and points at `XAUTHORITY`; a `GLASS_DISPLAY` that is not a display name,
+  and a screen the server does not have, each get their own message.
+- `glass doctor` no longer reports a tool as not installed when there was no `$PATH` to look it up
+  in — a stripped environment, which MCP clients routinely hand to the servers they spawn. Xvfb,
+  sway, `bubblewrap`, `dbus-daemon` and the AT-SPI launcher all say so and name their `GLASS_*`
+  override instead.
+- `glass doctor --deep` no longer reports a probe that never started as its full timeout elapsing.
+  A probe the host refused (a low `pids` limit) and one that panicked are now told apart from the
+  backend failing, and each gets the remedy for that, rather than the backend's. On the Wayland
+  backend a headless sway that exits immediately is reported as an exit, not as an eight-second
+  wait it never made.
+
 ## [1.4.0] - 2026-08-17
 
 ### Added

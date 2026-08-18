@@ -4,9 +4,9 @@
 //! facts to [`Check`]s and is unit-tested without sway.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use glass_core::{AppSpec, Check, CheckStatus};
+use glass_core::{AppSpec, Check, CheckStatus, ProbeFailure};
 
 use crate::command::{build_sway_command, sway_config};
 use crate::platform::{
@@ -31,7 +31,7 @@ pub fn checks(deep: bool) -> Vec<Check> {
 fn wayland_checks(
     sway: &Result<(PathBuf, VersionAnswer), NoSway>,
     gl_present: bool,
-    deep_spawn: Option<Result<(), String>>,
+    deep_spawn: Option<Result<(), ProbeFailure>>,
 ) -> Vec<Check> {
     let mut checks = Vec::new();
     checks.push(match sway {
@@ -63,9 +63,14 @@ fn wayland_checks(
                 CheckStatus::Ok,
                 "headless sway started and stopped",
             ),
-            Err(e) => Check::new("sway spawn (deep)", CheckStatus::Fail, e).with_remedy(
-                "sway is present but failed to start headless — check Mesa software GL",
-            ),
+            // The remedy comes from the failure itself, which withholds `SWAY_START_HINT` from
+            // the outcomes that never reached sway (glass#373).
+            Err(failure) => Check::new(
+                "sway spawn (deep)",
+                CheckStatus::Fail,
+                failure.detail("headless sway"),
+            )
+            .with_remedy(failure.remedy(SWAY_START_HINT)),
         });
     }
     checks
@@ -141,13 +146,30 @@ fn gl_present_in(egl_sonames: &[&str], dri_dirs: &[&str]) -> bool {
     egl && swrast
 }
 
+/// What to check when sway itself is what failed — reached only by the outcomes that got as far
+/// as running it.
+const SWAY_START_HINT: &str = "sway is present but produced no working compositor — check the \
+     host Mesa software GL stack and sway's own dependencies";
+
+/// How long the probe gives sway's IPC to appear — the give-up point, not a target: a working
+/// host answers in well under a second.
+const IPC_READY_BUDGET: Duration = Duration::from_secs(8);
+/// How often the probe asks, between the two answers that end the wait early.
+const IPC_POLL: Duration = Duration::from_millis(100);
+
 /// Spawn a headless sway with a no-op client, confirm its IPC comes up, and tear the
 /// process group down. Bounded so a wedged sway can't hang doctor.
-fn probe_sway(sway: &Path) -> Result<(), String> {
+fn probe_sway(sway: &Path) -> Result<(), ProbeFailure> {
+    probe_sway_within(sway, IPC_READY_BUDGET)
+}
+
+/// [`probe_sway`] with its budget passed in — the seam a test can drive in milliseconds rather
+/// than waiting out [`IPC_READY_BUDGET`].
+fn probe_sway_within(sway: &Path, budget: Duration) -> Result<(), ProbeFailure> {
     let rt = tempfile::Builder::new()
         .prefix("glass-doctor-wl.")
         .tempdir()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ProbeFailure::NotStarted(format!("private runtime dir: {e}")))?;
     let config = rt.path().join("sway.cfg");
     let spec = AppSpec {
         build: None,
@@ -162,22 +184,34 @@ fn probe_sway(sway: &Path) -> Result<(), String> {
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
     };
-    std::fs::write(&config, sway_config(&spec, rt.path(), None)).map_err(|e| e.to_string())?;
+    std::fs::write(&config, sway_config(&spec, rt.path(), None))
+        .map_err(|e| ProbeFailure::NotStarted(format!("sway config: {e}")))?;
+    // `NotStarted`, not `Failed`: resolution already proved this path executable, so what is left
+    // is the host refusing a process (EAGAIN under a `pids` limit, ENOMEM), which sway's own
+    // advice does not fit (glass#373).
     let mut child = build_sway_command(sway, &config, &spec, rt.path(), None)
         .spawn()
-        .map_err(|e| format!("spawn sway: {e}"))?;
+        .map_err(|e| ProbeFailure::NotStarted(format!("spawn sway: {e}")))?;
 
-    let mut up = false;
-    for _ in 0..80 {
-        if child.try_wait().ok().flatten().is_some() {
-            break; // sway exited before its IPC came up
+    // A deadline, not a poll count: the failure names the wait it made, and a count times
+    // `IPC_POLL` is not that wait — each turn also spends a connect attempt (glass#373).
+    let deadline = Instant::now() + budget;
+    let outcome = loop {
+        if let Some(status) = child.try_wait().ok().flatten() {
+            // sway exited before its IPC came up — its own answer, and immediate: quoting the
+            // budget below would claim a wait nobody made.
+            break Err(ProbeFailure::Failed(format!(
+                "sway exited before its IPC came up ({status})"
+            )));
         }
         if Ipc::connect(rt.path()).is_ok() {
-            up = true;
-            break;
+            break Ok(());
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+        if Instant::now() >= deadline {
+            break Err(ProbeFailure::TimedOut(budget));
+        }
+        std::thread::sleep(IPC_POLL);
+    };
 
     // Snapshot the launch before any of it exits: once sway is reaped its descendants are
     // reparented to init and can no longer be found from its pid.
@@ -187,15 +221,14 @@ fn probe_sway(sway: &Path) -> Result<(), String> {
     let tree = glass_proc_linux::proc_tree_pids(child.id());
     glass_proc_linux::reap_launch(&mut child, &tree, glass_proc_linux::APP_REAP_GRACE);
 
-    if up {
-        Ok(())
-    } else {
-        Err("headless sway did not come up within ~8s".into())
-    }
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
     use super::*;
 
     /// A resolved sway that answered, trimmed of the newline its `--version` ends with.
@@ -399,18 +432,122 @@ mod tests {
             .count()
     }
 
+    /// glass#373: `/bin/false` is gone before the first poll, and this reported "did not come up
+    /// within ~8s" — an eight-second wait that took none. Needs no sway.
     #[test]
-    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
-    fn probing_something_that_is_not_a_compositor_fails() {
+    fn a_compositor_that_exited_is_not_reported_as_one_that_never_answered() {
         let err = probe_sway(Path::new("/bin/false")).expect_err("no IPC ever appears");
-        assert!(err.contains("did not come up"), "{err}");
+        let ProbeFailure::Failed(why) = &err else {
+            panic!("an exit is the compositor's own answer, not a wait: {err:?}");
+        };
+        assert!(why.contains("exited"), "{why}");
+        assert!(
+            !why.contains("8s"),
+            "no budget elapsed, so none may be quoted: {why}"
+        );
+    }
+
+    /// The other end of the same wait: a "compositor" that starts, stays up and never opens an
+    /// IPC socket. Its budget is the one that elapsed, and it must not outlive the probe.
+    #[test]
+    fn a_compositor_that_never_answers_times_out_and_is_taken_down() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("sway");
+        let pidfile = dir.path().join("pid");
+        // Rejects an argv that is not the one glass builds, so a probe that stopped passing
+        // sway's arguments cannot pass this test by accident.
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *--unsupported-gpu*) ;; *) exit 64;; esac\n\
+                 echo $$ > {}\nexec sleep 30\n",
+                pidfile.display()
+            ),
+        )
+        .expect("write fake sway");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake sway");
+
+        // Long enough that a loaded CI box has written the pidfile below before the probe gives
+        // up on it; short enough that the test is not the slow one in the suite.
+        let budget = Duration::from_millis(500);
+        let started = Instant::now();
+        let err = probe_sway_within(&fake, budget).expect_err("no IPC ever appears");
+        assert_eq!(err, ProbeFailure::TimedOut(budget));
+        // The budget plus the teardown that follows it — the units this actually spans. A wait
+        // that ignored its argument would blow this by `IPC_READY_BUDGET`.
+        let ceiling = budget * 2 + glass_proc_linux::APP_REAP_GRACE * 2;
+        assert!(
+            started.elapsed() < ceiling,
+            "the wait must be the budget it reports: {:?} against {ceiling:?}",
+            started.elapsed()
+        );
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the fixture records its pid before it sleeps")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            !glass_proc_linux::any_alive(&[pid]),
+            "the probe left its compositor ({pid}) running"
+        );
     }
 
     #[test]
     fn deep_spawn_failure_is_reported() {
-        let cs = wayland_checks(&answered("1.12"), true, Some(Err("no come up".into())));
+        let cs = wayland_checks(
+            &answered("1.12"),
+            true,
+            Some(Err(ProbeFailure::Failed("no come up".into()))),
+        );
         let deep = cs.iter().find(|c| c.name == "sway spawn (deep)").unwrap();
         assert_eq!(deep.status, CheckStatus::Fail);
-        assert_eq!(deep.detail, "no come up");
+        assert!(deep.detail.contains("no come up"), "{:?}", deep.detail);
+        assert!(
+            deep.remedy.as_deref().is_some_and(|r| r.contains("Mesa")),
+            "a probe that reached sway gets sway's advice: {:?}",
+            deep.remedy
+        );
+    }
+
+    /// glass#373 in this backend's terms: a probe that never started says nothing about sway, so
+    /// Mesa is the wrong lead — for a `pids` limit that refused the fork, or for a temp dir the
+    /// probe could not write.
+    #[test]
+    fn a_probe_that_never_started_does_not_point_at_the_compositor() {
+        let cs = wayland_checks(
+            &answered("1.12"),
+            true,
+            Some(Err(ProbeFailure::NotStarted(
+                "private runtime dir: No space left on device".into(),
+            ))),
+        );
+        let deep = cs.iter().find(|c| c.name == "sway spawn (deep)").unwrap();
+        assert_eq!(deep.status, CheckStatus::Fail);
+        assert!(
+            deep.detail.contains("No space left on device"),
+            "the cause is the only text that names the resource: {deep:?}"
+        );
+        assert!(
+            deep.remedy.as_deref().is_some_and(|r| !r.contains("Mesa")),
+            "{deep:?}"
+        );
+    }
+
+    /// A spawn that never happened is not sway failing to render, and the classification is what
+    /// decides which remedy the operator reads.
+    #[test]
+    fn a_spawn_that_never_happened_is_not_reported_as_sway_failing() {
+        let missing = std::path::Path::new("/nonexistent/glass-doctor/sway");
+        let err = probe_sway(missing).expect_err("nothing to spawn");
+        assert!(
+            matches!(err, ProbeFailure::NotStarted(_)),
+            "a spawn that never happened is not sway's answer: {err:?}"
+        );
+        assert!(
+            !err.remedy(SWAY_START_HINT).contains("Mesa"),
+            "{:?}",
+            err.remedy(SWAY_START_HINT)
+        );
     }
 }

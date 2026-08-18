@@ -245,6 +245,15 @@ fn a11y_checks(launcher: &Resolved, override_set: bool, facts: &HostA11yFacts) -
         Resolved::Absent => Check::new("a11y", CheckStatus::Warn, "at-spi-bus-launcher not found").with_remedy(
             "install the AT-SPI registry (e.g. `apt install at-spi2-core`) so glass can spawn its private a11y bus",
         ),
+        // Unreachable while discovery walks fixed paths — kept apart because a launcher that was
+        // never looked up is not one that is missing (glass#373).
+        Resolved::NoSearchPath => Check::new(
+            "a11y",
+            CheckStatus::Warn,
+            "at-spi-bus-launcher could not be looked up — PATH is unset in glass's environment",
+        )
+        // No PATH advice: discovery walks fixed paths and would not read one.
+        .with_remedy("point GLASS_ATSPI_LAUNCHER at the launcher"),
     });
 
     // Concern B — host desktop a11y health (#9). Detect-only; never mutate.
@@ -496,6 +505,25 @@ mod tests {
         assert_eq!(head.status, CheckStatus::Warn);
         assert!(head.detail.contains("GLASS_ATSPI_LAUNCHER"));
         assert!(!head.remedy.clone().unwrap().contains("at-spi2-core"));
+    }
+
+    /// glass#373: unreachable while the launcher is looked for by path — kept distinct so a
+    /// caller that searches `$PATH` one day does not inherit "install at-spi2-core".
+    #[test]
+    fn a_launcher_that_could_not_be_looked_up_is_not_reported_as_missing() {
+        let cs = a11y_checks(
+            &Resolved::NoSearchPath,
+            false,
+            &facts(HostBusState::NotRunning, 0),
+        );
+        let head = cs.iter().find(|c| c.name == "a11y").unwrap();
+        assert_eq!(head.status, CheckStatus::Warn);
+        assert!(head.detail.contains("PATH"), "{:?}", head.detail);
+        assert!(
+            !head.remedy.clone().unwrap().contains("at-spi2-core"),
+            "the package may well be installed: {:?}",
+            head.remedy
+        );
     }
 
     #[test]

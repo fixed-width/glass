@@ -237,6 +237,9 @@ pub(crate) struct NoSway {
 const BUILD_A_SWAY: &str = "build it with https://github.com/fixed-width/sway-build \
      (./build.sh && ./build.sh install), or install a distro sway >=1.12";
 const MAKE_IT_RUNNABLE: &str = "chmod +x it, or point GLASS_SWAY at a runnable sway >=1.12";
+const SET_GLASS_SWAY: &str = "start glass with a PATH to search, or point GLASS_SWAY at a sway \
+     >=1.12; or install the bundle, which is found without a PATH — \
+     https://github.com/fixed-width/sway-build (./build.sh && ./build.sh install)";
 pub(crate) const CHECK_THAT_SWAY: &str =
     "check that binary, or point GLASS_SWAY at a working sway >=1.12";
 
@@ -245,6 +248,17 @@ impl NoSway {
         NoSway {
             cause: "no sway >=1.12 found".into(),
             remedy: BUILD_A_SWAY,
+        }
+    }
+
+    /// A bare `sway` and no `$PATH` to look it up in, and no bundle either. The bundle lookup did
+    /// run — it reads the glass data dir, not `$PATH` — so a build is still one of the fixes.
+    fn no_search_path() -> Self {
+        NoSway {
+            cause: "no sway >=1.12 found — PATH is unset in glass's environment, and no bundled \
+                    sway is installed"
+                .into(),
+            remedy: SET_GLASS_SWAY,
         }
     }
 
@@ -281,30 +295,54 @@ pub(crate) fn resolve_sway_verdict() -> std::result::Result<PathBuf, NoSway> {
     if let Some(overridden) = sway_override(std::env::var_os("GLASS_SWAY")) {
         return overridden;
     }
-    // Inlined rather than wrapped: a `fn` that only splits PATH and delegates has a
-    // constant-return mutation nothing can kill on a host where the true answer is that constant
-    // — here, any machine with no sway on PATH.
-    let walk = std::env::var_os("PATH").map_or_else(PathWalk::default, |path| {
-        sway_in_dirs(std::env::split_paths(&path), VERSION_PROBE_BUDGET)
-    });
-    if let Some(p) = walk.found {
-        return Ok(p);
-    }
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    match sway_bundle_in(data, exe_dir) {
+    // `None` when the environment carries no `$PATH` at all — a walk that never happened, kept
+    // apart from one that came back empty (glass#373).
+    //
+    // The walk stays inline: a `fn` that only splits `$PATH` and delegates has a constant-return
+    // mutation nothing can kill on a host with no sway on `$PATH`.
+    let walk = std::env::var_os("PATH")
+        .map(|path| sway_in_dirs(std::env::split_paths(&path), VERSION_PROBE_BUDGET));
+    sway_verdict(walk, || {
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
+        sway_bundle_in(data, exe_dir)
+    })
+}
+
+/// Pure: the verdict, given what the `$PATH` walk found (`None` when there was no `$PATH` to
+/// walk) and what the bundle lookup would find — the testable seam, with no global env and
+/// nothing spawned.
+///
+/// `bundle` is a thunk, not a value: looking for a bundle a `$PATH` hit has already made redundant
+/// costs a `current_exe` and a `stat` per candidate on every launch.
+fn sway_verdict(
+    walk: Option<PathWalk>,
+    bundle: impl FnOnce() -> Resolved,
+) -> std::result::Result<PathBuf, NoSway> {
+    let walk = match walk {
+        Some(PathWalk {
+            found: Some(sway), ..
+        }) => return Ok(sway),
+        walked => walked,
+    };
+    match bundle() {
         Resolved::Found(p) => Ok(p),
         Resolved::NotExecutable(p) => Err(NoSway::not_runnable(format!(
             "{} is not executable",
             p.display()
         ))),
-        // A silent candidate on PATH outranks "nothing qualifies" — telling the user to build one
-        // sends them past the sway they have.
-        Resolved::Absent => Err(walk.silent.unwrap_or_else(NoSway::nothing_qualifies)),
+        // `NoSearchPath` cannot come from the bundle lookup, which walks fixed paths; both mean
+        // there is no bundle to fall back to.
+        Resolved::Absent | Resolved::NoSearchPath => Err(match walk {
+            // A silent candidate on PATH outranks "nothing qualifies" — telling the user to build
+            // one sends them past the sway they have.
+            Some(walked) => walked.silent.unwrap_or_else(NoSway::nothing_qualifies),
+            None => NoSway::no_search_path(),
+        }),
     }
 }
 
@@ -326,7 +364,9 @@ fn sway_bundle_in(data: Option<PathBuf>, exe_dir: Option<PathBuf>) -> Resolved {
             Resolved::NotExecutable(p) => {
                 first_non_executable.get_or_insert(p);
             }
-            Resolved::Absent => {}
+            // Each candidate is one path, judged on its own: `resolve_path` has no search list
+            // to lack, so `NoSearchPath` cannot come from it. Both mean "nothing here".
+            Resolved::Absent | Resolved::NoSearchPath => {}
         }
     }
     first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
@@ -2890,6 +2930,48 @@ mod pure_tests {
             Resolved::Absent
         );
         assert_eq!(sway_bundle_in(None, None), Resolved::Absent);
+    }
+
+    /// glass#373: with no `$PATH` nothing was searched, and "no sway >=1.12 found" then sends the
+    /// user to build one — a build that cannot help, because the search list is what is missing.
+    /// MCP clients routinely spawn glass-mcp with a stripped environment.
+    #[test]
+    fn a_sway_that_could_not_be_looked_up_is_not_reported_as_missing() {
+        let no = sway_verdict(None, || Resolved::Absent).expect_err("nothing resolved");
+        assert!(no.cause.contains("PATH"), "{no:?}");
+        assert!(no.remedy.contains("GLASS_SWAY"), "{no:?}");
+        assert!(
+            no.remedy.contains("PATH to search"),
+            "restoring the search list is the fix nothing else names: {no:?}"
+        );
+        // The bundle lookup reads the glass data dir, not `$PATH`, so it ran and came back empty:
+        // installing the bundle really is one of the ways out, and dropping it would be a worse
+        // message than the one this replaced.
+        assert!(no.remedy.contains("sway-build"), "{no:?}");
+    }
+
+    /// The other half of the distinction: a list that was walked and held no sway really is a
+    /// host with no sway, and building one is the fix.
+    #[test]
+    fn a_search_that_turned_up_nothing_still_says_build_one() {
+        let no = sway_verdict(Some(PathWalk::default()), || Resolved::Absent)
+            .expect_err("nothing resolved");
+        assert_eq!(no.cause, "no sway >=1.12 found");
+        assert_eq!(no.remedy, BUILD_A_SWAY);
+    }
+
+    /// The bundle lookup is a `current_exe` and a `stat` per candidate, and a `$PATH` hit means
+    /// the answer is already in hand — passing it as a value would run it regardless.
+    #[test]
+    fn a_sway_found_on_path_is_taken_without_looking_for_the_bundle() {
+        let walk = PathWalk {
+            found: Some(PathBuf::from("/usr/bin/sway")),
+            silent: None,
+        };
+        let found = sway_verdict(Some(walk), || {
+            panic!("the bundle must not be looked for once PATH has answered")
+        });
+        assert_eq!(found, Ok(PathBuf::from("/usr/bin/sway")));
     }
 
     /// The launch path gets one string where doctor gets two columns, so it must carry both.
