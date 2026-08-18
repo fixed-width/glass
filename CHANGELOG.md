@@ -22,8 +22,11 @@ internal refactors, CI, or test-only changes.
 ### Fixed
 - `glass doctor` no longer reports a desktop accessibility bus that has hung as a green "no
   desktop a11y bus running". A bus that takes `GetAddress` and never answers, one that advertises
-  an address glass cannot connect to, and a check that could not run at all now each say so and
-  warn; a host that genuinely has no a11y bus still reads green.
+  an address glass cannot use, a question the session bus answered with an error, and a check that
+  could not run at all now each say so and warn; a host that genuinely has no a11y bus still reads
+  green. The check also asks for the address before trying to connect — the connection asks for it
+  too — so a bus that answers nothing costs one wait instead of two, and one that is still starting
+  up is no longer reported as unusable.
 - `glass doctor` tells apart the ways attaching to an X display can fail, instead of reporting
   every one as "cannot connect" with "start that display". A server that answers and refuses the
   connection now says so and points at `XAUTHORITY`; a `GLASS_DISPLAY` that is not a display name,

@@ -1124,6 +1124,7 @@ dependencies = [
  "glass-core",
  "glass-dbus-linux",
  "glass-exec-unix",
+ "glass-proc-linux",
  "glass-wayland",
  "glass-x11",
  "tempfile",

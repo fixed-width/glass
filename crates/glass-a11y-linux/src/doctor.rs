@@ -13,22 +13,31 @@ use glass_core::capability::CapabilityStatus;
 use glass_core::{Check, CheckStatus, ProbeFailure};
 use glass_exec_unix::Resolved;
 
-/// How long either host-bus probe may take before doctor stops waiting on it.
-const PROBE_BUDGET: Duration = Duration::from_secs(3);
+/// How long each host-bus probe may take before doctor stops waiting on it. A bus that answers
+/// nothing costs this once: the connection is attempted only once an address has been answered.
+pub const PROBE_BUDGET: Duration = Duration::from_secs(3);
 
-/// The one action every unhealthy host-bus state calls for. Its diagnosis stays in each check's
-/// detail: "its socket got unlinked" is wrong for a bus that never answered at all.
-const RESTART_AT_SPI: &str = "restart at-spi: kill the at-spi-bus-launcher / at-spi2-registryd / \
-     a11y dbus-daemon processes by PID, then re-activate with any a11y client (`dbus-send \
-     --session --dest=org.a11y.Bus --print-reply /org/a11y/bus org.a11y.Bus.GetAddress`). glass's \
-     own a11y is unaffected (it uses a private bus).";
+/// The action the states that found a bus and could not use it call for. Its diagnosis stays in
+/// each check's detail: "its socket got unlinked" is wrong for a bus that never answered at all.
+/// The PIDs are the host's — glass's own private bus is an `at-spi-bus-launcher` too.
+const RESTART_AT_SPI: &str = "restart the host's at-spi: kill its at-spi-bus-launcher / \
+     at-spi2-registryd / a11y dbus-daemon processes by PID, then re-activate with any a11y client \
+     (`dbus-send --session --dest=org.a11y.Bus --print-reply /org/a11y/bus \
+     org.a11y.Bus.GetAddress`). glass's own a11y is unaffected (it uses a private bus).";
 
-/// What a check that never ran calls for. Not [`ProbeFailure::remedy`]'s text: its "full or
+/// What a question the session bus answered with an error calls for.
+const ASK_FAILED: &str = "the error is the session bus's own — reproduce it with `dbus-send \
+     --session --dest=org.a11y.Bus --print-reply /org/a11y/bus org.a11y.Bus.GetAddress`. An \
+     activation failure there means at-spi-bus-launcher is failing to start. glass's own a11y is \
+     unaffected (it uses a private bus).";
+
+/// What a check that produced no answer of its own calls for — one action, because both ways of
+/// producing none are read the same way. Not [`ProbeFailure::remedy`]'s text: its "full or
 /// read-only temp dir" is a cause for the deep probes that lay one out; this one needs a thread
 /// and a runtime.
-const COULD_NOT_ASK: &str = "nothing here is about your desktop bus — glass never got to ask it, \
-     and the detail says what stopped it: a `pids` cgroup limit low enough to refuse a thread, or \
-     an fd limit low enough to refuse a runtime. A probe that panicked leaves the panic on glass's \
+const COULD_NOT_ASK: &str = "nothing here is about your desktop bus — glass got no answer of its \
+     own. The detail names the cause when the host refused the probe (a `pids` cgroup limit, or an \
+     fd limit low enough to refuse a runtime); a probe that panicked leaves the panic on glass's \
      stderr.";
 
 /// Live: is the AT-SPI bus launcher installed, so glass can spawn its private a11y bus?
@@ -135,36 +144,47 @@ where
     }
 }
 
+/// The D-Bus error for a name nothing serves and nothing can start — the answer a host with no
+/// desktop accessibility stack gives, and the only failure that means "there is no bus".
+const NO_SUCH_SERVICE: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
+
 /// Ask the host session bus what a11y address it advertises (`org.a11y.Bus.GetAddress`).
-fn advertised_a11y_address() -> Result<String, ProbeFailure> {
+///
+/// `Ok(None)` is the settled answer that there is no host bus; an error means the question itself
+/// could not be answered, which is not the same thing (glass#455).
+fn advertised_a11y_address() -> Result<Option<String>, ProbeFailure> {
     probe_on_a_private_runtime(PROBE_BUDGET, || async {
-        let conn = zbus::Connection::session()
-            .await
-            .map_err(|e| e.to_string())?;
+        // No session bus is no desktop a11y bus. The "session bus" check below reports the cause.
+        let Ok(conn) = zbus::Connection::session().await else {
+            return Ok(None);
+        };
         let proxy = zbus::Proxy::new(&conn, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus")
             .await
             .map_err(|e| e.to_string())?;
-        proxy
-            .call_method("GetAddress", &())
-            .await
-            .map_err(|e| e.to_string())?
+        let reply = match proxy.call_method("GetAddress", &()).await {
+            Ok(reply) => reply,
+            Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == NO_SUCH_SERVICE => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let address = reply
             .body()
             .deserialize::<String>()
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        // The launcher owns `org.a11y.Bus` before it has a bus to name, and answers "" until then.
+        Ok((!address.is_empty()).then_some(address))
     })
 }
 
 /// Gather host a11y facts (impure: live probe + GetAddress + `/proc`). Read-only — never mutates.
+///
+/// The address is asked for first because `AccessibilityConnection::new` asks for it too before it
+/// connects (atspi-connection 0.14): probing the connection first spends the budget on the same
+/// question, and reports a bus still warming up as one that cannot be connected to.
 fn gather_host_a11y() -> HostA11yFacts {
     let session_bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
-    let connect = probe_a11y_bus();
-    let advertised = advertised_a11y_address();
-    let socket_present = advertised
-        .as_deref()
-        .ok()
-        .and_then(socket_path_from_address)
-        .is_some_and(|p| std::path::Path::new(p).exists());
-    let bus = classify_host_bus(connect, advertised, socket_present);
+    let bus = classify_host_bus(advertised_a11y_address(), probe_a11y_bus, socket_state);
     let orphaned_daemons = count_orphaned_a11y_daemons(&read_proc_entries());
     HostA11yFacts {
         session_bus,
@@ -193,18 +213,25 @@ fn atspi_launcher_override_set() -> bool {
 pub(crate) enum HostBusState {
     /// glass connected to it.
     Reachable,
-    /// It advertises an address glass could not connect to.
+    /// It advertises an address glass could not use, `why` saying which way the attempt ended.
     Wedged {
         address: String,
-        socket_present: bool,
+        /// Whether the address's socket file exists — `None` when the address names no file to
+        /// look for, which is not the same as looking and finding none.
+        socket: Option<bool>,
+        why: String,
     },
     /// It took the `GetAddress` call and never answered — the one host state this check exists to
     /// surface, and the one that used to read as a green "no bus running" (glass#455).
     Unresponsive { waited: Duration },
-    /// Nothing was learned about the host: the probe never started, or its thread unwound. Only
-    /// those two [`ProbeFailure`]s reach here — the other two are answers about the bus itself.
+    /// The session bus answered the question with an error that does not mean "nothing serves that
+    /// name", so whether a bus is there is unknown.
+    Unknown { why: String },
+    /// glass's own probe produced no answer — it never started, or its thread unwound — so
+    /// nothing is claimed about the bus. Only those two [`ProbeFailure`]s reach here; the other
+    /// two are answers about the bus itself.
     Unaskable(ProbeFailure),
-    /// The session bus answered, and no a11y bus is running.
+    /// Nothing serves `org.a11y.Bus`, or it owns the name with no bus behind it yet.
     NotRunning,
 }
 
@@ -228,36 +255,46 @@ fn socket_path_from_address(addr: &str) -> Option<&str> {
     addr.split(',').find_map(|kv| kv.strip_prefix("unix:path="))
 }
 
-/// Classify the host bus from the connection attempt and what (if anything) the session bus
-/// advertises.
+/// Whether the address's socket file is there. `None` for an address that names no file — an
+/// abstract or TCP address is not one whose socket has gone missing.
+fn socket_state(address: &str) -> Option<bool> {
+    socket_path_from_address(address).map(|p| std::path::Path::new(p).exists())
+}
+
+/// Classify the host bus from what the session bus answered, connecting only if it named an
+/// address to connect to.
 ///
-/// The connection attempt is read first for the two outcomes that are about glass's own host
-/// rather than the bus: an advertised address says nothing about connectivity when nothing got as
-/// far as connecting. A `GetAddress` that answers cleanly then settles it — including the answer
-/// that there is no bus, which is why a connection that merely timed out does not overrule it.
+/// `connect` and `socket` are taken as thunks so the verdict stays pure and testable: neither runs
+/// unless an address is in hand, and a connection nothing attempted can never be reported as one
+/// that failed.
 fn classify_host_bus(
-    connect: Result<(), ProbeFailure>,
-    advertised: Result<String, ProbeFailure>,
-    socket_present: bool,
+    advertised: Result<Option<String>, ProbeFailure>,
+    connect: impl FnOnce() -> Result<(), ProbeFailure>,
+    socket: impl FnOnce(&str) -> Option<bool>,
 ) -> HostBusState {
-    match connect {
+    let address = match advertised {
+        Ok(Some(address)) => address,
+        Ok(None) => return HostBusState::NotRunning,
+        Err(ProbeFailure::TimedOut(waited)) => return HostBusState::Unresponsive { waited },
+        Err(ProbeFailure::Failed(why)) => return HostBusState::Unknown { why },
+        Err(nothing_learned @ (ProbeFailure::NotStarted(_) | ProbeFailure::Vanished)) => {
+            return HostBusState::Unaskable(nothing_learned);
+        }
+    };
+    let why = match connect() {
         Ok(()) => return HostBusState::Reachable,
         Err(nothing_learned @ (ProbeFailure::NotStarted(_) | ProbeFailure::Vanished)) => {
             return HostBusState::Unaskable(nothing_learned);
         }
-        Err(ProbeFailure::Failed(_) | ProbeFailure::TimedOut(_)) => {}
-    }
-    match advertised {
-        // The launcher owns `org.a11y.Bus` before it has a bus to name, and answers "" until then.
-        Ok(address) if !address.is_empty() => HostBusState::Wedged {
-            address,
-            socket_present,
-        },
-        Err(ProbeFailure::TimedOut(waited)) => HostBusState::Unresponsive { waited },
-        Err(nothing_learned @ (ProbeFailure::NotStarted(_) | ProbeFailure::Vanished)) => {
-            HostBusState::Unaskable(nothing_learned)
+        Err(ProbeFailure::Failed(why)) => format!("could not connect to it: {why}"),
+        Err(ProbeFailure::TimedOut(waited)) => {
+            format!("did not finish connecting to it within {waited:?}")
         }
-        Ok(_) | Err(ProbeFailure::Failed(_)) => HostBusState::NotRunning,
+    };
+    HostBusState::Wedged {
+        socket: socket(&address),
+        address,
+        why,
     }
 }
 
@@ -334,16 +371,15 @@ fn a11y_checks(launcher: &Resolved, override_set: bool, facts: &HostA11yFacts) -
         HostBusState::Reachable => {
             Check::new("host desktop a11y", CheckStatus::Ok, "your desktop accessibility bus is healthy")
         }
-        HostBusState::Wedged { address, socket_present } => Check::new(
+        HostBusState::Wedged { address, socket, why } => Check::new(
             "host desktop a11y",
             CheckStatus::Warn,
             format!(
-                "your desktop a11y bus is wedged — it advertises {address} and glass could not \
-                 connect to it: {}",
-                if *socket_present {
-                    "its socket file is still there"
-                } else {
-                    "its socket file is gone — the daemon is alive with its socket unlinked"
+                "your desktop a11y bus advertises {address} and glass {why}{}",
+                match socket {
+                    Some(true) => " — its socket file is there",
+                    Some(false) => " — nothing exists at that socket path",
+                    None => " — its address names no socket file to look for",
                 }
             ),
         )
@@ -352,11 +388,17 @@ fn a11y_checks(launcher: &Resolved, override_set: bool, facts: &HostA11yFacts) -
             "host desktop a11y",
             CheckStatus::Warn,
             format!(
-                "your desktop a11y bus did not answer GetAddress within {waited:?} — something \
-                 owns org.a11y.Bus and is not replying, so host a11y clients hang on it"
+                "nothing answered org.a11y.Bus.GetAddress within {waited:?} — the session bus, or \
+                 whatever owns that name, is not replying, so host a11y clients block on it"
             ),
         )
         .with_remedy(RESTART_AT_SPI),
+        HostBusState::Unknown { why } => Check::new(
+            "host desktop a11y",
+            CheckStatus::Warn,
+            format!("could not tell whether your desktop has an a11y bus: {why}"),
+        )
+        .with_remedy(ASK_FAILED),
         HostBusState::Unaskable(why) => Check::new(
             "host desktop a11y",
             CheckStatus::Warn,
@@ -459,22 +501,36 @@ mod tests {
     }
 
     // ---- classification ----
-    /// An answer from the bus itself, for the cases that turn on what the *other* probe found.
-    fn answered(what: &str) -> ProbeFailure {
-        ProbeFailure::Failed(what.into())
+    /// The two thunks, for the cases that must never reach them: a verdict that runs either has
+    /// classified on something it did not observe.
+    fn never_connects() -> Result<(), ProbeFailure> {
+        panic!("nothing should connect when no address was answered")
     }
 
-    fn wedged(socket_present: bool) -> HostBusState {
+    fn never_stats(_: &str) -> Option<bool> {
+        panic!("nothing should look for a socket when no address was answered")
+    }
+
+    fn refused() -> Result<(), ProbeFailure> {
+        Err(ProbeFailure::Failed("Connection refused".into()))
+    }
+
+    fn address() -> Result<Option<String>, ProbeFailure> {
+        Ok(Some("unix:path=/x".into()))
+    }
+
+    fn wedged(socket: Option<bool>, why: &str) -> HostBusState {
         HostBusState::Wedged {
             address: "unix:path=/x".into(),
-            socket_present,
+            socket,
+            why: why.into(),
         }
     }
 
     #[test]
     fn a_bus_glass_connected_to_is_reachable() {
         assert_eq!(
-            classify_host_bus(Ok(()), Ok("unix:path=/x".into()), true),
+            classify_host_bus(address(), || Ok(()), never_stats),
             HostBusState::Reachable
         );
     }
@@ -482,26 +538,43 @@ mod tests {
     #[test]
     fn an_advertised_bus_that_will_not_connect_is_wedged() {
         assert_eq!(
-            classify_host_bus(
-                Err(answered("Connection refused")),
-                Ok("unix:path=/x".into()),
-                false
-            ),
-            wedged(false)
+            classify_host_bus(address(), refused, |_| Some(false)),
+            wedged(Some(false), "could not connect to it: Connection refused")
         );
     }
 
-    /// A socket that is still there does not make an unconnectable bus a host without one: the
-    /// daemon holds it open and does not serve it. That fell to the green arm (glass#455).
+    /// A socket that is still there does not make an unconnectable bus a host without one. That
+    /// fell to the green arm (glass#455).
     #[test]
     fn an_advertised_bus_is_still_wedged_when_its_socket_is_there() {
         assert_eq!(
-            classify_host_bus(
-                Err(answered("Connection refused")),
-                Ok("unix:path=/x".into()),
-                true
-            ),
-            wedged(true)
+            classify_host_bus(address(), refused, |_| Some(true)),
+            wedged(Some(true), "could not connect to it: Connection refused")
+        );
+    }
+
+    /// An abstract or TCP address names no file, so "its socket is gone" would report a finding
+    /// nothing looked for.
+    #[test]
+    fn an_address_naming_no_file_is_not_a_socket_that_went_missing() {
+        assert_eq!(
+            classify_host_bus(address(), refused, |_| None),
+            wedged(None, "could not connect to it: Connection refused")
+        );
+    }
+
+    /// A connection that ran out of time is not one the bus refused — the wording is the
+    /// operator's only way to tell a wedge from a stall.
+    #[test]
+    fn a_connection_that_timed_out_says_so_rather_than_claiming_a_refusal() {
+        let state = classify_host_bus(
+            address(),
+            || Err(ProbeFailure::TimedOut(Duration::from_millis(1500))),
+            |_| Some(true),
+        );
+        assert_eq!(
+            state,
+            wedged(Some(true), "did not finish connecting to it within 1.5s")
         );
     }
 
@@ -509,47 +582,50 @@ mod tests {
     /// land in the arm that says nothing is wrong (glass#455).
     #[test]
     fn a_bus_that_never_answered_is_not_a_host_without_one() {
+        let waited = Duration::from_millis(1500);
         assert_eq!(
             classify_host_bus(
-                Err(ProbeFailure::TimedOut(PROBE_BUDGET)),
-                Err(ProbeFailure::TimedOut(PROBE_BUDGET)),
-                false
+                Err(ProbeFailure::TimedOut(waited)),
+                never_connects,
+                never_stats
             ),
-            HostBusState::Unresponsive {
-                waited: PROBE_BUDGET
+            HostBusState::Unresponsive { waited }
+        );
+    }
+
+    /// The launcher owns `org.a11y.Bus` before it has a bus to name, and answers `""` until then;
+    /// the probe reports that as no bus, and calling it a wedge would name an empty address.
+    #[test]
+    fn no_address_at_all_is_a_host_without_a_bus() {
+        assert_eq!(
+            classify_host_bus(Ok(None), never_connects, never_stats),
+            HostBusState::NotRunning
+        );
+    }
+
+    /// A question the session bus answered with an error is not the answer "there is no bus" —
+    /// an at-spi launcher that fails to start lands here, and used to read green (glass#455).
+    #[test]
+    fn a_question_that_failed_is_not_an_answer_that_there_is_no_bus() {
+        let state = classify_host_bus(
+            Err(ProbeFailure::Failed("Spawn.ChildExited".into())),
+            never_connects,
+            never_stats,
+        );
+        assert_eq!(
+            state,
+            HostBusState::Unknown {
+                why: "Spawn.ChildExited".into()
             }
         );
     }
 
-    /// The launcher owns `org.a11y.Bus` before it has a bus to name, and answers `""` until then.
-    /// Calling that a wedge prints a remedy about an address that names nothing.
-    #[test]
-    fn an_empty_address_is_no_bus_rather_than_a_wedged_one() {
-        assert_eq!(
-            classify_host_bus(Err(answered("no address")), Ok(String::new()), false),
-            HostBusState::NotRunning
-        );
-    }
-
-    #[test]
-    fn a_session_bus_that_answered_no_a11y_bus_is_not_running_one() {
-        assert_eq!(
-            classify_host_bus(
-                Err(answered("ServiceUnknown")),
-                Err(answered("org.freedesktop.DBus.Error.ServiceUnknown")),
-                false
-            ),
-            HostBusState::NotRunning
-        );
-    }
-
-    /// A probe the host refused learned nothing about the bus, so an advertised address is not
-    /// evidence of a wedge — nothing tried to connect.
+    /// A probe the host refused learned nothing about the bus, so nothing is claimed about it.
     #[test]
     fn a_probe_that_never_ran_is_not_a_verdict_on_the_host() {
         let refused = ProbeFailure::NotStarted("Resource temporarily unavailable".into());
         assert_eq!(
-            classify_host_bus(Err(refused.clone()), Ok("unix:path=/x".into()), true),
+            classify_host_bus(Err(refused.clone()), never_connects, never_stats),
             HostBusState::Unaskable(refused)
         );
     }
@@ -557,12 +633,30 @@ mod tests {
     #[test]
     fn a_getaddress_worker_that_unwound_is_not_a_host_without_a_bus() {
         assert_eq!(
-            classify_host_bus(
-                Err(answered("Connection refused")),
-                Err(ProbeFailure::Vanished),
-                false
-            ),
+            classify_host_bus(Err(ProbeFailure::Vanished), never_connects, never_stats),
             HostBusState::Unaskable(ProbeFailure::Vanished)
+        );
+    }
+
+    /// The same for the second probe: a connect thread that unwound is not a bus that refused.
+    #[test]
+    fn a_connect_worker_that_unwound_is_not_a_bus_that_refused() {
+        assert_eq!(
+            classify_host_bus(address(), || Err(ProbeFailure::Vanished), never_stats),
+            HostBusState::Unaskable(ProbeFailure::Vanished)
+        );
+    }
+
+    /// The socket check reads the address that was answered, not some other one.
+    #[test]
+    fn the_socket_is_looked_for_at_the_address_that_was_answered() {
+        let state = classify_host_bus(address(), refused, |addr| {
+            assert_eq!(addr, "unix:path=/x");
+            Some(true)
+        });
+        assert_eq!(
+            state,
+            wedged(Some(true), "could not connect to it: Connection refused")
         );
     }
 
@@ -699,34 +793,79 @@ mod tests {
         host_bus(&a11y_checks(&found(), false, &facts(bus, 0))).clone()
     }
 
+    /// The unusable states point at the host's at-spi; the check exists to send an operator
+    /// there, and a remedy about glass's own probe would be the wrong half of the diagnosis.
     #[test]
-    fn wedged_host_bus_warns() {
-        let h = reported(wedged(false));
-        assert_eq!(h.status, CheckStatus::Warn);
-        assert!(h.remedy.is_some());
+    fn the_states_that_found_an_unusable_bus_prescribe_the_restart() {
+        for bus in [
+            wedged(Some(false), "could not connect to it: Connection refused"),
+            HostBusState::Unresponsive {
+                waited: Duration::from_millis(1500),
+            },
+        ] {
+            let h = reported(bus);
+            assert_eq!(h.status, CheckStatus::Warn, "{h:#?}");
+            assert!(
+                h.remedy
+                    .clone()
+                    .unwrap()
+                    .contains("restart the host's at-spi"),
+                "{h:#?}"
+            );
+        }
     }
 
-    /// The socket being gone and the socket being held open are different things to have found,
-    /// and the operator reads the detail to tell which one they are looking at.
+    /// What was found about the socket is three answers, not two: an abstract or TCP address
+    /// names no file, and reporting one as gone is a finding nothing looked for.
     #[test]
-    fn a_wedged_bus_says_whether_its_socket_is_still_there() {
-        let gone = reported(wedged(false)).detail;
-        let there = reported(wedged(true)).detail;
-        assert_ne!(gone, there);
-        assert!(gone.contains("unix:path=/x"), "{gone}");
-        assert!(there.contains("unix:path=/x"), "{there}");
+    fn a_wedged_bus_says_what_was_found_about_its_socket() {
+        let details = [Some(false), Some(true), None]
+            .map(|socket| reported(wedged(socket, "could not connect to it: x")).detail);
+        let unique: std::collections::BTreeSet<&String> = details.iter().collect();
+        assert_eq!(unique.len(), 3, "{details:#?}");
+        assert!(
+            details.iter().all(|d| d.contains("unix:path=/x")),
+            "{details:#?}"
+        );
     }
 
-    /// glass#455: reported in green as the state where nothing is wrong, this was the one host
-    /// failure the check was added to catch.
+    /// The host failure the check was added to catch, and the one it reported in green.
     #[test]
     fn a_hung_host_bus_warns_and_says_how_long_it_waited() {
         let h = reported(HostBusState::Unresponsive {
-            waited: Duration::from_secs(3),
+            waited: Duration::from_millis(1500),
         });
         assert_eq!(h.status, CheckStatus::Warn);
-        assert!(h.detail.contains("3s"), "{}", h.detail);
+        assert!(h.detail.contains("1.5s"), "{}", h.detail);
         assert!(h.remedy.is_some());
+    }
+
+    /// A host with no a11y bus is the ordinary headless case, and warning at it would make every
+    /// container's doctor run noise. The fix is for the states that learned something is wrong.
+    #[test]
+    fn a_host_that_has_no_a11y_bus_still_reads_green() {
+        let h = reported(HostBusState::NotRunning);
+        assert_eq!(h.status, CheckStatus::Ok);
+        assert!(h.remedy.is_none(), "{h:#?}");
+    }
+
+    /// A question the session bus refused is not an answer about the host, so its remedy points
+    /// at the error rather than at the operator's at-spi processes.
+    #[test]
+    fn a_question_that_failed_reports_the_error_it_got() {
+        let h = reported(HostBusState::Unknown {
+            why: "org.freedesktop.DBus.Error.Spawn.ChildExited".into(),
+        });
+        assert_eq!(h.status, CheckStatus::Warn);
+        assert!(h.detail.contains("Spawn.ChildExited"), "{}", h.detail);
+        assert!(
+            !h.remedy
+                .clone()
+                .unwrap()
+                .contains("restart the host's at-spi"),
+            "{:?}",
+            h.remedy
+        );
     }
 
     /// A check that never ran says what stopped it, and does not send the operator to restart a
@@ -743,8 +882,9 @@ mod tests {
             h.detail
         );
         let remedy = h.remedy.clone().unwrap();
-        assert!(!remedy.contains("restart at-spi"), "{remedy}");
-        // Sending an operator to check `/tmp` over an `EAGAIN` is this change's own defect.
+        assert!(!remedy.contains("restart the host's at-spi"), "{remedy}");
+        // Sending an operator to check `/tmp` over an `EAGAIN` would be the same misdirection
+        // one layer down, so the shared not-started remedy is deliberately not reused.
         assert!(!remedy.contains("temp dir"), "{remedy}");
     }
 
@@ -753,11 +893,12 @@ mod tests {
     fn every_host_bus_state_says_something_different() {
         let details = [
             HostBusState::Reachable,
-            wedged(false),
-            wedged(true),
+            wedged(Some(false), "could not connect to it: x"),
+            wedged(Some(true), "could not connect to it: x"),
             HostBusState::Unresponsive {
-                waited: Duration::from_secs(3),
+                waited: Duration::from_millis(1500),
             },
+            HostBusState::Unknown { why: "x".into() },
             HostBusState::Unaskable(ProbeFailure::Vanished),
             HostBusState::NotRunning,
         ]
@@ -768,7 +909,7 @@ mod tests {
 
     // ---- the probe seam both host-bus probes run through ----
     /// A call the bus answered with an error is the bus's answer, not a wait that ran out — the
-    /// distinction the old `Err(_) => "timed out"` threw away.
+    /// distinction a single `Err(_)` arm loses.
     #[test]
     fn a_probe_that_failed_is_not_reported_as_one_that_timed_out() {
         let out: Result<(), ProbeFailure> =
@@ -776,6 +917,25 @@ mod tests {
                 Err::<(), String>("bus said no".into())
             });
         assert_eq!(out, Err(ProbeFailure::Failed("bus said no".into())));
+    }
+
+    /// A worker that unwound arrives at once, and is not a wait that elapsed — the distinction
+    /// this seam exists to keep. The panic below is deliberate; its message on stderr is what
+    /// the remedy tells the operator to look for.
+    #[test]
+    fn a_probe_whose_thread_unwound_is_not_reported_as_a_timeout() {
+        let started = std::time::Instant::now();
+        let out: Result<(), ProbeFailure> =
+            probe_on_a_private_runtime(Duration::from_secs(30), || async {
+                panic!("this probe panics on purpose (glass#455)")
+            });
+        assert_eq!(out, Err(ProbeFailure::Vanished));
+        // Reporting it after the budget would claim a wait nobody did.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// The budget the wait was given is the one it reports, so "3s" is never a number from a

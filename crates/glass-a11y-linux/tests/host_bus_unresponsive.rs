@@ -1,11 +1,11 @@
 //! glass#455: a desktop a11y bus that takes `org.a11y.Bus.GetAddress` and never answers is the one
 //! host state this check exists to surface, and the one that was reported in green as "no desktop
-//! a11y bus running" — the state where nothing is wrong. Nothing had ever driven it: the unit
-//! tests classify facts, and no test had produced the fact.
+//! a11y bus running" — the state where nothing is wrong. Nothing had ever driven it: the unit tests
+//! classify facts, and no test had produced the fact.
 //!
-//! Its own test binary, holding this one test: it points `DBUS_SESSION_BUS_ADDRESS` at a private
-//! bus of its own, which every other test's session reads. The operator's real a11y bus is only
-//! ever read from, never touched — this one is spawned, wedged and killed here.
+//! Its own test binary, holding this one test, because it repoints `DBUS_SESSION_BUS_ADDRESS` for
+//! the whole process — the variable every other test's glass session reads. The operator's real
+//! a11y bus is never touched; the bus wedged here is spawned, wedged and killed by this file.
 
 #![cfg(target_os = "linux")]
 
@@ -15,26 +15,24 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use glass_a11y_linux::doctor::PROBE_BUDGET;
 use glass_core::CheckStatus;
 
-/// Restores each variable's prior value, not "unset" — this suite runs inside a desktop session
+/// How long the private bus gets to print its address, and its wedge to own the name. Generous:
+/// it bounds a setup failure, and the thing under test has its own much tighter budget.
+const SETUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// Restores the variable's prior value, not "unset" — this suite runs inside a desktop session
 /// that has its own.
-struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+struct EnvGuard(Option<OsString>);
 
 #[allow(unsafe_code)]
 impl EnvGuard {
-    /// `DBUS_SESSION_BUS_ADDRESS` points the probes at the wedged bus; `AT_SPI_BUS_ADDRESS` is
-    /// cleared so the connection probe has to ask it rather than a bus named in the environment.
     fn set(address: &str) -> EnvGuard {
-        let prior = ["DBUS_SESSION_BUS_ADDRESS", "AT_SPI_BUS_ADDRESS"]
-            .map(|k| (k, std::env::var_os(k)))
-            .to_vec();
-        // SAFETY: this binary holds exactly one test, so nothing else in the process is reading
-        // the environment while it is mutated.
-        unsafe {
-            std::env::set_var("DBUS_SESSION_BUS_ADDRESS", address);
-            std::env::remove_var("AT_SPI_BUS_ADDRESS");
-        }
+        let prior = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
+        // SAFETY: this binary holds one test, and this runs before it starts a thread — the
+        // process is single-threaded here, so nothing can be reading the environment.
+        unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", address) };
         EnvGuard(prior)
     }
 }
@@ -42,23 +40,23 @@ impl EnvGuard {
 #[allow(unsafe_code)]
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        for (key, value) in self.0.drain(..) {
-            // SAFETY: as above — one test in this binary.
-            match value {
-                Some(v) => unsafe { std::env::set_var(key, v) },
-                None => unsafe { std::env::remove_var(key) },
-            }
+        // SAFETY: doctor's probe threads are detached and still parked on the wedged bus, but
+        // they read this variable once, when connecting, which they are long past — zbus resolves
+        // the address before the call that hangs them. Nothing else in the process reads it.
+        match self.0.take() {
+            Some(v) => unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", v) },
+            None => unsafe { std::env::remove_var("DBUS_SESSION_BUS_ADDRESS") },
         }
     }
 }
 
-/// A private `dbus-daemon --session`, killed when the test ends — a panic included.
+/// A private `dbus-daemon --session`, reaped when the test ends — a panic included.
 struct PrivateBus(Child);
 
 impl Drop for PrivateBus {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // SIGTERM first, so the daemon unlinks its own socket rather than leaving one behind.
+        glass_proc_linux::reap_graceful(&mut self.0, glass_proc_linux::REAP_GRACE);
     }
 }
 
@@ -71,12 +69,23 @@ impl PrivateBus {
             .expect("spawn dbus-daemon");
         let stdout = child.stdout.take().expect("dbus-daemon stdout");
         let bus = PrivateBus(child);
-        let mut address = String::new();
-        BufReader::new(stdout)
-            .read_line(&mut address)
-            .expect("read the bus address");
-        let address = address.trim().to_string();
-        assert!(!address.is_empty(), "dbus-daemon printed no address");
+        // Bounded: a daemon that starts and prints nothing would otherwise hang the suite, in a
+        // test whose whole subject is not waiting on something that never answers.
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let read = BufReader::new(stdout).read_line(&mut line);
+            let _ = tx.send(read.map(|_| line));
+        });
+        let address = rx
+            .recv_timeout(SETUP_BUDGET)
+            .expect("dbus-daemon printed no address")
+            .expect("read the bus address")
+            .trim()
+            .to_string();
+        // Joined, so the process is single-threaded again before the test mutates its environment.
+        reader.join().expect("the address reader");
+        assert!(!address.is_empty(), "dbus-daemon printed an empty address");
         (bus, address)
     }
 }
@@ -93,7 +102,7 @@ impl NeverAnswers {
     }
 }
 
-/// Wedge `bus`, returning once the name is owned — so a probe that gets "no such name" is a
+/// Wedge `address`, returning once the name is owned — so a probe that gets "no such name" is a
 /// failure of the code under test rather than of the setup.
 fn wedge(address: &str) {
     let address = address.to_string();
@@ -119,7 +128,7 @@ fn wedge(address: &str) {
             drop(conn);
         });
     });
-    rx.recv_timeout(Duration::from_secs(10))
+    rx.recv_timeout(SETUP_BUDGET)
         .expect("org.a11y.Bus was never owned");
 }
 
@@ -127,8 +136,8 @@ fn wedge(address: &str) {
 #[ignore = "spawns a private session bus and mutates the process environment; run via scripts/test-a11y.sh"]
 fn a_host_bus_that_never_answers_is_not_reported_as_a_host_without_one() {
     let (_bus, address) = PrivateBus::start();
-    wedge(&address);
     let _env = EnvGuard::set(&address);
+    wedge(&address);
 
     let started = Instant::now();
     let checks = glass_a11y_linux::doctor::checks();
@@ -139,15 +148,21 @@ fn a_host_bus_that_never_answers_is_not_reported_as_a_host_without_one() {
         .find(|c| c.name == "host desktop a11y")
         .expect("a host desktop a11y check");
     assert_eq!(host.status, CheckStatus::Warn, "{host:#?}");
-    assert!(host.detail.contains("did not answer"), "{}", host.detail);
+    // The phrase belongs to this state alone, so a `Warn` from any other one fails here.
+    assert!(
+        host.detail
+            .contains("nothing answered org.a11y.Bus.GetAddress"),
+        "{}",
+        host.detail
+    );
     assert!(
         host.remedy.is_some(),
-        "a warning about a wedged bus has to say what to do about it"
+        "a warning about a bus that answers nothing has to say what to do about it"
     );
-    // Each probe gives up after its own budget; doctor waiting with the bus is the other way this
-    // check fails an operator.
+    // One budget, not two: the connection is only attempted once an address has been answered,
+    // and here nothing ever answers. Doctor waiting with the bus is the other way this fails.
     assert!(
-        waited < Duration::from_secs(30),
+        waited < PROBE_BUDGET + PROBE_BUDGET / 2,
         "doctor waited {waited:?} on a bus that never answers"
     );
 }

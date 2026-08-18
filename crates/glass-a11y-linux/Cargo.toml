@@ -16,6 +16,7 @@ zbus.workspace = true
 tokio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+glass-proc-linux.workspace = true
 glass-x11 = { path = "../glass-x11" }
 glass-wayland = { path = "../glass-wayland" }
 tempfile.workspace = true
