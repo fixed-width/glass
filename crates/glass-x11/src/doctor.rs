@@ -220,9 +220,13 @@ fn no_attach(e: &ConnectError) -> NoAttach {
 
 /// Whether a refusal is about authorisation, read from the server's own reason text — X sends the
 /// same status byte for every refusal, so the variant alone cannot say.
+///
+/// Two terms, because X.org's refusals are worded two ways: "Authorization required, but no
+/// authorization protocol specified" and "Client is not authorized to connect to Server" carry the
+/// first, "Invalid MIT-MAGIC-COOKIE-1 key" only the second.
 fn refused_over_authority(reason: &[u8]) -> bool {
     let reason = String::from_utf8_lossy(reason).to_lowercase();
-    reason.contains("authoriz") || reason.contains("authenticat") || reason.contains("cookie")
+    reason.contains("authoriz") || reason.contains("cookie")
 }
 
 /// Margin over `Xvfb::start`'s own worst case, so the backstop effectively never fires and
@@ -480,6 +484,14 @@ mod tests {
                 "the display is already running: {no:?}"
             );
         }
+    }
+
+    /// A rejected cookie is worded without the word "authorization", so matching that alone would
+    /// send the operator with a stale cookie to "start that display".
+    #[test]
+    fn a_rejected_cookie_is_an_authorisation_failure_too() {
+        let no = no_attach(&refusal("Invalid MIT-MAGIC-COOKIE-1 key"));
+        assert!(no.remedy.contains("XAUTHORITY"), "{no:?}");
     }
 
     /// The refusal reason is the server's own, and the only text that says which of the auth
