@@ -219,9 +219,7 @@ impl ClipboardOwner {
         let handle = std::thread::Builder::new()
             .name("glass-x11-clip-owner".into())
             .spawn(move || {
-                if let Err(e) =
-                    owner_thread(&display, text_clone, stop_clone, Arc::clone(&ready_clone))
-                {
+                if let Err(e) = owner_thread(&display, text_clone, &stop_clone, ready_clone) {
                     eprintln!("glass: clipboard owner thread error: {e}");
                 }
             })
@@ -289,10 +287,26 @@ impl ClipboardOwner {
         *self.text.lock().expect("clipboard text mutex") = text.to_string();
     }
 
-    /// Returns `true` if the owner thread is still running (i.e. still owns the
-    /// selection; `false` means `SelectionClear` was received).
+    /// Returns `true` while the owner thread is still serving the selection.
+    ///
+    /// `false` covers every way the thread can stop: another client took CLIPBOARD
+    /// (`SelectionClear`), its connection failed, or it panicked. `set_clipboard` spawns a
+    /// replacement on `false`.
     pub fn is_alive(&self) -> bool {
         !self.stop.load(Ordering::Relaxed)
+    }
+}
+
+/// Retires the owner however its thread leaves.
+///
+/// `stop` is the only thing [`ClipboardOwner::is_alive`] consults, and the thread's only way to
+/// say it has gone. A statement at the end of the thread body would miss a panic, which is the
+/// one exit route that reaches no statement at all.
+struct RetireOnExit<'a>(&'a AtomicBool);
+
+impl Drop for RetireOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -424,15 +438,18 @@ fn take_selection(
 fn owner_thread(
     display: &str,
     text: Arc<Mutex<String>>,
-    stop: Arc<AtomicBool>,
+    stop: &AtomicBool,
     ready: Arc<(Mutex<ReadyState>, Condvar)>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // First, so no early return below escapes it.
+    let _retire = RetireOnExit(stop);
+
     let Some(Owned {
         conn,
         win,
         utf8_string,
         targets_atom,
-    }) = take_selection(display, &stop, &ready)?
+    }) = take_selection(display, stop, &ready)?
     else {
         return Ok(());
     };
@@ -448,7 +465,15 @@ fn owner_thread(
                 use x11rb::protocol::Event;
                 match event {
                     Event::SelectionRequest(req) => {
-                        handle_selection_request(&conn, &req, &text, utf8_string, targets_atom)?;
+                        // Any client that gives up first leaves a window ID the reply cannot be
+                        // written to, glass's own reader included once its read deadline expires
+                        // (glass#372). A connection that is genuinely broken fails
+                        // `poll_for_event` above.
+                        if let Err(e) =
+                            handle_selection_request(&conn, &req, &text, utf8_string, targets_atom)
+                        {
+                            eprintln!("glass: clipboard owner: selection request: {e}");
+                        }
                     }
                     Event::SelectionClear(_) => {
                         // Another client took ownership; we're done serving.
@@ -467,22 +492,19 @@ fn owner_thread(
     Ok(())
 }
 
-fn handle_selection_request(
+/// Write the converted selection onto the requestor, returning the property it landed in.
+///
+/// `x11rb::NONE` is the ICCCM refusal, for a target this owner cannot produce. An `Err` is the
+/// write itself failing, which the caller turns into a refusal too.
+fn convert_onto_requestor(
     conn: &RustConnection,
     req: &SelectionRequestEvent,
+    reply_prop: Atom,
     text: &Arc<Mutex<String>>,
     utf8_string: Atom,
     targets_atom: Atom,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // The property to write into on the requestor.  If req.property is NONE
-    // (old clients), fall back to writing into req.target as the property.
-    let reply_prop = if req.property != x11rb::NONE {
-        req.property
-    } else {
-        req.target
-    };
-
-    let granted_prop = if req.target == targets_atom {
+) -> std::result::Result<Atom, Box<dyn std::error::Error>> {
+    if req.target == targets_atom {
         let atoms: &[u32] = &[targets_atom, utf8_string];
         conn.change_property32(
             PropMode::REPLACE,
@@ -492,7 +514,7 @@ fn handle_selection_request(
             atoms,
         )?
         .check()?;
-        reply_prop
+        Ok(reply_prop)
     } else if req.target == utf8_string {
         let data = text.lock().expect("clipboard text mutex").clone();
         conn.change_property8(
@@ -503,15 +525,43 @@ fn handle_selection_request(
             data.as_bytes(),
         )?
         .check()?;
-        reply_prop
+        Ok(reply_prop)
     } else {
-        // Unsupported target: refuse with property = NONE.
-        x11rb::NONE
+        Ok(x11rb::NONE)
+    }
+}
+
+fn handle_selection_request(
+    conn: &RustConnection,
+    req: &SelectionRequestEvent,
+    text: &Arc<Mutex<String>>,
+    utf8_string: Atom,
+    targets_atom: Atom,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // A NONE property is an old client, which means writing into req.target instead.
+    let reply_prop = if req.property != x11rb::NONE {
+        req.property
+    } else {
+        req.target
     };
+
+    // A write that failed is still a request that must be answered: an owner that goes quiet
+    // keeps the selection, and every later paste on the display waits out its own timeout.
+    let granted_prop =
+        match convert_onto_requestor(conn, req, reply_prop, text, utf8_string, targets_atom) {
+            Ok(prop) => prop,
+            Err(e) => {
+                eprintln!(
+                    "glass: clipboard owner: converting for requestor {:#x}: {e}",
+                    req.requestor
+                );
+                x11rb::NONE
+            }
+        };
 
     // Send SelectionNotify to the requestor.
     let notify = SelectionNotifyEvent {
-        response_type: 31, // SELECTION_NOTIFY event code
+        response_type: SELECTION_NOTIFY_EVENT,
         sequence: 0,
         time: req.time,
         requestor: req.requestor,
@@ -645,6 +695,102 @@ mod tests {
 
     #[test]
     #[ignore = "starts a real X server; needs Xvfb"]
+    fn a_reply_that_cannot_be_delivered_costs_one_request_not_the_owner() {
+        // A requestor that asks and then exits leaves a window ID the reply cannot be written
+        // to — glass's own reader does, dropping its temporary window when its read deadline
+        // expires (glass#372). Ending the thread there hands the next copy to an owner that
+        // serves nobody.
+        let x = TestX::start();
+        let _owner =
+            ClipboardOwner::spawn(x.display().to_string(), "ours".to_string()).expect("spawn");
+        let owner_win = x.clipboard_owner();
+        assert_ne!(owner_win, x11rb::NONE, "the owner should hold CLIPBOARD");
+
+        let into = x.intern(b"TEST_CLIP_TRANSFER");
+        x.selection_request_from(owner_win, x.unused_id(), x.intern(b"UTF8_STRING"), into);
+
+        // The read, not `is_alive`, is what discriminates: a thread that has exited still
+        // reported itself alive before this was fixed (glass#371).
+        assert_eq!(
+            get(x.display()).expect("get"),
+            "ours",
+            "the owner should still be serving after a reply it could not deliver"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn a_conversion_the_owner_cannot_write_is_refused_rather_than_left_unanswered() {
+        // ICCCM: an owner answers every request, refusing with `property = NONE`. Returning
+        // before the reply leaves a live requestor waiting out its own timeout.
+        let x = TestX::start();
+        let _owner =
+            ClipboardOwner::spawn(x.display().to_string(), "ours".to_string()).expect("spawn");
+        let owner_win = x.clipboard_owner();
+        assert_ne!(owner_win, x11rb::NONE, "the owner should hold CLIPBOARD");
+
+        // A live requestor, so the reply has somewhere to go, and an XID where an atom
+        // belongs, so the value write fails with `BadAtom`.
+        let requestor = x.window().unmapped().create();
+        x.selection_request_from(
+            owner_win,
+            requestor,
+            x.intern(b"UTF8_STRING"),
+            x.unused_id(),
+        );
+
+        assert_eq!(
+            x.awaited_selection_notify(requestor, Duration::from_secs(2)),
+            Some(x11rb::NONE),
+            "a conversion the owner could not write is a refusal, not silence"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn an_owner_whose_connection_breaks_stops_reporting_itself_alive() {
+        // `set_clipboard` hands the text to whatever `is_alive` says is still serving, so a
+        // thread that is gone has to say so however it left — here, its connection closed under
+        // it. Reporting `true` puts the copy in a mutex nothing reads.
+        let x = TestX::start();
+        let owner =
+            ClipboardOwner::spawn(x.display().to_string(), "ours".to_string()).expect("spawn");
+        assert!(owner.is_alive());
+
+        let owner_win = x.clipboard_owner();
+        // `KillClient` reads resource 0 as `AllTemporary`, so an owner that never took the
+        // selection would kill nothing here and fail below blaming the retire logic.
+        assert_ne!(owner_win, x11rb::NONE, "the owner should hold CLIPBOARD");
+        x.kill_client(owner_win);
+
+        assert!(
+            eventually(Duration::from_secs(3), || !owner.is_alive()),
+            "the owner thread is gone; is_alive must not keep claiming otherwise"
+        );
+    }
+
+    /// Retiring on the way out is a value's `Drop`, not a statement at the end of the thread
+    /// body, and this is the difference between them: unwinding runs one and skips the other.
+    #[test]
+    fn an_owner_thread_that_panics_retires_like_one_that_returned() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let panicked = std::thread::spawn(move || {
+            let _retire = RetireOnExit(&thread_stop);
+            // The panic message below is the test working, not the test failing.
+            panic!("an owner thread panicking mid-serve");
+        })
+        .join();
+
+        assert!(panicked.is_err(), "the thread was supposed to panic");
+        assert!(
+            stop.load(Ordering::Relaxed),
+            "a thread that panicked is as gone as one that returned"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn the_owner_advertises_the_targets_it_can_convert_to() {
         let x = TestX::start();
         let _owner =
@@ -711,7 +857,7 @@ mod tests {
             Duration::from_secs(10),
             "a stalled X server must fail this test, not hang the whole suite",
             move || {
-                owner_thread(&display, text, stop, ready)
+                owner_thread(&display, text, &stop, ready)
                     .err()
                     .map(|e| e.to_string())
             },

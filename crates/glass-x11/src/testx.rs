@@ -191,6 +191,70 @@ impl TestX {
         None
     }
 
+    /// An XID no window was ever created with. x11rb hands these out of the client's own range
+    /// and never reuses one, so naming it as a requestor is a `BadWindow` the owner cannot dodge.
+    pub(crate) fn unused_id(&self) -> u32 {
+        self.conn.generate_id().expect("generate_id")
+    }
+
+    /// Ask `owner` to convert CLIPBOARD to `target` for `requestor`, writing into `into`.
+    ///
+    /// Synthesised rather than driven through `convert_selection` so a test can name a requestor
+    /// or a property the server will reject. Checked, not just flushed: a request the server
+    /// refuses to deliver would leave the owner idle and the test asserting against nothing.
+    pub(crate) fn selection_request_from(
+        &self,
+        owner: Window,
+        requestor: u32,
+        target: Atom,
+        into: Atom,
+    ) {
+        let event = SelectionRequestEvent {
+            response_type: SELECTION_REQUEST_EVENT,
+            sequence: 0,
+            time: x11rb::CURRENT_TIME,
+            owner,
+            requestor,
+            selection: self.intern(b"CLIPBOARD"),
+            target,
+            property: into,
+        };
+        // An empty mask sends the event to the client that created `owner`.
+        self.conn
+            .send_event(false, owner, EventMask::NO_EVENT, event)
+            .expect("send_event")
+            .check()
+            .expect("the server should deliver the synthesised SelectionRequest");
+    }
+
+    /// The property named in the `SelectionNotify` sent to `requestor`, or `None` if none
+    /// arrives within `within`. `x11rb::NONE` is a refusal; anything else is where the value
+    /// landed.
+    pub(crate) fn awaited_selection_notify(
+        &self,
+        requestor: Window,
+        within: Duration,
+    ) -> Option<Atom> {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if let Some(Event::SelectionNotify(n)) =
+                self.conn.poll_for_event().expect("poll_for_event")
+                && n.requestor == requestor
+            {
+                return Some(n.property);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    /// Have the server close `win`'s client connection, the way `xkill` does — how a test breaks
+    /// the owner thread's connection without taking down the display every other client is on.
+    pub(crate) fn kill_client(&self, win: Window) {
+        self.conn.kill_client(win).expect("kill_client");
+        self.flush();
+    }
+
     /// The atoms stored in `prop` on `win` — how a requestor reads a TARGETS reply.
     pub(crate) fn property_atoms(&self, win: Window, prop: Atom) -> Vec<Atom> {
         self.conn
