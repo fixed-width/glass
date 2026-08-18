@@ -54,9 +54,8 @@ pub const APP_REAP_GRACE: Duration = Duration::from_millis(1000);
 /// survivor.
 ///
 /// A signal lands when its target is next scheduled, so a `/proc` check taken straight after one
-/// still sees pids that are already dying. Small because it is spent only where something is
-/// still there — a launch that went away is confirmed gone on the first look — and because each
-/// backend counts it into the ladder it asserts against `glass_core::TEARDOWN_BUDGET`.
+/// still sees pids that are already dying. Each backend counts this into the ladder it asserts
+/// against `glass_core::TEARDOWN_BUDGET`.
 pub const KILL_CONFIRM: Duration = Duration::from_millis(50);
 
 /// How a launched app actually went away, so the backend can say so rather than reporting
@@ -206,9 +205,6 @@ pub fn await_condition(grace: Duration, mut done: impl FnMut() -> bool) -> bool 
 }
 
 /// Which of `pids` are still live processes — [`any_alive`]'s answer, named.
-///
-/// A caller that reports a teardown needs the list rather than the bool: an operator can kill a
-/// pid, and cannot act on "something survived".
 pub fn still_alive(pids: &[u32]) -> Vec<u32> {
     pids.iter()
         .copied()
@@ -240,8 +236,7 @@ pub fn any_alive(pids: &[u32]) -> bool {
 /// every teardown.
 ///
 /// Returns the pids still running [`KILL_CONFIRM`] after the ladder ran — empty on the ordinary
-/// path. A caller that reports the teardown must report these too, or it claims a stop that did
-/// not happen (glass#380).
+/// path, and what a caller reporting the teardown has to report too (glass#380).
 #[must_use = "a launch that outlived its reap is what the caller has to report"]
 pub fn reap_launch(child: &mut Child, tree: &[u32], grace: Duration) -> Vec<u32> {
     let leader = Pid::from_raw(child.id() as i32);
@@ -622,8 +617,7 @@ mod reap_tests {
     }
 
     /// glass#380: the reaper computed whether the launch went away and discarded the answer, so
-    /// its callers could only report the stop they asked for. A list rather than a bool because
-    /// naming a survivor is what an operator can act on.
+    /// its callers could only report the stop they asked for.
     #[test]
     fn still_alive_names_the_processes_that_are_there() {
         let mut child = Command::new("sleep").arg("5").spawn().expect("spawn sleep");

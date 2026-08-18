@@ -33,22 +33,20 @@ pub fn checks(deep: bool) -> Vec<Check> {
 /// What the deep probe learned: whether the compositor came up, and what its teardown left
 /// running.
 ///
-/// Two answers rather than one. A compositor that came up and was not torn down is a working sway
-/// and a leaked process at once, and the check that reports only the first says "started and
-/// stopped" of a launch that did neither half it claims (glass#380).
+/// A compositor that came up and was not torn down is a working sway and a leaked process at
+/// once; reporting only the first is what claimed a stop nobody had checked (glass#380).
 struct SwaySpawn {
     /// Whether sway's IPC answered inside the probe's budget.
     came_up: Result<(), ProbeFailure>,
-    /// What the last IPC connect attempt said — the difference between a socket that never
-    /// appeared and one that is there and refusing, which a timeout alone does not carry.
+    /// What the last IPC connect attempt said — a socket that never appeared, or one that is
+    /// there and refusing.
     last_ipc_error: Option<String>,
-    /// What sway wrote to stderr, captured rather than inherited: on the failure paths it is the
-    /// compositor's own account of what went wrong.
+    /// What sway wrote to stderr, captured rather than inherited — its own account of a failure.
     said: Option<String>,
     /// Pids of the probe's own launch still running once its teardown was done.
     left_behind: Vec<u32>,
-    /// The probe's private runtime dir, kept rather than deleted — `Some` only when something is
-    /// still running out of it, because deleting it takes the survivors' sockets with it.
+    /// The probe's private runtime dir, kept only when something is still running out of it —
+    /// deleting it would take that process's sockets with it.
     kept_runtime_dir: Option<PathBuf>,
 }
 
@@ -105,8 +103,8 @@ fn deep_spawn_check(spawn: SwaySpawn) -> Check {
         // the outcomes that never reached sway (glass#373).
         (Err(failure), left) => {
             let mut detail = failure.detail("headless sway");
-            // Only on the timeout: after an exit, or a wait glass could not make, the last connect
-            // error is a socket missing for a reason the detail already gives.
+            // Only on the timeout: after an exit the missing socket has a reason the detail
+            // already gives.
             if let (ProbeFailure::TimedOut(_), Some(why)) = (&failure, &spawn.last_ipc_error) {
                 detail.push_str(&format!(" — its IPC socket last said: {why}"));
             }
@@ -249,8 +247,8 @@ fn probe_sway(sway: &Path) -> SwaySpawn {
     probe_sway_within(sway, IPC_READY_BUDGET)
 }
 
-/// How much of sway's stderr the probe keeps. What explains a failed start is at the front, and
-/// the whole of it is rendered into a check, which is no place for a compositor's log.
+/// How much of sway's stderr the probe keeps — the front, where a failed start explains itself,
+/// and no more than a check's detail can carry.
 const STDERR_KEPT: u64 = 2 * 1024;
 
 /// How long the probe waits for the stderr pipe to end after the compositor has been reaped.
@@ -258,8 +256,8 @@ const SAID_GRACE: Duration = Duration::from_millis(200);
 
 /// Sway's own stderr, read on a helper thread for as long as the pipe is open.
 ///
-/// A thread rather than a read at the end, because a compositor whose stderr nobody drains stalls
-/// on a full pipe — which the probe would then report as a compositor that never came up.
+/// Not a read at the end: a compositor whose stderr nobody drains stalls on a full pipe, which
+/// the probe would report as one that never came up.
 struct SwaySaid(mpsc::Receiver<String>);
 
 impl SwaySaid {
@@ -287,8 +285,8 @@ impl SwaySaid {
         Ok(SwaySaid(rx))
     }
 
-    /// What it said, once its pipe has ended. `None` when it said nothing, and when the pipe is
-    /// still open — a survivor of the teardown holds it, and that survivor is what gets reported.
+    /// What it said, once its pipe has ended. `None` when it said nothing, or when a survivor of
+    /// the teardown still holds the pipe open.
     fn snapshot(self, grace: Duration) -> Option<String> {
         self.0.recv_timeout(grace).ok().filter(|s| !s.is_empty())
     }
@@ -306,8 +304,7 @@ struct IpcWait {
 /// A deadline, not a poll count: the failure names the wait it made, and a count times `poll` is
 /// not that wait — each turn also spends a connect attempt (glass#373).
 ///
-/// Both halves are closures because the classification is what this got wrong, and driving it
-/// takes no compositor.
+/// Both halves are closures so the classification can be driven without a compositor.
 fn await_ipc(
     budget: Duration,
     poll: Duration,
@@ -326,8 +323,8 @@ fn await_ipc(
                 )));
             }
             // Whether sway is running can no longer be established — something else reaped it, so
-            // `waitpid` answers ECHILD. Dropped, this read as "still running" and the wait went on
-            // to spend its whole budget and report a timeout.
+            // `waitpid` answers ECHILD. Dropped, this read as "still running", so the wait spent
+            // its whole budget and blamed a timeout.
             Err(e) => {
                 break Err(ProbeFailure::Failed(format!(
                     "glass could not wait on sway, so its exit could not be observed: {e}"
@@ -436,7 +433,7 @@ fn probe_sway_within(sway: &Path, budget: Duration) -> SwaySpawn {
     let left_behind =
         glass_proc_linux::reap_launch(&mut child, &tree, glass_proc_linux::APP_REAP_GRACE);
     // Deleting the runtime dir out from under a process still running in it takes its sockets
-    // with it, which is how a leak becomes one nothing can reach or place.
+    // too.
     let kept_runtime_dir = (!left_behind.is_empty()).then(|| rt.keep());
 
     SwaySpawn {
@@ -633,8 +630,7 @@ mod tests {
             .into_iter()
             .find(|c| c.name == "sway spawn (deep)")
             .expect("deep asks for the spawn check");
-        // `Ok` is now the stop as well as the start: a leaked compositor warns (glass#380), so
-        // this fails on a survivor even before the count below.
+        // `Ok` is the stop as well as the start now: a leaked compositor warns (glass#380).
         assert_eq!(deep.status, CheckStatus::Ok, "{}", deep.detail);
         // Counted from outside glass as well, so the verdict is not the only witness to it.
         assert_eq!(
@@ -847,8 +843,7 @@ mod tests {
     }
 
     /// The probe keeps the runtime dir when something is still using it, so the check has to say
-    /// where it is — otherwise the operator is left a directory they cannot find and sockets whose
-    /// processes they cannot place.
+    /// where it is.
     #[test]
     fn a_kept_runtime_dir_is_named_so_it_can_be_cleaned_up() {
         let cs = wayland_checks(
