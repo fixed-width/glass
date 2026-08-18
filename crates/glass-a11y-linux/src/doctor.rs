@@ -252,7 +252,8 @@ fn a11y_checks(launcher: &Resolved, override_set: bool, facts: &HostA11yFacts) -
             CheckStatus::Warn,
             "at-spi-bus-launcher could not be looked up — PATH is unset in glass's environment",
         )
-        .with_remedy("point GLASS_ATSPI_LAUNCHER at the launcher, or give glass a PATH to search"),
+        // No PATH advice: discovery walks fixed paths and would not read one.
+        .with_remedy("point GLASS_ATSPI_LAUNCHER at the launcher"),
     });
 
     // Concern B — host desktop a11y health (#9). Detect-only; never mutate.

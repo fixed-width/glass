@@ -352,6 +352,8 @@ type Probed = std::result::Result<Duration, NoSandbox>;
 enum NoSandbox {
     /// Nothing to run: no `bwrap` resolved, or the one that did cannot be executed.
     Missing(String),
+    /// A bare `bwrap` and no `$PATH` to look it up in, so nothing says whether it is installed.
+    NotLookedUp(String),
     /// bwrap ran and exited non-zero, including without saying why.
     Refused(String),
     /// bwrap had not exited when its budget ran out, so it was sent SIGKILL — which one wedged in
@@ -365,6 +367,8 @@ enum NoSandbox {
 
 const INSTALL_BWRAP: &str = "install `bubblewrap`, or point GLASS_BWRAP at a copy this machine can \
      execute; or run with sandbox:\"off\" (GLASS_SANDBOX=off) to launch unconfined";
+const NAME_BWRAP: &str = "point GLASS_BWRAP at bubblewrap's absolute path, or start glass with a \
+     PATH to search; or run with sandbox:\"off\" (GLASS_SANDBOX=off) to launch unconfined";
 const CHECK_THE_MOUNTS: &str = "the probe read-only-binds the whole root, so a mount that has \
      stopped responding (an unreachable network filesystem) can hold it there; check for one, or \
      run with sandbox:\"off\" (GLASS_SANDBOX=off) to launch unconfined";
@@ -375,6 +379,7 @@ impl NoSandbox {
     fn why(&self) -> &str {
         match self {
             NoSandbox::Missing(why)
+            | NoSandbox::NotLookedUp(why)
             | NoSandbox::Refused(why)
             | NoSandbox::TimedOut(why)
             | NoSandbox::Unfinished(why) => why,
@@ -386,6 +391,7 @@ impl NoSandbox {
     fn remedy(&self, apparmor_restricted: bool) -> &'static str {
         match self {
             NoSandbox::Missing(_) => INSTALL_BWRAP,
+            NoSandbox::NotLookedUp(_) => NAME_BWRAP,
             NoSandbox::Refused(_) => refusal_remedy(apparmor_restricted),
             NoSandbox::TimedOut(_) => CHECK_THE_MOUNTS,
             NoSandbox::Unfinished(_) => NOTHING_LEARNED,
@@ -409,8 +415,8 @@ fn probe() -> Probed {
 /// Pure: what resolving `bwrap` alone decides — the testable seam (no global env). `Ok` carries the
 /// file to probe; that it is runnable is all resolution proves.
 ///
-/// `bin` is the configured name, needed for the [`Resolved::Absent`] message because that variant
-/// carries no path.
+/// `bin` is the configured name, needed for the [`Resolved::Absent`] and
+/// [`Resolved::NoSearchPath`] messages because neither variant carries a path.
 fn resolved_bwrap(bin: &str, bwrap: Resolved) -> std::result::Result<PathBuf, NoSandbox> {
     match bwrap {
         Resolved::Found(p) => Ok(p),
@@ -419,9 +425,9 @@ fn resolved_bwrap(bin: &str, bwrap: Resolved) -> std::result::Result<PathBuf, No
             p.display()
         ))),
         Resolved::Absent => Err(NoSandbox::Missing(format!("bubblewrap ({bin}) not found"))),
-        // Not "not found": nothing was searched, and installing bubblewrap cannot restore a
-        // `PATH`.
-        Resolved::NoSearchPath => Err(NoSandbox::Missing(format!(
+        // Its own variant, not `Missing`: that one's remedy leads with "install `bubblewrap`",
+        // which cannot restore a `PATH` (glass#373).
+        Resolved::NoSearchPath => Err(NoSandbox::NotLookedUp(format!(
             "bubblewrap ({bin}) could not be looked up — PATH is unset in glass's environment"
         ))),
     }
@@ -1214,9 +1220,16 @@ mod tests {
             no.why().contains("PATH"),
             "the environment is what is missing: {no:?}"
         );
+        let remedy = no.remedy(false);
         assert!(
-            no.remedy(false).contains("GLASS_BWRAP"),
-            "an absolute path is the other way out: {no:?}"
+            remedy.contains("GLASS_BWRAP") && remedy.contains("PATH"),
+            "an absolute path or a search list are the ways out: {remedy}"
+        );
+        // The variant is the remedy here: routed through `Missing`, this reads "install
+        // `bubblewrap`" for a machine that may well have it installed.
+        assert!(
+            !remedy.contains("install"),
+            "nothing was searched, so nothing says it is missing: {remedy}"
         );
     }
 

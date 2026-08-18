@@ -965,6 +965,19 @@ mod tests {
         );
     }
 
+    /// The launcher is looked for by path, so this arm is unreachable today — tested because an
+    /// uncovered arm is one a later `$PATH` walk inherits without anyone reading it (glass#373).
+    #[test]
+    fn a_launcher_that_could_not_be_looked_up_is_not_reported_as_missing() {
+        let err = launcher_or_reason(Resolved::NoSearchPath)
+            .expect_err("nothing resolved, so there is nothing to launch");
+        assert!(err.contains("PATH"), "{err}");
+        assert!(
+            !err.contains("install at-spi2-core"),
+            "the package may well be installed: {err}"
+        );
+    }
+
     /// The other preflight branch: an explicit `$GLASS_DBUS_DAEMON` path that is not a file.
     #[test]
     fn available_errors_when_an_explicit_dbus_daemon_path_is_missing() {

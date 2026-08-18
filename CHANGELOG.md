@@ -20,14 +20,19 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
-- `glass doctor` no longer flattens distinct environment failures into one message with a remedy
-  for a different problem. An X display that answers and refuses the connection is reported as an
-  authorisation failure, pointing at `XAUTHORITY`, instead of one that needs starting; a tool that
-  could not be looked up because `PATH` is unset (common when an MCP client spawns glass-mcp with a
-  stripped environment) is no longer reported as not installed; and a deep probe the host stopped —
-  a thread refused or killed under a low `pids` limit — is no longer reported as its full timeout
-  elapsing. The Wayland backend gets the same treatment: a headless sway that exits immediately is
-  reported as an exit rather than as an eight-second wait.
+- `glass doctor` tells apart the ways attaching to an X display can fail, instead of reporting
+  every one as "cannot connect" with "start that display". A server that answers and refuses the
+  connection now says so and points at `XAUTHORITY`; a `GLASS_DISPLAY` that is not a display name,
+  and a screen the server does not have, each get their own message.
+- `glass doctor` no longer reports a tool as not installed when there was no `$PATH` to look it up
+  in — a stripped environment, which MCP clients routinely hand to the servers they spawn. Xvfb,
+  sway, `bubblewrap`, `dbus-daemon` and the AT-SPI launcher all say so and name their `GLASS_*`
+  override instead.
+- `glass doctor --deep` no longer reports a probe that never started as its full timeout elapsing.
+  A probe the host refused (a low `pids` limit) and one that panicked are now told apart from the
+  backend failing, and each gets the remedy for that, rather than the backend's. On the Wayland
+  backend a headless sway that exits immediately is reported as an exit, not as an eight-second
+  wait it never made.
 
 ## [1.4.0] - 2026-08-17
 

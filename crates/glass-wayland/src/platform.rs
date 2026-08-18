@@ -237,8 +237,9 @@ pub(crate) struct NoSway {
 const BUILD_A_SWAY: &str = "build it with https://github.com/fixed-width/sway-build \
      (./build.sh && ./build.sh install), or install a distro sway >=1.12";
 const MAKE_IT_RUNNABLE: &str = "chmod +x it, or point GLASS_SWAY at a runnable sway >=1.12";
-const SET_GLASS_SWAY: &str =
-    "point GLASS_SWAY at a sway >=1.12, or start glass with a PATH to search";
+const SET_GLASS_SWAY: &str = "start glass with a PATH to search, or point GLASS_SWAY at a sway \
+     >=1.12; or install the bundle, which is found without a PATH — \
+     https://github.com/fixed-width/sway-build (./build.sh && ./build.sh install)";
 pub(crate) const CHECK_THAT_SWAY: &str =
     "check that binary, or point GLASS_SWAY at a working sway >=1.12";
 
@@ -250,12 +251,12 @@ impl NoSway {
         }
     }
 
-    /// A bare `sway` and no `$PATH` to look it up in. The environment glass was spawned with is
-    /// what is missing, and no build restores it.
+    /// A bare `sway` and no `$PATH` to look it up in, and no bundle either. The bundle lookup did
+    /// run — it reads the glass data dir, not `$PATH` — so a build is still one of the fixes.
     fn no_search_path() -> Self {
         NoSway {
-            cause: "no sway >=1.12 found — PATH is unset in glass's environment, so nothing was \
-                    searched"
+            cause: "no sway >=1.12 found — PATH is unset in glass's environment, and no bundled \
+                    sway is installed"
                 .into(),
             remedy: SET_GLASS_SWAY,
         }
@@ -295,10 +296,11 @@ pub(crate) fn resolve_sway_verdict() -> std::result::Result<PathBuf, NoSway> {
         return overridden;
     }
     // `None` when the environment carries no `$PATH` at all — a walk that never happened, kept
-    // apart from one that came back empty (glass#373). An empty `$PATH` is the same fact: what
-    // `split_paths` makes of it is a one-entry list naming the current directory.
+    // apart from one that came back empty (glass#373).
+    //
+    // The walk stays inline: a `fn` that only splits `$PATH` and delegates has a constant-return
+    // mutation nothing can kill on a host with no sway on `$PATH`.
     let walk = std::env::var_os("PATH")
-        .filter(|path| !path.is_empty())
         .map(|path| sway_in_dirs(std::env::split_paths(&path), VERSION_PROBE_BUDGET));
     sway_verdict(walk, || {
         let data = std::env::var_os("XDG_DATA_HOME")
@@ -315,8 +317,8 @@ pub(crate) fn resolve_sway_verdict() -> std::result::Result<PathBuf, NoSway> {
 /// walk) and what the bundle lookup would find — the testable seam, with no global env and
 /// nothing spawned.
 ///
-/// `bundle` is a thunk, not a value: looking for a bundle a `$PATH` hit has already made
-/// redundant costs a `current_exe` and three `stat`s on every launch.
+/// `bundle` is a thunk, not a value: looking for a bundle a `$PATH` hit has already made redundant
+/// costs a `current_exe` and a `stat` per candidate on every launch.
 fn sway_verdict(
     walk: Option<PathWalk>,
     bundle: impl FnOnce() -> Resolved,
@@ -2939,9 +2941,13 @@ mod pure_tests {
         assert!(no.cause.contains("PATH"), "{no:?}");
         assert!(no.remedy.contains("GLASS_SWAY"), "{no:?}");
         assert!(
-            !no.remedy.contains("sway-build"),
-            "building one cannot restore a PATH: {no:?}"
+            no.remedy.contains("PATH to search"),
+            "restoring the search list is the fix nothing else names: {no:?}"
         );
+        // The bundle lookup reads the glass data dir, not `$PATH`, so it ran and came back empty:
+        // installing the bundle really is one of the ways out, and dropping it would be a worse
+        // message than the one this replaced.
+        assert!(no.remedy.contains("sway-build"), "{no:?}");
     }
 
     /// The other half of the distinction: a list that was walked and held no sway really is a
@@ -2954,8 +2960,8 @@ mod pure_tests {
         assert_eq!(no.remedy, BUILD_A_SWAY);
     }
 
-    /// The bundle lookup is three `stat`s and a `current_exe`, and a `$PATH` hit means the answer
-    /// is already in hand — passing it as a value rather than a thunk would run it regardless.
+    /// The bundle lookup is a `current_exe` and a `stat` per candidate, and a `$PATH` hit means
+    /// the answer is already in hand — passing it as a value would run it regardless.
     #[test]
     fn a_sway_found_on_path_is_taken_without_looking_for_the_bundle() {
         let walk = PathWalk {

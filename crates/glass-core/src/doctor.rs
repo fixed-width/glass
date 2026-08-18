@@ -147,14 +147,14 @@ impl Check {
 /// to report a 24-second wait against Xvfb (glass#373).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProbeFailure {
-    /// The probe was never started — the host refused the thread or process, so nothing was
-    /// learned about the backend.
+    /// Nothing was started, for the reason carried here — the host refused the thread or process,
+    /// or glass could not lay out what the probe needs. Nothing was learned about the backend.
     NotStarted(String),
     /// The probe ran and the backend failed, carrying what failed.
     Failed(String),
     /// The probe was still running, and still not ready, when its budget ran out.
     TimedOut(Duration),
-    /// The probe ended without answering: its thread unwound.
+    /// The probe ended without answering: it ran on a thread, and that thread unwound.
     Vanished,
 }
 
@@ -174,8 +174,7 @@ impl ProbeFailure {
         match self {
             ProbeFailure::NotStarted(why) => format!("could not start the {what} probe: {why}"),
             ProbeFailure::Failed(why) => format!("{what} failed to come up: {why}"),
-            // The budget that was actually waited, passed in — a renderer holding its own copy of
-            // the constant is free to drift from the wait it describes.
+            // The budget the wait was given, passed in rather than read from a constant here.
             ProbeFailure::TimedOut(budget) => {
                 format!("{what} was still not ready {budget:?} later")
             }
@@ -186,14 +185,24 @@ impl ProbeFailure {
     }
 
     /// The remedy. `hint` is the backend's own advice, used only for the two outcomes that
-    /// reached the backend; a probe the host stopped taught nothing about it, so that remedy names
-    /// this host instead.
+    /// reached the backend; the other two never did, so naming it there would be a guess.
+    ///
+    /// Those two do not share a remedy either: one is the host refusing what the probe needed, the
+    /// other is glass's own code unwinding.
     pub fn remedy(&self, hint: &str) -> String {
         match self {
             ProbeFailure::Failed(_) | ProbeFailure::TimedOut(_) => hint.to_string(),
-            ProbeFailure::NotStarted(_) | ProbeFailure::Vanished => {
-                "the host stopped the probe before it could answer — check this process's thread \
-                 and memory limits (a low `pids` cgroup limit is the usual cause)"
+            // The detail carries which resource was refused; a remedy that picked one would be
+            // wrong for the others.
+            ProbeFailure::NotStarted(_) => {
+                "the probe never started, so nothing here is about the backend — the cause is in \
+                 the detail: a low `pids` cgroup limit, and a full or read-only temp dir, are the \
+                 usual ones"
+                    .into()
+            }
+            ProbeFailure::Vanished => {
+                "the probe panicked — the panic is on glass's stderr; a `pids` cgroup limit low \
+                 enough to refuse a thread will also do this"
                     .into()
             }
         }
@@ -379,6 +388,28 @@ mod tests {
         assert_eq!(
             ProbeFailure::from_recv(mpsc::RecvTimeoutError::Timeout, budget),
             ProbeFailure::TimedOut(budget)
+        );
+    }
+
+    /// The OS reason is the only text separating a `pids` limit from an out-of-memory or a full
+    /// temp dir, and the shared remedy deliberately names none of them.
+    #[test]
+    fn a_probe_that_never_started_says_what_refused_it() {
+        let detail = ProbeFailure::NotStarted("Resource temporarily unavailable".into())
+            .detail("headless sway");
+        assert!(
+            detail.contains("Resource temporarily unavailable"),
+            "{detail}"
+        );
+    }
+
+    /// A host that refused the probe and glass unwinding are different repairs, and the type
+    /// exists to keep them apart all the way to the printed line.
+    #[test]
+    fn the_two_outcomes_that_never_reached_the_backend_still_differ() {
+        assert_ne!(
+            ProbeFailure::NotStarted("x".into()).remedy("hint"),
+            ProbeFailure::Vanished.remedy("hint")
         );
     }
 

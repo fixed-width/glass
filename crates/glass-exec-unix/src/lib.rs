@@ -3,7 +3,9 @@
 //! binary from an installed one it cannot spawn.
 //!
 //! One gap against `execvp` remains: with `$PATH` unset `execvp` searches `confstr(_CS_PATH)`,
-//! while [`resolve_bin`] given no search list reports [`Resolved::NoSearchPath`].
+//! while [`resolve_bin`] given no search list reports [`Resolved::NoSearchPath`]. A `$PATH` that
+//! is set but empty is not that case — `execvp` reads its one zero-length entry as the current
+//! directory, and so does the walk here.
 //!
 //! Consumers: the X11 and Wayland backends (`glass-x11`, `glass-wayland`), the AT-SPI bus launcher
 //! and its doctor check (`glass-dbus-linux`, `glass-a11y-linux`), and the sandbox backends
@@ -85,9 +87,7 @@ pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Resolved {
     if bin.contains('/') {
         return resolve_path(Path::new(bin));
     }
-    // `PATH=` is treated as the unset case, not as the one-entry list naming the current
-    // directory that `split_paths` reads it as.
-    let Some(path) = path.filter(|p| !p.is_empty()) else {
+    let Some(path) = path else {
         return Resolved::NoSearchPath;
     };
     let mut first_non_executable = None;
@@ -339,13 +339,15 @@ mod tests {
         assert_eq!(resolve_bin("Xvfb", None), Resolved::NoSearchPath);
     }
 
-    /// `PATH=` carries the same fact as an unset `PATH`, and must not be read as a one-entry list
-    /// naming the current directory — which is what `split_paths` makes of it.
+    /// A set-but-empty `$PATH` is a search list, not the absence of one: `execvp` reads its
+    /// zero-length entry as the current directory, and resolution mirrors `execvp` so that a
+    /// preflight cannot refuse a launch the kernel would have completed.
     #[test]
-    fn an_empty_search_list_is_no_search_list() {
+    fn an_empty_search_list_is_still_a_search_list() {
         assert_eq!(
             resolve_bin("Xvfb", Some(OsStr::new(""))),
-            Resolved::NoSearchPath
+            Resolved::Absent,
+            "an empty entry searches the current directory, which holds no Xvfb"
         );
     }
 

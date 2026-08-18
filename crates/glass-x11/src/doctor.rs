@@ -137,9 +137,10 @@ fn deep_spawn_check(spawn: &Result<String, ProbeFailure>) -> Check {
     }
 }
 
-/// What to check when Xvfb itself is what failed.
-const XVFB_START_HINT: &str = "Xvfb is installed but produced no working display — check its \
-     dependencies and permissions (the probe already waits out one retry of a stalled server)";
+/// What to check when Xvfb itself is what failed. It does not claim Xvfb is installed: the detail
+/// is `Xvfb::start`'s own message, which for a spawn failure says the opposite.
+const XVFB_START_HINT: &str = "the detail is Xvfb's own answer — check its dependencies and \
+     permissions, or set GLASS_DISPLAY=:N to attach to an existing display instead";
 
 /// Why glass could not attach to the display `GLASS_DISPLAY` names.
 ///
@@ -154,11 +155,18 @@ struct NoAttach {
 
 const START_THE_DISPLAY: &str = "start that display (e.g. `./scripts/sandbox-xvfb.sh start` for \
      :42) or unset GLASS_DISPLAY to self-spawn";
-const FIX_THE_AUTHORITY: &str = "point XAUTHORITY at the cookie file for that display (`xauth \
-     list` shows what it holds), or grant this user access with `xhost`";
-const NAME_A_DISPLAY: &str = "GLASS_DISPLAY must be an X display name — `:42`, `:42.0` or `host:0`";
-const PICK_A_SCREEN: &str = "name a screen that server has (`:42` or `:42.0`), or unset \
-     GLASS_DISPLAY to self-spawn";
+const FIX_THE_AUTHORITY: &str = "set XAUTHORITY to that display's cookie file — for a server \
+     spawned by an MCP client, in the client's `env` block, since glass inherits its environment \
+     (`xauth list` shows what a cookie file holds) — or, from a session that already reaches the \
+     display, run `xhost +si:localuser:$USER`";
+const SERVER_ANSWERED: &str = "the server answered and the connection still failed — its own \
+     reason is in the detail; unset GLASS_DISPLAY to self-spawn instead";
+// `normalize_display` prepends `:` to anything without one, so `host:0` becomes `:host:0` and X
+// then reads `:host` as the hostname: a remote display cannot be named here at all.
+const NAME_A_DISPLAY: &str = "GLASS_DISPLAY names a local display — `:42`, bare `42`, or `:42.0` \
+     to pick a screen; a remote `host:0` is not supported";
+const PICK_A_SCREEN: &str = "name a screen that server has — the `.N` suffix, e.g. `:42.0` (most \
+     servers have only screen 0) — or unset GLASS_DISPLAY to self-spawn";
 
 /// Whether glass can attach to `display`, and when it cannot, why — in the terms the remedy turns
 /// on. The connection is closed again at once.
@@ -168,15 +176,32 @@ fn attach_verdict(display: &str) -> Result<(), NoAttach> {
         .map_err(|e| no_attach(&e))
 }
 
-/// Classify a connect failure. `ConnectError` is `#[non_exhaustive]`, so anything not named here
-/// falls to "nothing answered" — the common case, and the one that advice fits.
+/// Classify a connect failure. What falls to the wildcard is `IoError` — nothing was listening,
+/// the case the advice fits — plus the local failures (`ParseError`, `InsufficientMemory`,
+/// `UnknownError`) and whatever this `#[non_exhaustive]` enum gains next.
 fn no_attach(e: &ConnectError) -> NoAttach {
     match e {
-        // The server answered and turned glass away: an authority problem, not a display that is
-        // down. XAUTHORITY unset or holding a stale cookie is the classic attach failure.
-        ConnectError::SetupAuthenticate(_) | ConnectError::SetupFailed(_) => NoAttach {
+        // The server answered and turned glass away, so it is running and a second one cannot
+        // help. Status 2 is an authentication demand outright; status 0 is the generic refusal,
+        // carrying "Maximum number of clients reached" as readily as an authorisation message, so
+        // its own reason picks the remedy.
+        ConnectError::SetupAuthenticate(_) => NoAttach {
             cause: format!("the server refused the connection ({e})"),
             remedy: FIX_THE_AUTHORITY,
+        },
+        ConnectError::SetupFailed(f) => NoAttach {
+            cause: format!("the server refused the connection ({e})"),
+            remedy: if refused_over_authority(&f.reason) {
+                FIX_THE_AUTHORITY
+            } else {
+                SERVER_ANSWERED
+            },
+        },
+        // The handshake began and did not finish, so something answered: the same reason
+        // "start that display" is wrong for a refusal.
+        ConnectError::Incomplete { .. } | ConnectError::ZeroIdMask => NoAttach {
+            cause: format!("the handshake did not complete ({e})"),
+            remedy: SERVER_ANSWERED,
         },
         ConnectError::DisplayParsingError(_) => NoAttach {
             cause: format!("not a display name X can parse ({e})"),
@@ -191,6 +216,13 @@ fn no_attach(e: &ConnectError) -> NoAttach {
             remedy: START_THE_DISPLAY,
         },
     }
+}
+
+/// Whether a refusal is about authorisation, read from the server's own reason text — X sends the
+/// same status byte for every refusal, so the variant alone cannot say.
+fn refused_over_authority(reason: &[u8]) -> bool {
+    let reason = String::from_utf8_lossy(reason).to_lowercase();
+    reason.contains("authoriz") || reason.contains("authenticat") || reason.contains("cookie")
 }
 
 /// Margin over `Xvfb::start`'s own worst case, so the backstop effectively never fires and
@@ -210,8 +242,9 @@ fn probe_xvfb() -> Result<String, ProbeFailure> {
     let screen = std::env::var("GLASS_XVFB_SCREEN").unwrap_or_else(|_| "1280x800x24".into());
     let budget = probe_budget();
     let (tx, rx) = mpsc::channel();
-    // Named and fallible, unlike a bare `spawn`, which panics when the OS refuses: `Xvfb::start`
-    // spawns two more threads of its own, so a low `pids` limit stops this probe first.
+    // Fallible, unlike a bare `spawn`, which panics when the OS refuses a thread — in doctor that
+    // is an unwind where a check belongs. `Xvfb::start` spawns two more threads with bare `spawn`,
+    // and those unwind inside this one, arriving as `Vanished`.
     std::thread::Builder::new()
         .name("glass-doctor-xvfb".into())
         .spawn(move || {
@@ -464,6 +497,39 @@ mod tests {
         );
     }
 
+    /// Setup status 0 is the server's generic "refused", not an auth verdict: a server at its
+    /// client limit sends it too, and telling that operator to fix a cookie is the misdirection
+    /// this check exists to remove. The reason is the server's own, so it decides.
+    #[test]
+    fn a_refusal_that_is_not_about_authorisation_does_not_get_the_cookie_remedy() {
+        let no = no_attach(&refusal("Maximum number of clients reached"));
+        assert!(no.cause.contains("Maximum number of clients"), "{no:?}");
+        assert!(
+            !no.remedy.contains("XAUTHORITY"),
+            "nothing here is about a cookie: {no:?}"
+        );
+        assert!(
+            !no.remedy.contains("start that display"),
+            "the server answered, so it is running: {no:?}"
+        );
+    }
+
+    /// A handshake that began and did not finish: the server answered, so "start that display" is
+    /// wrong for the same reason it is wrong for a refusal.
+    #[test]
+    fn a_handshake_that_broke_off_is_not_a_display_that_needs_starting() {
+        for e in [
+            ConnectError::Incomplete {
+                expected: 8,
+                received: 2,
+            },
+            ConnectError::ZeroIdMask,
+        ] {
+            let no = no_attach(&e);
+            assert!(!no.remedy.contains("start that display"), "{no:?}");
+        }
+    }
+
     #[test]
     fn nothing_listening_on_the_display_is_still_told_to_start_it() {
         let no = no_attach(&ConnectError::IoError(std::io::Error::from(
@@ -502,6 +568,16 @@ mod tests {
         .expect("a deep probe contributes its check")
     }
 
+    /// The arm every successful deep check renders, and the only one no failure test reaches:
+    /// dropped or restyled, `glass doctor --deep` would report a spawn it never proved.
+    #[test]
+    fn a_deep_probe_that_worked_names_the_display_it_started() {
+        let check = deep(Ok(":42".into()));
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.detail.contains(":42"), "{:?}", check.detail);
+        assert!(check.remedy.is_none(), "nothing to fix: {check:?}");
+    }
+
     #[test]
     fn deep_spawn_failure_is_reported() {
         let check = deep(Err(ProbeFailure::Failed("boom".into())));
@@ -519,24 +595,37 @@ mod tests {
     /// elapsing, a 24-second timeout that took no time.
     #[test]
     fn a_probe_the_host_stopped_is_not_reported_as_a_wait_that_never_happened() {
-        for failure in [
-            ProbeFailure::NotStarted("Resource temporarily unavailable".into()),
-            ProbeFailure::Vanished,
-        ] {
-            let check = deep(Err(failure.clone()));
-            assert_eq!(check.status, CheckStatus::Fail);
+        let refused = deep(Err(ProbeFailure::NotStarted(
+            "Resource temporarily unavailable".into(),
+        )));
+        assert_eq!(refused.status, CheckStatus::Fail);
+        assert!(
+            refused.detail.contains("Resource temporarily unavailable"),
+            "the OS reason is what separates a pids limit from an OOM: {refused:?}"
+        );
+        assert!(
+            !refused.detail.contains(&format!("{:?}", probe_budget())),
+            "no wait happened, so the budget must not be quoted: {refused:?}"
+        );
+
+        // Both outcomes stopped short of Xvfb, so neither may be answered with Xvfb's advice —
+        // and they are not each other's: one is the host refusing, one is glass unwinding.
+        let vanished = deep(Err(ProbeFailure::Vanished));
+        let (a, b) = (
+            refused.remedy.as_deref().expect("a remedy"),
+            vanished.remedy.as_deref().expect("a remedy"),
+        );
+        for r in [a, b] {
             assert!(
-                !check.detail.contains(&format!("{:?}", probe_budget())),
-                "no wait happened: {check:?}"
-            );
-            assert!(
-                check
-                    .remedy
-                    .as_deref()
-                    .is_some_and(|r| r.contains("limits") && !r.contains("dependencies")),
-                "the host stopped it, so Xvfb's dependencies are not the lead: {check:?}"
+                !r.contains(XVFB_START_HINT),
+                "the probe never reached Xvfb: {r}"
             );
         }
+        assert_ne!(
+            a, b,
+            "a refused probe and a panicked one want different repairs"
+        );
+        assert!(b.contains("panic"), "{b}");
     }
 
     /// The two ways the bounded wait can end, which used to be one `Err(_)` arm. Driven through
