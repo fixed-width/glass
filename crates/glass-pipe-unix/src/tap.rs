@@ -256,13 +256,48 @@ mod tests {
         t0.elapsed()
     }
 
-    /// A `Read` that always fills the buffer and never ends, so only the cap can stop a drain.
-    struct Endless;
+    /// A `Read` that hands back at most `per_read` bytes and never ends, so only the cap can stop
+    /// a drain.
+    ///
+    /// `per_read` divides neither [`CHUNK`] nor [`FINAL_DRAIN`], so the last read is a short one
+    /// and the remaining-room arithmetic is what decides the total — chunk-aligned, any error in
+    /// it lands on a boundary and cancels out.
+    struct Endless {
+        per_read: usize,
+    }
 
     impl Read for Endless {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            buf.fill(b'x');
-            Ok(buf.len())
+            assert!(
+                !buf.is_empty(),
+                "the drain must not ask for zero bytes; it has room or it is finished"
+            );
+            let n = buf.len().min(self.per_read);
+            buf[..n].fill(b'x');
+            Ok(n)
+        }
+    }
+
+    /// A `Read` that reports `Interrupted` `left` times, then hands back `bytes` once, then says
+    /// the pipe is empty.
+    struct InterruptedThen {
+        left: u32,
+        bytes: usize,
+    }
+
+    impl Read for InterruptedThen {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left > 0 {
+                self.left -= 1;
+                return Err(std::io::Error::from(ErrorKind::Interrupted));
+            }
+            match std::mem::take(&mut self.bytes) {
+                0 => Err(std::io::Error::from(ErrorKind::WouldBlock)),
+                n => {
+                    buf[..n].fill(b'y');
+                    Ok(n)
+                }
+            }
         }
     }
 
@@ -297,7 +332,37 @@ mod tests {
     #[test]
     fn the_final_drain_stops_at_the_cap_rather_than_reading_on() {
         // The cap is the whole bound against a survivor that keeps writing.
-        assert_eq!(drained(Endless).len(), FINAL_DRAIN);
+        assert_eq!(drained(Endless { per_read: 3000 }).len(), FINAL_DRAIN);
+    }
+
+    #[test]
+    fn the_final_drain_absorbs_interrupts_and_still_takes_what_follows() {
+        // An interrupt takes no bytes. Ending the drain on one loses what the app already wrote,
+        // and not counting it lets a persistent signal spin here.
+        assert_eq!(
+            drained(InterruptedThen {
+                left: DRAIN_INTERRUPTS as u32 - 1,
+                bytes: 5,
+            }),
+            "yyyyy"
+        );
+    }
+
+    #[test]
+    fn the_final_drain_gives_up_on_a_pipe_that_only_ever_interrupts() {
+        // Off-thread: without a budget on the interrupts this never returns, and the suite should
+        // fail rather than hang.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(drained(InterruptedThen {
+                left: u32::MAX,
+                bytes: 5,
+            }))
+        });
+        let took = rx
+            .recv_timeout(NEVER_RETURNS)
+            .expect("the drain must give up on interrupts, not spin on them");
+        assert_eq!(took, "", "nothing was ever readable");
     }
 
     #[test]
@@ -322,6 +387,124 @@ mod tests {
             }),
             "yy"
         );
+    }
+
+    #[test]
+    fn a_tap_over_a_pipe_that_closes_ends_itself() {
+        // The EOF exit, which every other test here deliberately never reaches — its survivor
+        // holds the pipe open. Without it, `StderrTail::finish` has nothing to wait on.
+        let mut c = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'all of it\n' >&2")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sh is runnable");
+        let collected = Collected::default();
+        let tap = PipeTap::start(
+            c.stderr.take().expect("piped stderr"),
+            "test-tap",
+            collected.clone(),
+        )
+        .expect("a reader");
+        c.wait().expect("the child exits");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !tap.is_done() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            tap.is_done(),
+            "a closed pipe must end its reader on its own"
+        );
+        assert_eq!(collected.read(), ("all of it\n".to_string(), true));
+    }
+
+    #[test]
+    fn a_tap_whose_pipe_a_survivor_holds_open_is_not_done() {
+        // The other half: `is_done` must not report a reader still parked on a live pipe as gone,
+        // or a caller waiting for a child's last words stops waiting at once.
+        let (mut c, _survivor) = said_then_survived("the last line\n");
+        let tap = PipeTap::start(
+            c.stderr.take().expect("piped stderr"),
+            "test-tap",
+            Collected::default(),
+        )
+        .expect("a reader");
+
+        assert!(!tap.is_done(), "the survivor still holds the write end");
+    }
+
+    #[test]
+    fn debug_reports_whether_the_reader_left_and_never_the_capture() {
+        // Derived, this would render the sink — a whole log buffer — into whatever printed the
+        // struct holding it.
+        let (mut c, _survivor) = said_then_survived("the fatal line\n");
+        let tap = PipeTap::start(
+            c.stderr.take().expect("piped stderr"),
+            "test-tap",
+            Collected::default(),
+        )
+        .expect("a reader");
+
+        let rendered = format!("{tap:?}");
+        assert!(rendered.contains("done: false"), "{rendered}");
+        assert!(
+            !rendered.contains("fatal"),
+            "the capture must not be in it: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_reader_waits_out_a_quiet_pipe_rather_than_leaving_it() {
+        // A pipe with nothing in it yet reads `WouldBlock`. Send that to the same arm as a real
+        // error and the reader leaves at the app's first quiet moment, losing everything after.
+        let (mut c, _survivor) = child_with_survivor(
+            "(printf 'first\n' >&2; sleep 0.4; printf 'second\n' >&2; sleep 30) & echo $!",
+        );
+        let collected = Collected::default();
+        let _tap = PipeTap::start(
+            c.stderr.take().expect("piped stderr"),
+            "test-tap",
+            collected.clone(),
+        )
+        .expect("a reader");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !collected.read().0.contains("second") {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            collected.read().0.contains("second"),
+            "the reader must still be there after the pause: {:?}",
+            collected.read().0
+        );
+    }
+
+    #[test]
+    fn dropping_a_tap_instead_of_stopping_it_still_ends_the_reader() {
+        // `Drop` is how every backend ends a tap — none of them call `stop`. Without it a
+        // teardown that just lets the field go leaves the reader parked on the survivor's pipe.
+        let (mut c, _survivor) = said_then_survived("the last line\n");
+        let collected = Collected::default();
+        let tap = PipeTap::start(
+            c.stderr.take().expect("piped stderr"),
+            "test-tap",
+            collected.clone(),
+        )
+        .expect("a reader");
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(tap);
+            tx.send(())
+        });
+        rx.recv_timeout(NEVER_RETURNS)
+            .expect("drop must end the reader; one parked in read() never returns");
+
+        assert!(collected.read().1, "the sink must have been ended");
     }
 
     #[test]

@@ -398,6 +398,9 @@ pub(crate) struct Launch {
     /// The app's stdout/stderr readers, held for the app's lifetime. The app's write ends are
     /// inherited by everything it spawns, so an EOF-only reader parks on a survivor's pipe, holding
     /// a thread and an fd for the life of the process (glass#477).
+    ///
+    /// Bind these, do not `..` them, in anything that later reads the sink: dropping a tap stops
+    /// its reader, and `..` does that at the destructuring — before the app has written a line.
     pub(crate) taps: Vec<LineTap>,
 }
 
@@ -603,7 +606,9 @@ mod tests {
         ];
         let logs = empty_sink();
         let Launch {
-            mut child, clip, ..
+            mut child,
+            clip,
+            taps: _taps,
         } = spawn(&denied, logs.clone())
             .unwrap_or_else(|e| panic!("sandboxed spawn should succeed: {e}"));
         // The probe is a plain, unsigned arm64 binary — always injectable — so a `None` here
@@ -679,7 +684,9 @@ mod tests {
 
         let logs = empty_sink();
         let Launch {
-            mut child, clip, ..
+            mut child,
+            clip,
+            taps: _taps,
         } = spawn(&launch, logs.clone()).unwrap_or_else(|e| {
             panic!(
                 "sandboxed spawn of a launch target under $HOME (cwd outside $HOME) should \
@@ -762,7 +769,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn spawn_pipes_stdout_and_stderr_lines() {
         let logs = empty_sink();
-        // `_taps` rather than `..`: dropping them here stops the readers before the child writes.
         let Launch {
             mut child,
             taps: _taps,
@@ -905,7 +911,11 @@ mod tests {
 
         let (fixture, build_dir) = build_quit_fixture("ask");
         let sink = empty_sink();
-        let Launch { mut child, .. } = spawn(
+        let Launch {
+            mut child,
+            taps: _taps,
+            ..
+        } = spawn(
             &spec(&[fixture.to_string_lossy().as_ref()]),
             Arc::clone(&sink),
         )
@@ -941,8 +951,11 @@ mod tests {
         spec.env = vec![("GLASS_FIXTURE_VETO_QUIT".to_string(), "1".to_string())];
 
         let sink = empty_sink();
-        let Launch { mut child, .. } =
-            spawn(&spec, Arc::clone(&sink)).expect("spawn the AppKit fixture");
+        let Launch {
+            mut child,
+            taps: _taps,
+            ..
+        } = spawn(&spec, Arc::clone(&sink)).expect("spawn the AppKit fixture");
         std::thread::sleep(FIXTURE_LAUNCH_SETTLE);
 
         let started = Instant::now();
