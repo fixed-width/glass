@@ -36,14 +36,13 @@ pub(crate) fn config_shim_dll_path(exe_dir: Option<&str>) -> Option<String> {
 
 #[cfg(windows)]
 mod imp {
-
     use glass_core::{AppSpec, GlassError, Result};
-
-    use super::config::{Decision, ProviderChoice, decide};
 
     /// Log lines captured from the app, tagged by stream. One alias, defined with the readers
     /// that fill it, rather than a second structurally-equal one here.
     pub(crate) use crate::logtap::LogSink;
+
+    use super::config::{Decision, ProviderChoice, decide};
 
     /// Read the provider choice (env `GLASS_WIN_SANDBOX_PROVIDER`, default `auto`).
     fn provider_choice() -> Result<ProviderChoice> {
@@ -91,16 +90,18 @@ mod imp {
                     let mut app = crate::process::spawn_suspended_in_job(&mut cmd, spec.sandbox)?;
                     // Wired before `resume`, so the app's first lines are not missed. A failure
                     // here has already closed the pipe it was for, so the launch fails rather
-                    // than resuming an app whose output goes nowhere — the app is still
-                    // suspended, and dropping `app` closes the Job, which terminates it.
-                    app.tap_logs(&logs).map_err(|e| {
-                        GlassError::AppNotStarted(format!(
+                    // than resuming an app whose output goes nowhere. `abandon` is what makes
+                    // that true: the app is still suspended, and nothing else would ever
+                    // terminate it or close its Job.
+                    if let Err(e) = app.tap_logs(&logs) {
+                        app.abandon();
+                        return Err(GlassError::AppNotStarted(format!(
                             "started {:?} but could not read its output ({e}); the app was \
                              stopped rather than left to write into a pipe nobody drains — free \
                              up threads on the host",
                             spec.run
-                        ))
-                    })?;
+                        )));
+                    }
                     app.resume();
                     Ok(Launched::Unconfined(app))
                 }

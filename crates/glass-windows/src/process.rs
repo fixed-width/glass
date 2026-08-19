@@ -149,6 +149,25 @@ impl LaunchedApp {
         Ok(())
     }
 
+    /// Terminate a launch that never started, closing the Job handle with it.
+    ///
+    /// `LaunchedApp` releases the Job only in [`LaunchedApp::kill`], and neither `SendHandle` nor
+    /// `Child` frees anything on drop — so a launch abandoned between `spawn_suspended_in_job`
+    /// and `resume` would sit `CREATE_SUSPENDED` and alive for the life of this process, with its
+    /// Job handle leaked and `KILL_ON_JOB_CLOSE` therefore never firing. The root is still
+    /// suspended and job-assigned but has never run, so it has no children of its own; this is
+    /// the same reasoning `spawn_suspended_in_job`'s own error arm uses.
+    ///
+    /// Any tap already started is ended by the drop that follows, after the kill.
+    pub(crate) fn abandon(mut self) {
+        // SAFETY: closing the last job handle terminates anything left in the tree.
+        unsafe {
+            let _ = CloseHandle(self.job.0);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait(); // reap, so an abandoned launch leaves no zombie
+    }
+
     /// Resume the suspended root thread(s) — call AFTER log readers are wired.
     pub(crate) fn resume(&self) {
         resume_process(self.pid());

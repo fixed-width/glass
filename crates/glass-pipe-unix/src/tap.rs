@@ -10,19 +10,26 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
 /// How long an idle reader sleeps before looking at the stop flag again.
 ///
-/// Also the ceiling on [`PipeTap::stop`]'s join if the wakeup is lost — the flag is what stops
-/// the reader.
+/// Not normally what a stop waits for: [`PipeTap::stop`] rings the wakeup first, and the write
+/// can only fail once the reader is already leaving. It is the backstop if that ever does not
+/// arrive.
 const HEARD_BY: Timespec = Timespec {
     tv_sec: 5,
     tv_nsec: 0,
 };
 
-/// The most the drain after the stop flag will read: one pipe buffer, which is everything a
-/// child can have left behind, so a survivor still writing cannot hold the stop open.
+/// A cap on the drain after the stop flag, not a measure of what is there: it is at least one
+/// pipe buffer on either platform (Linux defaults to 64 KiB, macOS to 16), so an ordinary child's
+/// last words fit, and a survivor still writing cannot hold the stop open.
 const FINAL_DRAIN: usize = 64 * 1024;
 
+/// How many `EINTR`s the final drain will absorb. It makes no progress on one, so without a
+/// budget a persistent signal would spin inside the function whose whole job is a bound.
+const DRAIN_INTERRUPTS: u8 = 8;
+
 /// What a `poll` that errored falls back to, rather than spinning the loop on an `EAGAIN` read.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Not a re-check cadence — the poll itself is the wait when it works.
+const POLL_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 
 /// How much one read asks for. A pipe buffer's worth arrives in these.
 const CHUNK: usize = 4096;
@@ -46,9 +53,6 @@ pub trait ChunkSink {
 /// holding an fd — one per stream per launch, for the life of a `glass-mcp serve --http`
 /// (glass#477).
 pub struct PipeTap {
-    /// Set by the reader on its way out, so a caller can tell a pipe that closed on its own from
-    /// one still held open.
-    done: Arc<AtomicBool>,
     /// What actually stops the reader. A flag rather than the wakeup below, so a wakeup that
     /// never arrives costs [`HEARD_BY`] rather than the life of the process.
     stopping: Arc<AtomicBool>,
@@ -56,6 +60,10 @@ pub struct PipeTap {
     /// write end of a self-pipe; nobody drains it, so one byte stays readable and the next poll
     /// is certain to see it. Only ever written by [`PipeTap::stop`], whose flag the loop checks
     /// immediately afterwards, so an always-readable byte cannot spin the reader.
+    ///
+    /// Closed only after the reader is joined — which `stop` guarantees, and `Drop` runs `stop`
+    /// before any field is dropped. Close it while the reader lives and its `poll` returns
+    /// `POLLHUP` forever, spinning the loop on a flag that is still false.
     wake: PipeWriter,
     /// Taken by whichever of [`PipeTap::stop`] and `drop` runs first.
     reader: Option<JoinHandle<()>>,
@@ -82,28 +90,32 @@ impl PipeTap {
         // and sets close-on-exec either way — without it these land in every process the host
         // spawns afterwards.
         let (woken, wake) = std::io::pipe()?;
-        let done: Arc<AtomicBool> = Arc::default();
         let stopping: Arc<AtomicBool> = Arc::default();
-        let (ended, stop) = (Arc::clone(&done), Arc::clone(&stopping));
+        let stop = Arc::clone(&stopping);
         let reader = std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
                 read_until_stopped(source, &woken, &stop, &mut sink);
                 sink.end();
-                ended.store(true, Ordering::Release);
             })?;
         Ok(PipeTap {
-            done,
             stopping,
             wake,
             reader: Some(reader),
         })
     }
 
-    /// Whether the reader has already left — the pipe closed, or nothing more can be read from
-    /// it. A caller waiting on a child's last words watches this rather than guessing a sleep.
+    /// Whether the reader has left and the sink has been told so — the pipe closed, or nothing
+    /// more can be read from it. A caller waiting on a child's last words watches this rather
+    /// than guessing a sleep.
+    ///
+    /// The thread's own state rather than a flag beside it, so it is still the truth when the
+    /// reader leaves by unwinding: a flag stored on the way out is never stored on that path, and
+    /// a caller polling it would wait out its whole grace for a thread that is already gone.
     pub fn is_done(&self) -> bool {
-        self.done.load(Ordering::Acquire)
+        self.reader
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
     }
 
     /// Stop the reader and wait for it to go, which is what makes the pipe closed rather than
@@ -115,7 +127,9 @@ impl PipeTap {
         // Set before the wake, or a reader the write pulls out of `poll` finds the flag still
         // false and goes back to sleep for another `HEARD_BY`.
         self.stopping.store(true, Ordering::Release);
-        let _ = rustix::io::write(&self.wake, &[1u8]);
+        // Retried, because a signal landing here would drop the byte and leave the reader asleep
+        // until `HEARD_BY` — inside a teardown budget measured in seconds.
+        let _ = rustix::io::retry_on_intr(|| rustix::io::write(&self.wake, &[1u8]));
         let _ = reader.join();
     }
 }
@@ -172,6 +186,7 @@ fn read_until_stopped<R: Read + AsFd, S: ChunkSink>(
 /// otherwise keep the drain fed for as long as it kept going.
 fn final_drain<R: Read, S: ChunkSink>(source: &mut R, chunk: &mut [u8; CHUNK], sink: &mut S) {
     let mut taken = 0;
+    let mut interrupts = 0;
     while taken < FINAL_DRAIN {
         let room = (FINAL_DRAIN - taken).min(CHUNK);
         match source.read(&mut chunk[..room]) {
@@ -180,7 +195,11 @@ fn final_drain<R: Read, S: ChunkSink>(source: &mut R, chunk: &mut [u8; CHUNK], s
                 taken += n;
                 sink.chunk(&chunk[..n]);
             }
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            // An interrupt takes nothing, so it cannot be what ends the loop — it needs its own
+            // budget or a persistent signal spins here.
+            Err(e) if e.kind() == ErrorKind::Interrupted && interrupts < DRAIN_INTERRUPTS => {
+                interrupts += 1;
+            }
             Err(_) => return,
         }
     }
@@ -197,67 +216,26 @@ fn wait_for_more<R: AsFd>(source: &R, woken: &PipeReader) {
         PollFd::new(woken, PollFlags::IN),
     ];
     if poll(&mut waiting, Some(&HEARD_BY)).is_err() {
-        std::thread::sleep(POLL_INTERVAL);
+        std::thread::sleep(POLL_ERROR_BACKOFF);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
+    // Only the two `/proc`-based assertions below need it, and they are Linux-only.
+    #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use rustix::process::{Pid, Signal, kill_process};
+    use crate::testsup::{child_with_survivor, said_then_survived};
 
     /// How long a test waits for a `stop` that is supposed to be bounded — a third of the
     /// survivor's life, which must not be what ends it.
     const NEVER_RETURNS: Duration = Duration::from_secs(10);
-
-    /// A process holding a child's pipe after the child is gone, killed when the test ends,
-    /// panic included. It outlives [`NEVER_RETURNS`] three times over, so a reader that only
-    /// stops at EOF stays parked for the whole test, and self-limits if the guard cannot run.
-    ///
-    /// Load-bearing for the fd assertions, not only for cleanup: while it holds the write end
-    /// the pipe's inode cannot be freed, so no sibling test thread can be handed the same
-    /// `pipe:[n]` and read as a false failure.
-    struct Survivor(Option<u32>);
-
-    impl Drop for Survivor {
-        fn drop(&mut self) {
-            if let Some(pid) = self.0.and_then(|p| Pid::from_raw(p as i32)) {
-                let _ = kill_process(pid, Signal::KILL);
-            }
-        }
-    }
-
-    /// Run `script` — which must background something and print its pid on stdout — and hand back
-    /// the exited child plus a guard for the survivor.
-    fn child_with_survivor(script: &str) -> (Child, Survivor) {
-        let mut c = Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("sh is runnable");
-        let mut pid = String::new();
-        let read = BufReader::new(c.stdout.take().expect("piped stdout")).read_line(&mut pid);
-        // Guarded before anything that can panic: the sleeper exists from the moment `sh` runs.
-        let survivor = Survivor(pid.trim().parse().ok());
-        read.expect("sh reports the pid it backgrounded");
-        assert!(survivor.0.is_some(), "sh reported {pid:?}, not a pid");
-        c.wait().expect("the child exits, the survivor does not");
-        (c, survivor)
-    }
-
-    /// A child that says `said` on stderr, leaves a sleeper holding that pipe, and exits.
-    fn said_then_survived(said: &str) -> (Child, Survivor) {
-        child_with_survivor(&format!("printf '{said}' >&2; sleep 30 & echo $!"))
-    }
 
     /// Collects every chunk handed to it, and records whether `end` ran.
     #[derive(Clone, Default)]
@@ -291,6 +269,78 @@ mod tests {
         rx.recv_timeout(NEVER_RETURNS)
             .expect("stop must return; a reader parked in read() never does");
         t0.elapsed()
+    }
+
+    /// A `Read` that always fills the buffer and never ends, so only the cap can stop a drain.
+    struct Endless;
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(b'x');
+            Ok(buf.len())
+        }
+    }
+
+    /// A `Read` that yields `first` once and then reports what `then` says.
+    struct ThenErr {
+        first: Option<usize>,
+        then: ErrorKind,
+    }
+
+    impl Read for ThenErr {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.first.take() {
+                Some(n) => {
+                    buf[..n].fill(b'y');
+                    Ok(n)
+                }
+                None => Err(std::io::Error::from(self.then)),
+            }
+        }
+    }
+
+    /// Bytes `final_drain` handed the sink, driving it directly.
+    ///
+    /// Directly, because through a real pipe it cannot be told apart from the main loop: the
+    /// reader thread races the caller's `stop`, and whichever wins, the bytes arrive and every
+    /// assertion passes. Ablating `final_drain` would leave those tests green.
+    fn drained(mut source: impl Read) -> String {
+        let collected = Collected::default();
+        let mut sink = collected.clone();
+        let mut chunk = [0u8; CHUNK];
+        final_drain(&mut source, &mut chunk, &mut sink);
+        collected.read().0
+    }
+
+    #[test]
+    fn the_final_drain_stops_at_the_cap_rather_than_reading_on() {
+        // The cap is the whole bound: a survivor that keeps writing must not be able to keep the
+        // drain fed, and the drain must not stop short of what a child actually left behind.
+        assert_eq!(drained(Endless).len(), FINAL_DRAIN);
+    }
+
+    #[test]
+    fn the_final_drain_ends_on_an_empty_pipe_rather_than_waiting() {
+        // The read is non-blocking, so `WouldBlock` is "nothing more right now" — the end of the
+        // drain. Treating it as a reason to wait would put teardown behind a survivor's silence.
+        assert_eq!(
+            drained(ThenErr {
+                first: Some(4),
+                then: ErrorKind::WouldBlock,
+            }),
+            "yyyy"
+        );
+    }
+
+    #[test]
+    fn the_final_drain_ends_at_eof() {
+        assert_eq!(
+            drained(ThenErr {
+                first: Some(2),
+                then: ErrorKind::UnexpectedEof,
+            }),
+            "yy"
+        );
     }
 
     #[test]

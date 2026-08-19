@@ -15,7 +15,8 @@ env:
 
 jobs:
   sweep:
-    # Named crates plus glass-proc-linux; the name matches the PR gate's, which the ruleset
+    # Named crates plus glass-proc-linux and glass-pipe-unix; the name matches the PR gate's,
+    # which the ruleset
     # requires by name.
     name: Mutation sweep shard ${{ matrix.shard }} (glass-core, glass-android, glass-x11, glass-exec-unix, glass-dbus-linux)
     runs-on: ubuntu-latest
@@ -45,7 +46,7 @@ jobs:
             --test-tool nextest \
             --package glass-core --package glass-android --package glass-x11 \
             --package glass-exec-unix --package glass-dbus-linux \
-            --package glass-proc-linux \
+            --package glass-proc-linux --package glass-pipe-unix \
             --shard ${{ matrix.shard }}/8 --sharding round-robin
       - name: Upload the outcome
         if: always()

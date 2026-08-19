@@ -32,6 +32,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_pipe_unix::LineTap;
+use std::os::fd::AsFd;
+
 use rustix::process::{Pid, Signal, kill_process};
 
 use glass_core::platform::{AppSpec, SandboxLevel};
@@ -347,12 +349,46 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Launch> {
     // `Stdio::piped()` guarantees these are `Some` immediately after a successful spawn.
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
-    let taps = vec![
-        tap_or_reap(stdout, Stream::Stdout, &logs, &mut child, spec)?,
-        tap_or_reap(stderr, Stream::Stderr, &logs, &mut child, spec)?,
-    ];
+    let taps = match (
+        tap_or_reap(
+            stdout,
+            Stream::Stdout,
+            "glass-app-stdout",
+            &logs,
+            &mut child,
+            spec,
+        ),
+        tap_or_reap(
+            stderr,
+            Stream::Stderr,
+            "glass-app-stderr",
+            &logs,
+            &mut child,
+            spec,
+        ),
+    ) {
+        (Ok(out), Ok(err)) => vec![out, err],
+        (out, err) => {
+            // The shim's boards outlive the process that was going to use them, and this is the
+            // first path that ends a `ClipLaunch` — `release_clip`'s doc requires every one of
+            // them to release, or they persist system-wide and a later session can read a stale
+            // `.ready` sentinel.
+            release_named_boards(clip.as_ref());
+            return Err(out.err().or(err.err()).expect("one of the two failed"));
+        }
+    };
 
     Ok(Launch { child, clip, taps })
+}
+
+/// Release the named pasteboards a shim launch created, for a launch that is being abandoned
+/// before the caller ever sees its [`ClipLaunch`]. `backend::release_clip` is the same call on the
+/// paths that do have one.
+fn release_named_boards(clip: Option<&ClipLaunch>) {
+    if let Some(c) = clip {
+        crate::clipboard::release_named(&c.name);
+        crate::clipboard::release_named(&format!("{}.ready", c.name));
+    }
 }
 
 /// What a direct spawn produced.
@@ -372,14 +408,15 @@ pub(crate) struct Launch {
 ///
 /// The failed start consumed the pipe, so its read end is already closed and the app's next write
 /// to that stream takes `SIGPIPE` — a death mid-run with nothing in the logs to say why.
-fn tap_or_reap<R: std::io::Read + std::os::fd::AsFd + Send + 'static>(
+fn tap_or_reap<R: std::io::Read + AsFd + Send + 'static>(
     stream: R,
     tag: Stream,
+    name: &str,
     logs: &LogSink,
     child: &mut Child,
     spec: &AppSpec,
 ) -> Result<LineTap> {
-    LineTap::start(stream, tag, logs.clone()).map_err(|e| {
+    LineTap::start(stream, tag, name, logs.clone()).map_err(|e| {
         terminate(child);
         GlassError::AppNotStarted(format!(
             "started {:?} but could not read its output ({e}); the app was stopped rather than \
@@ -677,13 +714,13 @@ mod tests {
     /// glass#477: the launch's readers are the caller's to end, and the last thing the app said
     /// survives that ending.
     ///
-    /// **What this covers and what it does not.** The fd-release property belongs to
-    /// `glass-pipe-unix` and is asserted by its own suite, which runs on this host too — macOS has
-    /// no cheap in-process equivalent of the `/proc/self/fd` check the Linux backends use, and
-    /// `spawn` is `pub(crate)`, so the assertion cannot move to its own test binary the way
-    /// theirs did. What is this crate's own to get right is the wiring: `spawn` hands the taps
-    /// back rather than detaching them, and the drain after the stop keeps what the app wrote on
-    /// its way out.
+    /// **What this covers and what it does not.** Not the fd release: that property is
+    /// `glass-pipe-unix`'s, and its assertion for it reads `/proc/self/fd`, so it is Linux-gated
+    /// and does not run here. Not the final drain either — `child.wait()` below returns long
+    /// after the reader has had the line through its ordinary loop, so ablating the drain leaves
+    /// this green; `glass-pipe-unix` drives that function directly instead. What is this crate's
+    /// own to get right, and what this pins, is the wiring: `spawn` hands the taps back rather
+    /// than detaching them, and stopping them joins rather than losing what the app already said.
     #[test]
     #[cfg(target_os = "macos")]
     fn a_launch_hands_back_taps_that_catch_the_apps_last_line() {
@@ -721,7 +758,7 @@ mod tests {
             .collect();
         assert!(
             said.iter().any(|line| line == "the last line"),
-            "the drain after the stop must keep the app's last line: {said:?}"
+            "stopping the taps must join, not lose what the app already wrote: {said:?}"
         );
     }
 

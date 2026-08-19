@@ -32,11 +32,11 @@ impl Lines {
 
     /// Feed the next read's bytes in.
     pub fn push(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            if *byte == b'\n' {
+        for &byte in bytes {
+            if byte == b'\n' {
                 self.emit();
             } else {
-                self.pending.push(*byte);
+                self.pending.push(byte);
             }
         }
     }
@@ -111,7 +111,9 @@ mod imp {
         ///
         /// `Err` is the host refusing the thread — `Builder`, where `thread::spawn` panics.
         /// `source` is consumed either way, so on `Err` the read end is already closed and the
-        /// app's next write to that stream is discarded rather than drained.
+        /// app's next write to that stream fails with `ERROR_BROKEN_PIPE` — the analogue of the
+        /// `EPIPE` the unix siblings name, and an error path for some runtimes rather than a
+        /// silent drop.
         pub(crate) fn start<R>(source: R, tag: Stream, logs: LogSink) -> std::io::Result<LogTap>
         where
             R: Read + AsRawHandle + Send + 'static,
@@ -120,15 +122,19 @@ mod imp {
             let stop = Arc::clone(&stopping);
             let reader = std::thread::Builder::new()
                 .name("glass-log-tap".into())
-                .spawn(move || {
-                    let mut lines = Lines::new(tag, logs);
-                    read_until_stopped(source, &stop, &mut lines);
-                    lines.flush();
-                })?;
+                .spawn(move || read_until_stopped(source, &stop, Lines::new(tag, logs)))?;
             Ok(LogTap {
                 stopping,
                 reader: Some(reader),
             })
+        }
+
+        /// Whether the reader has left and the sink has been flushed — the pipe broke, or
+        /// nothing more can be read from it.
+        pub(crate) fn is_done(&self) -> bool {
+            self.reader
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
         }
 
         /// Stop the reader and wait for it to go, which is what makes the pipe closed rather than
@@ -154,7 +160,10 @@ mod imp {
     impl std::fmt::Debug for LogTap {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("LogTap")
-                .field("running", &self.reader.is_some())
+                // The thread's own state, not whether the handle is still held: `reader` is taken
+                // only by `stop`, so `is_some` would report a reader that died an hour ago as
+                // running. Named as the unix tap names it, so the two read the same.
+                .field("done", &self.is_done())
                 .finish_non_exhaustive()
         }
     }
@@ -211,31 +220,55 @@ mod imp {
                 lines.push(&chunk[..n]);
                 Pumped::Read(n)
             }
+            // Nothing was taken, but nothing is wrong either — the peek said the bytes are there.
+            // Ending capture here would silence the app for the rest of its run over one signal;
+            // the unix reader treats the same case as a retry.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Pumped::Empty,
             Err(_) => Pumped::Ended,
         }
     }
 
-    /// Read `source` into `lines` until the pipe breaks or `stopping` says to.
+    /// Read `source` into `lines` until the pipe breaks or `stopping` says to, then tell `lines`
+    /// no more is coming.
+    ///
+    /// `lines` is taken by value and flushed here rather than by the caller: a last line that
+    /// never got its newline is only emitted by that flush, and a hand-call beside the loop is
+    /// one a refactor can drop with every test still green.
     fn read_until_stopped<R: Read + AsRawHandle>(
         mut source: R,
         stopping: &AtomicBool,
-        lines: &mut Lines,
+        mut lines: Lines,
     ) {
         let mut chunk = [0u8; CHUNK];
         while !stopping.load(Ordering::Acquire) {
-            match pump(&mut source, &mut chunk, CHUNK, lines) {
+            match pump(&mut source, &mut chunk, CHUNK, &mut lines) {
                 Pumped::Read(_) => continue,
                 Pumped::Empty => std::thread::sleep(IDLE),
-                Pumped::Ended => return,
+                Pumped::Ended => {
+                    lines.flush();
+                    return;
+                }
             }
         }
-        // Only reached via the flag. The loop above leaves without reading, so a teardown that
-        // stops the tap right after terminating the app would lose the last thing it wrote — the
-        // lines a failed teardown is most likely to need. Capped, so a survivor still writing
-        // cannot keep the drain fed for as long as it keeps going.
+        final_drain(&mut source, &mut chunk, &mut lines);
+        lines.flush();
+    }
+
+    /// Read what the pipe already holds, at most [`FINAL_DRAIN`] bytes, without waiting for more.
+    ///
+    /// Only reached via the stop flag: the loop above leaves without reading, so a teardown that
+    /// stops the tap right after terminating the app would lose the last thing it wrote — the
+    /// lines a failed teardown is most likely to need. The peek reports what is there right now,
+    /// so `Empty` ends the drain rather than being a reason to wait, and the cap is the other
+    /// half: a survivor still writing would otherwise keep it fed for as long as it kept going.
+    fn final_drain<R: Read + AsRawHandle>(
+        source: &mut R,
+        chunk: &mut [u8; CHUNK],
+        lines: &mut Lines,
+    ) {
         let mut taken = 0;
         while taken < FINAL_DRAIN {
-            match pump(&mut source, &mut chunk, FINAL_DRAIN - taken, lines) {
+            match pump(source, chunk, FINAL_DRAIN - taken, lines) {
                 Pumped::Read(n) => taken += n,
                 Pumped::Empty | Pumped::Ended => return,
             }
@@ -349,6 +382,39 @@ mod reader_tests {
             .spawn()
             .expect("cmd is runnable");
         (child, reader, writer)
+    }
+
+    #[test]
+    fn the_final_drain_is_bounded_against_a_writer_that_never_stops() {
+        // The drain reads what is already there; something still writing must not be able to keep
+        // handing it more and hold teardown open. The unix tap has the same test against a real
+        // survivor; here the writer is a thread, so it needs nothing wine will not detach.
+        let (reader, writer) = std::io::pipe().expect("a pipe");
+        let stop_writing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writing = {
+            let stop_writing = Arc::clone(&stop_writing);
+            std::thread::spawn(move || {
+                let mut writer = writer;
+                while !stop_writing.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::io::Write::write_all(&mut writer, b"noise\n").is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        let sink: LogSink = Arc::default();
+        let mut tap = LogTap::start(reader, Stream::Stdout, sink).expect("a reader");
+
+        let t0 = Instant::now();
+        tap.stop();
+        let took = t0.elapsed();
+
+        stop_writing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = writing.join();
+        assert!(
+            took < Duration::from_secs(5),
+            "the final drain must be capped, not run as long as somebody keeps writing: {took:?}"
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use glass_core::{AppSpec, Deadline, Platform, TEARDOWN_BUDGET};
 use rustix::process::{Pid, Signal, kill_process};
@@ -56,15 +57,17 @@ fn open_pipes() -> HashSet<String> {
 /// teardown — what glass#470 measures and reports as `leaked` — is a process that escaped both,
 /// which is what this builds. `setsid` covers the group, the subshell covers the tree.
 ///
-/// It prints the pid it left, so the test can kill what glass deliberately could not; the sleep
-/// self-limits well inside a suite run if that kill never happens.
+/// It prints the pid it left, so the test can kill what glass deliberately could not. The sleep
+/// self-limits if that kill never happens, and is long enough to outlive discovery plus the whole
+/// teardown budget on a loaded runner — a survivor that died first would take the pipes to EOF
+/// and turn this gate into a vacuous pass.
 fn spec_leaving_a_survivor() -> AppSpec {
     AppSpec {
         build: None,
         run: [
             "sh",
             "-c",
-            "printf 'complaint\\n' >&2; ( setsid sleep 10 & echo \"survivor $!\" ); sleep 30",
+            "printf 'complaint\\n' >&2; ( setsid sleep 60 & echo \"survivor $!\" ); sleep 30",
         ]
         .map(String::from)
         .to_vec(),
@@ -99,11 +102,19 @@ fn tearing_down_a_launch_releases_the_pipes_a_survivor_holds_open() {
     // Armed before the first assertion, so a failure still cleans up what glass could not.
     let _survivor = Survivor(survivor);
 
-    // Half the assertion, and what keeps the other half from passing vacuously: a launch whose
-    // output nobody read would leak nothing *because* it tapped nothing.
+    // Two vacuity guards, because either alone can go green for the wrong reason. A launch
+    // whose output nobody read would leak nothing *because* it tapped nothing...
     assert!(
         survivor.is_some(),
         "the tap must deliver what the app printed, but the log holds {said:?}"
+    );
+    // ...and a fixture that stopped leaving a *live* survivor would let the pipes reach EOF on
+    // their own, which the EOF-only reader this replaces would also have released. Then the
+    // assertion below would pass without covering glass#477 at all, and nothing would say so.
+    assert!(
+        survivor.is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists()),
+        "the fixture must leave a live survivor holding the write ends, or this gate proves \
+         nothing an EOF-only reader would not also pass"
     );
     let leaked: Vec<_> = open_pipes().difference(&before).cloned().collect();
     assert!(

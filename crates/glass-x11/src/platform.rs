@@ -1,3 +1,4 @@
+use std::os::fd::AsFd;
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -113,17 +114,23 @@ fn is_window_gone(err: &ReplyError) -> bool {
 ///
 /// The failed start consumed the pipe, so its read end is already closed and the app's next write
 /// to that stream takes `SIGPIPE` — a death mid-run with nothing in the logs to say why. Stopping
-/// it here is the honest failure, and the call `xvfb.rs` already makes for the X server's own
-/// stderr.
-fn tap_or_reap<R: std::io::Read + std::os::fd::AsFd + Send + 'static>(
+/// it here is the honest failure.
+///
+/// The group, not the leader: `command.rs` spawns the app with `process_group(0)` precisely so a
+/// teardown reaches the whole tree, and under a sandbox the leader is `bwrap` with the real app
+/// as its child. A leader-only reap would leave that child holding the write end of the very pipe
+/// this could not read. (`xvfb.rs` reaps the leader for the X server, which is *not* spawned into
+/// its own group — that is why it can.)
+fn tap_or_reap<R: std::io::Read + AsFd + Send + 'static>(
     stream: R,
     tag: Stream,
+    name: &str,
     logs: &LogSink,
     child: &mut Child,
     spec: &AppSpec,
 ) -> Result<LineTap> {
-    LineTap::start(stream, tag, logs.clone()).map_err(|e| {
-        glass_proc_linux::reap_graceful(child, glass_proc_linux::REAP_GRACE);
+    LineTap::start(stream, tag, name, logs.clone()).map_err(|e| {
+        glass_proc_linux::reap_group(child, glass_proc_linux::REAP_GRACE);
         GlassError::AppNotStarted(format!(
             "started {:?} but could not read its output ({e}); the app was stopped rather than \
              left to write into a pipe nobody drains — free up threads and file descriptors on \
@@ -328,26 +335,29 @@ impl X11Platform {
         let mut child = cmd
             .spawn()
             .map_err(|e| GlassError::AppNotStarted(format!("spawn {:?}: {e}", spec.run)))?;
-        let mut taps = Vec::new();
-        if let Some(out) = child.stdout.take() {
-            taps.push(tap_or_reap(
-                out,
+        // `Stdio::piped()` above guarantees both are `Some` after a successful spawn. Skipping a
+        // stream that is unexpectedly `None` would silently stop capturing it, which is the
+        // fallback this crate's contract forbids.
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+        self.taps = vec![
+            tap_or_reap(
+                stdout,
                 Stream::Stdout,
+                "glass-app-stdout",
                 &self.logs,
                 &mut child,
                 spec,
-            )?);
-        }
-        if let Some(err) = child.stderr.take() {
-            taps.push(tap_or_reap(
-                err,
+            )?,
+            tap_or_reap(
+                stderr,
                 Stream::Stderr,
+                "glass-app-stderr",
                 &self.logs,
                 &mut child,
                 spec,
-            )?);
-        }
-        self.taps = taps;
+            )?,
+        ];
         self.child = Some(child);
         Ok(())
     }

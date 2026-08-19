@@ -81,7 +81,7 @@ pub struct MacosPlatform {
     /// The launched child process, kept so `stop_app`/`Drop` can `process::terminate`
     /// it. `None` until `start_app` and after `stop_app` (idempotent).
     child: Option<Child>,
-    /// The launched app's stdout/stderr readers, dropped in `stop_app`/`Drop` once the child is
+    /// The launched app's stdout/stderr readers, cleared by `stop_app`/`Drop` once the child is
     /// terminated. The app's write ends are inherited by everything it spawns, so a reader that
     /// ended only at EOF would park on a survivor's pipe (glass#477). Empty until `start_app`,
     /// and for a LaunchServices-adopted app, which glass never gave a pipe.
@@ -471,6 +471,9 @@ impl MacosPlatform {
             }
         };
         self.child = None;
+        // With the child goes what read it. An adopted app was never given a pipe, so a tap left
+        // running here would file the *previous* launch's output into this session's logs.
+        self.taps.clear();
         // AppKit's pids are `i32` but always non-negative for a real process, so the cast to
         // `app_pid`'s `u32` is exact.
         self.app_pid = Some(pid as u32);
@@ -941,6 +944,10 @@ impl Drop for MacosPlatform {
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
         }
+        // Terminated first, so each tap's final drain sees what the app wrote on the way out.
+        // Explicit rather than left to field-drop order, so this path reads like `stop_app` and
+        // reordering two fields cannot silently change it.
+        self.taps.clear();
         // Release this session's named pasteboards too if `stop_app` didn't run (panic-unwind
         // or the process-exit backstop). `stop_app` sets `self.clip = None`, so this is a no-op
         // when it already ran; otherwise the boards would leak system-wide.

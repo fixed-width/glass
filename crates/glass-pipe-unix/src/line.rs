@@ -13,20 +13,23 @@ use crate::{ChunkSink, PipeTap};
 pub struct LineTap(PipeTap);
 
 impl LineTap {
-    /// Start reading `source`, filing each line into `sink` under `tag`.
+    /// Start reading `source`, filing each line into `sink` under `tag`. `name` names the reader
+    /// thread — a launch starts one per stream, and the name is what tells them apart in a
+    /// backtrace or a thread listing.
     ///
     /// `Err` is the host refusing the thread or the fds — see [`PipeTap::start`], whose failures
     /// these are. `source` is consumed either way.
     pub fn start<S, R>(
         source: R,
         tag: S,
+        name: &str,
         sink: Arc<Mutex<Vec<(S, String)>>>,
     ) -> std::io::Result<LineTap>
     where
         S: Copy + Send + 'static,
         R: Read + AsFd + Send + 'static,
     {
-        PipeTap::start(source, "glass-log-tap", Lines::new(tag, sink)).map(LineTap)
+        PipeTap::start(source, name, Lines::new(tag, sink)).map(LineTap)
     }
 
     /// Stop the reader and wait for it to go, releasing the pipe. Idempotent; `drop` runs it too.
@@ -37,6 +40,9 @@ impl LineTap {
 
 /// Splits what the pipe delivered into lines. Chunks arrive at pipe boundaries, so a line can
 /// span any number of them — `pending` is what has been seen of the line still open.
+///
+/// `glass-windows/src/logtap.rs` carries a twin of this, because that crate cannot link a
+/// `cfg(unix)` one. A decision made here about newlines, `\r` or invalid bytes belongs in both.
 struct Lines<S> {
     tag: S,
     sink: Arc<Mutex<Vec<(S, String)>>>,
@@ -73,11 +79,11 @@ impl<S: Copy> Lines<S> {
 
 impl<S: Copy> ChunkSink for Lines<S> {
     fn chunk(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            if *byte == b'\n' {
+        for &byte in bytes {
+            if byte == b'\n' {
                 self.emit();
             } else {
-                self.pending.push(*byte);
+                self.pending.push(byte);
             }
         }
     }
@@ -95,11 +101,10 @@ impl<S: Copy> ChunkSink for Lines<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
-    use std::process::{ChildStderr, Command, Stdio};
+    use std::process::ChildStderr;
     use std::time::{Duration, Instant};
 
-    use rustix::process::{Pid, Signal, kill_process};
+    use crate::testsup::{Survivor, child_with_survivor};
 
     /// Stands in for `glass_core::logbuf::Stream`, which this crate does not depend on.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,41 +112,18 @@ mod tests {
         Out,
     }
 
-    /// A process holding the pipe after the child that made it is gone; killed with the test.
-    struct Survivor(Option<u32>);
-
-    impl Drop for Survivor {
-        fn drop(&mut self) {
-            if let Some(pid) = self.0.and_then(|p| Pid::from_raw(p as i32)) {
-                let _ = kill_process(pid, Signal::KILL);
-            }
-        }
-    }
-
-    /// Run `script`, which must print the pid it backgrounded on stdout, and return its stderr
-    /// pipe plus a guard for the survivor.
+    /// `script`'s stderr pipe, plus a guard for the survivor holding it open.
     fn stderr_of(script: &str) -> (ChildStderr, Survivor) {
-        let mut c = Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("sh is runnable");
-        let mut pid = String::new();
-        let read = BufReader::new(c.stdout.take().expect("piped stdout")).read_line(&mut pid);
-        let survivor = Survivor(pid.trim().parse().ok());
-        read.expect("sh reports the pid it backgrounded");
-        assert!(survivor.0.is_some(), "sh reported {pid:?}, not a pid");
-        c.wait().expect("the child exits, the survivor does not");
-        (c.stderr.take().expect("piped stderr"), survivor)
+        let (mut child, survivor) = child_with_survivor(script);
+        (child.stderr.take().expect("piped stderr"), survivor)
     }
 
     /// What the tap filed after being stopped with the survivor still holding the pipe.
     fn lines_after_stopping(script: &str) -> Vec<(Tag, String)> {
         let (stderr, _survivor) = stderr_of(script);
         let sink: Arc<Mutex<Vec<(Tag, String)>>> = Arc::default();
-        let mut tap = LineTap::start(stderr, Tag::Out, Arc::clone(&sink)).expect("a reader");
+        let mut tap =
+            LineTap::start(stderr, Tag::Out, "test-log-tap", Arc::clone(&sink)).expect("a reader");
         tap.stop();
         sink.lock().expect("sink").clone()
     }
@@ -231,7 +213,7 @@ mod tests {
     fn stop_is_bounded_when_a_survivor_holds_the_pipe() {
         let (stderr, _survivor) = stderr_of("printf 'one\\n' >&2; sleep 30 & echo $!");
         let sink: Arc<Mutex<Vec<(Tag, String)>>> = Arc::default();
-        let mut tap = LineTap::start(stderr, Tag::Out, sink).expect("a reader");
+        let mut tap = LineTap::start(stderr, Tag::Out, "test-log-tap", sink).expect("a reader");
 
         let t0 = Instant::now();
         tap.stop();

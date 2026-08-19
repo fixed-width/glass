@@ -7,7 +7,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-# Non-blocking mode, the self-pipe wakeup, and the poll that waits on both at once.
+# Non-blocking mode, the write that rings the self-pipe wakeup, and the poll that waits on the
+# pipe and the wakeup at once. The wakeup pipe itself comes from std — see `tap.rs`.
 rustix.workspace = true
 
 [lints]

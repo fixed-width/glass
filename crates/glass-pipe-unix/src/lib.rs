@@ -15,6 +15,8 @@
 
 mod line;
 mod tap;
+#[cfg(test)]
+mod testsup;
 
 pub use line::LineTap;
 pub use tap::{ChunkSink, PipeTap};
