@@ -580,7 +580,14 @@ mod tests {
     /// the aggregator puts that check and what softening does to it, not about its wording, which
     /// is `glass-ios`'s to test.
     fn companion_fixture(status: CheckStatus) -> Check {
-        Check::new("idb_companion", status, "idb_companion").with_remedy(COMPANION_REMEDY)
+        let c = Check::new("idb_companion", status, "idb_companion");
+        // Production never puts a remedy on an Ok check, and these tests assert remedies survive
+        // softening — so the fixture carries one only where production would.
+        if status == CheckStatus::Ok {
+            c
+        } else {
+            c.with_remedy(COMPANION_REMEDY)
+        }
     }
 
     /// The fixture's remedy — any string, asserted only to survive softening.
@@ -854,9 +861,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_companion_fails_the_ios_verdict() {
-        // A Fail companion check in the ios section must escalate the overall verdict to Fail
-        // (exit code 1) when ios is the backend — iOS is unusable without the companion.
+    fn a_failing_ios_check_fails_the_verdict() {
+        // A Fail in the ios section must escalate the overall verdict to Fail (exit code 1) when
+        // ios is the backend. That an absent companion IS such a Fail is glass-ios's to prove
+        // (`a_companion_that_is_nowhere_points_at_the_install`); this pins only the escalation.
         let ios = Section::new(
             "ios",
             Some("ios".into()),

@@ -1,7 +1,7 @@
 //! Spawns and owns the `idb_companion` process bound to one simulator UDID, and
 //! exposes the Unix socket it serves gRPC on. Killing the child on Drop reaps it
 //! (Child::drop does NOT kill), mirroring glass-android's AgentRegistry lifetime.
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -21,7 +21,7 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How long to wait for the companion to open its socket before giving up.
 const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Standard Homebrew `idb_companion` locations, probed when it is not on `PATH`. A `.app` or
+/// Standard Homebrew `idb_companion` locations, probed when `$PATH` yields no runnable copy. A `.app` or
 /// LaunchAgent glass is launched by launchd with a minimal `PATH` that omits Homebrew's bindir,
 /// so a `brew install idb-companion` would otherwise be invisible and input/accessibility would
 /// go dark with no way for the user to fix it short of setting an env var. Apple-silicon prefix
@@ -35,10 +35,74 @@ const HOMEBREW_COMPANION_PATHS: [&str; 2] = [
 const COMPANION_ENV: &str = "GLASS_IDB_COMPANION";
 /// The companion's program name, looked up on `$PATH` when nothing names it outright.
 const COMPANION_BIN: &str = "idb_companion";
+/// The install, tap first — `idb_companion` is not in Homebrew core.
+pub(crate) const INSTALL_REMEDY: &str =
+    "brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion";
 
-/// What glass knows about this host's `idb_companion`: the resolution, and whether
-/// `GLASS_IDB_COMPANION` decided it. A struct rather than loose arguments so the two cannot be
-/// handed over in the wrong order.
+/// Why there is no companion to run. Two fields: the doctor prints cause and fix in separate
+/// columns, the launch path joins them into one message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoCompanion {
+    pub(crate) cause: String,
+    pub(crate) remedy: String,
+}
+
+impl NoCompanion {
+    fn not_executable(p: &Path) -> NoCompanion {
+        NoCompanion {
+            cause: format!("idb_companion at {} is not executable", p.display()),
+            remedy: "restore its execute bit (`chmod +x`), or point GLASS_IDB_COMPANION at a \
+                     runnable binary"
+                .into(),
+        }
+    }
+
+    /// An override skips discovery, so another install would not be looked at either.
+    fn override_names_nothing() -> NoCompanion {
+        NoCompanion {
+            cause: "GLASS_IDB_COMPANION does not name a runnable idb_companion".into(),
+            remedy: "point GLASS_IDB_COMPANION at a runnable idb_companion, or unset it to \
+                     search PATH and Homebrew's standard prefixes"
+                .into(),
+        }
+    }
+
+    fn absent() -> NoCompanion {
+        NoCompanion {
+            cause: "idb_companion not found".into(),
+            remedy: INSTALL_REMEDY.into(),
+        }
+    }
+
+    /// A bare name is all `$PATH` can resolve, and there is no `$PATH`.
+    fn override_needs_a_path() -> NoCompanion {
+        NoCompanion {
+            cause: "GLASS_IDB_COMPANION names a bare command, and PATH is unset in glass's \
+                    environment"
+                .into(),
+            remedy: "set GLASS_IDB_COMPANION to an absolute path".into(),
+        }
+    }
+
+    fn no_search_path() -> NoCompanion {
+        NoCompanion {
+            cause: "idb_companion could not be looked up — PATH is unset in glass's environment"
+                .into(),
+            remedy: format!(
+                "set GLASS_IDB_COMPANION to its absolute path, give glass a PATH to search, or \
+                 install it: {INSTALL_REMEDY}"
+            ),
+        }
+    }
+
+    /// Cause and fix in one string, for the launch path's single error message.
+    fn message(&self) -> String {
+        format!("{} — {}", self.cause, self.remedy)
+    }
+}
+
+/// What glass knows about this host's `idb_companion`, from one read of the environment.
+#[derive(Debug)]
 pub(crate) struct CompanionFacts {
     /// This host's `idb_companion`, or why there is none.
     pub(crate) resolved: Resolved,
@@ -48,72 +112,57 @@ pub(crate) struct CompanionFacts {
 }
 
 impl CompanionFacts {
-    /// Read the environment once, and resolve from it.
-    pub(crate) fn gather(get: &dyn Fn(&str) -> Option<String>) -> CompanionFacts {
+    /// Resolve from one read of the environment, so the two fields cannot describe different
+    /// moments — `override_set` is true exactly when the resolution took the override branch.
+    pub(crate) fn gather(get: &dyn Fn(&str) -> Option<OsString>) -> CompanionFacts {
+        // An override set to "" is how a wrapper clears it, and a non-UTF-8 value cannot be a
+        // program token `exec` would take; neither is an override.
+        let over = get(COMPANION_ENV)
+            .and_then(|v| v.into_string().ok())
+            .filter(|s| !s.is_empty());
         CompanionFacts {
-            resolved: resolve_companion(get),
-            override_set: get(COMPANION_ENV).is_some_and(|s| !s.is_empty()),
+            override_set: over.is_some(),
+            resolved: resolve_companion_with(over, get("PATH"), &HOMEBREW_COMPANION_PATHS),
         }
     }
 
     /// The binary to hand `Command::new`, or why there is none.
     ///
     /// A binary glass cannot run is refused here, not exec'd: `exec` comes back with a bare
-    /// `EACCES` where the resolution already knows the file and the fix. One mapping, so the
-    /// preflight and the bring-up cannot disagree.
-    pub(crate) fn spawn_target(&self) -> std::result::Result<&Path, String> {
+    /// `EACCES` where the resolution already knows the file and the fix. The doctor renders the
+    /// same [`NoCompanion`], so the preflight and the bring-up cannot disagree.
+    pub(crate) fn spawn_target(&self) -> std::result::Result<&Path, NoCompanion> {
         match &self.resolved {
             Resolved::Found(p) => Ok(p),
-            Resolved::NotExecutable(p) => Err(format!(
-                "idb_companion at {} is not executable — chmod +x it, or point \
-                 GLASS_IDB_COMPANION at a runnable binary",
-                p.display()
-            )),
-            // An override skips discovery, so installing another copy would not be read either.
-            Resolved::Absent if self.override_set => Err(
-                "GLASS_IDB_COMPANION does not name a runnable idb_companion — point it at one, \
-                 or unset it to search PATH and Homebrew's standard prefixes"
-                    .into(),
-            ),
-            Resolved::Absent => Err(
-                "idb_companion not found (install: brew install idb-companion), or set \
-                 GLASS_IDB_COMPANION to its path"
-                    .into(),
-            ),
-            Resolved::NoSearchPath => Err(
-                "idb_companion could not be looked up — PATH is unset in glass's environment; \
-                 set GLASS_IDB_COMPANION to its path"
-                    .into(),
-            ),
+            Resolved::NotExecutable(p) => Err(NoCompanion::not_executable(p)),
+            Resolved::Absent if self.override_set => Err(NoCompanion::override_names_nothing()),
+            Resolved::Absent => Err(NoCompanion::absent()),
+            Resolved::NoSearchPath if self.override_set => {
+                Err(NoCompanion::override_needs_a_path())
+            }
+            Resolved::NoSearchPath => Err(NoCompanion::no_search_path()),
         }
     }
 }
 
-/// This host's `idb_companion`, or why there is none.
-///
-/// One resolution, shared by the runtime spawn and `glass doctor`: a second lookup would let
-/// one run answer both "present" and "not found" about one file (glass#391).
-fn resolve_companion(get: &dyn Fn(&str) -> Option<String>) -> Resolved {
-    resolve_companion_with(get(COMPANION_ENV), get("PATH"), &HOMEBREW_COMPANION_PATHS)
-}
-
-/// [`resolve_companion`] against explicit inputs — the testable seam. The Homebrew prefixes are
-/// injected too, so a test cannot be answered by the developer's own `brew install`.
+/// [`CompanionFacts::gather`]'s resolution against explicit inputs — the testable seam. The
+/// Homebrew prefixes are injected too, so a test cannot be answered by the developer's own
+/// `brew install`. `override_value` is already normalised: `Some` means an override is in force.
 ///
 /// `GLASS_IDB_COMPANION` names the companion outright and is never searched for among
 /// `fallbacks`, though a bare name still goes through `$PATH`; discovery walks `$PATH` first and
 /// `fallbacks` only once it runs dry.
 fn resolve_companion_with(
     override_value: Option<String>,
-    path: Option<String>,
+    path: Option<OsString>,
     fallbacks: &[&str],
 ) -> Resolved {
-    if let Some(bin) = override_value.filter(|s| !s.is_empty()) {
-        return resolve_bin(&bin, path.as_deref().map(OsStr::new));
+    if let Some(bin) = override_value {
+        return resolve_bin(&bin, path.as_deref());
     }
     let mut first_unrunnable = None;
     let mut nothing_to_search = false;
-    for resolved in std::iter::once(resolve_bin(COMPANION_BIN, path.as_deref().map(OsStr::new)))
+    for resolved in std::iter::once(resolve_bin(COMPANION_BIN, path.as_deref()))
         .chain(fallbacks.iter().map(|c| resolve_path(Path::new(c))))
     {
         match resolved {
@@ -127,6 +176,8 @@ fn resolve_companion_with(
         }
     }
     match (first_unrunnable, nothing_to_search) {
+        // A file the user can act on outranks the missing search list, and the remedy's second
+        // clause covers a copy that a `$PATH` would have found.
         (Some(p), _) => Resolved::NotExecutable(p),
         // No `$PATH` to walk and nothing in the standard prefixes: the companion may well be
         // installed somewhere glass was never told to look (glass#373).
@@ -173,8 +224,10 @@ impl IdbCompanion {
     /// or a socket that never comes up leaves no child behind: both paths
     /// kill + reap before returning `Err`.
     pub fn spawn(udid: &str) -> Result<IdbCompanion> {
-        let facts = CompanionFacts::gather(&|k| std::env::var(k).ok());
-        let bin = facts.spawn_target().map_err(GlassError::Backend)?;
+        let facts = CompanionFacts::gather(&|k| std::env::var_os(k));
+        let bin = facts
+            .spawn_target()
+            .map_err(|no| GlassError::Backend(no.message()))?;
         Self::spawn_bin(udid, bin)
     }
 
@@ -225,9 +278,14 @@ impl IdbCompanion {
             .spawn()
             .map_err(|e| {
                 let _ = std::fs::remove_file(&stderr_log);
-                // No install hint: resolution already refused a companion that is missing or
-                // unrunnable, so what lands here is a binary that changed underneath it.
-                GlassError::Backend(format!("spawn {}: {e}", bin.display()))
+                // Resolution asked `access(X_OK)`, which answers permission and not whether
+                // the file is a loadable image — an x86_64 companion from the Intel prefix on an
+                // arm64 Mac without Rosetta resolves and fails here — so this keeps a remedy.
+                GlassError::Backend(format!(
+                    "spawn {}: {e} — the binary resolved but did not start; check it matches \
+                     this Mac's architecture, or reinstall it: {INSTALL_REMEDY}",
+                    bin.display()
+                ))
             })?;
         let mut this = IdbCompanion {
             child,
@@ -334,6 +392,7 @@ fn socket_ready(sock: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt;
 
     /// A directory holding `name` at `mode`. Real files at real modes, because resolution asks
@@ -347,14 +406,19 @@ mod tests {
         dir
     }
 
-    /// A `$PATH`-style value naming `dirs`, in the `String` shape the env getter yields.
-    fn path_of(dirs: &[&Path]) -> Option<String> {
-        Some(
-            std::env::join_paths(dirs)
-                .expect("join paths")
-                .into_string()
-                .expect("utf-8 temp paths"),
-        )
+    /// A `$PATH`-style value naming `dirs`.
+    fn path_of(dirs: &[&Path]) -> Option<OsString> {
+        Some(std::env::join_paths(dirs).expect("join paths"))
+    }
+
+    /// An env getter over a fixed set of pairs, in the shape [`CompanionFacts::gather`] reads.
+    fn env<'a>(pairs: &'a [(&'a str, &'a OsStr)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.to_os_string())
+        }
     }
 
     /// The `fallbacks` entry naming `dir`'s companion.
@@ -465,12 +529,53 @@ mod tests {
         );
     }
 
-    /// An unset `GLASS_IDB_COMPANION` and one set to the empty string mean the same thing.
+    /// An unset `GLASS_IDB_COMPANION` and one set to the empty string mean the same thing — and
+    /// both fields have to say so, or the doctor blames a variable that decided nothing.
     #[test]
-    fn an_empty_override_falls_through_to_discovery() {
+    fn an_empty_override_is_not_an_override() {
         let dir = dir_with(COMPANION_BIN, 0o755);
+        let facts = CompanionFacts::gather(&env(&[
+            (COMPANION_ENV, OsStr::new("")),
+            ("PATH", dir.path().as_os_str()),
+        ]));
+        assert!(!facts.override_set, "an empty override is not one");
         assert_eq!(
-            resolve_companion_with(Some(String::new()), path_of(&[dir.path()]), &[]),
+            facts.resolved,
+            Resolved::Found(dir.path().join(COMPANION_BIN)),
+            "discovery must have run"
+        );
+    }
+
+    /// The gathering wiring: `$PATH` really is the list discovery walks, and a set override
+    /// really does record itself.
+    #[test]
+    fn gather_walks_the_path_it_was_given_and_records_a_set_override() {
+        let dir = dir_with(COMPANION_BIN, 0o755);
+        let found = CompanionFacts::gather(&env(&[("PATH", dir.path().as_os_str())]));
+        assert_eq!(
+            found.resolved,
+            Resolved::Found(dir.path().join(COMPANION_BIN))
+        );
+        assert!(!found.override_set);
+
+        let bin = dir.path().join(COMPANION_BIN);
+        let overridden = CompanionFacts::gather(&env(&[(COMPANION_ENV, bin.as_os_str())]));
+        assert!(overridden.override_set);
+        assert_eq!(overridden.resolved, Resolved::Found(bin));
+    }
+
+    /// A `$PATH` that is not UTF-8 is still a search list. Reading it as a `String` would drop it
+    /// and report "PATH is unset", a claim the walk never established.
+    #[test]
+    fn a_non_utf8_path_is_still_searched() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = dir_with(COMPANION_BIN, 0o755);
+        let mut raw = dir.path().as_os_str().to_os_string();
+        raw.push(OsStr::from_bytes(b":/\xff\xfe"));
+        let facts = CompanionFacts::gather(&env(&[("PATH", &raw)]));
+        assert_eq!(
+            facts.resolved,
             Resolved::Found(dir.path().join(COMPANION_BIN))
         );
     }
@@ -532,6 +637,18 @@ mod tests {
         );
     }
 
+    /// Both facts are observed at once: no `$PATH` to search AND an unrunnable copy in a prefix.
+    /// The file the user can act on wins — reporting "PATH is unset" would send them to fix an
+    /// environment when there is a companion right there to `chmod`.
+    #[test]
+    fn an_unrunnable_prefix_copy_outranks_a_missing_search_list() {
+        let brew = dir_with(COMPANION_BIN, 0o644);
+        assert_eq!(
+            resolve_companion_with(None, None, &[&candidate(&brew)]),
+            Resolved::NotExecutable(brew.path().join(COMPANION_BIN))
+        );
+    }
+
     /// A companion found in a prefix answers the question outright, so a missing `$PATH` is not
     /// worth reporting.
     #[test]
@@ -551,6 +668,14 @@ mod tests {
         }
     }
 
+    /// Gathered facts for a resolution `GLASS_IDB_COMPANION` decided.
+    fn overridden(resolved: Resolved) -> CompanionFacts {
+        CompanionFacts {
+            resolved,
+            override_set: true,
+        }
+    }
+
     #[test]
     fn the_spawn_runs_the_binary_resolution_found() {
         let bin = PathBuf::from("/opt/homebrew/bin/idb_companion");
@@ -564,53 +689,98 @@ mod tests {
     /// resolution already knows the file and the fix.
     #[test]
     fn a_companion_it_cannot_run_is_refused_by_name_rather_than_spawned() {
-        let why = discovered(Resolved::NotExecutable(PathBuf::from(
+        let no = discovered(Resolved::NotExecutable(PathBuf::from(
             "/usr/local/bin/idb_companion",
         )))
         .spawn_target()
         .expect_err("an unrunnable companion must not be spawned");
         assert!(
-            why.contains("/usr/local/bin/idb_companion") && why.contains("chmod +x"),
-            "must name the file and the permission fix: {why}"
+            no.cause.contains("/usr/local/bin/idb_companion"),
+            "the cause must name the file: {}",
+            no.cause
+        );
+        assert!(
+            no.remedy.contains("chmod +x"),
+            "the remedy must be the permission fix: {}",
+            no.remedy
         );
     }
 
     #[test]
     fn a_companion_that_is_nowhere_is_refused_with_the_install() {
-        let why = discovered(Resolved::Absent)
+        let no = discovered(Resolved::Absent)
             .spawn_target()
             .expect_err("a missing companion cannot be spawned");
+        assert_eq!(no.remedy, INSTALL_REMEDY);
+    }
+
+    /// The tap comes first — `idb_companion` is not in Homebrew core, so a bare
+    /// `brew install idb-companion` fails. The launch path and the doctor must not differ on it.
+    #[test]
+    fn the_install_the_launch_path_names_is_the_one_the_doctor_names() {
         assert!(
-            why.contains("brew install idb-companion"),
-            "must name the install: {why}"
+            INSTALL_REMEDY.contains("brew tap facebook/fb"),
+            "the install must tap first: {INSTALL_REMEDY}"
         );
     }
 
     /// An override skips discovery, so an install the user has not pointed it at is not the fix.
     #[test]
     fn an_override_that_names_nothing_is_refused_by_naming_the_variable() {
-        let why = CompanionFacts {
-            resolved: Resolved::Absent,
-            override_set: true,
-        }
-        .spawn_target()
-        .expect_err("an override naming nothing cannot be spawned");
+        let no = overridden(Resolved::Absent)
+            .spawn_target()
+            .expect_err("an override naming nothing cannot be spawned");
         assert!(
-            why.contains("GLASS_IDB_COMPANION"),
-            "must name the variable that decided this: {why}"
+            no.cause.contains("GLASS_IDB_COMPANION"),
+            "must name the variable that decided this: {}",
+            no.cause
         );
         assert!(
-            !why.contains("brew install"),
-            "installing another copy would not be read while the override stands: {why}"
+            !no.remedy.contains("brew install"),
+            "installing another copy would not be read while the override stands: {}",
+            no.remedy
         );
     }
 
     #[test]
     fn a_companion_that_could_not_be_looked_up_is_refused_by_naming_path() {
-        let why = discovered(Resolved::NoSearchPath)
+        let no = discovered(Resolved::NoSearchPath)
             .spawn_target()
             .expect_err("nothing was looked up, so nothing can be spawned");
-        assert!(why.contains("PATH"), "must name the unset PATH: {why}");
+        assert!(
+            no.cause.contains("PATH"),
+            "must name the unset PATH: {}",
+            no.cause
+        );
+    }
+
+    /// A bare-name override with no `$PATH` is the one way an override reaches `NoSearchPath`.
+    /// "Set GLASS_IDB_COMPANION" is what they already did; an absolute path is the fix.
+    #[test]
+    fn a_bare_name_override_with_no_path_asks_for_an_absolute_path() {
+        let no = overridden(Resolved::NoSearchPath)
+            .spawn_target()
+            .expect_err("a bare name with no PATH resolves to nothing");
+        assert!(
+            no.cause.contains("GLASS_IDB_COMPANION"),
+            "must name the variable it searched for: {}",
+            no.cause
+        );
+        assert!(
+            no.remedy.contains("absolute path"),
+            "must ask for an absolute path, not for the variable they already set: {}",
+            no.remedy
+        );
+    }
+
+    /// The launch path gets one string, so it has to carry the fix as well as the cause.
+    #[test]
+    fn the_launch_message_joins_the_cause_to_its_remedy() {
+        let no = discovered(Resolved::Absent)
+            .spawn_target()
+            .expect_err("a missing companion cannot be spawned");
+        let msg = no.message();
+        assert!(msg.contains(&no.cause) && msg.contains(&no.remedy), "{msg}");
     }
 
     #[test]
@@ -663,9 +833,8 @@ mod tests {
         .expect("write stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        // Name the stub directly — never through this process's real env, which would race
-        // parallel tests. A short ready deadline keeps the never-served socket from costing the
-        // full production timeout.
+        // A short ready deadline keeps the never-served socket from costing the full
+        // production timeout.
         const READY: Duration = Duration::from_millis(500);
         // A unique udid keeps this test's socket file name from colliding with another test
         // in the same process (the socket path is keyed on the udid prefix + this pid).

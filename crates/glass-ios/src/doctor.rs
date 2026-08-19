@@ -1,9 +1,10 @@
-//! `glass doctor` checks for the iOS Simulator backend: is a full Xcode install active,
-//! does `xcrun simctl` work, is at least one iOS runtime downloaded, and is the target glass would
-//! resolve at start actually driveable?
+//! `glass doctor` checks for the iOS Simulator backend: is a full Xcode install active, does
+//! `xcrun simctl` work, is at least one iOS runtime downloaded, is the target glass would resolve
+//! at start actually driveable, and is there an `idb_companion` glass can run?
 //!
-//! Pure `build_checks(&Probe)` over observed state, plus the thin subprocess-probing
-//! `checks(deep)` entry point the aggregator calls.
+//! Two entry points for the aggregator: `checks(deep)`, the thin subprocess-probing wrapper over
+//! the pure `build_checks(&Probe)`, and `companion_check(deep)`, which carries the iOS backend's
+//! only expensive probe.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -13,7 +14,7 @@ use glass_core::{Check, CheckStatus, GlassError};
 use glass_exec_unix::Resolved;
 
 use crate::device::{Resolve, SimDevice, parse_devices, resolve};
-use crate::idb::companion::{CompanionFacts, IdbCompanion};
+use crate::idb::companion::{CompanionFacts, INSTALL_REMEDY, IdbCompanion};
 use crate::simctl::Simctl;
 use crate::target::wants;
 
@@ -185,7 +186,8 @@ const PROBE_BUDGET: Duration = Duration::from_secs(10);
 /// Build the iOS doctor checks by probing the host with real `xcrun`/`xcode-select`
 /// calls. Best-effort: a missing tool simply makes the corresponding check report
 /// not-ok with a remedy, rather than failing this function. `_deep` is accepted for
-/// signature parity with the other backends' doctors; iOS has no expensive deep probe.
+/// signature parity with the other backends' doctors; iOS's only deep probe is
+/// [`companion_check`].
 pub fn checks(_deep: bool) -> Vec<Check> {
     // Bounded like every other one-shot: doctor's job is to report, and a doctor that hangs on a
     // wedged tool reports nothing at all. A timeout lands in the same `None` as a missing tool,
@@ -301,7 +303,13 @@ fn self_test_with(bin: &Path) -> CompanionProbe {
                 ));
             }
             Ok(None) => std::thread::sleep(SELF_TEST_POLL),
-            Err(e) => break CompanionProbe::SelfTestFailed(format!("try_wait: {e}")),
+            // Reap before giving up: a wait glass could not make is no reason to leave the
+            // child running for the life of the server.
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break CompanionProbe::SelfTestFailed(format!("try_wait: {e}"));
+            }
         }
     }
     // `log` (a `NamedTempFile`) removes its file on drop here.
@@ -315,19 +323,20 @@ fn read_trimmed(path: &Path) -> Option<String> {
 }
 
 /// Whether this host has an `idb_companion` glass can actually run — the gate on the iOS
-/// input and accessibility capabilities.
+/// input and accessibility capabilities. The launch path's own verdict, not a second reading of
+/// the resolution that could disagree with it.
 pub(crate) fn companion_runnable() -> bool {
-    matches!(gather().resolved, Resolved::Found(_))
+    gather().spawn_target().is_ok()
 }
 
 /// What this host has, read from the real environment.
 fn gather() -> CompanionFacts {
-    CompanionFacts::gather(&|k| std::env::var(k).ok())
+    CompanionFacts::gather(&|k| std::env::var_os(k))
 }
 
 /// The `idb_companion` line for `glass doctor`, and — with `deep` — the health probe behind it.
 ///
-/// `deep` costs a real companion start, which is why the aggregator gates it on iOS being the
+/// `deep` can cost a real companion start, which is why the aggregator gates it on iOS being the
 /// selected backend while emitting the line either way.
 pub fn companion_check(deep: bool) -> Check {
     check_for(&gather(), deep, probe_companion)
@@ -343,92 +352,58 @@ fn check_for(
     match &facts.resolved {
         // Only a runnable binary is worth starting: probing any other outcome would report a
         // spawn failure whose cause is the resolution the check already has in hand.
-        Resolved::Found(bin) if deep => deep_check(&probe(bin)),
+        Resolved::Found(bin) if deep => deep_check(bin, &probe(bin)),
         _ => resolution_check(facts),
     }
 }
 
-/// The shared `idb_companion` install remedy.
-const INSTALL_REMEDY: &str =
-    "brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion";
-
-/// Pure: what a resolution means for the operator.
+/// Pure: what a resolution means for the operator, rendering the launch path's own
+/// [`NoCompanion`] so the two cannot drift about the same file.
 ///
 /// A companion glass cannot run is a **Fail**, not a Warn: unlike android, which keeps barebones
 /// function without its companions, iOS cannot drive apps at all without this one. The aggregator
 /// softens that to a Warn when iOS is not the selected backend.
 fn resolution_check(facts: &CompanionFacts) -> Check {
-    match &facts.resolved {
-        Resolved::Found(p) => Check::new(
+    match facts.spawn_target() {
+        Ok(p) => Check::new(
             "idb_companion",
             CheckStatus::Ok,
             format!("{} — input + accessibility are available", p.display()),
         ),
-        // It is installed; what it needs is permission, not another `brew install`.
-        Resolved::NotExecutable(p) => Check::new(
+        Err(no) => Check::new(
             "idb_companion",
             CheckStatus::Fail,
             format!(
-                "{} — not executable; input + accessibility are unavailable (iOS cannot drive apps)",
-                p.display()
+                "{} — input + accessibility are unavailable (iOS cannot drive apps)",
+                no.cause
             ),
         )
-        .with_remedy(format!(
-            "chmod +x {}, or point GLASS_IDB_COMPANION at a runnable binary",
-            p.display()
-        )),
-        // An override skips discovery, so the variable — not what this host has installed —
-        // is what left glass with nothing.
-        Resolved::Absent if facts.override_set => Check::new(
-            "idb_companion",
-            CheckStatus::Fail,
-            "GLASS_IDB_COMPANION does not name a runnable idb_companion — input + accessibility \
-             are unavailable (iOS cannot drive apps)",
-        )
-        .with_remedy(
-            "point GLASS_IDB_COMPANION at a runnable idb_companion, or unset it to search PATH \
-             and Homebrew's standard prefixes",
-        ),
-        Resolved::Absent => not_found_check(),
-        // Nothing was looked up, so "not found" would be a claim this check never established
-        // (glass#373).
-        Resolved::NoSearchPath => Check::new(
-            "idb_companion",
-            CheckStatus::Fail,
-            "idb_companion could not be looked up — PATH is unset in glass's environment",
-        )
-        .with_remedy(format!(
-            "set GLASS_IDB_COMPANION to its absolute path, give glass a PATH to search, or \
-             install it: {INSTALL_REMEDY}"
-        )),
+        .with_remedy(no.remedy),
     }
-}
-
-/// The Fail for a companion that is nowhere to be found.
-fn not_found_check() -> Check {
-    Check::new(
-        "idb_companion",
-        CheckStatus::Fail,
-        "idb_companion not found — input + accessibility are unavailable (iOS cannot drive apps)",
-    )
-    .with_remedy(INSTALL_REMEDY)
 }
 
 /// Pure: what a `--deep` probe proved. Broken (`FailedToStart`/`SelfTestFailed`) ⇒ Fail: iOS
 /// cannot drive apps without the companion. Unverified (`SelfTestOk` — the binary runs but no
 /// booted simulator was available to exercise a real start) ⇒ Warn.
-fn deep_check(probe: &CompanionProbe) -> Check {
+fn deep_check(bin: &Path, probe: &CompanionProbe) -> Check {
     match probe {
+        // The failure arms name the binary through their cause, which the spawn error carries.
         CompanionProbe::Started => Check::new(
             "idb_companion",
             CheckStatus::Ok,
-            "started and served its gRPC socket — input + accessibility are available",
+            format!(
+                "{} started and served its gRPC socket — input + accessibility are available",
+                bin.display()
+            ),
         ),
         CompanionProbe::SelfTestOk => Check::new(
             "idb_companion",
             CheckStatus::Warn,
-            "binary runs, but no booted simulator was available to verify a real start — \
-             boot one and re-run with --deep to exercise the companion",
+            format!(
+                "{} runs, but no booted simulator was available to verify a real start — boot \
+                 one and re-run with --deep to exercise the companion",
+                bin.display()
+            ),
         ),
         CompanionProbe::FailedToStart(cause) => Check::new(
             "idb_companion",
@@ -998,13 +973,18 @@ mod tests {
             "/usr/local/bin/idb_companion",
         ))));
         assert_eq!(c.status, CheckStatus::Fail);
+        assert!(
+            c.detail.contains("/usr/local/bin/idb_companion"),
+            "detail must name the file the operator has to fix: {}",
+            c.detail
+        );
         let remedy = c
             .remedy
             .as_deref()
             .expect("an unrunnable binary has a remedy");
         assert!(
-            remedy.contains("chmod +x /usr/local/bin/idb_companion"),
-            "remedy must name the permission fix on the real path: {remedy}"
+            remedy.contains("chmod +x"),
+            "remedy must name the permission fix: {remedy}"
         );
         assert_ne!(
             remedy, INSTALL_REMEDY,
@@ -1054,10 +1034,39 @@ mod tests {
             "detail must name the variable that decided this: {}",
             c.detail
         );
+        let remedy = c.remedy.as_deref().expect("a Fail names its fix");
+        assert!(
+            remedy.contains("unset it"),
+            "remedy must offer the way back to discovery: {remedy}"
+        );
         assert_ne!(
-            c.remedy.as_deref(),
-            Some(INSTALL_REMEDY),
+            remedy, INSTALL_REMEDY,
             "installing another copy would not be looked at while the override stands"
+        );
+    }
+
+    /// A bare-name override with no `$PATH` — the one way an override reaches `NoSearchPath`.
+    /// The discovery-flavoured "set GLASS_IDB_COMPANION" would be what they already did.
+    #[test]
+    fn a_bare_name_override_with_no_path_is_told_apart_from_a_stripped_environment() {
+        let c = resolution_check(&CompanionFacts {
+            resolved: Resolved::NoSearchPath,
+            override_set: true,
+        });
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert!(
+            c.detail.contains("GLASS_IDB_COMPANION"),
+            "detail must name the variable it searched for: {}",
+            c.detail
+        );
+        let remedy = c.remedy.as_deref().expect("a Fail names its fix");
+        assert!(
+            remedy.contains("absolute path"),
+            "remedy must ask for an absolute path: {remedy}"
+        );
+        assert!(
+            !remedy.contains("brew install"),
+            "an override in force means another install would not be read: {remedy}"
         );
     }
 
@@ -1095,9 +1104,7 @@ mod tests {
         );
         assert_eq!(c.status, CheckStatus::Fail);
         assert!(
-            c.remedy
-                .as_deref()
-                .is_some_and(|r| r.contains("chmod +x /usr/local/bin/idb_companion")),
+            c.remedy.as_deref().is_some_and(|r| r.contains("chmod +x")),
             "remedy must still be the permission fix: {:?}",
             c.remedy
         );
@@ -1117,14 +1124,16 @@ mod tests {
 
     #[test]
     fn deep_check_maps_every_probe_outcome() {
-        let started = deep_check(&CompanionProbe::Started);
+        let bin = Path::new("/opt/homebrew/bin/idb_companion");
+
+        let started = deep_check(bin, &CompanionProbe::Started);
         assert_eq!(started.status, CheckStatus::Ok);
         assert_eq!(started.remedy, None);
 
-        let unverified = deep_check(&CompanionProbe::SelfTestOk);
+        let unverified = deep_check(bin, &CompanionProbe::SelfTestOk);
         assert_eq!(unverified.status, CheckStatus::Warn);
 
-        let broken = deep_check(&CompanionProbe::FailedToStart("exited 1: boom".into()));
+        let broken = deep_check(bin, &CompanionProbe::FailedToStart("exited 1: boom".into()));
         assert_eq!(broken.status, CheckStatus::Fail);
         assert!(
             broken.detail.contains("boom"),
@@ -1133,13 +1142,33 @@ mod tests {
         );
         assert_eq!(broken.remedy.as_deref(), Some(INSTALL_REMEDY));
 
-        let unrunnable = deep_check(&CompanionProbe::SelfTestFailed("spawn: nope".into()));
+        let unrunnable = deep_check(bin, &CompanionProbe::SelfTestFailed("spawn: nope".into()));
         assert_eq!(unrunnable.status, CheckStatus::Fail);
         assert!(
             unrunnable.detail.contains("nope"),
             "cause must surface: {}",
             unrunnable.detail
         );
+        assert_eq!(
+            unrunnable.remedy.as_deref(),
+            Some(INSTALL_REMEDY),
+            "a binary that will not execute still needs a way out"
+        );
+    }
+
+    /// The shallow line names the binary that answered; a green `--deep` line has no less reason
+    /// to. The failure arms name it through the spawn error they quote.
+    #[test]
+    fn a_green_deep_check_names_the_binary_it_started() {
+        let bin = Path::new("/opt/homebrew/bin/idb_companion");
+        for probe in [CompanionProbe::Started, CompanionProbe::SelfTestOk] {
+            let c = deep_check(bin, &probe);
+            assert!(
+                c.detail.contains("/opt/homebrew/bin/idb_companion"),
+                "{probe:?} must name the binary: {}",
+                c.detail
+            );
+        }
     }
 
     #[test]

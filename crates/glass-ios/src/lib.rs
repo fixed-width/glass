@@ -36,8 +36,8 @@ use glass_core::capability::{CapabilityMap, CapabilityStatus, Support};
 pub const BACKEND: &str = "ios";
 
 /// This backend's live capability map. `input`/`accessibility` need `idb_companion` — gated on
-/// [`doctor::companion_runnable`], the same resolution the runtime spawn runs, so a companion
-/// that is installed but cannot be executed reads here as it does at spawn time.
+/// `doctor::companion_runnable`, which is the launch path's own verdict, so a companion that is
+/// installed but cannot be executed is unavailable here exactly as it would be at spawn time.
 pub fn capabilities() -> CapabilityMap {
     capabilities_with(crate::doctor::companion_runnable())
 }
@@ -57,7 +57,10 @@ fn capabilities_with(companion: bool) -> CapabilityMap {
         accessibility: if companion {
             CapabilityStatus::supported()
         } else {
-            CapabilityStatus::requires_setup("idb_companion not found (needed for accessibility)")
+            CapabilityStatus::requires_setup(
+                "needs a runnable idb_companion; `glass doctor` says whether it is missing, \
+                 not executable, or unresolvable",
+            )
         },
         window_move_resize: CapabilityStatus::unsupported(Some("apps are full-screen")),
     }
