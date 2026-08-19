@@ -8,6 +8,7 @@ publish.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix.workspace = true
+glass-pipe-unix.workspace = true
 
 [lints]
 workspace = true

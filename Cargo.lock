@@ -1302,6 +1302,7 @@ dependencies = [
 name = "glass-proc-linux"
 version = "0.0.0"
 dependencies = [
+ "glass-pipe-unix",
  "rustix",
 ]
 
