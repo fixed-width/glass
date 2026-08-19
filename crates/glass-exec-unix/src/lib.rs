@@ -8,9 +8,9 @@
 //! directory, and so does the walk here.
 //!
 //! Consumers: the X11 and Wayland backends (`glass-x11`, `glass-wayland`), the AT-SPI bus launcher
-//! and its doctor check (`glass-dbus-linux`, `glass-a11y-linux`), and the sandbox backends
-//! (`glass-sandbox-linux`, `glass-sandbox-macos`). `glass-android` and `glass-ios` resolve their
-//! device tooling themselves.
+//! and its doctor check (`glass-dbus-linux`, `glass-a11y-linux`), the sandbox backends
+//! (`glass-sandbox-linux`, `glass-sandbox-macos`), and the iOS Simulator backend's
+//! `idb_companion` (`glass-ios`). `glass-android` resolves its device tooling itself.
 //!
 //! Which host paths a launch touches is a different question, answered by `glass-sandbox-unix`.
 //!

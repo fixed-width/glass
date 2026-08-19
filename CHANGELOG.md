@@ -20,6 +20,15 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- iOS: an `idb_companion` that is installed but cannot be executed — no execute bit, a `noexec`
+  mount, permissions this user is not in — no longer reads as available. glass now asks the kernel
+  whether it may run the binary, so a runnable copy later on `PATH` or in a Homebrew prefix is
+  preferred over an unrunnable one earlier, and starting a session names the file and the `chmod +x`
+  that fixes it instead of failing at spawn. `glass doctor` and the iOS input and accessibility
+  capabilities report the same resolution: one that cannot run says so rather than reading as
+  present, one that could not be looked up at all (no `PATH` — the stripped environment MCP clients
+  routinely hand a server) says that rather than "not found", and a `GLASS_IDB_COMPANION` naming
+  nothing points at the variable rather than at another `brew install`.
 - `glass doctor` no longer reports a desktop accessibility bus that has hung as a green "no
   desktop a11y bus running". A bus that takes `GetAddress` and never answers, one that advertises
   an address glass cannot use, a question the session bus answered with an error, and a check that

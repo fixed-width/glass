@@ -13,6 +13,7 @@ bench = false
 # too — mirrors glass-x11/glass-wayland, the workspace's other fully-gated crates.
 [target.'cfg(unix)'.dependencies]
 glass-core.workspace = true
+glass-exec-unix.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }

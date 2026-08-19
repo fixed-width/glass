@@ -35,11 +35,11 @@ use glass_core::capability::{CapabilityMap, CapabilityStatus, Support};
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
 pub const BACKEND: &str = "ios";
 
-/// This backend's live capability map. `input`/`accessibility` need `idb_companion` —
-/// gated on [`doctor::companion_present`], the same presence signal the runtime spawn
-/// resolves.
+/// This backend's live capability map. `input`/`accessibility` need `idb_companion` — gated on
+/// [`doctor::companion_runnable`], the same resolution the runtime spawn runs, so a companion
+/// that is installed but cannot be executed reads here as it does at spawn time.
 pub fn capabilities() -> CapabilityMap {
-    capabilities_with(crate::doctor::companion_present())
+    capabilities_with(crate::doctor::companion_runnable())
 }
 
 fn capabilities_with(companion: bool) -> CapabilityMap {
