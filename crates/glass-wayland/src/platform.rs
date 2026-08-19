@@ -127,7 +127,13 @@ impl WaylandPlatform {
                     !glass_proc_linux::any_alive(&app)
                 }
             });
-            glass_proc_linux::reap_launch(&mut s.child, &tree, glass_proc_linux::APP_REAP_GRACE);
+            // Teardown reports what it asked, not what survived — doctor's deep probe is the
+            // caller that reads this (glass#380).
+            let _ = glass_proc_linux::reap_launch(
+                &mut s.child,
+                &tree,
+                glass_proc_linux::APP_REAP_GRACE,
+            );
             glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
         }
         self.dbus = None;

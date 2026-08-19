@@ -196,10 +196,32 @@ pub fn await_condition(grace: Duration, mut done: impl FnMut() -> bool) -> bool 
     }
 }
 
+/// Whether `pid` is a live process.
+///
+/// A zombie is not: it keeps a `/proc` entry until its parent reaps it, and holds nothing. Its
+/// state is field 3 of `/proc/<pid>/stat`, read after the last `)` because the comm field before
+/// it can itself contain spaces and parens.
+fn alive(pid: u32) -> bool {
+    if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        return false;
+    }
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        // Reported as alive: a caller looking twice costs less than a survivor missed.
+        return true;
+    };
+    !stat
+        .rsplit_once(')')
+        .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+}
+
+/// Which of `pids` are live processes.
+pub fn live_pids(pids: &[u32]) -> Vec<u32> {
+    pids.iter().copied().filter(|pid| alive(*pid)).collect()
+}
+
 /// Whether any of `pids` is still a live process.
 pub fn any_alive(pids: &[u32]) -> bool {
-    pids.iter()
-        .any(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+    pids.iter().copied().any(alive)
 }
 
 /// Reap a whole launch: the child glass spawned, its process group, and every pid in `tree` — a
@@ -218,14 +240,20 @@ pub fn any_alive(pids: &[u32]) -> bool {
 /// A pid is only signalled while `/proc/<pid>` still exists. That check races pid reuse the same
 /// way every `kill`-based reaper on Linux does; the alternative is leaking the app's children on
 /// every teardown.
-pub fn reap_launch(child: &mut Child, tree: &[u32], grace: Duration) {
+///
+/// Returns the pids of `tree` still alive once the ladder has run — empty on the ordinary path.
+/// Two things it is not: an answer about the process GROUP, which is signalled but not
+/// enumerated, and a confirmation, because a signal lands only when its target is next scheduled.
+/// A caller that reports what survived polls this until it settles (glass#380).
+#[must_use = "the survivors are the caller's to report, or to ignore on purpose"]
+pub fn reap_launch(child: &mut Child, tree: &[u32], grace: Duration) -> Vec<u32> {
     let leader = Pid::from_raw(child.id() as i32);
     let signal_all = |signal| {
         if let Some(leader) = leader {
             let _ = kill_process_group(leader, signal);
         }
         for &pid in tree {
-            if std::path::Path::new(&format!("/proc/{pid}")).exists()
+            if alive(pid)
                 && let Some(pid) = Pid::from_raw(pid as i32)
             {
                 let _ = kill_process(pid, signal);
@@ -241,6 +269,8 @@ pub fn reap_launch(child: &mut Child, tree: &[u32], grace: Duration) {
         let _ = child.kill();
     }
     let _ = child.wait();
+    // Asked after the wait, because until the child is reaped its own zombie is still in /proc.
+    live_pids(tree)
 }
 
 /// Gracefully reap a single child: SIGTERM, poll for exit up to `grace`, then
@@ -363,7 +393,8 @@ pub fn spawn_reader<S: Copy + Send + 'static, R: Read + Send + 'static>(
 #[cfg(test)]
 mod reap_tests {
     use super::{
-        Asked, CLOSE_GRACE, Closed, REAP_GRACE, reap_graceful, reap_group, teardown_notice,
+        Asked, CLOSE_GRACE, Closed, REAP_GRACE, await_condition, reap_graceful, reap_group,
+        teardown_notice,
     };
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::CommandExt;
@@ -593,6 +624,57 @@ mod reap_tests {
         assert!(super::CLOSE_GRACE > super::APP_REAP_GRACE);
     }
 
+    /// glass#380: the reaper computed whether the launch went away and discarded the answer, so
+    /// its callers could only report the stop they asked for.
+    #[test]
+    fn live_pids_names_the_processes_that_are_there() {
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert_eq!(super::live_pids(&[pid]), vec![pid]);
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        assert!(
+            super::live_pids(&[pid]).is_empty(),
+            "a child that was killed and reaped is not alive"
+        );
+    }
+
+    /// An existence test calls a zombie a survivor.
+    #[test]
+    fn a_zombie_is_not_a_live_process() {
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        child.kill().expect("kill");
+        // Deliberately not waited: that is what makes it a zombie rather than gone.
+        assert!(
+            await_condition(Duration::from_secs(5), || std::fs::read_to_string(format!(
+                "/proc/{pid}/stat"
+            ))
+            .is_ok_and(|s| s
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')))),
+            "the fixture has to reach the state under test"
+        );
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(
+            super::live_pids(&[pid]).is_empty(),
+            "a zombie holds nothing and takes no signal, so it is not a survivor"
+        );
+        child.wait().expect("reap the fixture");
+    }
+
     #[test]
     fn reap_launch_reaps_a_child_that_left_the_process_group() {
         // sway does exactly this to every app it execs: `setsid` puts the app in its own group
@@ -616,7 +698,11 @@ mod reap_tests {
             !escaped.is_empty(),
             "the launch should have a child to reap"
         );
-        super::reap_launch(&mut leader, &tree, Duration::from_secs(5));
+        let left = super::reap_launch(&mut leader, &tree, Duration::from_secs(5));
+        assert!(
+            left.is_empty(),
+            "a launch that was reaped has no survivors to report: {left:?}"
+        );
         std::thread::sleep(Duration::from_millis(100));
         assert!(
             !super::any_alive(&escaped),

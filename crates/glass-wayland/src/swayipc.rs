@@ -124,11 +124,15 @@ pub struct Ipc {
     broken: bool,
 }
 
+/// No socket in the runtime dir at all, as opposed to one that answered badly — doctor tells the
+/// two apart when it reports why a compositor never became reachable.
+pub(crate) const NO_IPC_SOCKET: &str = "sway IPC socket not found";
+
 impl Ipc {
     /// Find the `sway-ipc.*.sock` in the private runtime dir and connect.
     pub fn connect(runtime_dir: &Path) -> Result<Ipc> {
         let path = find_ipc_socket(runtime_dir)
-            .ok_or_else(|| GlassError::Backend("sway IPC socket not found".into()))?;
+            .ok_or_else(|| GlassError::Backend(NO_IPC_SOCKET.into()))?;
         let sock = UnixStream::connect(&path)
             .map_err(|e| GlassError::Backend(format!("connect sway IPC: {e}")))?;
         let mut ipc = Ipc::from_stream(sock)?;

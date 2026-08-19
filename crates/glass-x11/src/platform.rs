@@ -475,7 +475,9 @@ impl X11Platform {
             // The sweep runs either way: an app that closed itself can still have forked children
             // it never cleaned up, and on the graceful path the signals land on processes that
             // are already gone and cost nothing.
-            glass_proc_linux::reap_launch(&mut child, &tree, APP_REAP_GRACE);
+            // Teardown reports what it asked, not what survived — doctor's deep probe is the
+            // caller that reads this (glass#380).
+            let _ = glass_proc_linux::reap_launch(&mut child, &tree, APP_REAP_GRACE);
             glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
         }
         self.window = None;
