@@ -16,8 +16,7 @@
 //! the Windows backend for the same reason — the OS APIs can't share an impl.
 //!
 //! It also holds what both backends need *around* a spawned process: reaping it and its
-//! descendants, and reading what it wrote — its stderr under a cap and a stop
-//! ([`StderrTail`]), or its output line-by-line until EOF ([`spawn_reader`]).
+//! descendants, and reading its stderr under a cap and a stop ([`StderrTail`]).
 
 #![cfg(target_os = "linux")]
 
@@ -26,9 +25,7 @@ mod stderr;
 pub use stderr::{STDERR_KEPT, StderrTail};
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Read};
 use std::process::Child;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
@@ -376,26 +373,6 @@ fn collect_descendants(root: u32, parent_of: &HashMap<u32, u32>) -> Vec<u32> {
         }
     }
     out
-}
-
-/// Drain a child's piped output line-by-line into a shared buffer on a background
-/// thread, tagging each line with `tag`. The X11 and Wayland backends both spawn an
-/// app and capture its stdout/stderr this way; sharing it here keeps them from
-/// re-implementing the reader. Generic over the tag so this crate needn't depend on
-/// glass-core's `Stream` enum.
-pub fn spawn_reader<S: Copy + Send + 'static, R: Read + Send + 'static>(
-    reader: R,
-    tag: S,
-    sink: Arc<Mutex<Vec<(S, String)>>>,
-) {
-    std::thread::spawn(move || {
-        for line in BufReader::new(reader).lines() {
-            match line {
-                Ok(text) => sink.lock().expect("log sink mutex").push((tag, text)),
-                Err(_) => break,
-            }
-        }
-    });
 }
 
 #[cfg(test)]

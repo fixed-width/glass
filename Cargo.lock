@@ -1361,6 +1361,7 @@ dependencies = [
  "glass-core",
  "glass-dbus-linux",
  "glass-exec-unix",
+ "glass-pipe-unix",
  "glass-proc-linux",
  "glass-sandbox-linux",
  "rustix",
