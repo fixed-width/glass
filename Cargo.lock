@@ -1239,6 +1239,7 @@ dependencies = [
  "block2",
  "glass-a11y-macos",
  "glass-core",
+ "glass-pipe-unix",
  "glass-sandbox-macos",
  "objc2",
  "objc2-app-kit",
@@ -1292,9 +1293,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass-pipe-unix"
+version = "0.0.0"
+dependencies = [
+ "rustix",
+]
+
+[[package]]
 name = "glass-proc-linux"
 version = "0.0.0"
 dependencies = [
+ "glass-pipe-unix",
  "rustix",
 ]
 
@@ -1353,6 +1362,7 @@ dependencies = [
  "glass-core",
  "glass-dbus-linux",
  "glass-exec-unix",
+ "glass-pipe-unix",
  "glass-proc-linux",
  "glass-sandbox-linux",
  "rustix",
@@ -1389,6 +1399,7 @@ dependencies = [
  "glass-core",
  "glass-dbus-linux",
  "glass-exec-unix",
+ "glass-pipe-unix",
  "glass-proc-linux",
  "glass-sandbox-linux",
  "rustix",

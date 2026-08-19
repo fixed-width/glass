@@ -1,3 +1,4 @@
+use std::os::fd::AsFd;
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -6,7 +7,8 @@ use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
     TEARDOWN_BUDGET, WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
 };
-use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, proc_tree_pids, spawn_reader};
+use glass_pipe_unix::LineTap;
+use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, proc_tree_pids};
 use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
 use x11rb::errors::ReplyError;
@@ -57,6 +59,10 @@ pub struct X11Platform {
     child: Option<Child>,
     window: Option<Window>,
     logs: LogSink,
+    /// The launched app's stdout/stderr readers, dropped in `kill_child`. The app's write ends
+    /// are inherited by everything it spawns, so an EOF-only reader parks on a survivor's pipe
+    /// (glass#477).
+    taps: Vec<LineTap>,
     // A private Xvfb we spawned (default path); kept alive so Drop tears it down.
     xvfb: Option<crate::xvfb::Xvfb>,
     // A private a11y-enabled D-Bus session bus we spawned for the launched app;
@@ -102,6 +108,34 @@ fn is_window_gone(err: &ReplyError) -> bool {
         err,
         ReplyError::X11Error(x) if matches!(x.error_kind, ErrorKind::Window | ErrorKind::Drawable)
     )
+}
+
+/// Start a reader over one of the launch's streams, or reap the launch and say why it could not.
+///
+/// The failed start consumed the pipe, so the app's next write to that stream takes `SIGPIPE` — a
+/// death mid-run with nothing in the logs to say why.
+///
+/// The group, not the leader: `command.rs` spawns the app with `process_group(0)`, and under a
+/// sandbox the leader is `bwrap` with the real app as its child — a leader-only reap leaves that
+/// child holding the write end of the very pipe this could not read. (`xvfb.rs` can reap the
+/// leader because the X server is not spawned into its own group.)
+fn tap_or_reap<R: std::io::Read + AsFd + Send + 'static>(
+    stream: R,
+    tag: Stream,
+    name: &str,
+    logs: &LogSink,
+    child: &mut Child,
+    spec: &AppSpec,
+) -> Result<LineTap> {
+    LineTap::start(stream, tag, name, logs.clone()).map_err(|e| {
+        glass_proc_linux::reap_group(child, glass_proc_linux::REAP_GRACE);
+        GlassError::AppNotStarted(format!(
+            "started {:?} but could not read its output ({e}); the app was stopped rather than \
+             left to write into a pipe nobody drains — free up threads and file descriptors on \
+             the host",
+            spec.run
+        ))
+    })
 }
 
 impl X11Platform {
@@ -150,6 +184,7 @@ impl X11Platform {
             child: None,
             window: None,
             logs: Arc::new(Mutex::new(Vec::new())),
+            taps: Vec::new(),
             xvfb: None,
             dbus: None,
             clipboard_owner: None,
@@ -298,12 +333,28 @@ impl X11Platform {
         let mut child = cmd
             .spawn()
             .map_err(|e| GlassError::AppNotStarted(format!("spawn {:?}: {e}", spec.run)))?;
-        if let Some(out) = child.stdout.take() {
-            spawn_reader(out, Stream::Stdout, self.logs.clone());
-        }
-        if let Some(err) = child.stderr.take() {
-            spawn_reader(err, Stream::Stderr, self.logs.clone());
-        }
+        // `Stdio::piped()` above guarantees both are `Some`. Skipping one that is not would
+        // silently stop capturing it, the fallback this crate's contract forbids.
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+        self.taps = vec![
+            tap_or_reap(
+                stdout,
+                Stream::Stdout,
+                "glass-app-stdout",
+                &self.logs,
+                &mut child,
+                spec,
+            )?,
+            tap_or_reap(
+                stderr,
+                Stream::Stderr,
+                "glass-app-stderr",
+                &self.logs,
+                &mut child,
+                spec,
+            )?,
+        ];
         self.child = Some(child);
         Ok(())
     }
@@ -481,6 +532,10 @@ impl X11Platform {
             glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
         }
         self.window = None;
+        // Reaped first, so each tap's final drain sees what the app wrote on its way out.
+        // Dropping them releases the pipes anything the launch left running still holds
+        // (glass#477).
+        self.taps.clear();
         // Drop the private a11y bus, reaping its dbus-daemon / at-spi children. Also
         // covers `start_app`'s failure path (which calls `kill_child`), so a launch
         // that never finds a window doesn't leave the bus running until Drop.

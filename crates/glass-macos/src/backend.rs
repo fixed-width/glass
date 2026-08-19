@@ -81,6 +81,11 @@ pub struct MacosPlatform {
     /// The launched child process, kept so `stop_app`/`Drop` can `process::terminate`
     /// it. `None` until `start_app` and after `stop_app` (idempotent).
     child: Option<Child>,
+    /// The launched app's stdout/stderr readers, cleared by `stop_app`/`Drop` once the child is
+    /// terminated. The app's write ends are inherited by everything it spawns, so an EOF-only
+    /// reader parks on a survivor's pipe (glass#477). Empty until `start_app`, and for a
+    /// LaunchServices-adopted app, which glass never gave a pipe.
+    taps: Vec<glass_pipe_unix::LineTap>,
     /// The active window's `CGWindowID` — the implicit target of `capture_frame`/
     /// `send_pointer`/`send_key`, per the `Platform` contract. Set by `start_app` to the first
     /// window discovered, and by `select_window`; `None` before `start_app` and after
@@ -143,6 +148,7 @@ impl MacosPlatform {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
+            taps: Vec::new(),
             active_window: None,
             clipboard_route: ClipboardRoute::default(),
             clip: None,
@@ -360,12 +366,17 @@ impl MacosPlatform {
         // `spec.run.first()` before delegating here.
         let mut direct = spec.clone();
         direct.run[0] = inner.to_string_lossy().into_owned();
-        let (mut child, clip) = process::spawn(&direct, self.logs.clone())?;
+        let process::Launch {
+            mut child,
+            clip,
+            taps,
+        } = process::spawn(&direct, self.logs.clone())?;
         let pid = child.id();
         match Self::discover_window(&mut child, pid, spec.timeout_ms) {
             Ok(m) => {
                 // Foreground app: adopt exactly as the plain-exec Ok arm does.
                 self.child = Some(child);
+                self.taps = taps;
                 self.app_pid = Some(pid);
                 self.active_window = Some(m.window_id);
                 // Defensive: a direct-spawn is never an adopted session — clear any stale
@@ -384,6 +395,9 @@ impl MacosPlatform {
                 // only for a contained launch that failed.
                 process::terminate(&mut child);
                 release_clip(clip.as_ref());
+                // Terminated first, so the final drain catches what the inner exec said on its way
+                // out — the diagnosis, on this path. Explicit because the handoff runs in between.
+                drop(taps);
                 // Only an early inner-exec exit (`AppExited`) is the handoff signal; any other
                 // failure is propagated as-is.
                 //
@@ -456,6 +470,9 @@ impl MacosPlatform {
             }
         };
         self.child = None;
+        // With the child goes what read it: an adopted app was never given a pipe, so a tap left
+        // running here files the *previous* launch's output into this session's logs.
+        self.taps.clear();
         // AppKit's pids are `i32` but always non-negative for a real process, so the cast to
         // `app_pid`'s `u32` is exact.
         self.app_pid = Some(pid as u32);
@@ -636,11 +653,16 @@ impl Platform for MacosPlatform {
         let geometry = if crate::bundle::is_app_bundle(run0) {
             self.start_bundle(spec, Path::new(run0))?
         } else {
-            let (mut child, clip) = process::spawn(spec, self.logs.clone())?;
+            let process::Launch {
+                mut child,
+                clip,
+                taps,
+            } = process::spawn(spec, self.logs.clone())?;
             let pid = child.id();
             match Self::discover_window(&mut child, pid, spec.timeout_ms) {
                 Ok(m) => {
                     self.child = Some(child);
+                    self.taps = taps;
                     self.app_pid = Some(pid);
                     // Defensive: a plain exec is never an adopted session — clear any stale
                     // handoff record from a prior un-stopped session so it can't widen
@@ -693,6 +715,10 @@ impl Platform for MacosPlatform {
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
         }
+        // Terminated first, so each tap's final drain sees what the app wrote on the way out.
+        // Dropping them releases the pipes anything the launch left running still holds
+        // (glass#477).
+        self.taps.clear();
         // Named pasteboards persist system-wide until released, and a leftover `.ready`
         // sentinel could mask a failed injection in a later session. Only released when a shim
         // launch name is known — uncontained/hardened launches have none.
@@ -917,6 +943,9 @@ impl Drop for MacosPlatform {
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
         }
+        // Terminated first, as in `stop_app`. Explicit rather than left to field-drop order, so
+        // reordering two fields cannot silently change it.
+        self.taps.clear();
         // Release this session's named pasteboards too if `stop_app` didn't run (panic-unwind
         // or the process-exit backstop). `stop_app` sets `self.clip = None`, so this is a no-op
         // when it already ran; otherwise the boards would leak system-wide.
@@ -936,6 +965,7 @@ mod tests {
             logs: Arc::new(Mutex::new(vec![(Stream::Stdout, "hi".into())])),
             app_pid: Some(42),
             child: None,
+            taps: Vec::new(),
             active_window: None,
             clipboard_route: ClipboardRoute::default(),
             clip: None,
@@ -951,6 +981,7 @@ mod tests {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
+            taps: Vec::new(),
             active_window: None,
             clipboard_route: ClipboardRoute::default(),
             clip: None,
@@ -968,6 +999,7 @@ mod tests {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
+            taps: Vec::new(),
             active_window: None,
             clipboard_route: ClipboardRoute::default(),
             clip: None,
@@ -987,6 +1019,7 @@ mod tests {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
+            taps: Vec::new(),
             active_window: Some(7),
             clipboard_route: ClipboardRoute::default(),
             clip: None,
@@ -1006,6 +1039,7 @@ mod tests {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
+            taps: Vec::new(),
             active_window: Some(7),
             clipboard_route: ClipboardRoute::Private("tech.fixedwidth.glass.clip.42.1.1".into()),
             clip: None,
@@ -1024,6 +1058,7 @@ mod tests {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
+            taps: Vec::new(),
             active_window: Some(7),
             clipboard_route: ClipboardRoute::Private("tech.fixedwidth.glass.clip.42.1.1".into()),
             clip: Some(ClipLaunch {
@@ -1045,6 +1080,7 @@ mod tests {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(999_999),
             child: None,
+            taps: Vec::new(),
             active_window: Some(7),
             clipboard_route: ClipboardRoute::Private("tech.fixedwidth.glass.clip.9.1.1".into()),
             clip: None,
@@ -1068,6 +1104,7 @@ mod tests {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(999_999),
             child: None,
+            taps: Vec::new(),
             active_window: Some(7),
             clipboard_route: ClipboardRoute::default(),
             clip: None,
@@ -1091,6 +1128,7 @@ mod tests {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
+            taps: Vec::new(),
             active_window: None,
             clipboard_route: ClipboardRoute::default(),
             clip: None,
@@ -1139,6 +1177,7 @@ mod tests {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
+            taps: Vec::new(),
             active_window: None,
             clipboard_route: ClipboardRoute::Unsupported,
             clip: None,
@@ -1161,6 +1200,7 @@ mod tests {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
+            taps: Vec::new(),
             active_window: None,
             clipboard_route: ClipboardRoute::RealGeneral,
             clip: None,

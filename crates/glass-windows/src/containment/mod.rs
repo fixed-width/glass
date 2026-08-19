@@ -36,29 +36,13 @@ pub(crate) fn config_shim_dll_path(exe_dir: Option<&str>) -> Option<String> {
 
 #[cfg(windows)]
 mod imp {
-    use std::io::{BufRead, BufReader};
-    use std::sync::{Arc, Mutex};
-
-    use glass_core::logbuf::Stream;
     use glass_core::{AppSpec, GlassError, Result};
 
+    /// Log lines captured from the app, tagged by stream. One alias, defined with the readers
+    /// that fill it, rather than a second structurally-equal one here.
+    pub(crate) use crate::logtap::LogSink;
+
     use super::config::{Decision, ProviderChoice, decide};
-
-    /// Log lines captured from the app, tagged by stream. (Lifted from lib.rs.)
-    pub(crate) type LogSink = Arc<Mutex<Vec<(Stream, String)>>>;
-
-    /// Read `reader` line-by-line on a thread, tagging + pushing into `sink`.
-    fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, sink: LogSink) {
-        std::thread::spawn(move || {
-            let buf = BufReader::new(reader);
-            for line in buf.lines() {
-                match line {
-                    Ok(text) => sink.lock().expect("log sink mutex").push((stream, text)),
-                    Err(_) => break,
-                }
-            }
-        });
-    }
 
     /// Read the provider choice (env `GLASS_WIN_SANDBOX_PROVIDER`, default `auto`).
     fn provider_choice() -> Result<ProviderChoice> {
@@ -104,12 +88,17 @@ mod imp {
                 Containment::Unconfined => {
                     let mut cmd = crate::process::build_command(spec);
                     let mut app = crate::process::spawn_suspended_in_job(&mut cmd, spec.sandbox)?;
-                    let (out, err) = app.take_pipes();
-                    if let Some(o) = out {
-                        spawn_reader(o, Stream::Stdout, logs.clone());
-                    }
-                    if let Some(e) = err {
-                        spawn_reader(e, Stream::Stderr, logs.clone());
+                    // Wired before `resume`, so the app's first lines are not missed. `abandon`
+                    // rather than `?` alone: the app is still suspended, and nothing else would
+                    // ever terminate it or close its Job.
+                    if let Err(e) = app.tap_logs(&logs) {
+                        app.abandon();
+                        return Err(GlassError::AppNotStarted(format!(
+                            "started {:?} but could not read its output ({e}); the app was \
+                             stopped rather than left to write into a pipe nobody drains — free \
+                             up threads on the host",
+                            spec.run
+                        )));
                     }
                     app.resume();
                     Ok(Launched::Unconfined(app))

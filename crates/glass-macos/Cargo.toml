@@ -227,6 +227,9 @@ block2 = "0.6.2"
 # glass-proc-linux use it on Linux); its `kill_process`/`Pid`/`Signal` are plain POSIX
 # and available on macOS too.
 rustix.workspace = true
+# The launched app's stdout/stderr readers (`process.rs::spawn`), which end at teardown rather
+# than at an EOF a survivor holding the pipe never delivers. Shared with the Linux backends.
+glass-pipe-unix.workspace = true
 # Seatbelt process containment (`process.rs::spawn`'s `SandboxLevel::Default`/`Strict`
 # pre_exec): the pure SBPL generator (`build_profile`) plus the macOS-only `sandbox_init`
 # FFI (`apply_cstr`).

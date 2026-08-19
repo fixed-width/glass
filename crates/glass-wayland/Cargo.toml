@@ -23,6 +23,7 @@ glass-a11y-linux.workspace = true
 glass-dbus-linux = { path = "../glass-dbus-linux" }
 glass-sandbox-linux.workspace = true
 glass-proc-linux.workspace = true
+glass-pipe-unix.workspace = true
 wayland-client.workspace = true
 wayland-protocols-wlr.workspace = true
 wayland-protocols-misc.workspace = true

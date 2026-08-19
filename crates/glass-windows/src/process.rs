@@ -19,6 +19,7 @@ use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use glass_core::Stream;
 use glass_core::{AppSpec, GlassError, Result, SandboxLevel, TEARDOWN_BUDGET};
 
 use crate::teardown::{CloseStep, close_wait_step};
@@ -112,6 +113,10 @@ unsafe impl Send for SendHandle {}
 pub(crate) struct LaunchedApp {
     job: SendHandle,
     child: Child,
+    /// The app's stdout/stderr readers, ended by `kill`. The app's write ends are inherited by
+    /// everything it spawns, so an EOF-only reader parks on a survivor's pipe, holding a thread
+    /// and a handle for the life of the process (glass#477).
+    taps: Vec<crate::logtap::LogTap>,
 }
 
 impl LaunchedApp {
@@ -119,14 +124,47 @@ impl LaunchedApp {
         self.child.id()
     }
 
-    /// Take the piped stdout/stderr (call once, before resume, to wire log readers).
-    pub(crate) fn take_pipes(
-        &mut self,
-    ) -> (
-        Option<std::process::ChildStdout>,
-        Option<std::process::ChildStderr>,
-    ) {
-        (self.child.stdout.take(), self.child.stderr.take())
+    /// Start the log readers over the piped stdout/stderr, filing into `logs`. Call once, before
+    /// `resume`, so nothing the app writes at startup is missed.
+    ///
+    /// The readers stay here rather than being handed back: they are made from this handle's own
+    /// pipes, and `kill` ends them. `Err` is the host refusing a thread, with that stream's pipe
+    /// closed by then — the caller must fail the launch rather than resume an app whose output
+    /// goes nowhere.
+    pub(crate) fn tap_logs(&mut self, logs: &crate::logtap::LogSink) -> std::io::Result<()> {
+        if let Some(out) = self.child.stdout.take() {
+            self.taps.push(crate::logtap::LogTap::start(
+                out,
+                Stream::Stdout,
+                logs.clone(),
+            )?);
+        }
+        if let Some(err) = self.child.stderr.take() {
+            self.taps.push(crate::logtap::LogTap::start(
+                err,
+                Stream::Stderr,
+                logs.clone(),
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Terminate a launch that never started, closing the Job handle with it.
+    ///
+    /// `LaunchedApp` releases the Job only in [`LaunchedApp::kill`], and neither `SendHandle` nor
+    /// `Child` frees anything on drop — so a launch abandoned between `spawn_suspended_in_job` and
+    /// `resume` sits `CREATE_SUSPENDED` and alive for the life of this process, its Job handle
+    /// leaked and `KILL_ON_JOB_CLOSE` therefore never firing. The root has never run, so it has no
+    /// children; `spawn_suspended_in_job`'s own error arm reasons the same way.
+    ///
+    /// Any tap already started is ended by the drop that follows the kill.
+    pub(crate) fn abandon(mut self) {
+        // SAFETY: closing the last job handle terminates anything left in the tree.
+        unsafe {
+            let _ = CloseHandle(self.job.0);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait(); // reap, so an abandoned launch leaves no zombie
     }
 
     /// Resume the suspended root thread(s) — call AFTER log readers are wired.
@@ -163,6 +201,10 @@ impl LaunchedApp {
         }
         let _ = self.child.kill(); // belt-and-suspenders: ensure the root is terminated so wait() can't block
         let _ = self.child.wait(); // reap the now-terminated root; avoids a zombie
+        // Terminated first, so each tap's final drain sees what the app wrote on the way out.
+        // Dropping them releases the pipe handles anything the launch left running still holds
+        // (glass#477).
+        self.taps.clear();
         asked.outcome(closed_itself)
     }
 
@@ -314,6 +356,7 @@ pub(crate) fn spawn_suspended_in_job(
         Ok(job) => Ok(LaunchedApp {
             job: SendHandle(job),
             child,
+            taps: Vec::new(),
         }),
         Err(e) => {
             // The child is still SUSPENDED and not yet job-assigned, so it has no children:

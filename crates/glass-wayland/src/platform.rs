@@ -11,6 +11,7 @@ use glass_core::{
     TEARDOWN_BUDGET, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 use glass_exec_unix::{Resolved, is_executable_file, resolve_path};
+use glass_pipe_unix::LineTap;
 use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE};
 use smithay_client_toolkit::delegate_dispatch2;
 use smithay_client_toolkit::delegate_registry;
@@ -54,6 +55,10 @@ const _: () = assert!(
 
 struct ActiveSession {
     child: Child,
+    /// sway's stdout/stderr readers, dropped when the session is torn down. Everything sway
+    /// spawns inherits its write ends, so an EOF-only reader parks on a survivor's pipe
+    /// (glass#477).
+    taps: Vec<LineTap>,
     _runtime_dir: TempDir, // kept alive: the wayland socket lives here
     socket_path: PathBuf,  // path to the sway wayland socket (for clipboard threads)
     conn: Connection,
@@ -134,6 +139,8 @@ impl WaylandPlatform {
                 &tree,
                 glass_proc_linux::APP_REAP_GRACE,
             );
+            // Reaped first, so each tap's final drain sees what sway wrote on its way out.
+            s.taps.clear();
             glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
         }
         self.dbus = None;
@@ -1143,6 +1150,31 @@ fn open_session(
     ))
 }
 
+/// Start a reader over one of sway's streams, or reap the session and say why it could not.
+///
+/// The failed start consumed the pipe, so sway's next write to that stream takes `SIGPIPE`.
+///
+/// The group rather than the leader, matching every other error path here: sway forks Xwayland
+/// into its own group, and a leader-only reap leaves it holding the X display in the global
+/// namespace. It does not reach the apps sway `exec`s — those are `setsid`ed out (see
+/// `kill_session`) — but sway has not read its config yet, so there are none.
+fn tap_or_reap<R: std::io::Read + AsFd + Send + 'static>(
+    stream: R,
+    tag: Stream,
+    name: &str,
+    logs: &LogSink,
+    child: &mut Child,
+) -> Result<LineTap> {
+    LineTap::start(stream, tag, name, logs.clone()).map_err(|e| {
+        glass_proc_linux::reap_group(child, glass_proc_linux::REAP_GRACE);
+        GlassError::AppNotStarted(format!(
+            "started sway but could not read its output ({e}); the session was stopped rather \
+             than left to write into a pipe nobody drains — free up threads and file descriptors \
+             on the host"
+        ))
+    })
+}
+
 /// Spawn one per-session sway+Xwayland, connect, and discover the app's first
 /// window — the full compositor bring-up for `start_app`, factored out so it can
 /// be retried. On any failure the spawned compositor's process group is reaped, so
@@ -1177,12 +1209,28 @@ fn bring_up_session(
     let mut child = cmd
         .spawn()
         .map_err(|e| GlassError::AppNotStarted(format!("spawn sway: {e}")))?;
-    if let Some(out) = child.stdout.take() {
-        glass_proc_linux::spawn_reader(out, Stream::Stdout, logs.clone());
-    }
-    if let Some(err) = child.stderr.take() {
-        glass_proc_linux::spawn_reader(err, Stream::Stderr, logs.clone());
-    }
+    // Declared before the discovery loop below, so each of its `return Err(...)` paths drops the
+    // taps *after* its own reap — the order teardown uses, so the final drain sees what sway wrote
+    // on the way out. `Stdio::piped()` guarantees both are `Some`; skipping one that is not would
+    // silently stop capturing it.
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let taps = vec![
+        tap_or_reap(
+            stdout,
+            Stream::Stdout,
+            "glass-sway-stdout",
+            logs,
+            &mut child,
+        )?,
+        tap_or_reap(
+            stderr,
+            Stream::Stderr,
+            "glass-sway-stderr",
+            logs,
+            &mut child,
+        )?,
+    ];
 
     let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
     let socket = loop {
@@ -1190,10 +1238,10 @@ fn bring_up_session(
             break s;
         }
         if let Ok(Some(status)) = child.try_wait() {
-            // sway exited — but on an *unclean* exit its group children
-            // (Xwayland + the exec'd app) can outlive it. Reap the whole
-            // group, not just the leader, or a leaked Xwayland holds the X
-            // display in the global namespace and breaks the next session.
+            // sway exited — but on an *unclean* exit Xwayland, which sway forks into its own
+            // group, can outlive it and hold the X display in the global namespace, breaking the
+            // next session. (The app sway `exec`s is `setsid`ed out of that group — see
+            // `kill_session` — and is covered by the `reap_launch` tree walk there.)
             glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
             return Err(GlassError::app_exited_during_discovery(
                 status.code(),
@@ -1302,6 +1350,7 @@ fn bring_up_session(
     let geometry = active_rect.clone();
     let session = ActiveSession {
         child,
+        taps,
         _runtime_dir: runtime_dir,
         socket_path,
         conn,
