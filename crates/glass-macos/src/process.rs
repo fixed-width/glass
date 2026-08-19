@@ -1,9 +1,10 @@
 //! App spawn, background log-piping, and terminate for the macOS backend.
 //!
-//! Mirrors `glass-x11`/`glass-wayland`'s `spawn`+`spawn_reader`+`LogSink` shape: a plain
+//! Mirrors `glass-x11`/`glass-wayland`'s `spawn`+`LineTap`+`LogSink` shape: a plain
 //! `std::process::Command` built from [`AppSpec`], stdout/stderr piped into a shared,
 //! `Arc<Mutex<_>>`-guarded log buffer via one reader thread per stream, so
-//! `MacosPlatform::drain_logs` can read it without blocking the readers. `terminate` asks
+//! `MacosPlatform::drain_logs` can read it without blocking the readers. The taps go back to the
+//! caller with the child, because ending them is part of teardown (glass#477). `terminate` asks
 //! the app to quit first — AppKit runs no shutdown path for a signal — and only then falls
 //! back to `glass-proc-linux::reap`'s SIGTERM -> brief wait -> SIGKILL -> reap sequence,
 //! reimplemented here (rather than depending on that crate) because it is `/proc`-based
