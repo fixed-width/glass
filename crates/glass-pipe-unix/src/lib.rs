@@ -13,6 +13,8 @@
 #![cfg(unix)]
 #![forbid(unsafe_code)]
 
+mod line;
 mod tap;
 
+pub use line::LineTap;
 pub use tap::{ChunkSink, PipeTap};
