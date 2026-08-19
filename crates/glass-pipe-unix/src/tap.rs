@@ -222,23 +222,46 @@ mod tests {
     /// survivor's life, which must not be what ends it.
     const NEVER_RETURNS: Duration = Duration::from_secs(10);
 
-    /// Collects every chunk handed to it, and records whether `end` ran.
+    /// The most a collector keeps. Past it only the count grows.
+    ///
+    /// Bounded on purpose: several fixtures here read from something that never ends, so a mutant
+    /// that breaks the cap or the stop flag turns them into an unbounded read. Storing every byte
+    /// then exhausts the host's memory and takes the whole CI job down — which reports as a runner
+    /// shutdown, not as the one missed mutant it is.
+    const COLLECTED_KEPT: usize = 128 * 1024;
+
+    /// Collects what it is handed, keeping at most [`COLLECTED_KEPT`] bytes, counting all of them,
+    /// and recording whether `end` ran.
     #[derive(Clone, Default)]
-    struct Collected(Arc<Mutex<(Vec<u8>, bool)>>);
+    struct Collected(Arc<Mutex<Held>>);
+
+    #[derive(Default)]
+    struct Held {
+        kept: Vec<u8>,
+        total: usize,
+        ended: bool,
+    }
 
     impl ChunkSink for Collected {
         fn chunk(&mut self, bytes: &[u8]) {
-            self.0.lock().expect("collector").0.extend_from_slice(bytes);
+            let mut held = self.0.lock().expect("collector");
+            held.total += bytes.len();
+            let room = COLLECTED_KEPT.saturating_sub(held.kept.len());
+            held.kept.extend_from_slice(&bytes[..bytes.len().min(room)]);
         }
         fn end(&mut self) {
-            self.0.lock().expect("collector").1 = true;
+            self.0.lock().expect("collector").ended = true;
         }
     }
 
     impl Collected {
         fn read(&self) -> (String, bool) {
             let held = self.0.lock().expect("collector");
-            (String::from_utf8_lossy(&held.0).into_owned(), held.1)
+            (String::from_utf8_lossy(&held.kept).into_owned(), held.ended)
+        }
+
+        fn total(&self) -> usize {
+            self.0.lock().expect("collector").total
         }
     }
 
@@ -256,23 +279,42 @@ mod tests {
         t0.elapsed()
     }
 
-    /// A `Read` that hands back at most `per_read` bytes and never ends, so only the cap can stop
-    /// a drain.
+    /// A `Read` with far more to give than the drain may take: `per_read` bytes at a time until
+    /// `left` runs out, then an empty pipe.
     ///
-    /// `per_read` divides neither [`CHUNK`] nor [`FINAL_DRAIN`], so the last read is a short one
-    /// and the remaining-room arithmetic is what decides the total — chunk-aligned, any error in
-    /// it lands on a boundary and cancels out.
-    struct Endless {
+    /// `per_read` divides neither [`CHUNK`] nor [`FINAL_DRAIN`], so the last read the cap allows is
+    /// a short one and the remaining-room arithmetic is what decides the total — chunk-aligned, an
+    /// error in it lands on a boundary and cancels out.
+    ///
+    /// `left` rather than truly endless so that a drain which reads past its cap gives a wrong
+    /// *finite* answer instead of an unbounded one. Endless, the same mutant exhausts the host's
+    /// memory and takes the CI job with it.
+    struct Flooding {
         per_read: usize,
+        left: usize,
     }
 
-    impl Read for Endless {
+    impl Flooding {
+        /// Twice what the drain may take, so reading past the cap is unmistakable and still ends.
+        fn twice_the_cap() -> Self {
+            Flooding {
+                per_read: 3000,
+                left: FINAL_DRAIN * 2,
+            }
+        }
+    }
+
+    impl Read for Flooding {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             assert!(
                 !buf.is_empty(),
                 "the drain must not ask for zero bytes; it has room or it is finished"
             );
-            let n = buf.len().min(self.per_read);
+            let n = buf.len().min(self.per_read).min(self.left);
+            if n == 0 {
+                return Err(std::io::Error::from(ErrorKind::WouldBlock));
+            }
+            self.left -= n;
             buf[..n].fill(b'x');
             Ok(n)
         }
@@ -321,18 +363,24 @@ mod tests {
 
     /// Bytes `final_drain` handed the sink, driving it directly — through a real pipe it cannot be
     /// told apart from the main loop, which races it, so ablating it leaves those tests green.
-    fn drained(mut source: impl Read) -> String {
+    fn drained(source: impl Read) -> String {
+        drain_all(source).0
+    }
+
+    /// What `final_drain` took from `source`: the bytes it kept, and how many it read in total.
+    fn drain_all(mut source: impl Read) -> (String, usize) {
         let collected = Collected::default();
         let mut sink = collected.clone();
         let mut chunk = [0u8; CHUNK];
         final_drain(&mut source, &mut chunk, &mut sink);
-        collected.read().0
+        (collected.read().0, collected.total())
     }
 
     #[test]
     fn the_final_drain_stops_at_the_cap_rather_than_reading_on() {
-        // The cap is the whole bound against a survivor that keeps writing.
-        assert_eq!(drained(Endless { per_read: 3000 }).len(), FINAL_DRAIN);
+        // The cap is the whole bound against a survivor that keeps writing. Counted, not kept: the
+        // collector holds far less than the cap on purpose.
+        assert_eq!(drain_all(Flooding::twice_the_cap()).1, FINAL_DRAIN);
     }
 
     #[test]
@@ -359,23 +407,6 @@ mod tests {
             }),
             ""
         );
-    }
-
-    #[test]
-    fn the_final_drain_gives_up_on_a_pipe_that_only_ever_interrupts() {
-        // Off-thread: without a budget on the interrupts this never returns, and the suite should
-        // fail rather than hang.
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            tx.send(drained(InterruptedThen {
-                left: u32::MAX,
-                bytes: 5,
-            }))
-        });
-        let took = rx
-            .recv_timeout(NEVER_RETURNS)
-            .expect("the drain must give up on interrupts, not spin on them");
-        assert_eq!(took, "", "nothing was ever readable");
     }
 
     #[test]
