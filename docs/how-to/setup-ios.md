@@ -102,9 +102,10 @@ unsupported error, while capture, logs, and clipboard keep working.
 
 glass finds `idb_companion` on `PATH`, and — because a `.app` / LaunchAgent launch runs with a
 minimal `PATH` that omits Homebrew's bindir — also probes the standard Homebrew locations
-(`/opt/homebrew/bin`, `/usr/local/bin`), so a `brew install` is picked up with no extra setup. Set
-`GLASS_IDB_COMPANION` to the binary's path only to override that — an install elsewhere, or to pin a
-specific build.
+(`/opt/homebrew/bin`, `/usr/local/bin`), so a `brew install` is picked up with no extra setup. It
+takes the first copy it can actually execute, and reports one it cannot (`doctor` then asks for a
+`chmod +x` rather than another install). Set `GLASS_IDB_COMPANION` to the binary's path only to
+override that — an install elsewhere, or to pin a specific build.
 
 ## Clipboard
 

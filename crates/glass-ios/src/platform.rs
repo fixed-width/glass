@@ -309,7 +309,7 @@ impl IosPlatform {
         let (driver, driver_error) = match IdbDriver::start(target.udid()) {
             Ok(driver) => (Some(driver), None),
             Err(e) => {
-                let cause = e.to_string();
+                let cause = crate::doctor::spawn_cause(e);
                 eprintln!(
                     "glass-ios: idb_companion unavailable — running observe-only \
                      (capture/logs/clipboard); input and the accessibility tree are \
@@ -330,9 +330,9 @@ impl IosPlatform {
         self.app.as_ref().ok_or(GlassError::NoActiveSession)
     }
 
-    /// The input/accessibility driver, or a clear `Unsupported` when the companion is
-    /// absent (observe-only mode). The message carries the recorded cause so a caller sees
-    /// *why* input is disabled (not installed vs. installed-but-crashed).
+    /// The input/accessibility driver, or a clear `Unsupported` when there is no companion to
+    /// run (observe-only mode). The message carries the recorded cause, so a caller sees *why*
+    /// input is disabled rather than only that it is.
     fn driver(&self) -> Result<&IdbDriver> {
         self.driver.as_ref().ok_or_else(|| {
             GlassError::Unsupported(match &self.driver_error {
