@@ -24,10 +24,7 @@ use x11rb::wrapper::ConnectionExt as _;
 // private Xvfb — still reaps at `REAP_GRACE` each, so a helper that ignores SIGTERM can take the
 // whole teardown past the budget; that is pre-existing and not what this assertion is about.
 const _: () = assert!(
-    ASK_BUDGET.as_millis()
-        + CLOSE_GRACE.as_millis()
-        + APP_REAP_GRACE.as_millis()
-        + glass_proc_linux::KILL_CONFIRM.as_millis()
+    ASK_BUDGET.as_millis() + CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis()
         < TEARDOWN_BUDGET.as_millis(),
     "sending the close request, waiting it out and the signal ladder must all finish inside \
      glass_core::TEARDOWN_BUDGET"

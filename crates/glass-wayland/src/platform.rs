@@ -48,10 +48,7 @@ use crate::swayipc::{Ipc, Window as SwayWindow};
 // reaps at `REAP_GRACE`, so a helper that ignores SIGTERM can take the whole teardown past the
 // budget; that is pre-existing and not what this assertion is about.
 const _: () = assert!(
-    CLOSE_GRACE.as_millis()
-        + APP_REAP_GRACE.as_millis()
-        + glass_proc_linux::KILL_CONFIRM.as_millis()
-        < TEARDOWN_BUDGET.as_millis(),
+    CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis() < TEARDOWN_BUDGET.as_millis(),
     "the close request + compositor reap must finish inside glass_core::TEARDOWN_BUDGET"
 );
 

@@ -41,12 +41,14 @@ internal refactors, CI, or test-only changes.
   backend a headless sway that exits immediately is reported as an exit, not as an eight-second
   wait it never made.
 - `glass doctor --deep` no longer reports the Wayland probe's compositor as "started and stopped"
-  without checking the stopping half. A probe whose compositor outlives its teardown now warns and
-  names the processes that are still running, and keeps their runtime dir rather than deleting the
-  sockets out from under them. When the probe fails, the check carries sway's own stderr — its
-  account of what went wrong, which previously went to glass's stderr and never to the report —
-  and a compositor that is up but whose IPC never answers now says what the last connection
-  attempt was told.
+  without checking the stopping half. The probe now looks for anything still running out of the
+  private runtime directory it created — which is how a compositor's Xwayland and the app it starts
+  are found at all, since neither stays in sway's process tree — warns and names what is left, and
+  keeps that directory rather than deleting the sockets out from under it. When the probe fails the
+  check carries sway's own stderr, quoted and clipped, instead of leaving it on glass's stderr where
+  no MCP client reads it; a compositor whose IPC never answered now says whether its socket never
+  appeared or refused the connection; and a probe that lost track of what it started warns, rather
+  than reporting it as sway failing and pointing at the host's graphics stack.
 
 ## [1.4.0] - 2026-08-17
 

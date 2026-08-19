@@ -334,6 +334,25 @@ fn xwayland_pids() -> Vec<u32> {
         .collect()
 }
 
+/// Every process on the machine that belongs to the session `runtime_dir` was created for.
+///
+/// By what a process inherited, not by parentage: sway reparents Xwayland out of its own tree and
+/// `setsid`s every app it `exec`s, so a walk of sway's descendants finds neither. This is what
+/// answers whether a launch is really gone (glass#380).
+pub(crate) fn session_processes(runtime_dir: &Path) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|environ| serves_session(&environ, runtime_dir))
+        })
+        .collect()
+}
+
 /// Whether a process's environment (`/proc/<pid>/environ`: NUL-separated `KEY=VALUE`) says it
 /// belongs to the session glass created `runtime_dir` for.
 fn serves_session(environ: &[u8], runtime_dir: &Path) -> bool {
@@ -737,6 +756,33 @@ mod session_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// glass#380: what the probe started is found by what it inherited, because sway reparents
+    /// Xwayland out of its own tree and `setsid`s the app it `exec`s — a walk of sway's
+    /// descendants finds neither, so a teardown that missed one would look complete.
+    #[test]
+    fn a_process_is_matched_to_the_session_it_was_started_for() {
+        let rt = tempfile::tempdir().expect("tempdir");
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .env("XDG_RUNTIME_DIR", rt.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert!(
+            session_processes(rt.path()).contains(&pid),
+            "a process carrying the session's runtime dir belongs to it"
+        );
+        // Another session's dir must not match it — the whole point is telling them apart.
+        let other = tempfile::tempdir().expect("tempdir");
+        assert!(!session_processes(other.path()).contains(&pid));
+        child.kill().expect("kill");
+        child.wait().expect("reap");
+        assert!(!session_processes(rt.path()).contains(&pid));
+    }
 
     fn toplevel() -> WindowFacts {
         WindowFacts {
