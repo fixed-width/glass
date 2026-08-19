@@ -1239,6 +1239,7 @@ dependencies = [
  "block2",
  "glass-a11y-macos",
  "glass-core",
+ "glass-pipe-unix",
  "glass-sandbox-macos",
  "objc2",
  "objc2-app-kit",

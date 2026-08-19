@@ -23,7 +23,6 @@
 //! and the clipboard route can be decided.
 
 use std::ffi::CString;
-use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -31,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use glass_pipe_unix::LineTap;
 use rustix::process::{Pid, Signal, kill_process};
 
 use glass_core::platform::{AppSpec, SandboxLevel};
@@ -144,7 +144,7 @@ fn shim_dylib_path_with(env_override: Option<PathBuf>) -> Option<PathBuf> {
     crate::shim_path::resolve_shim(&exe_dir, env_override)
 }
 
-/// Log lines captured by the per-stream reader threads spawned in [`spawn`], drained by
+/// Log lines captured by the per-stream [`LineTap`]s started in [`spawn`], drained by
 /// `MacosPlatform::drain_logs`. `Arc<Mutex<_>>` (not a bare `Vec`) because the reader
 /// threads outlive `spawn`'s call and push into it concurrently with `drain_logs` reading
 /// it from the main thread — the same shape `glass-x11`/`glass-wayland` use.
@@ -187,12 +187,12 @@ const EXIT_POLL: Duration = Duration::from_millis(20);
 /// generated Seatbelt (`sandbox_init`) profile to the launched app via a fork-safe
 /// `pre_exec` (see below). [`SandboxLevel::Off`] spawns unchanged.
 ///
-/// The second return value is the clip-shim launch facts ([`ClipLaunch`]), `Some` only for
+/// The [`Launch`]'s `clip` is the clip-shim launch facts ([`ClipLaunch`]), `Some` only for
 /// a contained launch whose target is injectable (see [`target_is_injectable`]) and whose
 /// shim dylib resolved (see [`shim_dylib_path`]); `None` for `SandboxLevel::Off` or a
 /// non-injectable/unresolved target. The caller (`MacosPlatform::start_app`) holds it for a
 /// later clipboard-routing decision — this function only sets up the injection.
-pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<ClipLaunch>)> {
+pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Launch> {
     let mut cmd = Command::new(&spec.run[0]);
 
     // Apply the caller's env FIRST, so glass's own containment/injection vars are written LAST
@@ -346,24 +346,47 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
     // `Stdio::piped()` guarantees these are `Some` immediately after a successful spawn.
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
-    spawn_reader(stdout, Stream::Stdout, logs.clone());
-    spawn_reader(stderr, Stream::Stderr, logs);
+    let taps = vec![
+        tap_or_reap(stdout, Stream::Stdout, &logs, &mut child, spec)?,
+        tap_or_reap(stderr, Stream::Stderr, &logs, &mut child, spec)?,
+    ];
 
-    Ok((child, clip))
+    Ok(Launch { child, clip, taps })
 }
 
-/// Pipe a child stream's lines into the shared log sink on a background thread. Exits
-/// quietly (no error surfaced — this is a best-effort log tap, not the app's lifecycle)
-/// once the stream hits EOF (the child closed it, typically by exiting) or a read fails.
-fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, sink: LogSink) {
-    std::thread::spawn(move || {
-        for line in BufReader::new(reader).lines() {
-            match line {
-                Ok(text) => sink.lock().expect("log sink mutex").push((stream, text)),
-                Err(_) => break,
-            }
-        }
-    });
+/// What a direct spawn produced.
+#[derive(Debug)]
+pub(crate) struct Launch {
+    pub(crate) child: Child,
+    /// The clip-shim launch facts — see [`spawn`], which decides them.
+    pub(crate) clip: Option<ClipLaunch>,
+    /// The app's stdout/stderr readers, held for the app's lifetime. The app's write ends are
+    /// inherited by everything it spawns, so a reader that ended only at EOF would park on a
+    /// survivor's pipe, holding a thread and an fd for the life of the process (glass#477).
+    pub(crate) taps: Vec<LineTap>,
+}
+
+/// Start a reader over one of the launch's streams, or terminate the launch and say why it could
+/// not.
+///
+/// The failed start consumed the pipe, so its read end is already closed and the app's next write
+/// to that stream takes `SIGPIPE` — a death mid-run with nothing in the logs to say why.
+fn tap_or_reap<R: std::io::Read + std::os::fd::AsFd + Send + 'static>(
+    stream: R,
+    tag: Stream,
+    logs: &LogSink,
+    child: &mut Child,
+    spec: &AppSpec,
+) -> Result<LineTap> {
+    LineTap::start(stream, tag, logs.clone()).map_err(|e| {
+        terminate(child);
+        GlassError::AppNotStarted(format!(
+            "started {:?} but could not read its output ({e}); the app was stopped rather than \
+             left to write into a pipe nobody drains — free up threads and file descriptors on \
+             the host",
+            spec.run
+        ))
+    })
 }
 
 /// Idempotently terminate `child`: ask it to quit, wait up to [`QUIT_GRACE`], then SIGTERM,
@@ -543,7 +566,9 @@ mod tests {
             ("SECRET_PATH".to_string(), secret.to_string()),
         ];
         let logs = empty_sink();
-        let (mut child, clip) = spawn(&denied, logs.clone())
+        let Launch {
+            mut child, clip, ..
+        } = spawn(&denied, logs.clone())
             .unwrap_or_else(|e| panic!("sandboxed spawn should succeed: {e}"));
         // The probe is a plain, unsigned arm64 binary — always injectable — so a `None` here
         // means the shim never resolved (most likely `glass-clip-shim-macos` wasn't built; see
@@ -617,7 +642,9 @@ mod tests {
         launch.cwd = Some(std::env::temp_dir());
 
         let logs = empty_sink();
-        let (mut child, clip) = spawn(&launch, logs.clone()).unwrap_or_else(|e| {
+        let Launch {
+            mut child, clip, ..
+        } = spawn(&launch, logs.clone()).unwrap_or_else(|e| {
             panic!(
                 "sandboxed spawn of a launch target under $HOME (cwd outside $HOME) should \
                  succeed: {e}"
@@ -646,11 +673,68 @@ mod tests {
         );
     }
 
+    /// glass#477: the launch's readers are the caller's to end, and the last thing the app said
+    /// survives that ending.
+    ///
+    /// **What this covers and what it does not.** The fd-release property belongs to
+    /// `glass-pipe-unix` and is asserted by its own suite, which runs on this host too — macOS has
+    /// no cheap in-process equivalent of the `/proc/self/fd` check the Linux backends use, and
+    /// `spawn` is `pub(crate)`, so the assertion cannot move to its own test binary the way
+    /// theirs did. What is this crate's own to get right is the wiring: `spawn` hands the taps
+    /// back rather than detaching them, and the drain after the stop keeps what the app wrote on
+    /// its way out.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_launch_hands_back_taps_that_catch_the_apps_last_line() {
+        let logs = empty_sink();
+        // The sleeper inherits both pipes and outlives the child, so EOF is not a deadline the
+        // readers can reach — `drop(taps)` has to be what ends them.
+        let Launch {
+            mut child, taps, ..
+        } = spawn(
+            &spec(&["/bin/sh", "-c", "echo 'the last line'; sleep 30 &"]),
+            Arc::clone(&logs),
+        )
+        .expect("spawn /bin/sh");
+
+        assert_eq!(
+            taps.len(),
+            2,
+            "both streams must be tapped, and handed back"
+        );
+
+        // Waited for, not slept past: the child exits as soon as it has backgrounded the sleeper,
+        // and that is what makes "everything it wrote is already in the pipe" true rather than a
+        // race the reader can lose. `terminate` is then the idempotent no-op it is in production
+        // on an app that left on its own, and keeps this in the order teardown uses.
+        child.wait().expect("the child exits, the sleeper does not");
+        terminate(&mut child);
+        // Reaped first, so each tap's final drain sees what the app wrote on the way out.
+        drop(taps);
+
+        let said: Vec<String> = logs
+            .lock()
+            .expect("log sink mutex")
+            .iter()
+            .map(|(_, line)| line.clone())
+            .collect();
+        assert!(
+            said.iter().any(|line| line == "the last line"),
+            "the drain after the stop must keep the app's last line: {said:?}"
+        );
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn spawn_pipes_stdout_and_stderr_lines() {
         let logs = empty_sink();
-        let (mut child, _clip) = spawn(
+        // `_taps` rather than `..`: the readers are the caller's to hold now, and dropping them
+        // here would stop them before the child had written anything.
+        let Launch {
+            mut child,
+            taps: _taps,
+            ..
+        } = spawn(
             &spec(&["/bin/sh", "-c", "echo out; echo err 1>&2"]),
             logs.clone(),
         )
@@ -729,7 +813,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn terminate_kills_a_long_running_child() {
-        let (mut child, _clip) =
+        let Launch { mut child, .. } =
             spawn(&spec(&["/bin/sleep", "100"]), empty_sink()).expect("spawn /bin/sleep");
         terminate(&mut child);
         let status = child.try_wait().expect("try_wait after terminate");
@@ -788,7 +872,7 @@ mod tests {
 
         let (fixture, build_dir) = build_quit_fixture("ask");
         let sink = empty_sink();
-        let (mut child, _clip) = spawn(
+        let Launch { mut child, .. } = spawn(
             &spec(&[fixture.to_string_lossy().as_ref()]),
             Arc::clone(&sink),
         )
@@ -824,7 +908,8 @@ mod tests {
         spec.env = vec![("GLASS_FIXTURE_VETO_QUIT".to_string(), "1".to_string())];
 
         let sink = empty_sink();
-        let (mut child, _clip) = spawn(&spec, Arc::clone(&sink)).expect("spawn the AppKit fixture");
+        let Launch { mut child, .. } =
+            spawn(&spec, Arc::clone(&sink)).expect("spawn the AppKit fixture");
         std::thread::sleep(FIXTURE_LAUNCH_SETTLE);
 
         let started = Instant::now();
@@ -861,7 +946,7 @@ mod tests {
         // `terminate_app` reports that. The quit grace must then be skipped entirely rather
         // than spent — otherwise asking first would add `QUIT_GRACE` to the teardown of every
         // app glass cannot ask, which is every console-shaped one.
-        let (mut child, _clip) =
+        let Launch { mut child, .. } =
             spawn(&spec(&["/bin/sleep", "100"]), empty_sink()).expect("spawn /bin/sleep");
         let started = Instant::now();
         terminate(&mut child);
@@ -883,7 +968,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn terminate_is_idempotent_on_an_already_exited_child() {
-        let (mut child, _clip) =
+        let Launch { mut child, .. } =
             spawn(&spec(&["/bin/echo", "hi"]), empty_sink()).expect("spawn /bin/echo");
         child.wait().expect("wait for /bin/echo to exit");
         // Already reaped; terminate must not panic or hang.

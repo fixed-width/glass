@@ -1,5 +1,5 @@
-use std::io::{ErrorKind, Read};
-use std::os::fd::{AsFd, OwnedFd};
+use std::io::{ErrorKind, PipeReader, PipeWriter, Read};
+use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-use rustix::pipe::{PipeFlags, pipe_with};
 
 /// How long an idle reader sleeps before looking at the stop flag again.
 ///
@@ -57,7 +56,7 @@ pub struct PipeTap {
     /// write end of a self-pipe; nobody drains it, so one byte stays readable and the next poll
     /// is certain to see it. Only ever written by [`PipeTap::stop`], whose flag the loop checks
     /// immediately afterwards, so an always-readable byte cannot spin the reader.
-    wake: OwnedFd,
+    wake: PipeWriter,
     /// Taken by whichever of [`PipeTap::stop`] and `drop` runs first.
     reader: Option<JoinHandle<()>>,
 }
@@ -78,8 +77,11 @@ impl PipeTap {
         // child: `pipe(2)` gives the two ends separate open file descriptions, so a status flag
         // set here never reaches the write end it inherited.
         fcntl_setfl(&source, fcntl_getfl(&source)?.union(OFlags::NONBLOCK))?;
-        // CLOEXEC or these land in every process the host spawns afterwards.
-        let (woken, wake) = pipe_with(PipeFlags::CLOEXEC)?;
+        // `std::io::pipe` rather than rustix's: `pipe_with(CLOEXEC)` is `pipe2(2)`, which macOS
+        // does not have and rustix therefore gates out there. std closes the gap per platform,
+        // and sets close-on-exec either way — without it these land in every process the host
+        // spawns afterwards.
+        let (woken, wake) = std::io::pipe()?;
         let done: Arc<AtomicBool> = Arc::default();
         let stopping: Arc<AtomicBool> = Arc::default();
         let (ended, stop) = (Arc::clone(&done), Arc::clone(&stopping));
@@ -138,7 +140,7 @@ impl std::fmt::Debug for PipeTap {
 /// Read `source` into `sink` until it ends or `stopping` says to.
 fn read_until_stopped<R: Read + AsFd, S: ChunkSink>(
     mut source: R,
-    woken: &OwnedFd,
+    woken: &PipeReader,
     stopping: &AtomicBool,
     sink: &mut S,
 ) {
@@ -189,7 +191,7 @@ fn final_drain<R: Read, S: ChunkSink>(source: &mut R, chunk: &mut [u8; CHUNK], s
 ///
 /// A poll that errors sleeps instead of returning at once: a persistent one — `EINVAL` under an
 /// `RLIMIT_NOFILE` below two — would otherwise spin this loop on an `EAGAIN` read and burn a core.
-fn wait_for_more<R: AsFd>(source: &R, woken: &OwnedFd) {
+fn wait_for_more<R: AsFd>(source: &R, woken: &PipeReader) {
     let mut waiting = [
         PollFd::new(source, PollFlags::IN),
         PollFd::new(woken, PollFlags::IN),
@@ -311,7 +313,11 @@ mod tests {
         );
     }
 
+    // `/proc/self/fd`, so Linux only. The property is not: what it proves — the reader closes its
+    // end — holds on every unix, and `stop_returns_while_a_survivor_holds_the_pipe_open` above
+    // covers the half that can be asserted anywhere.
     #[test]
+    #[cfg(target_os = "linux")]
     fn stop_releases_the_pipe_a_survivor_holds_open() {
         // A tap that stops without ending its reader leaves the fd held for the process's life.
         let (mut c, _survivor) = said_then_survived("the last line\\n");
@@ -350,7 +356,9 @@ mod tests {
         assert!(ended, "the sink must be told no more is coming");
     }
 
+    // `/proc/self/fdinfo`, so Linux only — macOS exposes no per-fd status flags to read back.
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_read_end_is_non_blocking() {
         // Blocking, a read with nothing to read parks past every look at the stop flag, and the
         // wakeup cannot reach a thread that is no longer in `poll`.
