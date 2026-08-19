@@ -57,7 +57,7 @@ impl NoCompanion {
         }
     }
 
-    /// An override skips discovery, so another install would not be looked at either.
+    /// Another install would not be looked at while the override stands.
     fn override_names_nothing() -> NoCompanion {
         NoCompanion {
             cause: "GLASS_IDB_COMPANION does not name a runnable idb_companion".into(),
@@ -231,9 +231,8 @@ impl IdbCompanion {
         Self::spawn_bin(udid, bin)
     }
 
-    /// [`spawn`](Self::spawn) against an already-resolved binary, for a caller that resolved it
-    /// once and must not resolve again — a second lookup can answer differently from the first
-    /// (glass#391), so the doctor would report one binary and start another.
+    /// [`spawn`](Self::spawn) against an already-resolved binary, for a caller holding one from
+    /// [`resolve_companion`] that must not resolve again.
     pub(crate) fn spawn_bin(udid: &str, bin: &Path) -> Result<IdbCompanion> {
         Self::spawn_with(udid, bin, SOCKET_READY_TIMEOUT)
     }

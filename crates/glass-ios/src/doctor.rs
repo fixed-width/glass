@@ -322,9 +322,8 @@ fn read_trimmed(path: &Path) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Whether this host has an `idb_companion` glass can actually run — the gate on the iOS
-/// input and accessibility capabilities. The launch path's own verdict, not a second reading of
-/// the resolution that could disagree with it.
+/// Whether this host has an `idb_companion` glass can actually run — the launch path's own
+/// verdict, gating the iOS input and accessibility capabilities.
 pub(crate) fn companion_runnable() -> bool {
     gather().spawn_target().is_ok()
 }
@@ -342,8 +341,8 @@ pub fn companion_check(deep: bool) -> Check {
     check_for(&gather(), deep, probe_companion)
 }
 
-/// [`companion_check`] over gathered facts, with the probe injected — the seam that pins which
-/// resolutions are worth a real companion start without one running here.
+/// [`companion_check`] over gathered facts, with the probe injected — the seam a test drives
+/// without a companion running here.
 fn check_for(
     facts: &CompanionFacts,
     deep: bool,
@@ -358,7 +357,7 @@ fn check_for(
 }
 
 /// Pure: what a resolution means for the operator, rendering the launch path's own
-/// [`NoCompanion`] so the two cannot drift about the same file.
+/// `NoCompanion`.
 ///
 /// A companion glass cannot run is a **Fail**, not a Warn: unlike android, which keeps barebones
 /// function without its companions, iOS cannot drive apps at all without this one. The aggregator
@@ -964,9 +963,7 @@ mod tests {
         assert_eq!(c.remedy, None);
     }
 
-    /// glass#393: an `idb_companion` that is installed and unrunnable used to read as missing,
-    /// sending the user to reinstall a package that is already there. It has to name the file
-    /// and the permission fix instead.
+    /// glass#393 at the message layer: the file and the permission fix, not another install.
     #[test]
     fn a_companion_that_cannot_be_executed_is_told_apart_from_a_missing_one() {
         let c = resolution_check(&discovered(Resolved::NotExecutable(PathBuf::from(
