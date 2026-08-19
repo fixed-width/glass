@@ -22,6 +22,7 @@ glass-exec-unix.workspace = true
 glass-a11y-linux.workspace = true
 glass-sandbox-linux.workspace = true
 glass-proc-linux.workspace = true
+glass-pipe-unix.workspace = true
 glass-dbus-linux.workspace = true
 x11rb.workspace = true
 

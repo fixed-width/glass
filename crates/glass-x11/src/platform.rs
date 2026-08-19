@@ -6,7 +6,8 @@ use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
     TEARDOWN_BUDGET, WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
 };
-use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, proc_tree_pids, spawn_reader};
+use glass_pipe_unix::LineTap;
+use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, proc_tree_pids};
 use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
 use x11rb::errors::ReplyError;
@@ -57,6 +58,10 @@ pub struct X11Platform {
     child: Option<Child>,
     window: Option<Window>,
     logs: LogSink,
+    /// The launched app's stdout/stderr readers, kept for the app's lifetime and dropped in
+    /// `kill_child`. The app's write ends are inherited by everything it spawns, so a reader
+    /// that ended only at EOF would park on a survivor's pipe (glass#477).
+    taps: Vec<LineTap>,
     // A private Xvfb we spawned (default path); kept alive so Drop tears it down.
     xvfb: Option<crate::xvfb::Xvfb>,
     // A private a11y-enabled D-Bus session bus we spawned for the launched app;
@@ -102,6 +107,30 @@ fn is_window_gone(err: &ReplyError) -> bool {
         err,
         ReplyError::X11Error(x) if matches!(x.error_kind, ErrorKind::Window | ErrorKind::Drawable)
     )
+}
+
+/// Start a reader over one of the launch's streams, or reap the launch and say why it could not.
+///
+/// The failed start consumed the pipe, so its read end is already closed and the app's next write
+/// to that stream takes `SIGPIPE` — a death mid-run with nothing in the logs to say why. Stopping
+/// it here is the honest failure, and the call `xvfb.rs` already makes for the X server's own
+/// stderr.
+fn tap_or_reap<R: std::io::Read + std::os::fd::AsFd + Send + 'static>(
+    stream: R,
+    tag: Stream,
+    logs: &LogSink,
+    child: &mut Child,
+    spec: &AppSpec,
+) -> Result<LineTap> {
+    LineTap::start(stream, tag, logs.clone()).map_err(|e| {
+        glass_proc_linux::reap_graceful(child, glass_proc_linux::REAP_GRACE);
+        GlassError::AppNotStarted(format!(
+            "started {:?} but could not read its output ({e}); the app was stopped rather than \
+             left to write into a pipe nobody drains — free up threads and file descriptors on \
+             the host",
+            spec.run
+        ))
+    })
 }
 
 impl X11Platform {
@@ -150,6 +179,7 @@ impl X11Platform {
             child: None,
             window: None,
             logs: Arc::new(Mutex::new(Vec::new())),
+            taps: Vec::new(),
             xvfb: None,
             dbus: None,
             clipboard_owner: None,
@@ -298,12 +328,26 @@ impl X11Platform {
         let mut child = cmd
             .spawn()
             .map_err(|e| GlassError::AppNotStarted(format!("spawn {:?}: {e}", spec.run)))?;
+        let mut taps = Vec::new();
         if let Some(out) = child.stdout.take() {
-            spawn_reader(out, Stream::Stdout, self.logs.clone());
+            taps.push(tap_or_reap(
+                out,
+                Stream::Stdout,
+                &self.logs,
+                &mut child,
+                spec,
+            )?);
         }
         if let Some(err) = child.stderr.take() {
-            spawn_reader(err, Stream::Stderr, self.logs.clone());
+            taps.push(tap_or_reap(
+                err,
+                Stream::Stderr,
+                &self.logs,
+                &mut child,
+                spec,
+            )?);
         }
+        self.taps = taps;
         self.child = Some(child);
         Ok(())
     }
@@ -481,6 +525,10 @@ impl X11Platform {
             glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
         }
         self.window = None;
+        // Reaped first, so each tap's final drain sees what the app wrote on its way out. Dropping
+        // them ends the reader threads and releases the pipes, which anything the launch left
+        // running would otherwise hold for the life of this process (glass#477).
+        self.taps.clear();
         // Drop the private a11y bus, reaping its dbus-daemon / at-spi children. Also
         // covers `start_app`'s failure path (which calls `kill_child`), so a launch
         // that never finds a window doesn't leave the bus running until Drop.
