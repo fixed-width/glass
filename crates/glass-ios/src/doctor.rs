@@ -442,10 +442,10 @@ fn probe_companion(bin: &Path) -> CompanionProbe {
 }
 
 /// The human cause from a failed [`IdbCompanion::spawn`], stripped of `GlassError::Backend`'s
-/// `"backend error: "` Display prefix — the doctor already frames it as "failed to start: …",
-/// so the prefix would read redundantly in user-facing output. Any other variant falls back
-/// to its full Display.
-fn spawn_cause(e: GlassError) -> String {
+/// `"backend error: "` Display prefix — every caller frames the cause itself ("failed to start:
+/// …", "input and the accessibility tree are disabled: …"), so the prefix reads redundantly in
+/// user-facing output. Any other variant falls back to its full Display.
+pub(crate) fn spawn_cause(e: GlassError) -> String {
     match e {
         GlassError::Backend(msg) => msg,
         other => other.to_string(),

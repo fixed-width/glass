@@ -309,7 +309,7 @@ impl IosPlatform {
         let (driver, driver_error) = match IdbDriver::start(target.udid()) {
             Ok(driver) => (Some(driver), None),
             Err(e) => {
-                let cause = e.to_string();
+                let cause = crate::doctor::spawn_cause(e);
                 eprintln!(
                     "glass-ios: idb_companion unavailable — running observe-only \
                      (capture/logs/clipboard); input and the accessibility tree are \
