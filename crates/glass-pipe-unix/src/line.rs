@@ -6,9 +6,9 @@ use crate::{ChunkSink, PipeTap};
 
 /// A child's stream read as tagged lines into a buffer the caller drains.
 ///
-/// Held by the backend for the app's lifetime and dropped at teardown: the app's stdout/stderr
-/// write ends are inherited by everything it spawns, so a reader that ended only at EOF would
-/// park on a survivor's pipe (glass#477).
+/// Held by the backend for the app's lifetime and dropped at teardown: the app's write ends are
+/// inherited by everything it spawns, so an EOF-only reader parks on a survivor's pipe
+/// (glass#477).
 #[derive(Debug)]
 pub struct LineTap(PipeTap);
 
@@ -41,8 +41,8 @@ impl LineTap {
 /// Splits what the pipe delivered into lines. Chunks arrive at pipe boundaries, so a line can
 /// span any number of them — `pending` is what has been seen of the line still open.
 ///
-/// `glass-windows/src/logtap.rs` carries a twin of this, because that crate cannot link a
-/// `cfg(unix)` one. A decision made here about newlines, `\r` or invalid bytes belongs in both.
+/// `glass-windows/src/logtap.rs` carries a twin, since that crate cannot link a `cfg(unix)` one:
+/// a decision here about newlines, `\r` or invalid bytes belongs in both.
 struct Lines<S> {
     tag: S,
     sink: Arc<Mutex<Vec<(S, String)>>>,
@@ -63,9 +63,8 @@ impl<S: Copy> Lines<S> {
     /// File `pending` as a line and start the next one.
     ///
     /// Lossy rather than a decode that can fail: `BufRead::lines` returns `Err` on a bad byte and
-    /// the readers this replaces stopped there, so one stray byte silenced an app for the rest of
-    /// its run. The trailing `\r` goes the way `BufRead::lines` drops it, so a CRLF-writing app
-    /// does not gain one at the end of every line.
+    /// the readers this replaces stopped there, silencing an app for the rest of its run over one
+    /// stray byte. The trailing `\r` goes the way `BufRead::lines` drops it.
     fn emit(&mut self) {
         let line = std::mem::take(&mut self.pending);
         let text = String::from_utf8_lossy(&line);
@@ -89,8 +88,8 @@ impl<S: Copy> ChunkSink for Lines<S> {
     }
 
     /// A last line that never got its newline is still what the app said — a crash mid-write, or a
-    /// process killed between the text and the terminator. An empty `pending` is the ordinary case
-    /// of a stream that ended on a newline, and must not become a blank line.
+    /// process killed between the text and the terminator. An empty `pending` is a stream that
+    /// ended on a newline, and must not become a blank line.
     fn end(&mut self) {
         if !self.pending.is_empty() {
             self.emit();

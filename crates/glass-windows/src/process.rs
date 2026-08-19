@@ -114,8 +114,8 @@ pub(crate) struct LaunchedApp {
     job: SendHandle,
     child: Child,
     /// The app's stdout/stderr readers, ended by `kill`. The app's write ends are inherited by
-    /// everything it spawns, so a reader that ended only at EOF would park on a survivor's pipe,
-    /// holding a thread and a handle for the life of the process (glass#477).
+    /// everything it spawns, so an EOF-only reader parks on a survivor's pipe, holding a thread
+    /// and a handle for the life of the process (glass#477).
     taps: Vec<crate::logtap::LogTap>,
 }
 
@@ -127,10 +127,10 @@ impl LaunchedApp {
     /// Start the log readers over the piped stdout/stderr, filing into `logs`. Call once, before
     /// `resume`, so nothing the app writes at startup is missed.
     ///
-    /// The readers are kept here rather than handed back: they are made from this handle's own
-    /// pipes, and `kill` is what ends them. `Err` is the host refusing a thread, and the pipe it
-    /// was for is closed by then — the caller must fail the launch rather than resume an app
-    /// whose output goes nowhere.
+    /// The readers stay here rather than being handed back: they are made from this handle's own
+    /// pipes, and `kill` ends them. `Err` is the host refusing a thread, with that stream's pipe
+    /// closed by then — the caller must fail the launch rather than resume an app whose output
+    /// goes nowhere.
     pub(crate) fn tap_logs(&mut self, logs: &crate::logtap::LogSink) -> std::io::Result<()> {
         if let Some(out) = self.child.stdout.take() {
             self.taps.push(crate::logtap::LogTap::start(
@@ -152,13 +152,12 @@ impl LaunchedApp {
     /// Terminate a launch that never started, closing the Job handle with it.
     ///
     /// `LaunchedApp` releases the Job only in [`LaunchedApp::kill`], and neither `SendHandle` nor
-    /// `Child` frees anything on drop — so a launch abandoned between `spawn_suspended_in_job`
-    /// and `resume` would sit `CREATE_SUSPENDED` and alive for the life of this process, with its
-    /// Job handle leaked and `KILL_ON_JOB_CLOSE` therefore never firing. The root is still
-    /// suspended and job-assigned but has never run, so it has no children of its own; this is
-    /// the same reasoning `spawn_suspended_in_job`'s own error arm uses.
+    /// `Child` frees anything on drop — so a launch abandoned between `spawn_suspended_in_job` and
+    /// `resume` sits `CREATE_SUSPENDED` and alive for the life of this process, its Job handle
+    /// leaked and `KILL_ON_JOB_CLOSE` therefore never firing. The root has never run, so it has no
+    /// children; `spawn_suspended_in_job`'s own error arm reasons the same way.
     ///
-    /// Any tap already started is ended by the drop that follows, after the kill.
+    /// Any tap already started is ended by the drop that follows the kill.
     pub(crate) fn abandon(mut self) {
         // SAFETY: closing the last job handle terminates anything left in the tree.
         unsafe {
@@ -203,8 +202,8 @@ impl LaunchedApp {
         let _ = self.child.kill(); // belt-and-suspenders: ensure the root is terminated so wait() can't block
         let _ = self.child.wait(); // reap the now-terminated root; avoids a zombie
         // Terminated first, so each tap's final drain sees what the app wrote on the way out.
-        // Dropping them ends the reader threads and releases the pipe handles, which anything the
-        // launch left running would otherwise hold for the life of this process (glass#477).
+        // Dropping them releases the pipe handles anything the launch left running still holds
+        // (glass#477).
         self.taps.clear();
         asked.outcome(closed_itself)
     }

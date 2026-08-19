@@ -19,8 +19,8 @@ use rustix::process::{Pid, Signal, kill_process};
 /// The process the launch leaves behind, killed when the test ends, panic included.
 ///
 /// Load-bearing beyond cleanup: while it holds the write ends the pipes' inodes cannot be freed,
-/// so no other pipe in this process can be handed the same `pipe:[n]` and read as a false pass.
-/// Killed only after the assertions, for that reason.
+/// so no other pipe here can be handed the same `pipe:[n]` and read as a false pass — which is
+/// why it is killed only after the assertions.
 struct Survivor(Option<u32>);
 
 impl Drop for Survivor {
@@ -32,8 +32,7 @@ impl Drop for Survivor {
 }
 
 /// Every pipe this process holds, as `fd -> pipe:[inode]`. The inode is half the identity: an fd
-/// number the kernel released and handed straight back for a different pipe must not read as the
-/// same one still held.
+/// number released and handed straight back for a different pipe must not read as one still held.
 fn open_pipes() -> HashSet<String> {
     std::fs::read_dir("/proc/self/fd")
         .expect("/proc/self/fd")

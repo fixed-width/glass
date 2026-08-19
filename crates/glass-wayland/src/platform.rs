@@ -56,8 +56,8 @@ const _: () = assert!(
 struct ActiveSession {
     child: Child,
     /// sway's stdout/stderr readers, dropped when the session is torn down. Everything sway
-    /// spawns inherits its write ends, so a reader that ended only at EOF would park on a
-    /// survivor's pipe (glass#477).
+    /// spawns inherits its write ends, so an EOF-only reader parks on a survivor's pipe
+    /// (glass#477).
     taps: Vec<LineTap>,
     _runtime_dir: TempDir, // kept alive: the wayland socket lives here
     socket_path: PathBuf,  // path to the sway wayland socket (for clipboard threads)
@@ -1152,12 +1152,12 @@ fn open_session(
 
 /// Start a reader over one of sway's streams, or reap the session and say why it could not.
 ///
-/// The failed start consumed the pipe, so its read end is already closed and sway's next write to
-/// that stream takes `SIGPIPE`. The group rather than the leader, and matching every other
-/// error path in `bring_up_session`: sway forks Xwayland into its own group, and a leader-only
-/// reap would leave it holding the X display in the global namespace. It does *not* reach the
-/// apps sway `exec`s — those are `setsid`ed into their own sessions (see `kill_session`) — but at
-/// this point sway has not read its config, so there are none yet.
+/// The failed start consumed the pipe, so sway's next write to that stream takes `SIGPIPE`.
+///
+/// The group rather than the leader, matching every other error path here: sway forks Xwayland
+/// into its own group, and a leader-only reap leaves it holding the X display in the global
+/// namespace. It does not reach the apps sway `exec`s — those are `setsid`ed out (see
+/// `kill_session`) — but sway has not read its config yet, so there are none.
 fn tap_or_reap<R: std::io::Read + AsFd + Send + 'static>(
     stream: R,
     tag: Stream,
@@ -1210,9 +1210,9 @@ fn bring_up_session(
         .spawn()
         .map_err(|e| GlassError::AppNotStarted(format!("spawn sway: {e}")))?;
     // Declared before the discovery loop below, so each of its `return Err(...)` paths drops the
-    // taps *after* its own reap — the reap-then-stop order teardown uses, so the final drain sees
-    // what sway wrote on the way out. `Stdio::piped()` above guarantees both are `Some`; skipping
-    // a stream that is not would silently stop capturing it.
+    // taps *after* its own reap — the order teardown uses, so the final drain sees what sway wrote
+    // on the way out. `Stdio::piped()` guarantees both are `Some`; skipping one that is not would
+    // silently stop capturing it.
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let taps = vec![
@@ -1239,10 +1239,9 @@ fn bring_up_session(
         }
         if let Ok(Some(status)) = child.try_wait() {
             // sway exited — but on an *unclean* exit Xwayland, which sway forks into its own
-            // group, can outlive it. Reap the whole group, not just the leader, or a leaked
-            // Xwayland holds the X display in the global namespace and breaks the next session.
-            // (The app sway `exec`s is `setsid`ed out of that group — see `kill_session` — and is
-            // covered by the `reap_launch` tree walk there, not here.)
+            // group, can outlive it and hold the X display in the global namespace, breaking the
+            // next session. (The app sway `exec`s is `setsid`ed out of that group — see
+            // `kill_session` — and is covered by the `reap_launch` tree walk there.)
             glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
             return Err(GlassError::app_exited_during_discovery(
                 status.code(),

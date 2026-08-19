@@ -4,7 +4,7 @@
 //! `std::process::Command` built from [`AppSpec`], stdout/stderr piped into a shared,
 //! `Arc<Mutex<_>>`-guarded log buffer via one reader thread per stream, so
 //! `MacosPlatform::drain_logs` can read it without blocking the readers. The taps go back to the
-//! caller with the child, because ending them is part of teardown (glass#477). `terminate` asks
+//! caller with the child: ending them is part of teardown (glass#477). `terminate` asks
 //! the app to quit first — AppKit runs no shutdown path for a signal — and only then falls
 //! back to `glass-proc-linux::reap`'s SIGTERM -> brief wait -> SIGKILL -> reap sequence,
 //! reimplemented here (rather than depending on that crate) because it is `/proc`-based
@@ -369,10 +369,9 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Launch> {
     ) {
         (Ok(out), Ok(err)) => vec![out, err],
         (out, err) => {
-            // The shim's boards outlive the process that was going to use them, and this is the
-            // first path that ends a `ClipLaunch` — `release_clip`'s doc requires every one of
-            // them to release, or they persist system-wide and a later session can read a stale
-            // `.ready` sentinel.
+            // The first path that ends a `ClipLaunch`, and `release_clip`'s doc requires every one
+            // of them to release: the boards persist system-wide, and a later session can read a
+            // stale `.ready` sentinel.
             release_named_boards(clip.as_ref());
             return Err(out.err().or(err.err()).expect("one of the two failed"));
         }
@@ -381,9 +380,8 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Launch> {
     Ok(Launch { child, clip, taps })
 }
 
-/// Release the named pasteboards a shim launch created, for a launch that is being abandoned
-/// before the caller ever sees its [`ClipLaunch`]. `backend::release_clip` is the same call on the
-/// paths that do have one.
+/// Release the named pasteboards a shim launch created, for a launch abandoned before the caller
+/// ever sees its [`ClipLaunch`]. `backend::release_clip` is the same call where one exists.
 fn release_named_boards(clip: Option<&ClipLaunch>) {
     if let Some(c) = clip {
         crate::clipboard::release_named(&c.name);
@@ -398,16 +396,16 @@ pub(crate) struct Launch {
     /// The clip-shim launch facts — see [`spawn`], which decides them.
     pub(crate) clip: Option<ClipLaunch>,
     /// The app's stdout/stderr readers, held for the app's lifetime. The app's write ends are
-    /// inherited by everything it spawns, so a reader that ended only at EOF would park on a
-    /// survivor's pipe, holding a thread and an fd for the life of the process (glass#477).
+    /// inherited by everything it spawns, so an EOF-only reader parks on a survivor's pipe, holding
+    /// a thread and an fd for the life of the process (glass#477).
     pub(crate) taps: Vec<LineTap>,
 }
 
 /// Start a reader over one of the launch's streams, or terminate the launch and say why it could
 /// not.
 ///
-/// The failed start consumed the pipe, so its read end is already closed and the app's next write
-/// to that stream takes `SIGPIPE` — a death mid-run with nothing in the logs to say why.
+/// The failed start consumed the pipe, so the app's next write to that stream takes `SIGPIPE` — a
+/// death mid-run with nothing in the logs to say why.
 fn tap_or_reap<R: std::io::Read + AsFd + Send + 'static>(
     stream: R,
     tag: Stream,
@@ -714,19 +712,18 @@ mod tests {
     /// glass#477: the launch's readers are the caller's to end, and the last thing the app said
     /// survives that ending.
     ///
-    /// **What this covers and what it does not.** Not the fd release: that property is
-    /// `glass-pipe-unix`'s, and its assertion for it reads `/proc/self/fd`, so it is Linux-gated
-    /// and does not run here. Not the final drain either — `child.wait()` below returns long
-    /// after the reader has had the line through its ordinary loop, so ablating the drain leaves
-    /// this green; `glass-pipe-unix` drives that function directly instead. What is this crate's
-    /// own to get right, and what this pins, is the wiring: `spawn` hands the taps back rather
-    /// than detaching them, and stopping them joins rather than losing what the app already said.
+    /// **What this covers and what it does not.** Not the fd release: that assertion reads
+    /// `/proc/self/fd` and is Linux-gated. Not the final drain either — `child.wait()` below
+    /// returns long after the reader has had the line through its ordinary loop, so ablating the
+    /// drain leaves this green, and `glass-pipe-unix` drives that function directly instead. What
+    /// this pins is the wiring: `spawn` hands the taps back rather than detaching them, and
+    /// stopping them joins rather than losing what the app already said.
     #[test]
     #[cfg(target_os = "macos")]
     fn a_launch_hands_back_taps_that_catch_the_apps_last_line() {
         let logs = empty_sink();
         // The sleeper inherits both pipes and outlives the child, so EOF is not a deadline the
-        // readers can reach — `drop(taps)` has to be what ends them.
+        // readers can reach: `drop(taps)` has to be what ends them.
         let Launch {
             mut child, taps, ..
         } = spawn(
@@ -741,10 +738,9 @@ mod tests {
             "both streams must be tapped, and handed back"
         );
 
-        // Waited for, not slept past: the child exits as soon as it has backgrounded the sleeper,
-        // and that is what makes "everything it wrote is already in the pipe" true rather than a
-        // race the reader can lose. `terminate` is then the idempotent no-op it is in production
-        // on an app that left on its own, and keeps this in the order teardown uses.
+        // Waited for, not slept past: the child exits once it has backgrounded the sleeper, which
+        // is what makes "everything it wrote is already in the pipe" true rather than a race.
+        // `terminate` is then the no-op it is on an app that left on its own, in teardown's order.
         child.wait().expect("the child exits, the sleeper does not");
         terminate(&mut child);
         // Reaped first, so each tap's final drain sees what the app wrote on the way out.
@@ -766,8 +762,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn spawn_pipes_stdout_and_stderr_lines() {
         let logs = empty_sink();
-        // `_taps` rather than `..`: the readers are the caller's to hold now, and dropping them
-        // here would stop them before the child had written anything.
+        // `_taps` rather than `..`: dropping them here stops the readers before the child writes.
         let Launch {
             mut child,
             taps: _taps,

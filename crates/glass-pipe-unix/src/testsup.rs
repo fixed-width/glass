@@ -7,12 +7,11 @@ use std::process::{Child, Command, Stdio};
 use rustix::process::{Pid, Signal, kill_process};
 
 /// A process holding a child's pipe after the child is gone, killed when the test ends, panic
-/// included. It outlives the suites' own deadlines several times over, so a reader that only
-/// stops at EOF stays parked for the whole test, and self-limits if the guard cannot run.
+/// included. It outlives the suites' deadlines several times over, and self-limits if the guard
+/// cannot run.
 ///
-/// Load-bearing for the fd assertions, not only for cleanup: while it holds the write end the
-/// pipe's inode cannot be freed, so no sibling test thread can be handed the same `pipe:[n]` and
-/// read as a false failure.
+/// Load-bearing beyond cleanup: while it holds the write end the pipe's inode cannot be freed, so
+/// no sibling test thread can be handed the same `pipe:[n]` and read as a false failure.
 pub(crate) struct Survivor(pub(crate) Option<u32>);
 
 impl Drop for Survivor {

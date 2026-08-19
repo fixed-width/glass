@@ -82,9 +82,9 @@ pub struct MacosPlatform {
     /// it. `None` until `start_app` and after `stop_app` (idempotent).
     child: Option<Child>,
     /// The launched app's stdout/stderr readers, cleared by `stop_app`/`Drop` once the child is
-    /// terminated. The app's write ends are inherited by everything it spawns, so a reader that
-    /// ended only at EOF would park on a survivor's pipe (glass#477). Empty until `start_app`,
-    /// and for a LaunchServices-adopted app, which glass never gave a pipe.
+    /// terminated. The app's write ends are inherited by everything it spawns, so an EOF-only
+    /// reader parks on a survivor's pipe (glass#477). Empty until `start_app`, and for a
+    /// LaunchServices-adopted app, which glass never gave a pipe.
     taps: Vec<glass_pipe_unix::LineTap>,
     /// The active window's `CGWindowID` — the implicit target of `capture_frame`/
     /// `send_pointer`/`send_key`, per the `Platform` contract. Set by `start_app` to the first
@@ -395,9 +395,8 @@ impl MacosPlatform {
                 // only for a contained launch that failed.
                 process::terminate(&mut child);
                 release_clip(clip.as_ref());
-                // Terminated first, so the final drain catches what the inner exec said on its
-                // way out — which on this path is the diagnosis. Explicit rather than left to
-                // the end of the scope: the handoff below runs in between.
+                // Terminated first, so the final drain catches what the inner exec said on its way
+                // out — the diagnosis, on this path. Explicit because the handoff runs in between.
                 drop(taps);
                 // Only an early inner-exec exit (`AppExited`) is the handoff signal; any other
                 // failure is propagated as-is.
@@ -471,8 +470,8 @@ impl MacosPlatform {
             }
         };
         self.child = None;
-        // With the child goes what read it. An adopted app was never given a pipe, so a tap left
-        // running here would file the *previous* launch's output into this session's logs.
+        // With the child goes what read it: an adopted app was never given a pipe, so a tap left
+        // running here files the *previous* launch's output into this session's logs.
         self.taps.clear();
         // AppKit's pids are `i32` but always non-negative for a real process, so the cast to
         // `app_pid`'s `u32` is exact.
@@ -717,8 +716,8 @@ impl Platform for MacosPlatform {
             process::terminate(&mut child);
         }
         // Terminated first, so each tap's final drain sees what the app wrote on the way out.
-        // Dropping them ends the reader threads and releases the pipes, which anything the launch
-        // left running would otherwise hold for the life of this process (glass#477).
+        // Dropping them releases the pipes anything the launch left running still holds
+        // (glass#477).
         self.taps.clear();
         // Named pasteboards persist system-wide until released, and a leftover `.ready`
         // sentinel could mask a failed injection in a later session. Only released when a shim
@@ -944,8 +943,7 @@ impl Drop for MacosPlatform {
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
         }
-        // Terminated first, so each tap's final drain sees what the app wrote on the way out.
-        // Explicit rather than left to field-drop order, so this path reads like `stop_app` and
+        // Terminated first, as in `stop_app`. Explicit rather than left to field-drop order, so
         // reordering two fields cannot silently change it.
         self.taps.clear();
         // Release this session's named pasteboards too if `stop_app` didn't run (panic-unwind
