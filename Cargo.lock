@@ -1292,6 +1292,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass-pipe-unix"
+version = "0.0.0"
+dependencies = [
+ "rustix",
+]
+
+[[package]]
 name = "glass-proc-linux"
 version = "0.0.0"
 dependencies = [
