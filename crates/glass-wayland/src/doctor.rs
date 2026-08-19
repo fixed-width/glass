@@ -38,7 +38,7 @@ pub fn checks(deep: bool) -> Vec<Check> {
 #[derive(Debug)]
 struct SwaySpawn {
     came_up: CameUp,
-    /// What the last IPC connect attempt was told, phrased by the caller that made it.
+    /// What the last IPC connect attempt was told.
     last_ipc: Option<String>,
     /// What sway wrote to stderr, captured rather than inherited — its own account of a failure.
     said: Option<String>,
@@ -67,7 +67,8 @@ struct Leaked {
 }
 
 impl Leaked {
-    /// `rt` is consumed either way: deleted when nothing survived, kept when something did.
+    /// `rt` is consumed either way: deleted when nothing survived, kept when something did,
+    /// because deleting it would take that process's sockets with it.
     fn after_reap(pids: Vec<u32>, rt: tempfile::TempDir) -> Option<Leaked> {
         (!pids.is_empty()).then(|| Leaked {
             pids,
@@ -195,7 +196,7 @@ struct Survivors {
     remedy: String,
 }
 
-/// Describe what was left running, in what was observed rather than why.
+/// Describe what was left running.
 fn leak_notice(leaked: &Leaked) -> Survivors {
     let pids: Vec<String> = leaked.pids.iter().map(u32::to_string).collect();
     let (count, label) = match pids.len() {
@@ -458,9 +459,6 @@ const LEAK_GRACE: Duration = Duration::from_millis(500);
 
 /// Tear the launch down and account for it: what the probe started that is still running, and the
 /// runtime dir kept for it.
-///
-/// `rt` is consumed either way — deleted when nothing survived, kept when something did, because
-/// deleting it would take that process's sockets with it.
 fn reap_and_account(child: &mut Child, rt: tempfile::TempDir) -> Option<Leaked> {
     // Snapshot the launch before any of it exits: once sway is reaped its descendants are
     // reparented to init and can no longer be found from its pid.
@@ -472,10 +470,8 @@ fn reap_and_account(child: &mut Child, rt: tempfile::TempDir) -> Option<Leaked> 
 /// Everything of the probe's own still running after `grace`, by both of the answers available —
 /// neither is the set on its own.
 ///
-/// `after_reap` is what the reaper could still see of the tree it signalled; the session sweep is
-/// what carries the probe's private `XDG_RUNTIME_DIR`, which is how a compositor's Xwayland and
-/// the app it `exec`s are found at all — sway reparents one and `setsid`s the other out of the
-/// tree (glass#380).
+/// `after_reap` is what the reaper could still see of the tree it signalled; only
+/// [`session_processes`] finds a compositor's Xwayland or the app it `exec`s (glass#380).
 fn left_running(runtime_dir: &Path, after_reap: &[u32], grace: Duration) -> Vec<u32> {
     let look = || {
         let mut left = crate::xwayland::session_processes(runtime_dir);
@@ -532,8 +528,7 @@ fn probe_sway_within(sway: &Path, budget: Duration) -> SwaySpawn {
     let said = match child.stderr.take().map(SwaySaid::drain) {
         Some(Ok(said)) => Some(said),
         // A refused thread leaves sway's stderr undrained, so the compositor is taken back down
-        // rather than run blind — and this path accounts for it like any other, because a host
-        // that refuses threads is where a teardown is likeliest to leave something behind.
+        // rather than run blind — and accounted for like any other path.
         Some(Err(e)) => {
             return SwaySpawn {
                 came_up: CameUp::Unknown(format!(
@@ -557,9 +552,8 @@ fn probe_sway_within(sway: &Path, budget: Duration) -> SwaySpawn {
     }
 }
 
-/// One attempt at sway's IPC, phrased for the check that may have to quote it: a socket that never
-/// appeared and one that is there and refusing are different diagnoses, and `Ipc::connect` answers
-/// both with a `Backend` error.
+/// One attempt at sway's IPC, phrased for the check that quotes it: `Ipc::connect` answers both
+/// "no socket" and "refused" with a `Backend` error, and those are different diagnoses.
 fn connect_ipc(runtime_dir: &Path) -> Result<(), String> {
     match Ipc::connect(runtime_dir) {
         Ok(_) => Ok(()),
@@ -956,7 +950,7 @@ mod tests {
         assert!(attempts.get() > 1, "the wait made one attempt only");
     }
 
-    /// And it has to reach the check, which is the only surface an MCP client reads.
+    /// And it has to reach the check.
     #[test]
     fn the_check_shows_what_the_ipc_connect_said() {
         let refused = "its IPC socket refused the connection: Connection refused (os error 111)";

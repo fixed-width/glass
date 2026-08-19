@@ -645,8 +645,7 @@ mod reap_tests {
         );
     }
 
-    /// A zombie keeps its `/proc` entry until its parent reaps it, so an existence test calls one
-    /// a survivor.
+    /// An existence test calls a zombie a survivor.
     #[test]
     fn a_zombie_is_not_a_live_process() {
         let mut child = Command::new("sleep")
