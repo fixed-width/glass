@@ -336,15 +336,28 @@ mod tests {
     }
 
     #[test]
-    fn the_final_drain_absorbs_interrupts_and_still_takes_what_follows() {
-        // An interrupt takes no bytes. Ending the drain on one loses what the app already wrote,
-        // and not counting it lets a persistent signal spin here.
+    fn the_final_drain_absorbs_its_whole_interrupt_budget_and_still_takes_what_follows() {
+        // An interrupt takes no bytes, so ending the drain on one loses what the app already
+        // wrote. The budget is spent exactly here, and the read after it must still be taken.
         assert_eq!(
             drained(InterruptedThen {
-                left: DRAIN_INTERRUPTS as u32 - 1,
+                left: DRAIN_INTERRUPTS.into(),
                 bytes: 5,
             }),
             "yyyyy"
+        );
+    }
+
+    #[test]
+    fn the_final_drain_gives_up_one_interrupt_past_the_budget() {
+        // The other edge, and what makes the budget a bound rather than a number: one more
+        // interrupt than it allows ends the drain, whatever would have followed.
+        assert_eq!(
+            drained(InterruptedThen {
+                left: u32::from(DRAIN_INTERRUPTS) + 1,
+                bytes: 5,
+            }),
+            ""
         );
     }
 
