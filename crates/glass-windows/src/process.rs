@@ -19,6 +19,7 @@ use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use glass_core::Stream;
 use glass_core::{AppSpec, GlassError, Result, SandboxLevel, TEARDOWN_BUDGET};
 
 use crate::teardown::{CloseStep, close_wait_step};
@@ -112,6 +113,10 @@ unsafe impl Send for SendHandle {}
 pub(crate) struct LaunchedApp {
     job: SendHandle,
     child: Child,
+    /// The app's stdout/stderr readers, ended by `kill`. The app's write ends are inherited by
+    /// everything it spawns, so a reader that ended only at EOF would park on a survivor's pipe,
+    /// holding a thread and a handle for the life of the process (glass#477).
+    taps: Vec<crate::logtap::LogTap>,
 }
 
 impl LaunchedApp {
@@ -119,14 +124,29 @@ impl LaunchedApp {
         self.child.id()
     }
 
-    /// Take the piped stdout/stderr (call once, before resume, to wire log readers).
-    pub(crate) fn take_pipes(
-        &mut self,
-    ) -> (
-        Option<std::process::ChildStdout>,
-        Option<std::process::ChildStderr>,
-    ) {
-        (self.child.stdout.take(), self.child.stderr.take())
+    /// Start the log readers over the piped stdout/stderr, filing into `logs`. Call once, before
+    /// `resume`, so nothing the app writes at startup is missed.
+    ///
+    /// The readers are kept here rather than handed back: they are made from this handle's own
+    /// pipes, and `kill` is what ends them. `Err` is the host refusing a thread, and the pipe it
+    /// was for is closed by then — the caller must fail the launch rather than resume an app
+    /// whose output goes nowhere.
+    pub(crate) fn tap_logs(&mut self, logs: &crate::logtap::LogSink) -> std::io::Result<()> {
+        if let Some(out) = self.child.stdout.take() {
+            self.taps.push(crate::logtap::LogTap::start(
+                out,
+                Stream::Stdout,
+                logs.clone(),
+            )?);
+        }
+        if let Some(err) = self.child.stderr.take() {
+            self.taps.push(crate::logtap::LogTap::start(
+                err,
+                Stream::Stderr,
+                logs.clone(),
+            )?);
+        }
+        Ok(())
     }
 
     /// Resume the suspended root thread(s) — call AFTER log readers are wired.
@@ -163,6 +183,10 @@ impl LaunchedApp {
         }
         let _ = self.child.kill(); // belt-and-suspenders: ensure the root is terminated so wait() can't block
         let _ = self.child.wait(); // reap the now-terminated root; avoids a zombie
+        // Terminated first, so each tap's final drain sees what the app wrote on the way out.
+        // Dropping them ends the reader threads and releases the pipe handles, which anything the
+        // launch left running would otherwise hold for the life of this process (glass#477).
+        self.taps.clear();
         asked.outcome(closed_itself)
     }
 
@@ -314,6 +338,7 @@ pub(crate) fn spawn_suspended_in_job(
         Ok(job) => Ok(LaunchedApp {
             job: SendHandle(job),
             child,
+            taps: Vec::new(),
         }),
         Err(e) => {
             // The child is still SUSPENDED and not yet job-assigned, so it has no children:

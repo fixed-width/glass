@@ -20,6 +20,7 @@ pub mod doctor; // pure check-mapping cross-platform; Windows fact-gathering is 
 pub mod dpi; // pure coordinate math — cross-platform, unit-tested on any host
 pub mod jobcfg; // pure SandboxLevel -> job-limit descriptor — unit-tested on any host
 pub mod jobpids; // pure JOBOBJECT_BASIC_PROCESS_ID_LIST byte parser — Miri'd on the host
+pub mod logtap; // pure line splitting — cross-platform, host-tested; the reader is cfg(windows)
 #[doc(hidden)]
 pub mod onbox_support; // env-resolved paths shared by the on-box examples + tests; host-tested
 pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on any host
