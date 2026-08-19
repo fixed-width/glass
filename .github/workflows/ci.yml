@@ -269,6 +269,8 @@ jobs:
           if-no-files-found: warn
 
   mutants:
+    # The ruleset matches this check by name, so it stays as written even as the list below
+    # grows — glass-proc-linux is gated too, and deliberately unnamed here.
     name: Mutation shard ${{ matrix.shard }} (glass-core, glass-android, glass-x11, glass-exec-unix, glass-dbus-linux)
     runs-on: ubuntu-latest
     # A push carries no base ref to diff against; this gate is a pull-request check.
@@ -306,7 +308,8 @@ jobs:
                ':(glob)crates/glass-android/src/**/*.rs' \
                ':(glob)crates/glass-x11/src/**/*.rs' \
                ':(glob)crates/glass-exec-unix/src/**/*.rs' \
-               ':(glob)crates/glass-dbus-linux/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
+               ':(glob)crates/glass-dbus-linux/src/**/*.rs' \
+               ':(glob)crates/glass-proc-linux/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
           wc -l "$RUNNER_TEMP/pr.diff"
           if [ -s "$RUNNER_TEMP/pr.diff" ]; then
             echo "touched=true" >> "$GITHUB_OUTPUT"
@@ -340,6 +343,7 @@ jobs:
             --test-tool nextest \
             --package glass-core --package glass-android --package glass-x11 \
             --package glass-exec-unix --package glass-dbus-linux \
+            --package glass-proc-linux \
             --shard ${{ matrix.shard }}/8 --sharding round-robin \
             --in-diff "$RUNNER_TEMP/pr.diff"
 

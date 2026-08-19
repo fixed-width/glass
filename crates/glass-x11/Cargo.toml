@@ -27,6 +27,8 @@ x11rb.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 criterion = { workspace = true }
+# Signalling a fixture's leftover process directly, so a test cleans up what it started.
+rustix = { workspace = true }
 tempfile = { workspace = true }
 
 [[bench]]

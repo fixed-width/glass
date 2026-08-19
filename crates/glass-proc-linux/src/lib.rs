@@ -14,8 +14,16 @@
 //! the sandbox crate (it is generic process introspection, unrelated to
 //! bubblewrap). The Windows peer (`descendant_pids`, Toolhelp-based) lives with
 //! the Windows backend for the same reason — the OS APIs can't share an impl.
+//!
+//! It also holds what both backends need *around* a spawned process: reaping it and its
+//! descendants, and reading what it wrote — its stderr under a cap and a stop
+//! ([`StderrTail`]), or its output line-by-line until EOF ([`spawn_reader`]).
 
 #![cfg(target_os = "linux")]
+
+mod stderr;
+
+pub use stderr::{STDERR_KEPT, StderrTail};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read};

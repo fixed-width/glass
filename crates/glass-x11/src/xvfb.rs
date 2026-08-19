@@ -3,12 +3,13 @@
 //! Uses `-displayfd`: the server picks a free display and reports it once ready,
 //! avoiding display-number and readiness races.
 
-use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::io::{BufRead, BufReader};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use glass_core::{GlassError, Result};
+use glass_proc_linux::StderrTail;
 
 /// How long to wait for Xvfb to report its display before treating it as wedged.
 /// Readiness is normally well under a second; this ceiling is generous so a
@@ -18,16 +19,20 @@ use glass_core::{GlassError, Result};
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Upper bound on how long `Xvfb::start` can take before it returns (both
-/// attempts wedge, each reaped): callers that put their own timeout around a
-/// start (doctor's deep probe) must budget at least this or they'll misreport
-/// a start that would have succeeded on the retry.
+/// attempts wedge, each reaped and each collected): callers that put their own
+/// timeout around a start (doctor's deep probe) must budget at least this or
+/// they'll misreport a start that would have succeeded on the retry.
+///
+/// Excludes the reader's own backstop, which only runs if a wakeup is lost.
 pub(crate) fn start_deadline() -> Duration {
-    2 * (READY_TIMEOUT + glass_proc_linux::REAP_GRACE)
+    2 * (READY_TIMEOUT + glass_proc_linux::REAP_GRACE + SAID_GRACE)
 }
 
-/// How much of Xvfb's stderr to keep for error messages. Failures print early;
-/// past the cap the pipe is still drained (see `StderrTail`) but bytes are dropped.
-const STDERR_CAP: usize = 8 * 1024;
+/// How long a failed start waits for Xvfb's stderr pipe to close before rendering what it has.
+///
+/// The server is already reaped, so the pipe EOFs within moments — unless the server left
+/// something holding it, and then this is what the message costs instead of everything.
+const SAID_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub struct Xvfb {
@@ -40,6 +45,14 @@ pub struct Xvfb {
         reason = "RAII: held open for the server's lifetime so the fd never SIGPIPEs"
     )]
     displayfd: ChildStdout,
+    /// Kept draining for the server's lifetime — a chatty server must never stall on a full
+    /// pipe. Fields drop after `Drop::drop` returns, so the reader ends only once the server
+    /// has been reaped.
+    #[expect(
+        dead_code,
+        reason = "RAII: drained for the server's lifetime, and its reader ends when this drops"
+    )]
+    stderr: StderrTail,
 }
 
 impl Xvfb {
@@ -63,6 +76,10 @@ impl Xvfb {
 enum StartErr {
     /// `exec` itself failed — the binary is missing/not runnable.
     Spawn(String),
+    /// The server started, but the host refused something the stderr reader is built from —
+    /// the thread, an fd. Not `Spawn`: nothing is wrong with the binary, so its remedy would
+    /// misdirect.
+    NoReader(String),
     /// Xvfb exited before reporting a display.
     Exited { stderr: String },
     /// A line arrived on `-displayfd` but wasn't a display number.
@@ -76,7 +93,8 @@ enum StartErr {
 /// transient failure class (seen under heavy host load), and on a user's first
 /// run a single quiet retry is the difference between working and giving up.
 /// Exit/garbage failures are deterministic (bad binary/args/env); retrying those
-/// would only double the time to the same error.
+/// would only double the time to the same error. A refused reader is not retried
+/// either: the host is out of a resource, and a second server would ask for more.
 fn start_binary(xvfb: &str, screen: &str, ready_timeout: Duration) -> Result<Xvfb> {
     match start_once(xvfb, screen, ready_timeout) {
         Ok(x) => Ok(x),
@@ -107,20 +125,28 @@ fn start_once(
         .spawn()
         .map_err(|e| StartErr::Spawn(e.to_string()))?;
 
-    let stderr_tail = StderrTail::drain(child.stderr.take().expect("piped stderr"));
+    let stderr_tail = match StderrTail::drain(child.stderr.take().expect("piped stderr")) {
+        Ok(tail) => tail,
+        // `drain` consumed the pipe, so the read end is already closed and the server's next
+        // complaint takes SIGPIPE — reap it rather than leave a display glass cannot hear.
+        Err(e) => {
+            glass_proc_linux::reap_graceful(&mut child, glass_proc_linux::REAP_GRACE);
+            return Err(StartErr::NoReader(e.to_string()));
+        }
+    };
     let stdout = child.stdout.take().expect("piped stdout");
     match read_displayfd(stdout, ready_timeout) {
         Ok((num, displayfd)) => Ok(Xvfb {
             child,
             display: format!(":{num}"),
             displayfd,
+            stderr: stderr_tail,
         }),
         Err(e) => {
             glass_proc_linux::reap_graceful(&mut child, glass_proc_linux::REAP_GRACE);
-            // The child is dead, so its stderr pipe has EOF'd (or will within
-            // moments); wait briefly for the drain to finish so the message is
-            // complete rather than racing the reader thread.
-            let stderr = stderr_tail.snapshot(Duration::from_millis(500));
+            // Reaped first, so what is left is the reader catching up: collecting before that
+            // races it and reports an empty stderr, the only diagnostics a failed start has.
+            let stderr = stderr_tail.finish(SAID_GRACE).trim().to_string();
             Err(match e {
                 ReadErr::Closed => StartErr::Exited { stderr },
                 ReadErr::Garbage(line) => StartErr::Garbage { line, stderr },
@@ -137,6 +163,12 @@ fn into_glass_error(xvfb: &str, e: StartErr, ready_timeout: Duration) -> GlassEr
         StartErr::Spawn(e) => format!(
             "could not spawn {xvfb} ({e}); install it (e.g. `apt install xvfb`), \
              set GLASS_XVFB to its path, or set GLASS_DISPLAY=:N to attach to an \
+             existing display"
+        ),
+        StartErr::NoReader(e) => format!(
+            "started {xvfb} but could not set up the reader for its stderr ({e}); the server \
+             was stopped rather than left to stall on a pipe nobody drains — free up threads \
+             and file descriptors on the host, or set GLASS_DISPLAY=:N to attach to an \
              existing display"
         ),
         StartErr::Exited { stderr } => with_stderr(
@@ -171,7 +203,7 @@ const STDERR_SHOWN: usize = 512;
 
 fn with_stderr(msg: String, stderr: &str) -> String {
     if stderr.is_empty() {
-        return format!("{msg} (Xvfb printed nothing to stderr)");
+        return format!("{msg} (nothing arrived on Xvfb's stderr)");
     }
     if stderr.len() <= STDERR_SHOWN {
         return format!("{msg}; Xvfb stderr: {stderr}");
@@ -182,64 +214,6 @@ fn with_stderr(msg: String, stderr: &str) -> String {
         stderr.len(),
         &stderr[..cut]
     )
-}
-
-/// Drains a child's stderr on a helper thread for the child's whole lifetime
-/// (so a chatty server can never stall on a full pipe), keeping the first
-/// `STDERR_CAP` bytes for diagnostics.
-struct StderrTail(Arc<TailState>);
-
-struct TailState {
-    buf: Mutex<TailBuf>,
-    eof: Condvar,
-}
-
-struct TailBuf {
-    bytes: Vec<u8>,
-    done: bool,
-}
-
-impl StderrTail {
-    fn drain(mut stderr: ChildStderr) -> StderrTail {
-        let state = Arc::new(TailState {
-            buf: Mutex::new(TailBuf {
-                bytes: Vec::new(),
-                done: false,
-            }),
-            eof: Condvar::new(),
-        });
-        let s = state.clone();
-        std::thread::spawn(move || {
-            let mut chunk = [0u8; 4096];
-            loop {
-                match stderr.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let mut g = s.buf.lock().unwrap();
-                        let room = STDERR_CAP.saturating_sub(g.bytes.len());
-                        g.bytes.extend_from_slice(&chunk[..n.min(room)]);
-                        // keep looping past the cap — the pipe must stay drained
-                    }
-                }
-            }
-            let mut g = s.buf.lock().unwrap();
-            g.done = true;
-            s.eof.notify_all();
-        });
-        StderrTail(state)
-    }
-
-    /// The captured stderr, waiting up to `timeout` for the pipe to EOF first
-    /// (call after the child is reaped). Lossy UTF-8, trimmed.
-    fn snapshot(&self, timeout: Duration) -> String {
-        let g = self.0.buf.lock().unwrap();
-        let (g, _) = self
-            .0
-            .eof
-            .wait_timeout_while(g, timeout, |b| !b.done)
-            .unwrap();
-        String::from_utf8_lossy(&g.bytes).trim().to_string()
-    }
 }
 
 /// Why reading the `-displayfd` line failed.
@@ -288,6 +262,7 @@ impl Drop for Xvfb {
     /// leftover costs nothing — while unlinking it cuts off whoever reclaimed the number.
     fn drop(&mut self) {
         glass_proc_linux::reap_graceful(&mut self.child, glass_proc_linux::REAP_GRACE);
+        // `stderr` drops on the way out of here, ending its reader.
     }
 }
 
@@ -319,42 +294,6 @@ mod tests {
         panic!("ETXTBSY persisted after 100 retries: {last:?}")
     }
 
-    /// Spawn a fixture script directly with its stderr piped, for the tests that drive
-    /// `StderrTail` rather than a whole start. Retries past ETXTBSY for the same reason
-    /// `start_fixture` does.
-    fn spawn_fixture(script: &std::path::Path) -> std::process::Child {
-        for _ in 0..100 {
-            match Command::new(script)
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
-                Ok(child) => return child,
-                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => panic!("the fixture {} is not runnable: {e}", script.display()),
-            }
-        }
-        panic!("the fixture stayed ETXTBSY after 100 retries")
-    }
-
-    fn running(pid: u32) -> bool {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
-    }
-
-    /// Write an executable fake-Xvfb shell script into a unique temp dir and
-    /// return its path. `$0.ran` is the script's own scratch marker.
-    fn fixture(name: &str, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("glass-xvfb-fixture-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        p
-    }
-
     #[test]
     fn the_start_deadline_covers_both_attempts_and_both_reaps() {
         // doctor's deep probe puts its own timeout around `Xvfb::start`. Budget less than
@@ -381,35 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn the_drain_stops_keeping_bytes_at_the_documented_cap() {
-        // A server dumping megabytes must cost bounded memory, while the kept head stays
-        // large enough for a real Xvfb option table (~5KB).
-        let script = fixture(
-            "flood.sh",
-            "dd if=/dev/zero bs=1024 count=64 2>/dev/null | tr '\\0' e >&2\n",
-        );
-        let mut child = spawn_fixture(&script);
-        let tail = super::StderrTail::drain(child.stderr.take().expect("piped stderr"));
-        child.wait().expect("fixture exits");
-        assert_eq!(tail.snapshot(Duration::from_secs(5)).len(), 8 * 1024);
-    }
-
-    #[test]
-    fn a_snapshot_waits_for_the_pipe_to_close_before_reading() {
-        // The diagnostics arrive after the caller asks for them. Read without waiting for
-        // EOF and a failed start reports an empty stderr — the only clue it had.
-        let script = fixture(
-            "late-stderr.sh",
-            "sleep 0.3\nprintf 'the fatal line\\n' >&2\n",
-        );
-        let mut child = spawn_fixture(&script);
-        let tail = super::StderrTail::drain(child.stderr.take().expect("piped stderr"));
-        let captured = tail.snapshot(Duration::from_secs(5));
-        child.wait().expect("fixture exits");
-        assert_eq!(captured, "the fatal line");
-    }
-
-    #[test]
     fn the_reported_pid_is_the_server_itself() {
         // A test that SIGSTOPs this pid to make the display unresponsive stops something
         // else entirely if it is wrong.
@@ -428,6 +338,117 @@ mod tests {
             parent,
             std::process::id().to_string(),
             "the reported pid must be the server this test spawned, not another process"
+        );
+    }
+
+    /// Kills a fixture's leftover process however the test ends, panic included.
+    struct Survivor(u32);
+
+    impl Drop for Survivor {
+        fn drop(&mut self) {
+            if let Some(pid) = rustix::process::Pid::from_raw(self.0 as i32) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+
+    #[test]
+    fn a_server_that_complains_after_reporting_its_display_is_still_drained() {
+        // The tail is held for the server's lifetime, not the start's. End the reader when the
+        // start returns and the server blocks on a full 64KiB pipe or takes SIGPIPE on its next
+        // complaint — a display that vanishes mid-session either way.
+        let script = fixture(
+            "chatty-after.sh",
+            "echo 4321\n\
+             dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\0' e >&2\n\
+             echo 'still here' >&2\n\
+             touch \"$0.flushed\"\n\
+             exec sleep 30\n",
+        );
+        let flushed = format!("{}.flushed", script.display());
+        let _ = std::fs::remove_file(&flushed);
+        let server = start_fixture(&script, Duration::from_secs(5)).expect("must start");
+
+        // One marker catches both failures: a closed read end kills the shell at the `echo`
+        // before the `touch`, and an undrained pipe blocks `tr` after 64 KiB so it never runs.
+        assert!(
+            glass_proc_linux::await_condition(Duration::from_secs(10), || {
+                std::path::Path::new(&flushed).exists()
+            }),
+            "1MiB of stderr written after the display report must not stall or kill the server"
+        );
+        assert!(running(server.pid()), "the server must survive complaining");
+    }
+
+    #[test]
+    fn dropping_the_server_releases_a_stderr_pipe_its_survivor_holds_open() {
+        // A reader that can only stop at EOF is held open by whatever the server left behind,
+        // and doctor's deep probe starts a server per call (glass#471).
+        let script = fixture(
+            "survivor.sh",
+            "sleep 30 &\necho $! > \"$0.survivor\"\necho 4321\nexec sleep 30\n",
+        );
+        let server = start_fixture(&script, Duration::from_secs(5)).expect("must start");
+        let survivor: u32 = std::fs::read_to_string(format!("{}.survivor", script.display()))
+            .expect("the fixture reports what it left running")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let _reap = Survivor(survivor);
+        // The survivor inherited the write end, so this names the one pipe — no other process
+        // can hold it, and nothing else in this one can reopen it.
+        let pipe = std::fs::read_link(format!("/proc/{survivor}/fd/2"))
+            .expect("the survivor holds the server's stderr");
+
+        drop(server);
+
+        let held: Vec<_> = std::fs::read_dir("/proc/self/fd")
+            .expect("/proc/self/fd")
+            .filter_map(|e| e.ok())
+            .filter(|e| std::fs::read_link(e.path()).is_ok_and(|target| target == pipe))
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            held.is_empty(),
+            "a reaped server must leave no reader on its stderr, but {pipe:?} is still open on {held:?}"
+        );
+    }
+
+    fn running(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// Write an executable fake-Xvfb shell script into a unique temp dir and
+    /// return its path. `$0.ran` is the script's own scratch marker.
+    fn fixture(name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("glass-xvfb-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_refused_stderr_reader_is_not_reported_as_a_missing_binary() {
+        // The server started; what failed was the host giving glass a thread. `Spawn`'s remedy
+        // — install it, or point GLASS_XVFB somewhere else — would send the user after a
+        // binary that is already there and working.
+        let GlassError::Backend(msg) = super::into_glass_error(
+            "/usr/bin/Xvfb",
+            super::StartErr::NoReader("Resource temporarily unavailable".into()),
+            Duration::from_secs(10),
+        ) else {
+            panic!("a start failure is a Backend error")
+        };
+        assert!(
+            msg.contains("Resource temporarily unavailable"),
+            "the host's own reason is the diagnosis: {msg}"
+        );
+        assert!(
+            !msg.contains("install it"),
+            "nothing is missing, so nothing needs installing: {msg}"
         );
     }
 
@@ -475,7 +496,7 @@ mod tests {
 
     #[test]
     fn chatty_stderr_before_report_does_not_stall_startup() {
-        // The drain thread must keep reading past STDERR_CAP: a server writing
+        // The drain thread must keep reading past what it keeps: a server writing
         // more than the 64KiB pipe buffer before reporting its display would
         // otherwise block on write() forever and turn every start into a wedge.
         let script = fixture(
@@ -531,6 +552,17 @@ mod tests {
             err.contains("fixture stderr complaint"),
             "must include Xvfb stderr: {err}"
         );
+    }
+
+    #[test]
+    fn a_server_that_printed_only_whitespace_is_reported_as_silent() {
+        // The trim is what makes the silent branch true for a server whose last word was a
+        // newline; without it the error ends in an empty quote for the reader to interpret.
+        let script = fixture("blank-stderr.sh", "printf '  \\n \\n' >&2\nexit 1\n");
+        let err = start_fixture(&script, Duration::from_millis(500))
+            .expect_err("exit must fail")
+            .to_string();
+        assert!(err.contains("nothing arrived"), "msg: {err}");
     }
 
     #[test]
