@@ -757,9 +757,9 @@ mod session_tests {
 mod tests {
     use super::*;
 
-    /// glass#380: what the probe started is found by what it inherited, because sway reparents
-    /// Xwayland out of its own tree and `setsid`s the app it `exec`s — a walk of sway's
-    /// descendants finds neither, so a teardown that missed one would look complete.
+    /// glass#380: what the probe started is found by what it inherited — sway reparents Xwayland
+    /// out of its own tree and `setsid`s the app it `exec`s, so a walk of its descendants finds
+    /// neither.
     #[test]
     fn a_process_is_matched_to_the_session_it_was_started_for() {
         let rt = tempfile::tempdir().expect("tempdir");

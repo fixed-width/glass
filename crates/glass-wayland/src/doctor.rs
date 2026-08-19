@@ -52,8 +52,8 @@ enum CameUp {
     Yes,
     /// It did not, for a reason the shared vocabulary names.
     No(ProbeFailure),
-    /// Neither: the probe ran and glass lost track of what it had started, so nothing here is
-    /// about sway (glass#373's mis-attribution, one door along).
+    /// Neither: the probe ran and glass lost track of what it started, so nothing here is about
+    /// sway (glass#373).
     Unknown(String),
 }
 
@@ -159,8 +159,8 @@ fn deep_spawn_check(spawn: SwaySpawn) -> Check {
             leak.as_ref(),
         ),
     };
-    // Sway's own words go last and quoted: they are the one span of this line glass did not
-    // write, and undelimited they can imitate the clauses around them (glass#348).
+    // Sway's own words go last and quoted: undelimited, the one span glass did not write can
+    // imitate the clauses around it (glass#348).
     if let Some(said) = &spawn.said {
         detail.push_str(&format!(" — sway said: {said:?}"));
     }
@@ -310,8 +310,8 @@ fn probe_sway(sway: &Path) -> SwaySpawn {
 
 /// How much of sway's stderr the probe keeps, and how much of that a check quotes.
 ///
-/// Two numbers because they answer different questions: the pipe must be drained faster than sway
-/// writes, and a check's detail is one line an operator reads.
+/// The pipe must be drained faster than sway writes; a check's detail is one line an operator
+/// reads.
 const STDERR_KEPT: usize = 8 * 1024;
 const STDERR_SHOWN: usize = 512;
 
@@ -359,8 +359,7 @@ impl SwaySaid {
 
     /// What it said, after `grace` for the pipe to close — call once the compositor is reaped.
     ///
-    /// Read whether or not the pipe closed, because it stays open while anything the probe left
-    /// running holds it, which is the case whose stderr matters most.
+    /// Read whether or not the pipe closed — anything the probe left running holds it open.
     fn snapshot(&self, grace: Duration) -> Option<String> {
         glass_proc_linux::await_condition(grace, || self.closed.load(Ordering::Acquire));
         let kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
@@ -453,8 +452,8 @@ fn never_ran(why: ProbeFailure) -> SwaySpawn {
 /// How long the probe waits for what it started to leave before calling it left behind.
 ///
 /// A signal lands when its target is next scheduled, so a check taken straight after one still
-/// sees processes that are already going. Doctor has no teardown budget to fit inside, and the
-/// cost is only paid where something is still there.
+/// sees processes that are already going. Longer than a teardown's, because doctor has no budget
+/// to fit inside.
 const LEAK_GRACE: Duration = Duration::from_millis(500);
 
 /// Tear the launch down and account for it: what the probe started that is still running, and the
@@ -819,8 +818,7 @@ mod tests {
             spawn.last_ipc.as_deref(),
             Some("no sway IPC socket ever appeared in its runtime dir")
         );
-        // A teardown that reached everything keeps nothing — and deletes its runtime dir, which
-        // the next assertion is about.
+        // A teardown that reached everything keeps nothing, and deletes its runtime dir.
         assert!(spawn.leaked.is_none(), "{spawn:?}");
         assert!(
             !dir.path().join("glass-doctor-wl.").exists(),
@@ -856,8 +854,8 @@ mod tests {
              echo 'sway: Unable to create renderer' >&2\nexit 1\n",
         );
 
-        // Generous, because it bounds nothing this test is about: the wait ends the moment the
-        // exit is observed, so only a runner slow enough to miss the shell entirely reaches it.
+        // Generous: the wait ends the moment the exit is observed, so this bounds nothing the
+        // test is about.
         let spawn = probe_sway_within(&fake, Duration::from_secs(5));
         let cs = wayland_checks(&answered("1.12"), true, Some(spawn));
         let deep = cs.iter().find(|c| c.name == "sway spawn (deep)").unwrap();
@@ -1025,7 +1023,7 @@ mod tests {
         let deep = cs.iter().find(|c| c.name == "sway spawn (deep)").unwrap();
         assert_eq!(deep.status, CheckStatus::Warn, "{deep:?}");
         assert!(deep.detail.contains("2 processes"), "{deep:?}");
-        // An operator can only kill what is named, and the remedy is where the killing is said.
+        // An operator can only kill what is named.
         assert!(deep.detail.contains("4242, 4243"), "{deep:?}");
         assert!(
             deep.remedy

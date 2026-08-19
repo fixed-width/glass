@@ -198,18 +198,15 @@ pub fn await_condition(grace: Duration, mut done: impl FnMut() -> bool) -> bool 
 
 /// Whether `pid` is a live process.
 ///
-/// A zombie is not: it has a `/proc` entry until its parent reaps it, but it holds nothing and no
-/// signal reaches it, so counting one would make a teardown look unfinished. Its state is field 3
-/// of `/proc/<pid>/stat`, read after the last `)` because the comm field before it can itself
-/// contain spaces and parens.
+/// A zombie is not: it keeps a `/proc` entry until its parent reaps it, and holds nothing. Its
+/// state is field 3 of `/proc/<pid>/stat`, read after the last `)` because the comm field before
+/// it can itself contain spaces and parens.
 fn alive(pid: u32) -> bool {
     if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
         return false;
     }
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        // It answered the first question and not the second, which is what exiting looks like
-        // from here. Reported as alive, the direction that costs a caller a second look rather
-        // than a missed survivor.
+        // Reported as alive: a caller looking twice costs less than a survivor missed.
         return true;
     };
     !stat
@@ -649,7 +646,7 @@ mod reap_tests {
     }
 
     /// A zombie keeps its `/proc` entry until its parent reaps it, so an existence test calls one
-    /// a survivor — and then a teardown that reached everything reports a process to go and kill.
+    /// a survivor.
     #[test]
     fn a_zombie_is_not_a_live_process() {
         let mut child = Command::new("sleep")
