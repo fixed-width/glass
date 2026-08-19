@@ -1391,6 +1391,7 @@ dependencies = [
  "glass-exec-unix",
  "glass-proc-linux",
  "glass-sandbox-linux",
+ "rustix",
  "tempfile",
  "x11rb",
 ]

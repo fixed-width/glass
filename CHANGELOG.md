@@ -20,6 +20,15 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- Linux: a deep `glass doctor` probe no longer leaves a stuck thread and an open pipe behind for
+  the rest of the process's life. The X11 and Wayland probes each read their child's stderr on a
+  helper thread, and that thread could only stop at end-of-file — which anything the probe left
+  running holds off indefinitely, since it inherited the pipe. A long-lived `glass-mcp serve
+  --http` accumulated one thread and one file descriptor per such probe. The reader is now told to
+  stop and waited for, so it always ends and always closes its end; the private headless X
+  server's reader ends with the display it was reading. A host that refuses glass that
+  thread is now its own start failure, naming what the host said instead of sending the user to
+  reinstall an Xvfb that is already there and working.
 - iOS: an `idb_companion` that is installed but cannot be executed — no execute bit, a `noexec`
   mount, permissions this user is not in — no longer reads as available. glass now asks the kernel
   whether it may run the binary, so a runnable copy later on `PATH` or in a Homebrew prefix is

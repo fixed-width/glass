@@ -3,14 +3,12 @@
 //! [`checks`] gathers the real environment; the pure [`wayland_checks`] maps gathered
 //! facts to [`Check`]s and is unit-tested without sway.
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use glass_core::{AppSpec, Check, CheckStatus, ProbeFailure};
+use glass_proc_linux::StderrTail;
 
 use crate::command::{build_sway_command, sway_config};
 use crate::platform::{
@@ -115,8 +113,8 @@ fn wayland_checks(
 /// What glass can do about a probe whose own machinery failed — never the backend's advice, which
 /// nothing here established (glass#373).
 const NOTHING_ABOUT_SWAY: &str = "the compositor was started and then lost track of, so nothing \
-     here is about sway or the host's GL stack. Re-run `glass doctor --deep`; a host that refuses \
-     threads (a low `pids` cgroup limit) does this repeatably";
+     here is about sway or the host's GL stack. Re-run `glass doctor --deep`; a host out of \
+     threads (a low `pids` cgroup limit) or file descriptors does this repeatably";
 
 /// The `sway spawn (deep)` check: whether the compositor came up, and whether the probe stopped
 /// everything it started.
@@ -309,69 +307,16 @@ fn probe_sway(sway: &Path) -> SwaySpawn {
     probe_sway_within(sway, IPC_READY_BUDGET)
 }
 
-/// How much of sway's stderr the probe keeps, and how much of that a check quotes.
-///
-/// The pipe must be drained faster than sway writes; a check's detail is one line an operator
-/// reads.
-const STDERR_KEPT: usize = 8 * 1024;
+/// How much of the kept stderr a check quotes: a check's detail is one line an operator reads,
+/// where what was kept is [`glass_proc_linux::STDERR_KEPT`].
 const STDERR_SHOWN: usize = 512;
 
 /// How long the probe waits for the stderr pipe to close after the compositor has been reaped.
 const SAID_GRACE: Duration = Duration::from_millis(200);
 
-/// Sway's own stderr, read on a helper thread for as long as the pipe is open.
-///
-/// Not a read at the end: a compositor whose stderr nobody drains stalls on a full pipe, which the
-/// probe would report as one that never came up.
-struct SwaySaid {
-    kept: Arc<Mutex<Vec<u8>>>,
-    closed: Arc<AtomicBool>,
-}
-
-impl SwaySaid {
-    /// Start reading. `Err` is the host refusing the thread: `Builder`, where `thread::spawn`
-    /// panics (glass#454).
-    fn drain(mut stderr: ChildStderr) -> std::io::Result<SwaySaid> {
-        let said = SwaySaid {
-            kept: Arc::default(),
-            closed: Arc::default(),
-        };
-        let (kept, closed) = (Arc::clone(&said.kept), Arc::clone(&said.closed));
-        std::thread::Builder::new()
-            .name("glass-doctor-sway-stderr".into())
-            .spawn(move || {
-                let mut chunk = [0u8; 1024];
-                loop {
-                    match stderr.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
-                            // Past the cap the pipe is still drained, so sway is never blocked
-                            // writing to it.
-                            let room = STDERR_KEPT.saturating_sub(kept.len());
-                            kept.extend_from_slice(&chunk[..n.min(room)]);
-                        }
-                    }
-                }
-                closed.store(true, Ordering::Release);
-            })?;
-        Ok(said)
-    }
-
-    /// What it said, after `grace` for the pipe to close — call once the compositor is reaped.
-    ///
-    /// Read whether or not the pipe closed — anything the probe left running holds it open.
-    fn snapshot(&self, grace: Duration) -> Option<String> {
-        glass_proc_linux::await_condition(grace, || self.closed.load(Ordering::Acquire));
-        let kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
-        said_line(&kept)
-    }
-}
-
 /// Sway's stderr as one line of a check: lines joined, clipped to [`STDERR_SHOWN`] with the cut
 /// disclosed. `None` when it said nothing.
-fn said_line(kept: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(kept);
+fn said_line(text: &str) -> Option<String> {
     let said = text
         .lines()
         .map(str::trim)
@@ -525,30 +470,31 @@ fn probe_sway_within(sway: &Path, budget: Duration) -> SwaySpawn {
         Ok(child) => child,
         Err(e) => return never_ran(ProbeFailure::NotStarted(format!("spawn sway: {e}"))),
     };
-    let said = match child.stderr.take().map(SwaySaid::drain) {
-        Some(Ok(said)) => Some(said),
-        // A refused thread leaves sway's stderr undrained, so the compositor is taken back down
-        // rather than run blind — and accounted for like any other path.
-        Some(Err(e)) => {
+    let said = match StderrTail::drain(child.stderr.take().expect("piped stderr")) {
+        Ok(said) => said,
+        // `drain` consumed the pipe, so the read end is already closed and sway's next words
+        // take SIGPIPE.
+        Err(e) => {
             return SwaySpawn {
                 came_up: CameUp::Unknown(format!(
-                    "the host refused the thread that reads its stderr: {e}"
+                    "glass could not set up the reader for its stderr: {e}"
                 )),
                 last_ipc: None,
                 said: None,
                 leaked: reap_and_account(&mut child, rt),
             };
         }
-        None => None,
     };
 
     let wait = await_ipc(budget, || child.try_wait(), || connect_ipc(rt.path()));
-    let said = said.and_then(|said| said.snapshot(SAID_GRACE));
+    // Reap first: closing the read end under a live compositor would EPIPE the writes being
+    // collected.
+    let leaked = reap_and_account(&mut child, rt);
     SwaySpawn {
         came_up: wait.came_up,
         last_ipc: wait.last_ipc,
-        said,
-        leaked: reap_and_account(&mut child, rt),
+        said: said_line(&said.finish(SAID_GRACE)),
+        leaked,
     }
 }
 
@@ -744,7 +690,8 @@ mod tests {
     #[test]
     #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn the_deep_check_really_starts_and_stops_a_compositor() {
-        let before = compositors_running();
+        let (sway, _) = discover_sway().expect("this box has a discoverable sway");
+        let before = compositors_running(&sway);
         let deep = checks(true)
             .into_iter()
             .find(|c| c.name == "sway spawn (deep)")
@@ -753,22 +700,24 @@ mod tests {
         assert_eq!(deep.status, CheckStatus::Ok, "{}", deep.detail);
         // Counted from outside glass as well, so the verdict is not the only witness to it.
         assert_eq!(
-            compositors_running(),
+            compositors_running(&sway),
             before,
             "the deep probe left a compositor behind"
         );
     }
 
-    /// How many of the deep probe's own compositors are running, matched on its private
-    /// runtime-dir prefix so another test's session or a real sway is never counted.
-    fn compositors_running() -> usize {
+    /// How many of the deep probe's own compositors are running, matched on both the probe's
+    /// runtime-dir prefix and `sway` itself so a real session is never counted — nor a sibling
+    /// test's fixture compositor, which the prefix alone does not tell apart.
+    fn compositors_running(sway: &Path) -> usize {
+        let sway = sway.display().to_string();
         let out = std::process::Command::new("ps")
             .args(["-eo", "args"])
             .output()
             .expect("ps");
         String::from_utf8_lossy(&out.stdout)
             .lines()
-            .filter(|l| l.contains("glass-doctor-wl."))
+            .filter(|l| l.contains("glass-doctor-wl.") && l.contains(&sway))
             .count()
     }
 
@@ -860,6 +809,88 @@ mod tests {
                 .contains("could not create GLES2 renderer; sway: Unable to create renderer"),
             "{deep:?}"
         );
+    }
+
+    /// glass#471: the write end of sway's stderr is inherited by anything it leaves outside its
+    /// own process tree — an Xwayland, an `exec`ed client — so EOF is not a deadline the reader
+    /// can count on reaching.
+    #[test]
+    fn a_compositor_that_left_something_holding_its_stderr_still_reports_what_it_said() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("survivor");
+        let fake = fake_sway(
+            dir.path(),
+            // `setsid` puts it in its own session, so the pid-tree snapshot cannot see it and
+            // the reap cannot signal it. The `exec` keeps the pid the shell reported, so the
+            // guard can reach it, and the sleep self-limits if it cannot.
+            &format!(
+                "echo 'sway: Unable to create renderer' >&2\n\
+                 setsid sh -c 'echo $$ > {}; exec sleep 30' &\n\
+                 exit 1\n",
+                pidfile.display()
+            ),
+        );
+
+        // Off-thread: a reader with no exit of its own must fail this test, not hang the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_sway_within(&fake, Duration::from_secs(5)));
+        });
+        let spawn = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the probe must return; a reader parked in read() never does");
+        let _reap = Survivor(&pidfile);
+
+        assert!(
+            spawn
+                .said
+                .as_deref()
+                .is_some_and(|said| said.contains("Unable to create renderer")),
+            "what sway said must survive a survivor holding its stderr: {spawn:?}"
+        );
+    }
+
+    /// glass#471: `finish` closes the read end, so collecting before the reap takes sway's
+    /// stderr away from it while it is still running.
+    #[test]
+    fn a_compositor_says_what_it_said_on_the_way_out_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = fake_sway(
+            dir.path(),
+            // `sleep &` + `wait`, not `sleep`: a foreground child defers the trap until it
+            // returns, so the compositor would ride out the whole reap grace instead of
+            // answering the SIGTERM.
+            "trap 'echo \"sway: caught SIGTERM\" >&2; exit 0' TERM\n\
+             sleep 30 &\n\
+             wait\n",
+        );
+
+        // Short: the compositor never brings its IPC up, so this budget is pure waiting.
+        let spawn = probe_sway_within(&fake, Duration::from_secs(1));
+
+        assert!(
+            spawn
+                .said
+                .as_deref()
+                .is_some_and(|said| said.contains("caught SIGTERM")),
+            "the reader must outlive the reap it is reporting on: {spawn:?}"
+        );
+    }
+
+    /// Kills what a fixture left running, however the test ends. The pid is read at drop time:
+    /// the fixture writes it asynchronously, and a test that failed early may never have looked.
+    struct Survivor<'a>(&'a Path);
+
+    impl Drop for Survivor<'_> {
+        fn drop(&mut self) {
+            let pid = std::fs::read_to_string(self.0)
+                .ok()
+                .and_then(|p| p.trim().parse::<i32>().ok())
+                .and_then(rustix::process::Pid::from_raw);
+            if let Some(pid) = pid {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
     }
 
     /// A fake sway at `dir/sway` running `body`, which rejects an argv that is not the one glass
@@ -1101,10 +1132,10 @@ mod tests {
     #[test]
     fn a_long_stderr_is_clipped_and_says_it_was() {
         let long = "e".repeat(STDERR_SHOWN * 2);
-        let said = said_line(long.as_bytes()).expect("something was said");
+        let said = said_line(&long).expect("something was said");
         assert!(said.len() < long.len(), "clipped");
         assert!(said.contains(&format!("of {}", long.len())), "{said}");
-        assert_eq!(said_line(b"  \n \n"), None, "silence is not something said");
+        assert_eq!(said_line("  \n \n"), None, "silence is not something said");
     }
 
     #[test]
