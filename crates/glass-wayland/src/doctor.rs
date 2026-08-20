@@ -265,20 +265,19 @@ fn sway_check(path: &Path, answer: &VersionAnswer) -> Check {
 }
 
 /// Where a distro puts libEGL — the layouts that are not arch-specific. The Debian multiarch
-/// layout (one triplet subdirectory, `x86_64-linux-gnu`/`aarch64-linux-gnu`/…) is added at
-/// runtime from the host's own triplets, so the check works on every architecture rather than
-/// only x86_64 (glass#468).
+/// layout (one triplet subdirectory per installed arch) is added at runtime from the host's own
+/// triplets, so the check works on every architecture, not only x86_64 (glass#468).
 const EGL_SONAMES: &[&str] = &["/usr/lib/libEGL.so.1", "/usr/lib64/libEGL.so.1"];
-/// Where a distro puts the Mesa DRI drivers — likewise, with the multiarch `dri` dirs added
-/// at runtime from the host's own triplets.
+/// Where a distro puts the Mesa DRI drivers — likewise, with the multiarch `dri` dirs added at
+/// runtime from the host's own triplets.
 const DRI_DIRS: &[&str] = &["/usr/lib/dri", "/usr/lib64/dri"];
 /// The Debian-family multiarch roots, each holding one subdirectory per installed architecture.
 const MULTIARCH_ROOTS: &[&str] = &["/usr/lib", "/lib"];
 
 /// The Mesa paths the check should look in: the distro layouts above, plus the Debian multiarch
-/// layout for each architecture the host actually has. Built from the directories under the
-/// multiarch root instead of naming one triplet, so an `aarch64` host finds its own
-/// `/usr/lib/aarch64-linux-gnu/` rather than being sent to install a package it has (glass#468).
+/// layout for each architecture the host actually has — built from the directories under the
+/// multiarch root rather than naming one triplet, so an `aarch64` host finds its own
+/// `/usr/lib/aarch64-linux-gnu/` (glass#468).
 fn mesa_candidates() -> (Vec<String>, Vec<String>) {
     let mut egl = EGL_SONAMES
         .iter()
@@ -624,18 +623,16 @@ mod tests {
         gl_present_in(&egls, &dris)
     }
 
-    /// The multiarch half of glass#468: a `aarch64` (or any non-x86_64) host puts its Mesa under
-    /// `<root>/<triplet>/`, and the old check named only `x86_64-linux-gnu`. `mesa_candidates`
-    /// must add the triplet dir it finds under the multiarch roots, so the check is
-    /// architecture-neutral rather than x86_64-only.
+    /// The multiarch half of glass#468: a non-x86_64 host puts its Mesa under `<root>/<triplet>/`,
+    /// and the old check named only `x86_64-linux-gnu`. `mesa_candidates` must add the triplet
+    /// dir it finds under the multiarch roots.
     #[test]
     fn mesa_candidates_add_the_multiarch_triplet_dirs_the_host_has() {
         let (egl, dri) = mesa_candidates();
         // The architecture-independent layouts are always present.
         assert!(egl.contains(&"/usr/lib/libEGL.so.1".to_string()));
         assert!(dri.contains(&"/usr/lib/dri".to_string()));
-        // And for every `<root>/<arch>-linux-gnu` directory on this host, the arch-specific
-        // layout is included too — which is what the old constant list failed to do on aarch64.
+        // And so is the arch-specific layout for every `<root>/<arch>-linux-gnu` on this host.
         for root in MULTIARCH_ROOTS {
             let Ok(entries) = std::fs::read_dir(root) else {
                 continue;
