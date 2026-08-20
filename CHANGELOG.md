@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- On macOS, a ScreenCaptureKit query whose handler never answers is no longer reported as "the app has no window": a wedged capture handler is a capture failure, so finding windows and discovering the app's on-screen content no longer blame the app for a framework that stopped answering.
 - On iOS, a simulator listing that cannot be read no longer reads as "nothing is booted": the doctor now reports the booted state as unknown (a warning, the same status the device check uses) and points at the listing command to verify, instead of the "boot a simulator" remedy.
 - The X11 backend no longer reads a dead glass helper thread as the X server failing: a reader that unwinds is reported with what it carried (and is not retried against a fresh server), the ask-to-close timeout names glass's own dead ask thread instead of the server, and the displayfd reader's thread is fallible, so a host that refuses it names the thread limit.
 - On Linux, the event subscription's pump thread now spawns fallibly: a host that refuses the thread (a low `pids` limit is the ordinary way an MCP server is confined) no longer panics the caller — the session degrades to polling the tree, the fallback the caller already has.
