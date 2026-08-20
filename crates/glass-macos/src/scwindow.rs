@@ -586,9 +586,7 @@ fn query_once_by_id(window_id: u32, pids: &[i32]) -> Result<Option<WindowMatch>>
         Ok(QueryReply::Found(m)) => Ok(Some(m)),
         Ok(QueryReply::NotFound) => Ok(None),
         Ok(QueryReply::Failed(e)) => Err(e),
-        // A wedged handler is a query failure, not a "found nothing" answer — the same
-        // distinction `list_app_windows` makes. Reading it as `Ok(None)` would blame the app
-        // for a window ScreenCaptureKit could not enumerate (glass#467).
+        // Same distinction as [`query_once_inner`]: a wedged handler is a failure, not `Ok(None)` (glass#467).
         Err(mpsc::RecvTimeoutError::Timeout) => Err(GlassError::Backend(
             "SCShareableContent completion handler did not reply within the query timeout".into(),
         )),
