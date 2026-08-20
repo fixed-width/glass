@@ -80,6 +80,11 @@ enum StartErr {
     /// the thread, an fd. Not `Spawn`: nothing is wrong with the binary, so its remedy would
     /// misdirect.
     NoReader(String),
+    /// The host refused the `-displayfd` reader thread: nothing was learned about the server.
+    ReaderRefused(String),
+    /// The `-displayfd` reader thread unwound without answering — what its panic payload said.
+    /// Not a wedge (the server may be fine), so it is not retried against a fresh server.
+    ReaderGone(String),
     /// Xvfb exited before reporting a display.
     Exited { stderr: String },
     /// A line arrived on `-displayfd` but wasn't a display number.
@@ -151,6 +156,12 @@ fn start_once(
                 ReadErr::Closed => StartErr::Exited { stderr },
                 ReadErr::Garbage(line) => StartErr::Garbage { line, stderr },
                 ReadErr::TimedOut => StartErr::Wedged { stderr },
+                // The reader never ran, so nothing was learned about the server: the child's
+                // stderr (collected above) is not the diagnosis here.
+                ReadErr::Refused(reason) => StartErr::ReaderRefused(reason),
+                // The reader ran and unwound: the payload is what the error carries, and it is
+                // not a wedge, so `start_binary` will not retry a fresh server against it.
+                ReadErr::ReaderGone(payload) => StartErr::ReaderGone(payload),
             })
         }
     }
@@ -170,6 +181,17 @@ fn into_glass_error(xvfb: &str, e: StartErr, ready_timeout: Duration) -> GlassEr
              was stopped rather than left to stall on a pipe nobody drains — free up threads \
              and file descriptors on the host, or set GLASS_DISPLAY=:N to attach to an \
              existing display"
+        ),
+        StartErr::ReaderRefused(e) => format!(
+            "started {xvfb} but the host refused the thread that reads its display report ({e}); \
+             the server was stopped — nothing here is about the server itself, the cause is the \
+             host's thread limit (a low `pids` cgroup limit is the usual one), or set \
+             GLASS_DISPLAY=:N to attach to an existing display"
+        ),
+        StartErr::ReaderGone(payload) => format!(
+            "the thread reading {xvfb}'s display report ended without answering ({payload}); the \
+             server was stopped — that is glass's own reader unwinding, not a server fault, so \
+             it was not retried; retry, or set GLASS_DISPLAY=:N to attach to an existing display"
         ),
         StartErr::Exited { stderr } => with_stderr(
             "Xvfb exited without reporting a display (failed to start); \
@@ -225,6 +247,10 @@ enum ReadErr {
     Garbage(String),
     /// No line within the timeout — Xvfb spawned but never became ready.
     TimedOut,
+    /// The host refused the reader thread itself: nothing was learned about the server.
+    Refused(String),
+    /// The reader thread unwound without answering; what its panic payload rendered.
+    ReaderGone(String),
 }
 
 /// Read the display number Xvfb writes to its `-displayfd` pipe, bounded by
@@ -237,23 +263,69 @@ fn read_displayfd(
     timeout: Duration,
 ) -> std::result::Result<(u32, ChildStdout), ReadErr> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).unwrap_or(0);
-        // Hand the fd back so the caller keeps it open; ignore a send failure —
-        // the caller timed out and dropped the receiver, the child will be
-        // killed, and this read unblocks and drops the fd here.
-        let _ = tx.send((n, line, reader.into_inner()));
-    });
+    // Named and fallible, unlike a bare `spawn`: a refused thread (a low `pids` cgroup limit is
+    // the ordinary way an MCP server is confined) panics a bare `spawn` in the caller (glass#454).
+    // `Builder::spawn` reports the refusal instead; it is not retried as a wedge — a second
+    // server would ask for more of the resource the host is out of.
+    let reader = std::thread::Builder::new()
+        .name("glass-x11-xvfb-displayfd".into())
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).unwrap_or(0);
+            // Hand the fd back so the caller keeps it open; ignore a send failure —
+            // the caller timed out and dropped the receiver, the child will be
+            // killed, and this read unblocks and drops the fd here.
+            let _ = tx.send((n, line, reader.into_inner()));
+        })
+        .map_err(|e| ReadErr::Refused(e.to_string()))?;
+    wait_for_display(rx, reader, timeout)
+}
+
+/// The bounded wait on the reader's channel, mapped. Split from [`read_displayfd`] so each
+/// outcome is reachable in a test without a live child: a `Disconnected` (the reader dropped its
+/// sender) cannot be produced end-to-end, since the reader only does that by unwinding.
+fn wait_for_display(
+    rx: mpsc::Receiver<(usize, String, ChildStdout)>,
+    reader: std::thread::JoinHandle<()>,
+    timeout: Duration,
+) -> std::result::Result<(u32, ChildStdout), ReadErr> {
     match rx.recv_timeout(timeout) {
         Ok((0, _, _)) => Err(ReadErr::Closed),
         Ok((_, line, fd)) => match line.trim().parse::<u32>() {
             Ok(num) => Ok((num, fd)),
             Err(_) => Err(ReadErr::Garbage(line.trim().to_string())),
         },
-        Err(_) => Err(ReadErr::TimedOut),
+        // The server is alive but silent past the deadline — the wedge the one retry is for.
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(ReadErr::TimedOut),
+        // The sender went with the thread, so it unwound: it arrived at once, not after a wait
+        // that never happened, and it is not a wedge, so it must not be retried (glass#453). The
+        // thread is already gone, so `join` is immediate — the timeout arm does not join, because
+        // there the thread is still parked in `read_line`.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ReadErr::ReaderGone(
+            ended_thread_payload(reader)
+                .unwrap_or_else(|| "(the reader ended without a panic payload)".to_string()),
+        )),
     }
+}
+
+/// Join an ended helper thread and render whatever it said, for a `Disconnected` wait arm.
+/// The thread is already gone when its channel's sender is dropped, so `join` returns
+/// immediately (it would block forever against a thread still parked in a blocking call —
+/// the timeout case, the one that must not be joined). Returns the panic payload when it
+/// was text (a literal `panic!` carries a `&str`, a formatted one a `String`), or `None`
+/// when the thread returned cleanly or the payload was not text — the caller supplies the
+/// placeholder. Shared by the `-displayfd` reader (glass#453) and the teardown ask thread
+/// (glass#458); split out so the payload rendering is testable without a live child.
+pub(crate) fn ended_thread_payload(reader: std::thread::JoinHandle<()>) -> Option<String> {
+    let Some(payload) = reader.join().err() else {
+        // The thread returned cleanly without sending — still not a wait, just no message.
+        return None;
+    };
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
 }
 
 impl Drop for Xvfb {
@@ -268,7 +340,7 @@ impl Drop for Xvfb {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadErr, Xvfb, read_displayfd, start_binary};
+    use super::{ReadErr, Xvfb, ended_thread_payload, read_displayfd, start_binary};
     use glass_core::{GlassError, Result};
     use std::process::{Command, Stdio};
     use std::time::Duration;
@@ -633,5 +705,70 @@ mod tests {
         let r = read_displayfd(stdout, Duration::from_secs(5));
         let _ = child.wait();
         assert!(matches!(r, Err(ReadErr::Closed)), "expected Closed");
+    }
+
+    /// The `Disconnected` arm's payload distinguishes a reader that unwound from a server that
+    /// wedged (glass#453). `ended_thread_payload` is tested directly because the arm itself
+    /// cannot be driven end-to-end — the reader only drops its sender by unwinding, and the panic
+    /// payload is the very thing under test.
+    #[test]
+    fn ended_thread_payload_carries_the_panic_payload() {
+        let reader = std::thread::spawn(|| panic!("read_line blew up: fake reader panic"));
+        assert_eq!(
+            ended_thread_payload(reader).as_deref(),
+            Some("read_line blew up: fake reader panic")
+        );
+    }
+
+    /// A reader that ends without panicking (a clean return) has no payload to carry: the
+    /// caller turns the `None` into its placeholder, never a `TimedOut` that would claim a wait
+    /// that did not happen.
+    #[test]
+    fn ended_thread_payload_is_none_when_the_thread_returned_cleanly() {
+        let clean = std::thread::spawn(|| ());
+        assert_eq!(ended_thread_payload(clean), None);
+    }
+
+    /// `ReaderRefused` and `ReaderGone` must each render their own message: the two carry the
+    /// reader's refusal reason / panic payload, point the operator at the host (not the server),
+    /// and neither borrows `Wedged`'s "killed and a fresh one retried" claim — neither was
+    /// retried, so that text would misdirect an operator into a third start.
+    #[test]
+    fn refused_and_gone_readers_render_their_own_messages() {
+        let message = |variant: super::StartErr| match super::into_glass_error(
+            "Xvfb",
+            variant,
+            super::READY_TIMEOUT,
+        ) {
+            GlassError::Backend(m) => m,
+            other => panic!("expected a Backend message, got {other:?}"),
+        };
+
+        let refused = message(super::StartErr::ReaderRefused("no threads left".into()));
+        assert!(
+            refused.contains("no threads left"),
+            "must carry the refusal reason: {refused}"
+        );
+        assert!(
+            refused.contains("host's thread limit"),
+            "must point at the host, not the server: {refused}"
+        );
+
+        let gone = message(super::StartErr::ReaderGone("reader panicked".into()));
+        assert!(
+            gone.contains("reader panicked"),
+            "must carry the panic payload: {gone}"
+        );
+        assert!(
+            gone.contains("not retried"),
+            "a gone reader was not retried: {gone}"
+        );
+
+        for m in [&refused, &gone] {
+            assert!(
+                !m.contains("killed and a fresh one retried"),
+                "the retry claim is `Wedged`'s alone; {m}"
+            );
+        }
     }
 }
