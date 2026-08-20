@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- `glass doctor` no longer waits forever on an X server that accepts connections and goes silent: the attach probe is bounded, and a server that answers then stops is reported as wedged with its own remedy, distinct from a refusal, a missing display, or a missing screen.
 - `glass doctor` on Android and iOS no longer reports a probe that timed out as a missing tool: a hung `emulator -list-avds` and a hung booted-simulator probe now say the probe timed out (carrying its cause), and the install remedy is reserved for a tool that is actually absent.
 - On Wayland, the clipboard owner retires on every exit path, including a panic, so a panicked owner can be re-spawned instead of being written to while it is gone (a paste into a dead owner comes back empty).
 - On macOS, a ScreenCaptureKit query whose handler never answers is no longer reported as "the app has no window": a wedged capture handler is a capture failure, so finding windows and discovering the app's on-screen content no longer blame the app for a framework that stopped answering.
