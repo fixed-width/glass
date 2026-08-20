@@ -495,7 +495,7 @@ impl X11Platform {
     fn request_close_bounded(&self, root_pid: u32) -> Asked {
         let (display, active) = (self.display.clone(), self.window);
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let asker = std::thread::spawn(move || {
             let asked = match X11Platform::connect(Some(&display)) {
                 Ok(mut asker) => {
                     // Carry the active window over so the ask sees what this backend is driving:
@@ -507,12 +507,25 @@ impl X11Platform {
             };
             let _ = tx.send(asked);
         });
-        rx.recv_timeout(ASK_BUDGET).unwrap_or_else(|_| {
-            Asked::blocked(format!(
+        match rx.recv_timeout(ASK_BUDGET) {
+            Ok(asked) => asked,
+            // The display is alive but slow: the ask is still running in the thread, so it is
+            // abandoned — joining would block teardown for a round trip x11rb cannot cancel.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Asked::blocked(format!(
                 "the X server did not answer within {ASK_BUDGET:?}, so the app could not be asked \
                  to close"
-            ))
-        })
+            )),
+            // The sender went with the thread, so it unwound: it arrived at once, not after a
+            // full budget that never happened. It is glass's own ask thread that died, not the
+            // X server, which may be healthy (glass#458); the thread is already gone, so the join
+            // is immediate and carries what it said.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Asked::blocked(format!(
+                "glass's own close-request thread ended without an answer ({}) — that is glass \
+                 failing to ask, not the X server refusing; the app was not asked to close",
+                crate::xvfb::ended_thread_payload(asker)
+                    .unwrap_or_else(|| "it carried no message".to_string())
+            )),
+        }
     }
 
     fn kill_child(&mut self) {

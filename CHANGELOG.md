@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- The X11 backend no longer reads a dead glass helper thread as the X server failing: a reader that unwinds is reported with what it carried (and is not retried against a fresh server), the ask-to-close timeout names glass's own dead ask thread instead of the server, and the displayfd reader's thread is fallible, so a host that refuses it names the thread limit.
 - On Linux, the event subscription's pump thread now spawns fallibly: a host that refuses the thread (a low `pids` limit is the ordinary way an MCP server is confined) no longer panics the caller — the session degrades to polling the tree, the fallback the caller already has.
 - `glass doctor --deep` on Android gives a uiautomator dump the remedy that fits its failure: a device that is up but not ready says "wait for it to finish booting", while a dump that cannot be resolved by waiting says the device may be wedged and to check `adb devices` — instead of both getting the boot remedy.
 - The a11y bus `GetAddress` poll on Linux is bounded by a wall-clock deadline, not a sleep-sum of attempts, and its failure message reports the budget that actually governed the wait.
