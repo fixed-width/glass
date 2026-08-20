@@ -354,8 +354,8 @@ enum NoSandbox {
     Missing(String),
     /// A bare `bwrap` and no `$PATH` to look it up in, so nothing says whether it is installed.
     NotLookedUp(String),
-    /// The configured `bwrap` path could not even be stat'd (a prefix this process cannot
-    /// traverse): a permission, not a missing package (glass#474).
+    /// The configured `bwrap` path could not be stat'd (a prefix this process cannot traverse):
+    /// a permission, not a missing package (glass#474).
     Unreadable(String),
     /// bwrap ran and exited non-zero, including without saying why.
     Refused(String),
@@ -432,8 +432,7 @@ fn resolved_bwrap(bin: &str, bwrap: Resolved) -> std::result::Result<PathBuf, No
             "bubblewrap ({}) is not executable",
             p.display()
         ))),
-        // The binary may be installed in a prefix glass cannot stat — a permission, not an install
-        // (glass#474).
+        // The binary may be installed in a prefix glass cannot stat (glass#474).
         Resolved::Unreadable(p, e) => Err(NoSandbox::Unreadable(format!(
             "bubblewrap at {} could not be looked at ({e})",
             p.display()

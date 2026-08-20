@@ -101,7 +101,7 @@ fn xvfb_check(xvfb: &Resolved) -> Check {
             "chmod +x {}, or point GLASS_XVFB at a runnable binary",
             p.display()
         )),
-        // Xvfb is there but glass could not even stat it — a permission, not an install
+        // Xvfb may be present, but glass could not stat it: a permission, not an install
         // (glass#474).
         Resolved::Unreadable(p, e) => Check::new(
             "Xvfb",

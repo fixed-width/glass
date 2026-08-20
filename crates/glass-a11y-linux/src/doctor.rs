@@ -335,7 +335,7 @@ fn a11y_checks(launcher: &Resolved, override_set: bool, facts: &HostA11yFacts) -
         .with_remedy(
             "restore its execute bit (`chmod +x`), or point GLASS_ATSPI_LAUNCHER at a runnable copy",
         ),
-        // A launcher glass could not even stat — a permission, not a missing package (glass#474).
+        // A launcher glass could not stat: a permission, not a missing package (glass#474).
         Resolved::Unreadable(p, e) => Check::new(
             "a11y",
             CheckStatus::Warn,

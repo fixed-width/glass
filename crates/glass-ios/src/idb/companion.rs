@@ -57,8 +57,8 @@ impl NoCompanion {
         }
     }
 
-    /// The companion is installed, but glass could not even stat the path (a prefix it cannot
-    /// traverse). A permission to fix, not a package to install (glass#474).
+    /// The companion is installed, but glass could not stat the path (a prefix it cannot
+    /// traverse): a permission to fix, not a package to install (glass#474).
     fn unreadable(p: &Path, e: &str) -> NoCompanion {
         NoCompanion {
             cause: format!(
@@ -150,8 +150,8 @@ impl CompanionFacts {
         match &self.resolved {
             Resolved::Found(p) => Ok(p),
             Resolved::NotExecutable(p) => Err(NoCompanion::not_executable(p)),
-            // The companion may be installed where glass cannot even stat it — a permission, not
-            // an install (glass#474).
+            // The companion may be installed where glass cannot stat it: a permission, not an
+            // install (glass#474).
             Resolved::Unreadable(p, e) => Err(NoCompanion::unreadable(p, e)),
             Resolved::Absent if self.override_set => Err(NoCompanion::override_names_nothing()),
             Resolved::Absent => Err(NoCompanion::absent()),
@@ -189,8 +189,8 @@ fn resolve_companion_with(
             Resolved::NotExecutable(p) => {
                 first_unrunnable.get_or_insert(p);
             }
-            // A prefix glass could not stat (glass#474): remember it, but a runnable or
-            // present-but-unrunnable copy in a later entry still outranks it.
+            // A prefix glass could not stat (glass#474): a later runnable or
+            // present-but-unrunnable copy still outranks it.
             Resolved::Unreadable(p, e) => {
                 first_unreadable.get_or_insert((p, e));
             }
@@ -201,10 +201,10 @@ fn resolve_companion_with(
     }
     match (first_unrunnable, first_unreadable, nothing_to_search) {
         // A file the user can act on outranks an unreadable prefix and the missing search list;
-        // the remedy's second clause covers a copy that a `$PATH` would have found.
+        // the remedy's second clause covers a copy a `$PATH` would have found.
         (Some(p), _, _) => Resolved::NotExecutable(p),
-        // No runnable/unrunnable file, but a prefix glass could not stat: name the permission
-        // rather than the install (glass#474).
+        // No runnable or unrunnable file, but a prefix glass could not stat: name the permission
+        // (glass#474).
         (None, Some((p, e)), _) => Resolved::Unreadable(p, e),
         // No `$PATH` to walk and nothing in the standard prefixes: the companion may well be
         // installed somewhere glass was never told to look (glass#373).

@@ -289,7 +289,7 @@ fn find_launcher_with(
                 first_non_executable.get_or_insert(p);
             }
             // A prefix we could not stat (glass#474): keep walking, but remember it so an
-            // exhausted search names the permission rather than a missing launcher.
+            // exhausted search names the permission.
             Resolved::Unreadable(p, e) => {
                 first_unreadable.get_or_insert((p, e));
             }
@@ -385,8 +385,7 @@ fn launcher_or_reason(resolved: Resolved) -> std::result::Result<PathBuf, String
             "at-spi-bus-launcher at {} is not executable",
             p.display()
         )),
-        // The launcher may well be installed — it just could not be stat'd. The remedy names the
-        // permission rather than an install (glass#474).
+        // The launcher may well be installed — it just could not be stat'd (glass#474).
         Resolved::Unreadable(p, e) => Err(format!(
             "at-spi-bus-launcher at {} could not be looked at ({e}); it may be installed in a \
              location glass cannot read — check that path's permissions, or set \
@@ -436,8 +435,7 @@ fn available_with(
         Resolved::NotExecutable(p) => {
             Err(format!("dbus-daemon at {} is not executable", p.display()))
         }
-        // The binary may be installed in a prefix glass cannot stat — name the permission, not
-        // an install (glass#474).
+        // The binary may be installed in a prefix glass cannot stat (glass#474).
         Resolved::Unreadable(p, e) => Err(format!(
             "dbus-daemon at {} could not be looked at ({e}); it may be installed in a location \
              glass cannot read — check that path's permissions, or set GLASS_DBUS_DAEMON to a \

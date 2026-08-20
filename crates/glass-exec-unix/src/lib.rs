@@ -60,10 +60,9 @@ pub fn is_executable_file(p: &Path) -> bool {
 ///
 /// The `NotExecutable` case is the reason this is not an `Option<PathBuf>`: a caller that only
 /// learns "no" cannot tell a missing binary from an installed one whose execute bit is off, and
-/// sends the user to reinstall a package that is already there. The `Unreadable` case is the same
-/// harm from a third cause — the path could not be stat'd (e.g. a prefix this process cannot
-/// traverse, a macOS path outside its sandbox) — which the code must name as a permission rather
-/// than an install (glass#474).
+/// sends the user to reinstall a package that is already there. `Unreadable` is the same harm
+/// from a third cause — the path could not be stat'd — and must be named as a permission, not an
+/// install (glass#474).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
 pub enum Resolved {
@@ -72,11 +71,10 @@ pub enum Resolved {
     /// A regular file is there, and this process may not execute it.
     NotExecutable(PathBuf),
     /// The path could not be looked at at all: `metadata` failed, so neither its presence nor its
-    /// execute bit is knowable. Carries the OS error's message so the remedy can name the
-    /// permission rather than an install.
+    /// execute bit is knowable. Carries the OS error's message for the remedy.
     Unreadable(PathBuf, String),
     /// Nothing to point the user at: no such path, or a directory. A path that cannot be stat'd
-    /// is [`Resolved::Unreadable`], not this — the two send a reader to different remedies.
+    /// is [`Resolved::Unreadable`], not this.
     Absent,
     /// A bare name and no `$PATH` to look it up in. Distinct from [`Resolved::Absent`] because the
     /// tool may well be installed: what is missing is the environment glass was spawned with.
@@ -107,8 +105,7 @@ pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Resolved {
                 first_non_executable.get_or_insert(p);
             }
             // A prefix we could not traverse: keep walking (the binary may be in a later entry),
-            // but remember it so an exhausted search reports the permission, not a missing tool
-            // (glass#474).
+            // but remember it for an exhausted search (glass#474).
             Resolved::Unreadable(p, e) => {
                 first_unreadable.get_or_insert((p, e));
             }
@@ -117,8 +114,8 @@ pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Resolved {
             Resolved::Absent | Resolved::NoSearchPath => {}
         }
     }
-    // A runnable or present-but-unrunnable match outranks an unreadable prefix; only when neither
-    // was seen does the unreadable one become the report.
+    // A runnable or present-but-unrunnable match outranks an unreadable prefix; the unreadable one
+    // is the report only when neither was seen.
     if let Some(p) = first_non_executable {
         return Resolved::NotExecutable(p);
     }
@@ -131,14 +128,11 @@ pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Resolved {
 /// rather than a name to look up. A directory is [`Resolved::Absent`]: it is not a launch target
 /// however its mode bits read.
 ///
-/// A path that cannot even be stat'd is [`Resolved::Unreadable`], not [`Resolved::Absent`]: a
-/// prefix this process cannot traverse (a `0700` directory owned by another user, a macOS path
-/// outside the sandbox, a volume that went away) holds no verdict glass can act on, and naming it
-/// as an install would send the user to fix what is not broken (glass#474).
+/// A path that cannot even be stat'd is [`Resolved::Unreadable`], not [`Resolved::Absent`]: it
+/// holds no verdict glass can act on (glass#474).
 pub fn resolve_path(p: &Path) -> Resolved {
     if let Err(e) = std::fs::metadata(p) {
-        // A clean "nothing is here" is still `Absent`; anything else — a permission error on a
-        // prefix traversal, an IO error on a path that may exist — is `Unreadable`.
+        // A clean "nothing is here" is still `Absent`; any other `metadata` error is `Unreadable`.
         if e.kind() != std::io::ErrorKind::NotFound {
             return Resolved::Unreadable(p.to_path_buf(), e.to_string());
         }
@@ -452,8 +446,8 @@ mod tests {
         let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755));
     }
 
-    /// The `$PATH` walk keeps going past an unreadable prefix and remembers it, so a search that
-    /// finds nothing runnable anywhere reports the permission rather than a missing tool.
+    /// The `$PATH` walk keeps going past an unreadable prefix and remembers it, so an exhausted
+    /// search reports it rather than [`Resolved::Absent`].
     #[test]
     fn a_search_past_an_unreadable_prefix_reports_it_rather_than_absent() {
         if rustix::process::geteuid().is_root() {

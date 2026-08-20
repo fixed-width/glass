@@ -348,8 +348,7 @@ fn sway_verdict(
             "{} is not executable",
             p.display()
         ))),
-        // A bundled sway glass could not even stat — a permission, not a missing build
-        // (glass#474).
+        // A bundled sway glass could not even stat: a permission, not a missing build (glass#474).
         Resolved::Unreadable(p, e) => Err(NoSway {
             cause: format!(
                 "the bundled sway at {} could not be looked at ({e}) — it may be installed where \
@@ -366,8 +365,7 @@ fn sway_verdict(
             Some(PathWalk {
                 silent: Some(no), ..
             }) => no,
-            // A prefix the walk could not even look into outranks "no sway found": the binary may
-            // well be there, and the fix is a permission, not a build (glass#474).
+            // A prefix the walk could not even look into outranks "no sway found" (glass#474).
             Some(PathWalk {
                 unreadable: Some((p, e)),
                 ..
@@ -404,8 +402,8 @@ fn sway_bundle_in(data: Option<PathBuf>, exe_dir: Option<PathBuf>) -> Resolved {
             Resolved::NotExecutable(p) => {
                 first_non_executable.get_or_insert(p);
             }
-            // A bundle root glass could not stat (glass#474): remember it, but a runnable or
-            // present-but-unrunnable copy in a later root still outranks it.
+            // A bundle root glass could not stat (glass#474): a later runnable or
+            // present-but-unrunnable copy still outranks it.
             Resolved::Unreadable(p, e) => {
                 first_unreadable.get_or_insert((p, e));
             }
@@ -431,8 +429,8 @@ fn sway_override(
     value: Option<std::ffi::OsString>,
 ) -> Option<std::result::Result<PathBuf, NoSway>> {
     let p = PathBuf::from(value.filter(|s| !s.is_empty())?);
-    // `resolve_path`, not `is_executable_file`, so a path glass cannot even stat (a prefix outside
-    // the sandbox) is named as a permission rather than as "not executable" (glass#474).
+    // `resolve_path`, not `is_executable_file`, so a path glass cannot even stat is named as a
+    // permission, not "not executable" (glass#474).
     Some(match resolve_path(&p) {
         Resolved::Found(p) => Ok(p),
         Resolved::NotExecutable(p) => Err(NoSway::not_runnable(format!(
@@ -447,9 +445,8 @@ fn sway_override(
             ),
             remedy: MAKE_IT_RUNNABLE,
         }),
-        // `NoSearchPath` cannot come from `resolve_path`, which judges one path and never wants
-        // a search list; it is named for uniformity. A path that is a directory answers `Absent`,
-        // so keep the old "not an executable file" verdict for both.
+        // `NoSearchPath` cannot come from `resolve_path`, which judges one path; a directory
+        // answers `Absent`, so both keep the old "not an executable file" verdict.
         Resolved::Absent | Resolved::NoSearchPath => Err(NoSway::not_runnable(format!(
             "GLASS_SWAY={} is not an executable file",
             p.display()
@@ -500,12 +497,9 @@ pub(crate) fn ask_sway_version(sway: &Path, budget: Duration) -> VersionAnswer {
     }
 }
 
-/// The outcome of walking `PATH`: the sway to use, the first candidate that was there and
-/// gave no answer, and the first entry the walk could not even look into.
-///
-/// `silent` is kept so a walk that ends empty can name that candidate rather than report no
-/// sway. `unreadable` is the same from a permission: a `sway` the walk could not stat is not
-/// "no sway found" (glass#474), so it is remembered and reported when nothing qualified.
+/// The outcome of walking `PATH`: the sway to use, the first candidate that was there and gave no
+/// answer, and the first entry the walk could not look into — `unreadable`, the same from a
+/// permission, remembered so an empty walk can report it (glass#474).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PathWalk {
     found: Option<PathBuf>,
@@ -526,15 +520,14 @@ fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>, budget: Duration) -> PathWa
     let mut walk = PathWalk::default();
     for dir in dirs {
         let cand = dir.join("sway");
-        // `resolve_path`, not `is_executable_file`, so a candidate glass cannot even stat
-        // (a prefix outside the sandbox) is reported as a permission, not skipped as if it
-        // were not there (glass#474).
+        // `resolve_path`, not `is_executable_file`, so a candidate glass cannot stat is reported
+        // as a permission, not skipped as if it were not there (glass#474).
         match resolve_path(&cand) {
             Resolved::Found(_) => {}
             Resolved::NotExecutable(_) => continue,
             Resolved::Unreadable(p, e) => {
-                // A later entry may still hold a sway; the permission is reported only if the
-                // whole walk comes back empty.
+                // A later entry may still hold a sway; report the permission only if the walk
+                // comes back empty.
                 walk.unreadable.get_or_insert((p, e));
                 continue;
             }
@@ -3099,8 +3092,8 @@ mod pure_tests {
     }
 
     /// The verdict for a walk that could not stat any `$PATH` entry: the permission is named
-    /// rather than "no sway found" — the fix is the permission, not a build (glass#474). A
-    /// candidate that actually ran (silent) still outranks the permission.
+    /// rather than "no sway found" (glass#474); a candidate that actually ran (silent) still
+    /// outranks it.
     #[test]
     fn an_unreadable_path_walk_outranks_nothing_qualifies() {
         let unreadable = Some((
@@ -3147,9 +3140,10 @@ mod pure_tests {
         assert_eq!(no.remedy, CHECK_THAT_SWAY);
     }
 
-    /// A `$PATH` entry glass cannot even stat must not silently drop the sway it holds: the walk
-    /// records the permission and the verdict reports it. Root can traverse a `0o000` directory,
-    /// so the EACCES needs a non-root host (same guard as the `resolve_bin` permission test).
+    /// A `$PATH` entry glass cannot stat must not silently drop the sway it holds: the walk
+    /// records the permission and the verdict reports it (glass#474). Root can traverse a
+    /// `0o000` directory, so this needs a non-root host (same guard as the `resolve_bin`
+    /// permission test).
     #[test]
     fn a_path_prefix_the_walk_cannot_stat_is_named_not_skipped() {
         if rustix::process::geteuid().is_root() {
