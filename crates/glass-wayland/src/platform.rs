@@ -10,7 +10,7 @@ use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
     TEARDOWN_BUDGET, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
-use glass_exec_unix::{Resolved, is_executable_file, resolve_path};
+use glass_exec_unix::{Resolved, resolve_path};
 use glass_pipe_unix::LineTap;
 use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE};
 use smithay_client_toolkit::delegate_dispatch2;
@@ -348,12 +348,36 @@ fn sway_verdict(
             "{} is not executable",
             p.display()
         ))),
+        // A bundled sway glass could not even stat: a permission, not a missing build (glass#474).
+        Resolved::Unreadable(p, e) => Err(NoSway {
+            cause: format!(
+                "the bundled sway at {} could not be looked at ({e}) — it may be installed where \
+                 glass cannot read it",
+                p.display()
+            ),
+            remedy: MAKE_IT_RUNNABLE,
+        }),
         // `NoSearchPath` cannot come from the bundle lookup, which walks fixed paths; both mean
         // there is no bundle to fall back to.
         Resolved::Absent | Resolved::NoSearchPath => Err(match walk {
             // A silent candidate on PATH outranks "nothing qualifies" — telling the user to build
             // one sends them past the sway they have.
-            Some(walked) => walked.silent.unwrap_or_else(NoSway::nothing_qualifies),
+            Some(PathWalk {
+                silent: Some(no), ..
+            }) => no,
+            // A prefix the walk could not even look into outranks "no sway found" (glass#474).
+            Some(PathWalk {
+                unreadable: Some((p, e)),
+                ..
+            }) => NoSway {
+                cause: format!(
+                    "the sway at {} could not be looked at ({e}) — it may be installed where \
+                     glass cannot read it",
+                    p.display()
+                ),
+                remedy: MAKE_IT_RUNNABLE,
+            },
+            Some(_) => NoSway::nothing_qualifies(),
             None => NoSway::no_search_path(),
         }),
     }
@@ -371,18 +395,29 @@ fn sway_bundle_in(data: Option<PathBuf>, exe_dir: Option<PathBuf>) -> Resolved {
         exe_dir.map(|d| d.join("sway/bin/sway")),
     ];
     let mut first_non_executable = None;
+    let mut first_unreadable = None;
     for cand in candidates.into_iter().flatten() {
         match resolve_path(&cand) {
             Resolved::Found(p) => return Resolved::Found(p),
             Resolved::NotExecutable(p) => {
                 first_non_executable.get_or_insert(p);
             }
+            // A bundle root glass could not stat (glass#474): a later runnable or
+            // present-but-unrunnable copy still outranks it.
+            Resolved::Unreadable(p, e) => {
+                first_unreadable.get_or_insert((p, e));
+            }
             // Each candidate is one path, judged on its own: `resolve_path` has no search list
             // to lack, so `NoSearchPath` cannot come from it. Both mean "nothing here".
             Resolved::Absent | Resolved::NoSearchPath => {}
         }
     }
-    first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
+    if let Some(p) = first_non_executable {
+        return Resolved::NotExecutable(p);
+    }
+    first_unreadable
+        .map(|(p, e)| Resolved::Unreadable(p, e))
+        .unwrap_or(Resolved::Absent)
 }
 
 /// What `GLASS_SWAY` decides, or `None` when it is unset or empty and discovery should run.
@@ -394,13 +429,28 @@ fn sway_override(
     value: Option<std::ffi::OsString>,
 ) -> Option<std::result::Result<PathBuf, NoSway>> {
     let p = PathBuf::from(value.filter(|s| !s.is_empty())?);
-    Some(if is_executable_file(&p) {
-        Ok(p)
-    } else {
-        Err(NoSway::not_runnable(format!(
+    // `resolve_path`, not `is_executable_file`, so a path glass cannot even stat is named as a
+    // permission, not "not executable" (glass#474).
+    Some(match resolve_path(&p) {
+        Resolved::Found(p) => Ok(p),
+        Resolved::NotExecutable(p) => Err(NoSway::not_runnable(format!(
             "GLASS_SWAY={} is not an executable file",
             p.display()
-        )))
+        ))),
+        Resolved::Unreadable(p, e) => Err(NoSway {
+            cause: format!(
+                "GLASS_SWAY={} could not be looked at ({e}) — it may point at a location glass \
+                 cannot read",
+                p.display()
+            ),
+            remedy: MAKE_IT_RUNNABLE,
+        }),
+        // `NoSearchPath` cannot come from `resolve_path`, which judges one path; a directory
+        // answers `Absent`, so both keep the old "not an executable file" verdict.
+        Resolved::Absent | Resolved::NoSearchPath => Err(NoSway::not_runnable(format!(
+            "GLASS_SWAY={} is not an executable file",
+            p.display()
+        ))),
     })
 }
 
@@ -447,14 +497,14 @@ pub(crate) fn ask_sway_version(sway: &Path, budget: Duration) -> VersionAnswer {
     }
 }
 
-/// The outcome of walking `PATH`: the sway to use, and the first candidate that was there and
-/// gave no answer.
-///
-/// The second field is kept so a walk that ends empty can name it rather than report no sway.
+/// The outcome of walking `PATH`: the sway to use, the first candidate that was there and gave no
+/// answer, and the first entry the walk could not look into — `unreadable`, the same from a
+/// permission, remembered so an empty walk can report it (glass#474).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PathWalk {
     found: Option<PathBuf>,
     silent: Option<NoSway>,
+    unreadable: Option<(PathBuf, String)>,
 }
 
 /// The first `sway` in `dirs` whose `--version` reports >= 1.12.
@@ -470,8 +520,18 @@ fn sway_in_dirs(dirs: impl Iterator<Item = PathBuf>, budget: Duration) -> PathWa
     let mut walk = PathWalk::default();
     for dir in dirs {
         let cand = dir.join("sway");
-        if !is_executable_file(&cand) {
-            continue;
+        // `resolve_path`, not `is_executable_file`, so a candidate glass cannot stat is reported
+        // as a permission, not skipped as if it were not there (glass#474).
+        match resolve_path(&cand) {
+            Resolved::Found(_) => {}
+            Resolved::NotExecutable(_) => continue,
+            Resolved::Unreadable(p, e) => {
+                // A later entry may still hold a sway; report the permission only if the walk
+                // comes back empty.
+                walk.unreadable.get_or_insert((p, e));
+                continue;
+            }
+            Resolved::Absent | Resolved::NoSearchPath => continue,
         }
         let why = match ask_sway_version(&cand, budget) {
             VersionAnswer::Answered(ver) => {
@@ -2196,6 +2256,7 @@ mod pure_tests {
 
     use super::*;
     use crate::testw::on_a_thread;
+    use glass_exec_unix::is_executable_file;
 
     /// The budget the pure waits below are given. `on_a_thread` allows a multiple of it, so a lost
     /// bound fails the test rather than hanging the suite.
@@ -3022,11 +3083,85 @@ mod pure_tests {
         let walk = PathWalk {
             found: Some(PathBuf::from("/usr/bin/sway")),
             silent: None,
+            unreadable: None,
         };
         let found = sway_verdict(Some(walk), || {
             panic!("the bundle must not be looked for once PATH has answered")
         });
         assert_eq!(found, Ok(PathBuf::from("/usr/bin/sway")));
+    }
+
+    /// The verdict for a walk that could not stat any `$PATH` entry: the permission is named
+    /// rather than "no sway found" (glass#474); a candidate that actually ran (silent) still
+    /// outranks it.
+    #[test]
+    fn an_unreadable_path_walk_outranks_nothing_qualifies() {
+        let unreadable = Some((
+            PathBuf::from("/usr/sway/bin/sway"),
+            "Permission denied (os error 13)".to_string(),
+        ));
+        let no = sway_verdict(
+            Some(PathWalk {
+                found: None,
+                silent: None,
+                unreadable,
+            }),
+            || Resolved::Absent,
+        )
+        .expect_err("nothing runnable");
+        assert!(no.cause.contains("/usr/sway/bin/sway"), "{}", no.message());
+        assert!(
+            no.cause.contains("could not be looked at"),
+            "{}",
+            no.message()
+        );
+        assert_eq!(no.remedy, MAKE_IT_RUNNABLE);
+
+        let no = sway_verdict(
+            Some(PathWalk {
+                found: None,
+                silent: Some(NoSway::silent(
+                    Path::new("/usr/bin/sway"),
+                    "it ran and said nothing",
+                )),
+                unreadable: Some((
+                    PathBuf::from("/usr/sway/bin/sway"),
+                    "Permission denied (os error 13)".to_string(),
+                )),
+            }),
+            || Resolved::Absent,
+        )
+        .expect_err("nothing runnable");
+        assert!(
+            no.cause.contains("/usr/bin/sway"),
+            "the running sway outranks the permission: {}",
+            no.message()
+        );
+        assert_eq!(no.remedy, CHECK_THAT_SWAY);
+    }
+
+    /// A `$PATH` entry glass cannot stat must not silently drop the sway it holds: the walk
+    /// records the permission and the verdict reports it (glass#474). Root can traverse a
+    /// `0o000` directory, so this needs a non-root host (same guard as the `resolve_bin`
+    /// permission test).
+    #[test]
+    fn a_path_prefix_the_walk_cannot_stat_is_named_not_skipped() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: root can traverse a 0o000 directory, so the EACCES never fires");
+            return;
+        }
+        let _guard = one_spawner_at_a_time();
+        let dir = fake_sway("sway version 1.12-abc (Jun 3 2026)");
+        let prefix = dir.path().to_path_buf();
+        std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let walk = sway_in(&[dir.path()]);
+        std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let Some((p, e)) = walk.unreadable else {
+            panic!("the walk cannot stat {prefix:?}, so it must record the permission");
+        };
+        assert_eq!(p, prefix.join("sway"));
+        assert!(e.contains("Permission denied"), "{e}");
+        assert!(walk.found.is_none());
     }
 
     /// The launch path gets one string where doctor gets two columns, so it must carry both.
