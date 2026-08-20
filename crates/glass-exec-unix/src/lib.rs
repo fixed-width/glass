@@ -75,7 +75,8 @@ pub enum Resolved {
     /// execute bit is knowable. Carries the OS error's message so the remedy can name the
     /// permission rather than an install.
     Unreadable(PathBuf, String),
-    /// Nothing to point the user at: no such path, a directory, or a path that cannot be stat'd.
+    /// Nothing to point the user at: no such path, or a directory. A path that cannot be stat'd
+    /// is [`Resolved::Unreadable`], not this — the two send a reader to different remedies.
     Absent,
     /// A bare name and no `$PATH` to look it up in. Distinct from [`Resolved::Absent`] because the
     /// tool may well be installed: what is missing is the environment glass was spawned with.
