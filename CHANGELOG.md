@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- On macOS, a ScreenCaptureKit query whose handler never answers is no longer reported as "the app has no window": a wedged capture handler is a capture failure, so finding windows and discovering the app's on-screen content no longer blame the app for a framework that stopped answering.
 - Linux: a deep `glass doctor` probe no longer leaves a stuck thread and an open pipe behind for
   the rest of the process's life. The X11 and Wayland probes each read their child's stderr on a
   helper thread, and that thread could only stop at end-of-file — which anything the probe left
