@@ -420,8 +420,11 @@ fn render(report: &Report, opts: &Options) -> String {
             "glass-mcp {} is a from-source build; the latest release is {}.\n",
             report.current, latest
         ),
+        // This arm covers `latest <= current`, which is only true when they are equal unless the
+        // running build is a prerelease newer than the latest release — "is the latest release"
+        // would be a claim the code never established in that case, so say "up to date" instead.
         Outcome::Checked | Outcome::UpToDate => {
-            format!("glass-mcp {} is the latest release.\n", report.current)
+            format!("glass-mcp {} is up to date.\n", report.current)
         }
         Outcome::Updated => format!(
             "{} glass-mcp {} → {}\n{}{}",
@@ -638,6 +641,26 @@ mod tests {
         let server = FakeRelease::start("v1.3.0", &asset, BODY, &sidecar(&asset));
         let src = ReleaseSource::with_base(server.base());
         let out = run(opts(), &src, "1.3.0", &exe).await.unwrap().outcome;
+        assert!(matches!(out, Outcome::UpToDate), "{out:?}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old");
+    }
+
+    /// The apply path's `latest <= current` decision (glass#447) in its non-equal shape: a
+    /// running build that is a prerelease *newer* than the latest release. The render test pins
+    /// the string; this pins the classification itself — the binary must be reported up to date
+    /// and left untouched, not downloaded (the `1.3.0` server below would 404 no asset for
+    /// `1.4.0-rc1`, so a misclassified "update" would fail the run, not just the assert).
+    #[tokio::test]
+    async fn a_prerelease_running_above_the_latest_release_is_up_to_date() {
+        if !apply_path_exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exe = install(dir.path(), b"old");
+        let asset = release::asset_name("v1.3.0").expect("supported target");
+        let server = FakeRelease::start("v1.3.0", &asset, BODY, &sidecar(&asset));
+        let src = ReleaseSource::with_base(server.base());
+        let out = run(opts(), &src, "1.4.0-rc1", &exe).await.unwrap().outcome;
         assert!(matches!(out, Outcome::UpToDate), "{out:?}");
         assert_eq!(std::fs::read(&exe).unwrap(), b"old");
     }
@@ -1095,6 +1118,41 @@ mod tests {
         assert!(
             !wrong.contains("not a `sha256sum` line"),
             "a sidecar that parsed must not be reported as unreadable: {wrong}"
+        );
+    }
+
+    /// The glass#447 render pin, one case per shape of `latest <= current`: an equal build and a
+    /// prerelease running above the latest release. Both must render "up to date" and neither may
+    /// claim "is the latest release" (that claim is false in the second case).
+    #[test]
+    fn up_to_date_does_not_claim_to_be_the_latest_release() {
+        // current == latest: the ordinary up-to-date case.
+        let mut r = report_fixture();
+        r.outcome = Outcome::UpToDate;
+        r.current = "1.4.0".into();
+        r.latest = Some("1.4.0".into());
+        r.update_available = false;
+        let human = render(&r, &plain(false));
+        assert!(human.contains("is up to date"), "the equal case: {human}");
+        assert!(
+            !human.contains("is the latest release"),
+            "must not claim to be the latest release: {human}"
+        );
+
+        // current newer than latest (a prerelease build, the shape glass#447 observed).
+        let mut r = report_fixture();
+        r.outcome = Outcome::Checked;
+        r.current = "1.4.0-rc1".into();
+        r.latest = Some("1.3.0".into());
+        r.update_available = false;
+        let human = render(&r, &plain(false));
+        assert!(
+            human.contains("is up to date"),
+            "the current-newer case: {human}"
+        );
+        assert!(
+            !human.contains("is the latest release"),
+            "a prerelease above the latest release is not the latest release: {human}"
         );
     }
 
