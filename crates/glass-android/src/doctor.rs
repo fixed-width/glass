@@ -33,9 +33,9 @@ struct Probe {
     adb_version: Option<String>,
     /// Resolved emulator path (`GLASS_EMULATOR`/SDK root/`"emulator"`).
     emulator_bin: String,
-    /// AVDs from `emulator -list-avds`; `None` when the binary is absent/failed,
-    /// `Some(vec![])` when it ran but found none.
-    avds: Option<Vec<String>>,
+    /// What `emulator -list-avds` said: the parsed AVDs, or that it could not be read at all,
+    /// or that it never answered — the two `None`s used to share one arm (glass#457).
+    avds: AvdList,
     /// Serials with `adb devices` state `"device"` (online), for display.
     online: Vec<String>,
     /// The reason `adb devices` failed to read, when it did — `Some` when the listing errored
@@ -75,7 +75,20 @@ struct Probe {
 struct DeepProbe {
     serial: String,
     screencap: Result<String, String>,
-    uiautomator: Result<String, String>,
+    uiautomator: UiProbe,
+}
+
+/// The uiautomator half of [`DeepProbe`], keeping the two failure shapes `dump_once` already
+/// distinguishes: a dump the wait could still resolve (the device is up but not ready to serve
+/// one yet), and one a wait cannot help (adb is gone, the device is wedged, or a deadline
+/// fired). Collapsing them was the one place the a11y module's `NotReady`/`Fatal` split was
+/// dropped (glass#461).
+enum UiProbe {
+    Ok(String),
+    /// The device cannot serve a dump yet — waiting is what resolves it.
+    NotReady(String),
+    /// Waiting cannot help this attempt: adb is gone, the device is wedged, or a deadline fired.
+    Fatal(String),
 }
 
 /// Build the Android doctor checks by probing the host. `deep` additionally captures a
@@ -109,7 +122,7 @@ fn probe_with(
         .map(|s| first_line(&s))
         .filter(|s| !s.is_empty());
     let emulator_bin = resolve_emulator_bin(get, exists);
-    let avds = list_avds(&emulator_bin);
+    let avds = list_avds(&emulator_bin, crate::avd::EMULATOR_LIST_BUDGET);
 
     let (online_devices, devices_listing_failed): (Vec<Device>, Option<String>) =
         if adb_version.is_some() {
@@ -214,27 +227,45 @@ fn probe_with(
     }
 }
 
+/// What `emulator -list-avds` said (glass#457): a run listing, a pre-answer failure, and a hung
+/// read are kept apart — they used to share one `None`, and a wedged emulator then read as
+/// "not found".
+#[derive(Debug, PartialEq, Eq)]
+enum AvdList {
+    /// The binary ran and reported these AVDs (possibly none). A non-zero exit with an empty
+    /// answer lands here too — the caller drops `o.status`, so it reads as the "no AVDs" remedy.
+    Listed(Vec<String>),
+    /// The listing failed before it could answer — would not start, or could not spawn — but
+    /// nothing timed out. Carries the cause.
+    Unreadable(String),
+    /// The binary started but never answered within the budget — it is wedged, not "not
+    /// installed", so its remedy differs.
+    TimedOut(String),
+}
+
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_string()
 }
 
-/// `<bin> -list-avds`: `None` when the binary could not be run to an answer, else the parsed names.
+/// `<bin> -list-avds`, with the outcomes that used to share `None` kept apart (glass#457).
 ///
-/// Bounded like the boot path's copy of this call: a doctor that hangs on a wedged tool reports
-/// nothing at all, which is the one thing it must never do. A timeout still collapses into the same
-/// `None` as an absent binary — the caller renders that as "not found", which is then the wrong
-/// remedy — so it is logged, the way the iOS doctor logs its probes.
-fn list_avds(bin: &str) -> Option<Vec<String>> {
+/// Bounded like the boot path's copy: a doctor that hangs on a wedged tool reports nothing at
+/// all, which it must never do.
+fn list_avds(bin: &str, budget: std::time::Duration) -> AvdList {
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("-list-avds");
-    glass_core::run_bounded(
-        &mut cmd,
-        crate::avd::EMULATOR_LIST_BUDGET,
-        "emulator:-list-avds",
-    )
-    .inspect_err(|e| eprintln!("glass-android doctor: {e}"))
-    .ok()
-    .map(|o| parse_list_avds(&String::from_utf8_lossy(&o.stdout)))
+    match glass_core::run_bounded(&mut cmd, budget, "emulator:-list-avds") {
+        Ok(o) => AvdList::Listed(parse_list_avds(&String::from_utf8_lossy(&o.stdout))),
+        Err(e) => {
+            // A timeout is reported, not logged (the detail carries the budget); every other
+            // failure is logged the way the other doctor probes are.
+            if e.bound() == Some(glass_core::BoundKind::TimedOut) {
+                return AvdList::TimedOut(e.to_string());
+            }
+            eprintln!("glass-android doctor: {e}");
+            AvdList::Unreadable(e.to_string())
+        }
+    }
 }
 
 /// Deep probe one online device: capture a frame (validated via the real decoder) and
@@ -260,9 +291,13 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
     // can do now, and a dump that only succeeds after a wait is what this check exists to
     // reveal.
     let uiautomator = match dump_once(&mut adb_runner(&dev), DUMP_PREFIX, attempt_deadline()) {
-        Attempt::Dumped(xml) if xml.contains("<hierarchy") => Ok("a11y dump OK".to_string()),
-        Attempt::Dumped(_) => Err("uiautomator dump produced no hierarchy".to_string()),
-        Attempt::NotReady(e) | Attempt::Fatal(e) => Err(e.to_string()),
+        Attempt::Dumped(xml) if xml.contains("<hierarchy") => {
+            UiProbe::Ok("a11y dump OK".to_string())
+        }
+        Attempt::Dumped(_) => UiProbe::Fatal("uiautomator dump produced no hierarchy".to_string()),
+        // Keep the a11y module's own split — the one place it was dropped (glass#461).
+        Attempt::NotReady(e) => UiProbe::NotReady(e.to_string()),
+        Attempt::Fatal(e) => UiProbe::Fatal(e.to_string()),
     };
 
     DeepProbe {
@@ -398,10 +433,34 @@ fn deep_checks(p: &Probe) -> (Check, Check) {
         Err(e) => Check::new(name, CheckStatus::Fail, format!("{}: {e}", d.serial))
             .with_remedy("ensure the device is fully booted"),
     };
-    (
-        render("screencap", &d.screencap),
-        render("uiautomator", &d.uiautomator),
-    )
+    // The uiautomator check is rendered on its own so each failure shape gets the remedy that
+    // fits it (glass#461).
+    let uiautomator = match &d.uiautomator {
+        UiProbe::Ok(detail) => Check::new(
+            "uiautomator",
+            CheckStatus::Ok,
+            format!("{}: {detail}", d.serial),
+        ),
+        UiProbe::NotReady(e) => Check::new(
+            "uiautomator",
+            CheckStatus::Fail,
+            format!("{}: {e}", d.serial),
+        )
+        .with_remedy(
+            "the device is up but not ready to serve a dump yet — wait for it to finish \
+             booting and re-run with --deep",
+        ),
+        UiProbe::Fatal(e) => Check::new(
+            "uiautomator",
+            CheckStatus::Fail,
+            format!("{}: {e}", d.serial),
+        )
+        .with_remedy(
+            "waiting will not resolve this — the device may be wedged or adb gone; re-run \
+             `adb devices` (or `adb kill-server`) and re-run with --deep",
+        ),
+    };
+    (render("screencap", &d.screencap), uiautomator)
 }
 
 fn device_check(p: &Probe) -> Check {
@@ -430,7 +489,7 @@ fn device_check(p: &Probe) -> Check {
             format!("{} online; glass will use {serial}", p.online.len()),
         ),
         Action::Boot => {
-            if matches!(&p.avds, Some(avds) if !avds.is_empty()) {
+            if matches!(&p.avds, AvdList::Listed(avds) if !avds.is_empty()) {
                 Check::new(
                     "device",
                     CheckStatus::Warn,
@@ -451,16 +510,28 @@ fn device_check(p: &Probe) -> Check {
 
 fn emulator_check(p: &Probe) -> Check {
     match &p.avds {
-        None => Check::new(
+        // A listing that never answered is a different finding from one that could not be run —
+        // the remedy is to check the binary, not to install it (glass#457).
+        AvdList::TimedOut(cause) => Check::new(
             "emulator",
             CheckStatus::Warn,
             format!(
-                "emulator binary not found ({}); attach still works, but glass can't boot an AVD",
-                p.emulator_bin
+                "{} started but did not answer `emulator -list-avds` ({}); glass can't tell what \
+                 AVDs are bootable",
+                p.emulator_bin, cause
             ),
         )
+        .with_remedy(
+            "run `emulator -list-avds` by hand: a binary that starts and then hangs usually needs \
+             an SDK/AVD fix, not a reinstall",
+        ),
+        AvdList::Unreadable(cause) => Check::new(
+            "emulator",
+            CheckStatus::Warn,
+            format!("{} could not be listed ({cause}); attach still works, but glass can't boot an AVD", p.emulator_bin),
+        )
         .with_remedy("install the Android emulator at a standard SDK location (auto-found), or set GLASS_EMULATOR / ANDROID_SDK_ROOT"),
-        Some(avds) if avds.is_empty() => Check::new(
+        AvdList::Listed(avds) if avds.is_empty() => Check::new(
             "emulator",
             CheckStatus::Warn,
             format!("{}: no AVDs listed; glass can't boot one", p.emulator_bin),
@@ -468,7 +539,7 @@ fn emulator_check(p: &Probe) -> Check {
         .with_remedy(
             "create an AVD (e.g. `avdmanager create avd`); if you expected existing AVDs, check the emulator install",
         ),
-        Some(avds) => Check::new(
+        AvdList::Listed(avds) => Check::new(
             "emulator",
             CheckStatus::Ok,
             format!("{} ({} AVD(s): {})", p.emulator_bin, avds.len(), avds.join(", ")),
@@ -509,7 +580,7 @@ mod tests {
             ],
             adb_version: Some("Android Debug Bridge version 1.0.41".into()),
             emulator_bin: "/sdk/emulator/emulator".into(),
-            avds: Some(vec!["glass".into()]),
+            avds: AvdList::Listed(vec!["glass".into()]),
             online: vec!["emulator-5554".into()],
             devices_listing_failed: None,
             selection: Action::Attach("emulator-5554".into()),
@@ -530,7 +601,7 @@ mod tests {
         DeepProbe {
             serial: "emulator-5554".into(),
             screencap: Ok("captured 1080x2400, 10368016 bytes raw".into()),
-            uiautomator: Ok("a11y dump OK".into()),
+            uiautomator: UiProbe::Ok("a11y dump OK".into()),
         }
     }
 
@@ -674,12 +745,60 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            list_avds(&emulator.to_string_lossy()),
-            Some(vec!["Pixel_6".to_string(), "glass".to_string()])
+            list_avds(
+                &emulator.to_string_lossy(),
+                crate::avd::EMULATOR_LIST_BUDGET
+            ),
+            AvdList::Listed(vec!["Pixel_6".to_string(), "glass".to_string()])
         );
         // A binary that cannot be run answers nothing, which is not the same as a device with no
-        // AVDs — the remedy the caller is given differs.
-        assert_eq!(list_avds("/nonexistent/emulator"), None);
+        // AVDs — the remedy the caller is given differs. A spawn failure (no bound) lands in
+        // `Unreadable`, not in the arm a wedged binary would use.
+        assert!(matches!(
+            list_avds("/nonexistent/emulator", crate::avd::EMULATOR_LIST_BUDGET),
+            AvdList::Unreadable(_)
+        ));
+    }
+
+    /// The regression glass#457 pins, driven through the real `list_avds`: a hung `emulator`
+    /// comes out `TimedOut`, not the old "binary not found" / "no AVDs" fold.
+    #[test]
+    #[cfg(unix)]
+    fn a_hanging_emulator_is_timed_out_not_unreadable() {
+        use crate::adb::{Answer, FakeAdb};
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let emulator = fake.alongside(
+            "emulator",
+            "#!/bin/sh\n[ \"$1\" = --glass-probe ] && exit 0\nexec sleep 30\n",
+        );
+        let v = list_avds(
+            &emulator.to_string_lossy(),
+            std::time::Duration::from_millis(300),
+        );
+        assert!(
+            matches!(&v, AvdList::TimedOut(c) if c.contains("emulator:-list-avds")),
+            "a hang is TimedOut with the real run_bounded text, not the fabricated one: {v:?}"
+        );
+    }
+
+    /// A `emulator -list-avds` that ran and exited non-zero with no list: the caller keeps the
+    /// empty list, not `Unreadable` — the exit code is the one thing it drops.
+    #[test]
+    #[cfg(unix)]
+    fn a_non_zero_exit_with_no_list_is_the_empty_list() {
+        use crate::adb::{Answer, FakeAdb};
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let emulator = fake.alongside(
+            "emulator",
+            "#!/bin/sh\n[ \"$1\" = --glass-probe ] && exit 0\nexit 1\n",
+        );
+        assert_eq!(
+            list_avds(
+                &emulator.to_string_lossy(),
+                std::time::Duration::from_millis(500)
+            ),
+            AvdList::Listed(vec![])
+        );
     }
 
     #[test]
@@ -708,7 +827,7 @@ mod tests {
             Ok("captured 2x3, 36 bytes raw"),
             "the frame is decoded, not merely fetched"
         );
-        assert_eq!(probed.uiautomator.as_deref(), Ok("a11y dump OK"));
+        assert!(matches!(&probed.uiautomator, UiProbe::Ok(s) if s == "a11y dump OK"));
     }
 
     #[test]
@@ -724,10 +843,11 @@ mod tests {
         ]);
 
         let probed = deep_probe(fake.adb(), "emulator-5554");
-        assert_eq!(
-            probed.uiautomator.as_deref().map_err(String::as_str),
-            Err("uiautomator dump produced no hierarchy")
-        );
+        // A dump that ran and wrote nothing usable is not one a wait would resolve, so `Fatal`.
+        assert!(matches!(
+            &probed.uiautomator,
+            UiProbe::Fatal(s) if s == "uiautomator dump produced no hierarchy"
+        ));
     }
 
     #[test]
@@ -822,18 +942,37 @@ mod tests {
     #[test]
     fn emulator_binary_absent_is_warn() {
         let mut p = base_probe();
-        p.avds = None;
+        p.avds = AvdList::Unreadable("spawn failed: No such file or directory".into());
         let e = build_checks(&p);
         let e = find(&e, "emulator");
         assert_eq!(e.status, CheckStatus::Warn);
-        assert!(e.detail.contains("emulator binary not found"));
+        assert!(e.detail.contains("could not be listed"));
         assert!(e.remedy.as_deref().unwrap().contains("ANDROID_SDK_ROOT"));
+    }
+
+    /// The regression glass#457 pins: an emulator that started and then hung is not reported as
+    /// one that is not installed — the remedy for a wedged binary is to check it, not to install
+    /// it.
+    #[test]
+    fn a_wedged_emulator_is_not_reported_as_absent() {
+        let mut p = base_probe();
+        p.avds = AvdList::TimedOut("emulator:-list-avds: killed after 5s".into());
+        let e = build_checks(&p);
+        let e = find(&e, "emulator");
+        assert_eq!(e.status, CheckStatus::Warn);
+        assert!(e.detail.contains("did not answer"), "{}", e.detail);
+        assert!(!e.detail.contains("could not be listed"), "{}", e.detail);
+        assert!(
+            !e.remedy.as_deref().unwrap().contains("ANDROID_SDK_ROOT"),
+            "a wedged binary must not be told to install: {:?}",
+            e.remedy
+        );
     }
 
     #[test]
     fn emulator_no_avds_is_warn() {
         let mut p = base_probe();
-        p.avds = Some(vec![]);
+        p.avds = AvdList::Listed(vec![]);
         let e = build_checks(&p);
         let e = find(&e, "emulator");
         assert_eq!(e.status, CheckStatus::Warn);
@@ -908,7 +1047,7 @@ mod tests {
         let mut p = base_probe();
         p.online = vec![];
         p.selection = decide(&[], None, Lifecycle::Auto); // would boot...
-        p.avds = Some(vec![]); // ...but emulator ran with no AVDs => cannot boot
+        p.avds = AvdList::Listed(vec![]); // ...but emulator ran with no AVDs => cannot boot
         let d = build_checks(&p);
         let d = find(&d, "device");
         assert_eq!(d.status, CheckStatus::Fail);
@@ -923,7 +1062,7 @@ mod tests {
         let mut p = base_probe();
         p.online = vec![];
         p.selection = decide(&[], None, Lifecycle::Auto); // would otherwise say "boot one"
-        p.avds = Some(vec!["glass".into()]); // so it is not the "no AVD" Fail either
+        p.avds = AvdList::Listed(vec!["glass".into()]); // so it is not the "no AVD" Fail either
         p.devices_listing_failed = Some("timeout: adb devices did not answer within 10s".into());
         let d = build_checks(&p);
         let d = find(&d, "device");
@@ -982,7 +1121,7 @@ mod tests {
         let mut p = base_probe();
         p.online = vec![];
         p.selection = decide(&[], None, Lifecycle::Auto); // would boot...
-        p.avds = None; // ...but the emulator binary is absent => cannot boot
+        p.avds = AvdList::Unreadable("spawn failed: No such file or directory".into()); // ...but the emulator binary is absent => cannot boot
         let d = build_checks(&p);
         let d = find(&d, "device");
         assert_eq!(d.status, CheckStatus::Fail);
@@ -1049,7 +1188,7 @@ mod tests {
         p.deep = Some(DeepProbe {
             serial: "emulator-5554".into(),
             screencap: Err("screencap 0x0: FLAG_SECURE?".into()),
-            uiautomator: Err("dump produced no hierarchy".into()),
+            uiautomator: UiProbe::Fatal("dump produced no hierarchy".into()),
         });
         let c = build_checks(&p);
         let s = find(&c, "screencap");
@@ -1057,6 +1196,45 @@ mod tests {
         assert!(s.detail.contains("FLAG_SECURE"));
         assert!(s.remedy.as_deref().unwrap().contains("fully booted"));
         assert_eq!(find(&c, "uiautomator").status, CheckStatus::Fail);
+    }
+
+    /// The defect in glass#461: a dump the wait could still resolve (NotReady) is not one a wait
+    /// cannot help (Fatal), so the two carry different remedies — "wait for boot" versus
+    /// "adb is gone / wedged".
+    #[test]
+    fn a_not_ready_dump_and_a_fatal_dump_get_different_remedies() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.deep = Some(DeepProbe {
+            serial: "emulator-5554".into(),
+            screencap: Ok("captured 1080x2400".into()),
+            uiautomator: UiProbe::NotReady("device not yet serving dumps".into()),
+        });
+        let c = build_checks(&p);
+        let nr = find(&c, "uiautomator");
+        assert_eq!(nr.status, CheckStatus::Fail);
+        assert!(nr.detail.contains("not yet serving dumps"));
+        let nr_remedy = nr.remedy.as_deref().unwrap();
+        assert!(
+            nr_remedy.contains("not ready to serve a dump"),
+            "{nr_remedy}"
+        );
+
+        // A Fatal dump (a deadline fired / adb gone) is the opposite answer: waiting won't help.
+        p.deep = Some(DeepProbe {
+            serial: "emulator-5554".into(),
+            screencap: Ok("captured 1080x2400".into()),
+            uiautomator: UiProbe::Fatal("deadline fired".into()),
+        });
+        let checks = build_checks(&p);
+        let fa = find(&checks, "uiautomator");
+        let fa_remedy = fa.remedy.as_deref().unwrap();
+        assert!(
+            fa_remedy.contains("waiting will not resolve"),
+            "{fa_remedy}"
+        );
+        // The two remedies differ — the collapse that motivated the issue.
+        assert_ne!(nr_remedy, fa_remedy);
     }
 
     #[test]

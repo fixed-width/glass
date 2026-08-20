@@ -1535,6 +1535,27 @@ mod tests {
         assert!(!encloses(None, rect(10, 10, 10, 10)));
     }
 
+    /// The far-edge arithmetic promotes to `i64` (glass#322): an outer at (0, 0) with a u32::MAX
+    /// width makes `x + width` = 2^32 - 1, which overflows an `i32`, so a node that genuinely
+    /// encloses its descendant would read as not enclosing it. Pin the result so a simplification
+    /// back to i32 arithmetic fails here instead of silently mis-actuating a control.
+    #[test]
+    fn encloses_does_not_overflow_on_max_edges() {
+        let rect = |x, y, width, height| {
+            Some(AxRect {
+                x,
+                y,
+                width,
+                height,
+            })
+        };
+        let outer = rect(0, 0, u32::MAX, u32::MAX);
+        let inner = rect(0, 0, 100, 100);
+        // outer.x + outer.width = 2^32 - 1 (overflowing as i32) >= the inner's right edge 100,
+        // and every start/far edge is within i32 range, so this genuinely encloses.
+        assert!(encloses(outer, inner));
+    }
+
     /// `GLASS_ANDROID_A11Y_APK` is caller-supplied and lands in the argv the error names, so a
     /// path quoting the phrase used to make every install failure take the uninstall branch.
     #[test]
