@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- The X11 backend no longer reads a dead glass helper thread as the X server failing: a reader that unwinds is reported with what it carried (and is not retried against a fresh server), the ask-to-close timeout names glass's own dead ask thread instead of the server, and the displayfd reader's thread is fallible, so a host that refuses it names the thread limit.
 - Linux: a deep `glass doctor` probe no longer leaves a stuck thread and an open pipe behind for
   the rest of the process's life. The X11 and Wayland probes each read their child's stderr on a
   helper thread, and that thread could only stop at end-of-file — which anything the probe left
