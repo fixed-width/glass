@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use glass_core::{Check, CheckStatus, GlassError};
+use glass_core::{BoundKind, Check, CheckStatus, GlassError};
 use glass_exec_unix::Resolved;
 
 use crate::device::{Resolve, SimDevice, parse_devices, resolve};
@@ -18,15 +18,58 @@ use crate::idb::companion::{CompanionFacts, INSTALL_REMEDY, IdbCompanion};
 use crate::simctl::Simctl;
 use crate::target::wants;
 
+/// What `xcode-select -p` said. The two `None`s used to share one arm (glass#457): a developer
+/// dir that does not exist, and one that cannot be read because `xcode-select` hung. The first's
+/// remedy is "install Xcode"; the second's is not — the operator may well have Xcode.
+#[derive(Debug, PartialEq, Eq)]
+pub enum XcodeDir {
+    /// `xcode-select -p` named the active developer directory.
+    Active(String),
+    /// `xcode-select -p` said there is no active developer directory.
+    Missing,
+    /// `xcode-select` started but did not answer within the budget: the tool is wedged, which is a
+    /// different diagnosis — and a different remedy — from "Xcode is not installed".
+    Unreadable(String),
+}
+
+/// What `xcrun simctl help` said. The `bool` used to fold a hang into the same `false` as a
+/// missing tool (glass#457), and the check then recommended installing Xcode to someone whose
+/// Xcode is fine but whose CoreSimulator is wedged.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SimctlState {
+    /// `xcrun simctl help` ran.
+    Available,
+    /// `xcrun simctl` did not answer: it is missing, or it ran and refused. Carries the cause.
+    Unreadable(String),
+    /// `xcrun simctl` started but was still not answering within the budget: it is wedged, not
+    /// absent — "install Xcode" is the wrong remedy for it.
+    TimedOut(String),
+}
+
+/// What `xcrun simctl list runtimes` said. A listing that ran is an answer about the installed
+/// runtimes; one that did not answer is an answer about the *host*, and the two used to collapse
+/// into the same empty list (glass#457), which then read as "no runtimes installed" — a
+/// "download the platform" remedy for an operator who has the platform.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RuntimeList {
+    /// The binary ran and reported these iOS runtimes (possibly none).
+    Listed(Vec<String>),
+    /// The listing ran to a failure, or could not be started: the runtimes cannot be listed, but
+    /// nothing timed out. Carries the cause.
+    Unreadable(String),
+    /// The binary was present (it started) but never answered within the budget: it is wedged.
+    TimedOut(String),
+}
+
 /// Observed host state for the iOS doctor checks. Captured by [`checks`], consumed by the pure
 /// [`build_checks`] so all branch logic is unit-testable without subprocesses.
 pub struct Probe<'a> {
-    /// `xcode-select -p` output: the active developer directory, if any.
-    pub xcode_dir: Option<String>,
-    /// Whether `xcrun simctl help` ran successfully.
-    pub simctl_ok: bool,
-    /// iOS runtime lines from `xcrun simctl list runtimes`.
-    pub runtimes: &'a [String],
+    /// What `xcode-select -p` said: the active directory, that there is none, or that it hung.
+    pub xcode_dir: XcodeDir,
+    /// What `xcrun simctl help` said.
+    pub simctl: SimctlState,
+    /// What `xcrun simctl list runtimes` said.
+    pub runtimes: RuntimeList,
     /// What the device listing said about the target glass would drive.
     pub target: &'a TargetFacts,
 }
@@ -73,45 +116,88 @@ fn build_checks(p: &Probe) -> Vec<Check> {
 
 fn xcode_check(p: &Probe) -> Check {
     match &p.xcode_dir {
-        Some(dir) if dir.contains("Xcode.app") => Check::new(
+        XcodeDir::Active(dir) if dir.contains("Xcode.app") => Check::new(
             "xcode",
             CheckStatus::Ok,
             format!("active developer dir: {dir}"),
         ),
-        Some(dir) => Check::new(
+        XcodeDir::Active(dir) => Check::new(
             "xcode",
             CheckStatus::Fail,
             format!("active developer dir is Command Line Tools only: {dir}"),
         )
         .with_remedy(INSTALL_XCODE_REMEDY),
-        None => Check::new("xcode", CheckStatus::Fail, "no active developer directory")
+        XcodeDir::Missing => Check::new("xcode", CheckStatus::Fail, "no active developer directory")
             .with_remedy("install Xcode from the App Store"),
+        // `xcode-select` started but could not answer: the developer dir may well be fine, so this
+        // is a "couldn't read" finding (Warn), not an "install Xcode" one — the wrong remedy the
+        // old `None` handed out (glass#457).
+        XcodeDir::Unreadable(cause) => Check::new(
+            "xcode",
+            CheckStatus::Warn,
+            format!("could not read the active developer directory: {cause}"),
+        )
+        .with_remedy(
+            "run `xcode-select -p` by hand: a developer dir that hangs to read usually needs a repair",
+        ),
     }
 }
 
 fn simctl_check(p: &Probe) -> Check {
-    if p.simctl_ok {
-        Check::new("simctl", CheckStatus::Ok, "xcrun simctl is available")
-    } else {
-        Check::new("simctl", CheckStatus::Fail, "xcrun simctl is unavailable")
-            .with_remedy(INSTALL_XCODE_REMEDY)
+    match &p.simctl {
+        SimctlState::Available => {
+            Check::new("simctl", CheckStatus::Ok, "xcrun simctl is available")
+        }
+        // A hang is not "unavailable": `xcrun simctl` may be perfectly present but wedged, and the
+        // old `bool` told such a host to install Xcode (glass#457).
+        SimctlState::TimedOut(cause) => Check::new(
+            "simctl",
+            CheckStatus::Warn,
+            format!("`xcrun simctl` did not answer `help`: {cause}"),
+        )
+        .with_remedy(
+            "run `xcrun simctl help` by hand: a simctl that hangs usually needs its simulator \
+             runtime or a `xcrun simctl shutdown` fix",
+        ),
+        SimctlState::Unreadable(cause) => Check::new(
+            "simctl",
+            CheckStatus::Fail,
+            format!("xcrun simctl is unavailable: {cause}"),
+        )
+        .with_remedy(INSTALL_XCODE_REMEDY),
     }
 }
 
 fn runtime_check(p: &Probe) -> Check {
-    if p.runtimes.is_empty() {
-        Check::new(
+    match &p.runtimes {
+        // A listing that ran and found nothing is a real "no runtime" finding; one that did not
+        // answer is a host problem, not a missing download (glass#457).
+        RuntimeList::Listed(runtimes) if runtimes.is_empty() => Check::new(
             "runtime",
             CheckStatus::Fail,
             "no iOS simulator runtime installed",
         )
-        .with_remedy("download one with `xcodebuild -downloadPlatform iOS`")
-    } else {
-        Check::new(
+        .with_remedy("download one with `xcodebuild -downloadPlatform iOS`"),
+        RuntimeList::Listed(runtimes) => Check::new(
             "runtime",
             CheckStatus::Ok,
-            format!("iOS runtimes: {}", p.runtimes.join(", ")),
+            format!("iOS runtimes: {}", runtimes.join(", ")),
+        ),
+        RuntimeList::TimedOut(cause) => Check::new(
+            "runtime",
+            CheckStatus::Warn,
+            format!("`xcrun simctl list runtimes` did not answer: {cause}"),
         )
+        .with_remedy(
+            "run `xcrun simctl list runtimes` by hand: a listing that hangs points at a wedged \
+             simulator runtime, not a missing one",
+        ),
+        RuntimeList::Unreadable(cause) => Check::new(
+            "runtime",
+            CheckStatus::Warn,
+            format!("could not list iOS runtimes: {cause}"),
+        )
+        .with_remedy("run `xcrun simctl list runtimes` by hand to see why it could not be read"),
     }
 }
 
@@ -183,50 +269,140 @@ fn device_check(p: &Probe) -> Check {
 /// probe here is a fast query; a tool that does not answer in this long is itself the finding.
 const PROBE_BUDGET: Duration = Duration::from_secs(10);
 
+/// The outcome of one bounded one-shot probe, kept as a trichotomy so a hang is never folded into
+/// the "missing tool" value (glass#457). `Answered` is any run to completion — the exit status is
+/// the caller's to read; `TimedOut` is a tool that started and was still not answering; `Failed`
+/// is everything else (could not start, or a non-timeout error).
+enum Run {
+    Answered {
+        status_ok: bool,
+        stdout: String,
+        stderr: String,
+    },
+    Failed(String),
+    TimedOut(String),
+}
+
+/// One bounded one-shot probe. Errors are logged the way the doctor logged them before; the
+/// report now carries the cause too, so this is for a reader of stderr, not the fix.
+fn run_probe(cmd: &mut Command, op: &str) -> Run {
+    match glass_core::run_bounded(cmd, PROBE_BUDGET, op) {
+        Ok(o) => Run::Answered {
+            status_ok: o.status.success(),
+            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        },
+        Err(e) => {
+            let cause = e.to_string();
+            eprintln!("glass-ios doctor: {cause}");
+            if e.bound() == Some(BoundKind::TimedOut) {
+                Run::TimedOut(cause)
+            } else {
+                Run::Failed(cause)
+            }
+        }
+    }
+}
+
+/// The trimmed stderr of a run, or a fixed phrase when it was empty — the line to show for a
+/// command that ran but did not succeed.
+fn failed_note(stderr: &str, fallback: &str) -> String {
+    let t = stderr.trim();
+    if t.is_empty() {
+        fallback.to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 /// Build the iOS doctor checks by probing the host with real `xcrun`/`xcode-select`
 /// calls. Best-effort: a missing tool simply makes the corresponding check report
-/// not-ok with a remedy, rather than failing this function. `_deep` is accepted for
-/// signature parity with the other backends' doctors; iOS's only deep probe is
-/// [`companion_check`].
+/// not-ok with a remedy, rather than failing this function. A tool that *hangs* is its own
+/// finding — kept out of the missing-tool value and given its own remedy (glass#457).
+/// `_deep` is accepted for signature parity with the other backends' doctors; iOS's only deep
+/// probe is [`companion_check`].
 pub fn checks(_deep: bool) -> Vec<Check> {
     // Bounded like every other one-shot: doctor's job is to report, and a doctor that hangs on a
-    // wedged tool reports nothing at all. A timeout lands in the same `None` as a missing tool,
-    // so the check still says not-ok with its remedy.
+    // wedged tool reports nothing at all. A timeout is kept out of the "missing" value: it is
+    // reported as its own finding with its own remedy.
     let mut xcode_select = Command::new("xcode-select");
     xcode_select.arg("-p");
-    let xcode_dir = glass_core::run_bounded(&mut xcode_select, PROBE_BUDGET, "xcode-select:-p")
-        .inspect_err(|e| eprintln!("glass-ios doctor: {e}"))
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-
-    // Labelled per probe, not "doctor probe": a timeout has to say whether `help`, `list runtimes`
-    // or `list devices` hung. The error is logged rather than dropped, because `.ok()` folds a
-    // timeout into the same `None` as a missing tool, and the resulting check then recommends
-    // installing Xcode to someone whose Xcode is fine but whose CoreSimulator is wedged.
-    let simctl_out = |args: &[&str]| {
-        let mut cmd = Command::new("xcrun");
-        cmd.args(args);
-        glass_core::run_bounded(&mut cmd, PROBE_BUDGET, &format!("xcrun:{}", args.join(" ")))
-            .inspect_err(|e| eprintln!("glass-ios doctor: {e}"))
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    let xcode_dir = match run_probe(&mut xcode_select, "xcode-select:-p") {
+        Run::Answered {
+            status_ok: true,
+            stdout,
+            ..
+        } => XcodeDir::Active(stdout.trim().to_string()),
+        Run::Answered {
+            status_ok: false, ..
+        } => XcodeDir::Missing,
+        Run::TimedOut(cause) | Run::Failed(cause) => XcodeDir::Unreadable(cause),
     };
 
-    let simctl_ok = simctl_out(&["simctl", "help"]).is_some();
-    let runtimes: Vec<String> = simctl_out(&["simctl", "list", "runtimes"])
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| l.contains("iOS"))
-        .map(|l| l.trim().to_string())
-        .collect();
-    let target = gather_target(&simctl_out, &|k| std::env::var(k).ok());
+    // `xcrun simctl <args>` as a trichotomy. A non-zero exit (the "only the Command Line Tools
+    // are installed" case) is a real answer about the tool; a hang is not, and the two used to
+    // share one value. `gather_target` keeps the thin `Option<String>` view: a failed device
+    // listing is already its own `TargetFacts::Unknown` arm, which the device check renders with a
+    // "check it parses" remedy rather than an install one.
+    let xcrun = |args: &[&str]| {
+        let mut cmd = Command::new("xcrun");
+        cmd.args(args);
+        run_probe(&mut cmd, &format!("xcrun:{}", args.join(" ")))
+    };
+    let simctl = match xcrun(&["simctl", "help"]) {
+        Run::Answered {
+            status_ok: true, ..
+        } => SimctlState::Available,
+        Run::Answered {
+            status_ok: false,
+            stderr,
+            ..
+        } => SimctlState::Unreadable(failed_note(&stderr, "xcrun simctl did not succeed")),
+        Run::TimedOut(cause) => SimctlState::TimedOut(cause),
+        Run::Failed(cause) => SimctlState::Unreadable(cause),
+    };
+    let runtimes = match xcrun(&["simctl", "list", "runtimes"]) {
+        Run::Answered {
+            status_ok: true,
+            stdout,
+            ..
+        } => RuntimeList::Listed(
+            stdout
+                .lines()
+                .filter(|l| l.contains("iOS"))
+                .map(|l| l.trim().to_string())
+                .collect(),
+        ),
+        Run::Answered {
+            status_ok: false,
+            stderr,
+            ..
+        } => RuntimeList::Unreadable(failed_note(
+            &stderr,
+            "xcrun simctl list runtimes did not succeed",
+        )),
+        Run::TimedOut(cause) => RuntimeList::TimedOut(cause),
+        Run::Failed(cause) => RuntimeList::Unreadable(cause),
+    };
+
+    let simctl_opt = |args: &[&str]| match xcrun(args) {
+        Run::Answered {
+            status_ok: true,
+            stdout,
+            ..
+        } => Some(stdout),
+        Run::Answered {
+            status_ok: false, ..
+        }
+        | Run::TimedOut(_)
+        | Run::Failed(_) => None,
+    };
+    let target = gather_target(&simctl_opt, &|k| std::env::var(k).ok());
 
     build_checks(&Probe {
         xcode_dir,
-        simctl_ok,
-        runtimes: &runtimes,
+        simctl,
+        runtimes,
         target: &target,
     })
 }
@@ -598,11 +774,10 @@ mod tests {
     }
 
     fn device_line(target: &TargetFacts) -> Check {
-        let runtimes = vec!["iOS 26.5".to_string()];
         let p = Probe {
-            xcode_dir: Some("/Applications/Xcode.app/Contents/Developer".into()),
-            simctl_ok: true,
-            runtimes: &runtimes,
+            xcode_dir: XcodeDir::Active("/Applications/Xcode.app/Contents/Developer".into()),
+            simctl: SimctlState::Available,
+            runtimes: RuntimeList::Listed(vec!["iOS 26.5".to_string()]),
             target,
         };
         build_checks(&p)
@@ -857,11 +1032,10 @@ mod tests {
 
     #[test]
     fn all_green_when_fully_configured() {
-        let runtimes = vec!["iOS 26.5".to_string()];
         let p = Probe {
-            xcode_dir: Some("/Applications/Xcode.app/Contents/Developer".into()),
-            simctl_ok: true,
-            runtimes: &runtimes,
+            xcode_dir: XcodeDir::Active("/Applications/Xcode.app/Contents/Developer".into()),
+            simctl: SimctlState::Available,
+            runtimes: RuntimeList::Listed(vec!["iOS 26.5".to_string()]),
             target: &TargetFacts::Attaching {
                 name: "iPhone 17".into(),
                 available: 1,
@@ -874,9 +1048,9 @@ mod tests {
     #[test]
     fn flags_command_line_tools_only() {
         let p = Probe {
-            xcode_dir: Some("/Library/Developer/CommandLineTools".into()),
-            simctl_ok: false,
-            runtimes: &[],
+            xcode_dir: XcodeDir::Active("/Library/Developer/CommandLineTools".into()),
+            simctl: SimctlState::Unreadable("xcrun simctl did not succeed".into()),
+            runtimes: RuntimeList::Unreadable("xcrun simctl did not succeed".into()),
             target: &TargetFacts::Unresolvable {
                 why: "no available iPhone simulator found".into(),
                 named: false,
@@ -901,9 +1075,9 @@ mod tests {
     #[test]
     fn no_active_developer_directory_fails_with_install_xcode_remedy() {
         let p = Probe {
-            xcode_dir: None,
-            simctl_ok: false,
-            runtimes: &[],
+            xcode_dir: XcodeDir::Missing,
+            simctl: SimctlState::Unreadable("xcrun simctl did not succeed".into()),
+            runtimes: RuntimeList::Unreadable("xcrun simctl did not succeed".into()),
             target: &TargetFacts::Unresolvable {
                 why: "no available iPhone simulator found".into(),
                 named: false,
@@ -922,9 +1096,9 @@ mod tests {
     #[test]
     fn flags_missing_runtime_and_device() {
         let p = Probe {
-            xcode_dir: Some("/Applications/Xcode.app/Contents/Developer".into()),
-            simctl_ok: true,
-            runtimes: &[],
+            xcode_dir: XcodeDir::Active("/Applications/Xcode.app/Contents/Developer".into()),
+            simctl: SimctlState::Available,
+            runtimes: RuntimeList::Listed(vec![]),
             target: &TargetFacts::Unresolvable {
                 why: "no available iPhone simulator found".into(),
                 named: false,
@@ -938,6 +1112,66 @@ mod tests {
         assert_eq!(
             cs.iter().find(|c| c.name == "device").unwrap().status,
             CheckStatus::Fail
+        );
+    }
+
+    /// The regression glass#457 pins: an `xcrun simctl` that started and then hung is not reported
+    /// as one that is unavailable. The old `bool` folded the hang into `false` and the check told
+    /// a host with a fine Xcode to install it.
+    #[test]
+    fn a_wedged_simctl_is_not_reported_as_unavailable() {
+        let p = Probe {
+            xcode_dir: XcodeDir::Active("/Applications/Xcode.app/Contents/Developer".into()),
+            simctl: SimctlState::TimedOut("xcrun:simctl help: no answer within 10s".into()),
+            runtimes: RuntimeList::Listed(vec!["iOS 26.5".to_string()]),
+            target: &TargetFacts::Attaching {
+                name: "iPhone 17".into(),
+                available: 1,
+            },
+        };
+        let c = build_checks(&p)
+            .into_iter()
+            .find(|c| c.name == "simctl")
+            .unwrap();
+        assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+        assert!(c.detail.contains("did not answer"), "{}", c.detail);
+        assert!(
+            !c.remedy.as_deref().unwrap().contains("install"),
+            "a wedged simctl must not be told to install Xcode: {:?}",
+            c.remedy
+        );
+    }
+
+    /// The same regression on the other two probes: a hung `xcode-select -p` and a hung runtime
+    /// listing are "couldn't read" findings, not "install"/"download" ones.
+    #[test]
+    fn a_wedged_xcode_select_and_runtime_listing_are_not_install_findings() {
+        let p = Probe {
+            xcode_dir: XcodeDir::Unreadable("xcode-select:-p: no answer within 10s".into()),
+            simctl: SimctlState::Available,
+            runtimes: RuntimeList::TimedOut(
+                "xcrun:simctl list runtimes: no answer within 10s".into(),
+            ),
+            target: &TargetFacts::Attaching {
+                name: "iPhone 17".into(),
+                available: 1,
+            },
+        };
+        let cs = build_checks(&p);
+        let xcode = cs.iter().find(|c| c.name == "xcode").unwrap();
+        assert_eq!(xcode.status, CheckStatus::Warn, "{xcode:?}");
+        assert!(xcode.detail.contains("could not read"), "{}", xcode.detail);
+        assert!(
+            !xcode.remedy.as_deref().unwrap().contains("install"),
+            "{:?}",
+            xcode.remedy
+        );
+        let runtime = cs.iter().find(|c| c.name == "runtime").unwrap();
+        assert_eq!(runtime.status, CheckStatus::Warn, "{runtime:?}");
+        assert!(
+            runtime.detail.contains("did not answer"),
+            "{}",
+            runtime.detail
         );
     }
 

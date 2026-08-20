@@ -33,9 +33,9 @@ struct Probe {
     adb_version: Option<String>,
     /// Resolved emulator path (`GLASS_EMULATOR`/SDK root/`"emulator"`).
     emulator_bin: String,
-    /// AVDs from `emulator -list-avds`; `None` when the binary is absent/failed,
-    /// `Some(vec![])` when it ran but found none.
-    avds: Option<Vec<String>>,
+    /// What `emulator -list-avds` said: the parsed AVDs, or that it could not be read at all,
+    /// or that it never answered — the two `None`s used to share one arm (glass#457).
+    avds: AvdList,
     /// Serials with `adb devices` state `"device"` (online), for display.
     online: Vec<String>,
     /// What `glass_start` would do with these devices — the runtime's own
@@ -198,27 +198,51 @@ fn probe_with(
     }
 }
 
+/// What `emulator -list-avds` said. A listing that ran is an answer about the emulator; a
+/// listing that timed out or failed to start is an answer about the *host*, and the two used
+/// to collapse into the same `None` as "no AVDs" (glass#457): an emulator present but wedged
+/// then read as "binary not found", and the remedy said install what the operator has.
+#[derive(Debug, PartialEq, Eq)]
+enum AvdList {
+    /// The binary ran and reported these AVDs (possibly none).
+    Listed(Vec<String>),
+    /// The listing ran to an answer, or at least to a non-timeout failure: the emulator is not
+    /// in a usable state, but nothing timed out. Carries the cause.
+    Unreadable(String),
+    /// The binary was present (it started) but never answered within the budget: it is wedged,
+    /// which is a different diagnosis — and a different remedy — from "not installed".
+    TimedOut(String),
+}
+
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_string()
 }
 
-/// `<bin> -list-avds`: `None` when the binary could not be run to an answer, else the parsed names.
+/// `<bin> -list-avds`, with the outcomes that used to share `None` kept apart (glass#457).
 ///
-/// Bounded like the boot path's copy of this call: a doctor that hangs on a wedged tool reports
-/// nothing at all, which is the one thing it must never do. A timeout still collapses into the same
-/// `None` as an absent binary — the caller renders that as "not found", which is then the wrong
-/// remedy — so it is logged, the way the iOS doctor logs its probes.
-fn list_avds(bin: &str) -> Option<Vec<String>> {
+/// Bounded like the boot path's copy of this call: a doctor that hangs on a wedged tool
+/// reports nothing at all, which is the one thing it must never do.
+fn list_avds(bin: &str) -> AvdList {
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("-list-avds");
-    glass_core::run_bounded(
+    match glass_core::run_bounded(
         &mut cmd,
         crate::avd::EMULATOR_LIST_BUDGET,
         "emulator:-list-avds",
-    )
-    .inspect_err(|e| eprintln!("glass-android doctor: {e}"))
-    .ok()
-    .map(|o| parse_list_avds(&String::from_utf8_lossy(&o.stdout)))
+    ) {
+        Ok(o) => AvdList::Listed(parse_list_avds(&String::from_utf8_lossy(&o.stdout))),
+        Err(e) => {
+            // A timeout is "present and wedged" — reported as such, nothing to log: the detail
+            // carries the budget. Every other failure (spawn refused, the binary exited, the
+            // OS said no) is "unusable" without claiming it hung, and is logged the way the
+            // other doctor probes are.
+            if e.bound() == Some(glass_core::BoundKind::TimedOut) {
+                return AvdList::TimedOut(e.to_string());
+            }
+            eprintln!("glass-android doctor: {e}");
+            AvdList::Unreadable(e.to_string())
+        }
+    }
 }
 
 /// Deep probe one online device: capture a frame (validated via the real decoder) and
@@ -402,7 +426,7 @@ fn device_check(p: &Probe) -> Check {
             format!("{} online; glass will use {serial}", p.online.len()),
         ),
         Action::Boot => {
-            if matches!(&p.avds, Some(avds) if !avds.is_empty()) {
+            if matches!(&p.avds, AvdList::Listed(avds) if !avds.is_empty()) {
                 Check::new(
                     "device",
                     CheckStatus::Warn,
@@ -423,16 +447,29 @@ fn device_check(p: &Probe) -> Check {
 
 fn emulator_check(p: &Probe) -> Check {
     match &p.avds {
-        None => Check::new(
+        // A listing that never answered is a different finding from one that could not be run:
+        // the binary exists and started, so the remedy is to check that, not to install it
+        // (glass#457).
+        AvdList::TimedOut(cause) => Check::new(
             "emulator",
             CheckStatus::Warn,
             format!(
-                "emulator binary not found ({}); attach still works, but glass can't boot an AVD",
-                p.emulator_bin
+                "{} started but did not answer `emulator -list-avds` ({}); glass can't tell what \
+                 AVDs are bootable",
+                p.emulator_bin, cause
             ),
         )
+        .with_remedy(
+            "run `emulator -list-avds` by hand: a binary that starts and then hangs usually needs \
+             an SDK/AVD fix, not a reinstall",
+        ),
+        AvdList::Unreadable(cause) => Check::new(
+            "emulator",
+            CheckStatus::Warn,
+            format!("{} could not be listed ({cause}); attach still works, but glass can't boot an AVD", p.emulator_bin),
+        )
         .with_remedy("install the Android emulator at a standard SDK location (auto-found), or set GLASS_EMULATOR / ANDROID_SDK_ROOT"),
-        Some(avds) if avds.is_empty() => Check::new(
+        AvdList::Listed(avds) if avds.is_empty() => Check::new(
             "emulator",
             CheckStatus::Warn,
             format!("{}: no AVDs listed; glass can't boot one", p.emulator_bin),
@@ -440,7 +477,7 @@ fn emulator_check(p: &Probe) -> Check {
         .with_remedy(
             "create an AVD (e.g. `avdmanager create avd`); if you expected existing AVDs, check the emulator install",
         ),
-        Some(avds) => Check::new(
+        AvdList::Listed(avds) => Check::new(
             "emulator",
             CheckStatus::Ok,
             format!("{} ({} AVD(s): {})", p.emulator_bin, avds.len(), avds.join(", ")),
@@ -481,7 +518,7 @@ mod tests {
             ],
             adb_version: Some("Android Debug Bridge version 1.0.41".into()),
             emulator_bin: "/sdk/emulator/emulator".into(),
-            avds: Some(vec!["glass".into()]),
+            avds: AvdList::Listed(vec!["glass".into()]),
             online: vec!["emulator-5554".into()],
             selection: Action::Attach("emulator-5554".into()),
             deep_requested: false,
@@ -646,11 +683,15 @@ mod tests {
 
         assert_eq!(
             list_avds(&emulator.to_string_lossy()),
-            Some(vec!["Pixel_6".to_string(), "glass".to_string()])
+            AvdList::Listed(vec!["Pixel_6".to_string(), "glass".to_string()])
         );
         // A binary that cannot be run answers nothing, which is not the same as a device with no
-        // AVDs — the remedy the caller is given differs.
-        assert_eq!(list_avds("/nonexistent/emulator"), None);
+        // AVDs — the remedy the caller is given differs. A spawn failure (no bound) lands in
+        // `Unreadable`, not in the arm a wedged binary would use.
+        assert!(matches!(
+            list_avds("/nonexistent/emulator"),
+            AvdList::Unreadable(_)
+        ));
     }
 
     #[test]
@@ -793,18 +834,37 @@ mod tests {
     #[test]
     fn emulator_binary_absent_is_warn() {
         let mut p = base_probe();
-        p.avds = None;
+        p.avds = AvdList::Unreadable("spawn failed: No such file or directory".into());
         let e = build_checks(&p);
         let e = find(&e, "emulator");
         assert_eq!(e.status, CheckStatus::Warn);
-        assert!(e.detail.contains("emulator binary not found"));
+        assert!(e.detail.contains("could not be listed"));
         assert!(e.remedy.as_deref().unwrap().contains("ANDROID_SDK_ROOT"));
+    }
+
+    /// The regression glass#457 pins: an emulator that started and then hung is not reported as
+    /// one that is not installed — the remedy for a wedged binary is to check it, not to install
+    /// it.
+    #[test]
+    fn a_wedged_emulator_is_not_reported_as_absent() {
+        let mut p = base_probe();
+        p.avds = AvdList::TimedOut("emulator:-list-avds: killed after 5s".into());
+        let e = build_checks(&p);
+        let e = find(&e, "emulator");
+        assert_eq!(e.status, CheckStatus::Warn);
+        assert!(e.detail.contains("did not answer"), "{}", e.detail);
+        assert!(!e.detail.contains("could not be listed"), "{}", e.detail);
+        assert!(
+            !e.remedy.as_deref().unwrap().contains("ANDROID_SDK_ROOT"),
+            "a wedged binary must not be told to install: {:?}",
+            e.remedy
+        );
     }
 
     #[test]
     fn emulator_no_avds_is_warn() {
         let mut p = base_probe();
-        p.avds = Some(vec![]);
+        p.avds = AvdList::Listed(vec![]);
         let e = build_checks(&p);
         let e = find(&e, "emulator");
         assert_eq!(e.status, CheckStatus::Warn);
@@ -879,7 +939,7 @@ mod tests {
         let mut p = base_probe();
         p.online = vec![];
         p.selection = decide(&[], None, Lifecycle::Auto); // would boot...
-        p.avds = Some(vec![]); // ...but emulator ran with no AVDs => cannot boot
+        p.avds = AvdList::Listed(vec![]); // ...but emulator ran with no AVDs => cannot boot
         let d = build_checks(&p);
         let d = find(&d, "device");
         assert_eq!(d.status, CheckStatus::Fail);
@@ -891,7 +951,7 @@ mod tests {
         let mut p = base_probe();
         p.online = vec![];
         p.selection = decide(&[], None, Lifecycle::Auto); // would boot...
-        p.avds = None; // ...but the emulator binary is absent => cannot boot
+        p.avds = AvdList::Unreadable("spawn failed: No such file or directory".into()); // ...but the emulator binary is absent => cannot boot
         let d = build_checks(&p);
         let d = find(&d, "device");
         assert_eq!(d.status, CheckStatus::Fail);
