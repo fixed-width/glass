@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use glass_core::{Check, CheckStatus, ProbeFailure};
 use glass_exec_unix::{Resolved, resolve_bin};
+use x11rb::connect;
 use x11rb::errors::ConnectError;
 
 use crate::xvfb::Xvfb;
@@ -47,7 +48,7 @@ enum Mode<'a> {
     /// `GLASS_DISPLAY` names a display; the only question is whether glass can attach to it.
     Attach {
         display: &'a str,
-        verdict: Result<(), NoAttach>,
+        verdict: AttachVerdict,
     },
     /// No `GLASS_DISPLAY`: glass starts its own Xvfb, which must be present and — on a deep
     /// check — provably startable.
@@ -73,17 +74,26 @@ fn x11_checks(mode: &Mode) -> Vec<Check> {
             checks
         }
         Mode::Attach { display, verdict } => vec![match verdict {
-            Ok(()) => Check::new(
+            AttachVerdict::Answered(Ok(())) => Check::new(
                 "GLASS_DISPLAY",
                 CheckStatus::Ok,
                 format!("{display} — reachable; glass will attach to it"),
             ),
-            Err(no) => Check::new(
+            AttachVerdict::Answered(Err(no)) => Check::new(
                 "GLASS_DISPLAY",
                 CheckStatus::Fail,
                 format!("{display} — {}", no.cause),
             )
             .with_remedy(no.remedy),
+            // A server that accepts and goes silent is not "unreachable" — nothing to start — and
+            // attaching to it would hang, so the check fails rather than passes: glass cannot
+            // reach a usable session on this display. (glass#462)
+            AttachVerdict::TimedOut(budget) => Check::new(
+                "GLASS_DISPLAY",
+                CheckStatus::Fail,
+                format!("{display} — the server accepted the connection but did not answer within {budget:?}"),
+            )
+            .with_remedy(ATTACH_WEDGED),
         }],
     }
 }
@@ -168,12 +178,62 @@ const NAME_A_DISPLAY: &str = "GLASS_DISPLAY names a local display — `:42`, bar
 const PICK_A_SCREEN: &str = "name a screen that server has — the `.N` suffix, e.g. `:42.0` (most \
      servers have only screen 0) — or unset GLASS_DISPLAY to self-spawn";
 
-/// Whether glass can attach to `display`, and when it cannot, why — in the terms the remedy turns
-/// on. The connection is closed again at once.
-fn attach_verdict(display: &str) -> Result<(), NoAttach> {
-    x11rb::connect(Some(display))
-        .map(|_| ())
-        .map_err(|e| no_attach(&e))
+/// What the attach probe learned about the display `GLASS_DISPLAY` names. The connect used to be
+/// unbounded (glass#462): a server that accepts and never sends its setup reply blocked the
+/// doctor with no check, no section, and no way to say which probe was stuck. `Answered` is the
+/// real handshake outcome; `TimedOut` is the server that accepts and goes silent.
+#[derive(Debug)]
+enum AttachVerdict {
+    /// `x11rb::connect` returned a connection or a refusal.
+    Answered(Result<(), NoAttach>),
+    /// The server accepted (or the connect hung elsewhere) and had not answered within the
+    /// budget. Carries the budget it waited.
+    TimedOut(Duration),
+}
+
+/// How long the attach probe waits. A one-shot like the other doctor probes; a connect that
+/// takes longer than `run_bounded`'s `PROBE_BUDGET` on the Android and iOS doctors is itself the
+/// finding, and 10s matches the connect timeouts elsewhere in glass (idb, the release check).
+const ATTACH_PROBE_BUDGET: Duration = Duration::from_secs(10);
+
+/// The remedy for a server that accepted and went silent: there is nothing to start, so the
+/// advice is to inspect it rather than to start it. The budget the check waited is in the detail.
+const ATTACH_WEDGED: &str = "a server that accepts and goes silent is not one to start — \
+     check the display with `xdpyinfo` or `xhost` by hand, and see its logs";
+
+/// Bounded `x11rb::connect`, with the outcomes kept apart the way `probe_xvfb` keeps them:
+/// a refusal is an answer, a hang is not. The connect runs on its own thread because there is
+/// no deadline inside `x11rb::connect` to interrupt — the join must not wait on the server.
+fn attach_verdict(display: &str) -> AttachVerdict {
+    let display = display.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("glass-doctor-x11-attach".into())
+        .spawn(move || {
+            let _ = tx.send(
+                connect(Some(display.as_str()))
+                    .map(|_| ())
+                    .map_err(|e| no_attach(&e)),
+            );
+        })
+        .expect("a doctor that cannot spawn its probe thread has no process");
+    await_verdict(&rx)
+}
+
+/// The bounded wait on the connect. A sender that dropped unsent is a probe thread that
+/// unwound, and arrives immediately: called a timeout it claims a wait nobody did (glass#373).
+fn await_verdict(rx: &mpsc::Receiver<Result<(), NoAttach>>) -> AttachVerdict {
+    match rx.recv_timeout(ATTACH_PROBE_BUDGET) {
+        Ok(v) => AttachVerdict::Answered(v),
+        // `Disconnected` is not a hang: the thread unwound, and the wait it never did must not be
+        // reported as one. The panic is on glass's stderr.
+        Err(mpsc::RecvTimeoutError::Disconnected) => AttachVerdict::Answered(Err(NoAttach {
+            cause: "the attach probe ended without an answer — its thread unwound".into(),
+            remedy: "the panic is on glass's stderr; a `pids` cgroup limit low enough to refuse \
+                 a thread will also do this",
+        })),
+        Err(mpsc::RecvTimeoutError::Timeout) => AttachVerdict::TimedOut(ATTACH_PROBE_BUDGET),
+    }
 }
 
 /// Classify a connect failure. What falls to the wildcard is `IoError` — nothing was listening,
@@ -315,7 +375,7 @@ mod tests {
     fn attach_reachable_is_ok_unreachable_fails() {
         let ok = x11_checks(&Mode::Attach {
             display: ":42",
-            verdict: Ok(()),
+            verdict: AttachVerdict::Answered(Ok(())),
         });
         assert_eq!(ok[0].status, CheckStatus::Ok);
         assert!(
@@ -325,7 +385,7 @@ mod tests {
 
         let bad = x11_checks(&Mode::Attach {
             display: ":42",
-            verdict: Err(no_attach(&ConnectError::UnknownError)),
+            verdict: AttachVerdict::Answered(Err(no_attach(&ConnectError::UnknownError))),
         });
         assert_eq!(bad[0].status, CheckStatus::Fail);
         assert!(bad[0].remedy.is_some());
@@ -337,7 +397,7 @@ mod tests {
     fn an_unreachable_display_carries_the_reason_into_the_detail() {
         let cs = x11_checks(&Mode::Attach {
             display: ":42",
-            verdict: Err(no_attach(&refusal("Client is not authorized"))),
+            verdict: AttachVerdict::Answered(Err(no_attach(&refusal("Client is not authorized")))),
         });
         assert!(cs[0].detail.contains(":42"), "{:?}", cs[0].detail);
         assert!(
@@ -347,17 +407,77 @@ mod tests {
         );
     }
 
+    /// The regression glass#462 pins: a server that accepts and goes silent is reported as a
+    /// hang — not as "unreachable" (there is nothing to start) and not as a pass (attaching would
+    /// hang) — and the remedy is the wedged one, not the start-the-display one.
+    #[test]
+    fn a_wedged_server_fails_the_check_and_gets_the_wedged_remedy() {
+        let cs = x11_checks(&Mode::Attach {
+            display: ":42",
+            verdict: AttachVerdict::TimedOut(ATTACH_PROBE_BUDGET),
+        });
+        assert_eq!(cs[0].status, CheckStatus::Fail);
+        assert!(cs[0].detail.contains("accepted"), "{:?}", cs[0].detail);
+        assert!(cs[0].detail.contains("10s"), "{:?}", cs[0].detail);
+        assert_eq!(
+            cs[0].remedy.as_deref(),
+            Some(ATTACH_WEDGED),
+            "a wedged server must not be told to start a display: {:?}",
+            cs[0].remedy
+        );
+        assert!(!ATTACH_WEDGED.contains(START_THE_DISPLAY), "sanity");
+    }
+
+    /// The wait passes through every connect answer it can be given: a refusal, a success, a
+    /// hang, and a probe thread that unwound. The last is not a hang — it arrives at once, and
+    /// calling it one would claim a wait nobody did (glass#373).
+    #[test]
+    fn the_attach_wait_keeps_a_refusal_a_hang_and_an_unwound_probe_apart() {
+        let (tx, rx) = mpsc::channel::<Result<(), NoAttach>>();
+        tx.send(Ok(())).expect("send");
+        assert!(matches!(
+            await_verdict(&rx),
+            AttachVerdict::Answered(Ok(()))
+        ));
+
+        let (tx, rx) = mpsc::channel::<Result<(), NoAttach>>();
+        tx.send(Err(no_attach(&ConnectError::ZeroIdMask)))
+            .expect("send");
+        assert!(matches!(
+            await_verdict(&rx),
+            AttachVerdict::Answered(Err(_))
+        ));
+
+        let (tx, rx) = mpsc::channel::<Result<(), NoAttach>>();
+        let started = std::time::Instant::now();
+        drop(tx);
+        assert!(matches!(
+            await_verdict(&rx),
+            AttachVerdict::Answered(Err(no)) if no.cause.contains("unwound")
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an unwound probe arrives at once: {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     #[ignore = "starts a real X server; needs Xvfb"]
     fn a_live_display_is_reachable_and_an_unused_number_is_not() {
         let server = Xvfb::start("640x480x24").expect("Xvfb should start");
-        assert_eq!(
-            attach_verdict(&server.display),
-            Ok(()),
+        assert!(
+            matches!(
+                attach_verdict(&server.display),
+                AttachVerdict::Answered(Ok(()))
+            ),
             "the display we just started must be reachable"
         );
         drop(server);
-        let no = attach_verdict(":9999").expect_err("an unused display number is not reachable");
+        let no = match attach_verdict(":9999") {
+            AttachVerdict::Answered(Err(no)) => no,
+            other => panic!("an unused display number is not reachable: {other:?}"),
+        };
         assert_eq!(
             no.remedy, START_THE_DISPLAY,
             "nothing is listening, so starting one is the fix: {no:?}"
