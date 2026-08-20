@@ -207,7 +207,7 @@ const ATTACH_WEDGED: &str = "a server that accepts and goes silent is not one to
 fn attach_verdict(display: &str) -> AttachVerdict {
     let display = display.to_string();
     let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
+    let spawn = std::thread::Builder::new()
         .name("glass-doctor-x11-attach".into())
         .spawn(move || {
             let _ = tx.send(
@@ -215,9 +215,18 @@ fn attach_verdict(display: &str) -> AttachVerdict {
                     .map(|_| ())
                     .map_err(|e| no_attach(&e)),
             );
-        })
-        .expect("a doctor that cannot spawn its probe thread has no process");
-    await_verdict(&rx)
+        });
+    match spawn {
+        // The thread runs; wait on it the way the other two outcomes are waited on.
+        Ok(_handle) => await_verdict(&rx),
+        // The host refused the probe's own thread (a low `pids` cgroup limit is the usual
+        // cause). There was no connect to hang, so it is reported as an answer, not a timeout.
+        Err(e) => AttachVerdict::Answered(Err(NoAttach {
+            cause: format!("the host refused the probe's own thread, so nothing was probed: {e}"),
+            remedy: "a low `pids` cgroup limit is the usual cause; free up threads on the host, \
+                 or unset GLASS_DISPLAY to self-spawn instead",
+        })),
+    }
 }
 
 /// The bounded wait on the connect. A sender that dropped unsent is a probe thread that
