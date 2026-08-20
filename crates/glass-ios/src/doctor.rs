@@ -234,18 +234,16 @@ pub fn checks(_deep: bool) -> Vec<Check> {
 /// Outcome of the `--deep` `idb_companion` health probe (see [`probe_companion`]).
 /// `Started`/`FailedToStart` come from a real spawn against an already-booted simulator;
 /// `SelfTestOk`/`SelfTestFailed` from the bounded `--version` fallback used when none is booted.
-/// `ListingUnreadable` is the case the fallback exists to avoid being mistaken for: the device
-/// list could not be read, so whether anything is booted is unknown — reported as that, not
-/// "none booted". A binary that never resolved is not among them — [`companion_check`] answers
-/// that from the resolution, without spawning.
+/// `ListingUnreadable` reports the case the fallback exists to avoid being mistaken for;
+/// a binary that never resolved is answered from the resolution, without spawning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CompanionProbe {
     Started,
     FailedToStart(String),
     SelfTestOk,
     SelfTestFailed(String),
-    /// The device listing could not be read. Nothing was tried against a simulator, so
-    /// "no booted simulator was available" would be a claim the code never established.
+    /// The device listing could not be read: "no booted simulator was available" would be a claim
+    /// the code never established.
     ListingUnreadable(String),
 }
 
@@ -409,10 +407,8 @@ fn deep_check(bin: &Path, probe: &CompanionProbe) -> Check {
                 bin.display()
             ),
         ),
-        // The listing is the precondition the self-test fallback assumes away, so an unreadable
-        // listing must not take the self-test path: "no booted simulator was available" is a
-        // claim the probe did not establish (glass#466/#475). Warn, as the device check does for
-        // the same listing failure, with the listing as the remedy.
+        // An unreadable listing must not take the self-test path: "no booted simulator was
+        // available" is a claim the probe did not establish (glass#466/#475).
         CompanionProbe::ListingUnreadable(cause) => Check::new(
             "idb_companion",
             CheckStatus::Warn,
@@ -441,10 +437,9 @@ fn deep_check(bin: &Path, probe: &CompanionProbe) -> Check {
     }
 }
 
-/// The device listing's answer about a booted simulator: one booted, or none booted (the
-/// ordinary cold state), or the listing itself was unreadable. The last is kept distinct on
-/// purpose (glass#466/#475): a `simctl`/parse failure used to collapse into "none booted",
-/// which is a claim the probe did not establish.
+/// The device listing's answer about a booted simulator: one booted, none booted (the ordinary
+/// cold state), or the listing itself was unreadable — kept distinct on purpose (glass#466/#475),
+/// since a `simctl`/parse failure used to collapse into "none booted".
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BootedUdid {
     None,
@@ -464,8 +459,7 @@ enum ProbeAttempt {
 /// probe establish?
 ///
 /// `spawn` is consulted only when a simulator is booted; `self_test` only when the listing
-/// *answers* "nothing is booted". An unreadable listing calls neither: it reports itself,
-/// because "no booted simulator was available" is not a claim an unreadable listing supports.
+/// *answers* "nothing is booted". An unreadable listing calls neither and reports itself.
 fn companion_probe(
     listing: BootedUdid,
     spawn: impl FnOnce(&str) -> ProbeAttempt,
@@ -513,10 +507,9 @@ pub(crate) fn spawn_cause(e: GlassError) -> String {
     }
 }
 
-/// The device listing's [`BootedUdid`]: which simulator is booted, or that none is (the
-/// ordinary cold state), or that the listing itself could not be read. The last is kept
-/// distinct on purpose (glass#466/#475): a `simctl`/parse failure used to collapse into
-/// "none booted", which is a claim the probe did not establish.
+/// The device listing's [`BootedUdid`]: which simulator is booted, that none is (the ordinary
+/// cold state), or that the listing itself could not be read — kept distinct on purpose
+/// (glass#466/#475).
 fn booted_udid_state() -> BootedUdid {
     let list = match Simctl::new().run(&["list", "devices", "available", "--json"]) {
         Ok(list) => list,
@@ -1189,8 +1182,7 @@ mod tests {
     }
 
     /// The regression glass#466/#475 pins: an unreadable listing calls neither the spawn nor
-    /// the self-test, and reports itself. The self-test's "no booted simulator was available"
-    /// would be a lie here — the listing said nothing at all.
+    /// the self-test — the self-test's "no booted simulator was available" would be a lie here.
     #[test]
     fn an_unreadable_listing_is_neither_a_spawn_nor_a_self_test() {
         let p = companion_probe(
@@ -1247,8 +1239,7 @@ mod tests {
         let unverified = deep_check(bin, &CompanionProbe::SelfTestOk);
         assert_eq!(unverified.status, CheckStatus::Warn);
 
-        // An unreadable listing is a third outcome, not the self-test: the "no booted
-        // simulator was available" line is a claim an unreadable listing does not establish.
+        // An unreadable listing is a third outcome, not the self-test (glass#466/#475).
         let unreadable = deep_check(
             bin,
             &CompanionProbe::ListingUnreadable("`xcrun simctl list` failed: no xcrun here".into()),
