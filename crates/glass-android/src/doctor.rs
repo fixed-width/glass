@@ -198,23 +198,19 @@ fn probe_with(
     }
 }
 
-/// What `emulator -list-avds` said. A listing that ran is an answer about the emulator; a
-/// listing that timed out or failed to start is an answer about the *host*, and the two used
-/// to collapse into the same `None` as "no AVDs" (glass#457): an emulator present but wedged
-/// then read as "binary not found", and the remedy said install what the operator has.
+/// What `emulator -list-avds` said (glass#457): a run listing, a pre-answer failure, and a hung
+/// read are kept apart — they used to share one `None`, and a wedged emulator then read as
+/// "not found".
 #[derive(Debug, PartialEq, Eq)]
 enum AvdList {
     /// The binary ran and reported these AVDs (possibly none). A non-zero exit with an empty
-    /// answer lands here too — the emulator's own failure is in the exit code the caller does
-    /// not keep, so what is observable is the empty list, and the remedy the caller is given is
-    /// the "no AVDs" one.
+    /// answer lands here too — the caller drops `o.status`, so it reads as the "no AVDs" remedy.
     Listed(Vec<String>),
-    /// The listing failed before it could answer — the binary would not start, the OS said no,
-    /// or the call could not even be spawned: the emulator is not in a usable state, but nothing
-    /// timed out. Carries the cause.
+    /// The listing failed before it could answer — would not start, or could not spawn — but
+    /// nothing timed out. Carries the cause.
     Unreadable(String),
-    /// The binary was present (it started) but never answered within the budget: it is wedged,
-    /// which is a different diagnosis — and a different remedy — from "not installed".
+    /// The binary started but never answered within the budget — it is wedged, not "not
+    /// installed", so its remedy differs.
     TimedOut(String),
 }
 
@@ -224,18 +220,16 @@ fn first_line(s: &str) -> String {
 
 /// `<bin> -list-avds`, with the outcomes that used to share `None` kept apart (glass#457).
 ///
-/// Bounded like the boot path's copy of this call: a doctor that hangs on a wedged tool
-/// reports nothing at all, which is the one thing it must never do.
+/// Bounded like the boot path's copy: a doctor that hangs on a wedged tool reports nothing at
+/// all, which it must never do.
 fn list_avds(bin: &str, budget: std::time::Duration) -> AvdList {
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("-list-avds");
     match glass_core::run_bounded(&mut cmd, budget, "emulator:-list-avds") {
         Ok(o) => AvdList::Listed(parse_list_avds(&String::from_utf8_lossy(&o.stdout))),
         Err(e) => {
-            // A timeout is "present and wedged" — reported as such, nothing to log: the detail
-            // carries the budget. Every other failure (spawn refused, the binary exited, the
-            // OS said no) is "unusable" without claiming it hung, and is logged the way the
-            // other doctor probes are.
+            // A timeout is reported, not logged (the detail carries the budget); every other
+            // failure is logged the way the other doctor probes are.
             if e.bound() == Some(glass_core::BoundKind::TimedOut) {
                 return AvdList::TimedOut(e.to_string());
             }
@@ -447,9 +441,8 @@ fn device_check(p: &Probe) -> Check {
 
 fn emulator_check(p: &Probe) -> Check {
     match &p.avds {
-        // A listing that never answered is a different finding from one that could not be run:
-        // the binary exists and started, so the remedy is to check that, not to install it
-        // (glass#457).
+        // A listing that never answered is a different finding from one that could not be run —
+        // the remedy is to check the binary, not to install it (glass#457).
         AvdList::TimedOut(cause) => Check::new(
             "emulator",
             CheckStatus::Warn,
@@ -697,10 +690,8 @@ mod tests {
         ));
     }
 
-    /// The regression glass#457 pins, driven through the real `list_avds`: a `emulator` that
-    /// started and then hung must come out `TimedOut`, not the old "binary not found" / "no
-    /// AVDs" fold. The budget is a short one so the test costs a third of a second, not the
-    /// production 15.
+    /// The regression glass#457 pins, driven through the real `list_avds`: a hung `emulator`
+    /// comes out `TimedOut`, not the old "binary not found" / "no AVDs" fold.
     #[test]
     #[cfg(unix)]
     fn a_hanging_emulator_is_timed_out_not_unreadable() {
@@ -720,9 +711,8 @@ mod tests {
         );
     }
 
-    /// A `emulator -list-avds` that ran, said nothing, and exited non-zero: the caller keeps the
-    /// empty list, not `Unreadable` — the arm the `Listed` doc names — because the exit code is
-    /// the one thing the caller drops.
+    /// A `emulator -list-avds` that ran and exited non-zero with no list: the caller keeps the
+    /// empty list, not `Unreadable` — the exit code is the one thing it drops.
     #[test]
     #[cfg(unix)]
     fn a_non_zero_exit_with_no_list_is_the_empty_list() {
