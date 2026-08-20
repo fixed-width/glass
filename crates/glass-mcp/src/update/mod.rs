@@ -645,6 +645,26 @@ mod tests {
         assert_eq!(std::fs::read(&exe).unwrap(), b"old");
     }
 
+    /// The apply path's `latest <= current` decision (glass#447) in its non-equal shape: a
+    /// running build that is a prerelease *newer* than the latest release. The render test pins
+    /// the string; this pins the classification itself — the binary must be reported up to date
+    /// and left untouched, not downloaded (the `1.3.0` server below would 404 no asset for
+    /// `1.4.0-rc1`, so a misclassified "update" would fail the run, not just the assert).
+    #[tokio::test]
+    async fn a_prerelease_running_above_the_latest_release_is_up_to_date() {
+        if !apply_path_exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exe = install(dir.path(), b"old");
+        let asset = release::asset_name("v1.3.0").expect("supported target");
+        let server = FakeRelease::start("v1.3.0", &asset, BODY, &sidecar(&asset));
+        let src = ReleaseSource::with_base(server.base());
+        let out = run(opts(), &src, "1.4.0-rc1", &exe).await.unwrap().outcome;
+        assert!(matches!(out, Outcome::UpToDate), "{out:?}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old");
+    }
+
     /// The whole flow, end to end, against the real code path.
     #[tokio::test]
     async fn a_newer_release_replaces_the_binary() {
