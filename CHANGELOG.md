@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- On Linux, the event subscription's pump thread now spawns fallibly: a host that refuses the thread (a low `pids` limit is the ordinary way an MCP server is confined) no longer panics the caller — the session degrades to polling the tree, the fallback the caller already has.
 - Linux: a deep `glass doctor` probe no longer leaves a stuck thread and an open pipe behind for
   the rest of the process's life. The X11 and Wayland probes each read their child's stderr on a
   helper thread, and that thread could only stop at end-of-file — which anything the probe left
