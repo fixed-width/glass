@@ -1020,7 +1020,7 @@ mod tests {
         let mut p = base_probe();
         p.online = vec![];
         p.selection = decide(&[], None, Lifecycle::Auto); // would otherwise say "boot one"
-        p.avds = Some(vec!["glass".into()]); // so it is not the "no AVD" Fail either
+        p.avds = AvdList::Listed(vec!["glass".into()]); // so it is not the "no AVD" Fail either
         p.devices_listing_failed = Some("timeout: adb devices did not answer within 10s".into());
         let d = build_checks(&p);
         let d = find(&d, "device");
