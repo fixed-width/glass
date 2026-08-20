@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- The a11y bus `GetAddress` poll on Linux is bounded by a wall-clock deadline, not a sleep-sum of attempts, and its failure message reports the budget that actually governed the wait.
 - `glass-mcp update --check` no longer claims a build is "the latest release" when it is a prerelease above the latest release: that now reports "up to date", the thing the check can actually establish.
 - PATH resolution no longer treats a prefix glass cannot read as a missing binary: an unreadable directory is reported as unreadable (with its path and the fix), not swallowed as absent, so the remedy points at the permission instead of a `brew install`.
 - On Wayland, `glass doctor` finds the Mesa libraries in the host's own multiarch directories (`/usr/lib/<triplet>/…`, `/usr/lib/*/dri`, …) instead of a fixed x86 path list, so the GPU check is correct on architectures whose libraries live elsewhere.
