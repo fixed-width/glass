@@ -110,6 +110,17 @@ fn xvfb_check(xvfb: &Resolved) -> Check {
             "chmod +x {}, or point GLASS_XVFB at a runnable binary",
             p.display()
         )),
+        // Xvfb may be present, but glass could not stat it: a permission, not an install
+        // (glass#474).
+        Resolved::Unreadable(p, e) => Check::new(
+            "Xvfb",
+            CheckStatus::Fail,
+            format!(
+                "{} — could not be looked at ({e}); it may be installed where glass cannot read it",
+                p.display()
+            ),
+        )
+        .with_remedy("check that path's permissions, or point GLASS_XVFB at a readable copy"),
         Resolved::Absent => Check::new("Xvfb", CheckStatus::Fail, "not found").with_remedy(
             "install it (e.g. `apt install xvfb`), set GLASS_XVFB to its path, or set \
              GLASS_DISPLAY=:N to attach to an existing display",

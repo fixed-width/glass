@@ -57,6 +57,21 @@ impl NoCompanion {
         }
     }
 
+    /// The companion is installed, but glass could not stat the path (a prefix it cannot
+    /// traverse): a permission to fix, not a package to install (glass#474).
+    fn unreadable(p: &Path, e: &str) -> NoCompanion {
+        NoCompanion {
+            cause: format!(
+                "idb_companion at {} could not be looked at ({e}) — it may be installed where \
+                 glass cannot read it",
+                p.display()
+            ),
+            remedy: "check that path's permissions, or point GLASS_IDB_COMPANION at a readable \
+                     copy"
+                .into(),
+        }
+    }
+
     /// Another install would not be looked at while the override stands.
     fn override_names_nothing() -> NoCompanion {
         NoCompanion {
@@ -135,6 +150,9 @@ impl CompanionFacts {
         match &self.resolved {
             Resolved::Found(p) => Ok(p),
             Resolved::NotExecutable(p) => Err(NoCompanion::not_executable(p)),
+            // The companion may be installed where glass cannot stat it: a permission, not an
+            // install (glass#474).
+            Resolved::Unreadable(p, e) => Err(NoCompanion::unreadable(p, e)),
             Resolved::Absent if self.override_set => Err(NoCompanion::override_names_nothing()),
             Resolved::Absent => Err(NoCompanion::absent()),
             Resolved::NoSearchPath if self.override_set => {
@@ -161,6 +179,7 @@ fn resolve_companion_with(
         return resolve_bin(&bin, path.as_deref());
     }
     let mut first_unrunnable = None;
+    let mut first_unreadable = None;
     let mut nothing_to_search = false;
     for resolved in std::iter::once(resolve_bin(COMPANION_BIN, path.as_deref()))
         .chain(fallbacks.iter().map(|c| resolve_path(Path::new(c))))
@@ -170,19 +189,27 @@ fn resolve_companion_with(
             Resolved::NotExecutable(p) => {
                 first_unrunnable.get_or_insert(p);
             }
+            // A prefix glass could not stat (glass#474): a later runnable or
+            // present-but-unrunnable copy still outranks it.
+            Resolved::Unreadable(p, e) => {
+                first_unreadable.get_or_insert((p, e));
+            }
             // Only the `$PATH` walk can lack a search list; a fallback is one fixed path.
             Resolved::NoSearchPath => nothing_to_search = true,
             Resolved::Absent => {}
         }
     }
-    match (first_unrunnable, nothing_to_search) {
-        // A file the user can act on outranks the missing search list, and the remedy's second
-        // clause covers a copy that a `$PATH` would have found.
-        (Some(p), _) => Resolved::NotExecutable(p),
+    match (first_unrunnable, first_unreadable, nothing_to_search) {
+        // A file the user can act on outranks an unreadable prefix and the missing search list;
+        // the remedy's second clause covers a copy a `$PATH` would have found.
+        (Some(p), _, _) => Resolved::NotExecutable(p),
+        // No runnable or unrunnable file, but a prefix glass could not stat: name the permission
+        // (glass#474).
+        (None, Some((p, e)), _) => Resolved::Unreadable(p, e),
         // No `$PATH` to walk and nothing in the standard prefixes: the companion may well be
         // installed somewhere glass was never told to look (glass#373).
-        (None, true) => Resolved::NoSearchPath,
-        (None, false) => Resolved::Absent,
+        (None, None, true) => Resolved::NoSearchPath,
+        (None, None, false) => Resolved::Absent,
     }
 }
 
