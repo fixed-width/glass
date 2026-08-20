@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- `glass doctor --deep` on Android gives a uiautomator dump the remedy that fits its failure: a device that is up but not ready says "wait for it to finish booting", while a dump that cannot be resolved by waiting says the device may be wedged and to check `adb devices` — instead of both getting the boot remedy.
 - The a11y bus `GetAddress` poll on Linux is bounded by a wall-clock deadline, not a sleep-sum of attempts, and its failure message reports the budget that actually governed the wait.
 - `glass-mcp update --check` no longer claims a build is "the latest release" when it is a prerelease above the latest release: that now reports "up to date", the thing the check can actually establish.
 - PATH resolution no longer treats a prefix glass cannot read as a missing binary: an unreadable directory is reported as unreadable (with its path and the fix), not swallowed as absent, so the remedy points at the permission instead of a `brew install`.
