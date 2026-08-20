@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glass_core::{GlassError, Result};
 use glass_exec_unix::{Resolved, resolve_bin, resolve_path};
@@ -21,6 +21,15 @@ const READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// per-call bounds below don't cover the connect/proxy await, so without this a stalled
 /// at-spi bring-up can hang glass_start forever; cap it and fail loud instead.
 const A11Y_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wall-clock budget for the `org.a11y.Bus.GetAddress` poll alone, distinct from
+/// [`A11Y_RESOLVE_TIMEOUT`]: that one is the ceiling over the *whole* resolve (connect →
+/// proxy → poll), so the poll must spend a strictly smaller share or its deadline could never
+/// be reached and the outer backstop would be the thing that actually fires.
+///
+/// Each turn is a D-Bus round trip to a launcher that may be unresponsive, so a wall clock,
+/// not an attempt count — the old `0..50` sleep-sum understated the real wait.
+const A11Y_GETADDRESS_POLL_BUDGET: Duration = Duration::from_secs(5);
 
 /// A private session bus + AT-SPI registry, torn down on drop.
 pub struct PrivateBus {
@@ -539,7 +548,11 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
                     .map_err(|e| GlassError::Backend(format!("org.a11y.Bus proxy: {e}")))?;
                 let mut answered_empty = false;
                 let mut last_err: Option<String> = None;
-                for _ in 0..50 {
+                // A deadline, not an attempt count, so the old `0..50` sleep-sum's understated
+                // wait is gone and the reported budget is the one that governed the loop
+                // (glass#456).
+                let poll_deadline = Instant::now() + A11Y_GETADDRESS_POLL_BUDGET;
+                loop {
                     match proxy.get_address().await {
                         Ok(a) => match usable_address(a) {
                             Some(addr) => {
@@ -550,10 +563,14 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
                         },
                         Err(e) => last_err = Some(e.to_string()),
                     }
+                    if Instant::now() >= poll_deadline {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(GlassError::Backend(format!(
-                    "org.a11y.Bus.GetAddress did not yield an address after 5s (answered empty: {answered_empty}, last err: {last_err:?})"
+                    "org.a11y.Bus.GetAddress did not yield an address within the \
+                     {A11Y_GETADDRESS_POLL_BUDGET:?} poll budget (answered empty: {answered_empty}, last err: {last_err:?})"
                 )))
             };
             match tokio::time::timeout(A11Y_RESOLVE_TIMEOUT, resolve).await {
