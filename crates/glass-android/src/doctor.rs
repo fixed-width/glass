@@ -103,7 +103,7 @@ fn probe_with(
         .map(|s| first_line(&s))
         .filter(|s| !s.is_empty());
     let emulator_bin = resolve_emulator_bin(get, exists);
-    let avds = list_avds(&emulator_bin);
+    let avds = list_avds(&emulator_bin, crate::avd::EMULATOR_LIST_BUDGET);
 
     let online_devices: Vec<Device> = if adb_version.is_some() {
         parse_devices(&adb.run(["devices"]).unwrap_or_default())
@@ -204,10 +204,14 @@ fn probe_with(
 /// then read as "binary not found", and the remedy said install what the operator has.
 #[derive(Debug, PartialEq, Eq)]
 enum AvdList {
-    /// The binary ran and reported these AVDs (possibly none).
+    /// The binary ran and reported these AVDs (possibly none). A non-zero exit with an empty
+    /// answer lands here too — the emulator's own failure is in the exit code the caller does
+    /// not keep, so what is observable is the empty list, and the remedy the caller is given is
+    /// the "no AVDs" one.
     Listed(Vec<String>),
-    /// The listing ran to an answer, or at least to a non-timeout failure: the emulator is not
-    /// in a usable state, but nothing timed out. Carries the cause.
+    /// The listing failed before it could answer — the binary would not start, the OS said no,
+    /// or the call could not even be spawned: the emulator is not in a usable state, but nothing
+    /// timed out. Carries the cause.
     Unreadable(String),
     /// The binary was present (it started) but never answered within the budget: it is wedged,
     /// which is a different diagnosis — and a different remedy — from "not installed".
@@ -222,14 +226,10 @@ fn first_line(s: &str) -> String {
 ///
 /// Bounded like the boot path's copy of this call: a doctor that hangs on a wedged tool
 /// reports nothing at all, which is the one thing it must never do.
-fn list_avds(bin: &str) -> AvdList {
+fn list_avds(bin: &str, budget: std::time::Duration) -> AvdList {
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("-list-avds");
-    match glass_core::run_bounded(
-        &mut cmd,
-        crate::avd::EMULATOR_LIST_BUDGET,
-        "emulator:-list-avds",
-    ) {
+    match glass_core::run_bounded(&mut cmd, budget, "emulator:-list-avds") {
         Ok(o) => AvdList::Listed(parse_list_avds(&String::from_utf8_lossy(&o.stdout))),
         Err(e) => {
             // A timeout is "present and wedged" — reported as such, nothing to log: the detail
@@ -682,16 +682,63 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            list_avds(&emulator.to_string_lossy()),
+            list_avds(
+                &emulator.to_string_lossy(),
+                crate::avd::EMULATOR_LIST_BUDGET
+            ),
             AvdList::Listed(vec!["Pixel_6".to_string(), "glass".to_string()])
         );
         // A binary that cannot be run answers nothing, which is not the same as a device with no
         // AVDs — the remedy the caller is given differs. A spawn failure (no bound) lands in
         // `Unreadable`, not in the arm a wedged binary would use.
         assert!(matches!(
-            list_avds("/nonexistent/emulator"),
+            list_avds("/nonexistent/emulator", crate::avd::EMULATOR_LIST_BUDGET),
             AvdList::Unreadable(_)
         ));
+    }
+
+    /// The regression glass#457 pins, driven through the real `list_avds`: a `emulator` that
+    /// started and then hung must come out `TimedOut`, not the old "binary not found" / "no
+    /// AVDs" fold. The budget is a short one so the test costs a third of a second, not the
+    /// production 15.
+    #[test]
+    #[cfg(unix)]
+    fn a_hanging_emulator_is_timed_out_not_unreadable() {
+        use crate::adb::{Answer, FakeAdb};
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let emulator = fake.alongside(
+            "emulator",
+            "#!/bin/sh\n[ \"$1\" = --glass-probe ] && exit 0\nexec sleep 30\n",
+        );
+        let v = list_avds(
+            &emulator.to_string_lossy(),
+            std::time::Duration::from_millis(300),
+        );
+        assert!(
+            matches!(&v, AvdList::TimedOut(c) if c.contains("emulator:-list-avds")),
+            "a hang is TimedOut with the real run_bounded text, not the fabricated one: {v:?}"
+        );
+    }
+
+    /// A `emulator -list-avds` that ran, said nothing, and exited non-zero: the caller keeps the
+    /// empty list, not `Unreadable` — the arm the `Listed` doc names — because the exit code is
+    /// the one thing the caller drops.
+    #[test]
+    #[cfg(unix)]
+    fn a_non_zero_exit_with_no_list_is_the_empty_list() {
+        use crate::adb::{Answer, FakeAdb};
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let emulator = fake.alongside(
+            "emulator",
+            "#!/bin/sh\n[ \"$1\" = --glass-probe ] && exit 0\nexit 1\n",
+        );
+        assert_eq!(
+            list_avds(
+                &emulator.to_string_lossy(),
+                std::time::Duration::from_millis(500)
+            ),
+            AvdList::Listed(vec![])
+        );
     }
 
     #[test]
