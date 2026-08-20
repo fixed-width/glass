@@ -630,6 +630,68 @@ mod tests {
 
     #[test]
     #[ignore = "starts a real X server; needs Xvfb"]
+    fn an_owner_that_never_answers_is_a_timeout_not_an_empty_clipboard() {
+        // Reaching get's deadline means an owner exists and did not answer within a second; it
+        // must read as a timeout error, not as the empty string a genuinely unowned selection
+        // returns on the property == NONE branch. (glass#372)
+        let x = TestX::start();
+        let display = x.display().to_string();
+        let clipboard_atom = x.intern(b"CLIPBOARD");
+        // A separate owner connection that takes CLIPBOARD and then never services a
+        // SelectionRequest: it holds the selection and blocks, so the conversion get
+        // requests is answered by nothing until get's deadline.
+        let _owner = std::thread::Builder::new()
+            .name("silent-clip-owner".into())
+            .spawn(move || {
+                let (owner_conn, owner_screen) =
+                    x11rb::connect(Some(display.as_str())).expect("owner connect");
+                let owner_root = owner_conn.setup().roots[owner_screen].root;
+                let owner_win = owner_conn.generate_id().expect("owner generate_id");
+                owner_conn
+                    .create_window(
+                        0,
+                        owner_win,
+                        owner_root,
+                        0,
+                        0,
+                        1,
+                        1,
+                        0,
+                        WindowClass::INPUT_ONLY,
+                        0,
+                        &CreateWindowAux::default(),
+                    )
+                    .expect("owner create_window")
+                    .check()
+                    .expect("owner create_window check");
+                owner_conn
+                    .set_selection_owner(owner_win, clipboard_atom, x11rb::CURRENT_TIME)
+                    .expect("owner set_selection_owner")
+                    .check()
+                    .expect("owner set_selection_owner check");
+                owner_conn.flush().expect("owner flush");
+                // Own the selection and stay silent: block on a channel nothing sends to so
+                // the owner outlives the read without ever servicing the SelectionRequest.
+                let (_tx, rx) = std::sync::mpsc::channel::<()>();
+                let _ = rx.recv();
+            })
+            .expect("the owner thread should start");
+        // Wait until the server agrees the selection is owned, so what get's deadline meets is
+        // the owner's silence, not a read that raced the ownership transfer.
+        assert!(
+            eventually(Duration::from_secs(5), || x.clipboard_owner()
+                != x11rb::NONE),
+            "the silent owner never took the selection"
+        );
+        let err = get(x.display()).expect_err("a silent owner is a timeout, not an empty read");
+        assert!(
+            err.to_string().contains("did not respond"),
+            "the timeout must name that the owner did not respond: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn repeated_reads_leave_no_windows_behind() {
         // Each read creates a temporary window to receive the SelectionNotify on. An agent
         // polls the clipboard, so one leaked window per read accumulates for the session.
