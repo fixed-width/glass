@@ -24,10 +24,11 @@ const A11Y_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Wall-clock budget for the `org.a11y.Bus.GetAddress` poll alone, distinct from
 /// [`A11Y_RESOLVE_TIMEOUT`]: that one is the ceiling over the *whole* resolve (connect →
-/// proxy → poll combined), so the poll must spend a strictly smaller share or its deadline
-/// could never be reached and the outer backstop would be the thing that actually fires.
-/// Each turn is a D-Bus round trip to a launcher that may be unresponsive, so this is a wall
-/// clock, not an attempt count — the old `0..50` sleep-sum understated the real wait.
+/// proxy → poll), so the poll must spend a strictly smaller share or its deadline could never
+/// be reached and the outer backstop would be the thing that actually fires.
+///
+/// Each turn is a D-Bus round trip to a launcher that may be unresponsive, so a wall clock,
+/// not an attempt count — the old `0..50` sleep-sum understated the real wait.
 const A11Y_GETADDRESS_POLL_BUDGET: Duration = Duration::from_secs(5);
 
 /// A private session bus + AT-SPI registry, torn down on drop.
@@ -521,12 +522,9 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
                     .map_err(|e| GlassError::Backend(format!("org.a11y.Bus proxy: {e}")))?;
                 let mut answered_empty = false;
                 let mut last_err: Option<String> = None;
-                // A deadline, not an attempt count: each turn is a D-Bus round trip to a
-                // launcher that may by then be unresponsive, so the old `0..50` sleep-sum
-                // understated the real wait and the message reported a budget the loop never
-                // actually used (glass#456). Bound by a wall clock and report the budget that
-                // governed it. This poll spends `A11Y_GETADDRESS_POLL_BUDGET`, strictly less
-                // than the whole-resolve ceiling, so its own deadline can fire.
+                // A deadline, not an attempt count, so the old `0..50` sleep-sum's understated
+                // wait is gone and the reported budget is the one that governed the loop
+                // (glass#456).
                 let poll_deadline = Instant::now() + A11Y_GETADDRESS_POLL_BUDGET;
                 loop {
                     match proxy.get_address().await {
