@@ -38,6 +38,12 @@ struct Probe {
     avds: AvdList,
     /// Serials with `adb devices` state `"device"` (online), for display.
     online: Vec<String>,
+    /// The reason `adb devices` failed to read, when it did — `Some` when the listing errored
+    /// (a spawn failure, a non-zero exit, or a timeout) rather than the empty list an
+    /// "no devices attached" host produces. When set, `online` is empty for a reason the
+    /// operator cannot follow, so the device check says so instead of prescribing a boot
+    /// (glass#460).
+    devices_listing_failed: Option<String>,
     /// What `glass_start` would do with these devices — the runtime's own
     /// `decide(online, GLASS_ANDROID_SERIAL, GLASS_ANDROID_LIFECYCLE)` verdict, so the
     /// doctor matches the real backend (attach a serial / boot / refuse) by construction.
@@ -105,14 +111,23 @@ fn probe_with(
     let emulator_bin = resolve_emulator_bin(get, exists);
     let avds = list_avds(&emulator_bin, crate::avd::EMULATOR_LIST_BUDGET);
 
-    let online_devices: Vec<Device> = if adb_version.is_some() {
-        parse_devices(&adb.run(["devices"]).unwrap_or_default())
-            .into_iter()
-            .filter(|d| d.state == "device")
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let (online_devices, devices_listing_failed): (Vec<Device>, Option<String>) =
+        if adb_version.is_some() {
+            match adb.run(["devices"]) {
+                // `Err` covers a spawn failure, a non-zero exit, and a timeout — none of which
+                // means "no devices attached" (glass#460).
+                Ok(out) => (
+                    parse_devices(&out)
+                        .into_iter()
+                        .filter(|d| d.state == "device")
+                        .collect(),
+                    None,
+                ),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            }
+        } else {
+            (Vec::new(), None)
+        };
     let online: Vec<String> = online_devices.iter().map(|d| d.serial.clone()).collect();
     // Reuse the runtime's own selection policy so the doctor's verdict matches what
     // `glass_start` will actually do (attach a specific serial / boot / refuse).
@@ -184,6 +199,7 @@ fn probe_with(
         emulator_bin,
         avds,
         online,
+        devices_listing_failed,
         selection,
         deep_requested,
         deep,
@@ -410,6 +426,18 @@ fn device_check(p: &Probe) -> Check {
     if p.adb_version.is_none() {
         return Check::new("device", CheckStatus::Skip, "skipped — adb unavailable");
     }
+    // The listing failed, so this is a "could not read" finding, not an empty host (glass#460).
+    if let Some(why) = &p.devices_listing_failed {
+        return Check::new(
+            "device",
+            CheckStatus::Fail,
+            format!("could not read the device list: {why}"),
+        )
+        .with_remedy(
+            "check that `adb devices` runs on this host (the adb server may be wedged — try \
+             `adb kill-server`), or point GLASS_ADB at a working adb",
+        );
+    }
     // Mirror the runtime's `decide`: Ok when glass would attach to a specific device,
     // Warn when it will boot one, Fail (carrying the runtime's own message) when it would
     // refuse — so a green `device` check guarantees `glass_start` won't reject the host.
@@ -513,6 +541,7 @@ mod tests {
             emulator_bin: "/sdk/emulator/emulator".into(),
             avds: AvdList::Listed(vec!["glass".into()]),
             online: vec!["emulator-5554".into()],
+            devices_listing_failed: None,
             selection: Action::Attach("emulator-5554".into()),
             deep_requested: false,
             deep: None,
@@ -981,6 +1010,68 @@ mod tests {
         let d = find(&d, "device");
         assert_eq!(d.status, CheckStatus::Fail);
         assert!(d.remedy.as_deref().unwrap().contains("emulator -avd"));
+    }
+
+    /// The defect in glass#460: `adb devices` that fails must not read as an empty host. The
+    /// "no devices attached" host produces an empty *list*; a spawn failure / non-zero exit /
+    /// timeout is a different answer, and the boot remedy fits only the former.
+    #[test]
+    fn a_failed_devices_listing_is_fail_not_an_empty_host() {
+        let mut p = base_probe();
+        p.online = vec![];
+        p.selection = decide(&[], None, Lifecycle::Auto); // would otherwise say "boot one"
+        p.avds = Some(vec!["glass".into()]); // so it is not the "no AVD" Fail either
+        p.devices_listing_failed = Some("timeout: adb devices did not answer within 10s".into());
+        let d = build_checks(&p);
+        let d = find(&d, "device");
+        assert_eq!(d.status, CheckStatus::Fail);
+        assert!(d.detail.contains("could not read the device list"));
+        assert!(d.detail.contains("did not answer"));
+        // The remedy names the adb server, not a boot of an emulator the host may already have.
+        assert!(d.remedy.as_deref().unwrap().contains("adb kill-server"));
+        assert!(!d.remedy.as_deref().unwrap().contains("emulator -avd"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_devices_listing_is_detected_by_the_probe_itself() {
+        use crate::adb::{Answer, FakeAdb};
+
+        // The rendering test above drives a hand-built `Probe`; this one drives the real
+        // `probe_with`, so the `adb devices` Err -> `devices_listing_failed` mapping itself is
+        // what is pinned (glass#460).
+        let fake = FakeAdb::new(&[
+            (
+                "version",
+                Answer::says("Android Debug Bridge version 1.0.41\nInstalled as /x/adb\n"),
+            ),
+            (
+                "devices",
+                Answer::fails("adb: cannot run server; libusb_init() failed"),
+            ),
+            ("*", Answer::Silent),
+        ]);
+        let p = probe_with(false, fake.adb(), &|_| None, &|_| false);
+        assert!(
+            p.devices_listing_failed.is_some(),
+            "an `adb devices` that failed must be recorded, not read as an empty host: {:?}",
+            p.devices_listing_failed
+        );
+        assert!(p.online.is_empty());
+        let d = build_checks(&p);
+        let d = find(&d, "device");
+        assert_eq!(d.status, CheckStatus::Fail);
+        assert!(
+            d.detail.contains("could not read the device list"),
+            "{}",
+            d.detail
+        );
+        assert!(
+            d.detail.contains("libusb_init"),
+            "the failure reason carries through: {}",
+            d.detail
+        );
+        assert!(d.remedy.as_deref().unwrap().contains("adb kill-server"));
     }
 
     #[test]
