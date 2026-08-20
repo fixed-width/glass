@@ -420,8 +420,11 @@ fn render(report: &Report, opts: &Options) -> String {
             "glass-mcp {} is a from-source build; the latest release is {}.\n",
             report.current, latest
         ),
+        // This arm covers `latest <= current`, which is only true when they are equal unless the
+        // running build is a prerelease newer than the latest release — "is the latest release"
+        // would be a claim the code never established in that case, so say "up to date" instead.
         Outcome::Checked | Outcome::UpToDate => {
-            format!("glass-mcp {} is the latest release.\n", report.current)
+            format!("glass-mcp {} is up to date.\n", report.current)
         }
         Outcome::Updated => format!(
             "{} glass-mcp {} → {}\n{}{}",
@@ -1095,6 +1098,42 @@ mod tests {
         assert!(
             !wrong.contains("not a `sha256sum` line"),
             "a sidecar that parsed must not be reported as unreadable: {wrong}"
+        );
+    }
+
+    /// The arm that renders "up to date" covers `latest <= current` — true for an equal build,
+    /// and true for a prerelease running above the latest release. "is the latest release" would
+    /// be false in the latter case, so neither path may make that claim. One render test per path
+    /// pins it (glass#447).
+    #[test]
+    fn up_to_date_does_not_claim_to_be_the_latest_release() {
+        // current == latest: the ordinary up-to-date case.
+        let mut r = report_fixture();
+        r.outcome = Outcome::UpToDate;
+        r.current = "1.4.0".into();
+        r.latest = Some("1.4.0".into());
+        r.update_available = false;
+        let human = render(&r, &plain(false));
+        assert!(human.contains("is up to date"), "the equal case: {human}");
+        assert!(
+            !human.contains("is the latest release"),
+            "must not claim to be the latest release: {human}"
+        );
+
+        // current newer than latest (a prerelease build, the shape glass#447 observed).
+        let mut r = report_fixture();
+        r.outcome = Outcome::Checked;
+        r.current = "1.4.0-rc1".into();
+        r.latest = Some("1.3.0".into());
+        r.update_available = false;
+        let human = render(&r, &plain(false));
+        assert!(
+            human.contains("is up to date"),
+            "the current-newer case: {human}"
+        );
+        assert!(
+            !human.contains("is the latest release"),
+            "a prerelease above the latest release is not the latest release: {human}"
         );
     }
 
