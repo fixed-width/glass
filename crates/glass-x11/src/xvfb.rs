@@ -731,4 +731,47 @@ mod tests {
         let clean = std::thread::spawn(|| ());
         assert_eq!(ended_thread_payload(clean), None);
     }
+
+    /// `ReaderRefused` and `ReaderGone` must each render their own message: the two carry the
+    /// reader's refusal reason / panic payload, point the operator at the host (not the server),
+    /// and neither borrows `Wedged`'s "killed and a fresh one retried" claim — neither was
+    /// retried, so that text would misdirect an operator into a third start.
+    #[test]
+    fn refused_and_gone_readers_render_their_own_messages() {
+        let message = |variant: super::StartErr| match super::into_glass_error(
+            "Xvfb",
+            variant,
+            super::READY_TIMEOUT,
+        ) {
+            GlassError::Backend(m) => m,
+            other => panic!("expected a Backend message, got {other:?}"),
+        };
+
+        let refused = message(super::StartErr::ReaderRefused("no threads left".into()));
+        assert!(
+            refused.contains("no threads left"),
+            "must carry the refusal reason: {refused}"
+        );
+        assert!(
+            refused.contains("host's thread limit"),
+            "must point at the host, not the server: {refused}"
+        );
+
+        let gone = message(super::StartErr::ReaderGone("reader panicked".into()));
+        assert!(
+            gone.contains("reader panicked"),
+            "must carry the panic payload: {gone}"
+        );
+        assert!(
+            gone.contains("not retried"),
+            "a gone reader was not retried: {gone}"
+        );
+
+        for m in [&refused, &gone] {
+            assert!(
+                !m.contains("killed and a fresh one retried"),
+                "the retry claim is `Wedged`'s alone; {m}"
+            );
+        }
+    }
 }
