@@ -58,12 +58,10 @@ fn intern_get_atoms(conn: &RustConnection) -> Result<GetAtoms> {
 /// Opens a fresh connection to avoid disturbing the main connection's event
 /// queue. Creates a temporary INPUT_ONLY window, calls `ConvertSelection` with
 /// `UTF8_STRING` target + `GLASS_CLIP` transfer property, then polls for the
-/// resulting `SelectionNotify`. Returns `""` when the selection is genuinely
-/// unowned (the X server replies with `property == NONE`); a selection whose
-/// owner does not answer within a second is a timeout and returns a `Backend`
-/// error rather than reading as an empty clipboard. INCR (incremental)
-/// transfers are refused with a `Backend` error rather than silently
-/// truncating.
+/// `SelectionNotify`. Returns `""` when the selection is genuinely unowned (the X server replies
+/// with `property == NONE`); an owner that does not answer within a second is a timeout and
+/// returns a `Backend` error rather than an empty read. INCR (incremental) transfers are refused
+/// with a `Backend` error rather than silently truncating.
 pub fn get(display: &str) -> Result<String> {
     // Open a separate connection so SelectionNotify is not mixed with other
     // events on the main connection.
@@ -155,11 +153,10 @@ pub fn get(display: &str) -> Result<String> {
             }
             None => {
                 if Instant::now() >= deadline {
-                    // No SelectionNotify in time. Reaching the deadline means an owner exists and
-                    // did not answer within a second (a busy app, a modal loop pumping its own
-                    // events, a large selection, an app stopped in a debugger) — a genuinely
-                    // unowned selection already answered on the `property == NONE` branch above,
-                    // so this is a timeout to report, not an empty clipboard to assume.
+                    // No SelectionNotify in time: an owner exists and did not answer within a
+                    // second. A genuinely unowned selection already answered on the
+                    // `property == NONE` branch above, so this is a timeout to report, not an
+                    // empty clipboard to assume.
                     return Err(GlassError::Backend(
                         "clipboard read: the selection owner did not respond within 1s".into(),
                     ));
@@ -632,14 +629,13 @@ mod tests {
     #[ignore = "starts a real X server; needs Xvfb"]
     fn an_owner_that_never_answers_is_a_timeout_not_an_empty_clipboard() {
         // Reaching get's deadline means an owner exists and did not answer within a second; it
-        // must read as a timeout error, not as the empty string a genuinely unowned selection
-        // returns on the property == NONE branch. (glass#372)
+        // must read as a timeout error, not the empty string a genuinely unowned selection
+        // returns (glass#372).
         let x = TestX::start();
         let display = x.display().to_string();
         let clipboard_atom = x.intern(b"CLIPBOARD");
         // A separate owner connection that takes CLIPBOARD and then never services a
-        // SelectionRequest: it holds the selection and blocks, so the conversion get
-        // requests is answered by nothing until get's deadline.
+        // SelectionRequest: the conversion get requests is answered by nothing until get's deadline.
         let _owner = std::thread::Builder::new()
             .name("silent-clip-owner".into())
             .spawn(move || {
@@ -670,14 +666,13 @@ mod tests {
                     .check()
                     .expect("owner set_selection_owner check");
                 owner_conn.flush().expect("owner flush");
-                // Own the selection and stay silent: block on a channel nothing sends to so
-                // the owner outlives the read without ever servicing the SelectionRequest.
+                // Stay silent until the read gives up: block on a channel nothing sends to.
                 let (_tx, rx) = std::sync::mpsc::channel::<()>();
                 let _ = rx.recv();
             })
             .expect("the owner thread should start");
-        // Wait until the server agrees the selection is owned, so what get's deadline meets is
-        // the owner's silence, not a read that raced the ownership transfer.
+        // Wait until the server agrees the selection is owned, so get's deadline meets the
+        // owner's silence, not a read that raced the ownership transfer.
         assert!(
             eventually(Duration::from_secs(5), || x.clipboard_owner()
                 != x11rb::NONE),
