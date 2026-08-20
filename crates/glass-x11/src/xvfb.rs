@@ -83,8 +83,7 @@ enum StartErr {
     /// The host refused the `-displayfd` reader thread: nothing was learned about the server.
     ReaderRefused(String),
     /// The `-displayfd` reader thread unwound without answering — what its panic payload said.
-    /// Not a wedge: the server may be perfectly fine, so it must not be retried against a fresh
-    /// server.
+    /// Not a wedge (the server may be fine), so it is not retried against a fresh server.
     ReaderGone(String),
     /// Xvfb exited before reporting a display.
     Exited { stderr: String },
@@ -264,10 +263,10 @@ fn read_displayfd(
     timeout: Duration,
 ) -> std::result::Result<(u32, ChildStdout), ReadErr> {
     let (tx, rx) = mpsc::channel();
-    // Named and fallible, unlike a bare `spawn`: a host that refuses the thread (a low `pids`
-    // cgroup limit is the ordinary way an MCP server is confined) panics a bare `spawn` in the
-    // caller (glass#454). `Builder::spawn` reports the refusal instead, and it is not retried
-    // as a wedge — the host is out of a resource, and a second server would ask for more.
+    // Named and fallible, unlike a bare `spawn`: a refused thread (a low `pids` cgroup limit is
+    // the ordinary way an MCP server is confined) panics a bare `spawn` in the caller (glass#454).
+    // `Builder::spawn` reports the refusal instead; it is not retried as a wedge — a second
+    // server would ask for more of the resource the host is out of.
     let reader = std::thread::Builder::new()
         .name("glass-x11-xvfb-displayfd".into())
         .spawn(move || {
@@ -300,10 +299,9 @@ fn wait_for_display(
         // The server is alive but silent past the deadline — the wedge the one retry is for.
         Err(mpsc::RecvTimeoutError::Timeout) => Err(ReadErr::TimedOut),
         // The sender went with the thread, so it unwound: it arrived at once, not after a wait
-        // that never happened, and it is not a wedge, so it must not be retried (glass#453).
-        // The thread is already gone (its closure returned or panicked), so `join` completes
-        // immediately rather than waiting on a `read_line` that would never end — the timeout arm
-        // deliberately does NOT join, because there the thread is still parked in that read.
+        // that never happened, and it is not a wedge, so it must not be retried (glass#453). The
+        // thread is already gone, so `join` is immediate — the timeout arm does not join, because
+        // there the thread is still parked in `read_line`.
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(ReadErr::ReaderGone(
             ended_thread_payload(reader)
                 .unwrap_or_else(|| "(the reader ended without a panic payload)".to_string()),
@@ -312,13 +310,13 @@ fn wait_for_display(
 }
 
 /// Join an ended helper thread and render whatever it said, for a `Disconnected` wait arm.
-/// The thread is already gone by the time its channel's sender is dropped, so `join` returns
-/// immediately (it would block forever against a thread still parked in a blocking call — the
-/// timeout case, and the one that must NOT be joined). Returns the panic payload when it was
-/// text (a literal `panic!` carries a `&str`, a formatted one a `String`), or `None` when the
-/// thread returned cleanly or its payload was not renderable text — the caller supplies the
+/// The thread is already gone when its channel's sender is dropped, so `join` returns
+/// immediately (it would block forever against a thread still parked in a blocking call —
+/// the timeout case, the one that must not be joined). Returns the panic payload when it
+/// was text (a literal `panic!` carries a `&str`, a formatted one a `String`), or `None`
+/// when the thread returned cleanly or the payload was not text — the caller supplies the
 /// placeholder. Shared by the `-displayfd` reader (glass#453) and the teardown ask thread
-/// (glass#458). Split out so the payload rendering is testable without a live child.
+/// (glass#458); split out so the payload rendering is testable without a live child.
 pub(crate) fn ended_thread_payload(reader: std::thread::JoinHandle<()>) -> Option<String> {
     let Some(payload) = reader.join().err() else {
         // The thread returned cleanly without sending — still not a wait, just no message.
@@ -709,11 +707,10 @@ mod tests {
         assert!(matches!(r, Err(ReadErr::Closed)), "expected Closed");
     }
 
-    /// The `Disconnected` arm's payload is what distinguishes a reader that unwound from a
-    /// server that wedged (glass#453): the panic text is the diagnosis, so it is carried.
-    /// `ended_thread_payload` is tested directly because the arm itself cannot be driven end-to-end —
-    /// the reader only drops its sender by unwinding, and the panic payload is the very thing
-    /// under test.
+    /// The `Disconnected` arm's payload distinguishes a reader that unwound from a server that
+    /// wedged (glass#453). `ended_thread_payload` is tested directly because the arm itself
+    /// cannot be driven end-to-end — the reader only drops its sender by unwinding, and the panic
+    /// payload is the very thing under test.
     #[test]
     fn ended_thread_payload_carries_the_panic_payload() {
         let reader = std::thread::spawn(|| panic!("read_line blew up: fake reader panic"));
@@ -724,8 +721,8 @@ mod tests {
     }
 
     /// A reader that ends without panicking (a clean return) has no payload to carry: the
-    /// caller turns the `None` into its placeholder, never a `TimedOut` that would claim a
-    /// wait that did not happen.
+    /// caller turns the `None` into its placeholder, never a `TimedOut` that would claim a wait
+    /// that did not happen.
     #[test]
     fn ended_thread_payload_is_none_when_the_thread_returned_cleanly() {
         let clean = std::thread::spawn(|| ());

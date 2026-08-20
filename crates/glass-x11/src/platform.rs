@@ -516,9 +516,9 @@ impl X11Platform {
                  to close"
             )),
             // The sender went with the thread, so it unwound: it arrived at once, not after a
-            // full budget that never happened, and it is glass's own ask thread that died, not
-            // the X server, which may be perfectly healthy (glass#458). The thread is already
-            // gone, so the join is immediate and carries what it said.
+            // full budget that never happened. It is glass's own ask thread that died, not the
+            // X server, which may be healthy (glass#458); the thread is already gone, so the join
+            // is immediate and carries what it said.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Asked::blocked(format!(
                 "glass's own close-request thread ended without an answer ({}) — that is glass \
                  failing to ask, not the X server refusing; the app was not asked to close",
