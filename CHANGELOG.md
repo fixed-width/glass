@@ -21,6 +21,12 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 - The X11 backend no longer reads a dead glass helper thread as the X server failing: a reader that unwinds is reported with what it carried (and is not retried against a fresh server), the ask-to-close timeout names glass's own dead ask thread instead of the server, and the displayfd reader's thread is fallible, so a host that refuses it names the thread limit.
+- The a11y bus `GetAddress` poll on Linux is bounded by a wall-clock deadline, not a sleep-sum of attempts, and its failure message reports the budget that actually governed the wait.
+- `glass-mcp update --check` no longer claims a build is "the latest release" when it is a prerelease above the latest release: that now reports "up to date", the thing the check can actually establish.
+- PATH resolution no longer treats a prefix glass cannot read as a missing binary: an unreadable directory is reported as unreadable (with its path and the fix), not swallowed as absent, so the remedy points at the permission instead of a `brew install`.
+- On Wayland, `glass doctor` finds the Mesa libraries in the host's own multiarch directories (`/usr/lib/<triplet>/…`, `/usr/lib/*/dri`, …) instead of a fixed x86 path list, so the GPU check is correct on architectures whose libraries live elsewhere.
+- An X clipboard read no longer reads a selection owner that stops answering as an empty clipboard: the read has its own one-second deadline and reports a timeout, and a reply longer than the buffer it arrived in is read on rather than truncated silently.
+- On Android, a failed `adb devices` listing no longer reads as an empty host: the device check now fails with the reason the listing could not be read and the remedy for a wedged adb server (`adb kill-server`), instead of the "no devices attached" remedy to boot an emulator.
 - Linux: a deep `glass doctor` probe no longer leaves a stuck thread and an open pipe behind for
   the rest of the process's life. The X11 and Wayland probes each read their child's stderr on a
   helper thread, and that thread could only stop at end-of-file — which anything the probe left
