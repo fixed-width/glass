@@ -1121,10 +1121,9 @@ mod tests {
         );
     }
 
-    /// The arm that renders "up to date" covers `latest <= current` — true for an equal build,
-    /// and true for a prerelease running above the latest release. "is the latest release" would
-    /// be false in the latter case, so neither path may make that claim. One render test per path
-    /// pins it (glass#447).
+    /// The glass#447 render pin, one case per shape of `latest <= current`: an equal build and a
+    /// prerelease running above the latest release. Both must render "up to date" and neither may
+    /// claim "is the latest release" (that claim is false in the second case).
     #[test]
     fn up_to_date_does_not_claim_to_be_the_latest_release() {
         // current == latest: the ordinary up-to-date case.
