@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- `glass doctor` on Android and iOS no longer reports a probe that timed out as a missing tool: a hung `emulator -list-avds` and a hung booted-simulator probe now say the probe timed out (carrying its cause), and the install remedy is reserved for a tool that is actually absent.
 - Linux: a deep `glass doctor` probe no longer leaves a stuck thread and an open pipe behind for
   the rest of the process's life. The X11 and Wayland probes each read their child's stderr on a
   helper thread, and that thread could only stop at end-of-file — which anything the probe left
