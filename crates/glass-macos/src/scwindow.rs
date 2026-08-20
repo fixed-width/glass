@@ -431,13 +431,21 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The shared body of [`query_once`] and [`query_once_with_candidates`]: one
 /// `SCShareableContent` round trip via the `RcBlock` -> `mpsc` bridge (`ffi.rs`'s documented
-/// pattern). `Ok(Some(_))` on a match, `Ok(None)` if no matching on-screen window exists yet
-/// (the outer poll should retry), `Err` if `SCShareableContent` itself failed — classified
-/// via [`crate::ffi::classify_null_result`] (TCC decline -> `PermissionDenied`, anything else
-/// -> `CaptureFailed`) rather than assumed to always be a permission decline; not worth
-/// retrying either way. `collect` is forwarded straight to [`scan_on_screen_windows`]:
-/// [`Candidates::Skip`] (`query_once`) gets back an unallocated empty `Vec`, so the hot path
-/// pays nothing for a candidate summary it never uses.
+/// pattern). `Ok(Some(_))` on a match. `Ok(None)` only when the framework answered and no
+/// matching on-screen window exists yet — a transient state the outer poll retries. `Err` in
+/// two cases, and a poll loop must treat them differently from `Ok(None)`:
+///
+/// - `SCShareableContent` itself failed — classified via
+///   [`crate::ffi::classify_null_result`] (TCC decline -> `PermissionDenied`, anything else
+///   -> `CaptureFailed`), not assumed to always be a permission decline;
+/// - the handler was wedged or dropped and sent no reply within [`QUERY_TIMEOUT`] (the two
+///   `Err` arms below).
+///
+/// Either way the `Err` aborts the caller's `poll_until` loop immediately (`Err` from a tick
+/// stops polling, `Ok(None)` retries to the deadline), so a query that could not enumerate the
+/// windows is never reported as "no window yet". `collect` is forwarded straight to
+/// [`scan_on_screen_windows`]: [`Candidates::Skip`] (`query_once`) gets back an unallocated
+/// empty `Vec`, so the hot path pays nothing for a candidate summary it never uses.
 ///
 /// The adopted window's geometry is read once here, from the `WindowMatch` snapshot
 /// ([`window_match_from`]) — not re-derived from the scan's own separately-read candidate entry
