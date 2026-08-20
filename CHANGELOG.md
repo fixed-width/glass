@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- `glass doctor` no longer waits forever on an X server that accepts connections and goes silent: the attach probe is bounded, and a server that answers then stops is reported as wedged with its own remedy, distinct from a refusal, a missing display, or a missing screen.
 - Linux: a deep `glass doctor` probe no longer leaves a stuck thread and an open pipe behind for
   the rest of the process's life. The X11 and Wayland probes each read their child's stderr on a
   helper thread, and that thread could only stop at end-of-file — which anything the probe left
