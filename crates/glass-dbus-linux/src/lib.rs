@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glass_core::{GlassError, Result};
 use glass_exec_unix::{Resolved, resolve_bin, resolve_path};
@@ -513,7 +513,13 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
                     .map_err(|e| GlassError::Backend(format!("org.a11y.Bus proxy: {e}")))?;
                 let mut answered_empty = false;
                 let mut last_err: Option<String> = None;
-                for _ in 0..50 {
+                // A deadline, not an attempt count: each turn spends a D-Bus round trip to a
+                // launcher that may by then be unresponsive, so the old `0..50` sleep-sum
+                // understated the real wait and the message reported a budget the loop never
+                // actually used (glass#456). Bound by a wall clock and report the budget that
+                // governed it.
+                let poll_deadline = Instant::now() + A11Y_RESOLVE_TIMEOUT;
+                loop {
                     match proxy.get_address().await {
                         Ok(a) => match usable_address(a) {
                             Some(addr) => {
@@ -524,10 +530,13 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
                         },
                         Err(e) => last_err = Some(e.to_string()),
                     }
+                    if Instant::now() >= poll_deadline {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(GlassError::Backend(format!(
-                    "org.a11y.Bus.GetAddress did not yield an address after 5s (answered empty: {answered_empty}, last err: {last_err:?})"
+                    "org.a11y.Bus.GetAddress did not yield an address within the {A11Y_RESOLVE_TIMEOUT:?} resolve budget (answered empty: {answered_empty}, last err: {last_err:?})"
                 )))
             };
             match tokio::time::timeout(A11Y_RESOLVE_TIMEOUT, resolve).await {
