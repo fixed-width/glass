@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- `glass doctor --deep` on Android gives a uiautomator dump the remedy that fits its failure: a device that is up but not ready says "wait for it to finish booting", while a dump that cannot be resolved by waiting says the device may be wedged and to check `adb devices` — instead of both getting the boot remedy.
 - Linux: a deep `glass doctor` probe no longer leaves a stuck thread and an open pipe behind for
   the rest of the process's life. The X11 and Wayland probes each read their child's stderr on a
   helper thread, and that thread could only stop at end-of-file — which anything the probe left
