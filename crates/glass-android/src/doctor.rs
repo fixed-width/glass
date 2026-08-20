@@ -69,7 +69,21 @@ struct Probe {
 struct DeepProbe {
     serial: String,
     screencap: Result<String, String>,
-    uiautomator: Result<String, String>,
+    uiautomator: UiProbe,
+}
+
+/// The uiautomator half of [`DeepProbe`], keeping the two failure shapes `dump_once` already
+/// distinguishes apart: a dump the wait could still resolve (the device is up but not ready to
+/// serve one yet), and one a wait cannot help (adb is gone, the device is wedged, or a deadline
+/// fired). Collapsing them was the one place the a11y module's `NotReady`/`Fatal` split was
+/// dropped (glass#461) — each gets its own remedy rather than one "fully booted" line that fits
+/// neither.
+enum UiProbe {
+    Ok(String),
+    /// The device cannot serve a dump yet — waiting is what resolves it.
+    NotReady(String),
+    /// Waiting cannot help this attempt: adb is gone, the device is wedged, or a deadline fired.
+    Fatal(String),
 }
 
 /// Build the Android doctor checks by probing the host. `deep` additionally captures a
@@ -244,9 +258,14 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
     // can do now, and a dump that only succeeds after a wait is what this check exists to
     // reveal.
     let uiautomator = match dump_once(&mut adb_runner(&dev), DUMP_PREFIX, attempt_deadline()) {
-        Attempt::Dumped(xml) if xml.contains("<hierarchy") => Ok("a11y dump OK".to_string()),
-        Attempt::Dumped(_) => Err("uiautomator dump produced no hierarchy".to_string()),
-        Attempt::NotReady(e) | Attempt::Fatal(e) => Err(e.to_string()),
+        Attempt::Dumped(xml) if xml.contains("<hierarchy") => {
+            UiProbe::Ok("a11y dump OK".to_string())
+        }
+        Attempt::Dumped(_) => UiProbe::Fatal("uiautomator dump produced no hierarchy".to_string()),
+        // Keep the a11y module's own split — the one place it was dropped (glass#461): a dump
+        // the wait could still resolve is not one a wait cannot help.
+        Attempt::NotReady(e) => UiProbe::NotReady(e.to_string()),
+        Attempt::Fatal(e) => UiProbe::Fatal(e.to_string()),
     };
 
     DeepProbe {
@@ -382,10 +401,34 @@ fn deep_checks(p: &Probe) -> (Check, Check) {
         Err(e) => Check::new(name, CheckStatus::Fail, format!("{}: {e}", d.serial))
             .with_remedy("ensure the device is fully booted"),
     };
-    (
-        render("screencap", &d.screencap),
-        render("uiautomator", &d.uiautomator),
-    )
+    // The uiautomator check is rendered on its own so each failure shape gets the remedy that
+    // fits it (glass#461), rather than the single "fully booted" line the screencap case earns.
+    let uiautomator = match &d.uiautomator {
+        UiProbe::Ok(detail) => Check::new(
+            "uiautomator",
+            CheckStatus::Ok,
+            format!("{}: {detail}", d.serial),
+        ),
+        UiProbe::NotReady(e) => Check::new(
+            "uiautomator",
+            CheckStatus::Fail,
+            format!("{}: {e}", d.serial),
+        )
+        .with_remedy(
+            "the device is up but not ready to serve a dump yet — wait for it to finish \
+             booting and re-run with --deep",
+        ),
+        UiProbe::Fatal(e) => Check::new(
+            "uiautomator",
+            CheckStatus::Fail,
+            format!("{}: {e}", d.serial),
+        )
+        .with_remedy(
+            "waiting will not resolve this — the device may be wedged or adb gone; re-run \
+             `adb devices` (or `adb kill-server`) and re-run with --deep",
+        ),
+    };
+    (render("screencap", &d.screencap), uiautomator)
 }
 
 fn device_check(p: &Probe) -> Check {
@@ -501,7 +544,7 @@ mod tests {
         DeepProbe {
             serial: "emulator-5554".into(),
             screencap: Ok("captured 1080x2400, 10368016 bytes raw".into()),
-            uiautomator: Ok("a11y dump OK".into()),
+            uiautomator: UiProbe::Ok("a11y dump OK".into()),
         }
     }
 
@@ -679,7 +722,7 @@ mod tests {
             Ok("captured 2x3, 36 bytes raw"),
             "the frame is decoded, not merely fetched"
         );
-        assert_eq!(probed.uiautomator.as_deref(), Ok("a11y dump OK"));
+        assert!(matches!(&probed.uiautomator, UiProbe::Ok(s) if s == "a11y dump OK"));
     }
 
     #[test]
@@ -695,10 +738,12 @@ mod tests {
         ]);
 
         let probed = deep_probe(fake.adb(), "emulator-5554");
-        assert_eq!(
-            probed.uiautomator.as_deref().map_err(String::as_str),
-            Err("uiautomator dump produced no hierarchy")
-        );
+        // A dump that ran and wrote nothing usable is not one a wait would resolve, so it is
+        // `Fatal`, carrying the reason the content check found.
+        assert!(matches!(
+            &probed.uiautomator,
+            UiProbe::Fatal(s) if s == "uiautomator dump produced no hierarchy"
+        ));
     }
 
     #[test]
@@ -958,7 +1003,7 @@ mod tests {
         p.deep = Some(DeepProbe {
             serial: "emulator-5554".into(),
             screencap: Err("screencap 0x0: FLAG_SECURE?".into()),
-            uiautomator: Err("dump produced no hierarchy".into()),
+            uiautomator: UiProbe::Fatal("dump produced no hierarchy".into()),
         });
         let c = build_checks(&p);
         let s = find(&c, "screencap");
@@ -966,6 +1011,45 @@ mod tests {
         assert!(s.detail.contains("FLAG_SECURE"));
         assert!(s.remedy.as_deref().unwrap().contains("fully booted"));
         assert_eq!(find(&c, "uiautomator").status, CheckStatus::Fail);
+    }
+
+    /// The defect in glass#461: a dump the wait could still resolve (NotReady) is not one a wait
+    /// cannot help (Fatal). The two must carry different remedies — "wait for boot" versus
+    /// "adb is gone / wedged" — rather than one "fully booted" line that fits neither.
+    #[test]
+    fn a_not_ready_dump_and_a_fatal_dump_get_different_remedies() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.deep = Some(DeepProbe {
+            serial: "emulator-5554".into(),
+            screencap: Ok("captured 1080x2400".into()),
+            uiautomator: UiProbe::NotReady("device not yet serving dumps".into()),
+        });
+        let c = build_checks(&p);
+        let nr = find(&c, "uiautomator");
+        assert_eq!(nr.status, CheckStatus::Fail);
+        assert!(nr.detail.contains("not yet serving dumps"));
+        let nr_remedy = nr.remedy.as_deref().unwrap();
+        assert!(
+            nr_remedy.contains("not ready to serve a dump"),
+            "{nr_remedy}"
+        );
+
+        // A Fatal dump (a deadline fired / adb gone) is the opposite answer: waiting won't help.
+        p.deep = Some(DeepProbe {
+            serial: "emulator-5554".into(),
+            screencap: Ok("captured 1080x2400".into()),
+            uiautomator: UiProbe::Fatal("deadline fired".into()),
+        });
+        let checks = build_checks(&p);
+        let fa = find(&checks, "uiautomator");
+        let fa_remedy = fa.remedy.as_deref().unwrap();
+        assert!(
+            fa_remedy.contains("waiting will not resolve"),
+            "{fa_remedy}"
+        );
+        // And the two remedies are genuinely different — the collapse that motivated the issue.
+        assert_ne!(nr_remedy, fa_remedy);
     }
 
     #[test]
