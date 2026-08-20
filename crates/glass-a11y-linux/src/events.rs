@@ -70,16 +70,23 @@ pub(crate) fn subscribe(ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let running = Arc::new(AtomicBool::new(true));
     let pump_running = running.clone();
-    std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            let _ = ready_tx.send(false);
-            return;
-        };
-        rt.block_on(pump(&ctx, tx, ready_tx, pump_running));
-    });
+    // Named and fallible, unlike a bare `spawn`: a host that refuses the thread (a low `pids`
+    // cgroup limit) used to panic the caller instead of returning the no-subscription that the
+    // caller already handles (glass#463, the #454 defect in this crate). No pump started, so
+    // there is nothing to stop — the `running` flag is simply never set.
+    std::thread::Builder::new()
+        .name("glass-a11y-atspi-subscribe".into())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                let _ = ready_tx.send(false);
+                return;
+            };
+            rt.block_on(pump(&ctx, tx, ready_tx, pump_running));
+        })
+        .ok()?;
     // Wait for the subscription to be established before returning: a caller reads the tree the
     // moment it gets a signal back, and a change landing before the match rule is in place would
     // be lost.

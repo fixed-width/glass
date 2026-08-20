@@ -785,6 +785,19 @@ fn signal_ready(ready: &Arc<(Mutex<ReadyState>, Condvar)>, state: ReadyState) {
     cvar.notify_one();
 }
 
+/// Retires the owner however its thread leaves.
+///
+/// `stop` is the only thing [`ClipboardOwner::is_alive`] consults, and the thread's only way to
+/// say it has gone. A statement at the end of the thread body would miss a panic, which is the
+/// one exit route that reaches no statement at all (glass#450).
+struct RetireOnExit<'a>(&'a AtomicBool);
+
+impl Drop for RetireOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// The serving thread body: connect, set up the source, pump until stopped.
 fn serve_loop(
     socket: PathBuf,
@@ -792,6 +805,8 @@ fn serve_loop(
     stop: Arc<AtomicBool>,
     ready: Arc<(Mutex<ReadyState>, Condvar)>,
 ) -> Result<()> {
+    // First, so no early return — including a panic — leaves the owner reporting alive.
+    let _retire = RetireOnExit(&stop);
     let deadline = Instant::now() + SERVE_SETUP_BUDGET;
     let (conn, globals, mut queue): (_, _, EventQueue<ServeState>) =
         crate::platform::connect_bounded(
@@ -944,8 +959,8 @@ fn serve_loop(
         }
     }
 
-    // Signal that this owner has stopped so the platform can re-spawn if needed.
-    stop.store(true, Ordering::Relaxed);
+    // Retirement happens in `RetireOnExit`'s drop, whatever route the loop took, including a
+    // panic (glass#450).
     Ok(())
 }
 
@@ -953,8 +968,8 @@ fn serve_loop(
 mod tests {
     use super::{
         Arc, AtomicBool, CLIP_READ_TIMEOUT, CLIP_WRITE_TIMEOUT, ClipboardOwner, Condvar, Mutex,
-        PoisonError, ReadyState, get, is_retryable, open_transfer, read_to_eof_bounded, serve_loop,
-        signal_ready, write_all_bounded,
+        Ordering, PoisonError, ReadyState, RetireOnExit, get, is_retryable, open_transfer,
+        read_to_eof_bounded, serve_loop, signal_ready, write_all_bounded,
     };
     use crate::testw::{Launch, on_a_thread};
     use glass_core::GlassError;
@@ -1139,6 +1154,27 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, GlassError::Backend(_)), "{err}");
+    }
+
+    /// Retiring on the way out is a value's `Drop`, not a statement at the end of the thread
+    /// body: unwinding runs one and skips the other, and `glass-wayland` is not mutation-gated,
+    /// so this holds the panic route a trailing store would miss (glass#450).
+    #[test]
+    fn an_owner_thread_that_panics_retires_like_one_that_returned() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let panicked = std::thread::spawn(move || {
+            let _retire = RetireOnExit(&thread_stop);
+            // The panic message below is the test working, not the test failing.
+            panic!("a clipboard owner thread panicking mid-serve");
+        })
+        .join();
+
+        assert!(panicked.is_err(), "the thread was supposed to panic");
+        assert!(
+            stop.load(Ordering::Relaxed),
+            "a thread that panicked is as gone as one that returned"
+        );
     }
 
     /// A compositor that accepts the connection and then never answers is what the readiness bound
