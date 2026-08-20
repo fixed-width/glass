@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- On iOS, a simulator listing that cannot be read no longer reads as "nothing is booted": the doctor now reports the booted state as unknown (a warning, the same status the device check uses) and points at the listing command to verify, instead of the "boot a simulator" remedy.
 - Linux: a deep `glass doctor` probe no longer leaves a stuck thread and an open pipe behind for
   the rest of the process's life. The X11 and Wayland probes each read their child's stderr on a
   helper thread, and that thread could only stop at end-of-file — which anything the probe left
