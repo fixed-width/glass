@@ -58,9 +58,12 @@ fn intern_get_atoms(conn: &RustConnection) -> Result<GetAtoms> {
 /// Opens a fresh connection to avoid disturbing the main connection's event
 /// queue. Creates a temporary INPUT_ONLY window, calls `ConvertSelection` with
 /// `UTF8_STRING` target + `GLASS_CLIP` transfer property, then polls for the
-/// resulting `SelectionNotify`.  Returns `""` if there is no current owner.
-/// INCR (incremental) transfers are refused with a `Backend` error rather than
-/// silently truncating.
+/// resulting `SelectionNotify`. Returns `""` when the selection is genuinely
+/// unowned (the X server replies with `property == NONE`); a selection whose
+/// owner does not answer within a second is a timeout and returns a `Backend`
+/// error rather than reading as an empty clipboard. INCR (incremental)
+/// transfers are refused with a `Backend` error rather than silently
+/// truncating.
 pub fn get(display: &str) -> Result<String> {
     // Open a separate connection so SelectionNotify is not mixed with other
     // events on the main connection.
@@ -152,8 +155,14 @@ pub fn get(display: &str) -> Result<String> {
             }
             None => {
                 if Instant::now() >= deadline {
-                    // No SelectionNotify in time — assume no owner.
-                    return Ok(String::new());
+                    // No SelectionNotify in time. Reaching the deadline means an owner exists and
+                    // did not answer within a second (a busy app, a modal loop pumping its own
+                    // events, a large selection, an app stopped in a debugger) — a genuinely
+                    // unowned selection already answered on the `property == NONE` branch above,
+                    // so this is a timeout to report, not an empty clipboard to assume.
+                    return Err(GlassError::Backend(
+                        "clipboard read: the selection owner did not respond within 1s".into(),
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
