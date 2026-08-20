@@ -39,7 +39,7 @@ struct Probe {
     /// Serials with `adb devices` state `"device"` (online), for display.
     online: Vec<String>,
     /// The reason `adb devices` failed to read, when it did — `Some` when the listing errored
-    /// (a spawn failure, a non-zero exit, or a timeout) rather than the empty list that an
+    /// (a spawn failure, a non-zero exit, or a timeout) rather than the empty list an
     /// "no devices attached" host produces. When set, `online` is empty for a reason the
     /// operator cannot follow, so the device check says so instead of prescribing a boot
     /// (glass#460).
@@ -115,8 +115,7 @@ fn probe_with(
         if adb_version.is_some() {
             match adb.run(["devices"]) {
                 // `Err` covers a spawn failure, a non-zero exit, and a timeout — none of which
-                // means "no devices attached" (the empty-list case), so it must not be read as
-                // an empty host (glass#460).
+                // means "no devices attached" (glass#460).
                 Ok(out) => (
                     parse_devices(&out)
                         .into_iter()
@@ -409,9 +408,7 @@ fn device_check(p: &Probe) -> Check {
     if p.adb_version.is_none() {
         return Check::new("device", CheckStatus::Skip, "skipped — adb unavailable");
     }
-    // The `adb devices` listing itself failed — a wedged adb server, a spawn failure, a non-zero
-    // exit, or a timeout. None of these means "no devices attached", so it must not read as an
-    // empty host with a boot remedy (glass#460).
+    // The listing failed, so this is a "could not read" finding, not an empty host (glass#460).
     if let Some(why) = &p.devices_listing_failed {
         return Check::new(
             "device",
