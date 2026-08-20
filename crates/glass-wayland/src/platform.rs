@@ -348,6 +348,16 @@ fn sway_verdict(
             "{} is not executable",
             p.display()
         ))),
+        // A bundled sway glass could not even stat — a permission, not a missing build
+        // (glass#474).
+        Resolved::Unreadable(p, e) => Err(NoSway {
+            cause: format!(
+                "the bundled sway at {} could not be looked at ({e}) — it may be installed where \
+                 glass cannot read it",
+                p.display()
+            ),
+            remedy: MAKE_IT_RUNNABLE,
+        }),
         // `NoSearchPath` cannot come from the bundle lookup, which walks fixed paths; both mean
         // there is no bundle to fall back to.
         Resolved::Absent | Resolved::NoSearchPath => Err(match walk {
@@ -371,18 +381,29 @@ fn sway_bundle_in(data: Option<PathBuf>, exe_dir: Option<PathBuf>) -> Resolved {
         exe_dir.map(|d| d.join("sway/bin/sway")),
     ];
     let mut first_non_executable = None;
+    let mut first_unreadable = None;
     for cand in candidates.into_iter().flatten() {
         match resolve_path(&cand) {
             Resolved::Found(p) => return Resolved::Found(p),
             Resolved::NotExecutable(p) => {
                 first_non_executable.get_or_insert(p);
             }
+            // A bundle root glass could not stat (glass#474): remember it, but a runnable or
+            // present-but-unrunnable copy in a later root still outranks it.
+            Resolved::Unreadable(p, e) => {
+                first_unreadable.get_or_insert((p, e));
+            }
             // Each candidate is one path, judged on its own: `resolve_path` has no search list
             // to lack, so `NoSearchPath` cannot come from it. Both mean "nothing here".
             Resolved::Absent | Resolved::NoSearchPath => {}
         }
     }
-    first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
+    if let Some(p) = first_non_executable {
+        return Resolved::NotExecutable(p);
+    }
+    first_unreadable
+        .map(|(p, e)| Resolved::Unreadable(p, e))
+        .unwrap_or(Resolved::Absent)
 }
 
 /// What `GLASS_SWAY` decides, or `None` when it is unset or empty and discovery should run.
@@ -394,13 +415,28 @@ fn sway_override(
     value: Option<std::ffi::OsString>,
 ) -> Option<std::result::Result<PathBuf, NoSway>> {
     let p = PathBuf::from(value.filter(|s| !s.is_empty())?);
-    Some(if is_executable_file(&p) {
-        Ok(p)
-    } else {
-        Err(NoSway::not_runnable(format!(
+    // `resolve_path`, not `is_executable_file`, so a path glass cannot even stat (a prefix outside
+    // the sandbox) is named as a permission rather than as "not executable" (glass#474).
+    Some(match resolve_path(&p) {
+        Resolved::Found(p) => Ok(p),
+        Resolved::NotExecutable(p) => Err(NoSway::not_runnable(format!(
             "GLASS_SWAY={} is not an executable file",
             p.display()
-        )))
+        ))),
+        Resolved::Unreadable(p, e) => Err(NoSway {
+            cause: format!(
+                "GLASS_SWAY={} could not be looked at ({e}) — it may point at a location glass \
+                 cannot read",
+                p.display()
+            ),
+            remedy: MAKE_IT_RUNNABLE,
+        }),
+        // `Absent` and `NoSearchPath` cannot come from a path that contains `/`, but an override
+        // that is a directory answers `Absent` — keep the old "not an executable file" verdict.
+        Resolved::Absent | Resolved::NoSearchPath => Err(NoSway::not_runnable(format!(
+            "GLASS_SWAY={} is not an executable file",
+            p.display()
+        ))),
     })
 }
 

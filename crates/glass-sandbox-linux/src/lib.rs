@@ -354,6 +354,9 @@ enum NoSandbox {
     Missing(String),
     /// A bare `bwrap` and no `$PATH` to look it up in, so nothing says whether it is installed.
     NotLookedUp(String),
+    /// The configured `bwrap` path could not even be stat'd (a prefix this process cannot
+    /// traverse): a permission, not a missing package (glass#474).
+    Unreadable(String),
     /// bwrap ran and exited non-zero, including without saying why.
     Refused(String),
     /// bwrap had not exited when its budget ran out, so it was sent SIGKILL — which one wedged in
@@ -369,6 +372,9 @@ const INSTALL_BWRAP: &str = "install `bubblewrap`, or point GLASS_BWRAP at a cop
      execute; or run with sandbox:\"off\" (GLASS_SANDBOX=off) to launch unconfined";
 const NAME_BWRAP: &str = "point GLASS_BWRAP at bubblewrap's absolute path, or start glass with a \
      PATH to search; or run with sandbox:\"off\" (GLASS_SANDBOX=off) to launch unconfined";
+const READ_BWRAP: &str = "bubblewrap is there but glass could not read that path — check its \
+     permissions, or point GLASS_BWRAP at a readable copy; or run with sandbox:\"off\" \
+     (GLASS_SANDBOX=off) to launch unconfined";
 const CHECK_THE_MOUNTS: &str = "the probe read-only-binds the whole root, so a mount that has \
      stopped responding (an unreachable network filesystem) can hold it there; check for one, or \
      run with sandbox:\"off\" (GLASS_SANDBOX=off) to launch unconfined";
@@ -380,6 +386,7 @@ impl NoSandbox {
         match self {
             NoSandbox::Missing(why)
             | NoSandbox::NotLookedUp(why)
+            | NoSandbox::Unreadable(why)
             | NoSandbox::Refused(why)
             | NoSandbox::TimedOut(why)
             | NoSandbox::Unfinished(why) => why,
@@ -392,6 +399,7 @@ impl NoSandbox {
         match self {
             NoSandbox::Missing(_) => INSTALL_BWRAP,
             NoSandbox::NotLookedUp(_) => NAME_BWRAP,
+            NoSandbox::Unreadable(_) => READ_BWRAP,
             NoSandbox::Refused(_) => refusal_remedy(apparmor_restricted),
             NoSandbox::TimedOut(_) => CHECK_THE_MOUNTS,
             NoSandbox::Unfinished(_) => NOTHING_LEARNED,
@@ -422,6 +430,12 @@ fn resolved_bwrap(bin: &str, bwrap: Resolved) -> std::result::Result<PathBuf, No
         Resolved::Found(p) => Ok(p),
         Resolved::NotExecutable(p) => Err(NoSandbox::Missing(format!(
             "bubblewrap ({}) is not executable",
+            p.display()
+        ))),
+        // The binary may be installed in a prefix glass cannot stat — a permission, not an install
+        // (glass#474).
+        Resolved::Unreadable(p, e) => Err(NoSandbox::Unreadable(format!(
+            "bubblewrap at {} could not be looked at ({e})",
             p.display()
         ))),
         Resolved::Absent => Err(NoSandbox::Missing(format!("bubblewrap ({bin}) not found"))),

@@ -60,7 +60,10 @@ pub fn is_executable_file(p: &Path) -> bool {
 ///
 /// The `NotExecutable` case is the reason this is not an `Option<PathBuf>`: a caller that only
 /// learns "no" cannot tell a missing binary from an installed one whose execute bit is off, and
-/// sends the user to reinstall a package that is already there.
+/// sends the user to reinstall a package that is already there. The `Unreadable` case is the same
+/// harm from a third cause — the path could not be stat'd (e.g. a prefix this process cannot
+/// traverse, a macOS path outside its sandbox) — which the code must name as a permission rather
+/// than an install (glass#474).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
 pub enum Resolved {
@@ -68,6 +71,10 @@ pub enum Resolved {
     Found(PathBuf),
     /// A regular file is there, and this process may not execute it.
     NotExecutable(PathBuf),
+    /// The path could not be looked at at all: `metadata` failed, so neither its presence nor its
+    /// execute bit is knowable. Carries the OS error's message so the remedy can name the
+    /// permission rather than an install.
+    Unreadable(PathBuf, String),
     /// Nothing to point the user at: no such path, a directory, or a path that cannot be stat'd.
     Absent,
     /// A bare name and no `$PATH` to look it up in. Distinct from [`Resolved::Absent`] because the
@@ -91,24 +98,51 @@ pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Resolved {
         return Resolved::NoSearchPath;
     };
     let mut first_non_executable = None;
+    let mut first_unreadable = None;
     for cand in std::env::split_paths(path).map(|dir| dir.join(bin)) {
         match resolve_path(&cand) {
             Resolved::Found(p) => return Resolved::Found(p),
             Resolved::NotExecutable(p) => {
                 first_non_executable.get_or_insert(p);
             }
+            // A prefix we could not traverse: keep walking (the binary may be in a later entry),
+            // but remember it so an exhausted search reports the permission, not a missing tool
+            // (glass#474).
+            Resolved::Unreadable(p, e) => {
+                first_unreadable.get_or_insert((p, e));
+            }
             // `resolve_path` judges one path and never wants a search list, so `NoSearchPath`
             // cannot come from it; both mean "nothing here" to the walk.
             Resolved::Absent | Resolved::NoSearchPath => {}
         }
     }
-    first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
+    // A runnable or present-but-unrunnable match outranks an unreadable prefix; only when neither
+    // was seen does the unreadable one become the report.
+    if let Some(p) = first_non_executable {
+        return Resolved::NotExecutable(p);
+    }
+    first_unreadable
+        .map(|(p, e)| Resolved::Unreadable(p, e))
+        .unwrap_or(Resolved::Absent)
 }
 
 /// The verdict on one path, with no `$PATH` search — for a caller holding a single candidate
 /// rather than a name to look up. A directory is [`Resolved::Absent`]: it is not a launch target
 /// however its mode bits read.
+///
+/// A path that cannot even be stat'd is [`Resolved::Unreadable`], not [`Resolved::Absent`]: a
+/// prefix this process cannot traverse (a `0700` directory owned by another user, a macOS path
+/// outside the sandbox, a volume that went away) holds no verdict glass can act on, and naming it
+/// as an install would send the user to fix what is not broken (glass#474).
 pub fn resolve_path(p: &Path) -> Resolved {
+    if let Err(e) = std::fs::metadata(p) {
+        // A clean "nothing is here" is still `Absent`; anything else — a permission error on a
+        // prefix traversal, an IO error on a path that may exist — is `Unreadable`.
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Resolved::Unreadable(p.to_path_buf(), e.to_string());
+        }
+        return Resolved::Absent;
+    }
     if is_executable_file(p) {
         Resolved::Found(p.to_path_buf())
     } else if p.is_file() {
@@ -381,5 +415,64 @@ mod tests {
             Resolved::Absent,
             "a directory answers X_OK but is not a launch target"
         );
+    }
+
+    /// The defect in glass#474: a prefix this process cannot traverse makes `metadata` fail with
+    /// `EACCES`, which used to fold into `Absent` — "not installed" — and send the user to
+    /// install what is already there. It must come out as `Unreadable`, naming the permission.
+    ///
+    /// Root can traverse a `0o000` directory, so this needs a non-root host (same guard as the
+    /// `a_file_whose_own_class_denies_exec_is_not_executable` test).
+    #[test]
+    fn a_path_glass_cannot_stat_is_unreadable_not_absent() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: root can traverse a 0o000 directory, so the EACCES never fires");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A binary that is actually there, behind a prefix the process may not walk.
+        let bin = dir.path().join("idb_companion");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // Confirm it is reachable while the prefix is open, so the test is not a vacuous pass.
+        assert_eq!(
+            resolve_path(&bin),
+            Resolved::Found(dir.path().join("idb_companion")),
+            "the binary must be runnable before the prefix is locked"
+        );
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000))
+            .expect("chmod prefix 0o000");
+        let resolved = resolve_path(&bin);
+        assert!(
+            matches!(resolved, Resolved::Unreadable(ref p, _) if p == &bin),
+            "an unreadable prefix must be Unreadable, not Absent: {resolved:?}"
+        );
+        // Restore so the tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755));
+    }
+
+    /// The `$PATH` walk keeps going past an unreadable prefix and remembers it, so a search that
+    /// finds nothing runnable anywhere reports the permission rather than a missing tool.
+    #[test]
+    fn a_search_past_an_unreadable_prefix_reports_it_rather_than_absent() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: root can traverse a 0o000 directory, so the EACCES never fires");
+            return;
+        }
+        let locked = tempfile::tempdir().expect("locked tempdir");
+        // A real binary sits behind the locked prefix, but the prefix will be 0o000.
+        let bin = locked.path().join("Xvfb");
+        std::fs::write(&bin, b"").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let empty = tempfile::tempdir().expect("empty tempdir");
+        let path = std::env::join_paths([locked.path(), empty.path()]).expect("join paths");
+        std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o000))
+            .expect("chmod prefix 0o000");
+        let resolved = resolve_bin("Xvfb", Some(&path));
+        assert!(
+            matches!(resolved, Resolved::Unreadable(ref p, _) if p == &locked.path().join("Xvfb")),
+            "an unreadable prefix with no other match must be Unreadable, not Absent: {resolved:?}"
+        );
+        let _ = std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o755));
     }
 }

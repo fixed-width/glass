@@ -278,6 +278,7 @@ fn find_launcher_with(
         return resolve_path(Path::new(&p));
     }
     let mut first_non_executable = None;
+    let mut first_unreadable = None;
     // `once_with`, not a plain call: as a `chain` argument the scan would run on every lookup,
     // reading all of /usr/lib even when the first fixed candidate hits.
     let scanned = std::iter::once_with(scan_multiarch).flatten();
@@ -287,12 +288,23 @@ fn find_launcher_with(
             Resolved::NotExecutable(p) => {
                 first_non_executable.get_or_insert(p);
             }
+            // A prefix we could not stat (glass#474): keep walking, but remember it so an
+            // exhausted search names the permission rather than a missing launcher.
+            Resolved::Unreadable(p, e) => {
+                first_unreadable.get_or_insert((p, e));
+            }
             // A candidate is one path, judged on its own: `resolve_path` has no search list to
             // lack, so `NoSearchPath` cannot come from it. Both mean "nothing here" to the walk.
             Resolved::Absent | Resolved::NoSearchPath => {}
         }
     }
-    first_non_executable.map_or(Resolved::Absent, Resolved::NotExecutable)
+    // A runnable or present-but-unrunnable candidate outranks an unreadable prefix.
+    if let Some(p) = first_non_executable {
+        return Resolved::NotExecutable(p);
+    }
+    first_unreadable
+        .map(|(p, e)| Resolved::Unreadable(p, e))
+        .unwrap_or(Resolved::Absent)
 }
 
 /// `<multiarch_root>/<triplet>/at-spi2-core/at-spi-bus-launcher` for every entry under the root.
@@ -373,6 +385,14 @@ fn launcher_or_reason(resolved: Resolved) -> std::result::Result<PathBuf, String
             "at-spi-bus-launcher at {} is not executable",
             p.display()
         )),
+        // The launcher may well be installed — it just could not be stat'd. The remedy names the
+        // permission rather than an install (glass#474).
+        Resolved::Unreadable(p, e) => Err(format!(
+            "at-spi-bus-launcher at {} could not be looked at ({e}); it may be installed in a \
+             location glass cannot read — check that path's permissions, or set \
+             GLASS_ATSPI_LAUNCHER to a readable copy",
+            p.display()
+        )),
         Resolved::Absent => Err(
             "at-spi-bus-launcher not found (install at-spi2-core), or set GLASS_ATSPI_LAUNCHER"
                 .into(),
@@ -416,6 +436,14 @@ fn available_with(
         Resolved::NotExecutable(p) => {
             Err(format!("dbus-daemon at {} is not executable", p.display()))
         }
+        // The binary may be installed in a prefix glass cannot stat — name the permission, not
+        // an install (glass#474).
+        Resolved::Unreadable(p, e) => Err(format!(
+            "dbus-daemon at {} could not be looked at ({e}); it may be installed in a location \
+             glass cannot read — check that path's permissions, or set GLASS_DBUS_DAEMON to a \
+             readable copy",
+            p.display()
+        )),
         Resolved::Absent => Err(format!(
             "dbus-daemon ({dbus}) not found (install dbus, or set GLASS_DBUS_DAEMON to its path)"
         )),
