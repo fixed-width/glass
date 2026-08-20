@@ -86,8 +86,7 @@ fn x11_checks(mode: &Mode) -> Vec<Check> {
             )
             .with_remedy(no.remedy),
             // A server that accepts and goes silent is not "unreachable" — nothing to start — and
-            // attaching to it would hang, so the check fails rather than passes: glass cannot
-            // reach a usable session on this display. (glass#462)
+            // attaching would hang, so the check fails rather than passes (glass#462).
             AttachVerdict::TimedOut(budget) => Check::new(
                 "GLASS_DISPLAY",
                 CheckStatus::Fail,
@@ -178,10 +177,10 @@ const NAME_A_DISPLAY: &str = "GLASS_DISPLAY names a local display — `:42`, bar
 const PICK_A_SCREEN: &str = "name a screen that server has — the `.N` suffix, e.g. `:42.0` (most \
      servers have only screen 0) — or unset GLASS_DISPLAY to self-spawn";
 
-/// What the attach probe learned about the display `GLASS_DISPLAY` names. The connect used to be
-/// unbounded (glass#462): a server that accepts and never sends its setup reply blocked the
-/// doctor with no check, no section, and no way to say which probe was stuck. `Answered` is the
-/// real handshake outcome; `TimedOut` is the server that accepts and goes silent.
+/// What the attach probe learned about the display `GLASS_DISPLAY` names. The connect used to
+/// be unbounded (glass#462): a server that accepted and went silent blocked the doctor with no
+/// check and no way to say which probe was stuck. `Answered` is the real handshake outcome;
+/// `TimedOut` is the server that accepts and goes silent.
 #[derive(Debug)]
 enum AttachVerdict {
     /// `x11rb::connect` returned a connection or a refusal.
@@ -191,13 +190,12 @@ enum AttachVerdict {
     TimedOut(Duration),
 }
 
-/// How long the attach probe waits. A one-shot like the other doctor probes; a connect that
-/// takes longer than `run_bounded`'s `PROBE_BUDGET` on the Android and iOS doctors is itself the
-/// finding, and 10s matches the connect timeouts elsewhere in glass (idb, the release check).
+/// How long the attach probe waits: a one-shot like the other doctor probes, and 10s matches
+/// the connect timeouts elsewhere in glass (idb, the release check).
 const ATTACH_PROBE_BUDGET: Duration = Duration::from_secs(10);
 
-/// The remedy for a server that accepted and went silent: there is nothing to start, so the
-/// advice is to inspect it rather than to start it. The budget the check waited is in the detail.
+/// The remedy for a server that accepted and went silent: there is nothing to start, so inspect
+/// it rather than start it. The budget the check waited is in the detail.
 const ATTACH_WEDGED: &str = "a server that accepts and goes silent is not one to start — \
      check the display with `xdpyinfo` or `xhost` by hand, and see its logs";
 
@@ -220,7 +218,7 @@ fn attach_verdict(display: &str) -> AttachVerdict {
         // The thread runs; wait on it the way the other two outcomes are waited on.
         Ok(_handle) => await_verdict(&rx),
         // The host refused the probe's own thread (a low `pids` cgroup limit is the usual
-        // cause). There was no connect to hang, so it is reported as an answer, not a timeout.
+        // cause): there was no connect to hang, so it is an answer, not a timeout.
         Err(e) => AttachVerdict::Answered(Err(NoAttach {
             cause: format!("the host refused the probe's own thread, so nothing was probed: {e}"),
             remedy: "a low `pids` cgroup limit is the usual cause; free up threads on the host, \
@@ -417,8 +415,8 @@ mod tests {
     }
 
     /// The regression glass#462 pins: a server that accepts and goes silent is reported as a
-    /// hang — not as "unreachable" (there is nothing to start) and not as a pass (attaching would
-    /// hang) — and the remedy is the wedged one, not the start-the-display one.
+    /// hang — not "unreachable" (nothing to start) and not a pass (attaching would hang) — and
+    /// the remedy is the wedged one, not the start-the-display one.
     #[test]
     fn a_wedged_server_fails_the_check_and_gets_the_wedged_remedy() {
         let cs = x11_checks(&Mode::Attach {
@@ -438,8 +436,8 @@ mod tests {
     }
 
     /// The wait passes through every connect answer it can be given: a refusal, a success, a
-    /// hang, and a probe thread that unwound. The last is not a hang — it arrives at once, and
-    /// calling it one would claim a wait nobody did (glass#373).
+    /// hang, and a probe thread that unwound. The last arrives at once; calling it a hang would
+    /// claim a wait nobody did (glass#373).
     #[test]
     fn the_attach_wait_keeps_a_refusal_a_hang_and_an_unwound_probe_apart() {
         let (tx, rx) = mpsc::channel::<Result<(), NoAttach>>();
