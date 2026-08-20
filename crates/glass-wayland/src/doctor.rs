@@ -21,7 +21,8 @@ use crate::swayipc::Ipc;
 /// a headless sway to prove it actually starts.
 pub fn checks(deep: bool) -> Vec<Check> {
     let sway = discover_sway();
-    let gl = gl_present_in(EGL_SONAMES, DRI_DIRS);
+    let (egl_sonames, dri_dirs) = mesa_candidates();
+    let gl = gl_present_in(&egl_sonames, &dri_dirs);
     let deep_spawn = match (deep, &sway) {
         (true, Ok((path, _))) => Some(probe_sway(path)),
         _ => None,
@@ -263,25 +264,49 @@ fn sway_check(path: &Path, answer: &VersionAnswer) -> Check {
     }
 }
 
-/// Where a distro puts libEGL.
-const EGL_SONAMES: &[&str] = &[
-    "/usr/lib/x86_64-linux-gnu/libEGL.so.1",
-    "/usr/lib/libEGL.so.1",
-    "/lib/x86_64-linux-gnu/libEGL.so.1",
-    "/usr/lib64/libEGL.so.1",
-];
-/// Where a distro puts the Mesa DRI drivers.
-const DRI_DIRS: &[&str] = &[
-    "/usr/lib/x86_64-linux-gnu/dri",
-    "/usr/lib/dri",
-    "/usr/lib64/dri",
-];
+/// Where a distro puts libEGL — the layouts that are not arch-specific. The Debian multiarch
+/// layout (one triplet subdirectory per installed arch) is added at runtime from the host's own
+/// triplets, so the check works on every architecture, not only x86_64 (glass#468).
+const EGL_SONAMES: &[&str] = &["/usr/lib/libEGL.so.1", "/usr/lib64/libEGL.so.1"];
+/// Where a distro puts the Mesa DRI drivers — likewise, with the multiarch `dri` dirs added at
+/// runtime from the host's own triplets.
+const DRI_DIRS: &[&str] = &["/usr/lib/dri", "/usr/lib64/dri"];
+/// The Debian-family multiarch roots, each holding one subdirectory per installed architecture.
+const MULTIARCH_ROOTS: &[&str] = &["/usr/lib", "/lib"];
+
+/// The Mesa paths the check should look in: the distro layouts above, plus the Debian multiarch
+/// layout for each architecture the host actually has — built from the directories under the
+/// multiarch root rather than naming one triplet, so an `aarch64` host finds its own
+/// `/usr/lib/aarch64-linux-gnu/` (glass#468).
+fn mesa_candidates() -> (Vec<String>, Vec<String>) {
+    let mut egl = EGL_SONAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    let mut dri = DRI_DIRS.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    for root in MULTIARCH_ROOTS {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().into_string().ok() else {
+                continue;
+            };
+            if !name.ends_with("-linux-gnu") {
+                continue;
+            }
+            egl.push(format!("{root}/{name}/libEGL.so.1"));
+            dri.push(format!("{root}/{name}/dri"));
+        }
+    }
+    (egl, dri)
+}
 
 /// Heuristic check for the host Mesa software-GL stack the headless sway needs.
 ///
 /// Both halves must be present — a loader cannot render without a driver, or a driver be reached
 /// without the loader. Either swrast name counts: a host may carry only one.
-fn gl_present_in(egl_sonames: &[&str], dri_dirs: &[&str]) -> bool {
+fn gl_present_in(egl_sonames: &[String], dri_dirs: &[String]) -> bool {
     let egl = egl_sonames.iter().any(|p| Path::new(p).exists());
     let swrast = dri_dirs.iter().any(|d| {
         let d = Path::new(d);
@@ -595,9 +620,40 @@ mod tests {
 
     fn gl_present_for(egl: bool, dri: Option<&str>) -> bool {
         let (_root, egls, dris) = gl_tree(egl, dri);
-        let egls: Vec<&str> = egls.iter().map(String::as_str).collect();
-        let dris: Vec<&str> = dris.iter().map(String::as_str).collect();
         gl_present_in(&egls, &dris)
+    }
+
+    /// The multiarch half of glass#468: a non-x86_64 host puts its Mesa under `<root>/<triplet>/`,
+    /// and the old check named only `x86_64-linux-gnu`. `mesa_candidates` must add the triplet
+    /// dir it finds under the multiarch roots.
+    #[test]
+    fn mesa_candidates_add_the_multiarch_triplet_dirs_the_host_has() {
+        let (egl, dri) = mesa_candidates();
+        // The architecture-independent layouts are always present.
+        assert!(egl.contains(&"/usr/lib/libEGL.so.1".to_string()));
+        assert!(dri.contains(&"/usr/lib/dri".to_string()));
+        // And so is the arch-specific layout for every `<root>/<arch>-linux-gnu` on this host.
+        for root in MULTIARCH_ROOTS {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().into_string().ok() else {
+                    continue;
+                };
+                if !name.ends_with("-linux-gnu") {
+                    continue;
+                }
+                assert!(
+                    egl.contains(&format!("{root}/{name}/libEGL.so.1")),
+                    "missing the multiarch libEGL for {name}"
+                );
+                assert!(
+                    dri.contains(&format!("{root}/{name}/dri")),
+                    "missing the multiarch dri dir for {name}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -335,6 +335,19 @@ fn a11y_checks(launcher: &Resolved, override_set: bool, facts: &HostA11yFacts) -
         .with_remedy(
             "restore its execute bit (`chmod +x`), or point GLASS_ATSPI_LAUNCHER at a runnable copy",
         ),
+        // A launcher glass could not stat: a permission, not a missing package (glass#474).
+        Resolved::Unreadable(p, e) => Check::new(
+            "a11y",
+            CheckStatus::Warn,
+            format!(
+                "at-spi-bus-launcher at {} could not be looked at ({e}); it may be installed in \
+                 a location glass cannot read",
+                p.display()
+            ),
+        )
+        .with_remedy(
+            "check that path's permissions, or point GLASS_ATSPI_LAUNCHER at a readable copy",
+        ),
         // An override skips discovery outright, so the well-known paths were never consulted:
         // whatever this host has installed, the variable is what left glass with nothing.
         Resolved::Absent if override_set => Check::new(
