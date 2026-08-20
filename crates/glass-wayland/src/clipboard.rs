@@ -789,8 +789,7 @@ fn signal_ready(ready: &Arc<(Mutex<ReadyState>, Condvar)>, state: ReadyState) {
 ///
 /// `stop` is the only thing [`ClipboardOwner::is_alive`] consults, and the thread's only way to
 /// say it has gone. A statement at the end of the thread body would miss a panic, which is the
-/// one exit route that reaches no statement at all (glass#450). The X11 sibling retired the same
-/// way in #371; this closes the gap between the two backends.
+/// one exit route that reaches no statement at all (glass#450).
 struct RetireOnExit<'a>(&'a AtomicBool);
 
 impl Drop for RetireOnExit<'_> {
@@ -960,8 +959,8 @@ fn serve_loop(
         }
     }
 
-    // Retirement happens in `RetireOnExit`'s drop, whatever route the loop took — including a
-    // panic, which this trailing statement used to miss (glass#450).
+    // Retirement happens in `RetireOnExit`'s drop, whatever route the loop took, including a
+    // panic (glass#450).
     Ok(())
 }
 
@@ -1158,9 +1157,8 @@ mod tests {
     }
 
     /// Retiring on the way out is a value's `Drop`, not a statement at the end of the thread
-    /// body, and this is the difference between them: unwinding runs one and skips the other.
-    /// `glass-wayland` is not mutation-gated, so this is the thing that holds the panic route
-    /// the trailing store used to miss (glass#450).
+    /// body: unwinding runs one and skips the other, and `glass-wayland` is not mutation-gated,
+    /// so this holds the panic route a trailing store would miss (glass#450).
     #[test]
     fn an_owner_thread_that_panics_retires_like_one_that_returned() {
         let stop = Arc::new(AtomicBool::new(false));
