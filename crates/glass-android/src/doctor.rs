@@ -939,6 +939,48 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a_failed_devices_listing_is_detected_by_the_probe_itself() {
+        use crate::adb::{Answer, FakeAdb};
+
+        // The rendering test above drives a hand-built `Probe`; this one drives the real
+        // `probe_with`, so the `adb devices` Err -> `devices_listing_failed` mapping itself is
+        // what is pinned (glass#460).
+        let fake = FakeAdb::new(&[
+            (
+                "version",
+                Answer::says("Android Debug Bridge version 1.0.41\nInstalled as /x/adb\n"),
+            ),
+            (
+                "devices",
+                Answer::fails("adb: cannot run server; libusb_init() failed"),
+            ),
+            ("*", Answer::Silent),
+        ]);
+        let p = probe_with(false, fake.adb(), &|_| None, &|_| false);
+        assert!(
+            p.devices_listing_failed.is_some(),
+            "an `adb devices` that failed must be recorded, not read as an empty host: {:?}",
+            p.devices_listing_failed
+        );
+        assert!(p.online.is_empty());
+        let d = build_checks(&p);
+        let d = find(&d, "device");
+        assert_eq!(d.status, CheckStatus::Fail);
+        assert!(
+            d.detail.contains("could not read the device list"),
+            "{}",
+            d.detail
+        );
+        assert!(
+            d.detail.contains("libusb_init"),
+            "the failure reason carries through: {}",
+            d.detail
+        );
+        assert!(d.remedy.as_deref().unwrap().contains("adb kill-server"));
+    }
+
+    #[test]
     fn device_boot_but_no_emulator_binary_is_fail() {
         let mut p = base_probe();
         p.online = vec![];
