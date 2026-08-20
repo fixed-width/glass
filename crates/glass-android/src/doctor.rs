@@ -73,11 +73,10 @@ struct DeepProbe {
 }
 
 /// The uiautomator half of [`DeepProbe`], keeping the two failure shapes `dump_once` already
-/// distinguishes apart: a dump the wait could still resolve (the device is up but not ready to
-/// serve one yet), and one a wait cannot help (adb is gone, the device is wedged, or a deadline
+/// distinguishes: a dump the wait could still resolve (the device is up but not ready to serve
+/// one yet), and one a wait cannot help (adb is gone, the device is wedged, or a deadline
 /// fired). Collapsing them was the one place the a11y module's `NotReady`/`Fatal` split was
-/// dropped (glass#461) — each gets its own remedy rather than one "fully booted" line that fits
-/// neither.
+/// dropped (glass#461).
 enum UiProbe {
     Ok(String),
     /// The device cannot serve a dump yet — waiting is what resolves it.
@@ -262,8 +261,7 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
             UiProbe::Ok("a11y dump OK".to_string())
         }
         Attempt::Dumped(_) => UiProbe::Fatal("uiautomator dump produced no hierarchy".to_string()),
-        // Keep the a11y module's own split — the one place it was dropped (glass#461): a dump
-        // the wait could still resolve is not one a wait cannot help.
+        // Keep the a11y module's own split — the one place it was dropped (glass#461).
         Attempt::NotReady(e) => UiProbe::NotReady(e.to_string()),
         Attempt::Fatal(e) => UiProbe::Fatal(e.to_string()),
     };
@@ -402,7 +400,7 @@ fn deep_checks(p: &Probe) -> (Check, Check) {
             .with_remedy("ensure the device is fully booted"),
     };
     // The uiautomator check is rendered on its own so each failure shape gets the remedy that
-    // fits it (glass#461), rather than the single "fully booted" line the screencap case earns.
+    // fits it (glass#461).
     let uiautomator = match &d.uiautomator {
         UiProbe::Ok(detail) => Check::new(
             "uiautomator",
@@ -738,8 +736,7 @@ mod tests {
         ]);
 
         let probed = deep_probe(fake.adb(), "emulator-5554");
-        // A dump that ran and wrote nothing usable is not one a wait would resolve, so it is
-        // `Fatal`, carrying the reason the content check found.
+        // A dump that ran and wrote nothing usable is not one a wait would resolve, so `Fatal`.
         assert!(matches!(
             &probed.uiautomator,
             UiProbe::Fatal(s) if s == "uiautomator dump produced no hierarchy"
@@ -1014,8 +1011,8 @@ mod tests {
     }
 
     /// The defect in glass#461: a dump the wait could still resolve (NotReady) is not one a wait
-    /// cannot help (Fatal). The two must carry different remedies — "wait for boot" versus
-    /// "adb is gone / wedged" — rather than one "fully booted" line that fits neither.
+    /// cannot help (Fatal), so the two carry different remedies — "wait for boot" versus
+    /// "adb is gone / wedged".
     #[test]
     fn a_not_ready_dump_and_a_fatal_dump_get_different_remedies() {
         let mut p = base_probe();
@@ -1048,7 +1045,7 @@ mod tests {
             fa_remedy.contains("waiting will not resolve"),
             "{fa_remedy}"
         );
-        // And the two remedies are genuinely different — the collapse that motivated the issue.
+        // The two remedies differ — the collapse that motivated the issue.
         assert_ne!(nr_remedy, fa_remedy);
     }
 
