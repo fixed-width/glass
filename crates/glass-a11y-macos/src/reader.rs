@@ -381,7 +381,7 @@ fn read_label(el: &AXUIElement, attr_name: &str) -> Option<String> {
 /// `el`'s `name` as [`walk`] records it: the fingerprint `set_value`/`invoke` re-walk against has
 /// to come from the same reads, in the same order, that produced the name in the snapshot.
 fn read_name(el: &AXUIElement) -> Option<String> {
-    mapping::name(read_label(el, attr::TITLE), || {
+    mapping::node_name(read_label(el, attr::TITLE), || {
         read_label(el, attr::DESCRIPTION)
     })
 }

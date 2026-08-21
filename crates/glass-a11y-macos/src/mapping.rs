@@ -163,19 +163,21 @@ pub fn checkable_checked(role: AxRole, ax_value: Option<i64>) -> (bool, bool) {
 }
 
 /// A node's `name`: its `AXTitle`, else its `AXDescription` (`setAccessibilityLabel` surfaces as
-/// `AXDescription`). Never `AXValue` — volatile content in a field that is half the `AxTarget`
-/// fingerprint `set_value`/`click_element` re-walk against.
+/// `AXDescription`). Never `AXValue` — volatile, and the name is half the `AxTarget` fingerprint
+/// `set_value`/`invoke` re-walk against.
 ///
-/// The description arrives as a reader because each label costs an AX round-trip and a titled node
-/// never needs it.
+/// The description arrives as a reader because it costs an AX round-trip and a titled node never
+/// needs it.
 ///
-/// The one place the rule lives: a second copy could read a name differently and reject an element
-/// that never moved. [`labels`] repeats it only because an `FnOnce` cannot fill both the name slot
-/// and the description fallback, and a test quantifies their agreement over every input.
+/// The one place the precedence lives: [`labels`] delegates its name slot here rather than
+/// restating it, so the walk and the two fingerprint sites cannot rank the two attributes
+/// differently and reject an element that never moved. The reads themselves are still spelled at
+/// each site.
 ///
-/// Both labels arrive already empty-filtered by the reader; a whitespace-only one is a name,
-/// matching the Windows and Linux readers' `nonempty`.
-pub fn name(
+/// Precondition: both labels arrive already empty-filtered — the reader's `read_label` folds `""`.
+/// A whitespace-only label is a name, matching the Windows and Linux readers' `nonempty`; the
+/// Android reader deliberately differs, counting a blank label as absent.
+pub fn node_name(
     title: Option<String>,
     read_description: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
@@ -185,22 +187,23 @@ pub fn name(
 /// A node's `(name, description)`, decided together because which attribute is left to describe a
 /// node depends on which one named it.
 ///
-/// `AXDescription` costs at most one read per node either way: as the name when there is no title,
-/// as the description only when there IS a title and no `AXHelp`. Reading it unconditionally
-/// re-reads the string that is already the name on the untitled nodes that are most of a macOS
-/// tree, and [`glass_core::normalize_description`] drops the copy — so only a read count catches
-/// that edit.
+/// `AXDescription` costs at most one read: [`node_name`] spends it only on an untitled node, and
+/// the description slot only on a titled node with no `AXHelp`. Hoisting that read above the
+/// decision leaves every output byte-identical and buys one extra round-trip on every titled node
+/// that has help text, so only a read count catches the edit. The reader is one-shot: whichever
+/// slot spends it, the other finds it gone.
 ///
-/// The returned description is normalized: blank, or a repeat of `name`, becomes `None`.
+/// The returned description is normalized — blank, or a repeat of `name`, becomes `None`. An
+/// `AXHelp` that normalizes away does not fall back to `AXDescription`, because retrying it would
+/// spend the read this gate exists to save.
 pub fn labels(
     title: Option<String>,
     read_description: impl FnOnce() -> Option<String>,
     read_help: impl FnOnce() -> Option<String>,
 ) -> (Option<String>, Option<String>) {
-    let (name, secondary) = match title {
-        Some(title) => (Some(title), read_help().or_else(read_description)),
-        None => (read_description(), read_help()),
-    };
+    let mut unread_description = Some(read_description);
+    let name = node_name(title, || unread_description.take().and_then(|read| read()));
+    let secondary = read_help().or_else(|| unread_description.take().and_then(|read| read()));
     let description = secondary.and_then(|raw| normalize_description(&raw, name.as_deref()));
     (name, description)
 }
@@ -500,7 +503,7 @@ mod tests {
     /// that reads everything.
     fn counted<'a>(
         text: Option<&'a str>,
-        calls: &'a Cell<u32>,
+        calls: &'a Cell<usize>,
     ) -> impl FnOnce() -> Option<String> + 'a {
         move || {
             calls.set(calls.get() + 1);
@@ -508,6 +511,7 @@ mod tests {
         }
     }
 
+    /// The same reader without the counter, for the tests that judge only the returned pair.
     fn reader(text: Option<&str>) -> impl FnOnce() -> Option<String> + '_ {
         move || text.map(str::to_string)
     }
@@ -543,8 +547,9 @@ mod tests {
 
     #[test]
     fn a_titled_node_with_help_never_reads_its_description() {
-        // The gate this extraction exists to keep verified: deleting the titled/untitled split
-        // leaves every output byte-identical, so this count is the only assertion that can fail.
+        // The gate this extraction exists to keep verified. Hoist the read out of the decision
+        // (`let d = read_description();`, then use `d` in both slots) and every output stays
+        // byte-identical, so this count is the only assertion that can fail.
         let reads = Cell::new(0);
         let (name, description) = labels(
             Some("Save".to_string()),
@@ -557,41 +562,33 @@ mod tests {
     }
 
     #[test]
-    fn an_untitled_node_reads_its_description_exactly_once() {
-        // The other half of the gate: the description already named the node, so consulting it
-        // again buys a second cross-process read of a string `normalize_description` drops.
-        let reads = Cell::new(0);
-        let (name, description) = labels(None, counted(Some("Close"), &reads), reader(None));
-        assert_eq!(
-            reads.get(),
-            1,
-            "AXDescription must be read once, as the name"
+    fn a_whitespace_only_help_is_dropped_without_retrying_the_description() {
+        // The description is present and must stay unread: the fallback fires on an absent
+        // `AXHelp`, not on one that normalizes away.
+        let (name, description) = labels(
+            Some("Save".to_string()),
+            reader(Some("Saves the document")),
+            reader(Some("   ")),
         );
-        assert_eq!(name.as_deref(), Some("Close"));
-        assert_eq!(description, None);
-    }
-
-    #[test]
-    fn a_secondary_label_that_repeats_the_name_is_dropped() {
-        let (name, description) =
-            labels(Some("Save".to_string()), reader(None), reader(Some("Save")));
         assert_eq!(name.as_deref(), Some("Save"));
         assert_eq!(description, None);
     }
 
     #[test]
-    fn a_whitespace_only_secondary_label_is_dropped() {
-        let (name, description) =
-            labels(Some("Save".to_string()), reader(None), reader(Some("   ")));
+    fn a_help_that_repeats_the_name_is_dropped_without_retrying_the_description() {
+        let (name, description) = labels(
+            Some("Save".to_string()),
+            reader(Some("Saves the document")),
+            reader(Some("Save")),
+        );
         assert_eq!(name.as_deref(), Some("Save"));
         assert_eq!(description, None);
     }
 
     #[test]
     fn a_whitespace_only_title_still_names_the_node() {
-        // `read_label` folds "" but not "   ", matching the Windows and Linux readers' `nonempty`.
-        // Pinned rather than trimmed: which strings may occupy the name slot is a cross-backend
-        // convention, not this function's call.
+        // Pinned rather than trimmed: the Android reader counts a blank label as absent, so this
+        // is a live divergence between backends, not a rule this function gets to settle.
         let (name, description) = labels(
             Some("   ".to_string()),
             reader(Some("a description")),
@@ -603,8 +600,9 @@ mod tests {
 
     #[test]
     fn every_title_description_help_combination_lands_where_the_reader_put_it() {
-        // Exhaustive over the eight inputs: a hand-picked sample cannot show that an arm was
-        // dropped rather than merely unexercised.
+        // Exhaustive over the eight present/absent combinations: a hand-picked sample cannot show
+        // that an arm was dropped rather than merely unexercised. The ninth row pins
+        // `normalize_description`'s trim at this seam, which a blankness-only lookalike would lose.
         let cases = [
             (Some("t"), Some("d"), Some("h"), Some("t"), Some("h")),
             (Some("t"), Some("d"), None, Some("t"), Some("d")),
@@ -614,11 +612,13 @@ mod tests {
             (None, Some("d"), None, Some("d"), None),
             (None, None, Some("h"), None, Some("h")),
             (None, None, None, None, None),
+            (Some("t"), None, Some("  h  "), Some("t"), Some("h")),
         ];
         for (title, description, help, want_name, want_description) in cases {
-            let got = labels(title.map(str::to_string), reader(description), reader(help));
+            let (name, got_description) =
+                labels(title.map(str::to_string), reader(description), reader(help));
             assert_eq!(
-                (got.0.as_deref(), got.1.as_deref()),
+                (name.as_deref(), got_description.as_deref()),
                 (want_name, want_description),
                 "title={title:?} description={description:?} help={help:?}"
             );
@@ -627,14 +627,16 @@ mod tests {
 
     #[test]
     fn the_fingerprint_name_and_the_walked_name_agree_on_every_combination() {
-        // `set_value`/`invoke` re-derive a name through `name` to fingerprint the element `walk`
-        // recorded through `labels`; a divergence would reject an element that never moved.
-        for title in [Some("t"), None] {
-            for description in [Some("d"), None] {
+        // `set_value`/`invoke` re-derive a name through `node_name` to fingerprint the element
+        // `walk` recorded through `labels`; a divergence would reject an element that never moved.
+        // Blank labels are in the loop because a trim added to one side and not the other is the
+        // realistic way the two drift.
+        for title in [Some("t"), Some("   "), None] {
+            for description in [Some("d"), Some("  "), None] {
                 for help in [Some("h"), None] {
                     let walked =
                         labels(title.map(str::to_string), reader(description), reader(help)).0;
-                    let fingerprint = name(title.map(str::to_string), reader(description));
+                    let fingerprint = node_name(title.map(str::to_string), reader(description));
                     assert_eq!(
                         walked, fingerprint,
                         "title={title:?} description={description:?} help={help:?}"
@@ -646,10 +648,10 @@ mod tests {
 
     #[test]
     fn a_titled_node_needs_no_description_read_to_be_named() {
-        // `set_value` and `invoke` pay these reads on the element they are about to act on.
+        // `set_value` and `invoke` pay this read on the element they are about to act on.
         let reads = Cell::new(0);
         assert_eq!(
-            name(Some("Save".to_string()), counted(Some("d"), &reads)).as_deref(),
+            node_name(Some("Save".to_string()), counted(Some("d"), &reads)).as_deref(),
             Some("Save")
         );
         assert_eq!(reads.get(), 0);
