@@ -19,6 +19,9 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Added
+- On iOS, `glass_gesture` actuates a two-finger pinch: two pointers whose separation changes become a real pinch on the Simulator, recognised as one by the app under test. It needs an `idb_companion` that implements idb's `HIDPinch` event — a companion that does not is named in the error, along with the `--version` it reported. Other multi-touch gestures (rotation, two-finger pan, three or more fingers) are refused by name rather than actuated as something else.
+
 ### Fixed
 - `glass doctor` no longer waits forever on an X server that accepts connections and goes silent: the attach probe is bounded, and a server that answers then stops is reported as wedged with its own remedy, distinct from a refusal, a missing display, or a missing screen.
 - `glass doctor` on Android and iOS no longer reports a probe that timed out as a missing tool: a hung `emulator -list-avds` and a hung booted-simulator probe now say the probe timed out (carrying its cause), and the install remedy is reserved for a tool that is actually absent.
