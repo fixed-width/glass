@@ -1,10 +1,10 @@
-//! Pure clipboard text codecs (no Win32), unit-tested + Miri-checked on any host.
+//! Pure clipboard text codecs (no Win32), unit-tested on any host.
 //!
 //! The `cfg(windows)` hook does the `unsafe` FFI — locking an `HGLOBAL` into a slice *bounded by
 //! `GlobalSize`* — and defers the actual NUL-terminated parse/encode to these helpers. So the
 //! UB-prone slicing/decoding lives in safe, tested code; only the FFI lock itself stays `unsafe`.
 //!
-//! Compiled for `windows` (the hook uses it) and for `test` (so the suite runs on Linux + Miri).
+//! Compiled for `windows` (the hook uses it) and for `test` (so the suite runs on any host).
 
 /// Decode a `CF_UNICODETEXT` block (the whole locked buffer, as UTF-16 code units) to a `String`,
 /// stopping at the first NUL terminator — or consuming the whole buffer if it is unterminated.

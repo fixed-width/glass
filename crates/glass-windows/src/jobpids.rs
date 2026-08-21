@@ -1,6 +1,6 @@
 //! Pure parser for the JOBOBJECT_BASIC_PROCESS_ID_LIST byte buffer (x64 layout). Kept ungated +
-//! free of `windows` types so it runs on the host under Miri — the buffer handling is the part with
-//! the alignment/UB risk; the QueryInformationJobObject syscall that fills the buffer can't be Miri'd.
+//! free of `windows` types so the buffer handling — the part carrying the alignment/UB risk — is
+//! unit-tested on any host; the QueryInformationJobObject syscall that fills it is cfg(windows).
 
 /// Parse a JOBOBJECT_BASIC_PROCESS_ID_LIST byte buffer into its PID list. x64 layout:
 /// `[0..4]` NumberOfAssignedProcesses (u32) · `[4..8]` NumberOfProcessIdsInList (u32) ·

@@ -1,4 +1,4 @@
-//! Pure DIB / DIBV5 byte-layout parsing + validation + header rewrite (no Win32, Miri-checked).
+//! Pure DIB / DIBV5 byte-layout parsing + validation + header rewrite (no Win32).
 //!
 //! `CF_DIB`/`CF_DIBV5` blobs are attacker-influenced (they come from a boxed app's clipboard), so
 //! every size is computed with checked arithmetic and validated against the actual buffer length —
