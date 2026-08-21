@@ -39,6 +39,8 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct IdbClient {
     rt: Runtime,
     client: CompanionServiceClient<Channel>,
+    /// The companion binary serving this channel, so an error can name what refused a call.
+    bin: PathBuf,
 }
 
 /// Budget for one `hid` stream. A `HidSwipe`/`HidDelay`/`HidPinch` plays out over
@@ -86,9 +88,44 @@ fn map_timed<T, E: std::fmt::Display>(
     }
 }
 
+/// Whether `status` is idb refusing an event its build does not implement. The companion answers
+/// `InvalidArgument` for both an unimplemented event and a malformed one, so the marker text is
+/// what separates them.
+fn unimplemented_event(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::InvalidArgument
+        && status.message().contains("Unrecognized request.event")
+}
+
+/// The error for an event this companion does not implement, with its build info injected.
+///
+/// It reports what was observed — the binary that refused, and idb's own words — and claims
+/// nothing about which builds carry the event, because that is not a fact this process can
+/// check and a claim that cannot be checked cannot be kept true.
+fn unimplemented_event_error_with(
+    bin: &Path,
+    status: &tonic::Status,
+    info: Option<String>,
+) -> GlassError {
+    let build = match info {
+        Some(text) => format!(" Its --version reports: {text}."),
+        None => String::new(),
+    };
+    GlassError::Backend(format!(
+        "the idb_companion at {} does not implement this event: it answered {:?}.{build} \
+         A newer idb_companion is required.",
+        bin.display(),
+        status.message()
+    ))
+}
+
+/// [`unimplemented_event_error_with`] for a companion whose build info has not been read.
+fn unimplemented_event_error(bin: &Path, status: &tonic::Status) -> GlassError {
+    unimplemented_event_error_with(bin, status, None)
+}
+
 impl IdbClient {
     /// Connect to `idb_companion`'s gRPC over the Unix socket at `sock`.
-    pub fn connect(sock: &Path) -> Result<IdbClient> {
+    pub fn connect(sock: &Path, bin: &Path) -> Result<IdbClient> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -117,6 +154,7 @@ impl IdbClient {
         Ok(IdbClient {
             rt,
             client: CompanionServiceClient::new(channel),
+            bin: bin.to_path_buf(),
         })
     }
 
@@ -138,6 +176,7 @@ impl IdbClient {
         IdbClient {
             rt,
             client: CompanionServiceClient::new(channel),
+            bin: PathBuf::from("/nonexistent/idb_companion"),
         }
     }
 
@@ -191,8 +230,14 @@ impl IdbClient {
             let stream = tokio_stream::iter(events);
             tokio::time::timeout(timeout, client.hid(stream)).await
         });
-        map_timed("idb hid", timeout, outcome)?;
-        Ok(())
+        match outcome {
+            // An event this build does not implement is reported as that, rather than as the
+            // generic backend string every other status folds into.
+            Ok(Err(status)) if unimplemented_event(&status) => {
+                Err(unimplemented_event_error(&self.bin, &status))
+            }
+            other => map_timed("idb hid", timeout, other).map(|_| ()),
+        }
     }
 
     /// Guard the `block_on` threading invariant (see the type doc): calling an RPC from a
@@ -229,8 +274,8 @@ mod tests {
         let udid = std::env::var("GLASS_IOS_UDID").expect("set GLASS_IOS_UDID to a booted sim");
         let companion =
             crate::idb::companion::IdbCompanion::spawn(&udid).expect("idb_companion must start");
-        let client =
-            IdbClient::connect(companion.socket()).expect("companion must accept a client");
+        let client = IdbClient::connect(companion.socket(), companion.bin())
+            .expect("companion must accept a client");
 
         let d = client
             .describe()
@@ -266,6 +311,42 @@ mod tests {
         assert!(
             matches!(err, GlassError::Backend(ref msg) if msg.contains("timed out after 30s")),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_event_is_recognised_as_an_unimplemented_one() {
+        let status = tonic::Status::invalid_argument("Unrecognized request.event");
+        assert!(unimplemented_event(&status));
+    }
+
+    #[test]
+    fn another_invalid_argument_is_not_mistaken_for_an_unimplemented_event() {
+        // A genuine argument error must keep its own message rather than being reported as
+        // an out-of-date companion.
+        let status = tonic::Status::invalid_argument("Unrecognized press.direction");
+        assert!(!unimplemented_event(&status));
+    }
+
+    #[test]
+    fn a_different_code_carrying_the_same_text_is_not_an_unimplemented_event() {
+        let status = tonic::Status::internal("Unrecognized request.event");
+        assert!(!unimplemented_event(&status));
+    }
+
+    #[test]
+    fn the_unimplemented_event_error_names_the_binary_that_refused_it() {
+        let err = unimplemented_event_error_with(
+            std::path::Path::new("/somewhere/idb_companion"),
+            &tonic::Status::invalid_argument("Unrecognized request.event"),
+            None,
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("/somewhere/idb_companion"), "{msg}");
+        assert!(msg.contains("does not implement"), "{msg}");
+        assert!(
+            msg.contains("Unrecognized request.event"),
+            "the cause is quoted: {msg}"
         );
     }
 
@@ -368,7 +449,11 @@ mod tests {
     #[test]
     fn connect_to_missing_socket_errors_cleanly() {
         // A UDS path that does not exist -> a structured Backend error, no panic. Runs on Linux.
-        let err = IdbClient::connect(std::path::Path::new("/nonexistent/idb.sock")).unwrap_err();
+        let err = IdbClient::connect(
+            std::path::Path::new("/nonexistent/idb.sock"),
+            std::path::Path::new("/nonexistent/idb_companion"),
+        )
+        .unwrap_err();
         assert!(matches!(err, glass_core::GlassError::Backend(_)), "{err:?}");
     }
 
@@ -387,7 +472,7 @@ mod tests {
         {
             let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         }
-        match IdbClient::connect(&sock) {
+        match IdbClient::connect(&sock, std::path::Path::new("/nonexistent/idb_companion")) {
             // Refused at the transport layer — the common case.
             Err(GlassError::Backend(_)) => {}
             // `connect` optimistically succeeded; the first RPC must then fail cleanly.

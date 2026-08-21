@@ -240,6 +240,9 @@ fn stderr_log_path(dir: &Path, udid: &str, pid: u32) -> PathBuf {
 pub struct IdbCompanion {
     child: Child,
     sock: PathBuf,
+    /// The binary this companion was spawned from, carried rather than re-resolved so an
+    /// error can name the binary that actually ran even if the environment has since changed.
+    bin: PathBuf,
     /// File the companion's stderr is redirected to, read back on a startup failure so the
     /// error names the real cause; removed on `Drop`.
     stderr_log: PathBuf,
@@ -316,6 +319,7 @@ impl IdbCompanion {
         let mut this = IdbCompanion {
             child,
             sock,
+            bin: bin.to_path_buf(),
             stderr_log,
         };
         // From here any failure must kill+reap the child, so a failed spawn never leaks it.
@@ -330,6 +334,11 @@ impl IdbCompanion {
     /// The Unix socket `idb_companion` serves gRPC on.
     pub fn socket(&self) -> &Path {
         &self.sock
+    }
+
+    /// The companion binary this instance was spawned from.
+    pub fn bin(&self) -> &Path {
+        &self.bin
     }
 
     /// Block until the companion's gRPC socket accepts a connection, or `deadline`. Each
@@ -391,6 +400,7 @@ impl IdbCompanion {
         IdbCompanion {
             child,
             sock: PathBuf::from("/nonexistent/glass-idb-test.sock"),
+            bin: PathBuf::from("/nonexistent/idb_companion"),
             stderr_log: PathBuf::from("/nonexistent/glass-idb-test.stderr.log"),
         }
     }
