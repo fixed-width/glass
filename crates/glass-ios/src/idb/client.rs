@@ -118,9 +118,32 @@ fn unimplemented_event_error_with(
     ))
 }
 
-/// [`unimplemented_event_error_with`] for a companion whose build info has not been read.
+/// How long the companion's `--version` may take while an error is already being reported.
+/// `--version` needs no simulator and returns near-instantly, so this only bounds a wedged binary.
+const BUILD_INFO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The companion's own `--version` output, or `None` if it could not be read.
+///
+/// Echoed raw and never parsed: idb prints a build date and no version number, and that format
+/// is not glass's to depend on. This runs while another error is already being reported, so every
+/// failure — unrunnable binary, non-zero exit, blown deadline, empty output — answers `None`
+/// rather than replacing the error it was called to explain.
+fn build_info(bin: &Path) -> Option<String> {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("--version");
+    let out =
+        glass_core::run_bounded(&mut cmd, BUILD_INFO_TIMEOUT, "idb_companion --version").ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// [`unimplemented_event_error_with`], reading the companion's build info first.
 fn unimplemented_event_error(bin: &Path, status: &tonic::Status) -> GlassError {
-    unimplemented_event_error_with(bin, status, None)
+    let info = build_info(bin);
+    unimplemented_event_error_with(bin, status, info)
 }
 
 impl IdbClient {
@@ -332,6 +355,78 @@ mod tests {
     fn a_different_code_carrying_the_same_text_is_not_an_unimplemented_event() {
         let status = tonic::Status::internal("Unrecognized request.event");
         assert!(!unimplemented_event(&status));
+    }
+
+    /// A stub companion whose `--version` prints a build line and which **rejects any other
+    /// argv**, so a test using it also pins that `--version` is the flag actually passed. A
+    /// system binary cannot stand in here: GNU `/bin/echo` interprets `--version` and prints
+    /// its own banner where macOS `/bin/echo` echoes the string.
+    fn stub_companion(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("stub_companion");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 64\n\
+             echo '{\"build_date\":\"Aug 12 2022\",\"build_time\":\"08:41:50\"}'\n",
+        )
+        .expect("write the stub companion");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+        bin
+    }
+
+    #[test]
+    fn build_info_reports_what_the_binary_printed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let info = build_info(&stub_companion(dir.path())).expect("the stub exits 0");
+        assert_eq!(
+            info, r#"{"build_date":"Aug 12 2022","build_time":"08:41:50"}"#,
+            "the raw output is carried through, unparsed"
+        );
+    }
+
+    #[test]
+    fn build_info_gives_up_when_the_binary_prints_but_fails() {
+        // A companion that writes to stdout and then exits non-zero has not reported a build;
+        // its output must not be quoted back as though it had.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("failing_companion");
+        std::fs::write(&bin, "#!/bin/sh\necho 'not a build line'\nexit 3\n").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(build_info(&bin), None);
+    }
+
+    #[test]
+    fn build_info_gives_up_rather_than_failing_when_the_binary_cannot_run() {
+        // The give-up path is live: this runs while another error is already being reported,
+        // so a binary that cannot be executed must yield None, not an error and not a hang.
+        assert!(build_info(std::path::Path::new("/nonexistent/idb_companion")).is_none());
+    }
+
+    #[test]
+    fn the_error_carries_the_build_info_when_it_is_available() {
+        let err = unimplemented_event_error_with(
+            std::path::Path::new("/somewhere/idb_companion"),
+            &tonic::Status::invalid_argument("Unrecognized request.event"),
+            Some("{\"build_date\":\"Aug 12 2022\"}".to_string()),
+        );
+        assert!(err.to_string().contains("Aug 12 2022"), "{err}");
+    }
+
+    #[test]
+    fn the_error_stands_alone_when_the_build_info_is_unavailable() {
+        let err = unimplemented_event_error_with(
+            std::path::Path::new("/somewhere/idb_companion"),
+            &tonic::Status::invalid_argument("Unrecognized request.event"),
+            None,
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("does not implement"), "{msg}");
+        assert!(
+            !msg.contains("--version"),
+            "no dangling half-sentence: {msg}"
+        );
     }
 
     #[test]
