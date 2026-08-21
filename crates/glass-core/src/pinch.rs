@@ -13,6 +13,16 @@ use crate::platform::Segment;
 /// smaller than that delivery error cannot be told apart from it.
 pub const SCALE_EPSILON: f64 = 0.05;
 
+/// The band around 1 that [`SCALE_EPSILON`] describes, written out rather than computed.
+///
+/// Do not go back to comparing `(scale - 1.0).abs()` against the epsilon: `1.05 - 1.0` is not
+/// `0.05` in `f64`, so that boundary is one no input can land on. `scale` itself reaches exactly
+/// `1.05` and `0.95` — 200px separating to 210 or 190. `scale_bounds_match_the_epsilon` keeps
+/// them in step.
+pub const SCALE_MAX: f64 = 1.05;
+/// The lower end of the band; see [`SCALE_MAX`].
+pub const SCALE_MIN: f64 = 0.95;
+
 /// A two-finger pinch: where it is centred, how far apart the fingers start, and the factor
 /// their separation changes by.
 ///
@@ -100,7 +110,7 @@ impl Pinch {
         let start = separation((a.from_x, a.from_y), (b.from_x, b.from_y));
         let end = separation((a.to_x, a.to_y), (b.to_x, b.to_y));
         let scale = end / start;
-        if (scale - 1.0).abs() < SCALE_EPSILON {
+        if scale > SCALE_MIN && scale < SCALE_MAX {
             return Err(separation_held(a, b, scale));
         }
         Ok(Pinch {
@@ -146,10 +156,10 @@ fn axis_turned(a: &Segment, b: &Segment) -> bool {
     };
     let start = angle((a.from_x, a.from_y), (b.from_x, b.from_y));
     let end = angle((a.to_x, a.to_y), (b.to_x, b.to_y));
-    let mut turn = (end - start).abs();
-    if turn > std::f64::consts::PI {
-        turn = std::f64::consts::TAU - turn; // the short way round
-    }
+    let raw = (end - start).abs();
+    // The short way round, as a min rather than a `> PI` branch: at exactly PI the arms agree
+    // (`TAU - PI == PI`), so that comparison is undecidable by any test.
+    let turn = raw.min(std::f64::consts::TAU - raw);
     turn > (1.0 / separation((a.from_x, a.from_y), (b.from_x, b.from_y))).atan()
 }
 
@@ -329,6 +339,47 @@ mod tests {
             f64::from(u32::MAX),
             "the full i32 span, not a wrapped one"
         );
+    }
+
+    #[test]
+    fn scale_bounds_match_the_epsilon() {
+        // The bounds are literals so the comparison has a reachable boundary; this keeps them
+        // honest about the epsilon they claim to be.
+        assert!((SCALE_MAX - 1.0 - SCALE_EPSILON).abs() < 1e-12);
+        assert!((1.0 - SCALE_MIN - SCALE_EPSILON).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_shrink_to_exactly_the_lower_bound_is_a_pinch() {
+        // 200 -> 190 is exactly 0.95 in f64, the boundary the band excludes.
+        let p = Pinch::classify(&[seg((100, 400), (105, 400)), seg((300, 400), (295, 400))])
+            .expect("exactly the lower bound is a scale change");
+        assert_eq!(p.scale, SCALE_MIN);
+    }
+
+    #[test]
+    fn a_pan_along_a_vertical_axis_is_a_pan() {
+        // The axis is pi/2 rather than 0, so a sum in place of the difference no longer reads
+        // as no turn at all.
+        let g = [seg((100, 400), (150, 400)), seg((100, 600), (150, 600))];
+        assert_eq!(Pinch::classify(&g), Err(NotAPinch::Pan));
+    }
+
+    #[test]
+    fn a_small_rotation_is_still_a_rotation() {
+        // A 0.1 rad swing at separation 200: far above the one-pixel tolerance, far below the
+        // one a mistaken `1.0 % sep` or `1.0 * sep` would produce.
+        let g = [seg((100, 400), (100, 400)), seg((300, 400), (299, 420))];
+        assert_eq!(Pinch::classify(&g), Err(NotAPinch::Rotation));
+    }
+
+    #[test]
+    fn an_axis_crossing_the_half_turn_mark_turns_the_short_way() {
+        // The axis points left, so one pixel of perpendicular travel flips atan2 from +pi to
+        // -pi — a raw difference of nearly a full turn. Taken the long way round it reads as a
+        // rotation instead of a pan.
+        let g = [seg((100, 400), (100, 400)), seg((60, 400), (60, 399))];
+        assert_eq!(Pinch::classify(&g), Err(NotAPinch::Pan));
     }
 
     #[test]
