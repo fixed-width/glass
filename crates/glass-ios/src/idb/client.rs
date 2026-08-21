@@ -39,6 +39,12 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct IdbClient {
     rt: Runtime,
     client: CompanionServiceClient<Channel>,
+    /// The companion binary serving this channel, so an error can name what refused a call.
+    bin: PathBuf,
+    /// Read **when the companion was spawned**. Do not re-read it at error time: right after a
+    /// user replaces the binary as the error advises, that reports a fresh build as evidence
+    /// the old one is in the way.
+    build_info: Option<String>,
 }
 
 /// Budget for one `hid` stream. A `HidSwipe`/`HidDelay`/`HidPinch` plays out over
@@ -86,9 +92,67 @@ fn map_timed<T, E: std::fmt::Display>(
     }
 }
 
+/// Fold one `hid` outcome into a `Result`. An event this build does not implement is reported
+/// as that; everything else keeps the generic folding every other RPC gets.
+///
+/// Do not inline this back into [`IdbClient::hid`]: the predicate and the message were each
+/// tested there while the choice between them was not, so the suite passed with the feature
+/// gone.
+fn map_hid_outcome<T>(
+    bin: &Path,
+    build_info: Option<&str>,
+    timeout: Duration,
+    outcome: std::result::Result<
+        std::result::Result<T, tonic::Status>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Result<()> {
+    match outcome {
+        Ok(Err(status)) if unimplemented_event(&status) => Err(unimplemented_event_error_with(
+            bin,
+            &status,
+            build_info.map(str::to_owned),
+        )),
+        other => map_timed("idb hid", timeout, other).map(|_| ()),
+    }
+}
+
+/// Whether `status` is idb refusing an event its build does not implement.
+///
+/// Observed against companion 1.1.8: an unimplemented event and a malformed one both come back
+/// as `InvalidArgument`, so only the marker text separates them. If that wording ever drifts
+/// this answers `false` and the caller gets the generic folding, which still carries idb's own
+/// message — a worse-framed cause, never a swallowed one.
+fn unimplemented_event(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::InvalidArgument
+        && status.message().contains("Unrecognized request.event")
+}
+
+/// The error for an event this companion does not implement, with its build info injected.
+///
+/// Reports what was observed: the binary that refused, and idb's own words. It does not say
+/// which builds carry the event — this process cannot check that, and an unverifiable claim
+/// cannot be kept true — so it points at the setup guide for where to get one instead.
+fn unimplemented_event_error_with(
+    bin: &Path,
+    status: &tonic::Status,
+    info: Option<String>,
+) -> GlassError {
+    let build = match info {
+        Some(text) => format!(" Its --version reports: {text}."),
+        None => String::new(),
+    };
+    GlassError::Backend(format!(
+        "the idb_companion at {} does not implement this event: it answered {:?}.{build} \
+         See docs/how-to/setup-ios.md for companion requirements.",
+        bin.display(),
+        status.message()
+    ))
+}
+
 impl IdbClient {
     /// Connect to `idb_companion`'s gRPC over the Unix socket at `sock`.
-    pub fn connect(sock: &Path) -> Result<IdbClient> {
+    pub fn connect(sock: &Path, bin: &Path, build_info: Option<&str>) -> Result<IdbClient> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -117,6 +181,8 @@ impl IdbClient {
         Ok(IdbClient {
             rt,
             client: CompanionServiceClient::new(channel),
+            bin: bin.to_path_buf(),
+            build_info: build_info.map(str::to_owned),
         })
     }
 
@@ -138,6 +204,8 @@ impl IdbClient {
         IdbClient {
             rt,
             client: CompanionServiceClient::new(channel),
+            bin: PathBuf::from("/nonexistent/idb_companion"),
+            build_info: None,
         }
     }
 
@@ -191,8 +259,10 @@ impl IdbClient {
             let stream = tokio_stream::iter(events);
             tokio::time::timeout(timeout, client.hid(stream)).await
         });
-        map_timed("idb hid", timeout, outcome)?;
-        Ok(())
+        // Swapping this line for a bare `map_timed` compiles and keeps every off-device test
+        // green; only `a_pinch_is_accepted_by_a_companion_that_implements_it`, run on-box
+        // against a companion that predates the event, catches it.
+        map_hid_outcome(&self.bin, self.build_info.as_deref(), timeout, outcome)
     }
 
     /// Guard the `block_on` threading invariant (see the type doc): calling an RPC from a
@@ -215,6 +285,59 @@ mod tests {
 
     use super::*;
 
+    /// The acceptance leg for glass#117: a pinch built by the injector is accepted and executed
+    /// by a real companion. CI cannot run this — it needs a booted Simulator and a companion
+    /// that implements the event.
+    ///
+    /// Point `GLASS_IDB_COMPANION` at a companion that implements the event. To confirm the
+    /// pinch also *lands* as two contacts, run it with a foreground app whose touch handler
+    /// logs `event.allTouches.count` and watch for two.
+    ///
+    /// ```sh
+    /// GLASS_IOS_UDID=<udid> GLASS_IDB_COMPANION=<path> \
+    ///   cargo test -p glass-ios --lib a_pinch_is_accepted -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "on-box only: needs a booted iOS Simulator and a companion that implements HIDPinch"]
+    fn a_pinch_is_accepted_by_a_companion_that_implements_it() {
+        use crate::injector::IdbInjector;
+        use glass_core::{PointerEvent, Segment};
+
+        let udid = std::env::var("GLASS_IOS_UDID").expect("set GLASS_IOS_UDID to a booted sim");
+        let companion =
+            crate::idb::companion::IdbCompanion::spawn(&udid).expect("idb_companion must start");
+        let client =
+            IdbClient::connect(companion.socket(), companion.bin(), companion.build_info())
+                .expect("companion must accept a client");
+
+        // A spread about the middle of an iPhone 17 in device px (1206x2622, scale 3): fingers
+        // 240px either side of centre move out to 480px, a scale of 2.0.
+        let events = IdbInjector::new(3.0)
+            .pointer_events(&PointerEvent::Gesture {
+                pointers: vec![
+                    Segment {
+                        from_x: 363,
+                        from_y: 1311,
+                        to_x: 123,
+                        to_y: 1311,
+                    },
+                    Segment {
+                        from_x: 843,
+                        from_y: 1311,
+                        to_x: 1083,
+                        to_y: 1311,
+                    },
+                ],
+                duration_ms: 1000,
+            })
+            .expect("a symmetric spread classifies as a pinch");
+
+        client.hid(events).expect(
+            "the companion must accept HIDPinch; a build that does not implement it is named \
+             in this error along with its --version output",
+        );
+    }
+
     /// The scale glass drives every tap at comes from this RPC (`platform::discover_scale`),
     /// so a target that stops reporting a usable density silently breaks input placement.
     /// That the value is *correct* is proved end-to-end by `tests/drive_integration.rs`,
@@ -230,7 +353,8 @@ mod tests {
         let companion =
             crate::idb::companion::IdbCompanion::spawn(&udid).expect("idb_companion must start");
         let client =
-            IdbClient::connect(companion.socket()).expect("companion must accept a client");
+            IdbClient::connect(companion.socket(), companion.bin(), companion.build_info())
+                .expect("companion must accept a client");
 
         let d = client
             .describe()
@@ -266,6 +390,135 @@ mod tests {
         assert!(
             matches!(err, GlassError::Backend(ref msg) if msg.contains("timed out after 30s")),
             "{err:?}"
+        );
+    }
+
+    fn elapsed() -> tokio::time::error::Elapsed {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>())
+                .await
+                .expect_err("a pending future must time out")
+        })
+    }
+
+    #[test]
+    fn an_unimplemented_event_is_routed_to_the_named_error() {
+        // The routing itself: without this, deleting the arm that chooses leaves every other
+        // test in this file passing.
+        let outcome: std::result::Result<std::result::Result<(), _>, _> = Ok(Err(
+            tonic::Status::invalid_argument("Unrecognized request.event"),
+        ));
+        let err = map_hid_outcome(
+            std::path::Path::new("/somewhere/idb_companion"),
+            Some("build 2022"),
+            Duration::from_secs(30),
+            outcome,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("does not implement"), "{msg}");
+        assert!(
+            msg.contains("build 2022"),
+            "the spawn-time build info: {msg}"
+        );
+    }
+
+    #[test]
+    fn any_other_status_keeps_the_generic_folding() {
+        // The guard must not annex genuine argument errors — they keep idb's own message.
+        let outcome: std::result::Result<std::result::Result<(), _>, _> = Ok(Err(
+            tonic::Status::invalid_argument("Unrecognized press.direction"),
+        ));
+        let err = map_hid_outcome(
+            std::path::Path::new("/somewhere/idb_companion"),
+            None,
+            Duration::from_secs(30),
+            outcome,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("idb hid:"),
+            "the generic folding's own prefix: {msg}"
+        );
+        assert!(msg.contains("press.direction"), "{msg}");
+        assert!(!msg.contains("does not implement"), "{msg}");
+    }
+
+    #[test]
+    fn a_blown_deadline_still_reports_as_a_timeout() {
+        let err = map_hid_outcome(
+            std::path::Path::new("/somewhere/idb_companion"),
+            None,
+            Duration::from_secs(30),
+            Err::<std::result::Result<(), tonic::Status>, _>(elapsed()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out after 30s"), "{err}");
+    }
+
+    #[test]
+    fn an_unrecognized_event_is_recognised_as_an_unimplemented_one() {
+        let status = tonic::Status::invalid_argument("Unrecognized request.event");
+        assert!(unimplemented_event(&status));
+    }
+
+    #[test]
+    fn another_invalid_argument_is_not_mistaken_for_an_unimplemented_event() {
+        // A genuine argument error must keep its own message rather than being reported as
+        // an out-of-date companion.
+        let status = tonic::Status::invalid_argument("Unrecognized press.direction");
+        assert!(!unimplemented_event(&status));
+    }
+
+    #[test]
+    fn a_different_code_carrying_the_same_text_is_not_an_unimplemented_event() {
+        let status = tonic::Status::internal("Unrecognized request.event");
+        assert!(!unimplemented_event(&status));
+    }
+
+    #[test]
+    fn the_error_carries_the_build_info_when_it_is_available() {
+        let err = unimplemented_event_error_with(
+            std::path::Path::new("/somewhere/idb_companion"),
+            &tonic::Status::invalid_argument("Unrecognized request.event"),
+            Some("{\"build_date\":\"Aug 12 2022\"}".to_string()),
+        );
+        assert!(err.to_string().contains("Aug 12 2022"), "{err}");
+    }
+
+    #[test]
+    fn the_error_stands_alone_when_the_build_info_is_unavailable() {
+        let err = unimplemented_event_error_with(
+            std::path::Path::new("/somewhere/idb_companion"),
+            &tonic::Status::invalid_argument("Unrecognized request.event"),
+            None,
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("does not implement"), "{msg}");
+        assert!(
+            !msg.contains("--version"),
+            "no dangling half-sentence: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_unimplemented_event_error_names_the_binary_that_refused_it() {
+        let err = unimplemented_event_error_with(
+            std::path::Path::new("/somewhere/idb_companion"),
+            &tonic::Status::invalid_argument("Unrecognized request.event"),
+            None,
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("/somewhere/idb_companion"), "{msg}");
+        assert!(msg.contains("does not implement"), "{msg}");
+        assert!(
+            msg.contains("Unrecognized request.event"),
+            "the cause is quoted: {msg}"
         );
     }
 
@@ -368,7 +621,12 @@ mod tests {
     #[test]
     fn connect_to_missing_socket_errors_cleanly() {
         // A UDS path that does not exist -> a structured Backend error, no panic. Runs on Linux.
-        let err = IdbClient::connect(std::path::Path::new("/nonexistent/idb.sock")).unwrap_err();
+        let err = IdbClient::connect(
+            std::path::Path::new("/nonexistent/idb.sock"),
+            std::path::Path::new("/nonexistent/idb_companion"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, glass_core::GlassError::Backend(_)), "{err:?}");
     }
 
@@ -387,7 +645,11 @@ mod tests {
         {
             let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         }
-        match IdbClient::connect(&sock) {
+        match IdbClient::connect(
+            &sock,
+            std::path::Path::new("/nonexistent/idb_companion"),
+            None,
+        ) {
             // Refused at the transport layer — the common case.
             Err(GlassError::Backend(_)) => {}
             // `connect` optimistically succeeded; the first RPC must then fail cleanly.

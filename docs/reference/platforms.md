@@ -90,8 +90,9 @@ non-goals.
 **§ iOS** is Simulator-only — macOS host required (`xcrun`/`simctl` ship with Xcode). Capture,
 clipboard, and logs work over `simctl`; pointer/keyboard input (tap, type, swipe, scroll) and the
 accessibility tree (snapshot, click-element, set-value) run over `idb_companion` (`brew install
-idb-companion`), which glass spawns and manages per Simulator. Multi-touch gestures (`glass_gesture`)
-are the exception — not supported on the Simulator yet. Without `idb_companion` the input and
+idb-companion`), which glass spawns and manages per Simulator. `glass_gesture` actuates a two-finger
+pinch, given a companion that implements idb's `HIDPinch`; other multi-touch gestures are refused by
+name. Without `idb_companion` the input and
 accessibility tools return an unsupported error; capture, logs, and clipboard keep working. Window
 support is geometry/focus only: resize and move are unsupported, since Simulator apps, like a real
 device, are always fullscreen. The host-independent logic — device resolution, `simctl`/`idb`
@@ -120,7 +121,7 @@ AccessibilityService for a Compose-rich a11y tree + high-fidelity `set_value`); 
 in CI and validated on-device. An **iOS** backend drives native apps on an iOS Simulator over `xcrun
 simctl` — capture, clipboard, logs, and a managed Simulator (attach-or-boot, matching the Android
 emulator's model); window support is geometry/focus only. Pointer/keyboard input and the accessibility
-tree run over `idb_companion` (multi-touch gestures excepted). Its host-independent logic is
+tree run over `idb_companion` (multi-touch is a two-finger pinch only). Its host-independent logic is
 unit-tested in CI; the on-box path against a real Simulator is exercised by `#[ignore]`d integration
 tests on a macOS host. The **macOS** backend
 (ScreenCaptureKit capture, CGEvent input, AXUIElement windows/logs, an AXUIElement accessibility tree,

@@ -240,6 +240,12 @@ fn stderr_log_path(dir: &Path, udid: &str, pid: u32) -> PathBuf {
 pub struct IdbCompanion {
     child: Child,
     sock: PathBuf,
+    /// The binary this companion was spawned from, carried rather than re-resolved so an
+    /// error can name the binary that actually ran even if the environment has since changed.
+    bin: PathBuf,
+    /// That binary's `--version` output, read at spawn. Read here rather than at error time
+    /// because only here is the file on disk still the image this process is running.
+    build_info: Option<String>,
     /// File the companion's stderr is redirected to, read back on a startup failure so the
     /// error names the real cause; removed on `Drop`.
     stderr_log: PathBuf,
@@ -316,6 +322,8 @@ impl IdbCompanion {
         let mut this = IdbCompanion {
             child,
             sock,
+            bin: bin.to_path_buf(),
+            build_info: build_info(bin),
             stderr_log,
         };
         // From here any failure must kill+reap the child, so a failed spawn never leaks it.
@@ -330,6 +338,16 @@ impl IdbCompanion {
     /// The Unix socket `idb_companion` serves gRPC on.
     pub fn socket(&self) -> &Path {
         &self.sock
+    }
+
+    /// The companion binary this instance was spawned from.
+    pub fn bin(&self) -> &Path {
+        &self.bin
+    }
+
+    /// What that binary's `--version` printed at spawn, if it could be read.
+    pub fn build_info(&self) -> Option<&str> {
+        self.build_info.as_deref()
     }
 
     /// Block until the companion's gRPC socket accepts a connection, or `deadline`. Each
@@ -391,6 +409,8 @@ impl IdbCompanion {
         IdbCompanion {
             child,
             sock: PathBuf::from("/nonexistent/glass-idb-test.sock"),
+            bin: PathBuf::from("/nonexistent/idb_companion"),
+            build_info: None,
             stderr_log: PathBuf::from("/nonexistent/glass-idb-test.stderr.log"),
         }
     }
@@ -411,12 +431,118 @@ impl Drop for IdbCompanion {
 /// immediately if the socket file exists but nothing is listening yet — so polling it
 /// keeps [`IdbCompanion::await_socket`]'s deadline responsive; the first real RPC carries
 /// its own timeout as a backstop.
+/// How long the companion's `--version` may take. Generous: it only has to bound a binary that
+/// never answers, on a path whose result is a decoration rather than a diagnosis.
+const BUILD_INFO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The companion's own `--version` output, or `None` if it could not be read.
+///
+/// Echoed raw and never parsed: the format is idb's, not glass's to depend on. Every failure —
+/// unrunnable binary, non-zero exit, blown deadline, empty output — answers `None`, because this
+/// only decorates an error raised for another reason.
+fn build_info(bin: &Path) -> Option<String> {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("--version");
+    let out =
+        glass_core::run_bounded(&mut cmd, BUILD_INFO_TIMEOUT, "idb_companion --version").ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 fn socket_ready(sock: &Path) -> bool {
     UnixStream::connect(sock).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Write `script` as an executable at `dir/name` and return once it can actually be exec'd.
+    ///
+    /// Writing a file and immediately exec'ing it races `cargo test`'s parallel threads: a
+    /// sibling's `Command::spawn` forks while this fixture's write fd is still open, the child
+    /// inherits it, and the exec fails `ETXTBSY` until that fork exec's and CLOEXEC closes it.
+    /// Frequent enough under `cargo test`'s parallel threads to fail runs reliably.
+    ///
+    /// Do not move this wait into `build_info`: a real installed companion is never mid-write,
+    /// so `ETXTBSY` there is a genuine fault. Without it here, a test expecting `None` passes on
+    /// a binary that never ran.
+    fn write_executable(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join(name);
+        std::fs::write(&bin, script).expect("write the stub");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::process::Command::new(&bin).arg("--version").output() {
+                Ok(_) => return bin,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{} stayed ETXTBSY past the deadline",
+                        bin.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("exec {}: {e}", bin.display()),
+            }
+        }
+    }
+
+    /// A stub companion whose `--version` prints a build line and which **rejects any other
+    /// argv**, so a test using it also pins that `--version` is the flag actually passed. A
+    /// system binary cannot stand in here: GNU `/bin/echo` interprets `--version` and prints
+    /// its own banner where macOS `/bin/echo` echoes the string.
+    fn stub_companion(dir: &std::path::Path) -> std::path::PathBuf {
+        write_executable(
+            dir,
+            "stub_companion",
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 64\n\
+             echo '{\"build_date\":\"Aug 12 2022\",\"build_time\":\"08:41:50\"}'\n",
+        )
+    }
+
+    #[test]
+    fn build_info_reports_what_the_binary_printed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let info = build_info(&stub_companion(dir.path())).expect("the stub exits 0");
+        assert_eq!(
+            info, r#"{"build_date":"Aug 12 2022","build_time":"08:41:50"}"#,
+            "the raw output is carried through, unparsed"
+        );
+    }
+
+    #[test]
+    fn build_info_gives_up_when_the_binary_prints_nothing() {
+        // Without this the message reads "Its --version reports: ." — the dangling
+        // half-sentence, by a route the stands-alone test cannot see.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = write_executable(dir.path(), "silent_companion", "#!/bin/sh\nexit 0\n");
+        assert_eq!(build_info(&bin), None);
+    }
+
+    #[test]
+    fn build_info_gives_up_when_the_binary_prints_but_fails() {
+        // Output from a run that then failed must not be quoted back as a build.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = write_executable(
+            dir.path(),
+            "failing_companion",
+            "#!/bin/sh\necho 'not a build line'\nexit 3\n",
+        );
+        assert_eq!(build_info(&bin), None);
+    }
+
+    #[test]
+    fn build_info_gives_up_rather_than_failing_when_the_binary_cannot_run() {
+        // The give-up path is live: this runs while another error is already being reported,
+        // so a binary that cannot be executed must yield None, not an error and not a hang.
+        assert!(build_info(std::path::Path::new("/nonexistent/idb_companion")).is_none());
+    }
+
     use super::*;
     use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt;

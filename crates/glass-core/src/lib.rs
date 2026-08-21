@@ -33,6 +33,9 @@ pub use pixels::{SourceOrder, to_opaque_rgba, to_opaque_rgba_in_place};
 pub mod drag;
 pub use drag::{DragGesture, DragSink, run_drag};
 
+pub mod pinch;
+pub use pinch::{NotAPinch, Pinch};
+
 pub mod chord;
 pub use chord::{CHORD_DWELL, ChordSink, run_chord};
 
