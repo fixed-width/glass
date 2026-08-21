@@ -7,9 +7,10 @@
 //! logic still compiles and unit-tests on the free Linux runner.
 //! The Simulator is the isolation boundary, so there is no sandbox machinery
 //! here. The backend drives input (tap, type, swipe, scroll) and reads the
-//! accessibility tree via `idb_companion`; multi-touch gestures are
-//! unsupported — `idb`'s raw-touch primitive is single-contact, with no
-//! general N-finger primitive to drive them.
+//! accessibility tree via `idb_companion`, including a two-finger pinch.
+//! Other multi-touch gestures are unsupported: idb's only multi-contact
+//! primitive is a canned pinch, and its raw-touch primitive is
+//! single-contact, so there is nothing to drive an N-finger gesture with.
 #![cfg(unix)]
 #![forbid(unsafe_code)]
 
@@ -49,7 +50,14 @@ fn capabilities_with(companion: bool) -> CapabilityMap {
         } else {
             CapabilityStatus::requires_setup("needs idb_companion (observe-only without it)")
         },
-        multi_touch: CapabilityStatus::unsupported(Some("idb provides single-contact touch only")),
+        multi_touch: if companion {
+            CapabilityStatus::degraded(
+                "two-finger pinch only, and only with an idb_companion that implements it; \
+                 rotation, two-finger pan and 3-or-more fingers are unsupported",
+            )
+        } else {
+            CapabilityStatus::unsupported(Some("needs idb_companion (observe-only without it)"))
+        },
         clipboard: CapabilityStatus::new(
             Support::Supported,
             Some("paste needs on-screen consent (Allow Paste)"),
@@ -95,13 +103,27 @@ mod capability_tests {
     }
 
     #[test]
+    fn multi_touch_is_degraded_with_a_companion_and_unsupported_without() {
+        let with = capabilities_with(true);
+        assert_eq!(with.multi_touch.status, Support::Degraded);
+        let note = with
+            .multi_touch
+            .note
+            .expect("a degraded cell explains itself");
+        assert!(note.contains("pinch"), "{note}");
+        assert!(
+            note.contains("rotation"),
+            "the refused gestures are named: {note}"
+        );
+        assert_eq!(
+            capabilities_with(false).multi_touch.status,
+            Support::Unsupported
+        );
+    }
+
+    #[test]
     fn constant_cells_are_fixed() {
         let c = capabilities_with(true);
-        assert_eq!(c.multi_touch.status, Support::Unsupported);
-        assert_eq!(
-            c.multi_touch.note,
-            Some("idb provides single-contact touch only")
-        );
         assert_eq!(c.clipboard.status, Support::Supported);
         assert_eq!(
             c.clipboard.note,
@@ -114,15 +136,17 @@ mod capability_tests {
 #[cfg(test)]
 mod unsupported_message_tests {
     #[test]
-    fn multi_touch_unsupported_message_names_the_ios_backend_with_note() {
+    fn multi_touch_unsupported_message_names_the_ios_backend_with_its_reason() {
+        // The injector supplies the refused gesture as the note rather than a blanket
+        // capability string, so this pins the shape that reaches the caller.
         let msg = glass_core::GlassError::unsupported(
             "multi_touch",
             crate::BACKEND,
-            crate::capabilities().multi_touch.note,
+            Some("a rotation, which is a different gesture from a pinch"),
         )
         .to_string();
         assert!(msg.contains("ios backend"), "{msg}");
-        assert!(msg.contains("single-contact"), "{msg}");
+        assert!(msg.contains("rotation"), "{msg}");
         assert!(msg.contains("glass_capabilities"), "{msg}");
     }
 

@@ -301,8 +301,8 @@ modified drags, and Ctrl+scroll.
 
 On the **iOS** backend `glass_click`, `glass_type`, `glass_key`, `glass_scroll`, and `glass_drag`
 drive the Simulator over `idb_companion` (install it — see
-[setup-ios.md](../how-to/setup-ios.md#input--accessibility)); only multi-touch `glass_gesture` is
-unsupported there.
+[setup-ios.md](../how-to/setup-ios.md#input--accessibility)). `glass_gesture` actuates a
+two-finger pinch there; other multi-touch gestures are unsupported.
 
 ### `glass_click`
 
@@ -387,8 +387,14 @@ do it.
 - `pointers` (array of `{ from{x,y}, to{x,y} }`, **required**) — 2–10 window-relative segments.
 - `duration_ms` (integer, default 250) — gesture span.
 
-**Platform notes:** multi-touch is currently implemented on the Android backend (via the optional
-on-device companion agent); other backends return `Unsupported`.
+**Platform notes:** the Android backend (via the optional on-device companion agent) actuates
+arbitrary multi-pointer gestures. The **iOS** backend actuates a **two-finger pinch** — two pointers
+whose separation changes — and refuses anything else by name: a rotation, a two-finger pan, a
+stationary pair, or three or more pointers. The pinch is delivered about the midpoint of the two
+start points, so a gesture that holds one finger still still moves both; what is preserved is the
+scale, which is what a pinch recognizer reports. It also needs an `idb_companion` that implements
+the event — glass reports the binary and its build info if yours does not. Other backends return
+`Unsupported`.
 
 ### `glass_do`
 

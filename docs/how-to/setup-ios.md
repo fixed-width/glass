@@ -9,8 +9,8 @@ Select the backend per launch with `glass_start`'s `backend: "ios"`, or make it 
 
 > The iOS backend captures, reads logs, drives the clipboard, and — with `idb_companion` installed
 > (see [Input & accessibility](#input--accessibility)) — taps, types, swipes, scrolls, and reads the
-> accessibility tree. Multi-touch gestures (`glass_gesture`) are the one exception, not yet supported
-> on the Simulator.
+> accessibility tree, and actuates a two-finger pinch. Other multi-touch gestures (rotation,
+> two-finger pan, three or more fingers) are not supported on the Simulator.
 
 ## Install Xcode and a Simulator runtime
 
@@ -96,9 +96,17 @@ With `idb_companion` on `PATH`, these tools work against the Simulator:
   `glass_set_value`, `glass_wait_for_element`, and `glass_scroll_to_element` read and drive the
   Simulator's accessibility tree.
 
-Multi-touch gestures (`glass_gesture` — pinch, rotate, two-finger swipe) are not supported on the
-Simulator yet. If `idb_companion` isn't installed, the input and accessibility tools return an
-unsupported error, while capture, logs, and clipboard keep working.
+- **Pinch** — `glass_gesture` with two pointers whose separation changes actuates a real
+  two-finger pinch. Rotation, two-finger pan and three-or-more-finger gestures are refused by name:
+  idb's only multi-contact primitive is a pinch, so there is nothing to map them onto.
+
+  A pinch also needs an `idb_companion` that implements idb's `HIDPinch` event. As of 2026-08,
+  Homebrew ships idb-companion 1.1.8 (built August 2022), which does not; prebuilt newer companions
+  are published on idb's GitHub releases. If yours does not implement it, glass names the binary and
+  quotes its `--version` output rather than failing opaquely.
+
+If `idb_companion` isn't installed, the input and accessibility tools return an unsupported error,
+while capture, logs, and clipboard keep working.
 
 glass finds `idb_companion` on `PATH`, and — because a `.app` / LaunchAgent launch runs with a
 minimal `PATH` that omits Homebrew's bindir — also probes the standard Homebrew locations

@@ -16,8 +16,8 @@ independently instead of asking the user "does this look right?".
 glass drives apps as an external black box, so it works with any native GUI app regardless of toolkit
 or language. It has two Linux backends (**X11** and **Wayland**), a **Windows** backend, an
 **Android** backend (an AVD emulator, driven over `adb` from any host), an **iOS** backend (native
-apps in the Simulator over `xcrun simctl`, with input and the accessibility tree via `idb_companion`;
-multi-touch gestures excepted), and a **macOS** backend, behind a platform-agnostic core.
+apps in the Simulator over `xcrun simctl`, with input and the accessibility tree via `idb_companion`,
+including a two-finger pinch), and a **macOS** backend, behind a platform-agnostic core.
 
 ## See it
 
