@@ -48,17 +48,25 @@ fn touch(pt: proto::Point, down: bool) -> proto::HidEvent {
     press(Action::Touch(HidTouch { point: Some(pt) }), down)
 }
 
-/// Smallest pinch radius idb can actuate as two contacts, in points. Below this the fingers
-/// fall inside a single fingertip and the pair is not resolvable as two. Bounded in points, not
-/// pixels, because the pixel equivalent moves with the device's scale.
+/// Smallest pinch radius glass will actuate, in points.
+///
+/// Measured against idb companion 1.5.0b3 on iOS 26.5: two contacts arrive at any radius, even
+/// 1pt, but below roughly 5pt no pinch is recognised from them at all, and near the floor the
+/// delivered factor is far from the request — a requested 2.0 arrives as 1.333 at an 8pt
+/// radius against 1.905 at 80pt. 8pt keeps a margin over the smallest radius measured to be
+/// recognised; below it glass would actuate a gesture that silently does nothing.
+///
+/// Bounded in points, not pixels, because the pixel equivalent moves with the device's scale.
 const MIN_RADIUS_PT: f64 = 8.0;
 
-fn pinch(center: proto::Point, scale: f64, radius_pt: f64, secs: f64) -> proto::HidEvent {
+/// `factor` is the pinch's scale factor; the density that converts pixels to points is the
+/// injector's own `scale`, and the two are deliberately not spelled alike here.
+fn pinch(center: proto::Point, factor: f64, radius_pt: f64, secs: f64) -> proto::HidEvent {
     use proto::hid_event::{Event, HidPinch};
     proto::HidEvent {
         event: Some(Event::Pinch(HidPinch {
             center: Some(center),
-            scale,
+            scale: factor,
             duration: secs,
             radius: radius_pt,
         })),
@@ -104,10 +112,11 @@ impl IdbInjector {
     /// Maps one glass `PointerEvent` to the idb HID events that reproduce it as a
     /// touch: a `Click` is a touch DOWN then UP at the same point (repeated `count`
     /// times); a `Drag`/`Scroll` is a single swipe; a `Move` is empty — touch has no
-    /// hover state to emit. `Gesture` (multi-touch) returns `Unsupported` rather than
-    /// silently dropping the pointers: idb's raw-touch primitive is single-contact
-    /// (a second concurrent DOWN relocates the same finger), so there is no general
-    /// N-finger primitive to map it to.
+    /// hover state to emit. A `Gesture` whose two fingers change separation becomes one
+    /// pinch; any other multi-touch gesture returns `Unsupported` naming what it was,
+    /// rather than silently actuating something else — the raw-touch primitive is
+    /// single-contact (a second concurrent DOWN relocates the same finger), so a pinch is
+    /// the only multi-contact gesture there is anything to map onto.
     pub fn pointer_events(&self, e: &PointerEvent) -> Result<Vec<proto::HidEvent>> {
         let s = self.scale;
         Ok(match *e {
@@ -143,8 +152,8 @@ impl IdbInjector {
                 let ey = y - dy * SCROLL_STEP_PX;
                 vec![swipe(point(x, y, s), point(ex, ey, s), SWIPE_SECS)]
             }
-            // idb's only multi-contact primitive is a canned pinch: centre, scale and radius,
-            // with the fingers on one axis. A gesture whose separation changes maps onto it; a
+            // The vendored proto's `HIDEvent` oneof carries one multi-contact event: a canned
+            // pinch of centre, scale and radius. A separation change maps onto it; a
             // pan or a rotation is a different gesture, refused by name rather than actuated as
             // something the caller did not ask for.
             PointerEvent::Gesture {
@@ -448,7 +457,61 @@ mod pointer_tests {
                 250,
             ))
             .unwrap_err();
-        assert!(err.to_string().contains('3'), "{err}");
+        assert!(err.to_string().contains("only a two-finger pinch"), "{err}");
+    }
+
+    #[test]
+    fn a_radius_of_exactly_the_minimum_is_accepted() {
+        // 16px apart at scale 1.0 is a radius of exactly MIN_RADIUS_PT. The bound is a floor,
+        // not an exclusive one, and nothing else in the suite sits on it.
+        let g = vec![seg((292, 400), (286, 400)), seg((308, 400), (330, 400))];
+        let events = IdbInjector::new(1.0)
+            .pointer_events(&gesture(g, 250))
+            .expect("exactly the minimum radius is actuated");
+        let Some(proto::hid_event::Event::Pinch(p)) = &events[0].event else {
+            panic!("expected a pinch event")
+        };
+        assert_eq!(p.radius, MIN_RADIUS_PT);
+    }
+
+    #[test]
+    fn an_asymmetric_pinch_is_actuated_symmetrically_about_the_start_midpoint() {
+        // The fidelity deviation documented in docs/reference/tools.md: the caller holds the
+        // left finger still, and idb moves both. What survives is the scale factor. Pinned
+        // here because that promise is agent-facing and nothing else asserts it.
+        use proto::hid_event::Event;
+        let events = IdbInjector::new(1.0)
+            .pointer_events(&gesture(
+                vec![seg((100, 400), (100, 400)), seg((300, 400), (400, 400))],
+                250,
+            ))
+            .expect("an asymmetric spread actuates");
+        let Some(Event::Pinch(p)) = &events[0].event else {
+            panic!("expected a pinch event")
+        };
+        let center = p.center.as_ref().expect("a pinch carries its centre");
+        assert_eq!(
+            (center.x, center.y),
+            (200.0, 400.0),
+            "centred between the two START points, not on the held finger"
+        );
+        assert_eq!(p.radius, 100.0);
+        assert_eq!(p.scale, 1.5, "the requested factor is what survives");
+    }
+
+    #[test]
+    fn a_pinch_too_small_to_deliver_says_so_and_says_what_to_do() {
+        // The reason has to survive the trip from core through the injector's error, or the
+        // agent is told only that multi_touch is unsupported.
+        let err = IdbInjector::new(1.0)
+            .pointer_events(&gesture(
+                vec![seg((100, 400), (98, 400)), seg((300, 400), (302, 400))],
+                250,
+            ))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("2.0%"), "it names how small: {msg}");
+        assert!(msg.contains("larger"), "and what to do instead: {msg}");
     }
 
     #[test]
@@ -461,11 +524,14 @@ mod pointer_tests {
             .pointer_events(&gesture(close.clone(), 250))
             .unwrap_err();
         assert!(err.to_string().contains("too close"), "{err}");
-        assert!(
-            IdbInjector::new(1.0)
-                .pointer_events(&gesture(close, 250))
-                .is_ok()
-        );
+        use proto::hid_event::Event;
+        let events = IdbInjector::new(1.0)
+            .pointer_events(&gesture(close, 250))
+            .expect("the same pixels at scale 1.0 are a 9pt radius, over the floor");
+        let Some(Event::Pinch(p)) = &events[0].event else {
+            panic!("expected a pinch event")
+        };
+        assert_eq!(p.radius, 9.0, "and the radius is the one that cleared it");
     }
 
     #[test]
