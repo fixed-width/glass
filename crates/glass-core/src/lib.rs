@@ -34,7 +34,7 @@ pub mod drag;
 pub use drag::{DragGesture, DragSink, run_drag};
 
 pub mod pinch;
-pub use pinch::{NotAPinch, PAN_MIN_PX, Pinch, SCALE_EPSILON};
+pub use pinch::{NotAPinch, Pinch};
 
 pub mod chord;
 pub use chord::{CHORD_DWELL, ChordSink, run_chord};
