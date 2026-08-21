@@ -291,6 +291,58 @@ mod tests {
     /// ```sh
     /// GLASS_IOS_UDID=<udid> cargo test -p glass-ios --lib describe_reports -- --ignored --nocapture
     /// ```
+    /// The acceptance leg for glass#117: a pinch built by the injector is accepted and executed
+    /// by a real companion. CI cannot run this — as of 2026-08 the companion Homebrew ships
+    /// rejects `HIDPinch`, and that rejection is the thing under test.
+    ///
+    /// Point `GLASS_IDB_COMPANION` at a companion that implements the event. To confirm the
+    /// pinch also *lands* as two contacts, run it with a foreground app whose touch handler
+    /// logs `event.allTouches.count` and watch for two.
+    ///
+    /// ```sh
+    /// GLASS_IOS_UDID=<udid> GLASS_IDB_COMPANION=<path> \
+    ///   cargo test -p glass-ios --lib a_pinch_is_accepted -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "on-box only: needs a booted iOS Simulator and a companion that implements HIDPinch"]
+    fn a_pinch_is_accepted_by_a_companion_that_implements_it() {
+        use crate::injector::IdbInjector;
+        use glass_core::{PointerEvent, Segment};
+
+        let udid = std::env::var("GLASS_IOS_UDID").expect("set GLASS_IOS_UDID to a booted sim");
+        let companion =
+            crate::idb::companion::IdbCompanion::spawn(&udid).expect("idb_companion must start");
+        let client = IdbClient::connect(companion.socket(), companion.bin())
+            .expect("companion must accept a client");
+
+        // A spread about the middle of an iPhone 17 in device px (1206x2622, scale 3): fingers
+        // 240px either side of centre move out to 480px, a scale of 2.0.
+        let events = IdbInjector::new(3.0)
+            .pointer_events(&PointerEvent::Gesture {
+                pointers: vec![
+                    Segment {
+                        from_x: 363,
+                        from_y: 1311,
+                        to_x: 123,
+                        to_y: 1311,
+                    },
+                    Segment {
+                        from_x: 843,
+                        from_y: 1311,
+                        to_x: 1083,
+                        to_y: 1311,
+                    },
+                ],
+                duration_ms: 1000,
+            })
+            .expect("a symmetric spread classifies as a pinch");
+
+        client.hid(events).expect(
+            "the companion must accept HIDPinch; a build that does not implement it is named \
+             in this error along with its --version output",
+        );
+    }
+
     #[test]
     #[ignore = "on-box only: needs a macOS host with a booted iOS Simulator and idb_companion"]
     fn describe_reports_a_usable_density_with_no_app_running() {
@@ -357,22 +409,55 @@ mod tests {
         assert!(!unimplemented_event(&status));
     }
 
+    /// `ETXTBSY`. Spelled as its raw errno rather than pulling in `libc` for one constant, or
+    /// `ErrorKind::ExecutableFileBusy`, which is not yet stable to match on.
+    const ETXTBSY: i32 = 26;
+
+    /// Write `script` as an executable at `dir/name` and return once it can actually be exec'd.
+    ///
+    /// Writing a file and immediately exec'ing it races `cargo test`'s parallel threads: a
+    /// sibling's `Command::spawn` forks while this fixture's write fd is still open, the child
+    /// inherits it, and the exec fails `ETXTBSY` until that fork exec's and CLOEXEC closes it.
+    /// Measured on this box at ~16% of attempts with forking siblings.
+    ///
+    /// The wait belongs here and nowhere else: a test that expects `build_info` to answer `None`
+    /// would otherwise pass for the wrong reason, on a binary that never ran. `build_info` must
+    /// **not** retry — a real installed companion is never being written, so `ETXTBSY` there
+    /// would be a genuine fault to report rather than a race to paper over.
+    fn write_executable(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join(name);
+        std::fs::write(&bin, script).expect("write the stub");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::process::Command::new(&bin).arg("--version").output() {
+                Ok(_) => return bin,
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{} stayed ETXTBSY past the deadline",
+                        bin.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("exec {}: {e}", bin.display()),
+            }
+        }
+    }
+
     /// A stub companion whose `--version` prints a build line and which **rejects any other
     /// argv**, so a test using it also pins that `--version` is the flag actually passed. A
     /// system binary cannot stand in here: GNU `/bin/echo` interprets `--version` and prints
     /// its own banner where macOS `/bin/echo` echoes the string.
     fn stub_companion(dir: &std::path::Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let bin = dir.join("stub_companion");
-        std::fs::write(
-            &bin,
+        write_executable(
+            dir,
+            "stub_companion",
             "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 64\n\
              echo '{\"build_date\":\"Aug 12 2022\",\"build_time\":\"08:41:50\"}'\n",
         )
-        .expect("write the stub companion");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stub executable");
-        bin
     }
 
     #[test]
@@ -389,11 +474,12 @@ mod tests {
     fn build_info_gives_up_when_the_binary_prints_but_fails() {
         // A companion that writes to stdout and then exits non-zero has not reported a build;
         // its output must not be quoted back as though it had.
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
-        let bin = dir.path().join("failing_companion");
-        std::fs::write(&bin, "#!/bin/sh\necho 'not a build line'\nexit 3\n").expect("write");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let bin = write_executable(
+            dir.path(),
+            "failing_companion",
+            "#!/bin/sh\necho 'not a build line'\nexit 3\n",
+        );
         assert_eq!(build_info(&bin), None);
     }
 
