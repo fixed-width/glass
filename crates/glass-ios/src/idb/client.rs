@@ -41,11 +41,9 @@ pub struct IdbClient {
     client: CompanionServiceClient<Channel>,
     /// The companion binary serving this channel, so an error can name what refused a call.
     bin: PathBuf,
-    /// That binary's `--version` output as read **when the companion was spawned**, so the
-    /// error describes the process actually serving this channel. Re-reading it at error time
-    /// would report whatever is on disk by then — which, right after a user follows the
-    /// error's own advice and replaces the binary, is a fresh build quoted as evidence that
-    /// an old one is in the way.
+    /// Read **when the companion was spawned**. Do not re-read it at error time: right after a
+    /// user replaces the binary as the error advises, that reports a fresh build as evidence
+    /// the old one is in the way.
     build_info: Option<String>,
 }
 
@@ -97,9 +95,9 @@ fn map_timed<T, E: std::fmt::Display>(
 /// Fold one `hid` outcome into a `Result`. An event this build does not implement is reported
 /// as that; everything else keeps the generic folding every other RPC gets.
 ///
-/// Split out of [`IdbClient::hid`] so the routing itself is assertable without a live
-/// companion — the predicate and the message were each tested while the choice between them
-/// was not, which is the shape that passes while the feature is gone.
+/// Do not inline this back into [`IdbClient::hid`]: the predicate and the message were each
+/// tested there while the choice between them was not, so the suite passed with the feature
+/// gone.
 fn map_hid_outcome<T>(
     bin: &Path,
     build_info: Option<&str>,
@@ -261,13 +259,9 @@ impl IdbClient {
             let stream = tokio_stream::iter(events);
             tokio::time::timeout(timeout, client.hid(stream)).await
         });
-        // The fold lives in `map_hid_outcome` so the routing is assertable off-device. This
-        // one delegating line is the residue that is not: swapping it for a bare `map_timed`
-        // compiles and keeps every off-device test green. Only the on-box leg catches it —
-        // `a_pinch_is_accepted_by_a_companion_that_implements_it` run against a companion that
-        // predates the event, where the named error is the observable difference. There is no
-        // in-process gRPC fake in this crate to close it with, and inventing one for a single
-        // delegation would buy less than it costs.
+        // Swapping this line for a bare `map_timed` compiles and keeps every off-device test
+        // green; only `a_pinch_is_accepted_by_a_companion_that_implements_it`, run on-box
+        // against a companion that predates the event, catches it.
         map_hid_outcome(&self.bin, self.build_info.as_deref(), timeout, outcome)
     }
 
@@ -413,8 +407,8 @@ mod tests {
 
     #[test]
     fn an_unimplemented_event_is_routed_to_the_named_error() {
-        // The routing itself, not the predicate or the formatter: without this, deleting the
-        // arm that chooses between them leaves every other test in this file passing.
+        // The routing itself: without this, deleting the arm that chooses leaves every other
+        // test in this file passing.
         let outcome: std::result::Result<std::result::Result<(), _>, _> = Ok(Err(
             tonic::Status::invalid_argument("Unrecognized request.event"),
         ));

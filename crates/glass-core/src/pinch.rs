@@ -8,20 +8,16 @@ use crate::platform::Segment;
 /// Below this fractional change in finger separation, a gesture is not a scale change.
 /// Compared against `|scale - 1.0|` — an absolute deviation from 1, not a percentage.
 ///
-/// Measured against idb companion 1.5.0b3 on iOS 26.5, pinching about the middle of an
-/// iPhone 17: a requested 2.0 arrived as 1.905 and a requested 0.5 as 0.513, both within about
-/// 5% of the request at a start radius of 80pt. That error grows sharply as the radius shrinks
-/// — the same requested 2.0 arrives as 1.333 at an 8pt radius — so 5% is the floor at a
-/// comfortable radius rather than a guarantee. A request smaller than the delivery error cannot
-/// be told apart from it.
+/// Measured against idb companion 1.5.0b3 on iOS 26.5: a requested 2.0 arrived as 1.905 and a
+/// requested 0.5 as 0.513 at an 80pt start radius, and the same 2.0 as 1.333 at 8pt. A request
+/// smaller than that delivery error cannot be told apart from it.
 pub const SCALE_EPSILON: f64 = 0.05;
 
 /// A two-finger pinch: where it is centred, how far apart the fingers start, and the factor
 /// their separation changes by.
 ///
-/// `#[non_exhaustive]` so [`Pinch::classify`] stays the only way to build one, in the house
-/// style of `GlassError::Bounded`. The fields are read freely; what is prevented is a literal
-/// that skips the classification, which is where every invariant below comes from.
+/// `#[non_exhaustive]` so [`Pinch::classify`] stays the only way to build one — the field
+/// invariants below all come from it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Pinch {
@@ -118,9 +114,8 @@ impl Pinch {
 /// What a pair whose separation held actually is: nothing moved, the axis turned, the pair
 /// travelled, or a pinch too small to deliver.
 ///
-/// Rotation is told from pan by the **axis** through the fingers, not by midpoint travel: a
-/// rotation about one held finger moves the midpoint exactly as a pan does, and reporting that
-/// as a pan would name a gesture the caller did not ask for.
+/// Do not go back to telling rotation from pan by midpoint travel: a rotation about one held
+/// finger moves the midpoint exactly as a pan does.
 fn separation_held(a: &Segment, b: &Segment, scale: f64) -> NotAPinch {
     let still = |s: &Segment| s.from_x == s.to_x && s.from_y == s.to_y;
     if still(a) && still(b) {
@@ -129,8 +124,8 @@ fn separation_held(a: &Segment, b: &Segment, scale: f64) -> NotAPinch {
     if axis_turned(a, b) {
         return NotAPinch::Rotation;
     }
-    // Separation and axis both held, so the pair is rigid; if it also went nowhere it was the
-    // `Stationary` case above, and a rigid pair that moved has travelled.
+    // Separation and axis both held, so the pair is rigid; one that also went nowhere was
+    // `Stationary` above.
     if midpoint((a.from_x, a.from_y), (b.from_x, b.from_y))
         != midpoint((a.to_x, a.to_y), (b.to_x, b.to_y))
     {
@@ -142,10 +137,8 @@ fn separation_held(a: &Segment, b: &Segment, scale: f64) -> NotAPinch {
 /// Whether the axis through the two fingers turned by more than one pixel of perpendicular
 /// travel at this separation.
 ///
-/// The tolerance scales with the separation rather than being a constant: one pixel is the
-/// finest distinction integer coordinates can express, so a turn below `atan(1 / separation)`
-/// is rounding rather than a gesture. Widely separated fingers resolve a finer rotation than
-/// close ones, which is the physical truth of it.
+/// One pixel is the finest distinction integer coordinates can express, so a turn below
+/// `atan(1 / separation)` is rounding rather than a gesture.
 fn axis_turned(a: &Segment, b: &Segment) -> bool {
     let angle = |from: (i32, i32), to: (i32, i32)| {
         let d = |p: i32, q: i32| (i64::from(p) - i64::from(q)) as f64;
@@ -222,8 +215,7 @@ mod tests {
 
     #[test]
     fn fingers_converging_on_one_point_scale_to_zero() {
-        // The natural "pinch fully closed". The starts are distinct, so this is not
-        // `Coincident`; idb actuates it as a pinch all the way in.
+        // The starts are distinct, so this is not `Coincident`; idb actuates it fully closed.
         let p = Pinch::classify(&[seg((100, 400), (200, 400)), seg((300, 400), (200, 400))])
             .expect("converging on one point is a pinch, not an error");
         assert_eq!(p.scale, 0.0);
@@ -270,19 +262,17 @@ mod tests {
 
     #[test]
     fn a_rotation_about_one_held_finger_is_a_rotation_not_a_pan() {
-        // `a` is pinned and `b` swings a quarter turn around it, so the midpoint travels just
-        // as far as a pan's would. Only the axis tells these two apart.
+        // `b` swings a quarter turn about the pinned `a`, so the midpoint travels as a pan's
+        // would — only the axis tells them apart.
         let g = [seg((100, 400), (100, 400)), seg((300, 400), (100, 600))];
         assert_eq!(Pinch::classify(&g), Err(NotAPinch::Rotation));
     }
 
     #[test]
     fn exactly_one_pixel_of_perpendicular_travel_is_not_a_rotation() {
-        // The tolerance boundary, and it is exactly constructible: `b` moves one pixel
-        // perpendicular at a separation of 200, so the turn is `atan2(1, 200)`, bit-identical
-        // to the `atan(1 / 200)` tolerance. The axis must turn by *more* than one pixel, so
-        // this falls through as a separation change too small to deliver rather than being
-        // reported as a rotation.
+        // `b` moves one pixel perpendicular at a separation of 200, so the turn is
+        // `atan2(1, 200)` — bit-identical to the `atan(1 / 200)` tolerance, and the boundary is
+        // therefore exactly constructible.
         let g = [seg((100, 400), (100, 400)), seg((300, 400), (300, 401))];
         assert!(
             matches!(Pinch::classify(&g), Err(NotAPinch::ScaleTooSmall(_))),
@@ -299,8 +289,7 @@ mod tests {
 
     #[test]
     fn a_spread_under_the_epsilon_is_named_as_a_too_small_pinch() {
-        // 200 -> 204 is 2%: a pinch, but a smaller one than can be delivered. It must not be
-        // reported as some other gesture the caller never asked for.
+        // 200 -> 204 is 2%: a pinch, but smaller than can be delivered.
         let g = [seg((100, 400), (98, 400)), seg((300, 400), (302, 400))];
         let Err(NotAPinch::ScaleTooSmall(scale)) = Pinch::classify(&g) else {
             panic!("expected ScaleTooSmall, got {:?}", Pinch::classify(&g));
@@ -320,9 +309,8 @@ mod tests {
 
     #[test]
     fn a_spread_just_outside_the_epsilon_is_a_pinch() {
-        // 200 -> 210 is exactly 1.05, and `1.05 - 1.0` in f64 is 0.050000000000000044, not
-        // below the epsilon. The smallest spread this accepts, pinning the constant from the
-        // side no other test covers.
+        // `1.05 - 1.0` in f64 is 0.050000000000000044, not below the epsilon — the smallest
+        // spread this accepts.
         let p = Pinch::classify(&[seg((100, 400), (95, 400)), seg((300, 400), (305, 400))])
             .expect("just outside the epsilon is a scale change");
         assert_eq!(p.scale, 1.05);
@@ -330,8 +318,7 @@ mod tests {
 
     #[test]
     fn separation_does_not_overflow_on_extreme_coordinates() {
-        // `classify` is public API with no stated precondition on coordinate range. Subtracting
-        // in i32 panics in debug and wraps to a confidently wrong answer in release.
+        // Subtracting in i32 panics in debug and wraps to a wrong answer in release.
         let g = [
             seg((i32::MAX, 0), (i32::MAX, 0)),
             seg((i32::MIN, 0), (i32::MIN, 0)),

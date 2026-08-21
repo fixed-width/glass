@@ -439,7 +439,7 @@ const BUILD_INFO_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Echoed raw and never parsed: the format is idb's, not glass's to depend on. Every failure —
 /// unrunnable binary, non-zero exit, blown deadline, empty output — answers `None`, because this
-/// only ever decorates an error raised for another reason and must not become one itself.
+/// only decorates an error raised for another reason.
 fn build_info(bin: &Path) -> Option<String> {
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("--version");
@@ -466,11 +466,9 @@ mod tests {
     /// inherits it, and the exec fails `ETXTBSY` until that fork exec's and CLOEXEC closes it.
     /// Frequent enough under `cargo test`'s parallel threads to fail runs reliably.
     ///
-    /// The wait belongs here and nowhere else: a test that expects `build_info` to answer `None`
-    /// would otherwise pass for the wrong reason, on a binary that never ran. `build_info` must
-    /// **not** retry: a real installed companion is never mid-write, so `ETXTBSY` there is a
-    /// genuine fault, and swallowing it as `None` is the deliberate trade for a path that only
-    /// decorates someone else's error.
+    /// Do not move this wait into `build_info`: a real installed companion is never mid-write,
+    /// so `ETXTBSY` there is a genuine fault. Without it here, a test expecting `None` passes on
+    /// a binary that never ran.
     fn write_executable(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let bin = dir.join(name);
@@ -519,9 +517,8 @@ mod tests {
 
     #[test]
     fn build_info_gives_up_when_the_binary_prints_nothing() {
-        // A companion that exits 0 in silence has reported no build. Without this the message
-        // would read "Its --version reports: ." — the dangling half-sentence the stands-alone
-        // test exists to prevent, arriving by a route that test cannot see.
+        // Without this the message reads "Its --version reports: ." — the dangling
+        // half-sentence, by a route the stands-alone test cannot see.
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = write_executable(dir.path(), "silent_companion", "#!/bin/sh\nexit 0\n");
         assert_eq!(build_info(&bin), None);
@@ -529,8 +526,7 @@ mod tests {
 
     #[test]
     fn build_info_gives_up_when_the_binary_prints_but_fails() {
-        // A companion that writes to stdout and then exits non-zero has not reported a build;
-        // its output must not be quoted back as though it had.
+        // Output from a run that then failed must not be quoted back as a build.
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = write_executable(
             dir.path(),

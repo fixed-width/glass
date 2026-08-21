@@ -50,17 +50,15 @@ fn touch(pt: proto::Point, down: bool) -> proto::HidEvent {
 
 /// Smallest pinch radius glass will actuate, in points.
 ///
-/// Measured against idb companion 1.5.0b3 on iOS 26.5: two contacts arrive at any radius, even
-/// 1pt, but below roughly 5pt no pinch is recognised from them at all, and near the floor the
-/// delivered factor is far from the request — a requested 2.0 arrives as 1.333 at an 8pt
-/// radius against 1.905 at 80pt. 8pt keeps a margin over the smallest radius measured to be
-/// recognised; below it glass would actuate a gesture that silently does nothing.
+/// Measured against idb companion 1.5.0b3 on iOS 26.5: two contacts arrive at any radius down
+/// to 1pt, but below roughly 5pt no pinch is recognised from them at all. 8pt keeps a margin
+/// over that, so glass does not actuate a gesture that silently does nothing.
 ///
 /// Bounded in points, not pixels, because the pixel equivalent moves with the device's scale.
 const MIN_RADIUS_PT: f64 = 8.0;
 
-/// `factor` is the pinch's scale factor; the density that converts pixels to points is the
-/// injector's own `scale`, and the two are deliberately not spelled alike here.
+/// `factor` is the pinch's scale factor, not the injector's px-per-point `scale` — kept
+/// spelled apart on purpose.
 fn pinch(center: proto::Point, factor: f64, radius_pt: f64, secs: f64) -> proto::HidEvent {
     use proto::hid_event::{Event, HidPinch};
     proto::HidEvent {
@@ -153,9 +151,8 @@ impl IdbInjector {
                 vec![swipe(point(x, y, s), point(ex, ey, s), SWIPE_SECS)]
             }
             // The vendored proto's `HIDEvent` oneof carries one multi-contact event: a canned
-            // pinch of centre, scale and radius. A separation change maps onto it; a
-            // pan or a rotation is a different gesture, refused by name rather than actuated as
-            // something the caller did not ask for.
+            // pinch of centre, scale and radius. A pan or a rotation is refused by name
+            // rather than actuated as something the caller did not ask for.
             PointerEvent::Gesture {
                 ref pointers,
                 duration_ms,
@@ -462,8 +459,8 @@ mod pointer_tests {
 
     #[test]
     fn a_radius_of_exactly_the_minimum_is_accepted() {
-        // 16px apart at scale 1.0 is a radius of exactly MIN_RADIUS_PT. The bound is a floor,
-        // not an exclusive one, and nothing else in the suite sits on it.
+        // 16px apart at scale 1.0 is exactly MIN_RADIUS_PT — the bound is a floor, not an
+        // exclusive one.
         let g = vec![seg((292, 400), (286, 400)), seg((308, 400), (330, 400))];
         let events = IdbInjector::new(1.0)
             .pointer_events(&gesture(g, 250))
@@ -476,9 +473,8 @@ mod pointer_tests {
 
     #[test]
     fn an_asymmetric_pinch_is_actuated_symmetrically_about_the_start_midpoint() {
-        // The fidelity deviation documented in docs/reference/tools.md: the caller holds the
-        // left finger still, and idb moves both. What survives is the scale factor. Pinned
-        // here because that promise is agent-facing and nothing else asserts it.
+        // The agent-facing promise in docs/reference/tools.md: the caller holds the left
+        // finger still, idb moves both, and the scale factor survives.
         use proto::hid_event::Event;
         let events = IdbInjector::new(1.0)
             .pointer_events(&gesture(
@@ -501,8 +497,8 @@ mod pointer_tests {
 
     #[test]
     fn a_pinch_too_small_to_deliver_says_so_and_says_what_to_do() {
-        // The reason has to survive the trip from core through the injector's error, or the
-        // agent is told only that multi_touch is unsupported.
+        // The reason must survive from core into the error, or the agent is told only that
+        // multi_touch is unsupported.
         let err = IdbInjector::new(1.0)
             .pointer_events(&gesture(
                 vec![seg((100, 400), (98, 400)), seg((300, 400), (302, 400))],
@@ -516,9 +512,8 @@ mod pointer_tests {
 
     #[test]
     fn fingers_closer_than_one_fingertip_are_refused_in_points() {
-        // 18px apart at scale 3.0 is a 3pt radius — under MIN_RADIUS_PT. The same pixel
-        // separation at scale 1.0 is a legitimate pinch, so the bound must be applied in
-        // points, the unit idb actuates in.
+        // The same 18px separation is a 3pt radius at scale 3.0 and a 9pt one at scale 1.0,
+        // so the bound has to be applied in points.
         let close = vec![seg((291, 400), (285, 400)), seg((309, 400), (330, 400))];
         let err = IdbInjector::new(3.0)
             .pointer_events(&gesture(close.clone(), 250))
