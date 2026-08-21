@@ -20,7 +20,7 @@ use glass_core::coords::pixel_geometry_from_content_rect;
 use glass_core::platform::WindowGeometry;
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, GlassError,
-    Result, WalkBudget, normalize_description, read_back_confirms, write_took_no_effect,
+    Result, WalkBudget, read_back_confirms, write_took_no_effect,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
@@ -113,10 +113,9 @@ impl Accessibility for MacosA11y {
         // and it is rejected here rather than silently overwritten.
         let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
         let role = mapping::map_role(&ax_role, read_subrole(&el, &ax_role).as_deref());
-        // Same two reads, in the same order, that `walk` derived this element's `name` from —
-        // through the same helper, so a fingerprint can never be computed from a differently-read
-        // name and reject an element that never moved.
-        let name = read_label(&el, attr::TITLE).or_else(|| read_label(&el, attr::DESCRIPTION));
+        // Same rule `walk` derived this element's `name` from, so a fingerprint can never be
+        // computed from a differently-read name and reject an element that never moved.
+        let name = read_name(&el);
         let bounds = window_relative_rect(&el, scale, &ctx.window);
         if !target.matches(role, name.as_deref())
             || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
@@ -188,7 +187,7 @@ impl Accessibility for MacosA11y {
         let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
         let role = mapping::map_role(&ax_role, read_subrole(&el, &ax_role).as_deref());
         // `name` derived exactly as in `walk` and `set_value` — see there.
-        let name = read_label(&el, attr::TITLE).or_else(|| read_label(&el, attr::DESCRIPTION));
+        let name = read_name(&el);
         let bounds = window_relative_rect(&el, scale, &ctx.window);
         if !target.matches(role, name.as_deref())
             || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
@@ -379,6 +378,14 @@ fn read_label(el: &AXUIElement, attr_name: &str) -> Option<String> {
     }
 }
 
+/// `el`'s `name` as [`walk`] records it: the fingerprint `set_value`/`invoke` re-walk against has
+/// to come from the same reads, in the same order, that produced the name in the snapshot.
+fn read_name(el: &AXUIElement) -> Option<String> {
+    mapping::name(read_label(el, attr::TITLE), || {
+        read_label(el, attr::DESCRIPTION)
+    })
+}
+
 /// `el`'s `AXSubrole`, but only for the base roles whose subrole actually changes the mapped
 /// role ([`mapping::subrole_matters`]) — every other node skips the AX IPC round-trip and gets
 /// `None`.
@@ -459,25 +466,14 @@ fn walk(
             _ => ax_role,
         }
     };
-    // Name = title, else description — both stable labels (e.g. `setAccessibilityLabel`
-    // surfaces as `AXDescription`). Never fold in `AXValue`: it's volatile content, and a
-    // node's name must stay stable for the `AxTarget` fingerprint `set_value` relies on.
-    //
-    // Which attribute is left to describe the node depends on which one named it, so both
-    // labels are decided in one place. `AXDescription` costs at most one read per node either
-    // way: as the name when there is no title, as the description only when there IS a title
-    // and no `AXHelp`.
-    let (name, secondary) = match read_label(el, attr::TITLE) {
-        Some(title) => (
-            Some(title),
-            read_label(el, attr::HELP).or_else(|| read_label(el, attr::DESCRIPTION)),
-        ),
-        None => (
-            read_label(el, attr::DESCRIPTION),
-            read_label(el, attr::HELP),
-        ),
-    };
-    let description = secondary.and_then(|raw| normalize_description(&raw, name.as_deref()));
+    // Which attribute names the node and which is left to describe it is decided in
+    // `mapping::labels`, where the rule — and which reads it declines to make — is unit-tested on
+    // any host.
+    let (name, description) = mapping::labels(
+        read_label(el, attr::TITLE),
+        || read_label(el, attr::DESCRIPTION),
+        || read_label(el, attr::HELP),
+    );
     let value = ffi::attribute_string(el, attr::VALUE);
     let bounds = window_relative_rect(el, scale, win);
     let states = mapping::map_states(&gather_states(el, role));
