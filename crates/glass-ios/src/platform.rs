@@ -49,7 +49,8 @@ impl IdbDriver {
     /// Spawn the companion for `udid` and connect an input client to its socket.
     fn start(udid: &str) -> Result<IdbDriver> {
         let companion = IdbCompanion::spawn(udid)?;
-        let client = IdbClient::connect(companion.socket(), companion.bin())?;
+        let client =
+            IdbClient::connect(companion.socket(), companion.bin(), companion.build_info())?;
         Ok(IdbDriver { companion, client })
     }
 
@@ -377,7 +378,11 @@ impl IosPlatform {
         let Some(driver) = self.driver.as_ref() else {
             return Ok(None);
         };
-        let client = IdbClient::connect(driver.companion.socket(), driver.companion.bin())?;
+        let client = IdbClient::connect(
+            driver.companion.socket(),
+            driver.companion.bin(),
+            driver.companion.build_info(),
+        )?;
         Ok(Some(crate::a11y::IosA11y::new(client)))
     }
 }

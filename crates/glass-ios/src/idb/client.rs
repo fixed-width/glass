@@ -41,6 +41,12 @@ pub struct IdbClient {
     client: CompanionServiceClient<Channel>,
     /// The companion binary serving this channel, so an error can name what refused a call.
     bin: PathBuf,
+    /// That binary's `--version` output as read **when the companion was spawned**, so the
+    /// error describes the process actually serving this channel. Re-reading it at error time
+    /// would report whatever is on disk by then — which, right after a user follows the
+    /// error's own advice and replaces the binary, is a fresh build quoted as evidence that
+    /// an old one is in the way.
+    build_info: Option<String>,
 }
 
 /// Budget for one `hid` stream. A `HidSwipe`/`HidDelay`/`HidPinch` plays out over
@@ -88,9 +94,37 @@ fn map_timed<T, E: std::fmt::Display>(
     }
 }
 
-/// Whether `status` is idb refusing an event its build does not implement. The companion answers
-/// `InvalidArgument` for both an unimplemented event and a malformed one, so the marker text is
-/// what separates them.
+/// Fold one `hid` outcome into a `Result`. An event this build does not implement is reported
+/// as that; everything else keeps the generic folding every other RPC gets.
+///
+/// Split out of [`IdbClient::hid`] so the routing itself is assertable without a live
+/// companion — the predicate and the message were each tested while the choice between them
+/// was not, which is the shape that passes while the feature is gone.
+fn map_hid_outcome<T>(
+    bin: &Path,
+    build_info: Option<&str>,
+    timeout: Duration,
+    outcome: std::result::Result<
+        std::result::Result<T, tonic::Status>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Result<()> {
+    match outcome {
+        Ok(Err(status)) if unimplemented_event(&status) => Err(unimplemented_event_error_with(
+            bin,
+            &status,
+            build_info.map(str::to_owned),
+        )),
+        other => map_timed("idb hid", timeout, other).map(|_| ()),
+    }
+}
+
+/// Whether `status` is idb refusing an event its build does not implement.
+///
+/// Observed against companion 1.1.8: an unimplemented event and a malformed one both come back
+/// as `InvalidArgument`, so only the marker text separates them. If that wording ever drifts
+/// this answers `false` and the caller gets the generic folding, which still carries idb's own
+/// message — a worse-framed cause, never a swallowed one.
 fn unimplemented_event(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::InvalidArgument
         && status.message().contains("Unrecognized request.event")
@@ -98,9 +132,9 @@ fn unimplemented_event(status: &tonic::Status) -> bool {
 
 /// The error for an event this companion does not implement, with its build info injected.
 ///
-/// It reports what was observed — the binary that refused, and idb's own words — and claims
-/// nothing about which builds carry the event, because that is not a fact this process can
-/// check and a claim that cannot be checked cannot be kept true.
+/// Reports what was observed: the binary that refused, and idb's own words. It does not say
+/// which builds carry the event — this process cannot check that, and an unverifiable claim
+/// cannot be kept true — so it points at the setup guide for where to get one instead.
 fn unimplemented_event_error_with(
     bin: &Path,
     status: &tonic::Status,
@@ -112,43 +146,15 @@ fn unimplemented_event_error_with(
     };
     GlassError::Backend(format!(
         "the idb_companion at {} does not implement this event: it answered {:?}.{build} \
-         A newer idb_companion is required.",
+         See docs/how-to/setup-ios.md for companion requirements.",
         bin.display(),
         status.message()
     ))
 }
 
-/// How long the companion's `--version` may take while an error is already being reported.
-/// `--version` needs no simulator and returns near-instantly, so this only bounds a wedged binary.
-const BUILD_INFO_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The companion's own `--version` output, or `None` if it could not be read.
-///
-/// Echoed raw and never parsed: idb prints a build date and no version number, and that format
-/// is not glass's to depend on. This runs while another error is already being reported, so every
-/// failure — unrunnable binary, non-zero exit, blown deadline, empty output — answers `None`
-/// rather than replacing the error it was called to explain.
-fn build_info(bin: &Path) -> Option<String> {
-    let mut cmd = std::process::Command::new(bin);
-    cmd.arg("--version");
-    let out =
-        glass_core::run_bounded(&mut cmd, BUILD_INFO_TIMEOUT, "idb_companion --version").ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
-}
-
-/// [`unimplemented_event_error_with`], reading the companion's build info first.
-fn unimplemented_event_error(bin: &Path, status: &tonic::Status) -> GlassError {
-    let info = build_info(bin);
-    unimplemented_event_error_with(bin, status, info)
-}
-
 impl IdbClient {
     /// Connect to `idb_companion`'s gRPC over the Unix socket at `sock`.
-    pub fn connect(sock: &Path, bin: &Path) -> Result<IdbClient> {
+    pub fn connect(sock: &Path, bin: &Path, build_info: Option<&str>) -> Result<IdbClient> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -178,6 +184,7 @@ impl IdbClient {
             rt,
             client: CompanionServiceClient::new(channel),
             bin: bin.to_path_buf(),
+            build_info: build_info.map(str::to_owned),
         })
     }
 
@@ -200,6 +207,7 @@ impl IdbClient {
             rt,
             client: CompanionServiceClient::new(channel),
             bin: PathBuf::from("/nonexistent/idb_companion"),
+            build_info: None,
         }
     }
 
@@ -253,14 +261,14 @@ impl IdbClient {
             let stream = tokio_stream::iter(events);
             tokio::time::timeout(timeout, client.hid(stream)).await
         });
-        match outcome {
-            // An event this build does not implement is reported as that, rather than as the
-            // generic backend string every other status folds into.
-            Ok(Err(status)) if unimplemented_event(&status) => {
-                Err(unimplemented_event_error(&self.bin, &status))
-            }
-            other => map_timed("idb hid", timeout, other).map(|_| ()),
-        }
+        // The fold lives in `map_hid_outcome` so the routing is assertable off-device. This
+        // one delegating line is the residue that is not: swapping it for a bare `map_timed`
+        // compiles and keeps every off-device test green. Only the on-box leg catches it —
+        // `a_pinch_is_accepted_by_a_companion_that_implements_it` run against a companion that
+        // predates the event, where the named error is the observable difference. There is no
+        // in-process gRPC fake in this crate to close it with, and inventing one for a single
+        // delegation would buy less than it costs.
+        map_hid_outcome(&self.bin, self.build_info.as_deref(), timeout, outcome)
     }
 
     /// Guard the `block_on` threading invariant (see the type doc): calling an RPC from a
@@ -283,17 +291,9 @@ mod tests {
 
     use super::*;
 
-    /// The scale glass drives every tap at comes from this RPC (`platform::discover_scale`),
-    /// so a target that stops reporting a usable density silently breaks input placement.
-    /// That the value is *correct* is proved end-to-end by `tests/drive_integration.rs`,
-    /// which taps elements by their accessibility bounds and asserts the app responded.
-    ///
-    /// ```sh
-    /// GLASS_IOS_UDID=<udid> cargo test -p glass-ios --lib describe_reports -- --ignored --nocapture
-    /// ```
     /// The acceptance leg for glass#117: a pinch built by the injector is accepted and executed
-    /// by a real companion. CI cannot run this — as of 2026-08 the companion Homebrew ships
-    /// rejects `HIDPinch`, and that rejection is the thing under test.
+    /// by a real companion. CI cannot run this — it needs a booted Simulator and a companion
+    /// that implements the event.
     ///
     /// Point `GLASS_IDB_COMPANION` at a companion that implements the event. To confirm the
     /// pinch also *lands* as two contacts, run it with a foreground app whose touch handler
@@ -312,8 +312,9 @@ mod tests {
         let udid = std::env::var("GLASS_IOS_UDID").expect("set GLASS_IOS_UDID to a booted sim");
         let companion =
             crate::idb::companion::IdbCompanion::spawn(&udid).expect("idb_companion must start");
-        let client = IdbClient::connect(companion.socket(), companion.bin())
-            .expect("companion must accept a client");
+        let client =
+            IdbClient::connect(companion.socket(), companion.bin(), companion.build_info())
+                .expect("companion must accept a client");
 
         // A spread about the middle of an iPhone 17 in device px (1206x2622, scale 3): fingers
         // 240px either side of centre move out to 480px, a scale of 2.0.
@@ -343,14 +344,23 @@ mod tests {
         );
     }
 
+    /// The scale glass drives every tap at comes from this RPC (`platform::discover_scale`),
+    /// so a target that stops reporting a usable density silently breaks input placement.
+    /// That the value is *correct* is proved end-to-end by `tests/drive_integration.rs`,
+    /// which taps elements by their accessibility bounds and asserts the app responded.
+    ///
+    /// ```sh
+    /// GLASS_IOS_UDID=<udid> cargo test -p glass-ios --lib describe_reports -- --ignored --nocapture
+    /// ```
     #[test]
     #[ignore = "on-box only: needs a macOS host with a booted iOS Simulator and idb_companion"]
     fn describe_reports_a_usable_density_with_no_app_running() {
         let udid = std::env::var("GLASS_IOS_UDID").expect("set GLASS_IOS_UDID to a booted sim");
         let companion =
             crate::idb::companion::IdbCompanion::spawn(&udid).expect("idb_companion must start");
-        let client = IdbClient::connect(companion.socket(), companion.bin())
-            .expect("companion must accept a client");
+        let client =
+            IdbClient::connect(companion.socket(), companion.bin(), companion.build_info())
+                .expect("companion must accept a client");
 
         let d = client
             .describe()
@@ -389,6 +399,74 @@ mod tests {
         );
     }
 
+    fn elapsed() -> tokio::time::error::Elapsed {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>())
+                .await
+                .expect_err("a pending future must time out")
+        })
+    }
+
+    #[test]
+    fn an_unimplemented_event_is_routed_to_the_named_error() {
+        // The routing itself, not the predicate or the formatter: without this, deleting the
+        // arm that chooses between them leaves every other test in this file passing.
+        let outcome: std::result::Result<std::result::Result<(), _>, _> = Ok(Err(
+            tonic::Status::invalid_argument("Unrecognized request.event"),
+        ));
+        let err = map_hid_outcome(
+            std::path::Path::new("/somewhere/idb_companion"),
+            Some("build 2022"),
+            Duration::from_secs(30),
+            outcome,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("does not implement"), "{msg}");
+        assert!(
+            msg.contains("build 2022"),
+            "the spawn-time build info: {msg}"
+        );
+    }
+
+    #[test]
+    fn any_other_status_keeps_the_generic_folding() {
+        // The guard must not annex genuine argument errors — they keep idb's own message.
+        let outcome: std::result::Result<std::result::Result<(), _>, _> = Ok(Err(
+            tonic::Status::invalid_argument("Unrecognized press.direction"),
+        ));
+        let err = map_hid_outcome(
+            std::path::Path::new("/somewhere/idb_companion"),
+            None,
+            Duration::from_secs(30),
+            outcome,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("idb hid:"),
+            "the generic folding's own prefix: {msg}"
+        );
+        assert!(msg.contains("press.direction"), "{msg}");
+        assert!(!msg.contains("does not implement"), "{msg}");
+    }
+
+    #[test]
+    fn a_blown_deadline_still_reports_as_a_timeout() {
+        let err = map_hid_outcome(
+            std::path::Path::new("/somewhere/idb_companion"),
+            None,
+            Duration::from_secs(30),
+            Err::<std::result::Result<(), tonic::Status>, _>(elapsed()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out after 30s"), "{err}");
+    }
+
     #[test]
     fn an_unrecognized_event_is_recognised_as_an_unimplemented_one() {
         let status = tonic::Status::invalid_argument("Unrecognized request.event");
@@ -407,87 +485,6 @@ mod tests {
     fn a_different_code_carrying_the_same_text_is_not_an_unimplemented_event() {
         let status = tonic::Status::internal("Unrecognized request.event");
         assert!(!unimplemented_event(&status));
-    }
-
-    /// `ETXTBSY`. Spelled as its raw errno rather than pulling in `libc` for one constant, or
-    /// `ErrorKind::ExecutableFileBusy`, which is not yet stable to match on.
-    const ETXTBSY: i32 = 26;
-
-    /// Write `script` as an executable at `dir/name` and return once it can actually be exec'd.
-    ///
-    /// Writing a file and immediately exec'ing it races `cargo test`'s parallel threads: a
-    /// sibling's `Command::spawn` forks while this fixture's write fd is still open, the child
-    /// inherits it, and the exec fails `ETXTBSY` until that fork exec's and CLOEXEC closes it.
-    /// Measured on this box at ~16% of attempts with forking siblings.
-    ///
-    /// The wait belongs here and nowhere else: a test that expects `build_info` to answer `None`
-    /// would otherwise pass for the wrong reason, on a binary that never ran. `build_info` must
-    /// **not** retry — a real installed companion is never being written, so `ETXTBSY` there
-    /// would be a genuine fault to report rather than a race to paper over.
-    fn write_executable(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let bin = dir.join(name);
-        std::fs::write(&bin, script).expect("write the stub");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stub executable");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            match std::process::Command::new(&bin).arg("--version").output() {
-                Ok(_) => return bin,
-                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "{} stayed ETXTBSY past the deadline",
-                        bin.display()
-                    );
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => panic!("exec {}: {e}", bin.display()),
-            }
-        }
-    }
-
-    /// A stub companion whose `--version` prints a build line and which **rejects any other
-    /// argv**, so a test using it also pins that `--version` is the flag actually passed. A
-    /// system binary cannot stand in here: GNU `/bin/echo` interprets `--version` and prints
-    /// its own banner where macOS `/bin/echo` echoes the string.
-    fn stub_companion(dir: &std::path::Path) -> std::path::PathBuf {
-        write_executable(
-            dir,
-            "stub_companion",
-            "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 64\n\
-             echo '{\"build_date\":\"Aug 12 2022\",\"build_time\":\"08:41:50\"}'\n",
-        )
-    }
-
-    #[test]
-    fn build_info_reports_what_the_binary_printed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let info = build_info(&stub_companion(dir.path())).expect("the stub exits 0");
-        assert_eq!(
-            info, r#"{"build_date":"Aug 12 2022","build_time":"08:41:50"}"#,
-            "the raw output is carried through, unparsed"
-        );
-    }
-
-    #[test]
-    fn build_info_gives_up_when_the_binary_prints_but_fails() {
-        // A companion that writes to stdout and then exits non-zero has not reported a build;
-        // its output must not be quoted back as though it had.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bin = write_executable(
-            dir.path(),
-            "failing_companion",
-            "#!/bin/sh\necho 'not a build line'\nexit 3\n",
-        );
-        assert_eq!(build_info(&bin), None);
-    }
-
-    #[test]
-    fn build_info_gives_up_rather_than_failing_when_the_binary_cannot_run() {
-        // The give-up path is live: this runs while another error is already being reported,
-        // so a binary that cannot be executed must yield None, not an error and not a hang.
-        assert!(build_info(std::path::Path::new("/nonexistent/idb_companion")).is_none());
     }
 
     #[test]
@@ -633,6 +630,7 @@ mod tests {
         let err = IdbClient::connect(
             std::path::Path::new("/nonexistent/idb.sock"),
             std::path::Path::new("/nonexistent/idb_companion"),
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, glass_core::GlassError::Backend(_)), "{err:?}");
@@ -653,7 +651,11 @@ mod tests {
         {
             let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         }
-        match IdbClient::connect(&sock, std::path::Path::new("/nonexistent/idb_companion")) {
+        match IdbClient::connect(
+            &sock,
+            std::path::Path::new("/nonexistent/idb_companion"),
+            None,
+        ) {
             // Refused at the transport layer — the common case.
             Err(GlassError::Backend(_)) => {}
             // `connect` optimistically succeeded; the first RPC must then fail cleanly.
