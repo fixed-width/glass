@@ -350,7 +350,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)] // ~96 MiB buffer — too slow under the Miri interpreter
     fn rejects_oversize_total() {
         // 3 items each just under MAX_ITEM_BYTES → aggregate exceeds MAX_TOTAL_BYTES.
         let chunk = MAX_ITEM_BYTES - 1;

@@ -1,4 +1,4 @@
-//! Pure synthesis *decisions* (no Win32, Miri-checked): which formats are available given the
+//! Pure synthesis *decisions* (no Win32): which formats are available given the
 //! stored set (canonical + synthesizable, canonical-first), and which stored format synthesizes a
 //! requested one. The actual byte conversions live in the `cfg(windows)` hook (code page via
 //! `WideCharToMultiByte`; `CF_BITMAP` via GDI; `CF_DIBV5` via `dib.rs`).
