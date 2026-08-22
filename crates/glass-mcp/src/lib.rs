@@ -6,6 +6,21 @@
 /// `doctor`, and the MCP `initialize` handshake — the crate version itself is pinned at 0.0.0.
 pub const VERSION: &str = env!("GLASS_VERSION");
 
+/// glass's display title, mirrored from `server.json` at build time (see `build.rs`) so the MCP
+/// `initialize` handshake and the MCP registry entry are written once.
+pub(crate) const TITLE: &str = env!("GLASS_BUILD_TITLE");
+
+/// glass's one-line description, mirrored from `server.json` the same way as [`TITLE`].
+pub(crate) const DESCRIPTION: &str = env!("GLASS_BUILD_DESCRIPTION");
+
+/// The site to read about glass, or `None` where `server.json` carries no `websiteUrl` — the
+/// registry schema makes it optional, and an empty `cargo:rustc-env` is how `build.rs` spells the
+/// absence `env!` cannot.
+pub(crate) const WEBSITE_URL: Option<&str> = {
+    let url = env!("GLASS_BUILD_WEBSITE_URL");
+    if url.is_empty() { None } else { Some(url) }
+};
+
 pub mod audit;
 pub mod capabilities;
 pub mod cli;

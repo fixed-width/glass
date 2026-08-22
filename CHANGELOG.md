@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
+- The MCP `initialize` handshake now tells the connecting client what glass is and where to read about it: it carries the same title, description and website that the MCP registry lists, so a host's server list shows them whether glass was installed from the registry or connected to directly.
 - On iOS, `glass_gesture` actuates a two-finger pinch: two pointers whose separation changes become a real pinch on the Simulator, recognised as one by the app under test. It needs an `idb_companion` that implements idb's `HIDPinch` event — a companion that does not is named in the error, along with the `--version` it reported. Other multi-touch gestures (rotation, two-finger pan, three or more fingers) are refused by name rather than actuated as something else.
 
 ### Fixed

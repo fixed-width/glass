@@ -334,8 +334,9 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
 /// `GLASS_*`-prefixed names read (or, for `GLASS_CLIP`, merely spelled) somewhere in the
 /// workspace that are deliberately **not** part of the user-facing override surface, so the
 /// `code_reads_match_registry_or_internal_allowlist` guard test below doesn't require them in
-/// [`GLASS_ENV`]. Each is a var glass **sets** for its own child/shim process (IPC plumbing) or
-/// reads only to force a code path in a test — never an operator override. Keep this list
+/// [`GLASS_ENV`]. Each is a var glass **sets** for its own child/shim process (IPC plumbing),
+/// reads only to force a code path in a test, or has `build.rs` emit as a `cargo:rustc-env` for
+/// the crate to read back with `env!` — never an operator override. Keep this list
 /// exact: an addition here should be accompanied by a one-line reason, same as the entries
 /// below.
 ///
@@ -372,6 +373,12 @@ pub(crate) const INTERNAL_ENV: &[&str] = &[
     // `cargo:rustc-env=GLASS_VERSION`, read via `env!` (see `crate::VERSION`). Not read from the
     // process environment and never an operator override.
     "GLASS_VERSION",
+    // Build-time only: `build.rs` reads them out of `server.json` and emits them as
+    // `cargo:rustc-env`, read via `env!` in the MCP `initialize` handshake. Keep the `BUILD`
+    // infix: without it they read as operator overrides that silently do nothing.
+    "GLASS_BUILD_TITLE",
+    "GLASS_BUILD_DESCRIPTION",
+    "GLASS_BUILD_WEBSITE_URL",
 ];
 
 /// Standard (non-`GLASS_*`) env glass reads at runtime — reference only.
