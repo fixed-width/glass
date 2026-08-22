@@ -19,8 +19,11 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-08-22
+
 ### Added
 - The MCP `initialize` handshake now tells the connecting client what glass is and where to read about it: it carries the same title, description and website that the MCP registry lists, so a host's server list shows them whether glass was installed from the registry or connected to directly.
+- Every glass tool now carries MCP annotations, so a host can tell an observation from an action. Reading tools — snapshots, screenshots, logs, window listings — are marked read-only instead of falling back to the spec's destructive default, and the tools that act on the app declare that they change it. A host that confirms or gates destructive calls no longer asks for the same confirmation to read the screen as to click it.
 - On iOS, `glass_gesture` actuates a two-finger pinch: two pointers whose separation changes become a real pinch on the Simulator, recognised as one by the app under test. It needs an `idb_companion` that implements idb's `HIDPinch` event — a companion that does not is named in the error, along with the `--version` it reported. Other multi-touch gestures (rotation, two-finger pan, three or more fingers) are refused by name rather than actuated as something else.
 
 ### Fixed
@@ -87,6 +90,16 @@ internal refactors, CI, or test-only changes.
   no MCP client reads it; a compositor whose IPC never answered now says whether its socket never
   appeared or refused the connection; and a probe that lost track of what it started warns, rather
   than reporting it as sway failing and pointing at the host's graphics stack.
+- On X11, a clipboard owner whose thread has died no longer reports itself alive, so a copy is no
+  longer written into an owner that is gone and the next paste comes back empty. A request the
+  owner cannot answer now costs that one request rather than the owner, and a conversion it cannot
+  write is refused the way the protocol expects instead of going unanswered — an unanswered request
+  left every later paste on that display waiting out its own timeout.
+- A launched app's log readers end at teardown instead of waiting for an end-of-file that never
+  comes. An app that leaves a survivor behind holds the write end of those pipes open, so each such
+  launch used to park two reader threads and two file descriptors for the life of the process —
+  which accumulates under a long-lived `glass-mcp serve --http`. The last read still happens after
+  the app is reaped, so what it wrote on the way out is not lost.
 
 ## [1.4.0] - 2026-08-17
 
@@ -1181,7 +1194,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/fixed-width/glass/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/fixed-width/glass/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/fixed-width/glass/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/fixed-width/glass/compare/v1.1.0...v1.2.0
