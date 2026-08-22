@@ -76,6 +76,9 @@ rustix.workspace = true
 
 [build-dependencies]
 embed-manifest = "1"
+# Already a normal dependency of this crate (above), so build.rs parsing server.json adds no
+# crate to the lockfile — only a host-side build of one already in the graph.
+serde_json = "1"
 
 # Windows-host builds only: statically link just the VCRuntime, leaving the OS-provided
 # Universal CRT dynamic (so it still gets Windows Update security fixes). Pairs with the

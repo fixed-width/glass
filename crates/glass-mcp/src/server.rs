@@ -770,10 +770,16 @@ impl ServerHandler for GlassServer {
         // Identify the server as glass in the MCP `initialize` handshake. The rmcp default
         // (`Implementation::from_build_env`) reports the transport crate's own name and version
         // (`rmcp` / its crate version), not glass's — so every connecting client would see the wrong
-        // server identity. Override with glass's name + build-time version.
+        // server identity. `name` stays glass-mcp rather than server.json's
+        // `io.github.fixed-width/glass`: the registry name is a namespaced identity token, and
+        // `Implementation.name` is not.
         info.server_info.name = "glass-mcp".to_string();
-        info.server_info.title = Some("glass".to_string());
         info.server_info.version = crate::VERSION.to_string();
+        // Mirrored from `server.json` by build.rs so the handshake and the registry entry are
+        // written once.
+        info.server_info.title = Some(crate::TITLE.to_string());
+        info.server_info.description = Some(crate::DESCRIPTION.to_string());
+        info.server_info.website_url = crate::WEBSITE_URL.map(str::to_string);
         info
     }
 }
@@ -895,6 +901,98 @@ mod tests {
             crate::VERSION,
             "handshake version must be glass's build-time version, not the crate's 0.0.0 or rmcp's"
         );
+    }
+
+    /// The descriptor this repo publishes to the MCP registry.
+    const SERVER_JSON: &str = include_str!("../../../server.json");
+
+    /// The `server.json` keys build.rs mirrors onto the handshake, split by whether the descriptor
+    /// must carry them: the registry schema makes `websiteUrl` optional, so the handshake omits it
+    /// rather than the build failing.
+    const MIRRORED_REQUIRED_KEYS: &[&str] = &["title", "description"];
+    const MIRRORED_OPTIONAL_KEYS: &[&str] = &["websiteUrl"];
+
+    fn server_json() -> serde_json::Value {
+        serde_json::from_str(SERVER_JSON).expect("server.json is valid JSON")
+    }
+
+    /// Compares against `server.json` rather than repeating its strings here: a literal copy would
+    /// go stale exactly when the handshake did, and pass.
+    #[test]
+    fn get_info_mirrors_server_jsons_title_description_and_website_url() {
+        let descriptor = server_json();
+
+        let glass =
+            crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform::new(10, 10));
+        let report = crate::audit::report_from_config(None, |_| None);
+        let info = GlassServer::new(glass, report).get_info();
+
+        for (key, got) in [
+            ("title", info.server_info.title.as_deref()),
+            ("description", info.server_info.description.as_deref()),
+        ] {
+            // Unwrap the expected value rather than comparing Option-to-Option: a missing key
+            // would otherwise match an unset handshake field and pass green with neither
+            // existing. `every_server_json_key_is_classified` keeps both present.
+            let want = descriptor[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("server.json carries a `{key}`"));
+            assert_eq!(
+                got,
+                Some(want),
+                "the handshake must carry server.json's `{key}`, not omit it or echo another field"
+            );
+            // Reachable only if build.rs's length check is dropped; the MCP registry rejects an
+            // empty value at publish time (minLength 1).
+            assert!(!want.is_empty(), "server.json's `{key}` must not be empty");
+        }
+
+        // Option-to-Option is the contract here, not a weakened assertion: an absent `websiteUrl`
+        // must reach the handshake as an omitted field, not an empty string.
+        assert_eq!(
+            info.server_info.website_url.as_deref(),
+            descriptor["websiteUrl"].as_str(),
+            "the handshake must carry server.json's `websiteUrl` when it has one, and omit the \
+             field when it does not"
+        );
+    }
+
+    /// Partition every `server.json` key, so a key added later has to be classified rather than
+    /// silently left off the handshake — the omission #510 fixed, one field over.
+    #[test]
+    fn every_server_json_key_is_classified() {
+        // `name` is the registry's namespaced identity token, not `Implementation.name` (which
+        // stays `glass-mcp`); `version` is rewritten from the release tag at publish time while
+        // the handshake reports the running build's own git-derived version; `$schema` and
+        // `repository` have no handshake counterpart in any spec revision.
+        const REGISTRY_ONLY_KEYS: &[&str] = &["$schema", "name", "version", "repository"];
+
+        let descriptor = server_json();
+        let keys: Vec<&str> = descriptor
+            .as_object()
+            .expect("server.json is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        let classified = |k: &&str| {
+            MIRRORED_REQUIRED_KEYS.contains(k)
+                || MIRRORED_OPTIONAL_KEYS.contains(k)
+                || REGISTRY_ONLY_KEYS.contains(k)
+        };
+        let unclassified: Vec<&str> = keys.iter().copied().filter(|k| !classified(k)).collect();
+        assert!(
+            unclassified.is_empty(),
+            "server.json key(s) {unclassified:?} are neither mirrored onto the handshake nor \
+             registry-only: mirror them in build.rs's emit_server_json_identity, or add them to \
+             REGISTRY_ONLY_KEYS"
+        );
+        for key in MIRRORED_REQUIRED_KEYS {
+            assert!(
+                keys.contains(key),
+                "`{key}` is mirrored onto the handshake but server.json no longer carries it"
+            );
+        }
     }
 
     #[tokio::test]

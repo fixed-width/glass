@@ -34,6 +34,68 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
     println!("cargo:rerun-if-changed=build.rs");
     watch_git_head();
+    emit_server_json_identity();
+}
+
+/// Emit the `server.json` fields the MCP `initialize` handshake mirrors, as build-time env vars
+/// read back through `crate::TITLE`, `DESCRIPTION` and `WEBSITE_URL`.
+///
+/// `server.json` is the descriptor this repo publishes to the MCP registry, so these strings are
+/// written once. Same source, not same instant: the registry can be republished from master
+/// without a release, so a shipped binary carries what its own tag was built from.
+///
+/// Do not soften the panics into a fallback. The registry validates this descriptor at publish
+/// time, which on the release path is *after* the tag is cut and immutable.
+fn emit_server_json_identity() {
+    const SERVER_JSON: &str = "../../server.json";
+    let raw = std::fs::read_to_string(SERVER_JSON)
+        .unwrap_or_else(|e| panic!("failed to read {SERVER_JSON}: {e}"));
+    let descriptor: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("{SERVER_JSON} is not valid JSON: {e}"));
+
+    // Both carry the registry schema's 1..=100 bound. glass requires `title` too, though the
+    // schema itself requires only `description`.
+    for (var, key) in [
+        ("GLASS_BUILD_TITLE", "title"),
+        ("GLASS_BUILD_DESCRIPTION", "description"),
+    ] {
+        let found = &descriptor[key];
+        let value = found
+            .as_str()
+            .unwrap_or_else(|| panic!("{SERVER_JSON}'s `{key}` must be a string, found {found}"));
+        assert!(
+            (1..=100).contains(&value.chars().count()),
+            "{SERVER_JSON}'s `{key}` must be 1..=100 characters, is {}",
+            value.chars().count()
+        );
+        emit_rustc_env(var, key, value);
+    }
+
+    // Optional in the registry schema, so a descriptor without one must not fail every build in
+    // the workspace. An empty value is how `crate::WEBSITE_URL` reads back the absence `env!`
+    // cannot represent.
+    let found = &descriptor["websiteUrl"];
+    let website_url = match found {
+        serde_json::Value::Null => "",
+        _ => found.as_str().unwrap_or_else(|| {
+            panic!("{SERVER_JSON}'s `websiteUrl` must be a string, found {found}")
+        }),
+    };
+    emit_rustc_env("GLASS_BUILD_WEBSITE_URL", "websiteUrl", website_url);
+
+    println!("cargo:rerun-if-changed={SERVER_JSON}");
+}
+
+/// Emit one `cargo:rustc-env`, rejecting a value the directive cannot carry intact.
+fn emit_rustc_env(var: &str, key: &str, value: &str) {
+    // cargo splits build-script output on '\n' and trims each line, so outer whitespace is
+    // silently stripped, an interior control character reaches rustc verbatim, and anything past a
+    // newline is read as a directive of its own.
+    assert!(
+        value.trim() == value && !value.chars().any(char::is_control),
+        "`{key}` must carry no control characters and no leading or trailing whitespace"
+    );
+    println!("cargo:rustc-env={var}={value}");
 }
 
 /// Declare the git files a local build's version is derived from, so cargo re-runs this script when
