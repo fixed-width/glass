@@ -135,6 +135,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        ),
         description = "Build, launch, and locate a native GUI app; returns its window geometry. Choose a backend with the `backend` param (defaults to the host). The accessibility tools are enabled by default; pass `a11y:false` to skip the accessibility bus for canvas/pixel-only apps. Optional `window_hint` ({ title?, class? }) picks the right window when several appear, or locates one the launched process hands off to another process."
     )]
     async fn glass_start(
@@ -145,6 +150,12 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Stop the running app and end the session. The app is asked to close first, \
                        so it saves state and starts clean next time; one that will not close is \
                        terminated, which takes a moment longer. Ends everything session-scoped: \
@@ -159,6 +170,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Focus/resize/move the window or read its geometry. op: focus|resize|move|geometry."
     )]
     async fn glass_window(
@@ -169,6 +185,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Capture the app window (or an optional window-relative `region`) as a screenshot (lossless WebP image). A capture reaching off the display edge is clipped to the on-screen portion — the returned `width`/`height` are the actual captured size, so a frame smaller than the window/region means it was clipped; only a fully off-screen surface errors."
     )]
     async fn glass_screenshot(
@@ -179,6 +196,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Wait until the window stops changing, then return the settled frame. Optional `stability_region` watches only that sub-rectangle for settling (ignore unrelated motion); optional `region` crops the returned frame. Set `include_image: false` for a text-only `{settled,width,height}` result with no image (`region` ignored) — cheap before a text `glass_diff`."
     )]
     async fn glass_wait_stable(
@@ -189,6 +207,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Click at window-relative coordinates. button: left|right|middle; count for multi-click. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select."
     )]
     async fn glass_click(
@@ -198,7 +221,14 @@ impl GlassServer {
         self.run(move |g| tools::click(g, &a)).await
     }
 
-    #[tool(description = "Move the pointer to window-relative coordinates.")]
+    #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
+        description = "Move the pointer to window-relative coordinates."
+    )]
     async fn glass_move(
         &self,
         Parameters(a): Parameters<MoveArgs>,
@@ -207,6 +237,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Drag with a button held from (x1,y1) to (x2,y2) — window-relative \
                        coordinates, so 0,0 is the window's top-left, not the screen's. Presses \
                        at the start point, moves across in steps over `duration_ms`, and releases \
@@ -226,6 +261,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Scroll at window-relative coordinates by (dx,dy) wheel steps. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select."
     )]
     async fn glass_scroll(
@@ -236,6 +276,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Perform a multi-touch gesture: 2–10 pointers, each a straight from→to \
                        segment in window-relative px, all down together at t=0 and up at \
                        duration_ms. Pinch = two pointers toward/apart; rotate = two on an arc; \
@@ -251,6 +296,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Type a string of text into the focused window. Does not focus anything \
                        itself — click the field first (glass_click_element, or glass_click), or \
                        the text goes wherever focus already was. Sent as individual keystrokes, \
@@ -273,6 +323,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Press a key chord like 'ctrl+s', 'Return', 'alt+F4'. One key with any \
                        number of modifiers, joined by '+': the last token is the key, every \
                        earlier one a modifier (ctrl, shift, alt, super — `cmd`, `win` and `meta` \
@@ -292,6 +347,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Read the app's clipboard as text (\"\" if empty). Also the cheap \
                        text-extraction path: glass_do ctrl+a then ctrl+c, then read here \
                        (beats OCR for selectable text). Returns Unsupported where the backend \
@@ -302,6 +358,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Write text to the app's clipboard so it can paste it. Returns \
                        Unsupported where the backend can't provide clipboard access."
     )]
@@ -313,6 +374,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Save the current frame as a named visual baseline — a reference image \
                        glass_diff and glass_wait_for_region later compare against, so you can ask \
                        what changed without spending image tokens on a before-and-after pair. \
@@ -331,6 +397,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Diff the current frame against a named baseline; returns change stats + bbox. Set `include_image: true` to also return the current frame cropped to the changed region (omitted when nothing changed)."
     )]
     async fn glass_diff(
@@ -341,6 +408,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Diagnose the glass environment and report per-check status + how to \
                        fix anything missing. Use this to self-diagnose a glass_start failure. \
                        Optional `deep`: also spin up and tear down the default backend's \
@@ -374,6 +446,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Report which operations (input, multi-touch, clipboard, accessibility, \
                        window move/resize) can be performed right now on a backend, and any \
                        setup a blocked one needs — so you can check before acting instead of \
@@ -396,6 +469,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "List the app's top-level windows: id, title, class, geometry, and which is active. Returns a JSON array. Window ids are not stable across calls — re-list after windows open/close instead of caching ids."
     )]
     async fn glass_list_windows(&self) -> Result<CallToolResult, McpError> {
@@ -403,6 +477,12 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Make a window active by id (from glass_list_windows). Subsequent screenshot/click/type/window ops target it; coordinates are relative to it."
     )]
     async fn glass_select_window(
@@ -413,6 +493,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Capture the active window's accessibility tree (semantic \
                        elements: role, name, description, window-relative bounds) as compact \
                        text — deterministic, low-token element addressing alongside \
@@ -434,6 +515,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Click an element by its #id from glass_a11y_snapshot (actuates via the \
                        platform's native accessibility action when the element exposes one — \
                        works even when it's occluded or scrolled off-screen — else falls back \
@@ -460,6 +546,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Set an editable element's value — pick the element's #id from \
                        glass_a11y_snapshot. Where the platform can write the value directly this is \
                        instant and takes no keystrokes; where it has to be typed, glass taps the \
@@ -491,6 +582,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Screenshot of the active window with a numbered box drawn on each \
                        interactable element (Set-of-Mark) — returns the annotated image plus a \
                        text legend (`#<id> <Role> \"<name>\"`, or `#<id> <Role> \
@@ -509,6 +601,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Read captured stdout/stderr log lines with a resumable cursor. glass_start \
                        captures the app's output from launch; this returns what has accumulated \
                        and a `cursor` to pass back next time, so a loop reads each line once. \
@@ -528,6 +621,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Block until a UI element reaches a precise state, then return it as text \
                        (no image). Select by `name` (accessible-name substring) and/or `role` \
                        (e.g. \"Button\"); `condition` (default appears): appears|disappears|enabled|\
@@ -547,6 +641,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Scroll a container (any axis) until an accessibility element is on-screen, \
                        then return it (text-only, no image). Requires the element to be actually \
                        visible — not merely present in the a11y tree — so the returned id is usable \
@@ -572,6 +671,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Block until a visual region changes (diverges from a reference) or matches \
                        (converges to a saved baseline), then return text metrics (no image unless \
                        `include_image:true`). `until`: \"changes\" (default) or \"matches\" (needs \
@@ -588,6 +688,7 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Block until a log line containing `contains` (optionally on a given \
                        `stream`) appears, then return it as text. By default only lines emitted \
                        after this call count; pass a `cursor` from glass_logs to catch a line \
@@ -602,6 +703,11 @@ impl GlassServer {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
         description = "Run an ordered sequence of input actions in ONE call (collapsing per-action \
                        round-trips), then optionally observe. `actions` is a list of \
                        {\"action\":\"click|move|drag|scroll|type|key|settle\", …same fields as the \
@@ -948,6 +1054,103 @@ mod tests {
             problems.is_empty(),
             "tool descriptions/instructions must not name a backend \
              (capability support is dynamic, not documentation):\n{}",
+            problems.join("\n")
+        );
+    }
+
+    /// `destructive_hint` and `open_world_hint` default to `true` in the MCP spec, so a tool
+    /// shipping without annotations reads to a host as destructive and open-world.
+    #[test]
+    fn annotations_classify_every_tool() {
+        // Tool name -> read_only_hint.
+        const EXPECTED_READ_ONLY: &[(&str, bool)] = &[
+            ("glass_a11y_marks", true),
+            ("glass_a11y_snapshot", true),
+            ("glass_baseline_save", false),
+            ("glass_capabilities", true),
+            ("glass_click", false),
+            ("glass_click_element", false),
+            ("glass_clipboard_get", true),
+            ("glass_clipboard_set", false),
+            ("glass_diff", true),
+            ("glass_do", false),
+            ("glass_doctor", false),
+            ("glass_drag", false),
+            ("glass_gesture", false),
+            ("glass_key", false),
+            ("glass_list_windows", true),
+            ("glass_logs", true),
+            ("glass_move", false),
+            ("glass_screenshot", true),
+            ("glass_scroll", false),
+            ("glass_scroll_to_element", false),
+            ("glass_select_window", false),
+            ("glass_set_value", false),
+            ("glass_start", false),
+            ("glass_stop", false),
+            ("glass_type", false),
+            ("glass_wait_for_element", true),
+            ("glass_wait_for_log", true),
+            ("glass_wait_for_region", true),
+            ("glass_wait_stable", true),
+            ("glass_window", false),
+        ];
+
+        let expected: BTreeMap<&str, bool> = EXPECTED_READ_ONLY.iter().copied().collect();
+        let mut problems: Vec<String> = Vec::new();
+        let mut registered: BTreeSet<String> = BTreeSet::new();
+
+        for tool in GlassServer::tool_router().list_all() {
+            let name = tool.name.to_string();
+            registered.insert(name.clone());
+
+            let Some(ann) = tool.annotations.as_ref() else {
+                problems.push(format!("  {name}: carries no annotations"));
+                continue;
+            };
+
+            match (ann.read_only_hint, expected.get(name.as_str())) {
+                (None, _) => problems.push(format!("  {name}: sets no read_only_hint")),
+                (Some(_), None) => {
+                    problems.push(format!("  {name}: missing from EXPECTED_READ_ONLY"));
+                }
+                (Some(got), Some(&want)) if got != want => problems.push(format!(
+                    "  {name}: read_only_hint is {got}, the table says {want}"
+                )),
+                (Some(_), Some(_)) => {}
+            }
+
+            if ann.open_world_hint.is_none() {
+                problems.push(format!("  {name}: sets no open_world_hint"));
+            }
+
+            // The spec says destructive_hint and idempotent_hint are meaningful only when
+            // read_only_hint is false.
+            if ann.read_only_hint == Some(true) {
+                for (field, set) in [
+                    ("destructive_hint", ann.destructive_hint.is_some()),
+                    ("idempotent_hint", ann.idempotent_hint.is_some()),
+                ] {
+                    if set {
+                        problems.push(format!("  {name}: read-only, so {field} says nothing"));
+                    }
+                }
+            } else if ann.destructive_hint.is_none() {
+                problems.push(format!("  {name}: sets no destructive_hint"));
+            }
+        }
+
+        for name in expected.keys() {
+            if !registered.contains(*name) {
+                problems.push(format!(
+                    "  {name}: in EXPECTED_READ_ONLY but not registered"
+                ));
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "every tool must carry annotations a host can act on:\n{}",
             problems.join("\n")
         );
     }
