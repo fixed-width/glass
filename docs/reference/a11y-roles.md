@@ -62,8 +62,11 @@ now, and the outline only names the token of an element that has none.
 
 **A web document is a `Document`.** A browser page or an embedded web view arrives as one
 `Document` element with the page's elements as its children; an `<iframe>` is a `Document`
-inside it. A web engine may publish its tree only after it detects an assistive technology, so a
-`Document` can arrive with no children at all. glass discloses that case in the snapshot rather
+inside it. On Windows a text editor's edit surface arrives under the same UIA control type, so
+the two are told apart per node by the framework the element reports — Chromium reported `Chrome`
+and Gecko `Gecko` against a stock text editor's `Win32` (read 2026-08-24). A web engine may
+publish its tree only after it detects an assistive technology, so a `Document` can arrive with
+no children at all. glass discloses that case in the snapshot rather
 than leaving an empty container to be read as an empty page, and where the walk completed the
 disclosure asks for a fresh snapshot before the pixel path: on an Android WebView the first
 snapshot after a launch was childless and the next held the whole page (read 2026-08-24). On iOS
@@ -107,7 +110,7 @@ page there is a pixel job: `glass_screenshot`, then `glass_click` at x,y.
 | `Toolbar` | yes | yes | yes | unmarked | yes |
 | `StatusBar` | yes | yes | unmarked | elsewhere | elsewhere |
 | `Heading` | yes | gap | yes | gap | yes |
-| `Document` | yes | gap | yes | yes | unmarked |
+| `Document` | yes | yes | yes | yes | unmarked |
 
 ### Why a cell is not `yes`
 
@@ -158,6 +161,5 @@ page there is a pixel job: `glass_screenshot`, then `glass_click` at x,y.
 - `StatusBar` / iOS — elsewhere: the system status bar is outside the app tree
 - `Heading` / Windows (UIA) — gap: UIA marks a heading with the HeadingLevel property — an h1 arrives as Text carrying level 80051 — and the reader maps by control type alone, so it never sees it. Header and HeaderItem are a grid's column headers, a different concept the normalized set has no role for
 - `Heading` / Android — gap: AccessibilityNodeInfo's isHeading marks a heading, and neither reader carries it: the uiautomator dump has no such attribute and the service reader parses only class, text, description and bounds
-- `Document` / Windows (UIA) — gap: UIA's Document control type maps to TextArea, read from a text editor's edit surface; what a web document reports on this backend has not been read, so the cell waits on that reading
 - `Document` / iOS — unmarked: a WKWebView page exposes no element at all through idb — neither the view nor its content (read on the iOS 26.5 Simulator, companions 1.5.0b3 and 1.1.8)
 <!-- END GENERATED: role-support -->

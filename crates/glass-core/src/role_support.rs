@@ -626,12 +626,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
             R::Document,
             [
                 Mapped,
-                Gap {
-                    unmapped: None,
-                    why: "UIA's Document control type maps to TextArea, read from a text \
-                     editor's edit surface; what a web document reports on this backend has \
-                     not been read, so the cell waits on that reading",
-                },
+                Mapped,
                 Mapped,
                 Mapped,
                 NotApplicable {
@@ -906,13 +901,12 @@ mod tests {
                 "{backend:?} has no Document cell"
             );
         }
-        // Windows keeps UIA Document on TextArea until a web document is read there.
-        // `unmapped` stays `None`: UIA's Document IS mapped, just to another role, so
-        // "`Document` arrives unmapped" would send a reader hunting for `Other(Document)`.
-        assert!(matches!(
+        // Windows tells a web page's Document from a text editor's by the FrameworkId the
+        // element reports.
+        assert_eq!(
             support(AxRole::Document, AxBackend::Windows),
-            Some(RoleSupport::Gap { unmapped: None, .. })
-        ));
+            Some(RoleSupport::Mapped)
+        );
         // iOS reads nothing at all for a WKWebView, so no token stands in for the role.
         assert!(matches!(
             support(AxRole::Document, AxBackend::Ios),

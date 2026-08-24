@@ -522,7 +522,9 @@ An element whose platform role glass has no mapping for renders as `Other(<nativ
 visible; a bare `Other` means the platform named no token at all.
 
 Web content — a browser's page, a WebView's content — arrives under a `Document` element whose
-children are the page's own elements (headings, links, fields), addressable like any other. A
+children are the page's own elements (headings, links, fields), addressable like any other. On
+Windows a text editor's edit surface uses the same underlying control type and stays a
+`TextArea`; the two are told apart by the framework each element reports (read 2026-08-24). A
 `Document` with **no** children has nothing inside to address: the web engine has not published
 its accessibility tree yet, the page is empty, or the walk did not complete — whether a bound cut
 it short or it dropped a subtree it could not read — before reaching its content. The snapshot

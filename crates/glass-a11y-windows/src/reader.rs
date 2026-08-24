@@ -147,6 +147,7 @@ fn walk(
     let raw_role = crate::mapping::canonical_name(ct_id)
         .map(str::to_string)
         .unwrap_or_else(|| format!("UIA:{ct_id}"));
+    let framework = framework_id(el, ct_id);
     let name = nonempty(el.get_name().unwrap_or_default());
     let description = normalize_description(&help_text(el, ct_id), name.as_deref());
     let bounds = window_relative_bounds(el, origin);
@@ -184,7 +185,7 @@ fn walk(
 
     Ok(AxNode {
         id: AxNodeId(0), // assigned by glass_core::AxTree::assign_ids
-        role: crate::mapping::map_role(ct_id, facts.checkable),
+        role: crate::mapping::map_role_with_framework(ct_id, facts.checkable, framework.as_deref()),
         raw_role,
         name,
         description,
@@ -343,6 +344,18 @@ fn nonempty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// The element's UIA `FrameworkId`, which `map_role_with_framework` decides a `Document` on.
+/// Gated by control type like `toggle_pattern`: only 50030 is decided by it, so no other node
+/// spends a cross-process property read. Read per node, never per app — a browser's window
+/// element reports `Win32` while the page inside it carries the engine's id. An empty id and a
+/// failed read both yield `None`.
+fn framework_id(el: &UIElement, ct_id: u32) -> Option<String> {
+    if ct_id != 50030 {
+        return None;
+    }
+    nonempty(el.get_framework_id().unwrap_or_default())
+}
+
 fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     let automation = UIAutomation::new().map_err(|e| {
         GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))
@@ -362,7 +375,11 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     // bounds fingerprint — the element sits elsewhere — rejects it. A target
     // without captured bounds falls back to role+name only.
     let ct_id = el.get_control_type().map_err(uia_err)? as i32 as u32;
-    let role = crate::mapping::map_role(ct_id, toggle_pattern(&el, ct_id).is_some());
+    let role = crate::mapping::map_role_with_framework(
+        ct_id,
+        toggle_pattern(&el, ct_id).is_some(),
+        framework_id(&el, ct_id).as_deref(),
+    );
     let name = nonempty(el.get_name().unwrap_or_default());
     let bounds = window_relative_bounds(&el, (ctx.window.x, ctx.window.y));
     if !target.matches(role, name.as_deref())
@@ -447,7 +464,11 @@ fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
 
     // Same fingerprint gate as run_set_value: role + name + bounds.
     let ct_id = el.get_control_type().map_err(uia_err)? as i32 as u32;
-    let role = crate::mapping::map_role(ct_id, toggle_pattern(&el, ct_id).is_some());
+    let role = crate::mapping::map_role_with_framework(
+        ct_id,
+        toggle_pattern(&el, ct_id).is_some(),
+        framework_id(&el, ct_id).as_deref(),
+    );
     let name = nonempty(el.get_name().unwrap_or_default());
     let bounds = window_relative_bounds(&el, (ctx.window.x, ctx.window.y));
     if !target.matches(role, name.as_deref())
