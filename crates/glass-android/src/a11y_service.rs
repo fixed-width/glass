@@ -987,10 +987,7 @@ fn movement_candidates<'a>(tree: &'a AxTree, target: &AxTarget) -> Vec<&'a AxNod
 
 /// A rectangle as `(x,y wxh)`.
 fn rect(b: Option<AxRect>) -> String {
-    b.map_or_else(
-        || "(no bounds)".to_string(),
-        |r| format!("({},{} {}x{})", r.x, r.y, r.width, r.height),
-    )
+    b.map_or_else(|| "(no bounds)".to_string(), |r| r.to_string())
 }
 
 /// The refusal for a target more than one node now matches on everything but position, so its id

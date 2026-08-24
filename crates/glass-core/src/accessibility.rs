@@ -792,7 +792,8 @@ impl AxTree {
     ///
     /// A bound or a failed child read empties a `Document`'s child list exactly like an
     /// unpublished tree does, so only a complete walk ([`Self::is_complete`]) names a cause;
-    /// otherwise this hedges and leaves the cause to the notice beside it.
+    /// otherwise this hedges and defers to the notice beside it, which owns the recourse —
+    /// core does not know that only a `Nodes` bound is raisable by `max_nodes`.
     pub fn document_guidance(&self) -> Option<String> {
         let docs = self.unpublished_documents();
         if docs.is_empty() {
@@ -822,10 +823,10 @@ impl AxTree {
         } else {
             format!(
                 "… {n} Document element{s} {have} no readable content in this snapshot: \
-                 {list}. The walk stopped early or dropped subtrees — the notice beside this \
-                 one says which — so {they} may hold content that was never reached. Raise \
-                 max_nodes, narrow the UI, or take a fresh glass_a11y_snapshot before driving \
-                 by pixels: glass_screenshot, then glass_click at x,y inside the bounds above."
+                 {list}, and the walk did not complete — see the notice beside this one — so \
+                 {they} may hold content that was never reached. Follow that notice, or take \
+                 a fresh glass_a11y_snapshot, before driving by pixels: glass_screenshot, \
+                 then glass_click at x,y inside the bounds above."
             )
         })
     }
@@ -2548,7 +2549,16 @@ mod tests {
             "a bounded walk cannot know that: {hint}"
         );
         assert!(hint.contains("in this snapshot"), "hedged: {hint}");
-        assert!(hint.contains("max_nodes"), "names the recourse: {hint}");
+        // Core stays tool-agnostic: only the MCP layer knows a Nodes hit is raisable, and it
+        // adds that recourse to the notice beside this one.
+        assert!(
+            !hint.contains("max_nodes"),
+            "not core's recourse to name: {hint}"
+        );
+        assert!(
+            hint.contains("the notice beside this one"),
+            "defers to the notice that knows the cause: {hint}"
+        );
     }
 
     #[test]
