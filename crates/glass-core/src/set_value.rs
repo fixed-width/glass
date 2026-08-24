@@ -11,7 +11,7 @@
 //! An *atomic platform write* (UIA `SetValue`, AX `AXValue`) either happens or does not, and may be
 //! reformatted on the way in — a slider set to `"50"` reads back `"50.0"`. So a value that merely
 //! differs from the old one is evidence it landed: [`read_back_confirms`]. The macOS and Windows
-//! readers had each grown their own copy of that rule; it is theirs.
+//! readers had each grown their own copy of that rule; it is theirs, and the AT-SPI reader's.
 //!
 //! A *typed write* (tap, select-all, delete, type) is not atomic. A dropped key, a `maxLength`, an
 //! input filter or autocorrect all leave the field holding something that is neither the request nor
@@ -19,9 +19,8 @@
 //! typed write must read back exactly what was asked: [`typed_text_landed`]. Android's on-device
 //! service reader reached the same conclusion independently (`a11y_service.rs`).
 //!
-//! Two write paths deliberately do not use either rule: the AT-SPI (Linux) reader trusts the
-//! toolkit's own `set_text_contents` answer without reading back, and Android's service reader keeps
-//! its own exact-match loop.
+//! One write path deliberately uses neither rule: Android's service reader keeps its own
+//! exact-match loop.
 //!
 //! [`verify_typed_write`] applies the typed rule to a whole tree read back after the keystrokes,
 //! and is what the tap-and-type backends (Android's `uiautomator` reader, iOS) call;

@@ -19,10 +19,11 @@
 //! A probe, not a mapping test: it prints evidence and does not assert what a browser ought to
 //! publish — a browser that launches but shows no page content is a reading, not a failure
 //! (`arrived: false` plus whatever disclosure rendered). What does fail the run: a browser that
-//! never launches, or an accessibility bus that never answers at all. Each backend's `Drop`
-//! impl tears its session down even through a panic, so failures are collected per (backend,
-//! browser, lever) and the test panics once at the end, after every browser it started has
-//! already been stopped.
+//! never launches, an accessibility bus that never answers at all, or a `set_value` whose verdict
+//! disagrees with the value the field reads back — the last is a claim about glass, which owes the
+//! same answer on every engine. Each backend's `Drop` impl tears its session down even through a
+//! panic, so failures are collected per (backend, browser, lever) and the test panics once at the
+//! end, after every browser it started has already been stopped.
 
 #![cfg(target_os = "linux")]
 
@@ -457,10 +458,18 @@ fn exercise(glass: &mut Glass, label: &str, failures: &mut Vec<String>) {
             return;
         }
     };
-    println!(
-        "set_value: {set:?} → text input value={:?}",
-        text_input(&after).and_then(|n| n.value.clone())
-    );
+    let held = text_input(&after).and_then(|n| n.value.clone());
+    println!("set_value: {set:?} → text input value={held:?}");
+    // A claim about glass, not about the engine: whatever this browser does with the write, the
+    // verdict has to agree with the read-back — `Ok` without the text is a false success, `Err`
+    // with it a false failure.
+    let holds = held.as_deref() == Some(TYPED);
+    if set.is_ok() != holds {
+        failures.push(format!(
+            "{label}: set_value returned {set:?} while the field reads back {held:?} — a verdict \
+             that disagrees with the read-back"
+        ));
+    }
 
     // The control for the line above. An empty readback has two causes — the write never
     // landed, or this engine never reports a web input's text over AT-SPI — and only text

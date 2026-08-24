@@ -11,7 +11,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
     A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError,
-    Result, WalkBudget, normalize_description,
+    Result, WalkBudget, normalize_description, read_back_confirms, write_took_no_effect,
 };
 
 use crate::mapping::{map_role, map_states};
@@ -168,6 +168,21 @@ fn writes_value_only(role: glass_core::AxRole, text: &str) -> bool {
     matches!(role, Slider | SpinButton | ScrollBar) && text.parse::<f64>().is_ok()
 }
 
+/// Poll bound for confirming a write actually landed — a value written, or a toggle moved: the
+/// toolkit applies it on a later main-loop pass, so the first read after dispatch is expected to
+/// be stale. Generous enough for a loaded headless session without letting a real failure hang
+/// the tool.
+const VERIFY_POLLS: usize = 6;
+/// See [`VERIFY_POLLS`].
+const VERIFY_INTERVAL: Duration = Duration::from_millis(120);
+
+/// What a write that took no effect looks like on this backend: the element's `EditableText`
+/// answers the write with `true` and keeps the text it had (read on Firefox 153 web content,
+/// 2026-08-24). The AT-SPI sibling of the `READ_ONLY_PROJECTION` consts in the Windows and macOS
+/// readers.
+const ACKNOWLEDGED_NOT_APPLIED: &str = "this element's accessibility interface acknowledged the write without applying it — focus the \
+     element and type into it instead";
+
 async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     let (app_ref, conn) = find_app(ctx).await?;
     let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
@@ -211,8 +226,21 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
         if let Some(b) = editable
             && let Ok(et) = b.build().await
         {
+            // The baseline for the confirmation below: without one, only an exact read-back
+            // confirms.
+            let before = read_text(&node, &conn).await;
             match et.set_text_contents(text).await {
-                Ok(true) => return Ok(()),
+                Ok(true) => {
+                    return confirm_write(
+                        &node,
+                        &conn,
+                        WrittenVia::EditableText,
+                        before,
+                        text,
+                        target.id.0,
+                    )
+                    .await;
+                }
                 // EditableText is present but rejected the write — don't try Value.
                 Ok(false) => return Err(GlassError::AxElementNotEditable(target.id.0)),
                 Err(_) => {} // interface absent / call failed — fall through to Value
@@ -226,12 +254,77 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
             .and_then(|b| b.path(path).ok());
         if let Some(b) = value_proxy
             && let Ok(vp) = b.build().await
-            && vp.set_current_value(v).await.is_ok()
         {
-            return Ok(());
+            let before = read_number(&node, &conn).await;
+            if vp.set_current_value(v).await.is_ok() {
+                return confirm_write(&node, &conn, WrittenVia::Value, before, text, target.id.0)
+                    .await;
+            }
         }
     }
     Err(GlassError::AxElementNotEditable(target.id.0))
+}
+
+/// Which interface a write went through, and so which read confirms it.
+#[derive(Clone, Copy)]
+enum WrittenVia {
+    EditableText,
+    Value,
+}
+
+/// Confirm a dispatched write landed, by reading the element back through the interface it was
+/// written to (`before` is what that read returned beforehand, `None` when it failed). Polls,
+/// because the toolkit applies the write on a later main-loop pass.
+///
+/// Without it the toolkit's own answer is the only evidence, and an engine can acknowledge a write
+/// it never applies — see [`ACKNOWLEDGED_NOT_APPLIED`].
+async fn confirm_write(
+    node: &AccessibleProxy<'_>,
+    conn: &zbus::Connection,
+    via: WrittenVia,
+    before: Option<String>,
+    requested: &str,
+    id: u32,
+) -> Result<()> {
+    let mut observed = None;
+    for poll in 0..VERIFY_POLLS {
+        if poll > 0 {
+            tokio::time::sleep(VERIFY_INTERVAL).await;
+        }
+        observed = match via {
+            WrittenVia::EditableText => read_text(node, conn).await,
+            WrittenVia::Value => read_number(node, conn).await,
+        };
+        if read_back_confirms(observed.as_deref(), before.as_deref(), requested) {
+            return Ok(());
+        }
+    }
+    Err(write_verdict(
+        id,
+        requested,
+        before.as_deref(),
+        observed.as_deref(),
+    ))
+}
+
+/// The verdict for a write whose read-back never held the request. [`ACKNOWLEDGED_NOT_APPLIED`]
+/// only where the element still holds exactly what it held before — a read that failed, or one
+/// showing a value the element reformatted, is not evidence the write never arrived.
+fn write_verdict(
+    id: u32,
+    requested: &str,
+    before: Option<&str>,
+    observed: Option<&str>,
+) -> GlassError {
+    match observed {
+        Some(seen) if write_took_no_effect(seen, before) => GlassError::value_not_applied_because(
+            id,
+            requested,
+            Some(seen),
+            ACKNOWLEDGED_NOT_APPLIED,
+        ),
+        seen => GlassError::value_not_applied(id, requested, seen),
+    }
 }
 
 /// Pre-order DFS to the node at index `target`, mirroring `walk` exactly: visit the node (its
@@ -485,13 +578,6 @@ fn toggle_state_flag(role: glass_core::AxRole) -> atspi_common::State {
     }
 }
 
-/// Poll bound for confirming a toggle actually moved: the toolkit applies the action on a
-/// later main-loop pass, so the first read after firing is expected to be stale. Generous
-/// enough for a loaded headless session without letting a real failure hang the tool.
-const TOGGLE_VERIFY_POLLS: usize = 6;
-/// See [`TOGGLE_VERIFY_POLLS`].
-const TOGGLE_VERIFY_INTERVAL: Duration = Duration::from_millis(120);
-
 /// Set a boolean widget (switch/checkbox/toggle/radio) to `target_on`, as the caller spelled it in
 /// `requested`. Idempotent:
 /// only invokes the toggle action when the boolean state differs, then confirms the
@@ -524,8 +610,8 @@ async fn set_toggle(
     }
     // Poll until the toolkit applies it; a no-op activation never converges.
     let mut last_on = None;
-    for _ in 0..TOGGLE_VERIFY_POLLS {
-        tokio::time::sleep(TOGGLE_VERIFY_INTERVAL).await;
+    for _ in 0..VERIFY_POLLS {
+        tokio::time::sleep(VERIFY_INTERVAL).await;
         let on = node.get_state().await.map_err(bus_err)?.contains(flag);
         last_on = Some(on);
         if on == target_on {
@@ -582,8 +668,8 @@ async fn verify_toggle_flipped(
     was_on: bool,
     id: u32,
 ) -> Result<()> {
-    for _ in 0..TOGGLE_VERIFY_POLLS {
-        tokio::time::sleep(TOGGLE_VERIFY_INTERVAL).await;
+    for _ in 0..VERIFY_POLLS {
+        tokio::time::sleep(VERIFY_INTERVAL).await;
         if node.get_state().await.map_err(bus_err)?.contains(flag) != was_on {
             return Ok(());
         }
@@ -677,40 +763,50 @@ async fn extents(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Option
 /// Read the element's current value/text for value-bearing roles, or `None`.
 /// Text-editable roles read the `Text` interface; numeric roles read `Value`.
 /// Gated by role so the walk adds at most one D-Bus call on relevant nodes.
+///
+/// An empty text field carries no value here, unlike [`read_text`]'s read-back: the outline
+/// renders what an element holds, and `""` is nothing to show.
 async fn read_value(
     proxy: &AccessibleProxy<'_>,
     conn: &zbus::Connection,
     role: glass_core::AxRole,
 ) -> Option<String> {
     use glass_core::AxRole::*;
-    let dest = proxy.inner().destination().to_owned();
-    let path = proxy.inner().path().to_owned();
     match role {
-        TextField | TextArea | ComboBox => {
-            let text = atspi::proxy::text::TextProxy::builder(conn)
-                .destination(dest)
-                .ok()?
-                .path(path)
-                .ok()?
-                .build()
-                .await
-                .ok()?;
-            let n = text.character_count().await.ok()?;
-            text.get_text(0, n).await.ok().and_then(nonempty)
-        }
-        Slider | SpinButton | ProgressBar => {
-            let val = atspi::proxy::value::ValueProxy::builder(conn)
-                .destination(dest)
-                .ok()?
-                .path(path)
-                .ok()?
-                .build()
-                .await
-                .ok()?;
-            val.current_value().await.ok().map(|v| v.to_string())
-        }
+        TextField | TextArea | ComboBox => read_text(proxy, conn).await.and_then(nonempty),
+        Slider | SpinButton | ProgressBar => read_number(proxy, conn).await,
         _ => None,
     }
+}
+
+/// The element's text over the AT-SPI `Text` interface. `Some("")` is an element holding nothing;
+/// `None` is no reading at all — the interface is absent, or the call failed — which
+/// [`read_back_confirms`] must never mistake for a value.
+async fn read_text(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Option<String> {
+    let text = atspi::proxy::text::TextProxy::builder(conn)
+        .destination(proxy.inner().destination().to_owned())
+        .ok()?
+        .path(proxy.inner().path().to_owned())
+        .ok()?
+        .build()
+        .await
+        .ok()?;
+    let n = text.character_count().await.ok()?;
+    text.get_text(0, n).await.ok()
+}
+
+/// The element's number over the AT-SPI `Value` interface, spelled as a caller spells a value.
+/// `None` when the interface is absent or the call failed.
+async fn read_number(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Option<String> {
+    let val = atspi::proxy::value::ValueProxy::builder(conn)
+        .destination(proxy.inner().destination().to_owned())
+        .ok()?
+        .path(proxy.inner().path().to_owned())
+        .ok()?
+        .build()
+        .await
+        .ok()?;
+    val.current_value().await.ok().map(|v| v.to_string())
 }
 
 fn nonempty(s: String) -> Option<String> {
@@ -790,6 +886,30 @@ mod tests {
             ObjectRefOwned::from_static_str_unchecked(":1.42", "/org/a11y/atspi/accessible/7");
         assert!(!unexposed_child(&child, &mut budget));
         assert_eq!(budget.unexposed(), 0);
+    }
+
+    /// The remedy is for a write that never arrived. Attached to a value the element transformed,
+    /// it would send the caller to type text the element already has in another form.
+    #[test]
+    fn only_a_value_the_element_still_holds_carries_the_write_never_arrived_remedy() {
+        let unchanged = write_verdict(3, "typed", Some("old"), Some("old"));
+        assert!(
+            matches!(
+                unchanged,
+                GlassError::AxValueNotApplied { why: Some(_), .. }
+            ),
+            "got: {unchanged:?}"
+        );
+        let transformed = write_verdict(3, "50", Some("1"), Some("50.0"));
+        assert!(
+            matches!(transformed, GlassError::AxValueNotApplied { why: None, .. }),
+            "got: {transformed:?}"
+        );
+        let unread = write_verdict(3, "typed", Some("old"), None);
+        assert!(
+            matches!(unread, GlassError::AxValueNotApplied { why: None, .. }),
+            "a read-back that failed is no evidence about the write; got: {unread:?}"
+        );
     }
 
     #[test]
