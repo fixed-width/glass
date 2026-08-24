@@ -61,19 +61,18 @@ window's own root node. The outline does not name that node's widget class — t
 now, and the outline only names the token of an element that has none.
 
 **A web document is a `Document`.** A browser page or an embedded web view arrives as one
-`Document` element with the page's elements as its children; an `<iframe>` is a `Document`
-inside it. On Windows a text editor's edit surface arrives under the same UIA control type, so
-the two are told apart per node by the framework the element reports — Chromium reported `Chrome`
-and Gecko `Gecko` against a stock text editor's `Win32` (read 2026-08-24). A `Document` can arrive
-with no children — read on Android, where the first snapshot after a launch showed an empty
-WebView and the next held the page (2026-08-24). glass discloses that case in the snapshot rather
-than leaving an empty container to be read as an empty page, and where the walk completed the
-disclosure asks for a fresh snapshot before the pixel path: on an Android WebView the first
-snapshot after a launch was childless and the next held the whole page (read 2026-08-24). On iOS
-there is no such element to disclose — a `WKWebView` page contributed nothing to the tree through
-`idb`, neither the view nor its content (read on the iOS 26.5 Simulator, 2026-08-24), so a web
-page there is a pixel job: `glass_screenshot`, then `glass_click` at x,y. See
-[Web content](../explanation/web-content.md) for the per-platform readings.
+`Document` element with the page's elements as its children; an `<iframe>` is a `Document` inside
+it. On Windows a text editor's edit surface arrives under the same UIA control type, so the two
+are told apart per node by the framework the element reports — Chromium reported `Chrome` and
+Gecko `Gecko` against a stock text editor's `Win32` (read 2026-08-24). A `Document` can arrive
+with no children. glass discloses that case in the snapshot rather than leaving an empty
+container to be read as an empty page, and where the walk completed the disclosure asks for a
+fresh snapshot before the pixel path: on an Android WebView the first snapshot after a launch was
+childless and the next held the whole page (read 2026-08-24). On iOS there is no such element to
+disclose — a `WKWebView` page contributed nothing to the tree through `idb`, neither the view nor
+its content (read on the iOS 26.5 Simulator, 2026-08-24), so a web page there is a pixel job:
+`glass_screenshot`, then `glass_click` at x,y. See [Web content](../explanation/web-content.md)
+for the per-platform readings.
 
 <!-- BEGIN GENERATED: role-support -->
 | Role | Linux (AT-SPI) | Windows (UIA) | macOS (AX) | Android | iOS |

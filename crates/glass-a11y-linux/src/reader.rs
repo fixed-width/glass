@@ -169,17 +169,12 @@ fn writes_value_only(role: glass_core::AxRole, text: &str) -> bool {
     matches!(role, Slider | SpinButton | ScrollBar) && text.parse::<f64>().is_ok()
 }
 
-/// Poll bound for confirming a write actually landed — a value written, or a toggle moved: the
-/// toolkit applies it on a later main-loop pass, so the first read after dispatch is expected to
-/// be stale. Generous enough for a loaded headless session without letting a real failure hang
-/// the tool.
-///
-/// A fixed count is safe here: `set_value` and `invoke` are bounded by [`BUS`]'s ceiling alone —
-/// the session builds their context with `Deadline::UNBOUNDED` — and 6 × 120 ms sits well inside
-/// it. [`confirm_write`] stops earlier where a caller does name a deadline.
-///
-/// Two loop shapes use them: [`confirm_write`] reads first (the write may already have landed);
-/// [`set_toggle`] and [`verify_toggle_flipped`] sleep first, having just dispatched an action.
+/// Poll bound for confirming a write or toggle landed — the toolkit applies it on a later
+/// main-loop pass, so the first read after dispatch is expected to be stale. [`confirm_write`]
+/// reads first and stops early once its `deadline` passes; [`set_toggle`] and
+/// [`verify_toggle_flipped`] sleep first, having just dispatched the action, and loop the full
+/// count regardless of deadline — safe only because `set_value` and `invoke` run under [`BUS`]'s
+/// bounded ceiling with `Deadline::UNBOUNDED` context, where 6 × 120 ms sits well inside it.
 const VERIFY_POLLS: usize = 6;
 /// See [`VERIFY_POLLS`]. Coarser than the Windows and macOS readers' 20 ms: a poll here is a D-Bus
 /// round trip, not an in-process call.
