@@ -10,8 +10,9 @@ use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
-    A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError,
-    Result, WalkBudget, normalize_description, read_back_confirms, write_took_no_effect,
+    A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, Deadline,
+    GlassError, Result, WalkBudget, normalize_description, read_back_confirms,
+    write_took_no_effect,
 };
 
 use crate::mapping::{map_role, map_states};
@@ -172,8 +173,16 @@ fn writes_value_only(role: glass_core::AxRole, text: &str) -> bool {
 /// toolkit applies it on a later main-loop pass, so the first read after dispatch is expected to
 /// be stale. Generous enough for a loaded headless session without letting a real failure hang
 /// the tool.
+///
+/// A fixed count is safe here: `set_value` and `invoke` are bounded by [`BUS`]'s ceiling alone —
+/// the session builds their context with `Deadline::UNBOUNDED` — and 6 × 120 ms sits well inside
+/// it. [`confirm_write`] stops earlier where a caller does name a deadline.
+///
+/// Two loop shapes use them: [`confirm_write`] reads first (the write may already have landed);
+/// [`set_toggle`] and [`verify_toggle_flipped`] sleep first, having just dispatched an action.
 const VERIFY_POLLS: usize = 6;
-/// See [`VERIFY_POLLS`].
+/// See [`VERIFY_POLLS`]. Coarser than the Windows and macOS readers' 20 ms: a poll here is a D-Bus
+/// round trip, not an in-process call.
 const VERIFY_INTERVAL: Duration = Duration::from_millis(120);
 
 /// What a write that took no effect looks like on this backend: the element's `EditableText`
@@ -238,6 +247,7 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
                         before,
                         text,
                         target.id.0,
+                        ctx.deadline,
                     )
                     .await;
                 }
@@ -257,8 +267,16 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
         {
             let before = read_number(&node, &conn).await;
             if vp.set_current_value(v).await.is_ok() {
-                return confirm_write(&node, &conn, WrittenVia::Value, before, text, target.id.0)
-                    .await;
+                return confirm_write(
+                    &node,
+                    &conn,
+                    WrittenVia::Value,
+                    before,
+                    text,
+                    target.id.0,
+                    ctx.deadline,
+                )
+                .await;
             }
         }
     }
@@ -272,9 +290,13 @@ enum WrittenVia {
     Value,
 }
 
-/// Confirm a dispatched write landed, by reading the element back through the interface it was
-/// written to (`before` is what that read returned beforehand, `None` when it failed). Polls,
-/// because the toolkit applies the write on a later main-loop pass.
+/// Confirm a dispatched write landed, by reading the element back (`before` is what that read
+/// returned beforehand, `None` when it failed). Polls, because the toolkit applies the write on a
+/// later main-loop pass, and stops early once `deadline` has passed.
+///
+/// An `EditableText` write reads back through `Text` ([`read_text`]), that interface having no read
+/// side of its own; a `Value` write reads back through `Value`. An element exposing `EditableText`
+/// without `Text` therefore confirms nothing, and the verdict says it could not be read back.
 ///
 /// Without it the toolkit's own answer is the only evidence, and an engine can acknowledge a write
 /// it never applies — see [`ACKNOWLEDGED_NOT_APPLIED`].
@@ -285,10 +307,14 @@ async fn confirm_write(
     before: Option<String>,
     requested: &str,
     id: u32,
+    deadline: Deadline,
 ) -> Result<()> {
     let mut observed = None;
     for poll in 0..VERIFY_POLLS {
         if poll > 0 {
+            if deadline.has_passed() {
+                break;
+            }
             tokio::time::sleep(VERIFY_INTERVAL).await;
         }
         observed = match via {
@@ -912,6 +938,31 @@ mod tests {
             matches!(unread, GlassError::AxValueNotApplied { why: None, .. }),
             "a read-back that failed is no evidence about the write; got: {unread:?}"
         );
+    }
+
+    /// Both arms build the error separately, and the request and the reading are adjacent string
+    /// arguments there — swapping them still compiles, and the message would then tell the caller
+    /// it asked for what the element holds.
+    #[test]
+    fn both_verdict_arms_carry_the_request_and_the_reading_apart() {
+        for (arm, before) in [
+            ("the write never arrived", Some("seen")),
+            ("the element transformed it", Some("old")),
+        ] {
+            match write_verdict(3, "asked", before, Some("seen")) {
+                GlassError::AxValueNotApplied {
+                    id,
+                    requested,
+                    observed,
+                    ..
+                } => assert_eq!(
+                    (id, requested.as_str(), observed.as_deref()),
+                    (3, "asked", Some("seen")),
+                    "{arm}"
+                ),
+                other => panic!("{arm}: expected AxValueNotApplied, got {other:?}"),
+            }
+        }
     }
 
     #[test]
