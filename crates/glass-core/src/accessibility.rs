@@ -466,20 +466,6 @@ impl Truncation {
     }
 }
 
-/// One line of [`AxTree::document_guidance`].
-fn document_notice(doc: &AxNode) -> String {
-    let bounds = match &doc.bounds {
-        Some(b) => format!("({},{} {}x{})", b.x, b.y, b.width, b.height),
-        None => "bounds unknown".to_string(),
-    };
-    format!(
-        "… #{} Document {bounds} has no readable content: the web engine has not published \
-         its accessibility tree, or the page is empty. Elements inside it cannot be addressed \
-         by id. Drive it by pixels: glass_screenshot, then glass_click at x,y inside it.",
-        doc.id.0
-    )
-}
-
 /// Bookkeeping for a bounded pre-order walk. Every backend threads one of these through its
 /// traversal so the caps and the truncation record are computed one way rather than five.
 #[derive(Debug, Default)]
@@ -789,17 +775,52 @@ impl AxTree {
         out
     }
 
-    /// The disclosure for [`Self::unpublished_documents`]: one line per document, or `None`
-    /// when there is nothing to disclose. Same shape as [`Truncation::notice`] and
-    /// [`Self::empty_guidance`] — what is missing, then the pixel path — because a web page
-    /// the reader cannot enter fails the agent the same way a truncated tree does.
+    /// The disclosure for [`Self::unpublished_documents`]: one notice naming every childless
+    /// `Document` by id and bounds, or `None` when there is nothing to disclose. Same shape as
+    /// [`Truncation::notice`] and [`Self::empty_guidance`] — what is missing, then the pixel
+    /// path — because a web page the reader cannot enter fails the agent the same way a
+    /// truncated tree does. Aggregated like [`Self::unreadable_notice`] rather than repeated
+    /// per document: a page of ad iframes would otherwise spend the budget `max_nodes` guards.
+    ///
+    /// Only a complete walk names a cause. A bound or a failed child read empties a
+    /// `Document`'s child list exactly like an unpublished tree does (see
+    /// [`Self::is_complete`]), so on such a tree this hedges and leaves the cause to the
+    /// truncation/unreadable notice beside it.
     pub fn document_guidance(&self) -> Option<String> {
         let docs = self.unpublished_documents();
         if docs.is_empty() {
             return None;
         }
-        let lines: Vec<String> = docs.iter().map(|d| document_notice(d)).collect();
-        Some(lines.join("\n"))
+        let list: Vec<String> = docs
+            .iter()
+            .map(|d| match &d.bounds {
+                Some(b) => format!("#{} ({},{} {}x{})", d.id.0, b.x, b.y, b.width, b.height),
+                None => format!("#{} (bounds unknown)", d.id.0),
+            })
+            .collect();
+        let one = docs.len() == 1;
+        let (s, have, they, them) = if one {
+            ("", "has", "it", "it")
+        } else {
+            ("s", "have", "they", "them")
+        };
+        let (n, list) = (docs.len(), list.join(", "));
+        Some(if self.is_complete() {
+            format!(
+                "… {n} Document element{s} {have} no readable content: {list}. The web engine \
+                 has not published its accessibility tree, or the page is empty. Elements \
+                 inside {them} cannot be addressed by id. Drive by pixels: glass_screenshot, \
+                 then glass_click at x,y inside the bounds above."
+            )
+        } else {
+            format!(
+                "… {n} Document element{s} {have} no readable content in this snapshot: \
+                 {list}. The walk stopped early or dropped subtrees — the notice beside this \
+                 one says which — so {they} may hold content that was never reached. Raise \
+                 max_nodes, narrow the UI, or take a fresh glass_a11y_snapshot before driving \
+                 by pixels: glass_screenshot, then glass_click at x,y inside the bounds above."
+            )
+        })
     }
 }
 
@@ -2449,28 +2470,79 @@ mod tests {
         d
     }
 
-    #[test]
-    fn a_childless_document_is_reported_with_its_id_and_bounds() {
+    /// A Window with a Back button and one childless `Document` (#2), walked completely.
+    fn tree_with_a_childless_document() -> AxTree {
         let mut tree = AxTree::new(AxNode {
             children: vec![leaf(AxRole::Button, "Back"), document("page", vec![])],
             ..leaf(AxRole::Window, "App")
         });
         tree.assign_ids();
+        tree
+    }
+
+    #[test]
+    fn a_childless_document_is_reported_with_its_id_and_bounds() {
+        let tree = tree_with_a_childless_document();
         let found = tree.unpublished_documents();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, AxNodeId(2));
         let hint = tree
             .document_guidance()
             .expect("a childless Document yields guidance");
-        assert!(hint.contains("#2 Document"), "{hint}");
         assert!(
-            hint.contains("(40,120 800x600)"),
-            "names the bounds: {hint}"
+            hint.contains("#2 (40,120 800x600)"),
+            "id and bounds: {hint}"
         );
         assert!(
             hint.contains("glass_screenshot"),
             "names the pixel path: {hint}"
         );
+        assert!(hint.contains("glass_click"), "names the pixel path: {hint}");
+    }
+
+    #[test]
+    fn a_complete_walk_names_the_engine_and_the_empty_page() {
+        // Nothing stopped this walk, so the childless Document really is all there was —
+        // the one case where glass can name a cause.
+        let hint = tree_with_a_childless_document()
+            .document_guidance()
+            .unwrap();
+        assert!(
+            hint.starts_with("… 1 Document element has no readable content:"),
+            "singular, aggregated: {hint}"
+        );
+        assert!(hint.contains("has not published"), "{hint}");
+    }
+
+    #[test]
+    fn a_document_emptied_by_a_bound_is_not_blamed_on_the_web_engine() {
+        // A bound leaves a Document childless too, so the notice must not claim the engine
+        // published nothing — the truncation notice beside it carries the real cause.
+        let mut tree = tree_with_a_childless_document();
+        tree.truncated = Some(Truncation {
+            limit: TruncationLimit::Nodes,
+            limit_value: 20,
+            nodes_walked: 20,
+        });
+        let hint = tree.document_guidance().unwrap();
+        assert!(
+            !hint.contains("has not published"),
+            "a bounded walk cannot know that: {hint}"
+        );
+        assert!(hint.contains("in this snapshot"), "hedged: {hint}");
+        assert!(hint.contains("max_nodes"), "names the recourse: {hint}");
+    }
+
+    #[test]
+    fn a_document_emptied_by_an_unread_subtree_is_not_blamed_on_the_web_engine() {
+        let mut tree = tree_with_a_childless_document();
+        tree.unreadable = 1;
+        let hint = tree.document_guidance().unwrap();
+        assert!(
+            !hint.contains("has not published"),
+            "a dropped subtree cannot know that: {hint}"
+        );
+        assert!(hint.contains("in this snapshot"), "hedged: {hint}");
     }
 
     #[test]
@@ -2500,8 +2572,14 @@ mod tests {
         tree.assign_ids();
         let ids: Vec<AxNodeId> = tree.unpublished_documents().iter().map(|n| n.id).collect();
         assert_eq!(ids, vec![AxNodeId(3), AxNodeId(4)]);
+        // One notice for both, ids listed in the same pre-order.
         let hint = tree.document_guidance().unwrap();
-        assert_eq!(hint.lines().count(), 2, "one line per document: {hint}");
+        assert!(
+            hint.starts_with("… 2 Document elements have no readable content:"),
+            "plural, aggregated: {hint}"
+        );
+        let (third, fourth) = (hint.find("#3").unwrap(), hint.find("#4").unwrap());
+        assert!(third < fourth, "pre-order: {hint}");
     }
 
     #[test]
