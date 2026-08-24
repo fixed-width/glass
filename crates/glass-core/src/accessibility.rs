@@ -762,6 +762,17 @@ impl AxTree {
         })
     }
 
+    /// Whether this tree can support a claim that something is *not* there: the walk completed
+    /// **and** nothing was withheld ([`Self::unexposed`]).
+    ///
+    /// A placeholder hides an unknown number of elements, so "no node carries this role and name"
+    /// describes only what the app published. Relocation asks this, not [`Self::is_complete`],
+    /// which answers the narrower question of whether the walk itself finished.
+    #[must_use]
+    pub fn can_prove_absence(&self) -> bool {
+        self.is_complete() && self.unexposed == 0
+    }
+
     /// Disclosure for placeholders the app published in place of content it has not exposed —
     /// [`AxTree::unexposed`]. Separate from [`AxTree::unreadable_notice`] because the recourse
     /// differs: the walk reached these and nothing failed, so a fresh snapshot returns the same
@@ -854,18 +865,19 @@ impl AxTree {
             })
             .collect();
         let one = docs.len() == 1;
-        let (s, have, they) = if one {
-            ("", "has", "it")
+        let (s, have, they, them) = if one {
+            ("", "has", "it", "it")
         } else {
-            ("s", "have", "they")
+            ("s", "have", "they", "them")
         };
         let (n, list) = (docs.len(), list.join(", "));
         Some(if self.is_complete() {
             format!(
                 "… {n} Document element{s} {have} no readable content: {list}. The web engine \
-                 has not published its accessibility tree yet, or the page is empty. Take a \
-                 fresh glass_a11y_snapshot after a moment; if it stays empty, drive it by \
-                 pixels: glass_screenshot, then glass_click at x,y inside the bounds above."
+                 has not published its accessibility tree yet, or the page is empty. Elements \
+                 inside {them} cannot be addressed by id. Take a fresh glass_a11y_snapshot \
+                 after a moment; if it stays empty, drive it by pixels: glass_screenshot, then \
+                 glass_click at x,y inside the bounds above."
             )
         } else {
             format!(
@@ -992,8 +1004,9 @@ impl AxTarget {
     /// usually its resource-id leaf, which names a *layout* and so repeats across every screen
     /// built from it — so [`Located::Moved`] is not granted on the search alone. It also needs:
     ///
-    /// * [`AxTree::is_complete`], because "one node matches" is a claim about the whole tree and a
-    ///   read that stopped early can only make it about the part it kept; and
+    /// * [`AxTree::can_prove_absence`], because "one node matches" is a claim about the whole
+    ///   tree, and a read that stopped early — or one the app withheld a subtree from — can only
+    ///   make it about the part it kept; and
     /// * the candidate's bounds to *overlap* the target's, so a same-named field on a screen the
     ///   write navigated to is not mistaken for the one that was written into.
     ///
@@ -1013,10 +1026,10 @@ impl AxTarget {
         let mut candidates = Vec::new();
         collect_matches(&tree.root, self, &mut candidates);
         match candidates.len() {
-            1 if tree.is_complete() && self.bounds_overlap(candidates[0].bounds) => {
+            1 if tree.can_prove_absence() && self.bounds_overlap(candidates[0].bounds) => {
                 Located::Moved(candidates[0])
             }
-            0 if tree.is_complete() => Located::Gone,
+            0 if tree.can_prove_absence() => Located::Gone,
             0 | 1 => Located::Unproven,
             _ => Located::Ambiguous(candidates),
         }
@@ -1029,8 +1042,9 @@ impl AxTarget {
     /// was replaced or the app that drew it restarted (glass#323); telling that caller to
     /// re-address the id is how a `set_value` read-back retypes a write that already landed.
     ///
-    /// An incomplete tree cannot support that second answer: it shows absence only for the part it
-    /// kept, so one that is not [`AxTree::is_complete`] gets the recoverable `AxElementChanged`.
+    /// A tree that cannot prove absence cannot support that second answer: it shows absence only
+    /// for the part it kept, so one failing [`AxTree::can_prove_absence`] — stopped early, or
+    /// missing what the app withheld — gets the recoverable `AxElementChanged`.
     ///
     /// Lives in core rather than in its caller because the question is not Android's: any reader
     /// holding an `AxTree` asks it before a write, and the desktop ones would if they had a tree
@@ -1041,7 +1055,7 @@ impl AxTarget {
     /// [`GlassError::AxWriteUnconfirmed`], which says the text went out.
     #[must_use]
     pub fn drift_error(&self, tree: &AxTree) -> GlassError {
-        if self.still_present(tree) || !tree.is_complete() {
+        if self.still_present(tree) || !tree.can_prove_absence() {
             GlassError::AxElementChanged(self.id.0)
         } else {
             GlassError::AxElementGone(self.id.0)
@@ -2293,6 +2307,28 @@ mod tests {
         assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
     }
 
+    #[test]
+    fn a_withheld_subtree_cannot_prove_the_target_absent() {
+        let mut tree = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        tree.unexposed = 1;
+        assert!(
+            tree.is_complete(),
+            "the walk finished; only the app withheld"
+        );
+        assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
+    }
+
+    #[test]
+    fn a_lone_match_is_not_accepted_as_moved_while_a_subtree_is_withheld() {
+        // "Exactly one node matches" is a claim about the whole tree, and a placeholder hides an
+        // unknown number of nodes behind it.
+        let mut occupied = leaf(AxRole::Button, "Cancel");
+        occupied.children = vec![leaf(AxRole::TextField, "Note")];
+        let mut tree = drift_tree(vec![occupied]);
+        tree.unexposed = 1;
+        assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
+    }
+
     /// Where the measured iOS field sat before the write: origin `(99,2409)`, 1008px wide.
     const CAPTURED: AxRect = AxRect {
         x: 99,
@@ -2511,6 +2547,18 @@ mod tests {
     }
 
     #[test]
+    fn a_withheld_subtree_never_reports_the_target_gone() {
+        // Complete, so `is_complete` cannot catch it — the element may be behind the placeholder.
+        let mut withheld = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        withheld.unexposed = 1;
+        assert!(withheld.is_complete(), "the walk finished");
+        assert!(matches!(
+            drift_target().drift_error(&withheld),
+            GlassError::AxElementChanged(1)
+        ));
+    }
+
+    #[test]
     fn empty_guidance_flags_a_treeless_snapshot() {
         // Only the window root, no children → nothing to address → steer to pixels.
         let empty = AxTree::new(leaf(AxRole::Window, "App"));
@@ -2565,6 +2613,10 @@ mod tests {
             "names the pixel path: {hint}"
         );
         assert!(hint.contains("glass_click"), "names the pixel path: {hint}");
+        assert!(
+            hint.contains("cannot be addressed by id"),
+            "nothing inside is addressable: {hint}"
+        );
     }
 
     #[test]

@@ -531,7 +531,10 @@ it short or it dropped a subtree it could not read — before reaching its conte
 says so in a separate notice naming the element's id and bounds, the same way a truncated tree is
 disclosed. Where the walk completed, that notice steers to a fresh `glass_a11y_snapshot` first and
 to the pixel path only if the page stays empty: on an Android WebView the first snapshot after a
-launch was childless and the next held the whole page (read 2026-08-24).
+launch was childless and the next held the whole page (read 2026-08-24). An app can also publish a
+*placeholder* where the content would be — an element standing in for a web view whose
+accessibility is off — and that gets its own notice: nothing behind it can be addressed by id and a
+re-snapshot will not change that, so it steers straight to the pixel path.
 
 - `max_nodes` (integer) — raise the element cap above the default (which protects the token
   budget), or `0` to remove the element-count limit. Omit for the default cap. (Structural

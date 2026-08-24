@@ -294,8 +294,7 @@ fn a11y_truncation_steer(tree: &glass_core::AxTree) -> Option<String> {
 /// not four call-site lists, so `a11y_snapshot` and the `return:"snapshot"` fold disclose
 /// identically.
 ///
-/// Ordered by how much the recourse can still change: a re-read first, then the two that leave
-/// only pixels.
+/// Order: truncation, unreadable, unexposed, document, subject.
 fn a11y_steers(tree: &glass_core::AxTree) -> Vec<String> {
     [
         a11y_truncation_steer(tree),

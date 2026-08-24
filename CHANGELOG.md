@@ -23,7 +23,7 @@ internal refactors, CI, or test-only changes.
 - `Document` accessibility role: a browser page or embedded web view (AT-SPI `document web`/`document frame`, `AXWebArea`, Android `WebView`, UIA `Document` from a web engine) now reads as a `Document` whose children are the page's elements, on Linux, Windows, macOS and Android.
 
 ### Fixed
-- A web view whose content the platform has not published is disclosed in the snapshot with its id, bounds and the pixel path, instead of arriving as an indistinguishable empty group.
+- A web view whose content the platform has not published is disclosed in the snapshot instead of arriving as an indistinguishable empty group: a childless `Document` is named by id and bounds and steers to a re-snapshot before pixels, while a placeholder the app published for content it withheld steers straight to pixels.
 
 ## [1.5.0] - 2026-08-22
 
