@@ -40,6 +40,8 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
     ("AXSplitter", AxRole::Separator),
     ("AXHeading", AxRole::Heading),
     ("AXMenuButton", AxRole::Button),
+    // The root of a web engine's subtree (WebKit and Chromium both report it).
+    ("AXWebArea", AxRole::Document),
 ];
 
 /// Subroles that decide a role, and the base roles that can carry one.
@@ -229,6 +231,11 @@ mod tests {
     fn unmapped_role_is_other() {
         assert_eq!(map_role("AXRuler", None), AxRole::Other);
         assert_eq!(map_role("", None), AxRole::Other);
+    }
+
+    #[test]
+    fn a_web_area_is_a_document() {
+        assert_eq!(map_role("AXWebArea", None), AxRole::Document);
     }
 
     #[test]

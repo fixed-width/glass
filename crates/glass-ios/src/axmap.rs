@@ -52,6 +52,8 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
     ("AXGroup", AxRole::Group),
     // A screen or section title.
     ("AXHeading", AxRole::Heading),
+    // The root of a web engine's subtree (WebKit and Chromium both report it).
+    ("AXWebArea", AxRole::Document),
 ];
 
 /// Map an idb AX role string (e.g. `AXButton`) to a normalized [`AxRole`].
@@ -316,6 +318,11 @@ mod tests {
         // The checkable roles the toggle-state derivation depends on.
         assert_eq!(ax_role("AXCheckBox"), AxRole::CheckBox);
         assert_eq!(ax_role("AXWhatever"), AxRole::Other);
+    }
+
+    #[test]
+    fn a_web_area_is_a_document() {
+        assert_eq!(ax_role("AXWebArea"), AxRole::Document);
     }
 
     #[test]
