@@ -8,10 +8,15 @@
 //! ```
 //!
 //! `GLASS_WEB_PROBE_BROWSERS` is a comma-separated list of launch commands — `.app` bundle
-//! paths or plain executables, exactly what `AppSpec::run[0]` accepts. Each is launched with
-//! the `examples/web-role-fixture/index.html` page as `run[1]`; when the launch path drops
-//! that argument (an app LaunchServices opens by bundle rather than by command line), the
-//! probe navigates by typing the URL into the address bar instead, and says which route ran.
+//! paths or plain executables, exactly what `AppSpec::run[0]` accepts. Each is launched on a
+//! fresh profile directory with the `examples/web-role-fixture/index.html` page as the last
+//! element of `run`.
+//!
+//! The argument does reach the app: a bundle launch carries `run[1..]` through
+//! `NSWorkspaceOpenConfiguration.setArguments`. An app can still decline to *open* it — Safari
+//! answers a `file://` URL given as `argv` with its own "Failed to open page" — so when the
+//! window title does not show the page, the probe types the URL into the address bar instead.
+//! It prints which of the two routes delivered the page.
 //!
 //! `GLASS_WEB_PROBE_LEVER` picks the enable lever set on the *application* element after the
 //! launch: `enhanced` → `AXEnhancedUserInterface`, `manual` → `AXManualAccessibility`,
@@ -52,6 +57,7 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos_main {
+    use std::path::Path;
     use std::ptr::NonNull;
     use std::time::{Duration, Instant};
 
@@ -152,6 +158,10 @@ mod macos_main {
         let name = CFString::from_str(attr);
         // `objc2-core-foundation` has no `CFBoolean` constructor; the two singletons are the
         // documented way to name a CF boolean, as `glass-macos::session`'s tests do.
+        //
+        // SAFETY: `kCFBooleanTrue` is an immortal Core Foundation singleton — reading the extern
+        // static is a plain load of a pointer CF keeps valid for the process's lifetime, and the
+        // binding hands it back as an `Option` so a null is handled rather than dereferenced.
         let value: &CFType = match unsafe { kCFBooleanTrue } {
             Some(v) => v,
             None => return Err("kCFBooleanTrue was null".to_string()),
@@ -791,10 +801,82 @@ mod macos_main {
         }
     }
 
-    fn browser_spec(browser: &str, url: &str) -> AppSpec {
-        AppSpec {
+    /// Which browser family a launch command names, decided from the executable or bundle
+    /// name. Nothing else in the launch says which engine this is, and the profile flag and the
+    /// first-run suppression differ per family.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Engine {
+        Gecko,
+        Chromium,
+        /// Anything else — including a `.app` bundle glass hands to LaunchServices. It gets no
+        /// profile flag, and the page reaches it by the address bar (see the module doc).
+        Other,
+    }
+
+    impl Engine {
+        fn of(browser: &str) -> Self {
+            let name = Path::new(browser)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if ["firefox", "librewolf", "waterfox"]
+                .iter()
+                .any(|n| name.contains(n))
+            {
+                Engine::Gecko
+            } else if ["chrome", "chromium", "brave", "edge", "vivaldi", "opera"]
+                .iter()
+                .any(|n| name.contains(n))
+            {
+                Engine::Chromium
+            } else {
+                Engine::Other
+            }
+        }
+    }
+
+    /// The prefs a fresh Gecko profile needs, so the reading is of the page rather than of a
+    /// welcome tab, a migration modal or a data-policy notification sitting in front of it.
+    const GECKO_USER_JS: &str = concat!(
+        "user_pref(\"browser.aboutwelcome.enabled\", false);\n",
+        "user_pref(\"browser.migrate.content-modal.enabled\", false);\n",
+        "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n",
+        "user_pref(\"browser.startup.upgradeDialog.enabled\", false);\n",
+        "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n",
+        "user_pref(\"datareporting.policy.dataSubmissionPolicyBypassNotification\", true);\n",
+        "user_pref(\"toolkit.telemetry.reportingpolicy.firstRun\", false);\n",
+    );
+
+    /// The launch spec for `browser`, on the fresh `profile` directory the caller owns.
+    ///
+    /// A fresh profile per launch is what keeps the reading repeatable: no first-run prompts, no
+    /// session restore, and no already-running instance adopting the URL instead of starting a
+    /// process glass owns. The caller must hold the directory for the life of the launch —
+    /// dropping it deletes the profile out from under a running browser.
+    fn browser_spec(browser: &str, url: &str, profile: &Path) -> Result<AppSpec, String> {
+        let mut run = vec![browser.to_string()];
+        match Engine::of(browser) {
+            Engine::Gecko => {
+                std::fs::write(profile.join("user.js"), GECKO_USER_JS)
+                    .map_err(|e| format!("writing the Gecko profile's user.js: {e}"))?;
+                run.extend([
+                    "--no-remote".to_string(),
+                    "--new-instance".to_string(),
+                    "--profile".to_string(),
+                    profile.display().to_string(),
+                ]);
+            }
+            Engine::Chromium => run.extend([
+                format!("--user-data-dir={}", profile.display()),
+                "--no-first-run".to_string(),
+                "--no-default-browser-check".to_string(),
+            ]),
+            Engine::Other => {}
+        }
+        run.push(url.to_string());
+        Ok(AppSpec {
             build: None,
-            run: vec![browser.to_string(), url.to_string()],
+            run,
             cwd: None,
             env: vec![],
             window_hint: Some(WindowHint {
@@ -804,17 +886,30 @@ mod macos_main {
             timeout_ms: LAUNCH_TIMEOUT_MS,
             sandbox: SandboxLevel::Off,
             a11y: true,
-        }
+        })
     }
 
-    fn probe_browser(browser: &str, lever: Lever, url: &str) -> Result<(), String> {
+    /// Probe one browser. `Ok` carries the blind spots this run found — content that never
+    /// arrived *and* no disclosure explaining it, which is a reading about glass rather than a
+    /// breakage — so [`run`] can repeat them in its summary. `Err` is reserved for the run
+    /// itself breaking: a launch that failed, or a reader that never answered.
+    fn probe_browser(browser: &str, lever: Lever, url: &str) -> Result<Vec<String>, String> {
         println!("\n=== macos / {browser} / lever={lever:?} ===");
-        let spec = browser_spec(browser, url);
+        // Held for the whole launch: dropping it deletes the profile out from under the browser.
+        let profile = tempfile::tempdir().map_err(|e| format!("profile dir for {browser}: {e}"))?;
+        let spec = browser_spec(browser, url, profile.path())?;
+        println!("engine family: {:?}", Engine::of(browser));
         println!("run: {:?}", spec.run);
         let mut platform =
             MacosPlatform::new().map_err(|e| format!("MacosPlatform::new(): {e}"))?;
 
         with_stop_app(&mut platform, browser, |platform| {
+            // Breakage is collected rather than returned at the first sign of it: the readings
+            // after it are still worth printing, and `with_stop_app` must reap the browser
+            // either way. Returned at the end of this closure so `run` can fail the process
+            // once, after every target has been probed and stopped.
+            let mut broke: Vec<String> = Vec::new();
+            let mut blind: Vec<String> = Vec::new();
             let started = Instant::now();
             let geometry = platform
                 .start_app(&spec)
@@ -824,11 +919,15 @@ mod macos_main {
 
             let carried = wait_for_page_title(platform, Duration::from_secs(6));
             if carried {
-                println!("url delivery: the launch carried AppSpec::run[1] to the browser");
+                println!("url delivery: the launch's own argument opened the page");
             } else {
+                // The argument reached the app — a bundle launch carries `run[1..]` through
+                // `NSWorkspaceOpenConfiguration.setArguments` — and the app declined to open
+                // it. Safari's decline is visible in the window title above: "Failed to open
+                // page", its own error page for a `file://` URL handed over as `argv`.
                 println!(
-                    "url delivery: the launch did not carry AppSpec::run[1] — navigating by \
-                     address bar"
+                    "url delivery: the launch carried AppSpec::run's tail, but the app did not \
+                     open the page from it — navigating by address bar"
                 );
                 navigate_by_address_bar(platform, url)?;
                 let loaded = wait_for_page_title(platform, Duration::from_secs(10));
@@ -852,7 +951,12 @@ mod macos_main {
                     documents(&tree).len(),
                     page_marker(&tree)
                 ),
-                Err(e) => println!("first snapshot after load failed: {e}"),
+                Err(e) => {
+                    println!("first snapshot after load failed: {e}");
+                    broke.push(format!(
+                        "{browser}: the first snapshot after the page loaded failed: {e}"
+                    ));
+                }
             }
             report_raw("after the first snapshot, before the lever", &raw_scan(pid));
 
@@ -869,19 +973,44 @@ mod macos_main {
                     report_iframe(&tree);
                     if arrived {
                         exercise(platform, &mut a11y, &ctx);
-                        if let Ok(after) = snapshot(&mut a11y, &ctx) {
-                            println!("--- tree after actuation ---");
-                            report_tree(&after);
+                        match snapshot(&mut a11y, &ctx) {
+                            Ok(after) => {
+                                println!("--- tree after actuation ---");
+                                report_tree(&after);
+                            }
+                            Err(e) => {
+                                println!("snapshot after actuation failed: {e}");
+                                broke.push(format!(
+                                    "{browser}: the snapshot after actuation failed: {e}"
+                                ));
+                            }
                         }
                     } else if let Some(hint) = tree.document_guidance() {
                         println!("disclosure rendered:\n{hint}");
                     } else {
+                        // A reading, not a breakage — finding this is why the probe exists. It
+                        // goes to `run`'s summary so it cannot be lost in the output above.
                         println!("NO DOCUMENT AND NO DISCLOSURE — the blind spot");
+                        blind.push(format!(
+                            "{browser} (lever={lever:?}): no page content arrived within \
+                             {SETTLE:?}, and the tree carried no Document to disclose — an \
+                             agent reading this app is told nothing"
+                        ));
                     }
                 }
-                None => println!("no tree at all — nothing was published within {SETTLE:?}"),
+                None => {
+                    println!("no tree at all — nothing was published within {SETTLE:?}");
+                    broke.push(format!(
+                        "{browser}: no snapshot succeeded within {SETTLE:?} — the reader never \
+                         answered, so this run read nothing"
+                    ));
+                }
             }
-            Ok(())
+            if broke.is_empty() {
+                Ok(blind)
+            } else {
+                Err(broke.join("\n"))
+            }
         })
     }
 
@@ -890,8 +1019,9 @@ mod macos_main {
 
     /// Five snapshot wall-clocks, printed individually beside the mean so one slow outlier is
     /// visible rather than averaged away.
-    fn time_snapshots(label: &str, a11y: &mut MacosA11y, ctx: &AxContext) {
+    fn time_snapshots(label: &str, a11y: &mut MacosA11y, ctx: &AxContext) -> Result<(), String> {
         let mut samples = Vec::with_capacity(TIMING_REPEATS);
+        let mut broke = None;
         for repeat in 0..TIMING_REPEATS {
             let started = Instant::now();
             match a11y.snapshot(ctx) {
@@ -901,8 +1031,14 @@ mod macos_main {
                     std::hint::black_box(&tree);
                     samples.push(started.elapsed().as_secs_f64() * 1000.0);
                 }
+                // The samples taken so far still print below — "the first one failed" and "they
+                // grew and then failed" are different findings — but a timing block that could
+                // not finish is read breakage, and the run must not pass on it.
                 Err(e) => {
                     println!("  {label}: repeat {repeat} failed: {e}");
+                    broke = Some(format!(
+                        "{label}: snapshot {repeat} of {TIMING_REPEATS} failed: {e}"
+                    ));
                     break;
                 }
             }
@@ -914,6 +1050,7 @@ mod macos_main {
             samples.iter().sum::<f64>() / samples.len() as f64
         };
         println!("  {label}: mean {mean:.0}ms over {rendered:?}");
+        broke.map_or(Ok(()), Err)
     }
 
     /// The side-effect reading: what leaving a lever set costs an ordinary AppKit app. Both
@@ -935,6 +1072,8 @@ mod macos_main {
             MacosPlatform::new().map_err(|e| format!("MacosPlatform::new(): {e}"))?;
 
         with_stop_app(&mut platform, TIMING_APP, |platform| {
+            // Collected, not returned early: see `probe_browser`'s closure for why.
+            let mut broke: Vec<String> = Vec::new();
             let geometry = platform
                 .start_app(&spec)
                 .map_err(|e| format!("start_app({TIMING_APP}): {e}"))?;
@@ -943,10 +1082,16 @@ mod macos_main {
 
             let ctx = context(platform, &geometry);
             let mut a11y = MacosA11y::new();
-            if let Ok(tree) = snapshot(&mut a11y, &ctx) {
-                println!("tree before the lever: {} nodes", tree.count);
+            match snapshot(&mut a11y, &ctx) {
+                Ok(tree) => println!("tree before the lever: {} nodes", tree.count),
+                Err(e) => {
+                    println!("tree before the lever: snapshot failed: {e}");
+                    broke.push(format!(
+                        "{TIMING_APP}: the snapshot before the lever failed: {e}"
+                    ));
+                }
             }
-            time_snapshots("before the lever", &mut a11y, &ctx);
+            broke.extend(time_snapshots("before the lever", &mut a11y, &ctx).err());
 
             let pid = app_pid(platform)?;
             // With no lever, the block below is the measurement's own noise — the control for a
@@ -954,11 +1099,21 @@ mod macos_main {
             apply_lever(pid, lever);
             std::thread::sleep(ACTION_SETTLE);
 
-            if let Ok(tree) = snapshot(&mut a11y, &ctx) {
-                println!("tree after the lever: {} nodes", tree.count);
+            match snapshot(&mut a11y, &ctx) {
+                Ok(tree) => println!("tree after the lever: {} nodes", tree.count),
+                Err(e) => {
+                    println!("tree after the lever: snapshot failed: {e}");
+                    broke.push(format!(
+                        "{TIMING_APP}: the snapshot after the lever failed: {e}"
+                    ));
+                }
             }
-            time_snapshots("after the lever", &mut a11y, &ctx);
-            Ok(())
+            broke.extend(time_snapshots("after the lever", &mut a11y, &ctx).err());
+            if broke.is_empty() {
+                Ok(())
+            } else {
+                Err(broke.join("\n"))
+            }
         })
     }
 
@@ -969,11 +1124,13 @@ mod macos_main {
         println!("page: {url}");
 
         let mut failures = Vec::new();
+        let mut blind_spots: Vec<String> = Vec::new();
         match std::env::var(BROWSERS_VAR) {
             Ok(list) if !list.trim().is_empty() => {
                 for browser in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    if let Err(e) = probe_browser(browser, lever, &url) {
-                        failures.push(e);
+                    match probe_browser(browser, lever, &url) {
+                        Ok(blind) => blind_spots.extend(blind),
+                        Err(e) => failures.push(e),
                     }
                 }
             }
@@ -988,12 +1145,21 @@ mod macos_main {
             }
         }
 
+        // Repeated here so a blind spot found halfway up a long run is not lost in the
+        // scrollback. It does not fail the run: a browser that published nothing is the reading
+        // this probe was written to take.
+        if !blind_spots.is_empty() {
+            println!("\nWEB_PROBE_BLIND_SPOTS:\n{}", blind_spots.join("\n"));
+        }
         if failures.is_empty() {
             println!("\nWEB_PROBE_DONE");
             std::process::exit(0);
         }
-        // Printed, not `fail`ed through stderr alone: the evidence above is the point, and a
-        // launch that never happened is the one thing worth a non-zero exit.
+        // Printed to stdout as well as failed through stderr: the granted run's harness reports
+        // the two separately, and the evidence above is what a reader needs beside the verdict.
+        // Only breakage gets here — a launch that never happened, or a reader that never
+        // answered — so a non-zero exit always means the run read nothing, never that an engine
+        // exposed nothing.
         println!("\nWEB_PROBE_FAILURES:\n{}", failures.join("\n"));
         crate::common::fail(failures.join("\n"));
     }
