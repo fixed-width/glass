@@ -168,8 +168,6 @@ pub struct SetValueArgs {
 }
 
 /// Arguments for `glass_a11y_snapshot`.
-/// Web content inside the app arrives under a `Document` element; a `Document` with no
-/// children is disclosed with the pixel path.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct A11ySnapshotArgs {
     /// Maximum number of elements to include. Omit for the default cap (protects the token

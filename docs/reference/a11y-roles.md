@@ -62,9 +62,9 @@ now, and the outline only names the token of an element that has none.
 
 **A web document is a `Document`.** A browser page or an embedded web view arrives as one
 `Document` element with the page's elements as its children; an `<iframe>` is a `Document`
-inside it. Web engines build that tree lazily — only once they believe an assistive technology is
-present — so a `Document` can arrive with no children at all. glass discloses that case in the
-snapshot rather than leaving an empty container to be read as an empty page.
+inside it. A web engine may publish its tree only after it detects an assistive technology, so a
+`Document` can arrive with no children at all. glass discloses that case in the snapshot rather
+than leaving an empty container to be read as an empty page.
 
 <!-- BEGIN GENERATED: role-support -->
 | Role | Linux (AT-SPI) | Windows (UIA) | macOS (AX) | Android | iOS |
