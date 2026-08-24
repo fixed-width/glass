@@ -14,8 +14,10 @@
 //! `.windows-artifacts/web-probe.txt`, which the harness copies back — see [`transcript`].
 //!
 //! A probe, not a mapping test: it prints evidence and does not assert what an engine ought to
-//! publish. Whether `stop` reached each browser is one of the readings; the one assertion is that
-//! nothing the probe launched is left running on the box afterwards.
+//! publish — a browser that starts but never shows the page's own content is a reading, not a
+//! failure (`arrived: false`, plus whatever disclosure rendered). What does fail the run: a
+//! browser that never launches, an accessibility channel that never answers, or a process this
+//! probe launched that outlives both `stop` and its own cleanup kill.
 #![cfg(windows)]
 
 use std::path::Path;
@@ -325,8 +327,14 @@ fn documents(tree: &AxTree) -> Vec<&AxNode> {
 ///
 /// Every error is retried until the deadline: a browser re-execs during startup and the reader
 /// has nothing to bind to until the second process owns the window. Each distinct error prints
-/// once.
-fn snapshot_until_page(glass: &mut Glass, budget: Duration) -> (Option<AxTree>, Duration, bool) {
+/// once and is recorded into `failures` — a caller not yet answering is expected during startup,
+/// but every other error is evidence the accessibility channel itself broke.
+fn snapshot_until_page(
+    glass: &mut Glass,
+    budget: Duration,
+    label: &str,
+    failures: &mut Vec<String>,
+) -> (Option<AxTree>, Duration, bool) {
     let start = Instant::now();
     let mut last = None;
     let mut reported: Vec<String> = Vec::new();
@@ -344,6 +352,7 @@ fn snapshot_until_page(glass: &mut Glass, budget: Duration) -> (Option<AxTree>, 
                 let text = e.to_string();
                 if !reported.contains(&text) {
                     say!("snapshot error at {:?}: {text}", start.elapsed());
+                    failures.push(format!("{label}: snapshot error: {text}"));
                     reported.push(text);
                 }
             }
@@ -395,16 +404,27 @@ fn report_tree(tree: &AxTree) {
 /// settles, and an id whose node has moved since the snapshot is rejected as changed.
 const CLICK_ATTEMPTS: usize = 4;
 
+/// Push a formatted `{label}: {context}: {e}` into `failures` unless `e` is
+/// [`GlassError::AccessibilityNotReady`] — a caller not yet answering is expected during
+/// startup and settles on retry; every other error means the accessibility channel broke after
+/// it had already been serving this session.
+fn record_snapshot_failure(failures: &mut Vec<String>, label: &str, context: &str, e: &GlassError) {
+    if !matches!(e, GlassError::AccessibilityNotReady(_)) {
+        failures.push(format!("{label}: {context}: {e}"));
+    }
+}
+
 /// The actuation readings. Each step re-snapshots first: `click_element` and `set_value` resolve
 /// ids against the session's most recent tree, so an id from an older one addresses nothing.
 /// Returns whether the click landed and whether the written value read back.
-fn exercise(glass: &mut Glass) -> (bool, bool) {
+fn exercise(glass: &mut Glass, label: &str, failures: &mut Vec<String>) -> (bool, bool) {
     let mut clicked = false;
     for attempt in 1..=CLICK_ATTEMPTS {
         let before = match glass.a11y_snapshot(Some(0)) {
             Ok(tree) => tree,
             Err(e) => {
                 say!("snapshot before the click failed: {e} — no click reading");
+                record_snapshot_failure(failures, label, "snapshot before the click failed", &e);
                 return (false, false);
             }
         };
@@ -432,12 +452,21 @@ fn exercise(glass: &mut Glass) -> (bool, bool) {
                              reads {CLICKED:?}: {clicked}"
                         );
                     }
-                    Err(e) => say!("click_element: {method:?} → re-snapshot failed: {e}"),
+                    Err(e) => {
+                        say!("click_element: {method:?} → re-snapshot failed: {e}");
+                        record_snapshot_failure(
+                            failures,
+                            label,
+                            "re-snapshot after click_element failed",
+                            &e,
+                        );
+                    }
                 }
                 break;
             }
             Err(e) => {
                 say!("click_element (attempt {attempt}) failed: {e}");
+                record_snapshot_failure(failures, label, "click_element failed", &e);
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
@@ -447,6 +476,7 @@ fn exercise(glass: &mut Glass) -> (bool, bool) {
         Ok(tree) => tree,
         Err(e) => {
             say!("snapshot before set_value failed: {e} — no set_value reading");
+            record_snapshot_failure(failures, label, "snapshot before set_value failed", &e);
             return (clicked, false);
         }
     };
@@ -467,6 +497,7 @@ fn exercise(glass: &mut Glass) -> (bool, bool) {
         Ok(tree) => tree,
         Err(e) => {
             say!("set_value: {set:?} → re-snapshot failed: {e}");
+            record_snapshot_failure(failures, label, "re-snapshot after set_value failed", &e);
             return (clicked, false);
         }
     };
@@ -489,7 +520,10 @@ fn exercise(glass: &mut Glass) -> (bool, bool) {
                 raised.is_ok(),
                 text_input(&after).and_then(|n| n.value.clone())
             ),
-            Err(e) => say!("control — re-snapshot failed: {e}"),
+            Err(e) => {
+                say!("control — re-snapshot failed: {e}");
+                record_snapshot_failure(failures, label, "control re-snapshot failed", &e);
+            }
         }
     }
 
@@ -509,7 +543,10 @@ fn exercise(glass: &mut Glass) -> (bool, bool) {
             say!("--- tree after actuation ---");
             report_tree(&after);
         }
-        Err(e) => say!("final snapshot failed: {e}"),
+        Err(e) => {
+            say!("final snapshot failed: {e}");
+            record_snapshot_failure(failures, label, "final snapshot failed", &e);
+        }
     }
     (clicked, value_took)
 }
@@ -556,11 +593,17 @@ fn documents_under(automation: &UIAutomation, root: UIElement, label: &str) -> V
 
 /// The app's top-level window as a UIA element, bound by handle exactly as the reader itself
 /// binds it — so the scoped walk sees the window glass drives, not a peer app's.
-fn app_window_element(glass: &mut Glass, automation: &UIAutomation) -> Option<UIElement> {
+fn app_window_element(
+    glass: &mut Glass,
+    automation: &UIAutomation,
+    label: &str,
+    failures: &mut Vec<String>,
+) -> Option<UIElement> {
     let windows = match glass.list_windows() {
         Ok(w) => w,
         Err(e) => {
             say!("list_windows failed: {e}");
+            record_snapshot_failure(failures, label, "list_windows failed", &e);
             return None;
         }
     };
@@ -595,6 +638,7 @@ fn app_window_element(glass: &mut Glass, automation: &UIAutomation) -> Option<UI
         }
         Err(e) => {
             say!("element_from_handle failed: {e}");
+            failures.push(format!("{label}: element_from_handle failed: {e}"));
             None
         }
     }
@@ -603,15 +647,16 @@ fn app_window_element(glass: &mut Glass, automation: &UIAutomation) -> Option<UI
 /// The `FrameworkId` reading for a running app: scoped to its own window first (precise), then
 /// the whole-desktop walk the recipe calls for, which also shows what else on the box publishes
 /// a `Document`. Returns the framework ids seen under the app's own window.
-fn framework_reading(glass: &mut Glass, label: &str) -> Vec<String> {
+fn framework_reading(glass: &mut Glass, label: &str, failures: &mut Vec<String>) -> Vec<String> {
     let automation = match UIAutomation::new() {
         Ok(a) => a,
         Err(e) => {
             say!("UIAutomation::new failed: {e}");
+            failures.push(format!("{label}: UIAutomation::new failed: {e}"));
             return Vec::new();
         }
     };
-    let scoped = match app_window_element(glass, &automation) {
+    let scoped = match app_window_element(glass, &automation, label, failures) {
         Some(window) => documents_under(&automation, window, &format!("{label}, from its window")),
         None => Vec::new(),
     };
@@ -623,15 +668,20 @@ fn framework_reading(glass: &mut Glass, label: &str) -> Vec<String> {
                 &format!("{label}, from the desktop root"),
             );
         }
-        Err(e) => say!("get_root_element failed: {e}"),
+        Err(e) => {
+            say!("get_root_element failed: {e}");
+            failures.push(format!("{label}: get_root_element failed: {e}"));
+        }
     }
     scoped
 }
 
 /// Pids of processes named `exe` whose command line carries `marker` — our isolated profile — so
 /// the box's own browsers are never matched. An empty vec also covers a failed query, which is
-/// why the teardown check kills what this returns rather than trusting a count.
-fn our_pids(exe: &str, marker: &str) -> Vec<u32> {
+/// why the teardown check kills what this returns rather than trusting a count — and why a
+/// failed query is recorded into `failures` rather than trusted silently: a query that never
+/// works would otherwise report every survivor as "gone" for the rest of the run.
+fn our_pids(exe: &str, marker: &str, failures: &mut Vec<String>) -> Vec<u32> {
     let ps = format!(
         "Get-CimInstance Win32_Process -Filter \"Name='{exe}'\" | \
          Where-Object {{ $_.CommandLine -like '*{marker}*' }} | \
@@ -647,6 +697,10 @@ fn our_pids(exe: &str, marker: &str) -> Vec<u32> {
             .collect(),
         Err(e) => {
             say!("pid query for {exe} failed: {e}");
+            let msg = format!("{exe}: pid query failed: {e}");
+            if !failures.contains(&msg) {
+                failures.push(msg);
+            }
             Vec::new()
         }
     }
@@ -655,10 +709,15 @@ fn our_pids(exe: &str, marker: &str) -> Vec<u32> {
 /// Poll until nothing carrying `marker` is left or `budget` elapses, returning what is still
 /// there. A browser tree takes seconds to unwind, so an immediate read would call a normal
 /// shutdown a leak.
-fn wait_for_no_process(exe: &str, marker: &str, budget: Duration) -> Vec<u32> {
+fn wait_for_no_process(
+    exe: &str,
+    marker: &str,
+    budget: Duration,
+    failures: &mut Vec<String>,
+) -> Vec<u32> {
     let deadline = Instant::now() + budget;
     loop {
-        let pids = our_pids(exe, marker);
+        let pids = our_pids(exe, marker, failures);
         if pids.is_empty() || Instant::now() >= deadline {
             return pids;
         }
@@ -670,8 +729,14 @@ fn wait_for_no_process(exe: &str, marker: &str, budget: Duration) -> Vec<u32> {
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(15);
 
 /// One engine's whole reading: launch on the fixture, wait for content, actuate, then read the
-/// `Document` control types. Never panics after `start` — `stop` has to run.
-fn probe_browser(engine: &'static str, exe: &str, marker: &str) -> Reading {
+/// `Document` control types. Never panics after `start` — `stop` has to run; genuine breakage is
+/// recorded into `failures` instead, for the test to panic on once every browser has had its turn.
+fn probe_browser(
+    engine: &'static str,
+    exe: &str,
+    marker: &str,
+    failures: &mut Vec<String>,
+) -> Reading {
     say!("\n=== {engine} — {exe} ===");
     let profile = glass_windows::onbox_support::scratch_dir(marker);
     let _ = std::fs::remove_dir_all(&profile);
@@ -689,18 +754,23 @@ fn probe_browser(engine: &'static str, exe: &str, marker: &str) -> Reading {
     let started = Instant::now();
     if let Err(e) = glass.start(&spec) {
         say!("start failed after {:?}: {e}", started.elapsed());
+        failures.push(format!(
+            "{engine}: start failed after {:?}: {e}",
+            started.elapsed()
+        ));
         let _ = std::fs::remove_dir_all(&profile);
         return reading;
     }
     say!("window mapped after {:?}", started.elapsed());
 
-    let (tree, settle, arrived) = snapshot_until_page(&mut glass, SETTLE);
+    let (tree, settle, arrived) = snapshot_until_page(&mut glass, SETTLE, engine, failures);
     say!("page content arrived within {SETTLE:?}: {arrived} after {settle:?}");
     let (tree, arrived) = if arrived {
         (tree, true)
     } else {
         // A second, longer read so "slow" is not recorded as "never".
-        let (tree, settle, arrived) = snapshot_until_page(&mut glass, EXTENDED_SETTLE);
+        let (tree, settle, arrived) =
+            snapshot_until_page(&mut glass, EXTENDED_SETTLE, engine, failures);
         say!("extended read: arrived={arrived} after a further {settle:?}");
         (tree, arrived)
     };
@@ -710,7 +780,7 @@ fn probe_browser(engine: &'static str, exe: &str, marker: &str) -> Reading {
         Some(tree) => {
             report_tree(&tree);
             if arrived {
-                let (clicked, value_took) = exercise(&mut glass);
+                let (clicked, value_took) = exercise(&mut glass, engine, failures);
                 reading.clicked = clicked;
                 reading.value_took = value_took;
             } else if let Some(hint) = tree.document_guidance() {
@@ -722,7 +792,7 @@ fn probe_browser(engine: &'static str, exe: &str, marker: &str) -> Reading {
         None => say!("no tree at all — nothing was published"),
     }
 
-    reading.frameworks = framework_reading(&mut glass, engine);
+    reading.frameworks = framework_reading(&mut glass, engine, failures);
     say!("stop: {:?}", glass.stop());
     let _ = std::fs::remove_dir_all(&profile);
     reading
@@ -730,11 +800,12 @@ fn probe_browser(engine: &'static str, exe: &str, marker: &str) -> Reading {
 
 /// The text-editor half of the `FrameworkId` reading: a stock editor's `Document` is the thing a
 /// web document has to be told apart from.
-fn probe_notepad() -> Vec<String> {
+fn probe_notepad(failures: &mut Vec<String>) -> Vec<String> {
     say!("\n=== notepad ===");
     let mut glass = glass_windows_with_a11y();
     if let Err(e) = glass.start(&notepad_spec()) {
         say!("start notepad failed: {e}");
+        failures.push(format!("notepad: start failed: {e}"));
         return Vec::new();
     }
     let raised = glass.window(&WindowOp::Focus);
@@ -743,9 +814,12 @@ fn probe_notepad() -> Vec<String> {
     std::thread::sleep(Duration::from_millis(800));
     match glass.a11y_snapshot(Some(0)) {
         Ok(tree) => report_tree(&tree),
-        Err(e) => say!("notepad snapshot failed: {e}"),
+        Err(e) => {
+            say!("notepad snapshot failed: {e}");
+            record_snapshot_failure(failures, "notepad", "snapshot failed", &e);
+        }
     }
-    let frameworks = framework_reading(&mut glass, "notepad");
+    let frameworks = framework_reading(&mut glass, "notepad", failures);
     say!("stop: {:?}", glass.stop());
     frameworks
 }
@@ -755,6 +829,10 @@ fn probe_notepad() -> Vec<String> {
 fn web_probe() {
     let mut readings = Vec::new();
     let mut launched = Vec::new();
+    // Breakage in the accessibility channel itself, not what a browser published — collected
+    // per browser so every requested browser still gets its turn (and its `stop`), with the run
+    // failing once at the end rather than on whichever browser happened to hit it first.
+    let mut failures: Vec<String> = Vec::new();
     for (engine, relative) in BROWSERS {
         let Some(exe) = locate(relative) else {
             say!("\n=== {engine} — not installed at {relative}; skipped ===");
@@ -772,10 +850,10 @@ fn web_probe() {
             .unwrap_or("")
             .to_string();
         let marker = format!("glass-web-probe-{stem}");
-        readings.push(probe_browser(engine, &exe, &marker));
+        readings.push(probe_browser(engine, &exe, &marker, &mut failures));
         launched.push((exe_name, marker));
     }
-    let notepad = probe_notepad();
+    let notepad = probe_notepad(&mut failures);
 
     say!("\n== aggregate: web-content probe ==");
     for r in &readings {
@@ -799,7 +877,7 @@ fn web_probe() {
     // own profile marker, so it kills those by exact pid rather than leaving them on the box.
     let mut left_behind = Vec::new();
     for (exe, marker) in &launched {
-        let survivors = wait_for_no_process(exe, marker, TEARDOWN_BUDGET);
+        let survivors = wait_for_no_process(exe, marker, TEARDOWN_BUDGET, &mut failures);
         say!("  survived stop by {TEARDOWN_BUDGET:?} — {exe}: {survivors:?}");
         for pid in &survivors {
             let killed = std::process::Command::new("taskkill")
@@ -809,15 +887,24 @@ fn web_probe() {
             say!("  killed {exe} pid {pid}: {killed}");
         }
         if !survivors.is_empty() {
-            left_behind.extend(wait_for_no_process(exe, marker, TEARDOWN_BUDGET));
+            left_behind.extend(wait_for_no_process(
+                exe,
+                marker,
+                TEARDOWN_BUDGET,
+                &mut failures,
+            ));
         }
         let _ = std::fs::remove_dir_all(glass_windows::onbox_support::scratch_dir(marker));
     }
 
-    // The only assertion: nothing this probe launched is left running on the box.
+    // Nothing this probe launched may still be running on the box.
     assert!(
         left_behind.is_empty(),
         "processes carrying our profile marker outlived both stop and the probe's own kill: \
          {left_behind:?}"
     );
+    // Genuine breakage — a browser that never launched, or an accessibility channel that never
+    // answered — collected while every browser still got its turn; asserted last, so the
+    // teardown above always runs first.
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
