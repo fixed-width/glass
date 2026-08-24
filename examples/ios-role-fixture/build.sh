@@ -28,4 +28,8 @@ executable="$(plutil -extract CFBundleExecutable raw -o - "$here/Info.plist")"
 }
 cp "$here/Info.plist" "$app/Info.plist"
 
+# The web tab loads this page out of the bundle, and shares it with every other platform's web
+# reading, so it is copied rather than duplicated.
+cp "$here/../web-role-fixture/index.html" "$app/index.html"
+
 echo "built: $app ($arch, $(xcrun --sdk iphonesimulator --show-sdk-version) SDK)"

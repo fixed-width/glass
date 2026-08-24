@@ -522,12 +522,20 @@ An element whose platform role glass has no mapping for renders as `Other(<nativ
 visible; a bare `Other` means the platform named no token at all.
 
 Web content — a browser's page, a WebView's content — arrives under a `Document` element whose
-children are the page's own elements (headings, links, fields), addressable like any other. A
+children are the page's own elements (headings, links, fields), addressable like any other. On
+Windows a text editor's edit surface uses the same underlying control type and stays a
+`TextArea`; the two are told apart by the framework each element reports (read 2026-08-24). A
 `Document` with **no** children has nothing inside to address: the web engine has not published
-its accessibility tree, the page is empty, or the walk did not complete — whether a bound cut it
-short or it dropped a subtree it could not read — before reaching its content. The snapshot says
-so in a separate notice naming the element's id, bounds and the pixel path, the same way a
-truncated tree is disclosed.
+its accessibility tree yet, the page is empty, or the walk did not complete — whether a bound cut
+it short or it dropped a subtree it could not read — before reaching its content. The snapshot
+says so in a separate notice naming the element's id and bounds, the same way a truncated tree is
+disclosed. Where the walk completed, that notice steers to a fresh `glass_a11y_snapshot` first and
+to the pixel path only if the page stays empty: on an Android WebView the first snapshot after a
+launch was childless and the next held the whole page (read 2026-08-24). An app can also publish a
+*placeholder* where the content would be — an element standing in for a web view whose
+accessibility is off — and that gets its own notice: nothing behind it can be addressed by id and a
+re-snapshot will not change that, so it steers straight to the pixel path. See
+[Web content](../explanation/web-content.md) for what each platform's readings say.
 
 - `max_nodes` (integer) — raise the element cap above the default (which protects the token
   budget), or `0` to remove the element-count limit. Omit for the default cap. (Structural

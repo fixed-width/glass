@@ -481,6 +481,7 @@ pub struct WalkBudget {
     count: usize,
     truncated: Option<Truncation>,
     unreadable: usize,
+    unexposed: usize,
     limits: WalkLimits,
 }
 
@@ -496,6 +497,7 @@ impl WalkBudget {
             count: 0,
             truncated: None,
             unreadable: 0,
+            unexposed: 0,
             limits,
         }
     }
@@ -584,6 +586,20 @@ impl WalkBudget {
         self.unreadable
     }
 
+    /// Record a placeholder the app published in place of content it has not exposed to
+    /// accessibility.
+    ///
+    /// Distinct from [`WalkBudget::note_unreadable`]: nothing failed and nothing vanished, so
+    /// re-reading is no recourse — the app is withholding the subtree, not losing it.
+    pub fn note_unexposed(&mut self) {
+        self.unexposed += 1;
+    }
+
+    /// How many placeholders stood in for content the app has not exposed.
+    pub fn unexposed(&self) -> usize {
+        self.unexposed
+    }
+
     /// Record that a bound stopped the walk. Only the FIRST hit is kept: it is the cause,
     /// while any later hit is a consequence of having continued.
     pub fn hit(&mut self, limit: TruncationLimit) {
@@ -628,6 +644,10 @@ pub struct AxTree {
     /// Subtrees dropped because a child read failed. Independent of [`AxTree::truncated`]: a
     /// tree can hit no bound at all and still be missing elements this way.
     pub unreadable: usize,
+    /// Placeholders the app published in place of content it has not exposed to accessibility —
+    /// on AT-SPI, a null child ref. Not [`AxTree::unreadable`]: the walk reached these and the
+    /// app was withholding what is behind them, so the walk itself still completed.
+    pub unexposed: usize,
     /// `Some` when the backend answered about something other than what it was asked about —
     /// see [`Subject`].
     pub subject: Option<Subject>,
@@ -635,7 +655,8 @@ pub struct AxTree {
 
 impl AxTree {
     /// Whether this tree describes everything the backend walked — no bound stopped it early and
-    /// no child read dropped a subtree.
+    /// no child read dropped a subtree. [`AxTree::unexposed`] does not count: the walk finished
+    /// and the app withheld the content.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.truncated.is_none() && self.unreadable == 0
@@ -649,6 +670,7 @@ impl AxTree {
             count: 0,
             truncated: None,
             unreadable: 0,
+            unexposed: 0,
             subject: None,
         }
     }
@@ -740,6 +762,38 @@ impl AxTree {
         })
     }
 
+    /// Whether this tree can support a claim that something is *not* there: the walk completed
+    /// **and** nothing was withheld ([`Self::unexposed`]).
+    ///
+    /// A placeholder hides an unknown number of elements, so "no node carries this role and name"
+    /// describes only what the app published. Relocation asks this, not [`Self::is_complete`],
+    /// which answers the narrower question of whether the walk itself finished.
+    #[must_use]
+    pub fn can_prove_absence(&self) -> bool {
+        self.is_complete() && self.unexposed == 0
+    }
+
+    /// Disclosure for placeholders the app published in place of content it has not exposed —
+    /// [`AxTree::unexposed`]. Separate from [`AxTree::unreadable_notice`] because the recourse
+    /// differs: the walk reached these and nothing failed, so a fresh snapshot returns the same
+    /// placeholder and only the pixel path is left.
+    pub fn unexposed_notice(&self) -> Option<String> {
+        (self.unexposed > 0).then(|| {
+            let n = self.unexposed;
+            let (s, are, they) = if n == 1 {
+                ("", "is a placeholder", "It")
+            } else {
+                ("s", "are placeholders", "They")
+            };
+            format!(
+                "… {n} element{s} {are} the app published for content it has not exposed to \
+                 accessibility (a web view whose accessibility is off reads like this). {they} \
+                 cannot be addressed by id; drive that area by pixels: glass_screenshot, then \
+                 glass_click at x,y."
+            )
+        })
+    }
+
     /// Disclosure for a tree that describes something other than what was asked for — the ids in
     /// it still address what it actually describes.
     pub fn subject_notice(&self) -> Option<String> {
@@ -790,6 +844,10 @@ impl AxTree {
     /// truncated tree does. Aggregated like [`Self::unreadable_notice`] rather than repeated
     /// per document: a page of ad iframes would otherwise spend the budget `max_nodes` guards.
     ///
+    /// A childless `Document` on a complete walk is most often *not yet*: an Android WebView's
+    /// first snapshot after a launch was childless and its next held the whole page (read
+    /// 2026-08-24), so that branch steers to a re-read before the pixel path.
+    ///
     /// A bound or a failed child read empties a `Document`'s child list exactly like an
     /// unpublished tree does, so only a complete walk ([`Self::is_complete`]) names a cause;
     /// otherwise this hedges and defers to the notice beside it, which owns the recourse —
@@ -816,9 +874,10 @@ impl AxTree {
         Some(if self.is_complete() {
             format!(
                 "… {n} Document element{s} {have} no readable content: {list}. The web engine \
-                 has not published its accessibility tree, or the page is empty. Elements \
-                 inside {them} cannot be addressed by id. Drive by pixels: glass_screenshot, \
-                 then glass_click at x,y inside the bounds above."
+                 has not published its accessibility tree yet, or the page is empty. Elements \
+                 inside {them} cannot be addressed by id. Take a fresh glass_a11y_snapshot \
+                 after a moment; if it stays empty, drive it by pixels: glass_screenshot, then \
+                 glass_click at x,y inside the bounds above."
             )
         } else {
             format!(
@@ -945,8 +1004,9 @@ impl AxTarget {
     /// usually its resource-id leaf, which names a *layout* and so repeats across every screen
     /// built from it — so [`Located::Moved`] is not granted on the search alone. It also needs:
     ///
-    /// * [`AxTree::is_complete`], because "one node matches" is a claim about the whole tree and a
-    ///   read that stopped early can only make it about the part it kept; and
+    /// * [`AxTree::can_prove_absence`], because "one node matches" is a claim about the whole
+    ///   tree, and a read that stopped early — or one the app withheld a subtree from — can only
+    ///   make it about the part it kept; and
     /// * the candidate's bounds to *overlap* the target's, so a same-named field on a screen the
     ///   write navigated to is not mistaken for the one that was written into.
     ///
@@ -966,10 +1026,10 @@ impl AxTarget {
         let mut candidates = Vec::new();
         collect_matches(&tree.root, self, &mut candidates);
         match candidates.len() {
-            1 if tree.is_complete() && self.bounds_overlap(candidates[0].bounds) => {
+            1 if tree.can_prove_absence() && self.bounds_overlap(candidates[0].bounds) => {
                 Located::Moved(candidates[0])
             }
-            0 if tree.is_complete() => Located::Gone,
+            0 if tree.can_prove_absence() => Located::Gone,
             0 | 1 => Located::Unproven,
             _ => Located::Ambiguous(candidates),
         }
@@ -982,8 +1042,9 @@ impl AxTarget {
     /// was replaced or the app that drew it restarted (glass#323); telling that caller to
     /// re-address the id is how a `set_value` read-back retypes a write that already landed.
     ///
-    /// An incomplete tree cannot support that second answer: it shows absence only for the part it
-    /// kept, so one that is not [`AxTree::is_complete`] gets the recoverable `AxElementChanged`.
+    /// A tree that cannot prove absence cannot support that second answer: it shows absence only
+    /// for the part it kept, so one failing [`AxTree::can_prove_absence`] — stopped early, or
+    /// missing what the app withheld — gets the recoverable `AxElementChanged`.
     ///
     /// Lives in core rather than in its caller because the question is not Android's: any reader
     /// holding an `AxTree` asks it before a write, and the desktop ones would if they had a tree
@@ -994,7 +1055,7 @@ impl AxTarget {
     /// [`GlassError::AxWriteUnconfirmed`], which says the text went out.
     #[must_use]
     pub fn drift_error(&self, tree: &AxTree) -> GlassError {
-        if self.still_present(tree) || !tree.is_complete() {
+        if self.still_present(tree) || !tree.can_prove_absence() {
             GlassError::AxElementChanged(self.id.0)
         } else {
             GlassError::AxElementGone(self.id.0)
@@ -2246,6 +2307,28 @@ mod tests {
         assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
     }
 
+    #[test]
+    fn a_withheld_subtree_cannot_prove_the_target_absent() {
+        let mut tree = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        tree.unexposed = 1;
+        assert!(
+            tree.is_complete(),
+            "the walk finished; only the app withheld"
+        );
+        assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
+    }
+
+    #[test]
+    fn a_lone_match_is_not_accepted_as_moved_while_a_subtree_is_withheld() {
+        // "Exactly one node matches" is a claim about the whole tree, and a placeholder hides an
+        // unknown number of nodes behind it.
+        let mut occupied = leaf(AxRole::Button, "Cancel");
+        occupied.children = vec![leaf(AxRole::TextField, "Note")];
+        let mut tree = drift_tree(vec![occupied]);
+        tree.unexposed = 1;
+        assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
+    }
+
     /// Where the measured iOS field sat before the write: origin `(99,2409)`, 1008px wide.
     const CAPTURED: AxRect = AxRect {
         x: 99,
@@ -2464,6 +2547,18 @@ mod tests {
     }
 
     #[test]
+    fn a_withheld_subtree_never_reports_the_target_gone() {
+        // Complete, so `is_complete` cannot catch it — the element may be behind the placeholder.
+        let mut withheld = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        withheld.unexposed = 1;
+        assert!(withheld.is_complete(), "the walk finished");
+        assert!(matches!(
+            drift_target().drift_error(&withheld),
+            GlassError::AxElementChanged(1)
+        ));
+    }
+
+    #[test]
     fn empty_guidance_flags_a_treeless_snapshot() {
         // Only the window root, no children → nothing to address → steer to pixels.
         let empty = AxTree::new(leaf(AxRole::Window, "App"));
@@ -2518,6 +2613,10 @@ mod tests {
             "names the pixel path: {hint}"
         );
         assert!(hint.contains("glass_click"), "names the pixel path: {hint}");
+        assert!(
+            hint.contains("cannot be addressed by id"),
+            "nothing inside is addressable: {hint}"
+        );
     }
 
     #[test]
@@ -2531,6 +2630,23 @@ mod tests {
             "singular, aggregated: {hint}"
         );
         assert!(hint.contains("has not published"), "{hint}");
+    }
+
+    /// The reading behind this (Android emulator, 2026-08-24): the first snapshot after a launch
+    /// holds a childless Document and the next holds the whole page, so childless on a complete
+    /// walk is most often *not yet*.
+    #[test]
+    fn a_complete_walk_steers_to_a_fresh_snapshot_before_pixels() {
+        let hint = tree_with_a_childless_document()
+            .document_guidance()
+            .unwrap();
+        let fresh = hint
+            .find("fresh glass_a11y_snapshot")
+            .unwrap_or_else(|| panic!("re-reading is the first recourse: {hint}"));
+        let pixels = hint
+            .find("glass_screenshot")
+            .unwrap_or_else(|| panic!("the pixel path is still named: {hint}"));
+        assert!(fresh < pixels, "the re-read comes first: {hint}");
     }
 
     #[test]
@@ -3274,6 +3390,76 @@ mod tests {
             None,
             "an unreadable read is not a bound hit"
         );
+    }
+
+    /// The reading behind this (Brave 151 on X11, 2026-08-24): the browser window's one child is
+    /// a null AT-SPI ref while renderer accessibility is off. Counted as unreadable, the agent
+    /// was told the element went away mid-walk and to re-snapshot — advice that never helps.
+    #[test]
+    fn a_withheld_placeholder_is_disclosed_as_unexposed_not_as_a_vanished_element() {
+        let mut t = AxTree::new(leaf(AxRole::Window, "w"));
+        t.unexposed = 1;
+        let n = t
+            .unexposed_notice()
+            .expect("a placeholder for withheld content must disclose");
+        assert!(n.contains("placeholder"), "{n}");
+        assert!(n.contains("has not exposed"), "{n}");
+        assert!(
+            n.contains("glass_screenshot") && n.contains("glass_click"),
+            "the pixel path is the only recourse: {n}"
+        );
+        assert!(
+            !n.contains("went away"),
+            "nothing vanished, so a re-snapshot is not the recourse: {n}"
+        );
+    }
+
+    #[test]
+    fn a_tree_withholding_nothing_yields_no_unexposed_notice() {
+        assert_eq!(
+            AxTree::new(leaf(AxRole::Window, "w")).unexposed_notice(),
+            None
+        );
+    }
+
+    /// Singular and plural both read as English, since the count is agent-facing text.
+    #[test]
+    fn the_unexposed_notice_agrees_in_number() {
+        let mut t = AxTree::new(leaf(AxRole::Window, "w"));
+        t.unexposed = 1;
+        let one = t.unexposed_notice().unwrap();
+        assert!(one.contains("1 element is a placeholder"), "{one}");
+        assert!(one.contains("It cannot be addressed"), "{one}");
+        t.unexposed = 2;
+        let many = t.unexposed_notice().unwrap();
+        assert!(many.contains("2 elements are placeholders"), "{many}");
+        assert!(many.contains("They cannot be addressed"), "{many}");
+    }
+
+    /// A withheld placeholder is not an incomplete walk, which is what lets `document_guidance`
+    /// still name the engine instead of hedging.
+    #[test]
+    fn a_withheld_placeholder_leaves_the_walk_complete() {
+        let mut t = AxTree::new(leaf(AxRole::Window, "w"));
+        t.unexposed = 1;
+        assert!(
+            t.is_complete(),
+            "the app withheld content; the walk finished"
+        );
+    }
+
+    #[test]
+    fn the_budget_counts_a_withheld_placeholder_separately_from_an_unreadable_subtree() {
+        let mut b = WalkBudget::new();
+        assert_eq!(b.unexposed(), 0);
+        b.note_unexposed();
+        assert_eq!(b.unexposed(), 1);
+        assert_eq!(
+            b.unreadable(),
+            0,
+            "a placeholder is not a failed read: the recourses differ"
+        );
+        assert_eq!(b.truncation(), None, "nor is it a bound hit");
     }
 
     #[test]

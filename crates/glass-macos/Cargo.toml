@@ -61,6 +61,18 @@ harness = false
 name = "role_probe"
 harness = false
 
+# Mac-gated web-content PROBE (crates/glass-macos/tests/web_probe.rs) — not a pass/fail
+# assertion test. Same harness=false main-thread requirement as `role_probe` above
+# (`MacosPlatform::start_app` reaches AppKit's `ffi::app_kit_init()`). Launches whatever
+# browsers `GLASS_WEB_PROBE_BROWSERS` names on the `examples/web-role-fixture` page and prints
+# what each engine publishes through `AXUIElement`, with the enable lever
+# `GLASS_WEB_PROBE_LEVER` names (`enhanced`/`manual`) set on the application element. With the
+# browser variable unset it times snapshots of an ordinary AppKit app either side of the lever
+# instead — the side-effect reading. See that file's module doc.
+[[test]]
+name = "web_probe"
+harness = false
+
 # Mac-gated window-adoption PROBE (crates/glass-macos/tests/window_adopt_probe.rs) — not a
 # pass/fail assertion test. Same harness=false main-thread requirement as the targets above
 # (`MacosPlatform::start_app` reaches AppKit's `ffi::app_kit_init()`). Launches the app named

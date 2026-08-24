@@ -47,6 +47,7 @@ pub const CONTROL_TYPES: &[(u32, &str, Option<AxRole>)] = &[
     (50027, "Thumb", None),
     (50028, "DataGrid", Some(AxRole::Table)),
     (50029, "DataItem", None),
+    // A web engine's Document reads as `Document` instead — see `map_role_with_framework`.
     (50030, "Document", Some(AxRole::TextArea)),
     // A split button is an actionable button carrying a dropdown.
     (50031, "SplitButton", Some(AxRole::Button)),
@@ -62,6 +63,12 @@ pub const CONTROL_TYPES: &[(u32, &str, Option<AxRole>)] = &[
     (50039, "SemanticZoom", None),
     (50040, "AppBar", None),
 ];
+
+/// The `FrameworkId`s a web engine publishes its content under, case-sensitive as UIA reports
+/// them. Read 2026-08-24 on Windows 11: Chromium (Edge, Brave) reports `Chrome` and Gecko
+/// (Firefox) `Gecko`, while a stock text editor's edit surface reports `Win32` and a console
+/// host's `Document` reports an empty id.
+const WEB_ENGINE_FRAMEWORK_IDS: [&str; 2] = ["Chrome", "Gecko"];
 
 /// The [`CONTROL_TYPES`] row for an id, shared by [`map_role`] and [`canonical_name`] so the two
 /// can never disagree about which ids are known.
@@ -86,7 +93,27 @@ fn control_type(control_type_id: u32) -> Option<&'static (u32, &'static str, Opt
 ///
 /// A control type glass does not map — known or not — becomes `AxRole::Other` (the reader keeps
 /// the control type's name in `raw_role`).
+///
+/// Framework-blind: a `Document` (50030) maps to `TextArea` here — the reader calls
+/// [`map_role_with_framework`].
 pub fn map_role(control_type_id: u32, toggleable: bool) -> AxRole {
+    map_role_with_framework(control_type_id, toggleable, None)
+}
+
+/// [`map_role`] plus the element's UIA `FrameworkId`, which tells a web page's `Document`
+/// (50030) from a text editor's: an id in [`WEB_ENGINE_FRAMEWORK_IDS`] maps to
+/// [`AxRole::Document`], any other id — including an empty one, which the reader passes as
+/// `None` — keeps the `TextArea` mapping.
+pub fn map_role_with_framework(
+    control_type_id: u32,
+    toggleable: bool,
+    framework_id: Option<&str>,
+) -> AxRole {
+    if control_type_id == 50030
+        && framework_id.is_some_and(|id| WEB_ENGINE_FRAMEWORK_IDS.contains(&id))
+    {
+        return AxRole::Document;
+    }
     if control_type_id == 50000 && toggleable {
         return AxRole::ToggleButton;
     }
@@ -328,10 +355,38 @@ mod tests {
 
     #[test]
     fn document_maps_from_an_observed_token() {
-        // Observed on a stock text editor — see the probe test in
-        // crates/glass-windows/tests/onbox.rs. What a web document reports here is unread, so
-        // the role-support matrix records the Document cell as a gap until one is read.
-        assert_eq!(map_role(50030, false), AxRole::TextArea);
+        // Observed on a stock text editor whose edit surface reported FrameworkId `Win32` —
+        // see the probe test in crates/glass-windows/tests/onbox.rs.
+        assert_eq!(
+            map_role_with_framework(50030, false, Some("Win32")),
+            AxRole::TextArea
+        );
+    }
+
+    #[test]
+    fn a_web_engines_document_is_a_document() {
+        assert_eq!(
+            map_role_with_framework(50030, false, Some("Chrome")),
+            AxRole::Document
+        );
+        assert_eq!(
+            map_role_with_framework(50030, false, Some("Gecko")),
+            AxRole::Document
+        );
+    }
+
+    #[test]
+    fn a_document_with_no_web_engine_framework_id_stays_a_text_area() {
+        // A console host publishes a `Document` with an EMPTY FrameworkId, which the reader
+        // passes as `None`.
+        assert_eq!(
+            map_role_with_framework(50030, false, Some("")),
+            AxRole::TextArea
+        );
+        assert_eq!(
+            map_role_with_framework(50030, false, None),
+            AxRole::TextArea
+        );
     }
 
     #[test]
@@ -448,12 +503,14 @@ mod tests {
         use glass_core::role_support::{AxBackend, RoleSupport, support};
         for role in AxRole::ALL {
             // Only a row carrying `Some(role)` produces a role; a named-but-unmapped control
-            // type yields `Other` and must not count as coverage. `ToggleButton` is the one
-            // role no `CONTROL_TYPES` row produces on its own — it comes from `map_role`'s
-            // Button-plus-Toggle-pattern rule — so it is checked by calling the real function
+            // type yields `Other` and must not count as coverage. `ToggleButton` and
+            // `Document` are the two roles no `CONTROL_TYPES` row produces on its own — they
+            // come from `map_role_with_framework`'s Button-plus-Toggle-pattern and
+            // Document-plus-web-engine rules — so each is checked by calling the real function
             // with the fact that triggers it, not by a hardcoded exception.
             let mapped = CONTROL_TYPES.iter().any(|(_, _, r)| *r == Some(role))
-                || map_role(50000, true) == role;
+                || map_role(50000, true) == role
+                || map_role_with_framework(50030, false, Some("Chrome")) == role;
             match support(role, AxBackend::Windows).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {
                     assert!(

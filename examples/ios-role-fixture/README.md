@@ -26,6 +26,7 @@ accessibility tree exposes, which may be narrower than what UIKit publishes to V
 | SwiftUI `Picker`, `.menu` | `AXPopUpButton` — a token glass does not map yet |
 | `UIButton` with an `accessibilityHint` | `help` carries the hint verbatim: `"Saves and closes the sheet"` |
 | `UITextField` with an identifier and a label | `AXTextField`; the label sits in `AXLabel` beside the id |
+| `WKWebView` on the shared web page (the `web` tab) | nothing at all — neither the page's elements nor the web view itself appears |
 
 ## Build and install
 
@@ -43,7 +44,7 @@ is chosen at launch instead, by environment variable or by launch argument. Both
 through glass (`AppSpec::env` and `AppSpec::run`'s tail) as well as through `simctl` by hand:
 
 ```bash
-xcrun simctl launch booted tech.fixedwidth.glassrolefixture --tab=collection    # or: swiftui
+xcrun simctl launch booted tech.fixedwidth.glassrolefixture --tab=collection    # or: swiftui, web
 SIMCTL_CHILD_ROLE_FIXTURE_TAB=swiftui xcrun simctl launch booted tech.fixedwidth.glassrolefixture
 ```
 
@@ -52,6 +53,28 @@ works as well as `--tab=swiftui`. A `--tab` with no value, or an unrecognized na
 than a quiet fall back to the first screen. The collection and SwiftUI screens also name themselves
 in the tree — `screen-collection` and `screen-swiftui` appear as element identifiers — and the
 Controls screen is headed `Controls`.
+
+## The `web` tab
+
+A stock `WKWebView` on `examples/web-role-fixture/index.html` — the same page every platform's web
+reading uses. `build.sh` copies it into the bundle, and the view loads it with `loadFileURL`.
+
+```bash
+xcrun simctl launch booted tech.fixedwidth.glassrolefixture --tab web
+xcrun simctl io booted screenshot /tmp/web-tab.png     # the page renders in full
+```
+
+Read back through idb on an iOS 26.5 Simulator (2026-08-24), the whole screen is two nodes:
+`AXApplication "Glass Role Fixture"` holding one `AXGroup "Tab Bar"`. The page's heading, button,
+inputs, table and nested frame are absent, and so is the `WKWebView` itself — there is no
+`AXWebArea`, and no empty container standing in for one. It stays that way for at least 30 seconds
+and across taps inside the page. Apple's own Simulator Safari reads the same way: its chrome
+(`Back`, `Page Menu`, `Address`, `refresh`, `More`) is exposed and the rendered page is not, so the
+absence is in what idb reported here, not in this fixture.
+
+Driving the page through glass is therefore a pixel job on this platform. The reading is
+re-taken by `crates/glass-ios/tests/drive_integration.rs`'s
+`web_fixture_button_and_field_respond`.
 
 ## Read the tree
 

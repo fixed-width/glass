@@ -505,7 +505,9 @@ impl GlassServer {
                        glass_click_element. Errors if the backend or app exposes no \
                        accessibility tree (e.g. a canvas/black-box app) — fall back to \
                        glass_screenshot then. Web content arrives under a `Document` element, \
-                       and a childless `Document` is disclosed with the pixel path. Optional \
+                       and a childless `Document` is disclosed in its own notice: take a fresh \
+                       snapshot first, then pixels. A placeholder the app published for content \
+                       it has not exposed gets its own notice — only pixels reach it. Optional \
                        max_nodes: raise the element cap, or 0 to remove the element-count limit \
                        (default caps protect the token budget)."
     )]

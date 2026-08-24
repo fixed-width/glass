@@ -43,6 +43,21 @@ adb install -r build/role-fixture.apk
 adb shell am start -n tech.fixedwidth.glassrolefixture/.MainActivity
 ```
 
+## Web view
+
+A second screen holds a stock `WebView` on the shared page in
+[../web-role-fixture](../web-role-fixture), copied into the APK's assets at build time and loaded
+over `file:///android_asset/index.html`. It is a separate activity so the readings above do not
+move:
+
+```bash
+adb shell am start -n tech.fixedwidth.glassrolefixture/.WebActivity
+```
+
+Its reading answers the `Document` row of
+[docs/reference/a11y-roles.md](../../docs/reference/a11y-roles.md): whether the page's own
+elements reach either reader, and under which widget classes they arrive.
+
 ## Read the tree
 
 Either reader answers the same question — the widget class is the token both key off.

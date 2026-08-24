@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import WebKit
 
 /// The controls whose accessibility vocabulary decides a cell in glass's role matrix
 /// (`glass_core::role_support::ROLE_SUPPORT`), built from stock UIKit classes. Reading this app
@@ -207,13 +208,38 @@ struct SwiftUIScreen: View {
     }
 }
 
+/// A stock `WKWebView` on the shared `examples/web-role-fixture` page, for reading what idb
+/// exposes of web content: whether the page's elements arrive at all, under which role strings,
+/// and whether the web area itself is a boundary the reader can enter.
+///
+/// The page is the same file every platform's web reading uses, so a row in one platform's table
+/// is comparable with the next; `build.sh` copies it into the bundle.
+final class WebViewController: UIViewController {
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "Web"
+        view.backgroundColor = .systemBackground
+        let web = WKWebView(frame: view.bounds)
+        web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        web.accessibilityIdentifier = "the-web-view"
+        view.addSubview(web)
+        // Fatal rather than a blank screen: a missing page would read as "the web view exposes
+        // nothing", which is the finding this screen exists to make, arrived at for the wrong
+        // reason.
+        guard let url = Bundle.main.url(forResource: "index", withExtension: "html") else {
+            fatalError("index.html is not in the bundle — build.sh copies it")
+        }
+        web.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+    }
+}
+
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
 
     /// The screen to show, as an index into the tab controller.
     ///
-    /// Named by `ROLE_FIXTURE_TAB=controls|collection|swiftui` in the environment, or by a
+    /// Named by `ROLE_FIXTURE_TAB=controls|collection|swiftui|web` in the environment, or by a
     /// `--tab=<name>` launch argument. Either reaches the app through glass — `AppSpec::env`
     /// arrives as `SIMCTL_CHILD_*`, and `AppSpec::run`'s tail is forwarded to `simctl launch` —
     /// or through `simctl` driven by hand.
@@ -231,7 +257,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
             requested = String(inline.dropFirst("--tab=".count))
         } else if let flag = arguments.firstIndex(of: "--tab") {
             guard flag + 1 < arguments.count else {
-                fatalError("--tab needs a value: controls, collection or swiftui")
+                fatalError("--tab needs a value: controls, collection, swiftui or web")
             }
             requested = arguments[flag + 1]
         }
@@ -240,8 +266,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         case "controls": return 0
         case "collection": return 1
         case "swiftui": return 2
+        case "web": return 3
         default:
-            fatalError("unknown tab '\(name)' — use controls, collection or swiftui")
+            fatalError("unknown tab '\(name)' — use controls, collection, swiftui or web")
         }
     }
 
@@ -255,12 +282,14 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         collection.tabBarItem = UITabBarItem(title: "Collection", image: nil, tag: 1)
         let swiftui = UIHostingController(rootView: SwiftUIScreen())
         swiftui.tabBarItem = UITabBarItem(title: "SwiftUI", image: nil, tag: 2)
+        let web = WebViewController()
+        web.tabBarItem = UITabBarItem(title: "Web", image: nil, tag: 3)
 
         // The tab bar's items are not exposed as accessibility elements and a synthetic tap on
         // one does not switch tabs, so the screen to show is chosen at launch instead:
         // `simctl launch booted tech.fixedwidth.glassrolefixture --tab collection`.
         let tabs = UITabBarController()
-        tabs.viewControllers = [controls, collection, swiftui]
+        tabs.viewControllers = [controls, collection, swiftui, web]
         tabs.selectedIndex = Self.requestedTab()
 
         let window = UIWindow(frame: UIScreen.main.bounds)

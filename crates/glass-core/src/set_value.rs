@@ -11,7 +11,7 @@
 //! An *atomic platform write* (UIA `SetValue`, AX `AXValue`) either happens or does not, and may be
 //! reformatted on the way in — a slider set to `"50"` reads back `"50.0"`. So a value that merely
 //! differs from the old one is evidence it landed: [`read_back_confirms`]. The macOS and Windows
-//! readers had each grown their own copy of that rule; it is theirs.
+//! readers had each grown their own copy of that rule; it is theirs, and the AT-SPI reader's.
 //!
 //! A *typed write* (tap, select-all, delete, type) is not atomic. A dropped key, a `maxLength`, an
 //! input filter or autocorrect all leave the field holding something that is neither the request nor
@@ -19,9 +19,8 @@
 //! typed write must read back exactly what was asked: [`typed_text_landed`]. Android's on-device
 //! service reader reached the same conclusion independently (`a11y_service.rs`).
 //!
-//! Two write paths deliberately do not use either rule: the AT-SPI (Linux) reader trusts the
-//! toolkit's own `set_text_contents` answer without reading back, and Android's service reader keeps
-//! its own exact-match loop.
+//! One write path deliberately uses neither rule: Android's service reader keeps its own
+//! exact-match loop.
 //!
 //! [`verify_typed_write`] applies the typed rule to a whole tree read back after the keystrokes,
 //! and is what the tap-and-type backends (Android's `uiautomator` reader, iOS) call;
@@ -196,9 +195,9 @@ pub fn verify_typed_write(
             ));
         }
         Located::Unproven => {
-            // Keep the cap in the message: it is what tells a caller to raise `max_nodes`. A
-            // complete tree has no hole to blame, so the one way it
-            // reaches here is a lone match drawn clear of where the element was.
+            // Keep the cap in the message: it is what tells a caller to raise `max_nodes`. With
+            // no hole to blame — no cap, no dropped subtree, no withheld placeholder — the one way
+            // it reaches here is a lone match drawn clear of where the element was.
             let why = if let Some(t) = &after_tree.truncated {
                 format!(
                     "the tree was truncated at {} {}, so the element — or a second one matching \
@@ -209,6 +208,10 @@ pub fn verify_typed_write(
             } else if after_tree.unreadable > 0 {
                 "a subtree could not be read, so the element — or a second one matching it — may \
                  be inside it"
+                    .to_string()
+            } else if after_tree.unexposed > 0 {
+                "the app published a placeholder for content it has not exposed, so the element \
+                 — or a second one matching it — may be behind it"
                     .to_string()
             } else {
                 "the only element carrying its role and name is drawn clear of where this one \
@@ -964,6 +967,21 @@ mod tests {
             assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
             assert!(err.set_value_failed_after_writing(), "{err}");
             assert!(err.to_string().contains("could not be read"), "{err}");
+        }
+
+        #[test]
+        fn a_withheld_subtree_cannot_confirm_a_write_against_its_one_match() {
+            // A complete tree with a placeholder in it: the second match can hide behind the
+            // placeholder, and neither the cap message nor the drifted-element one fits.
+            let mut moved = leaf(AxRole::TextField, "Note", FIELD);
+            moved.value = Some("world".into());
+            let mut after = tree_with(vec![leaf(AxRole::Label, "Suggestions", FIELD), moved]);
+            after.unexposed = 1;
+            let err = verify_typed_write(&after, &matching_target(), "world", TAP_MAY_HAVE_MISSED)
+                .unwrap_err();
+            assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+            assert!(err.set_value_failed_after_writing(), "{err}");
+            assert!(err.to_string().contains("has not exposed"), "{err}");
         }
 
         #[test]

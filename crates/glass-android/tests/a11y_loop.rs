@@ -9,13 +9,13 @@
 //! live field — and a clear that cannot be confirmed here at all, because this platform reports
 //! the emptied field's hint as its text; that a read takes its dump file with it; that a read
 //! stops at the deadline its caller named; that a snapshot taken while another app is foreground
-//! says which app it describes; and that a test which fails mid-interaction still hands the
-//! device back launchable.
+//! says which app it describes; that a WebView page's button and text field respond to a tap and
+//! a write; and that a test which fails mid-interaction still hands the device back launchable.
 
 use glass_core::Deadline;
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree, WalkLimits};
 use glass_core::{
-    AppSpec, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel, WindowGeometry,
+    AppSpec, AxRole, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel, WindowGeometry,
 };
 
 fn settings_spec() -> AppSpec {
@@ -48,6 +48,11 @@ struct Session {
 impl Session {
     /// Attach to the device and launch Settings.
     fn start() -> Self {
+        Self::start_spec(settings_spec())
+    }
+
+    /// Attach to the device and launch `spec`'s component.
+    fn start_spec(spec: AppSpec) -> Self {
         let agents = glass_android::AgentRegistry::new();
         let platform = glass_android::AndroidPlatform::from_env(
             &glass_android::EmulatorRegistry::new(),
@@ -65,8 +70,8 @@ impl Session {
         };
         session.window = session
             .platform()
-            .start_app(&settings_spec())
-            .expect("launch settings");
+            .start_app(&spec)
+            .expect("launch the app under test");
         session
     }
 
@@ -631,4 +636,171 @@ fn a_snapshot_taken_while_another_app_is_foreground_says_so() {
         .expect("the service must disclose it answered about the foreground app, not Settings");
     assert_eq!(subject.asked, "com.android.settings");
     assert_eq!(subject.actual, "com.google.android.deskclock");
+}
+
+/// The role fixture's WebView screen (`examples/android-role-fixture`), and the package that
+/// holds it.
+const WEB_FIXTURE: &str = "tech.fixedwidth.glassrolefixture/.WebActivity";
+const WEB_FIXTURE_PACKAGE: &str = "tech.fixedwidth.glassrolefixture";
+
+/// How long to wait for the WebView to publish the page's own nodes, and how often to look.
+///
+/// A poll, not a sleep: on this fixture the first read after a launch has come back a `Document`
+/// with nothing under it, with the next read holding the whole page.
+const WEB_CONTENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+const WEB_CONTENT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long to give the page's JS handler after a tap before re-reading the tree. Shares
+/// [`WEB_CONTENT_POLL`]'s value by coincidence, not by relationship — a settle and a poll
+/// interval answer different questions.
+const POST_TAP_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn web_fixture_spec() -> AppSpec {
+    AppSpec {
+        build: None,
+        run: vec![WEB_FIXTURE.to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 15_000,
+        sandbox: SandboxLevel::Off,
+        a11y: true,
+    }
+}
+
+/// Whether the fixture is installed on the device this run attached to.
+fn web_fixture_installed() -> bool {
+    let adb = std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".to_string());
+    let out = std::process::Command::new(adb)
+        .args(["shell", "pm", "list", "packages", WEB_FIXTURE_PACKAGE])
+        .output()
+        .expect("adb shell pm list packages");
+    String::from_utf8_lossy(&out.stdout).contains(WEB_FIXTURE_PACKAGE)
+}
+
+/// The first `Document` in `tree`, with how many children it published.
+fn first_document(tree: &AxTree) -> Option<(&AxNode, usize)> {
+    find(&tree.root, &|n| n.role == AxRole::Document).map(|d| (d, d.children.len()))
+}
+
+/// Every node whose name or value contains `needle`, as `#id role name=… value=…` lines.
+fn matching(tree: &AxTree, needle: &str) -> Vec<String> {
+    fn walk(node: &AxNode, needle: &str, into: &mut Vec<String>) {
+        let hit = |s: &Option<String>| s.as_deref().is_some_and(|s| s.contains(needle));
+        if hit(&node.name) || hit(&node.value) {
+            into.push(format!(
+                "#{} {:?} name={:?} value={:?} bounds={:?}",
+                node.id.0, node.role, node.name, node.value, node.bounds
+            ));
+        }
+        node.children.iter().for_each(|c| walk(c, needle, into));
+    }
+    let mut found = Vec::new();
+    walk(&tree.root, needle, &mut found);
+    found
+}
+
+/// What the web fixture's page reports through the `uiautomator` reader: whether its nodes
+/// arrive at all, whether a tap on its button reaches the page, and whether `set_value` on its
+/// text input lands.
+///
+/// A probe, not a pass/fail test of the page: it asserts only that the app launched and a tree
+/// came back, and prints the rest. What a WebView publishes is the engine's to change, so pinning
+/// today's answer here would fail a run for an update glass did not make.
+#[test]
+#[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB, and the role fixture installed"]
+fn web_fixture_button_and_field_respond() {
+    assert!(
+        web_fixture_installed(),
+        "{WEB_FIXTURE_PACKAGE} is not installed — build and install it with `cd \
+         examples/android-role-fixture && ./build.sh && adb install -r \
+         build/role-fixture.apk`"
+    );
+    let mut session = Session::start_spec(web_fixture_spec());
+    let ctx = session.ctx();
+    let mut a11y = glass_android::AndroidA11y::new();
+
+    // Every attempt is printed, not just the one that settled: whether the FIRST read of a
+    // WebView holds the page is the reading this probe exists for (glass#506).
+    let started = std::time::Instant::now();
+    let tree = loop {
+        let mut tree = a11y.snapshot(&ctx).expect("snapshot the web fixture");
+        tree.assign_ids();
+        let doc = first_document(&tree);
+        println!(
+            "read at {:?}: {} nodes, document={:?}, guidance={:?}",
+            started.elapsed(),
+            tree.count,
+            doc.map(|(d, kids)| format!("#{} {} child(ren)", d.id.0, kids)),
+            tree.document_guidance()
+        );
+        if doc.is_some_and(|(_, kids)| kids > 0) || started.elapsed() >= WEB_CONTENT_BUDGET {
+            break tree;
+        }
+        std::thread::sleep(WEB_CONTENT_POLL);
+    };
+    println!(
+        "\n===== the page as the uiautomator reader sees it =====\n{}",
+        tree.to_outline()
+    );
+    assert!(tree.count > 0, "a launched app must yield a tree");
+
+    // The page's button, tapped through the platform's pointer rather than an accessibility
+    // action: what is being read is whether a tap reaches web content at all.
+    match find(&tree.root, &|n| n.name.as_deref() == Some("click me"))
+        .and_then(|n| n.bounds.map(|b| (n.id, n.role, b)))
+        .and_then(|(id, role, b)| {
+            b.clamped_center(ctx.window.width, ctx.window.height)
+                .map(|c| (id, role, c))
+        }) {
+        Some((id, role, (x, y))) => {
+            println!("tapping #{} {role:?} at {x},{y}", id.0);
+            let sent = session.platform().send_pointer(&PointerEvent::Click {
+                x,
+                y,
+                button: MouseButton::Left,
+                count: 1,
+                modifiers: vec![],
+            });
+            println!("send_pointer: {sent:?}");
+        }
+        None => println!("no node named \"click me\" to tap"),
+    }
+    std::thread::sleep(POST_TAP_SETTLE);
+    let mut after_tap = a11y.snapshot(&ctx).expect("snapshot after the tap");
+    after_tap.assign_ids();
+    println!(
+        "after the tap, nodes matching \"click\": {:#?}",
+        matching(&after_tap, "click")
+    );
+
+    // The first editable element on the page (input or textarea) — its identity isn't pinned.
+    // `set_value` reports its own verdict; the read-back is what says whether the value took.
+    let field = find(&after_tap.root, &|n| n.states.editable).map(|n| AxTarget {
+        id: n.id,
+        role: n.role,
+        name: n.name.clone(),
+        bounds: n.bounds,
+        value: n.value.clone(),
+    });
+    match field {
+        Some(target) => {
+            println!(
+                "writing into #{} {:?} {:?}",
+                target.id.0, target.role, target.bounds
+            );
+            println!(
+                "set_value: {:?}",
+                a11y.set_value(&ctx, &target, "typed by glass")
+            );
+            let mut after_write = a11y.snapshot(&ctx).expect("snapshot after the write");
+            after_write.assign_ids();
+            println!(
+                "the field reads back {:?}; nodes matching \"typed\": {:#?}",
+                after_write.find(target.id).and_then(|n| n.value.clone()),
+                matching(&after_write, "typed")
+            );
+        }
+        None => println!("no editable node in the page to write into"),
+    }
 }
