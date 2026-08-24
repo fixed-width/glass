@@ -466,6 +466,20 @@ impl Truncation {
     }
 }
 
+/// One line of [`AxTree::document_guidance`].
+fn document_notice(doc: &AxNode) -> String {
+    let bounds = match &doc.bounds {
+        Some(b) => format!("({},{} {}x{})", b.x, b.y, b.width, b.height),
+        None => "bounds unknown".to_string(),
+    };
+    format!(
+        "… #{} Document {bounds} has no readable content: the web engine has not published \
+         its accessibility tree, or the page is empty. Elements inside it cannot be addressed \
+         by id. Drive it by pixels: glass_screenshot, then glass_click at x,y inside it.",
+        doc.id.0
+    )
+}
+
 /// Bookkeeping for a bounded pre-order walk. Every backend threads one of these through its
 /// traversal so the caps and the truncation record are computed one way rather than five.
 #[derive(Debug, Default)]
@@ -756,6 +770,36 @@ impl AxTree {
              (some toolkits need it enabled, e.g. relaunch with a11y:true; canvas/game apps \
              never will). Drive it by pixels instead: glass_screenshot, then glass_click at x,y.",
         )
+    }
+
+    /// Every `Document` with no children, in pre-order. A web engine that has not published
+    /// its tree — or an empty page — arrives exactly like this, and the outline alone cannot
+    /// tell the two apart.
+    pub fn unpublished_documents(&self) -> Vec<&AxNode> {
+        fn walk<'a>(node: &'a AxNode, out: &mut Vec<&'a AxNode>) {
+            if node.role == AxRole::Document && node.children.is_empty() {
+                out.push(node);
+            }
+            for child in &node.children {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, &mut out);
+        out
+    }
+
+    /// The disclosure for [`Self::unpublished_documents`]: one line per document, or `None`
+    /// when there is nothing to disclose. Same shape as [`Truncation::notice`] and
+    /// [`Self::empty_guidance`] — what is missing, then the pixel path — because a web page
+    /// the reader cannot enter fails the agent the same way a truncated tree does.
+    pub fn document_guidance(&self) -> Option<String> {
+        let docs = self.unpublished_documents();
+        if docs.is_empty() {
+            return None;
+        }
+        let lines: Vec<String> = docs.iter().map(|d| document_notice(d)).collect();
+        Some(lines.join("\n"))
     }
 }
 
@@ -2391,6 +2435,98 @@ mod tests {
         );
         // A tree with real elements has something to address — no hint.
         assert!(sample_tree().empty_guidance().is_none());
+    }
+
+    fn document(name: &str, children: Vec<AxNode>) -> AxNode {
+        let mut d = leaf(AxRole::Document, name);
+        d.bounds = Some(AxRect {
+            x: 40,
+            y: 120,
+            width: 800,
+            height: 600,
+        });
+        d.children = children;
+        d
+    }
+
+    #[test]
+    fn a_childless_document_is_reported_with_its_id_and_bounds() {
+        let mut tree = AxTree::new(AxNode {
+            children: vec![leaf(AxRole::Button, "Back"), document("page", vec![])],
+            ..leaf(AxRole::Window, "App")
+        });
+        tree.assign_ids();
+        let found = tree.unpublished_documents();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, AxNodeId(2));
+        let hint = tree
+            .document_guidance()
+            .expect("a childless Document yields guidance");
+        assert!(hint.contains("#2 Document"), "{hint}");
+        assert!(
+            hint.contains("(40,120 800x600)"),
+            "names the bounds: {hint}"
+        );
+        assert!(
+            hint.contains("glass_screenshot"),
+            "names the pixel path: {hint}"
+        );
+    }
+
+    #[test]
+    fn a_populated_document_is_not_reported() {
+        let mut tree = AxTree::new(AxNode {
+            children: vec![document("page", vec![leaf(AxRole::Heading, "Hello")])],
+            ..leaf(AxRole::Window, "App")
+        });
+        tree.assign_ids();
+        assert!(tree.unpublished_documents().is_empty());
+        assert!(tree.document_guidance().is_none());
+    }
+
+    #[test]
+    fn every_childless_document_is_reported_in_pre_order() {
+        // A populated document with an empty iframe inside it, and an empty one after it.
+        let mut tree = AxTree::new(AxNode {
+            children: vec![
+                document(
+                    "outer",
+                    vec![leaf(AxRole::Heading, "H"), document("iframe", vec![])],
+                ),
+                document("second", vec![]),
+            ],
+            ..leaf(AxRole::Window, "App")
+        });
+        tree.assign_ids();
+        let ids: Vec<AxNodeId> = tree.unpublished_documents().iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![AxNodeId(3), AxNodeId(4)]);
+        let hint = tree.document_guidance().unwrap();
+        assert_eq!(hint.lines().count(), 2, "one line per document: {hint}");
+    }
+
+    #[test]
+    fn a_tree_without_documents_yields_no_document_guidance() {
+        assert!(sample_tree().document_guidance().is_none());
+        // An empty tree is the empty_guidance case, not this one.
+        assert!(
+            AxTree::new(leaf(AxRole::Window, "App"))
+                .document_guidance()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_document_without_bounds_still_names_the_pixel_path() {
+        let mut d = document("page", vec![]);
+        d.bounds = None;
+        let mut tree = AxTree::new(AxNode {
+            children: vec![d],
+            ..leaf(AxRole::Window, "App")
+        });
+        tree.assign_ids();
+        let hint = tree.document_guidance().unwrap();
+        assert!(hint.contains("bounds unknown"), "{hint}");
+        assert!(hint.contains("glass_screenshot"), "{hint}");
     }
 
     fn sample_tree() -> AxTree {
