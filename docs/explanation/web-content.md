@@ -54,7 +54,7 @@ engine — a later version, or the same engine under a different embedder, can d
 | Linux (AT-SPI) | Brave 151 (Chromium) | Publishes a null placeholder child while renderer accessibility is off — read as withheld content, not an empty page. |
 | Windows (UIA) | Edge 151, Brave 151, Firefox 154 | Publish at baseline (0.4–3.3s). A web page's `Document` and a text editor's edit surface report the same UIA control type; they're told apart per element by the `FrameworkId` each reports (`Chrome`/`Gecko` vs. `Win32`). Clicks and `set_value` land. |
 | macOS (AX) | Safari 26.5 (WebKit) | Publishes `AXWebArea` in the very first snapshot — reading the tree is itself what materializes the lazily built web area. `AXPress` clicks land; `set_value` on a web input is refused honestly (`AxValueNotApplied`) — type into it instead. |
-| Android | both readers | A WebView's page arrives as `Document` twice — the host view and the page root. The first snapshot right after launch can show a childless `Document`; the next one holds the page. |
+| Android | System WebView (version not read), on an API 34 emulator | Read through both readers — `uiautomator` and the on-device companion (v0.6.0). A WebView's page arrives as `Document` twice — the host view and the page root. The first snapshot right after launch can show a childless `Document`; the next one holds the page. |
 | iOS (idb) | WKWebView | No element at all — not the view, not the page, not an empty web area. See below. |
 
 ## What stays open: iOS

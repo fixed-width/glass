@@ -5,9 +5,10 @@ express on each platform. Each control answers one question: what role does each
 accessibility API report for it? That answer is what a cell in
 [docs/reference/a11y-roles.md](../../docs/reference/a11y-roles.md) records.
 
-The table below lists what each control is for — not what any platform reported. For the
-readings themselves, dated per platform and browser, see
-[docs/reference/a11y-roles.md](../../docs/reference/a11y-roles.md).
+The table below lists what each control is for — not what any platform reported. For the readings
+themselves, dated per platform and browser, see
+[docs/explanation/web-content.md](../../docs/explanation/web-content.md); `a11y-roles.md` holds the
+matrix cell each one settles.
 
 | Control | Purpose |
 |---|---|
@@ -26,8 +27,11 @@ readings themselves, dated per platform and browser, see
 - **Android fixture**: Copied into the fixture's assets at build time; fixture loads it via WebView
 - **iOS fixture**: Copied into the fixture's assets at build time; fixture loads it via WKWebView
 
-Never use a top-level `data:` URL — browsers load it synchronously and fixtures need a stable
-`file://` baseline; the platform probe reads it over that URL, so all runs see the same content.
+Never use a top-level `data:` URL. Firefox refused a top-level `data:` navigation
+(`security.data_uri.block_toplevel_data_uri_navigation`) and the page stayed blank while every
+other signal looked healthy, so the run read as an engine publishing nothing (read 2026-07 on
+Firefox). Keeping the fixture a file gives every platform the same stable baseline: the desktop
+probes read it over `file://`, the mobile fixtures from the app's own assets.
 
 ## Verify it works
 
