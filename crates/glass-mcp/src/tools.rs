@@ -289,13 +289,14 @@ fn a11y_truncation_steer(tree: &glass_core::AxTree) -> Option<String> {
     })
 }
 
-/// Every disclosure a snapshot owes the agent: the elements it does not show, and what it turned
-/// out to describe. One function, not three call-site lists, so `a11y_snapshot` and the
-/// `return:"snapshot"` fold disclose identically.
+/// Every disclosure a snapshot owes the agent: the elements it does not show, the web content
+/// it could not enter, and what it turned out to describe. One function, not three call-site
+/// lists, so `a11y_snapshot` and the `return:"snapshot"` fold disclose identically.
 fn a11y_steers(tree: &glass_core::AxTree) -> Vec<String> {
     [
         a11y_truncation_steer(tree),
         tree.unreadable_notice(),
+        tree.document_guidance(),
         tree.subject_notice(),
     ]
     .into_iter()
@@ -816,6 +817,29 @@ pub(crate) mod testutil {
         t
     }
 
+    /// `fake_tree` with a childless `Document` child — the unpublished-web-content shape.
+    pub fn unpublished_document_tree() -> AxTree {
+        let mut t = fake_tree();
+        t.root.children.push(AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Document,
+            raw_role: "document web".into(),
+            name: Some("page".into()),
+            description: None,
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 40,
+                width: 100,
+                height: 60,
+            }),
+            children: vec![],
+        });
+        t.assign_ids();
+        t
+    }
+
     pub fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
         glass_with_a11y_outcome(platform, tree, SetOutcome::Ok)
     }
@@ -1245,6 +1269,40 @@ mod tests {
                 );
             }
             _ => panic!("expected the trusted truncation-steer text"),
+        }
+    }
+
+    #[test]
+    fn a11y_snapshot_discloses_an_unpublished_document_as_a_trusted_block() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), unpublished_document_tree());
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        let out = a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+        assert_envelope(&out, "glass_a11y_snapshot");
+        assert_eq!(
+            out.0.len(),
+            3,
+            "envelope + wrapped outline + document guidance"
+        );
+        match (&out.0[1], &out.0[2]) {
+            (OutContent::Text(body), OutContent::Text(steer)) => {
+                assert!(
+                    !body.contains("has no readable content"),
+                    "guidance must not be inside the untrusted body: {body}"
+                );
+                assert!(steer.contains("Document"), "{steer}");
+                assert!(steer.contains("glass_screenshot"), "{steer}");
+            }
+            other => panic!("unexpected blocks: {other:?}"),
         }
     }
 
@@ -1760,6 +1818,59 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn return_snapshot_discloses_an_unpublished_document_the_same_way_a_snapshot_does() {
+        // The fold's steer wiring, not `a11y_steers` itself: every fold test until now used a
+        // tree with nothing to disclose, so dropping the `extend` broke nothing.
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), unpublished_document_tree());
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        // Populates the id cache click_element resolves against, and is the parity tree.
+        let tree = g.a11y_snapshot(None).unwrap();
+        let out = click_element(
+            &mut g,
+            &ClickElementArgs {
+                id: 1,
+                return_: Some("snapshot".into()),
+            },
+        )
+        .unwrap();
+        let texts: Vec<&String> = out
+            .0
+            .iter()
+            .filter_map(|c| match c {
+                OutContent::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        let steer = texts
+            .iter()
+            .find(|t| t.contains("has no readable content"))
+            .unwrap_or_else(|| panic!("the fold owes the document guidance: {texts:?}"));
+        assert!(
+            !steer.starts_with(crate::untrusted::NOTE) && !steer.contains("⟦untrusted:"),
+            "glass's own guidance, outside the untrusted envelope: {steer}"
+        );
+        assert!(steer.contains("glass_screenshot"), "{steer}");
+        // Parity with `a11y_snapshot`: a fifth steer added to one call site and not the
+        // other fails here too.
+        for expected in a11y_steers(&tree) {
+            assert!(
+                texts.iter().any(|t| **t == expected),
+                "the fold dropped a steer: {expected}"
+            );
+        }
     }
 
     #[test]

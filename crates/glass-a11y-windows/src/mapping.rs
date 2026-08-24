@@ -329,7 +329,8 @@ mod tests {
     #[test]
     fn document_maps_from_an_observed_token() {
         // Observed on a stock text editor — see the probe test in
-        // crates/glass-windows/tests/onbox.rs.
+        // crates/glass-windows/tests/onbox.rs. What a web document reports here is unread, so
+        // the role-support matrix records the Document cell as a gap until one is read.
         assert_eq!(map_role(50030, false), AxRole::TextArea);
     }
 

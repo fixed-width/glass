@@ -48,6 +48,10 @@ pub enum AxRole {
     Toolbar,
     StatusBar,
     Heading,
+    /// A web document or web area — the root of a subtree a web engine publishes (a
+    /// browser tab's page, a WebView's content). Its children are the page's own elements;
+    /// a `Document` with no children is disclosed by [`AxTree::document_guidance`].
+    Document,
     Other,
 }
 
@@ -55,7 +59,7 @@ impl AxRole {
     /// Every role except [`AxRole::Other`], which is the sink for unmapped native tokens
     /// rather than a mapping target. Used by the per-backend role-parity tests and by
     /// [`crate::role_support::ROLE_SUPPORT`].
-    pub const ALL: [AxRole; 33] = [
+    pub const ALL: [AxRole; 34] = [
         AxRole::Application,
         AxRole::Window,
         AxRole::Dialog,
@@ -89,6 +93,7 @@ impl AxRole {
         AxRole::Toolbar,
         AxRole::StatusBar,
         AxRole::Heading,
+        AxRole::Document,
     ];
 
     /// Whether this role denotes an element a user acts on (clicks / types into) —
@@ -153,6 +158,7 @@ impl AxRole {
             "toolbar" => Toolbar,
             "statusbar" => StatusBar,
             "heading" => Heading,
+            "document" => Document,
             "other" => Other,
             _ => return None,
         })
@@ -215,6 +221,14 @@ pub struct AxRect {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+}
+
+impl std::fmt::Display for AxRect {
+    /// `(x,y wxh)` — the agent-facing bounds format, defined once so the outline and a notice
+    /// naming the same element cannot drift.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({},{} {}x{})", self.x, self.y, self.width, self.height)
+    }
 }
 
 impl AxRect {
@@ -750,6 +764,71 @@ impl AxTree {
              (some toolkits need it enabled, e.g. relaunch with a11y:true; canvas/game apps \
              never will). Drive it by pixels instead: glass_screenshot, then glass_click at x,y.",
         )
+    }
+
+    /// Every `Document` with no children, in pre-order. A web engine that has not published
+    /// its tree — or an empty page — arrives exactly like this, and the outline alone cannot
+    /// tell the two apart.
+    pub fn unpublished_documents(&self) -> Vec<&AxNode> {
+        fn walk<'a>(node: &'a AxNode, out: &mut Vec<&'a AxNode>) {
+            if node.role == AxRole::Document && node.children.is_empty() {
+                out.push(node);
+            }
+            for child in &node.children {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, &mut out);
+        out
+    }
+
+    /// The disclosure for [`Self::unpublished_documents`]: one notice naming every childless
+    /// `Document` by id and bounds, or `None` when there is nothing to disclose. Same shape as
+    /// [`Truncation::notice`] and [`Self::empty_guidance`] — what is missing, then the pixel
+    /// path — because a web page the reader cannot enter fails the agent the same way a
+    /// truncated tree does. Aggregated like [`Self::unreadable_notice`] rather than repeated
+    /// per document: a page of ad iframes would otherwise spend the budget `max_nodes` guards.
+    ///
+    /// A bound or a failed child read empties a `Document`'s child list exactly like an
+    /// unpublished tree does, so only a complete walk ([`Self::is_complete`]) names a cause;
+    /// otherwise this hedges and defers to the notice beside it, which owns the recourse —
+    /// core does not know that only a `Nodes` bound is raisable by `max_nodes`.
+    pub fn document_guidance(&self) -> Option<String> {
+        let docs = self.unpublished_documents();
+        if docs.is_empty() {
+            return None;
+        }
+        let list: Vec<String> = docs
+            .iter()
+            .map(|d| match &d.bounds {
+                Some(b) => format!("#{} {b}", d.id.0),
+                None => format!("#{} (bounds unknown)", d.id.0),
+            })
+            .collect();
+        let one = docs.len() == 1;
+        let (s, have, they, them) = if one {
+            ("", "has", "it", "it")
+        } else {
+            ("s", "have", "they", "them")
+        };
+        let (n, list) = (docs.len(), list.join(", "));
+        Some(if self.is_complete() {
+            format!(
+                "… {n} Document element{s} {have} no readable content: {list}. The web engine \
+                 has not published its accessibility tree, or the page is empty. Elements \
+                 inside {them} cannot be addressed by id. Drive by pixels: glass_screenshot, \
+                 then glass_click at x,y inside the bounds above."
+            )
+        } else {
+            format!(
+                "… {n} Document element{s} {have} no readable content in this snapshot: \
+                 {list}, and the walk did not complete — see the notice beside this one — so \
+                 {they} may hold content that was never reached. Follow that notice, or take \
+                 a fresh glass_a11y_snapshot, before driving by pixels: glass_screenshot, \
+                 then glass_click at x,y inside the bounds above."
+            )
+        })
     }
 }
 
@@ -1350,7 +1429,8 @@ mod tests {
             | AxRole::Separator
             | AxRole::Toolbar
             | AxRole::StatusBar
-            | AxRole::Heading => {}
+            | AxRole::Heading
+            | AxRole::Document => {}
             // Deliberately excluded from `ALL`: the sink for unmapped native tokens, not a
             // mapping target.
             AxRole::Other => {}
@@ -1692,7 +1772,7 @@ mod tests {
     #[test]
     fn every_role_parses_from_its_name() {
         use AxRole::*;
-        let pairs: [(&str, AxRole); 34] = [
+        let pairs: [(&str, AxRole); 35] = [
             ("application", Application),
             ("window", Window),
             ("dialog", Dialog),
@@ -1726,6 +1806,7 @@ mod tests {
             ("toolbar", Toolbar),
             ("statusbar", StatusBar),
             ("heading", Heading),
+            ("document", Document),
             ("other", Other),
         ];
 
@@ -2269,6 +2350,18 @@ mod tests {
     }
 
     #[test]
+    fn bounds_render_as_origin_then_size() {
+        // The shared format the outline line and the document notice both render through.
+        let r = AxRect {
+            x: 40,
+            y: 120,
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(r.to_string(), "(40,120 800x600)");
+    }
+
+    #[test]
     fn rects_overlap_only_where_they_share_area() {
         let a = AxRect {
             x: 0,
@@ -2385,6 +2478,162 @@ mod tests {
         assert!(sample_tree().empty_guidance().is_none());
     }
 
+    fn document(name: &str, children: Vec<AxNode>) -> AxNode {
+        let mut d = leaf(AxRole::Document, name);
+        d.bounds = Some(AxRect {
+            x: 40,
+            y: 120,
+            width: 800,
+            height: 600,
+        });
+        d.children = children;
+        d
+    }
+
+    /// A Window with a Back button and one childless `Document` (#2), walked completely.
+    fn tree_with_a_childless_document() -> AxTree {
+        let mut tree = AxTree::new(AxNode {
+            children: vec![leaf(AxRole::Button, "Back"), document("page", vec![])],
+            ..leaf(AxRole::Window, "App")
+        });
+        tree.assign_ids();
+        tree
+    }
+
+    #[test]
+    fn a_childless_document_is_reported_with_its_id_and_bounds() {
+        let tree = tree_with_a_childless_document();
+        let found = tree.unpublished_documents();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, AxNodeId(2));
+        let hint = tree
+            .document_guidance()
+            .expect("a childless Document yields guidance");
+        assert!(
+            hint.contains("#2 (40,120 800x600)"),
+            "id and bounds: {hint}"
+        );
+        assert!(
+            hint.contains("glass_screenshot"),
+            "names the pixel path: {hint}"
+        );
+        assert!(hint.contains("glass_click"), "names the pixel path: {hint}");
+    }
+
+    #[test]
+    fn a_complete_walk_names_the_engine_and_the_empty_page() {
+        // A complete walk is the one case where glass can name a cause.
+        let hint = tree_with_a_childless_document()
+            .document_guidance()
+            .unwrap();
+        assert!(
+            hint.starts_with("… 1 Document element has no readable content:"),
+            "singular, aggregated: {hint}"
+        );
+        assert!(hint.contains("has not published"), "{hint}");
+    }
+
+    #[test]
+    fn a_document_emptied_by_a_bound_is_not_blamed_on_the_web_engine() {
+        // A bound leaves a Document childless too, so the notice cannot claim the engine
+        // published nothing.
+        let mut tree = tree_with_a_childless_document();
+        tree.truncated = Some(Truncation {
+            limit: TruncationLimit::Nodes,
+            limit_value: 20,
+            nodes_walked: 20,
+        });
+        let hint = tree.document_guidance().unwrap();
+        assert!(
+            !hint.contains("has not published"),
+            "a bounded walk cannot know that: {hint}"
+        );
+        assert!(hint.contains("in this snapshot"), "hedged: {hint}");
+        // `max_nodes` is an MCP-layer detail; core doesn't know a Nodes hit is raisable by it.
+        assert!(
+            !hint.contains("max_nodes"),
+            "not core's recourse to name: {hint}"
+        );
+        assert!(
+            hint.contains("the notice beside this one"),
+            "defers to the notice that knows the cause: {hint}"
+        );
+    }
+
+    #[test]
+    fn a_document_emptied_by_an_unread_subtree_is_not_blamed_on_the_web_engine() {
+        let mut tree = tree_with_a_childless_document();
+        tree.unreadable = 1;
+        let hint = tree.document_guidance().unwrap();
+        assert!(
+            !hint.contains("has not published"),
+            "a dropped subtree cannot know that: {hint}"
+        );
+        assert!(hint.contains("in this snapshot"), "hedged: {hint}");
+    }
+
+    #[test]
+    fn a_populated_document_is_not_reported() {
+        let mut tree = AxTree::new(AxNode {
+            children: vec![document("page", vec![leaf(AxRole::Heading, "Hello")])],
+            ..leaf(AxRole::Window, "App")
+        });
+        tree.assign_ids();
+        assert!(tree.unpublished_documents().is_empty());
+        assert!(tree.document_guidance().is_none());
+    }
+
+    #[test]
+    fn every_childless_document_is_reported_in_pre_order() {
+        // A populated document with an empty iframe inside it, and an empty one after it.
+        let mut tree = AxTree::new(AxNode {
+            children: vec![
+                document(
+                    "outer",
+                    vec![leaf(AxRole::Heading, "H"), document("iframe", vec![])],
+                ),
+                document("second", vec![]),
+            ],
+            ..leaf(AxRole::Window, "App")
+        });
+        tree.assign_ids();
+        let ids: Vec<AxNodeId> = tree.unpublished_documents().iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![AxNodeId(3), AxNodeId(4)]);
+        // One notice for both, ids listed in the same pre-order.
+        let hint = tree.document_guidance().unwrap();
+        assert!(
+            hint.starts_with("… 2 Document elements have no readable content:"),
+            "plural, aggregated: {hint}"
+        );
+        let (third, fourth) = (hint.find("#3").unwrap(), hint.find("#4").unwrap());
+        assert!(third < fourth, "pre-order: {hint}");
+    }
+
+    #[test]
+    fn a_tree_without_documents_yields_no_document_guidance() {
+        assert!(sample_tree().document_guidance().is_none());
+        // An empty tree is the empty_guidance case, not this one.
+        assert!(
+            AxTree::new(leaf(AxRole::Window, "App"))
+                .document_guidance()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_document_without_bounds_still_names_the_pixel_path() {
+        let mut d = document("page", vec![]);
+        d.bounds = None;
+        let mut tree = AxTree::new(AxNode {
+            children: vec![d],
+            ..leaf(AxRole::Window, "App")
+        });
+        tree.assign_ids();
+        let hint = tree.document_guidance().unwrap();
+        assert!(hint.contains("bounds unknown"), "{hint}");
+        assert!(hint.contains("glass_screenshot"), "{hint}");
+    }
+
     fn sample_tree() -> AxTree {
         let mut button = leaf(AxRole::Button, "Save");
         button.bounds = Some(AxRect {
@@ -2493,6 +2742,9 @@ mod tests {
             AxRole::Group,
             AxRole::Label,
             AxRole::Image,
+            // Making it interactable would chip every web page root in `marks` and widen
+            // `role:"Document"` onto any focusable Group/Other through `element_match`.
+            AxRole::Document,
             AxRole::Other,
         ] {
             assert!(!r.is_interactable(), "{r:?} should not be interactable");

@@ -622,6 +622,21 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
             ],
         ),
+        (
+            R::Document,
+            [
+                Mapped,
+                Gap {
+                    unmapped: None,
+                    why: "UIA's Document control type maps to TextArea, read from a text \
+                     editor's edit surface; what a web document reports on this backend has \
+                     not been read, so the cell waits on that reading",
+                },
+                Mapped,
+                Mapped,
+                Mapped,
+            ],
+        ),
     ]
 };
 
@@ -875,5 +890,22 @@ mod tests {
                 "{role:?} unmapped on the reference backend"
             );
         }
+    }
+
+    #[test]
+    fn document_row_declares_every_backend() {
+        for backend in AxBackend::ALL {
+            assert!(
+                support(AxRole::Document, backend).is_some(),
+                "{backend:?} has no Document cell"
+            );
+        }
+        // Windows keeps UIA Document on TextArea until a web document is read there.
+        // `unmapped` stays `None`: UIA's Document IS mapped, just to another role, so
+        // "`Document` arrives unmapped" would send a reader hunting for `Other(Document)`.
+        assert!(matches!(
+            support(AxRole::Document, AxBackend::Windows),
+            Some(RoleSupport::Gap { unmapped: None, .. })
+        ));
     }
 }
