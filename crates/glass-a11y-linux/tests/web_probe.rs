@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     AppSpec, AxNode, AxRole, AxTree, Backend, BaselineStore, Glass, GlassError, KeyEvent,
-    PlatformFactory, SandboxLevel, WindowHint, role_histogram,
+    PlatformFactory, SandboxLevel, WindowHint, read_back_confirms, role_histogram,
 };
 
 const BROWSERS_VAR: &str = "GLASS_WEB_PROBE_BROWSERS";
@@ -448,6 +448,8 @@ fn exercise(glass: &mut Glass, label: &str, failures: &mut Vec<String>) {
         "text input: #{} role={:?} raw_role={} value={:?}",
         field.id.0, field.role, field.raw_role, field.value
     );
+    // The baseline glass's own rule compares against — read before the write, not after.
+    let before = field.value.clone();
     let set = glass.set_value(field.id, TYPED);
     std::thread::sleep(Duration::from_millis(500));
     let after = match glass.a11y_snapshot(Some(0)) {
@@ -461,13 +463,15 @@ fn exercise(glass: &mut Glass, label: &str, failures: &mut Vec<String>) {
     let held = text_input(&after).and_then(|n| n.value.clone());
     println!("set_value: {set:?} → text input value={held:?}");
     // A claim about glass, not about the engine: whatever this browser does with the write, the
-    // verdict has to agree with the read-back — `Ok` without the text is a false success, `Err`
-    // with it a false failure.
-    let holds = held.as_deref() == Some(TYPED);
-    if set.is_ok() != holds {
+    // verdict has to agree with `read_back_confirms`, the readers' own rule — `Ok` it cannot
+    // confirm is a false success, `Err` it can a false failure. Do not tighten this to
+    // `held == TYPED`: that fails the probe for an engine that reformatted the value and that
+    // glass accepts.
+    let confirms = read_back_confirms(held.as_deref(), before.as_deref(), TYPED);
+    if set.is_ok() != confirms {
         failures.push(format!(
-            "{label}: set_value returned {set:?} while the field reads back {held:?} — a verdict \
-             that disagrees with the read-back"
+            "{label}: set_value returned {set:?} while the field reads back {held:?} (was \
+             {before:?}) — a verdict that disagrees with glass's own read-back rule"
         ));
     }
 
