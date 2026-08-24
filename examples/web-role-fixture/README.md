@@ -5,9 +5,9 @@ express on each platform. Each control answers one question: what role does each
 accessibility API report for it? That answer is what a cell in
 [docs/reference/a11y-roles.md](../../docs/reference/a11y-roles.md) records.
 
-The controls below are what each platform reads when glass probes the page — a reading,
-not a guarantee. Re-run it rather than trusting it; the probe step prints the platform
-and browser it saw.
+The table below lists what each control is for — not what any platform reported. For the
+readings themselves, dated per platform and browser, see
+[docs/reference/a11y-roles.md](../../docs/reference/a11y-roles.md).
 
 | Control | Purpose |
 |---|---|

@@ -17,8 +17,12 @@
 //! `--include-ignored` run never needs a browser.
 //!
 //! A probe, not a mapping test: it prints evidence and does not assert what a browser ought to
-//! publish. After `start` it reports failures instead of panicking, so `stop` always runs and
-//! no browser is left behind.
+//! publish — a browser that launches but shows no page content is a reading, not a failure
+//! (`arrived: false` plus whatever disclosure rendered). What does fail the run: a browser that
+//! never launches, or an accessibility bus that never answers at all. Each backend's `Drop`
+//! impl tears its session down even through a panic, so failures are collected per (backend,
+//! browser, lever) and the test panics once at the end, after every browser it started has
+//! already been stopped.
 
 #![cfg(target_os = "linux")]
 
@@ -62,6 +66,35 @@ fn page_url() -> String {
     )
 }
 
+fn is_gecko(browser: &str) -> bool {
+    browser.contains("firefox")
+}
+
+/// Gecko's onboarding, turned off in the profile. A fresh Firefox profile renders
+/// `about:welcome` over the requested page, so the reader's subject is the onboarding content
+/// and the fixture is never read. `--profile` is honoured before these are needed, and
+/// `user.js` is applied on every startup, so writing it into the fresh directory is enough.
+/// Matches the Windows probe's `GECKO_PREFS` so both probes see the same browser.
+const GECKO_PREFS: &str = r#"user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.migrate.content-modal.enabled", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.startup.upgradeDialog.enabled", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
+user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+"#;
+
+/// Seed a fresh Gecko profile with [`GECKO_PREFS`]; a no-op for every other engine.
+fn prepare_profile(browser: &str, profile: &Path) {
+    if !is_gecko(browser) {
+        return;
+    }
+    let path = profile.join("user.js");
+    if let Err(e) = std::fs::write(&path, GECKO_PREFS) {
+        println!("could not write {}: {e}", path.display());
+    }
+}
+
 /// Which candidate enable lever the launch carries: environment variables, or the
 /// Chromium-family command-line switch.
 #[derive(Clone, Copy, Debug)]
@@ -74,13 +107,23 @@ enum Lever {
 }
 
 impl Lever {
+    /// # Panics
+    ///
+    /// Panics when the variable is set to a value (trimmed) that names none of the accepted
+    /// levers. Falling back to the baseline on a typo would silently run the probe without the
+    /// lever the caller meant to test.
     fn from_env() -> Self {
-        match std::env::var(LEVER_VAR).unwrap_or_default().as_str() {
+        let raw = std::env::var(LEVER_VAR).unwrap_or_default();
+        match raw.trim() {
+            "" => Lever::None,
             "1" | "both" => Lever::Both,
             "gnome" => Lever::Gnome,
             "enabled" => Lever::Enabled,
             "flag" => Lever::RendererFlag,
-            _ => Lever::None,
+            other => panic!(
+                "{LEVER_VAR}={other:?} is not a recognised lever — set it to one of: 1, both, \
+                 gnome, enabled, flag, or leave it unset for the baseline reading"
+            ),
         }
     }
 
@@ -127,7 +170,7 @@ fn glass_for(backend: &str) -> Glass {
 /// A fresh, isolated profile per launch: no first-run prompts, no session restore, and no
 /// already-running instance adopting the URL instead of starting a process glass owns.
 fn browser_spec(browser: &str, profile: &Path, lever: Lever) -> AppSpec {
-    let run = if browser.contains("firefox") {
+    let run = if is_gecko(browser) {
         vec![
             browser.to_string(),
             "--no-remote".into(),
@@ -236,9 +279,14 @@ fn documents(tree: &AxTree) -> Vec<&AxNode> {
 ///
 /// Every error is retried until the deadline, not just `AccessibilityNotReady`: a browser
 /// re-execs during startup, and the bus error its first process leaves behind resolves itself
-/// once the second one registers. Each distinct error is printed once — a probe that stops at
-/// the first one reads "nothing published" for a browser that had not started yet.
-fn snapshot_until_page(glass: &mut Glass) -> (Option<AxTree>, Duration, bool) {
+/// once the second one registers. Each distinct error is printed once and recorded into
+/// `failures` — a caller not yet answering is expected during startup, but every other error is
+/// evidence the a11y bus itself broke, not a reading about the page.
+fn snapshot_until_page(
+    glass: &mut Glass,
+    label: &str,
+    failures: &mut Vec<String>,
+) -> (Option<AxTree>, Duration, bool) {
     let start = Instant::now();
     let mut last = None;
     let mut reported = Vec::new();
@@ -256,6 +304,7 @@ fn snapshot_until_page(glass: &mut Glass) -> (Option<AxTree>, Duration, bool) {
                 let text = e.to_string();
                 if !reported.contains(&text) {
                     println!("snapshot error at {:?}: {text}", start.elapsed());
+                    failures.push(format!("{label}: snapshot error: {text}"));
                     reported.push(text);
                 }
             }
@@ -308,14 +357,24 @@ fn report_tree(tree: &AxTree) {
 /// retrying reads the button's clickability rather than the retry's luck.
 const CLICK_ATTEMPTS: usize = 4;
 
+/// Push `e` into `failures` unless it is [`GlassError::AccessibilityNotReady`] — a caller not
+/// yet answering is expected here just as it is in `snapshot_until_page`; every other snapshot
+/// error means the a11y bus broke after it had already been serving this session.
+fn record_snapshot_failure(failures: &mut Vec<String>, label: &str, context: &str, e: &GlassError) {
+    if !matches!(e, GlassError::AccessibilityNotReady(_)) {
+        failures.push(format!("{label}: {context}: {e}"));
+    }
+}
+
 /// The actuation readings. Each step re-snapshots first: `click_element` and `set_value` resolve
 /// ids against the session's most recent tree, so an id from an older one addresses nothing.
-fn exercise(glass: &mut Glass) {
+fn exercise(glass: &mut Glass, label: &str, failures: &mut Vec<String>) {
     for attempt in 1..=CLICK_ATTEMPTS {
         let before = match glass.a11y_snapshot(Some(0)) {
             Ok(tree) => tree,
             Err(e) => {
                 println!("snapshot before the click failed: {e} — no click reading");
+                record_snapshot_failure(failures, label, "snapshot before the click failed", &e);
                 return;
             }
         };
@@ -342,12 +401,21 @@ fn exercise(glass: &mut Glass) {
                          {CLICKED:?}: {}",
                         valued(&after, CLICKED).is_some()
                     ),
-                    Err(e) => println!("click_element: {method:?} → re-snapshot failed: {e}"),
+                    Err(e) => {
+                        println!("click_element: {method:?} → re-snapshot failed: {e}");
+                        record_snapshot_failure(
+                            failures,
+                            label,
+                            "re-snapshot after click_element failed",
+                            &e,
+                        );
+                    }
                 }
                 break;
             }
             Err(e) => {
                 println!("click_element (attempt {attempt}) failed: {e}");
+                record_snapshot_failure(failures, label, "click_element failed", &e);
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
@@ -357,6 +425,7 @@ fn exercise(glass: &mut Glass) {
         Ok(tree) => tree,
         Err(e) => {
             println!("snapshot before set_value failed: {e} — no set_value reading");
+            record_snapshot_failure(failures, label, "snapshot before set_value failed", &e);
             return;
         }
     };
@@ -374,6 +443,7 @@ fn exercise(glass: &mut Glass) {
         Ok(tree) => tree,
         Err(e) => {
             println!("set_value: {set:?} → re-snapshot failed: {e}");
+            record_snapshot_failure(failures, label, "re-snapshot after set_value failed", &e);
             return;
         }
     };
@@ -395,7 +465,10 @@ fn exercise(glass: &mut Glass) {
                 "control — click {focus:?} then key {keyed:?} → text input value={:?}",
                 text_input(&after).and_then(|n| n.value.clone())
             ),
-            Err(e) => println!("control — re-snapshot failed: {e}"),
+            Err(e) => {
+                println!("control — re-snapshot failed: {e}");
+                record_snapshot_failure(failures, label, "control re-snapshot failed", &e);
+            }
         }
     }
 
@@ -411,15 +484,24 @@ fn exercise(glass: &mut Glass) {
             println!("--- tree after actuation ---");
             report_tree(&after);
         }
-        Err(e) => println!("final snapshot failed: {e}"),
+        Err(e) => {
+            println!("final snapshot failed: {e}");
+            record_snapshot_failure(failures, label, "final snapshot failed", &e);
+        }
     }
 }
 
-fn probe(backend: &str, browser: &str, lever: Lever) {
-    println!("=== {backend} / {browser} / lever={lever:?} ===");
+/// One backend/browser/lever combination. Failures that mean the a11y bus itself broke — a
+/// launch that never happened, or a snapshot channel that never answered — are appended to
+/// `failures` rather than panicking, so the rest of the requested browsers still get their turn
+/// and this browser's `stop` still runs.
+fn probe(backend: &str, browser: &str, lever: Lever, failures: &mut Vec<String>) {
+    let label = format!("{backend}/{browser}/lever={lever:?}");
+    println!("=== {label} ===");
     println!("engine: {}", version_of(browser));
 
     let profile = tempfile::tempdir().expect("profile dir");
+    prepare_profile(browser, profile.path());
     let spec = browser_spec(browser, profile.path(), lever);
     println!("run: {:?}", spec.run);
     println!("env: {:?}", spec.env);
@@ -428,17 +510,21 @@ fn probe(backend: &str, browser: &str, lever: Lever) {
     let started = Instant::now();
     if let Err(e) = glass.start(&spec) {
         println!("start failed after {:?}: {e}", started.elapsed());
+        failures.push(format!(
+            "{label}: start failed after {:?}: {e}",
+            started.elapsed()
+        ));
         return;
     }
     println!("window mapped after {:?}", started.elapsed());
 
-    let (tree, settle, arrived) = snapshot_until_page(&mut glass);
+    let (tree, settle, arrived) = snapshot_until_page(&mut glass, &label, failures);
     println!("page content arrived: {arrived} after {settle:?}");
     match tree {
         Some(tree) => {
             report_tree(&tree);
             if arrived {
-                exercise(&mut glass);
+                exercise(&mut glass, &label, failures);
             } else if let Some(hint) = tree.document_guidance() {
                 println!("disclosure rendered:\n{hint}");
             } else {
@@ -450,25 +536,29 @@ fn probe(backend: &str, browser: &str, lever: Lever) {
     println!("stop: {:?}", glass.stop());
 }
 
-fn run_probes(backend: &str) {
+fn run_probes(backend: &str, failures: &mut Vec<String>) {
     let Ok(list) = std::env::var(BROWSERS_VAR) else {
         println!("skipped: set {BROWSERS_VAR}=firefox,brave-browser");
         return;
     };
     let lever = Lever::from_env();
     for browser in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        probe(backend, browser, lever);
+        probe(backend, browser, lever, failures);
     }
 }
 
 #[test]
 #[ignore = "needs a browser and the a11y prerequisites; see the module doc"]
 fn x11_browsers() {
-    run_probes("x11");
+    let mut failures = Vec::new();
+    run_probes("x11", &mut failures);
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
 #[test]
 #[ignore = "needs sway, a browser and the a11y prerequisites; see the module doc"]
 fn wayland_browsers() {
-    run_probes("wayland");
+    let mut failures = Vec::new();
+    run_probes("wayland", &mut failures);
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
