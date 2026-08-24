@@ -50,6 +50,7 @@ pub(crate) fn map_role(role: Role) -> AxRole {
         Role::ToolBar => AxRole::Toolbar,
         Role::StatusBar => AxRole::StatusBar,
         Role::Heading => AxRole::Heading,
+        Role::DocumentWeb | Role::DocumentFrame => AxRole::Document,
         _ => AxRole::Other,
     }
 }
@@ -106,6 +107,17 @@ mod tests {
     #[test]
     fn unknown_role_is_other() {
         assert_eq!(map_role(Role::Calendar), AxRole::Other);
+    }
+
+    #[test]
+    fn web_documents_map_to_document() {
+        // A browser's page root and an ARIA role=document region are both web documents;
+        // a text document (DocumentText) is a text area and stays one.
+        assert_eq!(map_role(Role::DocumentWeb), AxRole::Document);
+        assert_eq!(map_role(Role::DocumentFrame), AxRole::Document);
+        assert_eq!(map_role(Role::DocumentText), AxRole::TextArea);
+        // An embedded object (<embed>, <object>) is not a document.
+        assert_eq!(map_role(Role::Embedded), AxRole::Other);
     }
 
     #[test]
@@ -177,6 +189,7 @@ mod tests {
         (Role::ToolBar, AxRole::Toolbar),
         (Role::StatusBar, AxRole::StatusBar),
         (Role::Heading, AxRole::Heading),
+        (Role::DocumentWeb, AxRole::Document),
     ];
 
     #[test]
