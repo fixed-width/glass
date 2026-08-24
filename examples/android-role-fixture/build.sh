@@ -64,12 +64,16 @@ rm -rf "$out"
 mkdir -p "$out/classes"
 
 javac --release 17 -classpath "$android_jar" -d "$out/classes" \
-  "$here/src/tech/fixedwidth/glassrolefixture/MainActivity.java"
+  "$here"/src/tech/fixedwidth/glassrolefixture/*.java
 # -exec rather than $(find ...): the class list must survive a path containing spaces.
 find "$out/classes" -name '*.class' -exec "$tools/d8" --lib "$android_jar" --output "$out" {} +
 [ -f "$out/classes.dex" ] || { echo "d8 produced no dex" >&2; exit 1; }
 
-"$tools/aapt2" link -o "$out/unsigned.apk" -I "$android_jar" \
+# The shared page travels as an asset, copied at build time so there is one copy to edit.
+mkdir -p "$out/assets"
+cp "$here/../web-role-fixture/index.html" "$out/assets/index.html"
+
+"$tools/aapt2" link -o "$out/unsigned.apk" -I "$android_jar" -A "$out/assets" \
   --manifest "$here/AndroidManifest.xml" --min-sdk-version 24 --target-sdk-version 34
 # classes*.dex, not classes.dex: d8 splits past the method limit, and a silently half-packaged
 # APK still installs and runs — until it reaches the missing code.
