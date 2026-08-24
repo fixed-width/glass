@@ -341,6 +341,7 @@ fn report_tree(tree: &AxTree) {
     for notice in [
         tree.truncation_notice(),
         tree.unreadable_notice(),
+        tree.unexposed_notice(),
         tree.subject_notice(),
         tree.empty_guidance().map(str::to_string),
     ]
@@ -534,10 +535,11 @@ fn probe(backend: &str, browser: &str, lever: Lever, failures: &mut Vec<String>)
             report_tree(&tree);
             if arrived {
                 exercise(&mut glass, &label, failures);
-            } else if let Some(hint) = tree.document_guidance() {
+            } else if let Some(hint) = tree.document_guidance().or_else(|| tree.unexposed_notice())
+            {
                 println!("disclosure rendered:\n{hint}");
             } else {
-                println!("NO DOCUMENT AND NO DISCLOSURE — the blind spot");
+                println!("NOTHING ARRIVED AND NOTHING DISCLOSED — the blind spot");
             }
         }
         None => println!("no tree at all — nothing was published within {SETTLE:?}"),

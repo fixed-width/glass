@@ -481,6 +481,7 @@ pub struct WalkBudget {
     count: usize,
     truncated: Option<Truncation>,
     unreadable: usize,
+    unexposed: usize,
     limits: WalkLimits,
 }
 
@@ -496,6 +497,7 @@ impl WalkBudget {
             count: 0,
             truncated: None,
             unreadable: 0,
+            unexposed: 0,
             limits,
         }
     }
@@ -584,6 +586,20 @@ impl WalkBudget {
         self.unreadable
     }
 
+    /// Record a placeholder the app published in place of content it has not exposed to
+    /// accessibility.
+    ///
+    /// Distinct from [`WalkBudget::note_unreadable`]: nothing failed and nothing vanished, so
+    /// re-reading is no recourse — the app is withholding the subtree, not losing it.
+    pub fn note_unexposed(&mut self) {
+        self.unexposed += 1;
+    }
+
+    /// How many placeholders stood in for content the app has not exposed.
+    pub fn unexposed(&self) -> usize {
+        self.unexposed
+    }
+
     /// Record that a bound stopped the walk. Only the FIRST hit is kept: it is the cause,
     /// while any later hit is a consequence of having continued.
     pub fn hit(&mut self, limit: TruncationLimit) {
@@ -628,6 +644,10 @@ pub struct AxTree {
     /// Subtrees dropped because a child read failed. Independent of [`AxTree::truncated`]: a
     /// tree can hit no bound at all and still be missing elements this way.
     pub unreadable: usize,
+    /// Placeholders the app published in place of content it has not exposed to accessibility —
+    /// on AT-SPI, a null child ref. Not [`AxTree::unreadable`]: the walk reached these and the
+    /// app was withholding what is behind them, so the walk itself still completed.
+    pub unexposed: usize,
     /// `Some` when the backend answered about something other than what it was asked about —
     /// see [`Subject`].
     pub subject: Option<Subject>,
@@ -635,7 +655,8 @@ pub struct AxTree {
 
 impl AxTree {
     /// Whether this tree describes everything the backend walked — no bound stopped it early and
-    /// no child read dropped a subtree.
+    /// no child read dropped a subtree. [`AxTree::unexposed`] does not count: the walk finished
+    /// and the app withheld the content.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.truncated.is_none() && self.unreadable == 0
@@ -649,6 +670,7 @@ impl AxTree {
             count: 0,
             truncated: None,
             unreadable: 0,
+            unexposed: 0,
             subject: None,
         }
     }
@@ -736,6 +758,27 @@ impl AxTree {
                  show them; otherwise drive that area by pixels: glass_screenshot, then \
                  glass_click at x,y.",
                 if self.unreadable == 1 { "is" } else { "are" },
+            )
+        })
+    }
+
+    /// Disclosure for placeholders the app published in place of content it has not exposed —
+    /// [`AxTree::unexposed`]. Separate from [`AxTree::unreadable_notice`] because the recourse
+    /// differs: the walk reached these and nothing failed, so a fresh snapshot returns the same
+    /// placeholder and only the pixel path is left.
+    pub fn unexposed_notice(&self) -> Option<String> {
+        (self.unexposed > 0).then(|| {
+            let n = self.unexposed;
+            let (s, are, they) = if n == 1 {
+                ("", "is a placeholder", "It")
+            } else {
+                ("s", "are placeholders", "They")
+            };
+            format!(
+                "… {n} element{s} {are} the app published for content it has not exposed to \
+                 accessibility (a web view whose accessibility is off reads like this). {they} \
+                 cannot be addressed by id; drive that area by pixels: glass_screenshot, then \
+                 glass_click at x,y."
             )
         })
     }
@@ -3274,6 +3317,76 @@ mod tests {
             None,
             "an unreadable read is not a bound hit"
         );
+    }
+
+    /// The reading behind this (Brave 151 on X11, 2026-08-24): the browser window's one child is
+    /// a null AT-SPI ref while renderer accessibility is off. Counted as unreadable, the agent
+    /// was told the element went away mid-walk and to re-snapshot — advice that never helps.
+    #[test]
+    fn a_withheld_placeholder_is_disclosed_as_unexposed_not_as_a_vanished_element() {
+        let mut t = AxTree::new(leaf(AxRole::Window, "w"));
+        t.unexposed = 1;
+        let n = t
+            .unexposed_notice()
+            .expect("a placeholder for withheld content must disclose");
+        assert!(n.contains("placeholder"), "{n}");
+        assert!(n.contains("has not exposed"), "{n}");
+        assert!(
+            n.contains("glass_screenshot") && n.contains("glass_click"),
+            "the pixel path is the only recourse: {n}"
+        );
+        assert!(
+            !n.contains("went away"),
+            "nothing vanished, so a re-snapshot is not the recourse: {n}"
+        );
+    }
+
+    #[test]
+    fn a_tree_withholding_nothing_yields_no_unexposed_notice() {
+        assert_eq!(
+            AxTree::new(leaf(AxRole::Window, "w")).unexposed_notice(),
+            None
+        );
+    }
+
+    /// Singular and plural both read as English, since the count is agent-facing text.
+    #[test]
+    fn the_unexposed_notice_agrees_in_number() {
+        let mut t = AxTree::new(leaf(AxRole::Window, "w"));
+        t.unexposed = 1;
+        let one = t.unexposed_notice().unwrap();
+        assert!(one.contains("1 element is a placeholder"), "{one}");
+        assert!(one.contains("It cannot be addressed"), "{one}");
+        t.unexposed = 2;
+        let many = t.unexposed_notice().unwrap();
+        assert!(many.contains("2 elements are placeholders"), "{many}");
+        assert!(many.contains("They cannot be addressed"), "{many}");
+    }
+
+    /// A withheld placeholder is not an incomplete walk, which is what lets `document_guidance`
+    /// still name the engine instead of hedging.
+    #[test]
+    fn a_withheld_placeholder_leaves_the_walk_complete() {
+        let mut t = AxTree::new(leaf(AxRole::Window, "w"));
+        t.unexposed = 1;
+        assert!(
+            t.is_complete(),
+            "the app withheld content; the walk finished"
+        );
+    }
+
+    #[test]
+    fn the_budget_counts_a_withheld_placeholder_separately_from_an_unreadable_subtree() {
+        let mut b = WalkBudget::new();
+        assert_eq!(b.unexposed(), 0);
+        b.note_unexposed();
+        assert_eq!(b.unexposed(), 1);
+        assert_eq!(
+            b.unreadable(),
+            0,
+            "a placeholder is not a failed read: the recourses differ"
+        );
+        assert_eq!(b.truncation(), None, "nor is it a bound hit");
     }
 
     #[test]

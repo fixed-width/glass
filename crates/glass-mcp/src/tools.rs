@@ -289,13 +289,18 @@ fn a11y_truncation_steer(tree: &glass_core::AxTree) -> Option<String> {
     })
 }
 
-/// Every disclosure a snapshot owes the agent: the elements it does not show, the web content
-/// it could not enter, and what it turned out to describe. One function, not three call-site
-/// lists, so `a11y_snapshot` and the `return:"snapshot"` fold disclose identically.
+/// Every disclosure a snapshot owes the agent: the elements it does not show, the content the app
+/// withheld, the web content it could not enter, and what it turned out to describe. One function,
+/// not four call-site lists, so `a11y_snapshot` and the `return:"snapshot"` fold disclose
+/// identically.
+///
+/// Ordered by how much the recourse can still change: a re-read first, then the two that leave
+/// only pixels.
 fn a11y_steers(tree: &glass_core::AxTree) -> Vec<String> {
     [
         a11y_truncation_steer(tree),
         tree.unreadable_notice(),
+        tree.unexposed_notice(),
         tree.document_guidance(),
         tree.subject_notice(),
     ]
@@ -1304,6 +1309,69 @@ mod tests {
             }
             other => panic!("unexpected blocks: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a11y_snapshot_discloses_withheld_content_as_a_trusted_block() {
+        let mut tree = fake_tree();
+        tree.unexposed = 1;
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), tree);
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        let out = a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+        assert_envelope(&out, "glass_a11y_snapshot");
+        assert_eq!(
+            out.0.len(),
+            3,
+            "envelope + wrapped outline + the withheld-content steer"
+        );
+        match (&out.0[1], &out.0[2]) {
+            (OutContent::Text(body), OutContent::Text(steer)) => {
+                assert!(
+                    !body.contains("placeholder"),
+                    "the steer must not be inside the untrusted body: {body}"
+                );
+                assert!(steer.contains("has not exposed"), "{steer}");
+                assert!(steer.contains("glass_screenshot"), "{steer}");
+                assert!(
+                    !steer.starts_with(crate::untrusted::NOTE) && !steer.contains("⟦untrusted:"),
+                    "glass's own guidance stays outside the untrusted markers: {steer}"
+                );
+            }
+            other => panic!("unexpected blocks: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_withheld_content_steer_sits_between_the_unreadable_one_and_the_document_one() {
+        // All three can fire on one tree.
+        let mut tree = unpublished_document_tree();
+        tree.unreadable = 1;
+        tree.unexposed = 1;
+        let steers = a11y_steers(&tree);
+        let at = |needle: &str| {
+            steers
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("no steer contains {needle:?}: {steers:?}"))
+        };
+        assert!(
+            at("could not be read") < at("has not exposed"),
+            "{steers:?}"
+        );
+        assert!(
+            at("has not exposed") < at("no readable content"),
+            "{steers:?}"
+        );
     }
 
     #[test]

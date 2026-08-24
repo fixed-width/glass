@@ -153,6 +153,7 @@ async fn snapshot_async(ctx: &AxContext) -> Result<AxTree> {
     let mut tree = AxTree::new(root_node);
     tree.truncated = budget.truncation();
     tree.unreadable = budget.unreadable();
+    tree.unexposed = budget.unexposed();
     tree.assign_ids();
     Ok(tree)
 }
@@ -260,8 +261,11 @@ async fn find_nth(
         if !budget.may_visit_sibling(scanned) {
             break;
         }
+        // Both branches are counted in `walk` too, so the two traversals report the same drops.
+        if unexposed_child(&child_ref, budget) {
+            continue;
+        }
         let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
-            // Counted in `walk` too, so the two traversals report the same drop.
             budget.note_unreadable();
             continue;
         };
@@ -369,6 +373,9 @@ async fn walk(
         for (scanned, child_ref) in child_refs.into_iter().enumerate() {
             if !budget.may_visit_sibling(scanned) {
                 break;
+            }
+            if unexposed_child(&child_ref, budget) {
+                continue;
             }
             let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
                 budget.note_unreadable();
@@ -710,6 +717,20 @@ fn nonempty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Whether `child_ref` is AT-SPI's null reference — the placeholder an app publishes for content
+/// it has not exposed to accessibility — counting it on `budget` when it is. A Chromium window
+/// publishes exactly one while renderer accessibility is off (read on Brave 151, 2026-08-24).
+///
+/// Consulted before the proxy is built, in both traversals: building one from a null ref only
+/// errors, and that error read as a subtree lost mid-walk.
+fn unexposed_child(child_ref: &ObjectRefOwned, budget: &mut WalkBudget) -> bool {
+    let null = child_ref.is_null();
+    if null {
+        budget.note_unexposed();
+    }
+    null
+}
+
 #[cfg(test)]
 mod toggle_label_tests {
     use super::toggle_state_label;
@@ -725,6 +746,8 @@ mod toggle_label_tests {
 
 #[cfg(test)]
 mod tests {
+    use atspi_common::ObjectRef;
+
     use super::*;
 
     #[test]
@@ -740,6 +763,33 @@ mod tests {
             !msg.contains("relaunch with a11y:true"),
             "distinct from the bus/opt-in error"
         );
+    }
+
+    /// The reading behind this (Brave 151 on X11, 2026-08-24): the browser window's one child is
+    /// a null ObjectRef while renderer accessibility is off, and the proxy build's error read as
+    /// an element that had gone away mid-walk.
+    #[test]
+    fn a_null_child_ref_is_content_the_app_has_not_exposed_rather_than_a_failed_read() {
+        let mut budget = WalkBudget::new();
+        assert!(unexposed_child(
+            &ObjectRefOwned::new(ObjectRef::Null),
+            &mut budget
+        ));
+        assert_eq!(budget.unexposed(), 1);
+        assert_eq!(
+            budget.unreadable(),
+            0,
+            "no read was attempted, let alone failed"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_child_ref_is_left_to_the_proxy_build() {
+        let mut budget = WalkBudget::new();
+        let child =
+            ObjectRefOwned::from_static_str_unchecked(":1.42", "/org/a11y/atspi/accessible/7");
+        assert!(!unexposed_child(&child, &mut budget));
+        assert_eq!(budget.unexposed(), 0);
     }
 
     #[test]
