@@ -168,6 +168,8 @@ pub struct SetValueArgs {
 }
 
 /// Arguments for `glass_a11y_snapshot`.
+/// Web content inside the app arrives under a `Document` element; a `Document` with no
+/// children is disclosed with the pixel path.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct A11ySnapshotArgs {
     /// Maximum number of elements to include. Omit for the default cap (protects the token
@@ -333,7 +335,7 @@ pub struct WaitStableArgs {
 pub struct WaitForElementArgs {
     /// Substring of the element's accessible name (selector).
     pub name: Option<String>,
-    /// Element role filter, e.g. "Button", "ProgressBar" (selector).
+    /// Element role filter, e.g. "Button", "ProgressBar", "Document" (selector).
     pub role: Option<String>,
     /// What to wait for (default "appears"): appears|disappears|enabled|disabled|
     /// checked|unchecked|selected|unselected|expanded|collapsed|focused|visible|hidden.
@@ -354,7 +356,7 @@ pub struct ScrollToElementArgs {
     /// Substring of the target element's accessible name (selector). `name` and/or
     /// `role` is required.
     pub name: Option<String>,
-    /// Element role filter, e.g. "ListItem", "Button" (selector).
+    /// Element role filter, e.g. "ListItem", "Button", "Document" (selector).
     pub role: Option<String>,
     /// Additionally require the matched element's `value` to contain this substring.
     /// Not a standalone selector — `name` and/or `role` is still required.

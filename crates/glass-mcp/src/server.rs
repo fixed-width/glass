@@ -504,8 +504,10 @@ impl GlassServer {
                        glass_scroll_to_element select on name, not description. Pass an #id to \
                        glass_click_element. Errors if the backend or app exposes no \
                        accessibility tree (e.g. a canvas/black-box app) — fall back to \
-                       glass_screenshot then. Optional max_nodes: raise the element cap, or 0 \
-                       to remove the element-count limit (default caps protect the token budget)."
+                       glass_screenshot then. Web content arrives under a `Document` element, \
+                       and a childless `Document` is disclosed with the pixel path. Optional \
+                       max_nodes: raise the element cap, or 0 to remove the element-count limit \
+                       (default caps protect the token budget)."
     )]
     async fn glass_a11y_snapshot(
         &self,
