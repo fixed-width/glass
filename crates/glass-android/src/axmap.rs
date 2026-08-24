@@ -43,7 +43,7 @@ pub const CLASS_TOKENS: &[(&str, AxRole)] = &[
     ("RecyclerView", AxRole::List),
     ("ListView", AxRole::List),
     ("GridView", AxRole::List),
-    ("WebView", AxRole::Group),
+    ("WebView", AxRole::Document),
     // Containers the leaf-suffix rule below cannot catch, each observed in a real app's
     // tree: the AndroidX card container, the AppCompat linear layout (shipped under two
     // package names), the view that hosts a Compose hierarchy, and a swipe-paged container.
@@ -627,6 +627,13 @@ mod tests {
         ] {
             assert_eq!(class_to_role(class), AxRole::Group, "{class}");
         }
+    }
+
+    #[test]
+    fn a_webview_is_a_document_not_a_group() {
+        // glass#506: as a Group, a WebView whose content the reader could not enter was
+        // indistinguishable from an empty container.
+        assert_eq!(class_to_role("android.webkit.WebView"), AxRole::Document);
     }
 
     #[test]
