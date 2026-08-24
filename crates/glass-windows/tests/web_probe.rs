@@ -466,7 +466,16 @@ fn exercise(glass: &mut Glass, label: &str, failures: &mut Vec<String>) -> (bool
             }
             Err(e) => {
                 say!("click_element (attempt {attempt}) failed: {e}");
-                record_snapshot_failure(failures, label, "click_element failed", &e);
+                // A retry that lands is a reading, not a failure — only the exhausted attempt
+                // means click_element never worked at all.
+                if attempt == CLICK_ATTEMPTS {
+                    record_snapshot_failure(
+                        failures,
+                        label,
+                        &format!("click_element failed after {CLICK_ATTEMPTS} attempts"),
+                        &e,
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
