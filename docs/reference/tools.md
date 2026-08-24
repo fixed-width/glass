@@ -524,9 +524,10 @@ visible; a bare `Other` means the platform named no token at all.
 Web content — a browser's page, a WebView's content — arrives under a `Document` element whose
 children are the page's own elements (headings, links, fields), addressable like any other. A
 `Document` with **no** children has nothing inside to address: the web engine has not published
-its accessibility tree, the page is empty, or — on a truncated snapshot — the walk stopped before
-reaching its content. The snapshot says so in a separate notice naming the element's id, bounds
-and the pixel path, the same way a truncated tree is disclosed.
+its accessibility tree, the page is empty, or the walk did not complete — whether a bound cut it
+short or it dropped a subtree it could not read — before reaching its content. The snapshot says
+so in a separate notice naming the element's id, bounds and the pixel path, the same way a
+truncated tree is disclosed.
 
 - `max_nodes` (integer) — raise the element cap above the default (which protects the token
   budget), or `0` to remove the element-count limit. Omit for the default cap. (Structural
