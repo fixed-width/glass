@@ -634,7 +634,13 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 },
                 Mapped,
                 Mapped,
-                Mapped,
+                NotApplicable {
+                    basis: Unmarked,
+                    instead: None,
+                    why: "a WKWebView page exposes no element at all through idb — neither the \
+                     view nor its content (read on the iOS 26.5 Simulator, companions 1.5.0b3 \
+                     and 1.1.8)",
+                },
             ],
         ),
     ]
@@ -906,6 +912,15 @@ mod tests {
         assert!(matches!(
             support(AxRole::Document, AxBackend::Windows),
             Some(RoleSupport::Gap { unmapped: None, .. })
+        ));
+        // iOS reads nothing at all for a WKWebView, so no token stands in for the role.
+        assert!(matches!(
+            support(AxRole::Document, AxBackend::Ios),
+            Some(RoleSupport::NotApplicable {
+                basis: Basis::Unmarked,
+                instead: None,
+                ..
+            })
         ));
     }
 }

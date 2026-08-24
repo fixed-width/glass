@@ -52,8 +52,6 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
     ("AXGroup", AxRole::Group),
     // A screen or section title.
     ("AXHeading", AxRole::Heading),
-    // The root of a web engine's subtree.
-    ("AXWebArea", AxRole::Document),
 ];
 
 /// Map an idb AX role string (e.g. `AXButton`) to a normalized [`AxRole`].
@@ -320,9 +318,12 @@ mod tests {
         assert_eq!(ax_role("AXWhatever"), AxRole::Other);
     }
 
+    /// Read on the iOS 26.5 Simulator (2026-08-24, companions 1.5.0b3 and 1.1.8): a WKWebView
+    /// page exposes no element through idb — not the page, not an empty web area, not the view
+    /// itself. `AXWebArea` came from the macOS token table and was never seen here.
     #[test]
-    fn a_web_area_is_a_document() {
-        assert_eq!(ax_role("AXWebArea"), AxRole::Document);
+    fn no_token_stands_for_a_web_page_on_this_backend() {
+        assert_eq!(ax_role("AXWebArea"), AxRole::Other);
     }
 
     #[test]
