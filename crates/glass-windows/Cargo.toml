@@ -46,6 +46,9 @@ windows = { version = "0.62", features = [
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 # onbox.rs's Glass-session harness (glass_windows_with_a11y) needs a scratch baseline dir.
 tempfile.workspace = true
+# web_probe.rs reads `Document` elements' FrameworkId directly, below glass's reader. Same version
+# and features as glass-a11y-windows depends on, so no new crate enters the lockfile.
+uiautomation = { version = "0.25", features = ["process", "event"] }
 
 # The pixel conversion is cross-platform, so its bench builds and runs everywhere.
 [dev-dependencies]

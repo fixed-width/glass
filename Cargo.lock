@@ -1386,6 +1386,7 @@ dependencies = [
  "glass-clip-shim-windows",
  "glass-core",
  "tempfile",
+ "uiautomation",
  "windows",
  "windows-capture",
 ]
