@@ -489,6 +489,16 @@ mod macos_main {
         Ok(tree)
     }
 
+    /// Record a snapshot failure as breakage, deduped: an AX channel that breaks mid-run breaks
+    /// for every read after it. Recorded at all because a run whose reader stopped answering
+    /// otherwise prints the errors and exits 0.
+    fn record(broke: &mut Vec<String>, label: &str, context: &str, e: &GlassError) {
+        let msg = format!("{label}: {context}: {e}");
+        if !broke.contains(&msg) {
+            broke.push(msg);
+        }
+    }
+
     /// What proves the page's own content is in the tree, described — or `None` while it is
     /// not there.
     ///
@@ -514,15 +524,16 @@ mod macos_main {
 
     /// Re-snapshot until [`page_marker`] finds the page's own content or [`SETTLE`] elapses.
     /// Returns the last tree read, how long it took, and whether the content arrived. Each
-    /// distinct error is printed once — a probe that stops at the first reads "nothing
+    /// distinct error is reported once — a probe that stops at the first reads "nothing
     /// published" for a page that had not loaded yet.
     fn snapshot_until_page(
         a11y: &mut MacosA11y,
         ctx: &AxContext,
+        label: &str,
+        broke: &mut Vec<String>,
     ) -> (Option<AxTree>, Duration, bool) {
         let start = Instant::now();
         let mut last = None;
-        let mut reported: Vec<String> = Vec::new();
         loop {
             match snapshot(a11y, ctx) {
                 Ok(tree) => {
@@ -534,10 +545,15 @@ mod macos_main {
                     }
                 }
                 Err(e) => {
-                    let text = e.to_string();
-                    if !reported.contains(&text) {
-                        println!("snapshot error at {:?}: {text}", start.elapsed());
-                        reported.push(text);
+                    let before = broke.len();
+                    record(
+                        broke,
+                        label,
+                        "snapshot error while waiting for the page",
+                        &e,
+                    );
+                    if broke.len() != before {
+                        println!("snapshot error at {:?}: {e}", start.elapsed());
                     }
                 }
             }
@@ -619,11 +635,18 @@ mod macos_main {
     /// The actuation readings: click the fixture's button and check the page reacted, write the
     /// text input through `set_value` and read it back, then type into the same field by
     /// keyboard as the control that tells a failed write from a value this engine never reports.
-    fn exercise(platform: &mut MacosPlatform, a11y: &mut MacosA11y, ctx: &AxContext) {
+    fn exercise(
+        platform: &mut MacosPlatform,
+        a11y: &mut MacosA11y,
+        ctx: &AxContext,
+        label: &str,
+        broke: &mut Vec<String>,
+    ) {
         let before = match snapshot(a11y, ctx) {
             Ok(tree) => tree,
             Err(e) => {
                 println!("snapshot before the click failed: {e} — no click reading");
+                record(broke, label, "the snapshot before the click failed", &e);
                 return;
             }
         };
@@ -641,7 +664,10 @@ mod macos_main {
                                 "click_element: {method} → result paragraph reads {CLICKED:?}: {}",
                                 carries(&after, CLICKED).is_some()
                             ),
-                            Err(e) => println!("click_element: {method} → re-snapshot failed: {e}"),
+                            Err(e) => {
+                                println!("click_element: {method} → re-snapshot failed: {e}");
+                                record(broke, label, "the re-snapshot after the click failed", &e);
+                            }
                         }
                     }
                     Err(e) => println!("click_element failed: {e}"),
@@ -654,6 +680,7 @@ mod macos_main {
             Ok(tree) => tree,
             Err(e) => {
                 println!("snapshot before set_value failed: {e} — no set_value reading");
+                record(broke, label, "the snapshot before set_value failed", &e);
                 return;
             }
         };
@@ -672,7 +699,10 @@ mod macos_main {
                 "set_value: {set:?} → text input value={:?}",
                 text_input(&after).and_then(|n| n.value.clone())
             ),
-            Err(e) => println!("set_value: {set:?} → re-snapshot failed: {e}"),
+            Err(e) => {
+                println!("set_value: {set:?} → re-snapshot failed: {e}");
+                record(broke, label, "the re-snapshot after set_value failed", &e);
+            }
         }
 
         // The control for the line above. An empty readback has two causes — the write never
@@ -683,6 +713,12 @@ mod macos_main {
             Ok(tree) => tree,
             Err(e) => {
                 println!("snapshot before the keyboard control failed: {e}");
+                record(
+                    broke,
+                    label,
+                    "the snapshot before the keyboard control failed",
+                    &e,
+                );
                 return;
             }
         };
@@ -695,7 +731,10 @@ mod macos_main {
                     "control — click {focus:?} then key {keyed:?} → text input value={:?}",
                     text_input(&after).and_then(|n| n.value.clone())
                 ),
-                Err(e) => println!("control — re-snapshot failed: {e}"),
+                Err(e) => {
+                    println!("control — re-snapshot failed: {e}");
+                    record(broke, label, "the control's re-snapshot failed", &e);
+                }
             }
         }
     }
@@ -963,7 +1002,7 @@ mod macos_main {
             apply_lever(pid, lever);
             std::thread::sleep(ACTION_SETTLE);
 
-            let (tree, settle, arrived) = snapshot_until_page(&mut a11y, &ctx);
+            let (tree, settle, arrived) = snapshot_until_page(&mut a11y, &ctx, browser, &mut broke);
             println!("page content arrived: {arrived} after {settle:?}");
             report_raw("after the lever", &raw_scan(pid));
 
@@ -972,7 +1011,7 @@ mod macos_main {
                     report_tree(&tree);
                     report_iframe(&tree);
                     if arrived {
-                        exercise(platform, &mut a11y, &ctx);
+                        exercise(platform, &mut a11y, &ctx, browser, &mut broke);
                         match snapshot(&mut a11y, &ctx) {
                             Ok(after) => {
                                 println!("--- tree after actuation ---");
