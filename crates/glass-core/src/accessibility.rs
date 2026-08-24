@@ -2549,8 +2549,7 @@ mod tests {
             "a bounded walk cannot know that: {hint}"
         );
         assert!(hint.contains("in this snapshot"), "hedged: {hint}");
-        // Core stays tool-agnostic: only the MCP layer knows a Nodes hit is raisable, and it
-        // adds that recourse to the notice beside this one.
+        // `max_nodes` is an MCP-layer detail; core doesn't know a Nodes hit is raisable by it.
         assert!(
             !hint.contains("max_nodes"),
             "not core's recourse to name: {hint}"
