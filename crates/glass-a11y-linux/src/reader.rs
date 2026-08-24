@@ -940,9 +940,8 @@ mod tests {
         );
     }
 
-    /// Both arms build the error separately, and the request and the reading are adjacent string
-    /// arguments there — swapping them still compiles, and the message would then tell the caller
-    /// it asked for what the element holds.
+    /// `before` and `observed` are adjacent `Option<&str>` parameters in `write_verdict` —
+    /// swapping them still compiles, and the error would report the pre-write value as observed.
     #[test]
     fn both_verdict_arms_carry_the_request_and_the_reading_apart() {
         for (arm, before) in [

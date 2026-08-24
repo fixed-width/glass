@@ -19,10 +19,12 @@ actually read rather than what the DOM the agent can't see suggests should be th
 
 Nothing extra, on every platform. glass never pokes a browser to turn its accessibility on. On
 Linux, under the private AT-SPI bus `glass_start` already spawns for every a11y-enabled session,
-Firefox 153 published its page at baseline on both X11 and Wayland; Brave 151 did not, and neither
-of the two environment levers tried on it changed that (read 2026-08-24). On Windows, macOS and
-Android the engines examined published at baseline against the readers glass already runs, with no
-extra lever pulled to get there.
+Firefox 153 published its page at baseline on both X11 and Wayland; Brave 151 did not, and it
+stayed that way under both candidate levers tried on it: the `GNOME_ACCESSIBILITY=1` /
+`ACCESSIBILITY_ENABLED=1` environment pair, and the `--force-renderer-accessibility`
+command-line flag — which glass cannot inject into an arbitrary app it launches (read
+2026-08-24). On Windows, macOS and Android the engines examined published at baseline against
+the readers glass already runs, with no extra lever pulled to get there.
 
 ## What an agent sees
 

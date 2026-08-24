@@ -692,10 +692,11 @@ fn framework_reading(glass: &mut Glass, label: &str, failures: &mut Vec<String>)
 }
 
 /// Pids of processes named `exe` whose command line carries `marker` — our isolated profile, or
-/// the directory holding the file Notepad was opened on — so the box's own apps are never matched. An empty vec also covers a failed query, which is
-/// why the teardown check kills what this returns rather than trusting a count — and why a
-/// failed query is recorded into `failures` rather than trusted silently: a query that never
-/// works would otherwise report every survivor as "gone" for the rest of the run.
+/// the directory holding the file Notepad was opened on — so the box's own apps are never
+/// matched. An empty vec also covers a failed query, which is why the teardown check kills what
+/// this returns rather than trusting a count — and why a failed query is recorded into
+/// `failures` rather than trusted silently: a query that never works would otherwise report
+/// every survivor as "gone" for the rest of the run.
 fn our_pids(exe: &str, marker: &str, failures: &mut Vec<String>) -> Vec<u32> {
     let ps = format!(
         "Get-CimInstance Win32_Process -Filter \"Name='{exe}'\" | \

@@ -29,9 +29,9 @@ matrix cell each one settles.
 
 Never use a top-level `data:` URL. Firefox refused a top-level `data:` navigation
 (`security.data_uri.block_toplevel_data_uri_navigation`) and the page stayed blank while every
-other signal looked healthy, so the run read as an engine publishing nothing (read 2026-07 on
-Firefox). Keeping the fixture a file gives every platform the same stable baseline: the desktop
-probes read it over `file://`, the mobile fixtures from the app's own assets.
+other signal looked healthy, so the run read as an engine publishing nothing (read on Firefox in
+June 2026). Keeping the fixture a file gives every platform the same stable baseline: the
+desktop probes read it over `file://`, the mobile fixtures from the app's own assets.
 
 ## Verify it works
 
