@@ -5,22 +5,24 @@ for it is built by a web engine (Chromium, WebKit, Gecko) sitting inside the app
 schedule, not by the toolkit glass reads everywhere else. That difference is why web content gets
 its own page rather than a line in the roles reference.
 
-## Publication is lazy, and conditional
+## Publication is not tied to the page load
 
-A web engine does not build its accessibility tree just because a page loaded. Most engines build
-it only once they believe an assistive technology is present — a signal that follows something
-other than the page load. Until an engine reaches that belief, the tree it hands to the OS's
-accessibility layer is empty or absent, no matter how populated the rendered page is. glass treats
-this as a mechanism to handle, not a guarantee: it discloses what it actually read rather than
-inferring what should be there from the DOM the agent can't see.
+A web engine does not necessarily build its accessibility tree when the page loads. What was read
+here spans both outcomes: every engine read on Windows and macOS, and Firefox 153 on Linux,
+published within seconds of the page arriving, while Brave 151 on Linux published a placeholder and
+no tree at all inside the probe's 20 s wait (read 2026-08-24). Where an engine has not published,
+the tree it hands to the OS's accessibility layer is empty or absent no matter how populated the
+rendered page is. glass treats that as something to disclose, not to infer: it reports what it
+actually read rather than what the DOM the agent can't see suggests should be there.
 
 ## What glass does at launch
 
 Nothing extra, on every platform. glass never pokes a browser to turn its accessibility on. On
-Linux, the private AT-SPI bus that `glass_start` already spawns for every a11y-enabled session *is*
-the presence signal — a browser asking whether an AT is running finds one already there, so there
-is no separate step for web content. On Windows, macOS and Android the engines examined published
-at baseline against the readers glass already runs, with no extra lever pulled to get there.
+Linux, under the private AT-SPI bus `glass_start` already spawns for every a11y-enabled session,
+Firefox 153 published its page at baseline on both X11 and Wayland; Brave 151 did not, and neither
+of the two environment levers tried on it changed that (read 2026-08-24). On Windows, macOS and
+Android the engines examined published at baseline against the readers glass already runs, with no
+extra lever pulled to get there.
 
 ## What an agent sees
 
