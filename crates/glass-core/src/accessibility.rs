@@ -2736,6 +2736,10 @@ mod tests {
             AxRole::Group,
             AxRole::Label,
             AxRole::Image,
+            // Clickable by bounds, but not addressable: making it interactable would chip
+            // every web page root in `marks` and widen `role:"Document"` onto any focusable
+            // Group/Other through `element_match`'s fallback.
+            AxRole::Document,
             AxRole::Other,
         ] {
             assert!(!r.is_interactable(), "{r:?} should not be interactable");

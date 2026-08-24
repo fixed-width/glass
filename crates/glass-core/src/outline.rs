@@ -258,6 +258,24 @@ mod tests {
     }
 
     #[test]
+    fn a_childless_document_under_a_wrapper_still_renders_its_own_line() {
+        // `document_guidance` names the Document by id; that id has to be a line the agent
+        // can see, even when the only thing holding it is a collapsed wrapper.
+        let out = render_compact(&tree_of(wrap(node(AxRole::Document, None), 1)));
+        assert!(out.contains("Document"), "{out}");
+    }
+
+    #[test]
+    fn a_single_child_document_is_never_collapsed_as_scaffolding() {
+        // The shape that would be elided if `Document` joined the scaffolding roles: web
+        // content is content, and the docs promise the page's elements arrive under it.
+        let mut doc = node(AxRole::Document, None);
+        doc.children = vec![node(AxRole::Heading, Some("Title"))];
+        let out = render_compact(&tree_of(doc));
+        assert!(out.contains("Document"), "{out}");
+    }
+
+    #[test]
     fn a_semantic_role_is_never_elided() {
         let mut list = node(AxRole::List, None);
         list.children = vec![node(AxRole::ListItem, Some("Row"))];

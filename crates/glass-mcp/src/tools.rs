@@ -1821,6 +1821,60 @@ mod tests {
     }
 
     #[test]
+    fn return_snapshot_discloses_an_unpublished_document_the_same_way_a_snapshot_does() {
+        // The fold's steer wiring, not `a11y_steers` itself: every fold test until now used a
+        // tree with nothing to disclose, so dropping the `extend` broke nothing.
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), unpublished_document_tree());
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        // Populates the id cache click_element resolves against, and is the tree the fold
+        // is checked for parity with.
+        let tree = g.a11y_snapshot(None).unwrap();
+        let out = click_element(
+            &mut g,
+            &ClickElementArgs {
+                id: 1,
+                return_: Some("snapshot".into()),
+            },
+        )
+        .unwrap();
+        let texts: Vec<&String> = out
+            .0
+            .iter()
+            .filter_map(|c| match c {
+                OutContent::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        let steer = texts
+            .iter()
+            .find(|t| t.contains("has no readable content"))
+            .unwrap_or_else(|| panic!("the fold owes the document guidance: {texts:?}"));
+        assert!(
+            !steer.starts_with(crate::untrusted::NOTE) && !steer.contains("⟦untrusted:"),
+            "glass's own guidance, outside the untrusted envelope: {steer}"
+        );
+        assert!(steer.contains("glass_screenshot"), "{steer}");
+        // Parity with `a11y_snapshot`: a fifth steer added to one call site and not the
+        // other fails here too.
+        for expected in a11y_steers(&tree) {
+            assert!(
+                texts.iter().any(|t| **t == expected),
+                "the fold dropped a steer: {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn return_snapshot_settles_before_folding() {
         use glass_core::Frame;
         use std::sync::{Arc, Mutex};
