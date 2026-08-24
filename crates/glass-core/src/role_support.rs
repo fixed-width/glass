@@ -900,8 +900,8 @@ mod tests {
                 "{backend:?} has no Document cell"
             );
         }
-        // Windows keeps UIA Document on TextArea until a web document is read there. The
-        // cell names no unmapped token: UIA's Document IS mapped, just to another role, so
+        // Windows keeps UIA Document on TextArea until a web document is read there.
+        // `unmapped` stays `None`: UIA's Document IS mapped, just to another role, so
         // "`Document` arrives unmapped" would send a reader hunting for `Other(Document)`.
         assert!(matches!(
             support(AxRole::Document, AxBackend::Windows),

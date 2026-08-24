@@ -1836,8 +1836,7 @@ mod tests {
             a11y: false,
         })
         .unwrap();
-        // Populates the id cache click_element resolves against, and is the tree the fold
-        // is checked for parity with.
+        // Populates the id cache click_element resolves against, and is the parity tree.
         let tree = g.a11y_snapshot(None).unwrap();
         let out = click_element(
             &mut g,

@@ -224,8 +224,8 @@ pub struct AxRect {
 }
 
 impl std::fmt::Display for AxRect {
-    /// `(x,y wxh)` — the agent-facing bounds format, defined once so an outline line and the
-    /// notice that names the same element render it identically.
+    /// `(x,y wxh)` — the agent-facing bounds format, defined once so the outline and a notice
+    /// naming the same element cannot drift.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "({},{} {}x{})", self.x, self.y, self.width, self.height)
     }
@@ -790,10 +790,9 @@ impl AxTree {
     /// truncated tree does. Aggregated like [`Self::unreadable_notice`] rather than repeated
     /// per document: a page of ad iframes would otherwise spend the budget `max_nodes` guards.
     ///
-    /// Only a complete walk names a cause. A bound or a failed child read empties a
-    /// `Document`'s child list exactly like an unpublished tree does (see
-    /// [`Self::is_complete`]), so on such a tree this hedges and leaves the cause to the
-    /// truncation/unreadable notice beside it.
+    /// A bound or a failed child read empties a `Document`'s child list exactly like an
+    /// unpublished tree does, so only a complete walk ([`Self::is_complete`]) names a cause;
+    /// otherwise this hedges and leaves the cause to the notice beside it.
     pub fn document_guidance(&self) -> Option<String> {
         let docs = self.unpublished_documents();
         if docs.is_empty() {
@@ -2351,8 +2350,7 @@ mod tests {
 
     #[test]
     fn bounds_render_as_origin_then_size() {
-        // The one definition of the agent-facing bounds format: the outline line and the
-        // document notice both render through it, so they cannot drift apart.
+        // The shared format the outline line and the document notice both render through.
         let r = AxRect {
             x: 40,
             y: 120,
@@ -2523,8 +2521,7 @@ mod tests {
 
     #[test]
     fn a_complete_walk_names_the_engine_and_the_empty_page() {
-        // Nothing stopped this walk, so the childless Document really is all there was —
-        // the one case where glass can name a cause.
+        // A complete walk is the one case where glass can name a cause.
         let hint = tree_with_a_childless_document()
             .document_guidance()
             .unwrap();
@@ -2537,8 +2534,8 @@ mod tests {
 
     #[test]
     fn a_document_emptied_by_a_bound_is_not_blamed_on_the_web_engine() {
-        // A bound leaves a Document childless too, so the notice must not claim the engine
-        // published nothing — the truncation notice beside it carries the real cause.
+        // A bound leaves a Document childless too, so the notice cannot claim the engine
+        // published nothing.
         let mut tree = tree_with_a_childless_document();
         tree.truncated = Some(Truncation {
             limit: TruncationLimit::Nodes,
@@ -2736,9 +2733,8 @@ mod tests {
             AxRole::Group,
             AxRole::Label,
             AxRole::Image,
-            // Clickable by bounds, but not addressable: making it interactable would chip
-            // every web page root in `marks` and widen `role:"Document"` onto any focusable
-            // Group/Other through `element_match`'s fallback.
+            // Making it interactable would chip every web page root in `marks` and widen
+            // `role:"Document"` onto any focusable Group/Other through `element_match`.
             AxRole::Document,
             AxRole::Other,
         ] {
