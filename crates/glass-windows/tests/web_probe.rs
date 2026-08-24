@@ -13,7 +13,8 @@
 //! that isn't installed prints a skip line.
 //!
 //! A probe, not a mapping test: it prints evidence and does not assert what an engine ought to
-//! publish. The one assertion is teardown — nothing it launched may survive `stop`.
+//! publish. Whether `stop` reached each browser is one of the readings; the one assertion is that
+//! nothing the probe launched is left running on the box afterwards.
 #![cfg(windows)]
 
 use std::path::Path;
@@ -137,11 +138,42 @@ fn locate(relative: &str) -> Option<String> {
     })
 }
 
+/// Gecko's onboarding, turned off in the profile. Read on 2026-08-24: a fresh Firefox profile
+/// renders `about:welcome` over the requested page, so the reader's subject is the onboarding
+/// content and the fixture is never read. `--profile` is honoured before these are needed, and
+/// `user.js` is applied on every startup, so writing it into the fresh directory is enough.
+const GECKO_PREFS: &str = r#"user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.migrate.content-modal.enabled", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.startup.upgradeDialog.enabled", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
+user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+"#;
+
+/// Create the profile directory, seeding a Gecko one with [`GECKO_PREFS`].
+fn prepare_profile(exe: &str, profile: &str) {
+    if let Err(e) = std::fs::create_dir_all(profile) {
+        println!("could not create the profile dir {profile}: {e}");
+        return;
+    }
+    if is_gecko(exe) {
+        let path = Path::new(profile).join("user.js");
+        if let Err(e) = std::fs::write(&path, GECKO_PREFS) {
+            println!("could not write {}: {e}", path.display());
+        }
+    }
+}
+
+fn is_gecko(exe: &str) -> bool {
+    exe.to_ascii_lowercase().contains("firefox")
+}
+
 /// A fresh, isolated profile per launch: no first-run prompts, no session restore, and no
 /// already-running instance adopting the URL instead of starting a process glass owns. The
 /// profile path carries `marker`, which is also how the teardown check finds our processes.
 fn browser_spec(exe: &str, profile: &str) -> AppSpec {
-    let run = if exe.to_ascii_lowercase().contains("firefox") {
+    let run = if is_gecko(exe) {
         vec![
             exe.to_string(),
             "--no-remote".into(),
@@ -485,6 +517,11 @@ fn app_window_element(glass: &mut Glass, automation: &UIAutomation) -> Option<UI
             return None;
         }
     };
+    if windows.is_empty() {
+        println!(
+            "list_windows returned no window — the adopted window's process is not in the pid set glass tracks, so there is no scoped walk"
+        );
+    }
     for w in &windows {
         println!(
             "window: handle=0x{:x} title={:?} class={:?} active={}",
@@ -541,24 +578,46 @@ fn framework_reading(glass: &mut Glass, label: &str) -> Vec<String> {
     scoped
 }
 
-/// Count processes named `exe` whose command line carries `marker` — our isolated profile — so
-/// the box's own browsers are not counted. `-1` means the query itself failed.
-fn our_process_count(exe: &str, marker: &str) -> i32 {
+/// Pids of processes named `exe` whose command line carries `marker` — our isolated profile — so
+/// the box's own browsers are never matched. An empty vec also covers a failed query, which is
+/// why the teardown check kills what this returns rather than trusting a count.
+fn our_pids(exe: &str, marker: &str) -> Vec<u32> {
     let ps = format!(
-        "@(Get-CimInstance Win32_Process -Filter \"Name='{exe}'\" | \
-         Where-Object {{ $_.CommandLine -like '*{marker}*' }}).Count"
+        "Get-CimInstance Win32_Process -Filter \"Name='{exe}'\" | \
+         Where-Object {{ $_.CommandLine -like '*{marker}*' }} | \
+         ForEach-Object {{ $_.ProcessId }}"
     );
     match std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &ps])
         .output()
     {
         Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(-1),
-        Err(_) => -1,
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect(),
+        Err(e) => {
+            println!("pid query for {exe} failed: {e}");
+            Vec::new()
+        }
     }
 }
+
+/// Poll until nothing carrying `marker` is left or `budget` elapses, returning what is still
+/// there. A browser tree takes seconds to unwind, so an immediate read would call a normal
+/// shutdown a leak.
+fn wait_for_no_process(exe: &str, marker: &str, budget: Duration) -> Vec<u32> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let pids = our_pids(exe, marker);
+        if pids.is_empty() || Instant::now() >= deadline {
+            return pids;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// How long teardown is given before a survivor counts as one.
+const TEARDOWN_BUDGET: Duration = Duration::from_secs(15);
 
 /// One engine's whole reading: launch on the fixture, wait for content, actuate, then read the
 /// `Document` control types. Never panics after `start` — `stop` has to run.
@@ -566,6 +625,7 @@ fn probe_browser(engine: &'static str, exe: &str, marker: &str) -> Reading {
     println!("\n=== {engine} — {exe} ===");
     let profile = glass_windows::onbox_support::scratch_dir(marker);
     let _ = std::fs::remove_dir_all(&profile);
+    prepare_profile(exe, &profile);
 
     let spec = browser_spec(exe, &profile);
     println!("run: {:?}", spec.run);
@@ -680,15 +740,30 @@ fn web_probe() {
     }
     println!("  notepad: frameworks={notepad:?}");
 
-    // The only assertion: a browser this probe launched may not outlive it.
-    let survivors: Vec<(String, i32)> = launched
-        .iter()
-        .map(|(exe, marker)| (exe.clone(), our_process_count(exe, marker)))
-        .filter(|(_, n)| *n != 0)
-        .collect();
-    println!("  survivors after stop: {survivors:?}");
+    // Whether `stop` reached each browser is a reading, printed above the cleanup so a leak is
+    // visible even though the probe then repairs it. The probe owns every process carrying its
+    // own profile marker, so it kills those by exact pid rather than leaving them on the box.
+    let mut left_behind = Vec::new();
+    for (exe, marker) in &launched {
+        let survivors = wait_for_no_process(exe, marker, TEARDOWN_BUDGET);
+        println!("  survived stop by {TEARDOWN_BUDGET:?} — {exe}: {survivors:?}");
+        for pid in &survivors {
+            let killed = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output()
+                .is_ok();
+            println!("  killed {exe} pid {pid}: {killed}");
+        }
+        if !survivors.is_empty() {
+            left_behind.extend(wait_for_no_process(exe, marker, TEARDOWN_BUDGET));
+        }
+        let _ = std::fs::remove_dir_all(glass_windows::onbox_support::scratch_dir(marker));
+    }
+
+    // The only assertion: nothing this probe launched is left running on the box.
     assert!(
-        survivors.is_empty(),
-        "processes carrying our profile marker survived stop: {survivors:?}"
+        left_behind.is_empty(),
+        "processes carrying our profile marker outlived both stop and the probe's own kill: \
+         {left_behind:?}"
     );
 }
