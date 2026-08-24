@@ -60,6 +60,10 @@ const KEYED: &str = "keyed by glass";
 /// What the Notepad leg types, so its `Document` has content to expose.
 const NOTEPAD_LINE: &str = "glass web probe";
 
+/// The Notepad leg's scratch name: it names the directory holding the file Notepad opens, and so is
+/// the command-line marker [`our_pids`] matches on — the box's own Notepad is never touched.
+const NOTEPAD_MARKER: &str = "glass-web-probe-notepad";
+
 /// Each engine's per-machine install path, relative to a Program Files root, with the label the
 /// findings table uses. Gecko is listed so a box that has it reads it.
 const BROWSERS: [(&str, &str); 3] = [
@@ -247,12 +251,14 @@ fn browser_spec(exe: &str, profile: &str) -> AppSpec {
     }
 }
 
-/// Notepad, for the text-editor `Document` reading. No `window_hint`: its own process (or the
-/// descendant its launcher hands the UI to) is found by pid-set membership.
-fn notepad_spec() -> AppSpec {
+/// Notepad, for the text-editor `Document` reading, opened on `file` so the typed line belongs to
+/// a file this probe owns and deletes rather than to an unsaved tab the box would keep. No
+/// `window_hint`: its own process (or the descendant its launcher hands the UI to) is found by
+/// pid-set membership.
+fn notepad_spec(file: &str) -> AppSpec {
     AppSpec {
         build: None,
-        run: vec!["notepad.exe".to_string()],
+        run: vec!["notepad.exe".to_string(), file.to_string()],
         cwd: None,
         env: vec![],
         window_hint: None,
@@ -337,7 +343,6 @@ fn snapshot_until_page(
 ) -> (Option<AxTree>, Duration, bool) {
     let start = Instant::now();
     let mut last = None;
-    let mut reported: Vec<String> = Vec::new();
     loop {
         match glass.a11y_snapshot(Some(0)) {
             Ok(tree) => {
@@ -349,11 +354,12 @@ fn snapshot_until_page(
             }
             Err(GlassError::AccessibilityNotReady(_)) => {}
             Err(e) => {
-                let text = e.to_string();
-                if !reported.contains(&text) {
-                    say!("snapshot error at {:?}: {text}", start.elapsed());
-                    failures.push(format!("{label}: snapshot error: {text}"));
-                    reported.push(text);
+                // Deduped against `failures`, not a local set: this runs twice per browser (the
+                // initial pass, then the extended one), and one broken channel is one breakage.
+                let msg = format!("{label}: snapshot error: {e}");
+                if !failures.contains(&msg) {
+                    say!("snapshot error at {:?}: {e}", start.elapsed());
+                    failures.push(msg);
                 }
             }
         }
@@ -685,8 +691,8 @@ fn framework_reading(glass: &mut Glass, label: &str, failures: &mut Vec<String>)
     scoped
 }
 
-/// Pids of processes named `exe` whose command line carries `marker` — our isolated profile — so
-/// the box's own browsers are never matched. An empty vec also covers a failed query, which is
+/// Pids of processes named `exe` whose command line carries `marker` — our isolated profile, or
+/// the directory holding the file Notepad was opened on — so the box's own apps are never matched. An empty vec also covers a failed query, which is
 /// why the teardown check kills what this returns rather than trusting a count — and why a
 /// failed query is recorded into `failures` rather than trusted silently: a query that never
 /// works would otherwise report every survivor as "gone" for the rest of the run.
@@ -807,12 +813,35 @@ fn probe_browser(
     reading
 }
 
+/// The empty file Notepad opens, under a scratch directory named for [`NOTEPAD_MARKER`]. Notepad
+/// offers to create a path that does not exist instead of opening it, so the file is written
+/// first. `None` if either step fails.
+fn prepare_notepad_file() -> Option<String> {
+    let dir = glass_windows::onbox_support::scratch_dir(NOTEPAD_MARKER);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        say!("could not create the notepad scratch dir {dir}: {e}");
+        return None;
+    }
+    let path = Path::new(&dir).join("notepad.txt");
+    if let Err(e) = std::fs::write(&path, "") {
+        say!("could not create the notepad file {}: {e}", path.display());
+        return None;
+    }
+    Some(path.display().to_string())
+}
+
 /// The text-editor half of the `FrameworkId` reading: a stock editor's `Document` is the thing a
-/// web document has to be told apart from.
+/// web document has to be told apart from. Launched on a file of its own so the line typed into it
+/// never becomes unsaved session state on the box; the caller survivor-checks and deletes both,
+/// the same way it does for a browser.
 fn probe_notepad(failures: &mut Vec<String>) -> Vec<String> {
     say!("\n=== notepad ===");
+    let Some(file) = prepare_notepad_file() else {
+        failures.push("notepad: could not create the file to open".to_string());
+        return Vec::new();
+    };
     let mut glass = glass_windows_with_a11y();
-    if let Err(e) = glass.start(&notepad_spec()) {
+    if let Err(e) = glass.start(&notepad_spec(&file)) {
         say!("start notepad failed: {e}");
         failures.push(format!("notepad: start failed: {e}"));
         return Vec::new();
@@ -863,6 +892,10 @@ fn web_probe() {
         launched.push((exe_name, marker));
     }
     let notepad = probe_notepad(&mut failures);
+    // The Notepad leg is launched like a browser, so it is torn down like one: the loop below
+    // reads whether its `stop` took, kills what is left by exact pid, and removes the scratch
+    // directory holding the file it opened.
+    launched.push(("notepad.exe".to_string(), NOTEPAD_MARKER.to_string()));
 
     say!("\n== aggregate: web-content probe ==");
     for r in &readings {
@@ -881,9 +914,10 @@ fn web_probe() {
     }
     say!("  notepad: frameworks={notepad:?}");
 
-    // Whether `stop` reached each browser is a reading, printed above the cleanup so a leak is
-    // visible even though the probe then repairs it. The probe owns every process carrying its
-    // own profile marker, so it kills those by exact pid rather than leaving them on the box.
+    // Whether `stop` reached each launched app is a reading, printed above the cleanup so a leak
+    // is visible even though the probe then repairs it. The probe owns every process carrying one
+    // of its own scratch markers, so it kills those by exact pid rather than leaving them on the
+    // box, and removes the scratch directory each marker names.
     let mut left_behind = Vec::new();
     for (exe, marker) in &launched {
         let survivors = wait_for_no_process(exe, marker, TEARDOWN_BUDGET, &mut failures);
@@ -909,8 +943,8 @@ fn web_probe() {
     // Nothing this probe launched may still be running on the box.
     assert!(
         left_behind.is_empty(),
-        "processes carrying our profile marker outlived both stop and the probe's own kill: \
-         {left_behind:?}"
+        "processes carrying one of our scratch markers outlived both stop and the probe's own \
+         kill: {left_behind:?}"
     );
     // Genuine breakage — a browser that never launched, or an accessibility channel that never
     // answered — collected while every browser still got its turn; asserted last, so the
