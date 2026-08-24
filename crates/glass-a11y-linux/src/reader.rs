@@ -356,8 +356,7 @@ async fn find_nth(
             break;
         }
         // Both skips are counted in `walk` too, so the two traversals report the same drops.
-        if child_ref.is_null() {
-            budget.note_unexposed();
+        if claim_unexposed(&child_ref, budget) {
             continue;
         }
         let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
@@ -469,11 +468,7 @@ async fn walk(
             if !budget.may_visit_sibling(scanned) {
                 break;
             }
-            // AT-SPI's null ref stands in for content the app has not exposed; Brave 151's
-            // window published exactly one while renderer accessibility was off (read
-            // 2026-08-24). Building a proxy from it only errors, which read as a lost subtree.
-            if child_ref.is_null() {
-                budget.note_unexposed();
+            if claim_unexposed(&child_ref, budget) {
                 continue;
             }
             let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
@@ -819,6 +814,20 @@ fn nonempty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Records a null `child_ref` on `budget` as content the app has not exposed, and says whether it
+/// was one. Brave 151's window published exactly one while renderer accessibility was off (read
+/// 2026-08-24).
+///
+/// Called before the proxy is built, in both traversals: building one from a null ref only errors,
+/// and that error read as a subtree lost mid-walk.
+fn claim_unexposed(child_ref: &ObjectRefOwned, budget: &mut WalkBudget) -> bool {
+    let null = child_ref.is_null();
+    if null {
+        budget.note_unexposed();
+    }
+    null
+}
+
 #[cfg(test)]
 mod toggle_label_tests {
     use super::toggle_state_label;
@@ -834,7 +843,37 @@ mod toggle_label_tests {
 
 #[cfg(test)]
 mod tests {
+    use atspi_common::ObjectRef;
+
     use super::*;
+
+    /// The reading behind the skip (Brave 151 on X11, 2026-08-24): the browser window's one child
+    /// is a null ObjectRef while renderer accessibility is off, and the proxy build's error read
+    /// as an element that had gone away mid-walk.
+    #[test]
+    fn a_null_child_ref_is_claimed_as_unexposed_not_as_a_failed_read() {
+        let mut budget = WalkBudget::new();
+        assert!(claim_unexposed(
+            &ObjectRefOwned::new(ObjectRef::Null),
+            &mut budget
+        ));
+        assert_eq!(budget.unexposed(), 1);
+        assert_eq!(
+            budget.unreadable(),
+            0,
+            "no read was attempted, let alone failed"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_child_ref_is_claimed_by_neither_count() {
+        let mut budget = WalkBudget::new();
+        let child =
+            ObjectRefOwned::from_static_str_unchecked(":1.42", "/org/a11y/atspi/accessible/7");
+        assert!(!claim_unexposed(&child, &mut budget));
+        assert_eq!(budget.unexposed(), 0);
+        assert_eq!(budget.unreadable(), 0);
+    }
 
     #[test]
     fn no_matching_app_message_is_developer_framed() {
