@@ -9,8 +9,8 @@
 //! live field — and a clear that cannot be confirmed here at all, because this platform reports
 //! the emptied field's hint as its text; that a read takes its dump file with it; that a read
 //! stops at the deadline its caller named; that a snapshot taken while another app is foreground
-//! says which app it describes; and that a test which fails mid-interaction still hands the
-//! device back launchable.
+//! says which app it describes; that a WebView page's button and text field respond to a tap and
+//! a write; and that a test which fails mid-interaction still hands the device back launchable.
 
 use glass_core::Deadline;
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree, WalkLimits};
@@ -650,6 +650,11 @@ const WEB_FIXTURE_PACKAGE: &str = "tech.fixedwidth.glassrolefixture";
 const WEB_CONTENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 const WEB_CONTENT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long to give the page's JS handler after a tap before re-reading the tree. Shares
+/// [`WEB_CONTENT_POLL`]'s value by coincidence, not by relationship — a settle and a poll
+/// interval answer different questions.
+const POST_TAP_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn web_fixture_spec() -> AppSpec {
     AppSpec {
         build: None,
@@ -705,14 +710,12 @@ fn matching(tree: &AxTree, needle: &str) -> Vec<String> {
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB, and the role fixture installed"]
 fn web_fixture_button_and_field_respond() {
-    if !web_fixture_installed() {
-        println!(
-            "skipped: {WEB_FIXTURE_PACKAGE} is not installed — build and install it with \
-             `cd examples/android-role-fixture && ./build.sh && adb install -r \
-             build/role-fixture.apk`"
-        );
-        return;
-    }
+    assert!(
+        web_fixture_installed(),
+        "{WEB_FIXTURE_PACKAGE} is not installed — build and install it with `cd \
+         examples/android-role-fixture && ./build.sh && adb install -r \
+         build/role-fixture.apk`"
+    );
     let mut session = Session::start_spec(web_fixture_spec());
     let ctx = session.ctx();
     let mut a11y = glass_android::AndroidA11y::new();
@@ -763,7 +766,7 @@ fn web_fixture_button_and_field_respond() {
         }
         None => println!("no node named \"click me\" to tap"),
     }
-    std::thread::sleep(WEB_CONTENT_POLL);
+    std::thread::sleep(POST_TAP_SETTLE);
     let mut after_tap = a11y.snapshot(&ctx).expect("snapshot after the tap");
     after_tap.assign_ids();
     println!(
@@ -771,8 +774,8 @@ fn web_fixture_button_and_field_respond() {
         matching(&after_tap, "click")
     );
 
-    // The page's text input. `set_value` reports its own verdict; the read-back is what says
-    // whether the value took.
+    // The first editable element on the page (input or textarea) — its identity isn't pinned.
+    // `set_value` reports its own verdict; the read-back is what says whether the value took.
     let field = find(&after_tap.root, &|n| n.states.editable).map(|n| AxTarget {
         id: n.id,
         role: n.role,
