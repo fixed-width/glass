@@ -64,7 +64,9 @@ now, and the outline only names the token of an element that has none.
 `Document` element with the page's elements as its children; an `<iframe>` is a `Document`
 inside it. A web engine may publish its tree only after it detects an assistive technology, so a
 `Document` can arrive with no children at all. glass discloses that case in the snapshot rather
-than leaving an empty container to be read as an empty page.
+than leaving an empty container to be read as an empty page, and where the walk completed the
+disclosure asks for a fresh snapshot before the pixel path: on an Android WebView the first
+snapshot after a launch was childless and the next held the whole page (read 2026-08-24).
 
 <!-- BEGIN GENERATED: role-support -->
 | Role | Linux (AT-SPI) | Windows (UIA) | macOS (AX) | Android | iOS |

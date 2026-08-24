@@ -833,6 +833,10 @@ impl AxTree {
     /// truncated tree does. Aggregated like [`Self::unreadable_notice`] rather than repeated
     /// per document: a page of ad iframes would otherwise spend the budget `max_nodes` guards.
     ///
+    /// A childless `Document` on a complete walk is most often *not yet*: an Android WebView's
+    /// first snapshot after a launch was childless and its next held the whole page (read
+    /// 2026-08-24), so that branch steers to a re-read before the pixel path.
+    ///
     /// A bound or a failed child read empties a `Document`'s child list exactly like an
     /// unpublished tree does, so only a complete walk ([`Self::is_complete`]) names a cause;
     /// otherwise this hedges and defers to the notice beside it, which owns the recourse —
@@ -850,18 +854,18 @@ impl AxTree {
             })
             .collect();
         let one = docs.len() == 1;
-        let (s, have, they, them) = if one {
-            ("", "has", "it", "it")
+        let (s, have, they) = if one {
+            ("", "has", "it")
         } else {
-            ("s", "have", "they", "them")
+            ("s", "have", "they")
         };
         let (n, list) = (docs.len(), list.join(", "));
         Some(if self.is_complete() {
             format!(
                 "… {n} Document element{s} {have} no readable content: {list}. The web engine \
-                 has not published its accessibility tree, or the page is empty. Elements \
-                 inside {them} cannot be addressed by id. Drive by pixels: glass_screenshot, \
-                 then glass_click at x,y inside the bounds above."
+                 has not published its accessibility tree yet, or the page is empty. Take a \
+                 fresh glass_a11y_snapshot after a moment; if it stays empty, drive it by \
+                 pixels: glass_screenshot, then glass_click at x,y inside the bounds above."
             )
         } else {
             format!(
@@ -2574,6 +2578,23 @@ mod tests {
             "singular, aggregated: {hint}"
         );
         assert!(hint.contains("has not published"), "{hint}");
+    }
+
+    /// The reading behind this (Android emulator, 2026-08-24): the first snapshot after a launch
+    /// holds a childless Document and the next holds the whole page, so childless on a complete
+    /// walk is most often *not yet*.
+    #[test]
+    fn a_complete_walk_steers_to_a_fresh_snapshot_before_pixels() {
+        let hint = tree_with_a_childless_document()
+            .document_guidance()
+            .unwrap();
+        let fresh = hint
+            .find("fresh glass_a11y_snapshot")
+            .unwrap_or_else(|| panic!("re-reading is the first recourse: {hint}"));
+        let pixels = hint
+            .find("glass_screenshot")
+            .unwrap_or_else(|| panic!("the pixel path is still named: {hint}"));
+        assert!(fresh < pixels, "the re-read comes first: {hint}");
     }
 
     #[test]
