@@ -66,7 +66,7 @@ pub(crate) fn write_line(node: &AxNode, depth: usize, out: &mut String) {
         let _ = write!(out, " desc={description:?}");
     }
     if let Some(b) = &node.bounds {
-        let _ = write!(out, " ({},{} {}x{})", b.x, b.y, b.width, b.height);
+        let _ = write!(out, " {b}");
     }
     let states = node.states.active();
     if !states.is_empty() {

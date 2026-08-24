@@ -223,6 +223,14 @@ pub struct AxRect {
     pub height: u32,
 }
 
+impl std::fmt::Display for AxRect {
+    /// `(x,y wxh)` — the agent-facing bounds format, defined once so an outline line and the
+    /// notice that names the same element render it identically.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({},{} {}x{})", self.x, self.y, self.width, self.height)
+    }
+}
+
 impl AxRect {
     /// Whether this rect shares any area with `other`.
     ///
@@ -794,7 +802,7 @@ impl AxTree {
         let list: Vec<String> = docs
             .iter()
             .map(|d| match &d.bounds {
-                Some(b) => format!("#{} ({},{} {}x{})", d.id.0, b.x, b.y, b.width, b.height),
+                Some(b) => format!("#{} {b}", d.id.0),
                 None => format!("#{} (bounds unknown)", d.id.0),
             })
             .collect();
@@ -2339,6 +2347,19 @@ mod tests {
             leaf(AxRole::TextField, "Note"),
         ]);
         assert!(matches!(drift_target().relocate(&tree), Located::AtId(n) if n.id == AxNodeId(1)));
+    }
+
+    #[test]
+    fn bounds_render_as_origin_then_size() {
+        // The one definition of the agent-facing bounds format: the outline line and the
+        // document notice both render through it, so they cannot drift apart.
+        let r = AxRect {
+            x: 40,
+            y: 120,
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(r.to_string(), "(40,120 800x600)");
     }
 
     #[test]
