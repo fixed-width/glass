@@ -52,7 +52,7 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
     ("AXGroup", AxRole::Group),
     // A screen or section title.
     ("AXHeading", AxRole::Heading),
-    // The root of a web engine's subtree (WebKit and Chromium both report it).
+    // The root of a web engine's subtree.
     ("AXWebArea", AxRole::Document),
 ];
 
