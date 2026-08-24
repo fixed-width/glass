@@ -534,7 +534,9 @@ to the pixel path only if the page stays empty: on an Android WebView the first 
 launch was childless and the next held the whole page (read 2026-08-24). An app can also publish a
 *placeholder* where the content would be — an element standing in for a web view whose
 accessibility is off — and that gets its own notice: nothing behind it can be addressed by id and a
-re-snapshot will not change that, so it steers straight to the pixel path.
+re-snapshot will not change that, so it steers straight to the pixel path. See
+[Web content](../explanation/web-content.md) for why publication is lazy and what each platform's
+readings say.
 
 - `max_nodes` (integer) — raise the element cap above the default (which protects the token
   budget), or `0` to remove the element-count limit. Omit for the default cap. (Structural
