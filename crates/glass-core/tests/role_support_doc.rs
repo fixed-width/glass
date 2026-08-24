@@ -46,3 +46,13 @@ fn crlf_normalization_works() {
     let extracted = normalized[start..end].trim();
     assert_eq!(extracted, generated.trim());
 }
+
+/// Prints the generated block so it can be pasted between the markers. Ignored: it is a
+/// tool, not a check.
+///
+/// `cargo test -p glass-core --test role_support_doc print_generated -- --ignored --nocapture`
+#[test]
+#[ignore = "prints the block for docs/reference/a11y-roles.md; run on demand"]
+fn print_generated() {
+    print!("{}", glass_core::role_support::render_markdown());
+}

@@ -48,6 +48,10 @@ pub enum AxRole {
     Toolbar,
     StatusBar,
     Heading,
+    /// A web document or web area — the root of a subtree a web engine publishes (a
+    /// browser tab's page, a WebView's content). Its children are the page's own elements;
+    /// a `Document` with no children is disclosed by [`AxTree::document_guidance`].
+    Document,
     Other,
 }
 
@@ -55,7 +59,7 @@ impl AxRole {
     /// Every role except [`AxRole::Other`], which is the sink for unmapped native tokens
     /// rather than a mapping target. Used by the per-backend role-parity tests and by
     /// [`crate::role_support::ROLE_SUPPORT`].
-    pub const ALL: [AxRole; 33] = [
+    pub const ALL: [AxRole; 34] = [
         AxRole::Application,
         AxRole::Window,
         AxRole::Dialog,
@@ -89,6 +93,7 @@ impl AxRole {
         AxRole::Toolbar,
         AxRole::StatusBar,
         AxRole::Heading,
+        AxRole::Document,
     ];
 
     /// Whether this role denotes an element a user acts on (clicks / types into) —
@@ -153,6 +158,7 @@ impl AxRole {
             "toolbar" => Toolbar,
             "statusbar" => StatusBar,
             "heading" => Heading,
+            "document" => Document,
             "other" => Other,
             _ => return None,
         })
@@ -1350,7 +1356,8 @@ mod tests {
             | AxRole::Separator
             | AxRole::Toolbar
             | AxRole::StatusBar
-            | AxRole::Heading => {}
+            | AxRole::Heading
+            | AxRole::Document => {}
             // Deliberately excluded from `ALL`: the sink for unmapped native tokens, not a
             // mapping target.
             AxRole::Other => {}
@@ -1692,7 +1699,7 @@ mod tests {
     #[test]
     fn every_role_parses_from_its_name() {
         use AxRole::*;
-        let pairs: [(&str, AxRole); 34] = [
+        let pairs: [(&str, AxRole); 35] = [
             ("application", Application),
             ("window", Window),
             ("dialog", Dialog),
@@ -1726,6 +1733,7 @@ mod tests {
             ("toolbar", Toolbar),
             ("statusbar", StatusBar),
             ("heading", Heading),
+            ("document", Document),
             ("other", Other),
         ];
 

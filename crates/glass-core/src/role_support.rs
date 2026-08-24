@@ -622,6 +622,22 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
             ],
         ),
+        (
+            R::Document,
+            [
+                Mapped,
+                Gap {
+                    unmapped: Some("Document"),
+                    why: "UIA's Document control type is what a web document arrives as, and it \
+                     maps to TextArea because a stock text editor's edit surface reports the same \
+                     token (see glass-a11y-windows's document_maps_from_an_observed_token); \
+                     telling the two apart waits on a reading of both on one host",
+                },
+                Mapped,
+                Mapped,
+                Mapped,
+            ],
+        ),
     ]
 };
 
@@ -875,5 +891,23 @@ mod tests {
                 "{role:?} unmapped on the reference backend"
             );
         }
+    }
+
+    #[test]
+    fn document_row_declares_every_backend() {
+        for backend in AxBackend::ALL {
+            assert!(
+                support(AxRole::Document, backend).is_some(),
+                "{backend:?} has no Document cell"
+            );
+        }
+        // Windows keeps UIA Document on TextArea until both readings exist on one host.
+        assert!(matches!(
+            support(AxRole::Document, AxBackend::Windows),
+            Some(RoleSupport::Gap {
+                unmapped: Some("Document"),
+                ..
+            })
+        ));
     }
 }

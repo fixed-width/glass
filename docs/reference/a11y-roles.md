@@ -96,6 +96,7 @@ now, and the outline only names the token of an element that has none.
 | `Toolbar` | yes | yes | yes | unmarked | yes |
 | `StatusBar` | yes | yes | unmarked | elsewhere | elsewhere |
 | `Heading` | yes | gap | yes | gap | yes |
+| `Document` | yes | gap | yes | yes | yes |
 
 ### Why a cell is not `yes`
 
@@ -146,4 +147,5 @@ now, and the outline only names the token of an element that has none.
 - `StatusBar` / iOS — elsewhere: the system status bar is outside the app tree
 - `Heading` / Windows (UIA) — gap: UIA marks a heading with the HeadingLevel property — an h1 arrives as Text carrying level 80051 — and the reader maps by control type alone, so it never sees it. Header and HeaderItem are a grid's column headers, a different concept the normalized set has no role for
 - `Heading` / Android — gap: AccessibilityNodeInfo's isHeading marks a heading, and neither reader carries it: the uiautomator dump has no such attribute and the service reader parses only class, text, description and bounds
+- `Document` / Windows (UIA) — gap (`Document` arrives unmapped): UIA's Document control type is what a web document arrives as, and it maps to TextArea because a stock text editor's edit surface reports the same token (see glass-a11y-windows's document_maps_from_an_observed_token); telling the two apart waits on a reading of both on one host
 <!-- END GENERATED: role-support -->
