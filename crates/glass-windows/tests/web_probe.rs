@@ -10,7 +10,8 @@
 //!
 //! The harness's session-1 bounce forwards no environment, so browsers are located by their
 //! per-machine install paths and the fixture path derives from `CARGO_MANIFEST_DIR`. A browser
-//! that isn't installed prints a skip line.
+//! that isn't installed prints a skip line. Every reading is also written to
+//! `.windows-artifacts/web-probe.txt`, which the harness copies back — see [`transcript`].
 //!
 //! A probe, not a mapping test: it prints evidence and does not assert what an engine ought to
 //! publish. Whether `stop` reached each browser is one of the readings; the one assertion is that
@@ -111,14 +112,50 @@ fn glass_windows_with_a11y() -> Glass {
     Glass::new(factory, "windows".into(), BaselineStore::new(root), 100)
 }
 
+/// The repo root the box built from, two levels above this crate's manifest dir.
+fn repo_root() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repo root is two levels above crates/glass-windows")
+        .to_path_buf()
+}
+
+/// The transcript the harness ships back. `None` if the directory cannot be created.
+fn transcript_path() -> Option<std::path::PathBuf> {
+    let dir = repo_root().join(".windows-artifacts");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("web-probe.txt"))
+}
+
+/// Write one reading to stdout and to the transcript. libtest discards a passing test's stdout and
+/// the harness runs the test binary without `--nocapture`, so the file is the only copy of the
+/// reading that survives a green run.
+fn transcript(line: &str) {
+    println!("{line}");
+    let Some(path) = transcript_path() else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// The probe's only output call — see [`transcript`].
+macro_rules! say {
+    ($($arg:tt)*) => { transcript(&format!($($arg)*)) };
+}
+
 /// The shared web fixture as a `file://` URL, derived from this crate's manifest dir so it points
 /// at whatever checkout the box built. Backslashes are swapped for forward slashes: a browser
 /// takes the URL form, not the Windows path form.
 fn page_url() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("repo root is two levels above crates/glass-windows")
+    let path = repo_root()
         .join("examples")
         .join("web-role-fixture")
         .join("index.html");
@@ -154,13 +191,13 @@ user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
 /// Create the profile directory, seeding a Gecko one with [`GECKO_PREFS`].
 fn prepare_profile(exe: &str, profile: &str) {
     if let Err(e) = std::fs::create_dir_all(profile) {
-        println!("could not create the profile dir {profile}: {e}");
+        say!("could not create the profile dir {profile}: {e}");
         return;
     }
     if is_gecko(exe) {
         let path = Path::new(profile).join("user.js");
         if let Err(e) = std::fs::write(&path, GECKO_PREFS) {
-            println!("could not write {}: {e}", path.display());
+            say!("could not write {}: {e}", path.display());
         }
     }
 }
@@ -306,7 +343,7 @@ fn snapshot_until_page(glass: &mut Glass, budget: Duration) -> (Option<AxTree>, 
             Err(e) => {
                 let text = e.to_string();
                 if !reported.contains(&text) {
-                    println!("snapshot error at {:?}: {text}", start.elapsed());
+                    say!("snapshot error at {:?}: {text}", start.elapsed());
                     reported.push(text);
                 }
             }
@@ -320,7 +357,7 @@ fn snapshot_until_page(glass: &mut Glass, budget: Duration) -> (Option<AxTree>, 
 
 fn report_tree(tree: &AxTree) {
     for doc in documents(tree) {
-        println!(
+        say!(
             "document: #{} role={:?} raw_role={:?} name={:?} children={} bounds={:?}",
             doc.id.0,
             doc.role,
@@ -330,15 +367,15 @@ fn report_tree(tree: &AxTree) {
             doc.bounds
         );
     }
-    println!(
+    say!(
         "heading {HEADING:?} present: {}",
         find(tree, &|n| n.role == AxRole::Heading
             && n.name.as_deref() == Some(HEADING))
         .is_some()
     );
-    println!("role histogram (role, count, native token):");
+    say!("role histogram (role, count, native token):");
     for tally in role_histogram(tree) {
-        println!("  {:?} {:>4}  {}", tally.role, tally.count, tally.raw_role);
+        say!("  {:?} {:>4}  {}", tally.role, tally.count, tally.raw_role);
     }
     for notice in [
         tree.truncation_notice(),
@@ -349,9 +386,9 @@ fn report_tree(tree: &AxTree) {
     .into_iter()
     .flatten()
     {
-        println!("notice: {notice}");
+        say!("notice: {notice}");
     }
-    println!("outline:\n{}", tree.to_outline());
+    say!("outline:\n{}", tree.to_outline());
 }
 
 /// How many times to re-snapshot-and-click. A browser's tree keeps changing while the page
@@ -367,18 +404,21 @@ fn exercise(glass: &mut Glass) -> (bool, bool) {
         let before = match glass.a11y_snapshot(Some(0)) {
             Ok(tree) => tree,
             Err(e) => {
-                println!("snapshot before the click failed: {e} — no click reading");
+                say!("snapshot before the click failed: {e} — no click reading");
                 return (false, false);
             }
         };
         let Some(button) = named(&before, BUTTON) else {
-            println!("no node named {BUTTON:?} — no click reading");
+            say!("no node named {BUTTON:?} — no click reading");
             return (false, false);
         };
         if attempt == 1 {
-            println!(
+            say!(
                 "button: #{} role={:?} raw_role={} bounds={:?}",
-                button.id.0, button.role, button.raw_role, button.bounds
+                button.id.0,
+                button.role,
+                button.raw_role,
+                button.bounds
             );
         }
         match glass.click_element(button.id) {
@@ -387,17 +427,17 @@ fn exercise(glass: &mut Glass) -> (bool, bool) {
                 match glass.a11y_snapshot(Some(0)) {
                     Ok(after) => {
                         clicked = carrying(&after, CLICKED).is_some();
-                        println!(
+                        say!(
                             "click_element (attempt {attempt}): {method:?} → result paragraph \
                              reads {CLICKED:?}: {clicked}"
                         );
                     }
-                    Err(e) => println!("click_element: {method:?} → re-snapshot failed: {e}"),
+                    Err(e) => say!("click_element: {method:?} → re-snapshot failed: {e}"),
                 }
                 break;
             }
             Err(e) => {
-                println!("click_element (attempt {attempt}) failed: {e}");
+                say!("click_element (attempt {attempt}) failed: {e}");
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
@@ -406,30 +446,33 @@ fn exercise(glass: &mut Glass) -> (bool, bool) {
     let after = match glass.a11y_snapshot(Some(0)) {
         Ok(tree) => tree,
         Err(e) => {
-            println!("snapshot before set_value failed: {e} — no set_value reading");
+            say!("snapshot before set_value failed: {e} — no set_value reading");
             return (clicked, false);
         }
     };
     let Some(field) = text_input(&after) else {
-        println!("no editable node named {INPUT:?} — no set_value reading");
+        say!("no editable node named {INPUT:?} — no set_value reading");
         return (clicked, false);
     };
-    println!(
+    say!(
         "text input: #{} role={:?} raw_role={} value={:?}",
-        field.id.0, field.role, field.raw_role, field.value
+        field.id.0,
+        field.role,
+        field.raw_role,
+        field.value
     );
     let set = glass.set_value(field.id, TYPED);
     std::thread::sleep(Duration::from_millis(500));
     let after = match glass.a11y_snapshot(Some(0)) {
         Ok(tree) => tree,
         Err(e) => {
-            println!("set_value: {set:?} → re-snapshot failed: {e}");
+            say!("set_value: {set:?} → re-snapshot failed: {e}");
             return (clicked, false);
         }
     };
     let read_back = text_input(&after).and_then(|n| n.value.clone());
     let value_took = read_back.as_deref() == Some(TYPED);
-    println!("set_value: {set:?} → text input value={read_back:?}");
+    say!("set_value: {set:?} → text input value={read_back:?}");
 
     // The control for the line above. An empty read-back has two causes — the write never landed,
     // or this engine never reports a web input's text — and only text that reached the field by
@@ -441,28 +484,32 @@ fn exercise(glass: &mut Glass) -> (bool, bool) {
         let keyed = glass.key(&KeyEvent::Text(KEYED.to_string()));
         std::thread::sleep(Duration::from_millis(500));
         match glass.a11y_snapshot(Some(0)) {
-            Ok(after) => println!(
+            Ok(after) => say!(
                 "control — click {focus:?}, focus {:?}, key {keyed:?} → text input value={:?}",
                 raised.is_ok(),
                 text_input(&after).and_then(|n| n.value.clone())
             ),
-            Err(e) => println!("control — re-snapshot failed: {e}"),
+            Err(e) => say!("control — re-snapshot failed: {e}"),
         }
     }
 
     match glass.a11y_snapshot(Some(0)) {
         Ok(after) => {
-            println!("every editable node at the end:");
+            say!("every editable node at the end:");
             for node in collect(&after, &|n| n.states.editable) {
-                println!(
+                say!(
                     "  #{} role={:?} raw_role={} name={:?} value={:?}",
-                    node.id.0, node.role, node.raw_role, node.name, node.value
+                    node.id.0,
+                    node.role,
+                    node.raw_role,
+                    node.name,
+                    node.value
                 );
             }
-            println!("--- tree after actuation ---");
+            say!("--- tree after actuation ---");
             report_tree(&after);
         }
-        Err(e) => println!("final snapshot failed: {e}"),
+        Err(e) => say!("final snapshot failed: {e}"),
     }
     (clicked, value_took)
 }
@@ -480,14 +527,14 @@ fn documents_under(automation: &UIAutomation, root: UIElement, label: &str) -> V
     let mut frameworks: Vec<String> = Vec::new();
     match found {
         Ok(elements) => {
-            println!(
+            say!(
                 "{label}: {} Document element(s) in {:?}",
                 elements.len(),
                 started.elapsed()
             );
             for el in &elements {
                 let framework = el.get_framework_id().unwrap_or_default();
-                println!(
+                say!(
                     "  Document: framework={framework:?} class={:?} name={:?} pid={:?}",
                     el.get_classname(),
                     el.get_name(),
@@ -499,7 +546,7 @@ fn documents_under(automation: &UIAutomation, root: UIElement, label: &str) -> V
             }
         }
         // `find_all` reports "nothing matched" as an error, so this is the no-Document case too.
-        Err(e) => println!(
+        Err(e) => say!(
             "{label}: no Document element after {:?} ({e})",
             started.elapsed()
         ),
@@ -513,19 +560,22 @@ fn app_window_element(glass: &mut Glass, automation: &UIAutomation) -> Option<UI
     let windows = match glass.list_windows() {
         Ok(w) => w,
         Err(e) => {
-            println!("list_windows failed: {e}");
+            say!("list_windows failed: {e}");
             return None;
         }
     };
     if windows.is_empty() {
-        println!(
+        say!(
             "list_windows returned no window — the adopted window's process is not in the pid set glass tracks, so there is no scoped walk"
         );
     }
     for w in &windows {
-        println!(
+        say!(
             "window: handle=0x{:x} title={:?} class={:?} active={}",
-            w.id.0, w.title, w.class, w.active
+            w.id.0,
+            w.title,
+            w.class,
+            w.active
         );
     }
     let target = windows
@@ -534,7 +584,7 @@ fn app_window_element(glass: &mut Glass, automation: &UIAutomation) -> Option<UI
         .or_else(|| windows.first())?;
     match automation.element_from_handle(Handle::from(target.id.0 as isize)) {
         Ok(el) => {
-            println!(
+            say!(
                 "window element: framework={:?} class={:?} name={:?} pid={:?}",
                 el.get_framework_id(),
                 el.get_classname(),
@@ -544,7 +594,7 @@ fn app_window_element(glass: &mut Glass, automation: &UIAutomation) -> Option<UI
             Some(el)
         }
         Err(e) => {
-            println!("element_from_handle failed: {e}");
+            say!("element_from_handle failed: {e}");
             None
         }
     }
@@ -557,7 +607,7 @@ fn framework_reading(glass: &mut Glass, label: &str) -> Vec<String> {
     let automation = match UIAutomation::new() {
         Ok(a) => a,
         Err(e) => {
-            println!("UIAutomation::new failed: {e}");
+            say!("UIAutomation::new failed: {e}");
             return Vec::new();
         }
     };
@@ -573,7 +623,7 @@ fn framework_reading(glass: &mut Glass, label: &str) -> Vec<String> {
                 &format!("{label}, from the desktop root"),
             );
         }
-        Err(e) => println!("get_root_element failed: {e}"),
+        Err(e) => say!("get_root_element failed: {e}"),
     }
     scoped
 }
@@ -596,7 +646,7 @@ fn our_pids(exe: &str, marker: &str) -> Vec<u32> {
             .filter_map(|s| s.parse().ok())
             .collect(),
         Err(e) => {
-            println!("pid query for {exe} failed: {e}");
+            say!("pid query for {exe} failed: {e}");
             Vec::new()
         }
     }
@@ -622,13 +672,13 @@ const TEARDOWN_BUDGET: Duration = Duration::from_secs(15);
 /// One engine's whole reading: launch on the fixture, wait for content, actuate, then read the
 /// `Document` control types. Never panics after `start` — `stop` has to run.
 fn probe_browser(engine: &'static str, exe: &str, marker: &str) -> Reading {
-    println!("\n=== {engine} — {exe} ===");
+    say!("\n=== {engine} — {exe} ===");
     let profile = glass_windows::onbox_support::scratch_dir(marker);
     let _ = std::fs::remove_dir_all(&profile);
     prepare_profile(exe, &profile);
 
     let spec = browser_spec(exe, &profile);
-    println!("run: {:?}", spec.run);
+    say!("run: {:?}", spec.run);
 
     let mut reading = Reading {
         engine,
@@ -638,20 +688,20 @@ fn probe_browser(engine: &'static str, exe: &str, marker: &str) -> Reading {
     let mut glass = glass_windows_with_a11y();
     let started = Instant::now();
     if let Err(e) = glass.start(&spec) {
-        println!("start failed after {:?}: {e}", started.elapsed());
+        say!("start failed after {:?}: {e}", started.elapsed());
         let _ = std::fs::remove_dir_all(&profile);
         return reading;
     }
-    println!("window mapped after {:?}", started.elapsed());
+    say!("window mapped after {:?}", started.elapsed());
 
     let (tree, settle, arrived) = snapshot_until_page(&mut glass, SETTLE);
-    println!("page content arrived within {SETTLE:?}: {arrived} after {settle:?}");
+    say!("page content arrived within {SETTLE:?}: {arrived} after {settle:?}");
     let (tree, arrived) = if arrived {
         (tree, true)
     } else {
         // A second, longer read so "slow" is not recorded as "never".
         let (tree, settle, arrived) = snapshot_until_page(&mut glass, EXTENDED_SETTLE);
-        println!("extended read: arrived={arrived} after a further {settle:?}");
+        say!("extended read: arrived={arrived} after a further {settle:?}");
         (tree, arrived)
     };
     reading.arrived = arrived;
@@ -664,16 +714,16 @@ fn probe_browser(engine: &'static str, exe: &str, marker: &str) -> Reading {
                 reading.clicked = clicked;
                 reading.value_took = value_took;
             } else if let Some(hint) = tree.document_guidance() {
-                println!("disclosure rendered:\n{hint}");
+                say!("disclosure rendered:\n{hint}");
             } else {
-                println!("NO DOCUMENT DISCLOSURE — content missing and nothing said so");
+                say!("NO DOCUMENT DISCLOSURE — content missing and nothing said so");
             }
         }
-        None => println!("no tree at all — nothing was published"),
+        None => say!("no tree at all — nothing was published"),
     }
 
     reading.frameworks = framework_reading(&mut glass, engine);
-    println!("stop: {:?}", glass.stop());
+    say!("stop: {:?}", glass.stop());
     let _ = std::fs::remove_dir_all(&profile);
     reading
 }
@@ -681,22 +731,22 @@ fn probe_browser(engine: &'static str, exe: &str, marker: &str) -> Reading {
 /// The text-editor half of the `FrameworkId` reading: a stock editor's `Document` is the thing a
 /// web document has to be told apart from.
 fn probe_notepad() -> Vec<String> {
-    println!("\n=== notepad ===");
+    say!("\n=== notepad ===");
     let mut glass = glass_windows_with_a11y();
     if let Err(e) = glass.start(&notepad_spec()) {
-        println!("start notepad failed: {e}");
+        say!("start notepad failed: {e}");
         return Vec::new();
     }
     let raised = glass.window(&WindowOp::Focus);
     let typed = glass.key(&KeyEvent::Text(NOTEPAD_LINE.to_string()));
-    println!("focus {:?}, typed a line: {typed:?}", raised.is_ok());
+    say!("focus {:?}, typed a line: {typed:?}", raised.is_ok());
     std::thread::sleep(Duration::from_millis(800));
     match glass.a11y_snapshot(Some(0)) {
         Ok(tree) => report_tree(&tree),
-        Err(e) => println!("notepad snapshot failed: {e}"),
+        Err(e) => say!("notepad snapshot failed: {e}"),
     }
     let frameworks = framework_reading(&mut glass, "notepad");
-    println!("stop: {:?}", glass.stop());
+    say!("stop: {:?}", glass.stop());
     frameworks
 }
 
@@ -707,7 +757,7 @@ fn web_probe() {
     let mut launched = Vec::new();
     for (engine, relative) in BROWSERS {
         let Some(exe) = locate(relative) else {
-            println!("\n=== {engine} — not installed at {relative}; skipped ===");
+            say!("\n=== {engine} — not installed at {relative}; skipped ===");
             readings.push(Reading::absent(engine));
             continue;
         };
@@ -727,18 +777,22 @@ fn web_probe() {
     }
     let notepad = probe_notepad();
 
-    println!("\n== aggregate: web-content probe ==");
+    say!("\n== aggregate: web-content probe ==");
     for r in &readings {
         if !r.installed {
-            println!("  {}: unread (not installed)", r.engine);
+            say!("  {}: unread (not installed)", r.engine);
             continue;
         }
-        println!(
+        say!(
             "  {}: arrived={} clicked={} set_value_took={} frameworks={:?}",
-            r.engine, r.arrived, r.clicked, r.value_took, r.frameworks
+            r.engine,
+            r.arrived,
+            r.clicked,
+            r.value_took,
+            r.frameworks
         );
     }
-    println!("  notepad: frameworks={notepad:?}");
+    say!("  notepad: frameworks={notepad:?}");
 
     // Whether `stop` reached each browser is a reading, printed above the cleanup so a leak is
     // visible even though the probe then repairs it. The probe owns every process carrying its
@@ -746,13 +800,13 @@ fn web_probe() {
     let mut left_behind = Vec::new();
     for (exe, marker) in &launched {
         let survivors = wait_for_no_process(exe, marker, TEARDOWN_BUDGET);
-        println!("  survived stop by {TEARDOWN_BUDGET:?} — {exe}: {survivors:?}");
+        say!("  survived stop by {TEARDOWN_BUDGET:?} — {exe}: {survivors:?}");
         for pid in &survivors {
             let killed = std::process::Command::new("taskkill")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .output()
                 .is_ok();
-            println!("  killed {exe} pid {pid}: {killed}");
+            say!("  killed {exe} pid {pid}: {killed}");
         }
         if !survivors.is_empty() {
             left_behind.extend(wait_for_no_process(exe, marker, TEARDOWN_BUDGET));
