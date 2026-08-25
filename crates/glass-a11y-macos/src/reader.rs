@@ -156,6 +156,11 @@ impl Accessibility for MacosA11y {
                 // A read that failed, or one showing a value the element reformatted, is not
                 // evidence of a projection that accepted the write and kept its value.
                 return Err(match after.as_deref() {
+                    None => GlassError::AxWriteUnconfirmed(
+                        target.id.0,
+                        "the element exposes a writable value but no readable value was available after the write"
+                            .into(),
+                    ),
                     Some(seen) if write_took_no_effect(seen, before.as_deref()) => {
                         GlassError::value_not_applied_because(
                             target.id.0,
@@ -164,7 +169,9 @@ impl Accessibility for MacosA11y {
                             READ_ONLY_PROJECTION,
                         )
                     }
-                    seen => GlassError::value_not_applied(target.id.0, text, seen),
+                    Some(seen) => {
+                        GlassError::value_not_applied(target.id.0, text, Some(seen))
+                    }
                 });
             }
             std::thread::sleep(Duration::from_millis(SET_VALUE_POLL_MS));
