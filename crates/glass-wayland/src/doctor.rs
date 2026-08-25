@@ -56,23 +56,44 @@ enum CameUp {
     Unknown(String),
 }
 
-/// What the probe started and did not stop. Non-empty by construction — the absence is `None`.
+/// What the probe started and did not stop. Something to report by construction — the absence is
+/// `None`.
 #[derive(Debug)]
 struct Leaked {
     /// Processes of the probe's own session still running.
     pids: Vec<u32>,
+    /// Why the session scan could not be run, when it could not. A survivor glass cannot name is
+    /// still a survivor (glass#381).
+    unknown: Option<String>,
     /// The probe's runtime dir, kept because those processes still have sockets in it.
     runtime_dir: PathBuf,
 }
 
 impl Leaked {
-    /// `rt` is consumed either way: deleted when nothing survived, kept when something did,
-    /// because deleting it would take that process's sockets with it.
-    fn after_reap(pids: Vec<u32>, rt: tempfile::TempDir) -> Option<Leaked> {
-        (!pids.is_empty()).then(|| Leaked {
-            pids,
+    /// `rt` is consumed either way: deleted when nothing survived, kept when something did — or
+    /// when glass could not establish that nothing did — because deleting it would take that
+    /// process's sockets with it.
+    fn after_reap(left: LeftRunning, rt: tempfile::TempDir) -> Option<Leaked> {
+        (!left.is_clean()).then(|| Leaked {
+            pids: left.pids,
+            unknown: left.unknown,
             runtime_dir: rt.keep(),
         })
+    }
+}
+
+/// What the probe left running, and whether that is the whole answer.
+#[derive(Debug)]
+struct LeftRunning {
+    pids: Vec<u32>,
+    unknown: Option<String>,
+}
+
+impl LeftRunning {
+    /// Whether the probe is established to have left nothing behind — a scan that could not run
+    /// establishes nothing.
+    fn is_clean(&self) -> bool {
+        self.pids.is_empty() && self.unknown.is_none()
     }
 }
 
@@ -195,29 +216,48 @@ struct Survivors {
     remedy: String,
 }
 
-/// Describe what was left running.
+/// Describe what was left running, and what could not be established.
 fn leak_notice(leaked: &Leaked) -> Survivors {
-    let pids: Vec<String> = leaked.pids.iter().map(u32::to_string).collect();
-    let (count, label) = match pids.len() {
-        1 => ("1 process".to_string(), "pid"),
-        n => (format!("{n} processes"), "pids"),
-    };
     let dir = leaked.runtime_dir.display();
-    Survivors {
-        detail: format!(
+    let mut details = Vec::new();
+    let mut remedies = Vec::new();
+    if !leaked.pids.is_empty() {
+        let pids: Vec<String> = leaked.pids.iter().map(u32::to_string).collect();
+        let (count, label) = match pids.len() {
+            1 => ("1 process".to_string(), "pid"),
+            n => (format!("{n} processes"), "pids"),
+        };
+        details.push(format!(
             "{count} it started was still running {LEAK_GRACE:?} after the probe signalled it \
-             ({label} {}); the probe's runtime dir is kept at {dir} rather than deleted, so \
-             whatever is still using it keeps its sockets",
+             ({label} {})",
             pids.join(", ")
-        ),
+        ));
         // No cause is named: the same observation is produced by a process on its way out, one
         // the kernel cannot kill, and a pid that has been reused since.
-        remedy: format!(
+        remedies.push(format!(
             "look first — `ps -p {} -o pid,stat,args` says whether they are still the probe's \
              sway; if they are, `kill -9 {}` and remove {dir}",
             pids.join(","),
             pids.join(" ")
+        ));
+    }
+    if let Some(why) = &leaked.unknown {
+        let rest = if leaked.pids.is_empty() { "" } else { " else" };
+        details.push(format!(
+            "glass could not tell what{rest} it left running ({why})"
+        ));
+        remedies.push(format!(
+            "look for the probe's own session by hand — `ls {dir}` says whether anything still \
+             has sockets there; remove it once nothing does"
+        ));
+    }
+    Survivors {
+        detail: format!(
+            "{}; the probe's runtime dir is kept at {dir} rather than deleted, so whatever is \
+             still using it keeps its sockets",
+            details.join(", and ")
         ),
+        remedy: remedies.join(". "),
     }
 }
 
@@ -442,15 +482,25 @@ fn reap_and_account(child: &mut Child, rt: tempfile::TempDir) -> Option<Leaked> 
 ///
 /// `after_reap` is what the reaper could still see of the tree it signalled; only
 /// [`session_processes`] finds a compositor's Xwayland or the app it `exec`s (glass#380).
-fn left_running(runtime_dir: &Path, after_reap: &[u32], grace: Duration) -> Vec<u32> {
+fn left_running(runtime_dir: &Path, after_reap: &[u32], grace: Duration) -> LeftRunning {
     let look = || {
-        let mut left = crate::xwayland::session_processes(runtime_dir);
+        // A scan that could not run leaves the pids it would have found unknown rather than
+        // absent; the reaper's own answer still stands (glass#381).
+        let (mut left, unknown) = match crate::xwayland::session_processes(runtime_dir) {
+            Ok(pids) => (pids, None),
+            Err(e) => (Vec::new(), Some(e.to_string())),
+        };
         left.extend(glass_proc_linux::live_pids(after_reap));
         left.sort_unstable();
         left.dedup();
-        left
+        LeftRunning {
+            pids: left,
+            unknown,
+        }
     };
-    glass_proc_linux::await_condition(grace, || look().is_empty());
+    // Retried for the grace too: what stops it — a host out of file descriptors — is the
+    // transient the wait is there for.
+    glass_proc_linux::await_condition(grace, || look().is_clean());
     look()
 }
 
@@ -1083,8 +1133,90 @@ mod tests {
     fn leaked(pids: Vec<u32>) -> Option<Leaked> {
         Some(Leaked {
             pids,
+            unknown: None,
             runtime_dir: PathBuf::from("/tmp/glass-doctor-wl.abc123"),
         })
+    }
+
+    /// Why a session scan could not be run, in the words the caller would see.
+    const SCAN_FAILED: &str = "read /proc: Too many open files (os error 24)";
+
+    /// glass#381: the session scan returned an empty list on an unreadable `/proc`, which reads
+    /// as "the probe left nothing running" — and the runtime dir is deleted on the strength of
+    /// it, taking the sockets of whatever is still in there with it.
+    #[test]
+    fn a_session_scan_that_could_not_run_is_not_a_probe_that_left_nothing() {
+        let rt = tempfile::tempdir().expect("tempdir");
+        let kept = rt.path().to_path_buf();
+        let leaked = Leaked::after_reap(
+            LeftRunning {
+                pids: Vec::new(),
+                unknown: Some(SCAN_FAILED.into()),
+            },
+            rt,
+        );
+        assert!(
+            leaked.is_some(),
+            "a scan that could not run is not an answer of none"
+        );
+        assert!(
+            kept.exists(),
+            "the runtime dir is kept: something may still hold sockets in it"
+        );
+    }
+
+    /// And the check says which it is. A probe that could not look reported the green line of one
+    /// that tore everything down.
+    #[test]
+    fn a_probe_whose_session_scan_failed_reports_that_it_could_not_tell() {
+        let cs = wayland_checks(
+            &answered("1.12"),
+            true,
+            Some(SwaySpawn {
+                came_up: CameUp::Yes,
+                last_ipc: None,
+                said: None,
+                leaked: Some(Leaked {
+                    pids: Vec::new(),
+                    unknown: Some(SCAN_FAILED.into()),
+                    runtime_dir: PathBuf::from("/tmp/glass-doctor-wl.abc123"),
+                }),
+            }),
+        );
+        let deep = cs.iter().find(|c| c.name == "sway spawn (deep)").unwrap();
+        assert_eq!(deep.status, CheckStatus::Warn, "{deep:?}");
+        assert!(deep.detail.contains("could not tell"), "{deep:?}");
+        // The cause, so an operator can act on it rather than re-run and hope.
+        assert!(deep.detail.contains(SCAN_FAILED), "{deep:?}");
+        // And nothing about survivors it never saw.
+        assert!(!deep.detail.contains("still running"), "{deep:?}");
+        assert!(
+            deep.detail.contains("/tmp/glass-doctor-wl.abc123"),
+            "{deep:?}"
+        );
+    }
+
+    /// Both halves ride together: naming the survivors the scan did see must not imply they are
+    /// all of them.
+    #[test]
+    fn survivors_and_a_scan_that_could_not_finish_are_both_reported() {
+        let cs = wayland_checks(
+            &answered("1.12"),
+            true,
+            Some(SwaySpawn {
+                came_up: CameUp::Yes,
+                last_ipc: None,
+                said: None,
+                leaked: Some(Leaked {
+                    pids: vec![4242],
+                    unknown: Some(SCAN_FAILED.into()),
+                    runtime_dir: PathBuf::from("/tmp/glass-doctor-wl.abc123"),
+                }),
+            }),
+        );
+        let deep = cs.iter().find(|c| c.name == "sway spawn (deep)").unwrap();
+        assert!(deep.detail.contains("pid 4242"), "{deep:?}");
+        assert!(deep.detail.contains("could not tell"), "{deep:?}");
     }
 
     /// glass#380: the detail said "started and stopped" on the strength of the start alone, so a
