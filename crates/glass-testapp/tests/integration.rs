@@ -461,6 +461,26 @@ fn crop_extracts_region_of_real_capture() {
 
 #[test]
 #[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn app_exit_during_window_discovery_reports_the_exit_status() {
+    use glass_core::GlassError;
+
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    let spec = AppSpec {
+        run: vec!["true".to_string()],
+        timeout_ms: 5000,
+        ..app_spec()
+    };
+
+    let err = p.start_app(&spec).unwrap_err();
+    assert!(
+        matches!(err, GlassError::AppExited(Some(0))),
+        "expected the child's exit status, got {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
 fn failed_start_kills_the_child_process() {
     use glass_core::GlassError;
     // A process that never maps a window -> discovery times out. It echoes its
