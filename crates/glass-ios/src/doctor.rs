@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use glass_core::{BoundKind, Check, CheckStatus, GlassError};
+use glass_core::{BoundedRun, Check, CheckStatus, GlassError};
 use glass_exec_unix::Resolved;
 
 use crate::device::{Resolve, SimDevice, parse_devices, resolve};
@@ -280,20 +280,21 @@ enum Run {
 
 /// One bounded one-shot probe; the cause is kept on the result and logged to stderr.
 fn run_probe(cmd: &mut Command, op: &str) -> Run {
-    match glass_core::run_bounded(cmd, PROBE_BUDGET, op) {
-        Ok(o) => Run::Answered {
+    match glass_core::run_bounded_classified(cmd, PROBE_BUDGET, op) {
+        BoundedRun::Answered(o) => Run::Answered {
             status_ok: o.status.success(),
             stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
         },
-        Err(e) => {
+        BoundedRun::TimedOut(e) => {
             let cause = e.to_string();
             eprintln!("glass-ios doctor: {cause}");
-            if e.bound() == Some(BoundKind::TimedOut) {
-                Run::TimedOut(cause)
-            } else {
-                Run::Failed(cause)
-            }
+            Run::TimedOut(cause)
+        }
+        BoundedRun::NotStarted(e) | BoundedRun::Failed(e) => {
+            let cause = e.to_string();
+            eprintln!("glass-ios doctor: {cause}");
+            Run::Failed(cause)
         }
     }
 }
