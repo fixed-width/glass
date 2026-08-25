@@ -25,6 +25,7 @@ internal refactors, CI, or test-only changes.
 ### Fixed
 - A web view whose content the platform has not published is disclosed in the snapshot instead of arriving as an indistinguishable empty group: a childless `Document` is named by id and bounds and steers to a re-snapshot before pixels, while a placeholder the app published for content it withheld steers straight to pixels.
 - On Linux, `glass_set_value` now confirms a write actually landed instead of trusting the AT-SPI toolkit's own acknowledgment of it, the way the Windows and macOS readers already did: it reads the element back (polling briefly, since the toolkit applies the write on a later main-loop pass), and an element that acknowledges a write without applying it — as web content can — now reports that instead of a silent false success.
+- On Linux, the container of an `<iframe>` inside a browser page no longer reads as a `Window`: AT-SPI's `internal frame`, which the web engines publish for an embedded frame and no desktop toolkit uses, now maps to `Group`, so a `role:"Window"` selector matches the app's real windows again instead of frames inside a page. The nested `Document` inside such a frame is unchanged.
 
 ## [1.5.0] - 2026-08-22
 
