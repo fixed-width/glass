@@ -41,6 +41,11 @@ pub const REMAP_SETTLE: std::time::Duration = std::time::Duration::from_millis(2
 /// otherwise pay on every window enumeration. Afterwards each check is a round trip per X window.
 pub const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
 
+/// The process table every scan here reads. Passed to the scans as a parameter so a test can
+/// build one: an unreadable `/proc`, or an entry whose files cannot be read, decides whether
+/// recovery runs at all, and neither can be arranged in the real one.
+const PROC: &str = "/proc";
+
 /// A session's state for recovering lost toplevels: which session it is, the X connection once
 /// one exists, what has been tried, what was missing last time, and when the last check ran.
 pub struct Recovery {
@@ -117,13 +122,25 @@ impl Recovery {
     /// costs a `/proc` walk and this sits on the window-enumeration path.
     ///
     /// Best effort: a session with no Xwayland (a native Wayland app), an X server that will not
-    /// answer, or a check that is not due yet all leave the caller exactly as it was. The
-    /// throttle lives here rather than at the call sites so a caller cannot spend the walk by
-    /// forgetting to ask first.
+    /// answer, a process table that cannot be read, or a check that is not due yet all leave the
+    /// caller exactly as it was. Only the first is silent; the rest are glass failing to look and
+    /// say so (glass#381). The throttle lives here rather than at the call sites so a caller
+    /// cannot spend the walk by forgetting to ask first.
     ///
     /// `in_compositor` is the X11 window id of each window sway currently reports (native
     /// Wayland views have none and are simply absent from it).
     pub fn recover_if_due(&mut self, now: std::time::Instant, in_compositor: &[u32]) -> usize {
+        self.recover_if_due_in(Path::new(PROC), now, in_compositor)
+    }
+
+    /// [`Self::recover_if_due`] with the process table to scan passed in, so the outcomes of a
+    /// table that cannot be read are reachable without one.
+    fn recover_if_due_in(
+        &mut self,
+        proc_root: &Path,
+        now: std::time::Instant,
+        in_compositor: &[u32],
+    ) -> usize {
         if !self.due(now) {
             return 0;
         }
@@ -131,10 +148,21 @@ impl Recovery {
         let probe = match self.probe.take() {
             Some(p) => p,
             None => {
-                // No Xwayland holding this session's runtime directory: a native Wayland app,
-                // which never takes the path this recovers. Nothing to do, nothing to warn about.
-                let Some(display) = session_display(&self.runtime_dir) else {
-                    return 0;
+                let display = match session_display(proc_root, &self.runtime_dir) {
+                    Ok(Some(d)) => d,
+                    // No Xwayland holds this session's runtime directory: a native Wayland app,
+                    // which never takes the path this recovers. Nothing to do, nothing to warn
+                    // about.
+                    Ok(None) => return 0,
+                    // Not that: glass could not look. Recovery is off for the session either
+                    // way, so it is said like a failed connect (glass#381).
+                    Err(e) => {
+                        self.warn_once(format!(
+                            "glass: could not find the session's Xwayland: {e}. Windows the \
+                             compositor loses will not be recovered."
+                        ));
+                        return 0;
+                    }
                 };
                 match XProbe::connect(&display) {
                     Ok(p) => p,
@@ -297,8 +325,8 @@ fn window_is_gone(e: &ReplyError) -> bool {
     matches!(e, ReplyError::X11Error(x) if x.error_kind == ErrorKind::Window)
 }
 
-/// The display served by *this session's* Xwayland, or `None` when the session has no X11 side
-/// (a native Wayland app — sway only starts Xwayland once an X11 client connects).
+/// The display served by *this session's* Xwayland, or `Ok(None)` when the session has no X11
+/// side (a native Wayland app — sway only starts Xwayland once an X11 client connects).
 ///
 /// The session's Xwayland is found by its private runtime directory rather than by reading
 /// `DISPLAY` out of the app's environment, and that difference is a safety property, not a
@@ -310,28 +338,56 @@ fn window_is_gone(e: &ReplyError) -> bool {
 ///
 /// The process itself has to be found by scanning: sway reparents Xwayland out of its own
 /// process tree (its parent becomes init), so walking sway's descendants never finds it.
-fn session_display(runtime_dir: &Path) -> Option<String> {
-    xwayland_pids().into_iter().find_map(|pid| {
-        let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+///
+/// The no-X11-side answer is `Ok(None)` and nothing else; a scan that could not be run is an
+/// `Err`, because both leave recovery off and only one of them is expected (glass#381).
+fn session_display(proc_root: &Path, runtime_dir: &Path) -> Result<Option<String>> {
+    for pid in xwayland_pids(proc_root)? {
+        let dir = proc_root.join(pid.to_string());
+        // Before the match a read failure is routine: another user's Xwayland is unreadable by
+        // design, one that exited mid-scan is gone.
+        let Ok(environ) = std::fs::read(dir.join("environ")) else {
+            continue;
+        };
         if !serves_session(&environ, runtime_dir) {
-            return None;
+            continue;
         }
-        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-        display_from_cmdline(&cmdline)
-    })
+        // Past it the process is this session's own, so a failed read is glass failing to
+        // inspect what it started.
+        let cmdline = std::fs::read(dir.join("cmdline")).map_err(|e| {
+            GlassError::Backend(format!(
+                "read the session's Xwayland cmdline (pid {pid}): {e}"
+            ))
+        })?;
+        return display_from_cmdline(&cmdline).map(Some).ok_or_else(|| {
+            GlassError::Backend(format!(
+                "the session's Xwayland (pid {pid}) was started with no display argument"
+            ))
+        });
+    }
+    Ok(None)
 }
 
-/// Every Xwayland process on the machine. The session's own is picked out of these by its
+/// Every Xwayland process in a process table. The session's own is picked out of these by its
 /// runtime directory; a host with none simply has no X11 side to recover.
-fn xwayland_pids() -> Vec<u32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
+fn xwayland_pids(proc_root: &Path) -> Result<Vec<u32>> {
+    Ok(proc_pids(proc_root)?
+        .into_iter()
+        .filter(|pid| is_xwayland_in(proc_root, *pid))
+        .collect())
+}
+
+/// Every process id in a process table, or why it could not be read.
+///
+/// The failure is returned rather than swallowed as an empty list: callers act on "nothing there",
+/// and a table that could not be read is not that (glass#381).
+fn proc_pids(proc_root: &Path) -> Result<Vec<u32>> {
+    let entries = std::fs::read_dir(proc_root)
+        .map_err(|e| GlassError::Backend(format!("read {}: {e}", proc_root.display())))?;
+    Ok(entries
         .flatten()
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| is_xwayland(*pid))
-        .collect()
+        .collect())
 }
 
 /// Every process on the machine that belongs to the session `runtime_dir` was created for.
@@ -339,18 +395,19 @@ fn xwayland_pids() -> Vec<u32> {
 /// By what a process inherited, not by parentage: sway reparents Xwayland out of its own tree and
 /// `setsid`s every app it `exec`s, so a walk of sway's descendants finds neither. This is what
 /// answers whether a launch is really gone (glass#380).
-pub(crate) fn session_processes(runtime_dir: &Path) -> Vec<u32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+pub(crate) fn session_processes(runtime_dir: &Path) -> Result<Vec<u32>> {
+    session_processes_in(Path::new(PROC), runtime_dir)
+}
+
+/// [`session_processes`] over a given process table.
+fn session_processes_in(proc_root: &Path, runtime_dir: &Path) -> Result<Vec<u32>> {
+    Ok(proc_pids(proc_root)?
+        .into_iter()
         .filter(|pid| {
-            std::fs::read(format!("/proc/{pid}/environ"))
+            std::fs::read(proc_root.join(pid.to_string()).join("environ"))
                 .is_ok_and(|environ| serves_session(&environ, runtime_dir))
         })
-        .collect()
+        .collect())
 }
 
 /// Whether a process's environment (`/proc/<pid>/environ`: NUL-separated `KEY=VALUE`) says it
@@ -377,7 +434,13 @@ fn display_from_cmdline(cmdline: &[u8]) -> Option<String> {
 /// Whether `pid` is an Xwayland process, read from `/proc/<pid>/comm`. Also used by teardown,
 /// which must not wait on the compositor's own plumbing the way it waits on the app.
 pub fn is_xwayland(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm.trim() == "Xwayland")
+    is_xwayland_in(Path::new(PROC), pid)
+}
+
+/// [`is_xwayland`] over a given process table.
+fn is_xwayland_in(proc_root: &Path, pid: u32) -> bool {
+    std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm"))
+        .is_ok_and(|comm| comm.trim() == "Xwayland")
 }
 
 /// `:0`, `:1`, … — a bare display token. Rejects a screen-qualified (`:0.0`) or host-qualified
@@ -685,8 +748,9 @@ mod x_tests {
 
 #[cfg(test)]
 mod session_tests {
-    //! Finding the session's own Xwayland. The scan reads `/proc`, so only a real session shows
-    //! the match is by runtime directory rather than by whatever `DISPLAY` is set to.
+    //! Finding the session's own Xwayland. Only a real session shows the match is by runtime
+    //! directory rather than by whatever `DISPLAY` is set to; the process table a scan reads is a
+    //! parameter, so what it does with one it cannot read is shown against a built table.
     use super::*;
     use crate::testw::Launch;
 
@@ -698,7 +762,8 @@ mod session_tests {
         // Computed here rather than trusted from the lookup: sibling tests run their own sessions
         // in parallel, so a lookup that ignored the runtime dir would still find one of theirs and
         // answer with a perfectly plausible display.
-        let mine: Vec<String> = xwayland_pids()
+        let mine: Vec<String> = xwayland_pids(Path::new(PROC))
+            .expect("scan /proc")
             .into_iter()
             .filter(|pid| {
                 std::fs::read(format!("/proc/{pid}/environ"))
@@ -710,7 +775,9 @@ mod session_tests {
             .collect();
         assert_eq!(mine.len(), 1, "one Xwayland serves this session: {mine:?}");
         assert_eq!(
-            session_display(&dir).as_deref(),
+            session_display(Path::new(PROC), &dir)
+                .expect("scan /proc")
+                .as_deref(),
             Some(mine[0].as_str()),
             "the lookup answered with an X server this session does not own"
         );
@@ -721,7 +788,10 @@ mod session_tests {
     #[test]
     fn a_runtime_dir_no_xwayland_holds_has_no_display() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(session_display(dir.path()), None);
+        assert_eq!(
+            session_display(Path::new(PROC), dir.path()).expect("scan /proc"),
+            None
+        );
     }
 
     /// The scan has to find the session's *own* Xwayland. An empty list reads as "no X11 side",
@@ -735,7 +805,8 @@ mod session_tests {
     fn the_scan_finds_this_sessions_own_xwayland() {
         let s = Launch::new().through_xwayland().start();
         let dir = s.runtime_dir();
-        let mine: Vec<u32> = xwayland_pids()
+        let mine: Vec<u32> = xwayland_pids(Path::new(PROC))
+            .expect("scan /proc")
             .into_iter()
             .filter(|pid| {
                 std::fs::read(format!("/proc/{pid}/environ"))
@@ -750,6 +821,130 @@ mod session_tests {
     #[test]
     fn this_test_process_is_not_an_xwayland() {
         assert!(!is_xwayland(std::process::id()));
+    }
+
+    /// A process table built for a test: pid directories holding the files the scans read.
+    ///
+    /// The failures glass#381 is about — a `/proc` that cannot be read at all, an entry whose
+    /// files cannot be — do not happen on demand in the real one, and each of them decides
+    /// whether recovery runs for the session.
+    struct FakeProc(tempfile::TempDir);
+
+    impl FakeProc {
+        fn new() -> FakeProc {
+            FakeProc(tempfile::tempdir().expect("tempdir"))
+        }
+
+        fn path(&self) -> &Path {
+            self.0.path()
+        }
+
+        /// A process whose `comm` is `comm`, whose environment says it belongs to `runtime_dir`,
+        /// and whose `cmdline` is `argv`.
+        fn process(&self, pid: u32, comm: &str, runtime_dir: &Path, argv: &[&str]) -> PathBuf {
+            let dir = self.path().join(pid.to_string());
+            std::fs::create_dir(&dir).expect("pid dir");
+            std::fs::write(dir.join("comm"), format!("{comm}\n")).expect("comm");
+            std::fs::write(
+                dir.join("environ"),
+                format!("HOME=/tmp\0XDG_RUNTIME_DIR={}\0", runtime_dir.display()),
+            )
+            .expect("environ");
+            std::fs::write(dir.join("cmdline"), argv.join("\0")).expect("cmdline");
+            dir
+        }
+    }
+
+    /// Put something in place of `file` that no read can succeed on whatever the caller's
+    /// privileges — a mode-0 file still opens as root, which is how CI runs.
+    fn make_unreadable(file: &Path) {
+        std::fs::remove_file(file).expect("remove the file");
+        std::fs::create_dir(file).expect("a directory in its place");
+    }
+
+    /// A path no process table is at, for the scans that must report rather than answer.
+    fn no_process_table() -> &'static Path {
+        Path::new("/nonexistent/glass-381/proc")
+    }
+
+    /// glass#381: an unreadable process table is not "this session has no X11 side". Read as one,
+    /// it switches lost-window recovery off for the session with nothing said.
+    #[test]
+    fn a_process_table_that_cannot_be_read_is_not_an_absent_xwayland() {
+        session_display(no_process_table(), Path::new("/tmp/glass-wl.ab"))
+            .expect_err("a process table that cannot be read says nothing about Xwayland");
+    }
+
+    #[test]
+    fn the_sessions_xwayland_is_found_in_the_scanned_table() {
+        let proc = FakeProc::new();
+        let rt = tempfile::tempdir().expect("tempdir");
+        proc.process(41, "Xwayland", rt.path(), &["Xwayland", ":7", "-rootless"]);
+        assert_eq!(
+            session_display(proc.path(), rt.path()).expect("scan"),
+            Some(":7".to_string())
+        );
+    }
+
+    /// The silent case, and the only one: sway starts no Xwayland until an X11 client connects.
+    #[test]
+    fn an_xwayland_serving_another_session_leaves_this_one_with_no_display() {
+        let proc = FakeProc::new();
+        let theirs = tempfile::tempdir().expect("tempdir");
+        let mine = tempfile::tempdir().expect("tempdir");
+        proc.process(41, "Xwayland", theirs.path(), &["Xwayland", ":7"]);
+        assert_eq!(
+            session_display(proc.path(), mine.path()).expect("scan"),
+            None
+        );
+    }
+
+    /// Past the runtime-dir match the process is this session's own, so a file that cannot be read
+    /// is glass unable to read its own Xwayland — not another session's, which it may skip.
+    #[test]
+    fn the_sessions_own_xwayland_with_an_unreadable_cmdline_is_reported() {
+        let proc = FakeProc::new();
+        let rt = tempfile::tempdir().expect("tempdir");
+        let dir = proc.process(41, "Xwayland", rt.path(), &["Xwayland", ":7"]);
+        make_unreadable(&dir.join("cmdline"));
+        let e = session_display(proc.path(), rt.path())
+            .expect_err("the session's own Xwayland could not be read");
+        assert!(e.to_string().contains("cmdline"), "{e}");
+    }
+
+    /// Its display is what the probe connects to. Not finding one leaves recovery off just as an
+    /// unreadable table does, so it is reported the same way rather than read as no X11 side.
+    #[test]
+    fn the_sessions_own_xwayland_with_no_display_argument_is_reported() {
+        let proc = FakeProc::new();
+        let rt = tempfile::tempdir().expect("tempdir");
+        proc.process(41, "Xwayland", rt.path(), &["Xwayland", "-rootless"]);
+        session_display(proc.path(), rt.path())
+            .expect_err("an Xwayland with no display is not one this session can be probed on");
+    }
+
+    /// Before the match a read failure is routine: another user's Xwayland is unreadable by
+    /// design, and one that exits mid-scan is gone. Neither may hide the session's own.
+    #[test]
+    fn an_xwayland_whose_environ_cannot_be_read_is_skipped_not_reported() {
+        let proc = FakeProc::new();
+        let mine = tempfile::tempdir().expect("tempdir");
+        let theirs = tempfile::tempdir().expect("tempdir");
+        let unreadable = proc.process(41, "Xwayland", theirs.path(), &["Xwayland", ":1"]);
+        make_unreadable(&unreadable.join("environ"));
+        proc.process(42, "Xwayland", mine.path(), &["Xwayland", ":7"]);
+        assert_eq!(
+            session_display(proc.path(), mine.path()).expect("scan"),
+            Some(":7".to_string())
+        );
+    }
+
+    /// glass#381: doctor reads an empty list as "the probe left nothing running" and deletes the
+    /// session's runtime dir on the strength of it. A table that could not be read is not that.
+    #[test]
+    fn a_process_table_that_cannot_be_read_is_not_an_empty_session() {
+        session_processes_in(no_process_table(), Path::new("/tmp/glass-wl.ab"))
+            .expect_err("a process table that cannot be read says nothing about the session");
     }
 }
 
@@ -771,15 +966,25 @@ mod tests {
             .expect("spawn sleep");
         let pid = child.id();
         assert!(
-            session_processes(rt.path()).contains(&pid),
+            session_processes(rt.path())
+                .expect("scan /proc")
+                .contains(&pid),
             "a process carrying the session's runtime dir belongs to it"
         );
         // Another session's dir must not match it — the whole point is telling them apart.
         let other = tempfile::tempdir().expect("tempdir");
-        assert!(!session_processes(other.path()).contains(&pid));
+        assert!(
+            !session_processes(other.path())
+                .expect("scan /proc")
+                .contains(&pid)
+        );
         child.kill().expect("kill");
         child.wait().expect("reap");
-        assert!(!session_processes(rt.path()).contains(&pid));
+        assert!(
+            !session_processes(rt.path())
+                .expect("scan /proc")
+                .contains(&pid)
+        );
     }
 
     fn toplevel() -> WindowFacts {
@@ -915,6 +1120,20 @@ mod tests {
         assert!(!r.due(now));
         r.rearm();
         assert!(r.due(now));
+    }
+
+    /// glass#381: a process table glass cannot read leaves recovery off for the whole session.
+    /// That is a failure of glass's own machinery and has to read like one, not like the native
+    /// Wayland session that legitimately has no display to find.
+    #[test]
+    fn a_process_table_that_cannot_be_read_is_reported_and_recovers_nothing() {
+        let mut r = Recovery::new(Path::new("/tmp/glass-wl.ab"));
+        let now = std::time::Instant::now();
+        assert_eq!(
+            r.recover_if_due_in(Path::new("/nonexistent/glass-381/proc"), now, &[]),
+            0
+        );
+        assert!(r.warned, "recovery off for the session, said out loud");
     }
 
     /// A session whose runtime directory no Xwayland holds is a native Wayland app: no work, no
