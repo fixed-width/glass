@@ -462,8 +462,7 @@ impl Glass {
                     Err(e) => return Err(e),
                 };
                 Ok(
-                    match element_match(
-                        &tree,
+                    match tree.element_match(
                         params.name.as_deref(),
                         params.role,
                         params.value_contains.as_deref(),
@@ -621,8 +620,7 @@ impl Glass {
         // `?`, so a reader giving up at the deadline would turn the sweep's soft `{matched:false}`
         // into an error.
         let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
-        let found = match element_match(
-            &tree,
+        let found = match tree.element_match(
             params.name.as_deref(),
             params.role,
             params.value_contains.as_deref(),

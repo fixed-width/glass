@@ -692,13 +692,47 @@ impl AxTree {
 
     /// Find a node by id (pre-order). Call after [`AxTree::assign_ids`].
     pub fn find(&self, id: AxNodeId) -> Option<&AxNode> {
-        fn walk(node: &AxNode, id: AxNodeId) -> Option<&AxNode> {
-            if node.id == id {
+        self.find_first(|node| node.id == id)
+    }
+
+    /// Find the first node in pre-order DFS satisfying `pred`.
+    pub fn find_first(&self, pred: impl Fn(&AxNode) -> bool) -> Option<&AxNode> {
+        fn walk<'a>(node: &'a AxNode, pred: &impl Fn(&AxNode) -> bool) -> Option<&'a AxNode> {
+            if pred(node) {
                 return Some(node);
             }
-            node.children.iter().find_map(|c| walk(c, id))
+            node.children.iter().find_map(|child| walk(child, pred))
         }
-        walk(&self.root, id)
+        walk(&self.root, &pred)
+    }
+
+    /// Nodes from the root through `id`, inclusive, or `None` when `id` is not in this tree.
+    pub fn path_to(&self, id: AxNodeId) -> Option<Vec<&AxNode>> {
+        fn walk(node: &AxNode, id: AxNodeId, path: &mut Vec<usize>) -> bool {
+            if node.id == id {
+                return true;
+            }
+            for (index, child) in node.children.iter().enumerate() {
+                path.push(index);
+                if walk(child, id, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+
+        let mut indices = Vec::new();
+        if !walk(&self.root, id, &mut indices) {
+            return None;
+        }
+        let mut nodes = vec![&self.root];
+        let mut node = &self.root;
+        for index in indices {
+            node = &node.children[index];
+            nodes.push(node);
+        }
+        Some(nodes)
     }
 
     /// [`Self::find`], mutably — for patching a field of a cached node in place rather than
@@ -1390,23 +1424,57 @@ impl ElementInfo {
     }
 }
 
-/// Find the first node (pre-order DFS) satisfying `pred`.
-fn find_preorder<'a>(node: &'a AxNode, pred: &dyn Fn(&AxNode) -> bool) -> Option<&'a AxNode> {
-    if pred(node) {
-        return Some(node);
+impl AxTree {
+    /// Evaluate a precise element condition against this tree. The selector is the
+    /// conjunction of: `name` substring of the node's name, `role` equality, and
+    /// `value_contains` substring of the node's value (each optional). For positive
+    /// conditions, returns the first node matching selector + state; for
+    /// `Disappears`, satisfied iff no node matches the selector.
+    ///
+    /// A `name` or `value_contains` filter only matches nodes whose corresponding field
+    /// is `Some`. Pass `None` to skip that filter entirely.
+    pub fn element_match(
+        &self,
+        name: Option<&str>,
+        role: Option<AxRole>,
+        value_contains: Option<&str>,
+        condition: ElementCondition,
+    ) -> ElementMatch<'_> {
+        // Jetpack Compose surfaces a real button as a clickable `Group`/`Other` with the role
+        // lost, so an exact filter misses it; name + actability finds it anyway.
+        //
+        // The disambiguator is required: without it a role-only query would match the first
+        // focusable container in the tree — a confident wrong match, not an honest miss.
+        let has_disambiguator = name.is_some() || value_contains.is_some();
+        let role_match = |n: &AxNode, r: AxRole| {
+            n.role == r
+                || (r.is_interactable()
+                    && has_disambiguator
+                    && n.states.focusable
+                    && matches!(n.role, AxRole::Group | AxRole::Other))
+        };
+        let selector_match = |n: &AxNode| -> bool {
+            name.is_none_or(|q| n.name.as_deref().is_some_and(|nm| nm.contains(q)))
+                && role.is_none_or(|r| role_match(n, r))
+                && value_contains
+                    .is_none_or(|v| n.value.as_deref().is_some_and(|val| val.contains(v)))
+        };
+        if condition == ElementCondition::Disappears {
+            return if self.find_first(selector_match).is_none() {
+                ElementMatch::Satisfied(None)
+            } else {
+                ElementMatch::Pending
+            };
+        }
+        let pred = condition.state_pred();
+        match self.find_first(|n| selector_match(n) && pred(&n.states)) {
+            Some(n) => ElementMatch::Satisfied(Some(n)),
+            None => ElementMatch::Pending,
+        }
     }
-    node.children.iter().find_map(|c| find_preorder(c, pred))
 }
 
-/// Evaluate a precise element condition against `tree`. The selector is the
-/// conjunction of: `name` substring of the node's name, `role` equality, and
-/// `value_contains` substring of the node's value (each optional). For positive
-/// conditions, returns the first node matching selector + state; for
-/// `Disappears`, satisfied iff no node matches the selector.
-///
-/// Note: a `name` or `value_contains` filter only matches nodes whose `name`/`value`
-/// field is `Some` — a node with `name: None` never matches a name query. Pass
-/// `name: None` to skip the name filter entirely.
+/// Free-function form of [`AxTree::element_match`].
 pub fn element_match<'a>(
     tree: &'a AxTree,
     name: Option<&str>,
@@ -1414,36 +1482,7 @@ pub fn element_match<'a>(
     value_contains: Option<&str>,
     condition: ElementCondition,
 ) -> ElementMatch<'a> {
-    // Jetpack Compose surfaces a real button as a clickable `Group`/`Other` with the role
-    // lost, so an exact filter misses it; name + actability finds it anyway.
-    //
-    // The disambiguator is required: without it a role-only query would match the first
-    // focusable container in the tree — a confident wrong match, not an honest miss.
-    let has_disambiguator = name.is_some() || value_contains.is_some();
-    let role_match = |n: &AxNode, r: AxRole| {
-        n.role == r
-            || (r.is_interactable()
-                && has_disambiguator
-                && n.states.focusable
-                && matches!(n.role, AxRole::Group | AxRole::Other))
-    };
-    let selector_match = |n: &AxNode| -> bool {
-        name.is_none_or(|q| n.name.as_deref().is_some_and(|nm| nm.contains(q)))
-            && role.is_none_or(|r| role_match(n, r))
-            && value_contains.is_none_or(|v| n.value.as_deref().is_some_and(|val| val.contains(v)))
-    };
-    if condition == ElementCondition::Disappears {
-        return if find_preorder(&tree.root, &selector_match).is_none() {
-            ElementMatch::Satisfied(None)
-        } else {
-            ElementMatch::Pending
-        };
-    }
-    let pred = condition.state_pred();
-    match find_preorder(&tree.root, &|n| selector_match(n) && pred(&n.states)) {
-        Some(n) => ElementMatch::Satisfied(Some(n)),
-        None => ElementMatch::Pending,
-    }
+    tree.element_match(name, role, value_contains, condition)
 }
 
 #[cfg(test)]
@@ -2798,6 +2837,33 @@ mod tests {
         t.assign_ids();
         assert_eq!(t.find(AxNodeId(1)).unwrap().name.as_deref(), Some("Save"));
         assert!(t.find(AxNodeId(99)).is_none());
+    }
+
+    #[test]
+    fn find_first_uses_preorder() {
+        let mut t = sample_tree();
+        t.assign_ids();
+        assert_eq!(
+            t.find_first(|node| node.role != AxRole::Window)
+                .map(|node| node.id),
+            Some(AxNodeId(1))
+        );
+        assert!(t.find_first(|node| node.role == AxRole::Dialog).is_none());
+    }
+
+    #[test]
+    fn path_to_returns_root_through_target() {
+        let mut t = sample_tree();
+        t.root.children[0]
+            .children
+            .push(leaf(AxRole::Label, "Nested"));
+        t.assign_ids();
+        let path = t.path_to(AxNodeId(2)).unwrap();
+        assert_eq!(
+            path.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![AxNodeId(0), AxNodeId(1), AxNodeId(2)]
+        );
+        assert!(t.path_to(AxNodeId(99)).is_none());
     }
 
     #[test]

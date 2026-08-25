@@ -211,7 +211,7 @@ impl Glass {
             let container = {
                 let s = self.require_active()?;
                 let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
-                menu_container_bounds(&tree.root, id, &popover_geo)
+                menu_container_bounds(tree, id, &popover_geo)
             }
             .ok_or(GlassError::AxElementInUnmappedPopover(id.0))?;
             let prev = windows.iter().find(|w| w.active).map(|w| w.id);
@@ -746,21 +746,6 @@ fn owning_popover(
         .map(|w| w.id)
 }
 
-/// Path of nodes from `root` to `target` (inclusive of both ends), in that order —
-/// `None` if `target` isn't in this tree.
-fn ancestor_path(root: &AxNode, target: AxNodeId) -> Option<Vec<&AxNode>> {
-    if root.id == target {
-        return Some(vec![root]);
-    }
-    for child in &root.children {
-        if let Some(mut path) = ancestor_path(child, target) {
-            path.insert(0, root);
-            return Some(path);
-        }
-    }
-    None
-}
-
 /// The bounds of the ancestor of `target` whose size most closely matches `popover`'s
 /// window size (within 16px tolerance on each dimension) — the element's realized
 /// menu/list container, e.g. a dropdown popup's `List`. Its origin recovers the
@@ -775,14 +760,14 @@ fn ancestor_path(root: &AxNode, target: AxNodeId) -> Option<Vec<&AxNode>> {
 /// the popover's exact size (not proximity to `target`) picks the real container: it
 /// tracks the popover's size most tightly, while wrappers trimmed by padding/scrollbars
 /// drift further from it. Ties (equal score) break toward the shallower ancestor — the
-/// one closer to `root` — since `ancestor_path` walks root-to-target and `min_by_key`
+/// one closer to `root` — since [`AxTree::path_to`] returns root-to-target and `min_by_key`
 /// keeps the first minimum.
 fn menu_container_bounds(
-    root: &AxNode,
+    tree: &AxTree,
     target: AxNodeId,
     popover: &WindowGeometry,
 ) -> Option<crate::accessibility::AxRect> {
-    let path = ancestor_path(root, target)?;
+    let path = tree.path_to(target)?;
     path.iter()
         .filter_map(|node| {
             let b = node.bounds?;
@@ -1106,7 +1091,7 @@ mod tests {
         let looser = ax_node(1, AxRole::Group, Some(rect(0, 0, 110, 110)), vec![close]);
         let root = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![looser]);
         assert_eq!(
-            menu_container_bounds(&root, AxNodeId(2), &popover),
+            menu_container_bounds(&AxTree::new(root.clone()), AxNodeId(2), &popover),
             Some(rect(0, 0, 100, 100))
         );
 
@@ -1114,13 +1099,13 @@ mod tests {
         let edge = ax_node(2, AxRole::List, Some(rect(0, 0, 116, 100)), vec![]);
         let root_edge = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![edge]);
         assert_eq!(
-            menu_container_bounds(&root_edge, AxNodeId(2), &popover),
+            menu_container_bounds(&AxTree::new(root_edge.clone()), AxNodeId(2), &popover),
             Some(rect(0, 0, 116, 100))
         );
         let past = ax_node(2, AxRole::List, Some(rect(0, 0, 117, 100)), vec![]);
         let root_past = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![past]);
         assert_eq!(
-            menu_container_bounds(&root_past, AxNodeId(2), &popover),
+            menu_container_bounds(&AxTree::new(root_past.clone()), AxNodeId(2), &popover),
             None
         );
 
@@ -1128,13 +1113,13 @@ mod tests {
         let edge_h = ax_node(2, AxRole::List, Some(rect(0, 0, 100, 116)), vec![]);
         let root_edge_h = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![edge_h]);
         assert_eq!(
-            menu_container_bounds(&root_edge_h, AxNodeId(2), &popover),
+            menu_container_bounds(&AxTree::new(root_edge_h.clone()), AxNodeId(2), &popover),
             Some(rect(0, 0, 100, 116))
         );
         let past_h = ax_node(2, AxRole::List, Some(rect(0, 0, 100, 117)), vec![]);
         let root_past_h = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![past_h]);
         assert_eq!(
-            menu_container_bounds(&root_past_h, AxNodeId(2), &popover),
+            menu_container_bounds(&AxTree::new(root_past_h.clone()), AxNodeId(2), &popover),
             None
         );
 
@@ -1145,7 +1130,7 @@ mod tests {
         let even = ax_node(1, AxRole::Group, Some(rect(0, 0, 105, 105)), vec![lopsided]);
         let root_score = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![even]);
         assert_eq!(
-            menu_container_bounds(&root_score, AxNodeId(2), &popover),
+            menu_container_bounds(&AxTree::new(root_score.clone()), AxNodeId(2), &popover),
             Some(rect(0, 0, 105, 105)),
             "the lower summed difference must win, not the lower product"
         );
@@ -1154,7 +1139,7 @@ mod tests {
         let smaller = ax_node(2, AxRole::List, Some(rect(0, 0, 90, 90)), vec![]);
         let root_small = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![smaller]);
         assert_eq!(
-            menu_container_bounds(&root_small, AxNodeId(2), &popover),
+            menu_container_bounds(&AxTree::new(root_small.clone()), AxNodeId(2), &popover),
             Some(rect(0, 0, 90, 90))
         );
     }
@@ -1285,7 +1270,7 @@ mod tests {
             height: 135,
         };
         assert_eq!(
-            menu_container_bounds(&root, AxNodeId(2), &popover),
+            menu_container_bounds(&AxTree::new(root.clone()), AxNodeId(2), &popover),
             Some(list_bounds)
         );
     }
@@ -1322,7 +1307,10 @@ mod tests {
             width: 326,
             height: 135,
         };
-        assert_eq!(menu_container_bounds(&root, AxNodeId(1), &popover), None);
+        assert_eq!(
+            menu_container_bounds(&AxTree::new(root.clone()), AxNodeId(1), &popover),
+            None
+        );
     }
 
     #[test]
@@ -1411,7 +1399,7 @@ mod tests {
             vec![container],
         );
         assert_eq!(
-            menu_container_bounds(&root, AxNodeId(6), &popover),
+            menu_container_bounds(&AxTree::new(root.clone()), AxNodeId(6), &popover),
             Some(container_bounds),
             "the real container (closest in size to the popover) must win over nearer wrapper groups"
         );
@@ -1458,7 +1446,7 @@ mod tests {
             vec![content],
         );
         assert_eq!(
-            menu_container_bounds(&root, AxNodeId(2), &popover),
+            menu_container_bounds(&AxTree::new(root.clone()), AxNodeId(2), &popover),
             Some(content_bounds),
             "both root and content are within tolerance, but content is numerically \
              closest to the popover's size and must win over the outer window root"

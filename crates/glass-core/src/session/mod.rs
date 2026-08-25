@@ -4,7 +4,6 @@
 use crate::accessibility::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, ChangeSignal,
     ChangeWait, ClickMethod, ElementCondition, ElementInfo, ElementMatch, WalkLimits,
-    element_match,
 };
 use crate::baseline::BaselineStore;
 use crate::deadline::Deadline;
