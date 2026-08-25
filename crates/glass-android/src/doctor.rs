@@ -5,7 +5,7 @@
 //! Reports `Check` statuses; never errors.
 
 use glass_core::Deadline;
-use glass_core::{Check, CheckStatus};
+use glass_core::{BoundedRun, Check, CheckStatus};
 
 use crate::a11y::{Attempt, adb_runner, attempt_deadline, dump_once};
 use crate::adb::Adb;
@@ -254,14 +254,14 @@ fn first_line(s: &str) -> String {
 fn list_avds(bin: &str, budget: std::time::Duration) -> AvdList {
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("-list-avds");
-    match glass_core::run_bounded(&mut cmd, budget, "emulator:-list-avds") {
-        Ok(o) => AvdList::Listed(parse_list_avds(&String::from_utf8_lossy(&o.stdout))),
-        Err(e) => {
-            // A timeout is reported, not logged (the detail carries the budget); every other
-            // failure is logged the way the other doctor probes are.
-            if e.bound() == Some(glass_core::BoundKind::TimedOut) {
-                return AvdList::TimedOut(e.to_string());
-            }
+    match glass_core::run_bounded_classified(&mut cmd, budget, "emulator:-list-avds") {
+        BoundedRun::Answered(o) => {
+            AvdList::Listed(parse_list_avds(&String::from_utf8_lossy(&o.stdout)))
+        }
+        // A timeout is reported, not logged (the detail carries the budget); every other
+        // failure is logged the way the other doctor probes are.
+        BoundedRun::TimedOut(e) => AvdList::TimedOut(e.to_string()),
+        BoundedRun::NotStarted(e) | BoundedRun::Failed(e) => {
             eprintln!("glass-android doctor: {e}");
             AvdList::Unreadable(e.to_string())
         }

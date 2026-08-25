@@ -50,6 +50,31 @@ pub const KILL_REAP: Duration = Duration::from_millis(500);
 /// AVD, a `uiautomator dump` is ~12KB and the largest, `exec-out screencap`, is ~10MB.
 const MAX_CAPTURE: usize = 64 * 1024 * 1024;
 
+/// The execution facts from one bounded command, before a caller assigns domain meaning.
+#[derive(Debug)]
+pub enum BoundedRun {
+    /// The command ran to completion. A non-zero status is still an answer.
+    Answered(Output),
+    /// The command ran until its effective bound elapsed.
+    TimedOut(GlassError),
+    /// The command was not spawned because no time remained.
+    NotStarted(GlassError),
+    /// The command did not produce a complete answer for another reason.
+    Failed(GlassError),
+}
+
+/// Run one command under `budget` and retain its execution facts as structured values.
+pub fn run_bounded_classified(cmd: &mut Command, budget: Duration, op: &str) -> BoundedRun {
+    match run_bounded(cmd, budget, op) {
+        Ok(output) => BoundedRun::Answered(output),
+        Err(error) => match error.bound() {
+            Some(BoundKind::TimedOut) => BoundedRun::TimedOut(error),
+            Some(BoundKind::NotStarted) => BoundedRun::NotStarted(error),
+            None => BoundedRun::Failed(error),
+        },
+    }
+}
+
 /// Run `cmd` to completion, or kill it and fail once `budget` elapses.
 ///
 /// `op` names the operation in the error (`"adb:uiautomator dump"`), so a timeout says which call
@@ -485,6 +510,65 @@ mod tests {
         )
         .expect("a failing command still yields its Output");
         assert_eq!(out.status.code(), Some(3));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_classified_run_preserves_a_nonzero_answer() {
+        let run = run_bounded_classified(
+            Command::new("/bin/sh").args(["-c", "printf answered; exit 3"]),
+            Duration::from_secs(10),
+            "test:classified-answer",
+        );
+        let BoundedRun::Answered(out) = run else {
+            panic!("a completed command is an answer");
+        };
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "answered");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_classified_run_names_a_timeout_without_message_matching() {
+        let run = run_bounded_classified(
+            Command::new("/bin/sh").args(["-c", "sleep 30"]),
+            Duration::from_millis(100),
+            "test:classified-timeout",
+        );
+        let BoundedRun::TimedOut(err) = run else {
+            panic!("a command killed at its bound is timed out");
+        };
+        assert_eq!(err.bound(), Some(BoundKind::TimedOut));
+        assert!(err.to_string().contains("test:classified-timeout"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_classified_run_says_when_it_never_started() {
+        let run = run_bounded_classified(
+            &mut Command::new("/bin/true"),
+            Duration::ZERO,
+            "test:classified-not-started",
+        );
+        let BoundedRun::NotStarted(err) = run else {
+            panic!("a zero-budget command is not started");
+        };
+        assert_eq!(err.bound(), Some(BoundKind::NotStarted));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_classified_run_keeps_an_ordinary_failure_distinct() {
+        let run = run_bounded_classified(
+            &mut Command::new("/path/glass-test-command-does-not-exist"),
+            Duration::from_secs(10),
+            "test:classified-failure",
+        );
+        let BoundedRun::Failed(err) = run else {
+            panic!("a spawn refusal is an ordinary execution failure");
+        };
+        assert_eq!(err.bound(), None);
+        assert!(err.to_string().contains("failed to start"), "{err}");
     }
 
     #[test]

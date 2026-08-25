@@ -13,7 +13,10 @@ pub mod toolpath;
 pub use toolpath::tool_path;
 
 pub mod bounded;
-pub use bounded::{note_if_skipped, run_bounded, run_bounded_until, run_bounded_with_stdin};
+pub use bounded::{
+    BoundedRun, note_if_skipped, run_bounded, run_bounded_classified, run_bounded_until,
+    run_bounded_with_stdin,
+};
 
 pub mod a11y_thread;
 pub use a11y_thread::A11yThread;
