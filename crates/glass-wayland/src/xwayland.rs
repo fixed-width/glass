@@ -46,8 +46,8 @@ pub const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// recovery runs at all, and neither can be arranged in the real one.
 const PROC: &str = "/proc";
 
-/// Which step of a cross-check failed. Kept so a session reports each kind once rather than
-/// reporting only whichever failed first.
+/// Which step of a cross-check failed — kept so a session reports each kind once, not only
+/// whichever failed first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Failed {
     /// Finding the session's Xwayland at all — the process table, or the entry it matched.
@@ -79,9 +79,8 @@ pub struct Recovery {
     unrecovered: usize,
     last_checked: Option<std::time::Instant>,
     /// What the last reported failure to reach the X side was, or `None` while there has been
-    /// none. Checks repeat for the life of the session, and one unreachable X server should read
-    /// as one warning, not as a line every interval — but a failure of a *different* kind is
-    /// news, so the kind is kept rather than a flag (glass#381).
+    /// none. One unreachable X server reads as one warning rather than a line every interval; a
+    /// failure of a *different* kind is news (glass#381).
     warned: Option<Failed>,
 }
 
@@ -119,9 +118,9 @@ impl Recovery {
             .is_none_or(|last| now.duration_since(last) >= CHECK_INTERVAL)
     }
 
-    /// Report a failure to reach the session's X side once per kind. The cross-check repeats for
-    /// the life of the session, so an X server that stays unreachable would otherwise repeat its
-    /// warning every interval — drowning out whatever the app itself is saying.
+    /// Report a failure to reach the session's X side once per kind. An X server that stays
+    /// unreachable would otherwise repeat its warning every interval, drowning out the app's own
+    /// output.
     fn warn_once(&mut self, failed: Failed, message: String) {
         if self.warned != Some(failed) {
             self.warned = Some(failed);
@@ -954,9 +953,8 @@ mod session_tests {
     /// Before the match a read failure is routine: another user's Xwayland is unreadable by
     /// design, and one that exits mid-scan is gone. Neither is this session's to report.
     ///
-    /// The only Xwayland in the table is the unreadable one, so the answer cannot come from
-    /// somewhere else — a second, readable entry would let the scan return before ever reading
-    /// this one, whatever it does with a read it cannot make.
+    /// The only Xwayland in the table is the unreadable one: a second, readable entry would let
+    /// the scan return before ever reading this one.
     #[test]
     fn an_xwayland_whose_environ_cannot_be_read_is_skipped_not_reported() {
         let proc = FakeProc::new();
@@ -1172,8 +1170,8 @@ mod tests {
         );
     }
 
-    /// One line per failure, not per session: the discovery failure above must not consume the
-    /// line a failed connect would have said, which is the asymmetry glass#381 is about.
+    /// One line per failure kind, not per session: the discovery failure must not consume the
+    /// line a failed connect would have said (glass#381).
     #[test]
     fn a_connect_failure_after_a_table_failure_is_still_said() {
         let rt = tempfile::tempdir().expect("tempdir");
