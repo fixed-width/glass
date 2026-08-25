@@ -1425,14 +1425,9 @@ impl ElementInfo {
 }
 
 impl AxTree {
-    /// Evaluate a precise element condition against this tree. The selector is the
-    /// conjunction of: `name` substring of the node's name, `role` equality, and
-    /// `value_contains` substring of the node's value (each optional). For positive
-    /// conditions, returns the first node matching selector + state; for
-    /// `Disappears`, satisfied iff no node matches the selector.
-    ///
-    /// A `name` or `value_contains` filter only matches nodes whose corresponding field
-    /// is `Some`. Pass `None` to skip that filter entirely.
+    /// Evaluate `condition` against the first pre-order node matching the optional name, role,
+    /// and value filters. `Disappears` is satisfied only when no node matches the selector.
+    /// Name and value filters do not match missing fields.
     pub fn element_match(
         &self,
         name: Option<&str>,
@@ -1440,11 +1435,9 @@ impl AxTree {
         value_contains: Option<&str>,
         condition: ElementCondition,
     ) -> ElementMatch<'_> {
-        // Jetpack Compose surfaces a real button as a clickable `Group`/`Other` with the role
-        // lost, so an exact filter misses it; name + actability finds it anyway.
-        //
-        // The disambiguator is required: without it a role-only query would match the first
-        // focusable container in the tree — a confident wrong match, not an honest miss.
+        // Jetpack Compose can expose clickable controls as focusable `Group`/`Other` nodes, so a
+        // qualified interactable role may match them; requiring a qualifier prevents role-only
+        // queries from matching arbitrary focusable containers.
         let has_disambiguator = name.is_some() || value_contains.is_some();
         let role_match = |n: &AxNode, r: AxRole| {
             n.role == r
