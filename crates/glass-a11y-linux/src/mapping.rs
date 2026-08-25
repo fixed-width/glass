@@ -9,11 +9,14 @@ use glass_core::{AxRole, AxStates};
 pub(crate) fn map_role(role: Role) -> AxRole {
     match role {
         Role::Application => AxRole::Application,
-        Role::Frame | Role::Window | Role::InternalFrame => AxRole::Window,
+        Role::Frame | Role::Window => AxRole::Window,
         Role::Dialog | Role::Alert | Role::FileChooser | Role::ColorChooser | Role::FontChooser => {
             AxRole::Dialog
         }
         Role::Panel
+        // `InternalFrame` is a web engine's `<iframe>`, not a desktop window — see
+        // `a_web_frame_is_a_group_not_a_window`.
+        | Role::InternalFrame
         | Role::Filler
         | Role::Viewport
         | Role::SplitPane
@@ -102,6 +105,18 @@ mod tests {
         assert_eq!(map_role(Role::MenuItem), AxRole::MenuItem);
         assert_eq!(map_role(Role::PageTabList), AxRole::TabList);
         assert_eq!(map_role(Role::Application), AxRole::Application);
+    }
+
+    #[test]
+    fn a_web_frame_is_a_group_not_a_window() {
+        // Measured 2026-08-25 (#520): Firefox 153 publishes `internal frame` for an `<iframe>`
+        // and for each of its own browser docshells, and Chromium maps `kIframe` to the same
+        // token. Mapping it to `Window` put windows inside a page and made a `role:"Window"`
+        // selector match iframes. No desktop toolkit publishes the role: GTK 3.24.41 and 4.14.5
+        // never return it, and Qt's 82-role table has no entry for it.
+        assert_eq!(map_role(Role::InternalFrame), AxRole::Group);
+        assert_eq!(map_role(Role::Frame), AxRole::Window);
+        assert_eq!(map_role(Role::Window), AxRole::Window);
     }
 
     #[test]
