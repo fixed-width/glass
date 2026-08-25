@@ -57,7 +57,7 @@ enum CameUp {
 }
 
 /// What the probe started and did not stop. Something to report by construction — the absence is
-/// `None` — though not always something it can name: see `unknown`.
+/// `None`.
 #[derive(Debug)]
 struct Leaked {
     /// Processes of the probe's own session still running.
@@ -86,7 +86,6 @@ impl Leaked {
 #[derive(Debug)]
 struct LeftRunning {
     pids: Vec<u32>,
-    /// Why the session scan could not be run, when it could not.
     unknown: Option<String>,
 }
 
@@ -217,8 +216,7 @@ struct Survivors {
     remedy: String,
 }
 
-/// Describe what was left running, and what could not be established — a survivor the notice
-/// cannot name.
+/// Describe what was left running, and what could not be established.
 fn leak_notice(leaked: &Leaked) -> Survivors {
     let dir = leaked.runtime_dir.display();
     let mut details = Vec::new();

@@ -770,8 +770,7 @@ mod x_tests {
 #[cfg(test)]
 mod session_tests {
     //! Finding the session's own Xwayland. Only a real session shows the match is by runtime
-    //! directory rather than by whatever `DISPLAY` is set to; the process table a scan reads is a
-    //! parameter, so what it does with one it cannot read is shown against a built table.
+    //! directory rather than by whatever `DISPLAY` is set to.
     use super::*;
     use crate::testw::Launch;
 
@@ -845,10 +844,6 @@ mod session_tests {
     }
 
     /// A process table built for a test: pid directories holding the files the scans read.
-    ///
-    /// The failures glass#381 is about — a `/proc` that cannot be read at all, an entry whose
-    /// files cannot be — do not happen on demand in the real one, and each of them decides
-    /// whether recovery runs for the session.
     pub(super) struct FakeProc(tempfile::TempDir);
 
     impl FakeProc {
@@ -926,8 +921,8 @@ mod session_tests {
         );
     }
 
-    /// Past the runtime-dir match the process is this session's own, so a file that cannot be read
-    /// is glass unable to read its own Xwayland — not another session's, which it may skip.
+    /// The other half of the split: past the match, a file that cannot be read is glass unable to
+    /// read its own Xwayland.
     #[test]
     fn the_sessions_own_xwayland_with_an_unreadable_cmdline_is_reported() {
         let proc = FakeProc::new();
@@ -939,8 +934,8 @@ mod session_tests {
         assert!(e.to_string().contains("cmdline"), "{e}");
     }
 
-    /// Its display is what the probe connects to. Not finding one leaves recovery off just as an
-    /// unreadable table does, so it is reported the same way rather than read as no X11 side.
+    /// Its display is what the probe connects to; not finding one leaves recovery off just as an
+    /// unreadable table does.
     #[test]
     fn the_sessions_own_xwayland_with_no_display_argument_is_reported() {
         let proc = FakeProc::new();
@@ -950,9 +945,6 @@ mod session_tests {
             .expect_err("an Xwayland with no display is not one this session can be probed on");
     }
 
-    /// Before the match a read failure is routine: another user's Xwayland is unreadable by
-    /// design, and one that exits mid-scan is gone. Neither is this session's to report.
-    ///
     /// The only Xwayland in the table is the unreadable one: a second, readable entry would let
     /// the scan return before ever reading this one.
     #[test]
@@ -968,8 +960,8 @@ mod session_tests {
         );
     }
 
-    /// glass#381: doctor reads an empty list as "the probe left nothing running" and deletes the
-    /// session's runtime dir on the strength of it. A table that could not be read is not that.
+    /// glass#381: doctor reads an empty list as "the probe left nothing running"; a table that
+    /// could not be read is not that.
     #[test]
     fn a_process_table_that_cannot_be_read_is_not_an_empty_session() {
         session_processes_in(no_process_table(), Path::new("/tmp/glass-wl.ab"))
@@ -1152,9 +1144,8 @@ mod tests {
         assert!(r.due(now));
     }
 
-    /// glass#381: a process table glass cannot read leaves recovery off for the whole session.
-    /// That is a failure of glass's own machinery and has to read like one, not like the native
-    /// Wayland session that legitimately has no display to find.
+    /// glass#381: recovery off for the session reads as a failure of glass's own machinery, not
+    /// as the native Wayland session that legitimately has no display to find.
     #[test]
     fn a_process_table_that_cannot_be_read_is_reported_and_recovers_nothing() {
         let mut r = Recovery::new(Path::new("/tmp/glass-wl.ab"));
