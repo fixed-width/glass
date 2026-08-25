@@ -799,9 +799,15 @@ fn dropping_platform_reaps_the_app() {
 // ---------------------------------------------------------------------------
 
 /// Minimal X11 CLIPBOARD owner: opens its own connection, owns CLIPBOARD with
-/// `text`, serves exactly one SelectionRequest (TARGETS or UTF8_STRING), then
+/// `response`, serves exactly one SelectionRequest (TARGETS or UTF8_STRING), then
 /// returns.  Used to simulate a foreign app having clipboard ownership.
-fn serve_clipboard_once(display: &str, text: &str) {
+#[derive(Clone, Copy)]
+enum ClipboardResponse<'a> {
+    Text(&'a str),
+    Incr(u32),
+}
+
+fn serve_clipboard_once(display: &str, response: ClipboardResponse<'_>) {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::*;
     use x11rb::wrapper::ConnectionExt as _;
@@ -825,6 +831,12 @@ fn serve_clipboard_once(display: &str, text: &str) {
         .atom;
     let targets_atom = conn
         .intern_atom(false, b"TARGETS")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    let incr = conn
+        .intern_atom(false, b"INCR")
         .unwrap()
         .reply()
         .unwrap()
@@ -885,16 +897,30 @@ fn serve_clipboard_once(display: &str, text: &str) {
                             .check()
                             .unwrap();
                         } else if req.target == utf8 {
-                            conn.change_property8(
-                                PropMode::REPLACE,
-                                req.requestor,
-                                reply_prop,
-                                utf8,
-                                text.as_bytes(),
-                            )
-                            .unwrap()
-                            .check()
-                            .unwrap();
+                            match response {
+                                ClipboardResponse::Text(text) => conn
+                                    .change_property8(
+                                        PropMode::REPLACE,
+                                        req.requestor,
+                                        reply_prop,
+                                        utf8,
+                                        text.as_bytes(),
+                                    )
+                                    .unwrap()
+                                    .check()
+                                    .unwrap(),
+                                ClipboardResponse::Incr(size) => conn
+                                    .change_property32(
+                                        PropMode::REPLACE,
+                                        req.requestor,
+                                        reply_prop,
+                                        incr,
+                                        &[size],
+                                    )
+                                    .unwrap()
+                                    .check()
+                                    .unwrap(),
+                            }
                         } else {
                             // Unsupported target: refuse by setting property to None.
                             // We notify with property=NONE.
@@ -964,7 +990,9 @@ fn clipboard_get_reads_a_foreign_owner() {
     let xvfb = Xvfb::start();
     // A second client owns CLIPBOARD with known UTF8_STRING text, serving SelectionRequest.
     let display = xvfb.display.clone();
-    let owner = std::thread::spawn(move || serve_clipboard_once(&display, "from-other-app"));
+    let owner = std::thread::spawn(move || {
+        serve_clipboard_once(&display, ClipboardResponse::Text("from-other-app"))
+    });
     // Give the owner thread time to set up and take ownership before we request.
     std::thread::sleep(std::time::Duration::from_millis(200));
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
@@ -972,6 +1000,27 @@ fn clipboard_get_reads_a_foreign_owner() {
     assert_eq!(result, "from-other-app");
     owner.join().ok();
     p.stop_app().ok();
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn clipboard_get_refuses_an_incr_transfer_instead_of_returning_truncated_text() {
+    let xvfb = Xvfb::start();
+    let display = xvfb.display.clone();
+    let owner = std::thread::spawn(move || {
+        serve_clipboard_once(&display, ClipboardResponse::Incr(512 * 1024))
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+
+    let err = p
+        .get_clipboard()
+        .expect_err("INCR must fail explicitly until incremental reads are supported");
+    assert!(
+        err.to_string().contains("INCR unsupported"),
+        "the refusal must name the unsupported transfer: {err}"
+    );
+    owner.join().unwrap();
 }
 
 #[test]
@@ -1090,6 +1139,21 @@ fn clipboard_owner_answers_targets_and_refuses_unknown_target() {
         "an unsupported target must be refused with property == NONE"
     );
     p.stop_app().ok();
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn clipboard_owner_refuses_text_too_large_for_one_x11_property_write() {
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    // Xvfb's BIG-REQUESTS ceiling is 16 MiB, so smaller payloads still fit one property write.
+    let text = "x".repeat(20 * 1024 * 1024);
+    p.set_clipboard(&text).unwrap();
+
+    assert!(
+        request_clipboard_target(&xvfb.display, b"UTF8_STRING").is_none(),
+        "an oversized transfer must be refused rather than left unanswered or truncated"
+    );
 }
 
 // ---------------------------------------------------------------------------
