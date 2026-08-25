@@ -1190,6 +1190,8 @@ mod tests {
         assert!(deep.detail.contains("could not tell"), "{deep:?}");
         // The cause, so an operator can act on it rather than re-run and hope.
         assert!(deep.detail.contains(SCAN_FAILED), "{deep:?}");
+        // And nothing about survivors it never saw.
+        assert!(!deep.detail.contains("still running"), "{deep:?}");
         assert!(
             deep.detail.contains("/tmp/glass-doctor-wl.abc123"),
             "{deep:?}"

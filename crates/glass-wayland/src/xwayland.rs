@@ -46,6 +46,18 @@ pub const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// recovery runs at all, and neither can be arranged in the real one.
 const PROC: &str = "/proc";
 
+/// Which step of a cross-check failed. Kept so a session reports each kind once rather than
+/// reporting only whichever failed first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failed {
+    /// Finding the session's Xwayland at all — the process table, or the entry it matched.
+    Discovery,
+    /// Connecting to the display it found.
+    Connect,
+    /// Reading the windows from a connection that was established.
+    Read,
+}
+
 /// A session's state for recovering lost toplevels: which session it is, the X connection once
 /// one exists, what has been tried, what was missing last time, and when the last check ran.
 pub struct Recovery {
@@ -66,11 +78,11 @@ pub struct Recovery {
     /// bare timeout for an app whose window glass could see all along.
     unrecovered: usize,
     last_checked: Option<std::time::Instant>,
-    /// Whether a failure to reach the X side has already been reported. Checks repeat for the
-    /// life of the session, and one unreachable X server should read as one warning, not as a
-    /// line every interval. Cleared with the connection, so a later failure of a different kind
-    /// still gets said once.
-    warned: bool,
+    /// What the last reported failure to reach the X side was, or `None` while there has been
+    /// none. Checks repeat for the life of the session, and one unreachable X server should read
+    /// as one warning, not as a line every interval — but a failure of a *different* kind is
+    /// news, so the kind is kept rather than a flag (glass#381).
+    warned: Option<Failed>,
 }
 
 impl Recovery {
@@ -82,7 +94,7 @@ impl Recovery {
             missing_before: HashSet::new(),
             unrecovered: 0,
             last_checked: None,
-            warned: false,
+            warned: None,
         }
     }
 
@@ -107,12 +119,12 @@ impl Recovery {
             .is_none_or(|last| now.duration_since(last) >= CHECK_INTERVAL)
     }
 
-    /// Report a failure to reach the session's X side once. The cross-check repeats for the life
-    /// of the session, so an X server that stays unreachable would otherwise repeat its warning
-    /// every interval — drowning out whatever the app itself is saying.
-    fn warn_once(&mut self, message: String) {
-        if !self.warned {
-            self.warned = true;
+    /// Report a failure to reach the session's X side once per kind. The cross-check repeats for
+    /// the life of the session, so an X server that stays unreachable would otherwise repeat its
+    /// warning every interval — drowning out whatever the app itself is saying.
+    fn warn_once(&mut self, failed: Failed, message: String) {
+        if self.warned != Some(failed) {
+            self.warned = Some(failed);
             eprintln!("{message}");
         }
     }
@@ -157,19 +169,23 @@ impl Recovery {
                     // Not that: glass could not look. Recovery is off for the session either
                     // way, so it is said like a failed connect (glass#381).
                     Err(e) => {
-                        self.warn_once(format!(
-                            "glass: could not find the session's Xwayland: {e}. Windows the \
-                             compositor loses will not be recovered."
-                        ));
+                        self.warn_once(
+                            Failed::Discovery,
+                            format!(
+                                "glass: could not find the session's Xwayland: {e}. Windows the \
+                                 compositor loses will not be recovered."
+                            ),
+                        );
                         return 0;
                     }
                 };
                 match XProbe::connect(&display) {
                     Ok(p) => p,
                     Err(e) => {
-                        self.warn_once(format!(
-                            "glass: could not inspect the session's Xwayland display: {e}"
-                        ));
+                        self.warn_once(
+                            Failed::Connect,
+                            format!("glass: could not inspect the session's Xwayland display: {e}"),
+                        );
                         return 0;
                     }
                 }
@@ -181,11 +197,12 @@ impl Recovery {
                 // The connection is dropped rather than kept (it was taken out of `self` above):
                 // an Xwayland that went away leaves a socket that answers nothing, and keeping it
                 // would turn one dead connection into recovery being off for the rest of the
-                // session. The warning is re-armed with it, so the next failure still gets said.
-                self.warned = false;
-                self.warn_once(format!(
-                    "glass: could not read the session's Xwayland windows: {e}"
-                ));
+                // session. Whatever the reconnect then fails at is a different kind, so it is
+                // still said once.
+                self.warn_once(
+                    Failed::Read,
+                    format!("glass: could not read the session's Xwayland windows: {e}"),
+                );
                 return 0;
             }
         };
@@ -361,7 +378,7 @@ fn session_display(proc_root: &Path, runtime_dir: &Path) -> Result<Option<String
         })?;
         return display_from_cmdline(&cmdline).map(Some).ok_or_else(|| {
             GlassError::Backend(format!(
-                "the session's Xwayland (pid {pid}) was started with no display argument"
+                "no bare `:N` display argument in the session's Xwayland cmdline (pid {pid})"
             ))
         });
     }
@@ -403,6 +420,8 @@ pub(crate) fn session_processes(runtime_dir: &Path) -> Result<Vec<u32>> {
 fn session_processes_in(proc_root: &Path, runtime_dir: &Path) -> Result<Vec<u32>> {
     Ok(proc_pids(proc_root)?
         .into_iter()
+        // A process whose environ cannot be read is another user's or already gone; the
+        // session's own are this process's children and readable by it.
         .filter(|pid| {
             std::fs::read(proc_root.join(pid.to_string()).join("environ"))
                 .is_ok_and(|environ| serves_session(&environ, runtime_dir))
@@ -433,6 +452,9 @@ fn display_from_cmdline(cmdline: &[u8]) -> Option<String> {
 
 /// Whether `pid` is an Xwayland process, read from `/proc/<pid>/comm`. Also used by teardown,
 /// which must not wait on the compositor's own plumbing the way it waits on the app.
+///
+/// A `comm` that cannot be read answers `false`: it is world-readable, so the process is one that
+/// exited mid-scan.
 pub fn is_xwayland(pid: u32) -> bool {
     is_xwayland_in(Path::new(PROC), pid)
 }
@@ -828,20 +850,26 @@ mod session_tests {
     /// The failures glass#381 is about — a `/proc` that cannot be read at all, an entry whose
     /// files cannot be — do not happen on demand in the real one, and each of them decides
     /// whether recovery runs for the session.
-    struct FakeProc(tempfile::TempDir);
+    pub(super) struct FakeProc(tempfile::TempDir);
 
     impl FakeProc {
-        fn new() -> FakeProc {
+        pub(super) fn new() -> FakeProc {
             FakeProc(tempfile::tempdir().expect("tempdir"))
         }
 
-        fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &Path {
             self.0.path()
         }
 
         /// A process whose `comm` is `comm`, whose environment says it belongs to `runtime_dir`,
         /// and whose `cmdline` is `argv`.
-        fn process(&self, pid: u32, comm: &str, runtime_dir: &Path, argv: &[&str]) -> PathBuf {
+        pub(super) fn process(
+            &self,
+            pid: u32,
+            comm: &str,
+            runtime_dir: &Path,
+            argv: &[&str],
+        ) -> PathBuf {
             let dir = self.path().join(pid.to_string());
             std::fs::create_dir(&dir).expect("pid dir");
             std::fs::write(dir.join("comm"), format!("{comm}\n")).expect("comm");
@@ -856,7 +884,7 @@ mod session_tests {
     }
 
     /// Put something in place of `file` that no read can succeed on whatever the caller's
-    /// privileges — a mode-0 file still opens as root, which is how CI runs.
+    /// privileges — a mode-0 file still opens as root.
     fn make_unreadable(file: &Path) {
         std::fs::remove_file(file).expect("remove the file");
         std::fs::create_dir(file).expect("a directory in its place");
@@ -924,7 +952,11 @@ mod session_tests {
     }
 
     /// Before the match a read failure is routine: another user's Xwayland is unreadable by
-    /// design, and one that exits mid-scan is gone. Neither may hide the session's own.
+    /// design, and one that exits mid-scan is gone. Neither is this session's to report.
+    ///
+    /// The only Xwayland in the table is the unreadable one, so the answer cannot come from
+    /// somewhere else — a second, readable entry would let the scan return before ever reading
+    /// this one, whatever it does with a read it cannot make.
     #[test]
     fn an_xwayland_whose_environ_cannot_be_read_is_skipped_not_reported() {
         let proc = FakeProc::new();
@@ -932,10 +964,9 @@ mod session_tests {
         let theirs = tempfile::tempdir().expect("tempdir");
         let unreadable = proc.process(41, "Xwayland", theirs.path(), &["Xwayland", ":1"]);
         make_unreadable(&unreadable.join("environ"));
-        proc.process(42, "Xwayland", mine.path(), &["Xwayland", ":7"]);
         assert_eq!(
             session_display(proc.path(), mine.path()).expect("scan"),
-            Some(":7".to_string())
+            None
         );
     }
 
@@ -1019,11 +1050,12 @@ mod tests {
     #[test]
     fn the_first_warning_is_said_and_arms_the_silence() {
         let mut r = Recovery::new(std::path::Path::new("/nonexistent"));
-        assert!(!r.warned);
-        r.warn_once("glass: test warning".into());
-        assert!(
+        assert!(r.warned.is_none());
+        r.warn_once(Failed::Connect, "glass: test warning".into());
+        assert_eq!(
             r.warned,
-            "a warning that never arms the flag repeats forever"
+            Some(Failed::Connect),
+            "a warning that never records its kind repeats forever"
         );
     }
 
@@ -1133,7 +1165,29 @@ mod tests {
             r.recover_if_due_in(Path::new("/nonexistent/glass-381/proc"), now, &[]),
             0
         );
-        assert!(r.warned, "recovery off for the session, said out loud");
+        assert_eq!(
+            r.warned,
+            Some(Failed::Discovery),
+            "recovery off for the session, said out loud"
+        );
+    }
+
+    /// One line per failure, not per session: the discovery failure above must not consume the
+    /// line a failed connect would have said, which is the asymmetry glass#381 is about.
+    #[test]
+    fn a_connect_failure_after_a_table_failure_is_still_said() {
+        let rt = tempfile::tempdir().expect("tempdir");
+        let mut r = Recovery::new(rt.path());
+        let now = std::time::Instant::now();
+        r.recover_if_due_in(Path::new("/nonexistent/glass-381/proc"), now, &[]);
+        // A display no X server serves: discovery answers, and the connect behind it cannot.
+        let proc = super::session_tests::FakeProc::new();
+        proc.process(41, "Xwayland", rt.path(), &["Xwayland", ":999"]);
+        assert_eq!(
+            r.recover_if_due_in(proc.path(), now + CHECK_INTERVAL, &[]),
+            0
+        );
+        assert_eq!(r.warned, Some(Failed::Connect));
     }
 
     /// A session whose runtime directory no Xwayland holds is a native Wayland app: no work, no
@@ -1142,7 +1196,10 @@ mod tests {
     fn a_session_with_no_xwayland_recovers_nothing_and_says_nothing() {
         let mut r = Recovery::new(Path::new("/tmp/glass-wl.no-such-session"));
         assert_eq!(r.recover_if_due(std::time::Instant::now(), &[]), 0);
-        assert!(!r.warned, "a session with no X11 side is not a failure");
+        assert!(
+            r.warned.is_none(),
+            "a session with no X11 side is not a failure"
+        );
         assert_eq!(r.unrecovered(), 0);
     }
 
