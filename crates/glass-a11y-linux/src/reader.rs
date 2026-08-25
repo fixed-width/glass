@@ -338,13 +338,18 @@ fn write_verdict(
     observed: Option<&str>,
 ) -> GlassError {
     match observed {
+        None => GlassError::AxWriteUnconfirmed(
+            id,
+            "the element exposes a writable value but no readable value was available after the write"
+                .into(),
+        ),
         Some(seen) if write_took_no_effect(seen, before) => GlassError::value_not_applied_because(
             id,
             requested,
             Some(seen),
             ACKNOWLEDGED_NOT_APPLIED,
         ),
-        seen => GlassError::value_not_applied(id, requested, seen),
+        Some(seen) => GlassError::value_not_applied(id, requested, Some(seen)),
     }
 }
 
@@ -930,8 +935,8 @@ mod tests {
         );
         let unread = write_verdict(3, "typed", Some("old"), None);
         assert!(
-            matches!(unread, GlassError::AxValueNotApplied { why: None, .. }),
-            "a read-back that failed is no evidence about the write; got: {unread:?}"
+            matches!(unread, GlassError::AxWriteUnconfirmed(3, _)),
+            "a read-back that failed cannot prove the write was rejected; got: {unread:?}"
         );
     }
 
