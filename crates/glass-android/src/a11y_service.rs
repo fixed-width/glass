@@ -14,7 +14,7 @@ use glass_core::accessibility::{
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result, read_back_failed, write_took_no_effect};
 
-use crate::axmap::{LabelInputs, class_to_role, labels};
+use crate::axmap::{LabelInputs, class_to_role, demote_web_hosts, labels};
 use crate::conn::{CallFailure, Conn};
 
 /// One walk of a device `tree` reply: the bounds it runs under, and the device `ref` of every
@@ -179,6 +179,7 @@ pub(crate) fn tree_from_json(
 ) -> Result<RefTree> {
     let mut walk = Walk::new(limits);
     let mut root = json_to_node(tree, win, 0, &mut walk)?;
+    demote_web_hosts(&mut root);
     // The device answers with the root of the ACTIVE WINDOW, so this node is the window
     // whatever layout class it carries. Both Android readers have to agree about the root, or
     // a `role:` selector written against one misses on the other.
@@ -1645,6 +1646,32 @@ mod tests {
         assert_eq!(tree.root.children[0].role, AxRole::Label);
         assert_eq!(tree.root.children[1].id, AxNodeId(2));
         assert_eq!(tree.root.children[1].role, AxRole::Button);
+    }
+
+    #[test]
+    fn the_host_view_of_a_published_page_is_a_group_here_too() {
+        // Both readers have to agree about a web page's shape, or one `role:` selector cannot
+        // address it on both (glass#521).
+        let page = json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
+            "children": [{
+                "class": "android.webkit.WebView", "desc": "the web view",
+                "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2148},
+                "children": [{
+                    "class": "android.webkit.WebView",
+                    "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2148},
+                    "children": [{
+                        "class": "android.view.View", "text": "Role fixture",
+                        "bounds": {"x": 0, "y": 0, "w": 1080, "h": 120}, "children": []
+                    }]
+                }]
+            }]
+        });
+        let tree = read_json(&page, WalkLimits::DEFAULT).expect("builds").tree;
+        let host = &tree.root.children[0];
+        assert_eq!(host.role, AxRole::Group, "the host view");
+        assert_eq!(host.children[0].role, AxRole::Document, "the page root");
     }
 
     #[test]

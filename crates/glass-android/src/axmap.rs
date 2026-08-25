@@ -68,6 +68,32 @@ pub fn class_to_role(class: &str) -> AxRole {
     AxRole::Other
 }
 
+/// Re-role a web view's host to [`AxRole::Group`] where the engine has published the page root
+/// inside it, leaving one `Document` per web view instead of two nested ones (glass#521).
+///
+/// A web engine gives the page root the host's own class, so both nodes report
+/// `android.webkit.WebView`. Both readers call this, or a `role:` selector written against one
+/// misses on the other. No node is dropped and no id moves.
+///
+/// Not bounds: on the reading this came from the host was 2062px tall and the page root inside it
+/// 2064, so a same-rect test would never have fired.
+///
+/// A host that has published no page root stays a `Document` — the node
+/// [`glass_core::accessibility::AxTree::document_guidance`] names to say the page is not in the
+/// tree yet.
+pub(crate) fn demote_web_hosts(node: &mut AxNode) {
+    if node.role == AxRole::Document
+        && let [child] = node.children.as_slice()
+        && child.role == AxRole::Document
+        && child.raw_role == node.raw_role
+    {
+        node.role = AxRole::Group;
+    }
+    for child in &mut node.children {
+        demote_web_hosts(child);
+    }
+}
+
 /// `com.example:id/search_src_text` → `search_src_text`. The package-qualified form is noise in an
 /// outline; the bare leaf is still not unique within an app's tree — see [`labels`]'s doc for why
 /// it is only a label of last resort. The leaf can be blank where the whole id was not
@@ -120,7 +146,7 @@ pub fn build_tree(xml: &str, window: &WindowGeometry, limits: WalkLimits) -> Res
         }
         children.push(map_node(n, window, 0, &mut budget));
     }
-    let root = AxNode {
+    let mut root = AxNode {
         id: AxNodeId(0),
         role: AxRole::Window,
         raw_role: "hierarchy".into(),
@@ -136,6 +162,7 @@ pub fn build_tree(xml: &str, window: &WindowGeometry, limits: WalkLimits) -> Res
         }),
         children,
     };
+    demote_web_hosts(&mut root);
     let mut tree = AxTree::new(root);
     tree.truncated = budget.truncation();
     Ok(tree)
@@ -634,6 +661,51 @@ mod tests {
         // glass#506: as a Group, a WebView whose content the reader could not enter was
         // indistinguishable from an empty container.
         assert_eq!(class_to_role("android.webkit.WebView"), AxRole::Document);
+    }
+
+    /// A published web page as `uiautomator` dumps it: the host view, the page root inside it
+    /// reporting the same class, and one page node.
+    const PUBLISHED_WEB_PAGE_XML: &str = concat!(
+        "<?xml version='1.0'?><hierarchy rotation=\"0\">",
+        "<node index=\"0\" text=\"\" class=\"android.webkit.WebView\" package=\"com.x\" ",
+        "content-desc=\"the web view\" enabled=\"true\" focusable=\"true\" focused=\"true\" ",
+        "bounds=\"[0,0][1080,2148]\">",
+        "<node index=\"0\" text=\"\" class=\"android.webkit.WebView\" package=\"com.x\" ",
+        "content-desc=\"\" enabled=\"true\" focusable=\"false\" bounds=\"[0,0][1080,2148]\">",
+        "<node index=\"0\" text=\"Role fixture\" class=\"android.view.View\" package=\"com.x\" ",
+        "enabled=\"true\" focusable=\"false\" bounds=\"[0,0][1080,120]\" />",
+        "</node></node></hierarchy>",
+    );
+
+    #[test]
+    fn the_host_view_of_a_published_page_is_a_group_not_a_second_document() {
+        // glass#521, read on an API 34 emulator: the host view and the page root the engine
+        // publishes inside it both report `android.webkit.WebView`, so every web view arrived as
+        // two nested `Document`s and `role:"Document"` matched twice.
+        let tree = build_tree(PUBLISHED_WEB_PAGE_XML, &win(), WalkLimits::DEFAULT).unwrap();
+        let host = &tree.root.children[0];
+        assert_eq!(host.role, AxRole::Group, "the host view");
+        assert_eq!(host.children[0].role, AxRole::Document, "the page root");
+    }
+
+    #[test]
+    fn a_web_view_that_has_published_no_page_root_stays_a_document() {
+        // Demoting a host before its page root arrives would silence the childless-`Document`
+        // notice — on this fixture the first read after a launch is that shape.
+        let xml = concat!(
+            "<?xml version='1.0'?><hierarchy rotation=\"0\">",
+            "<node index=\"0\" text=\"\" class=\"android.webkit.WebView\" package=\"com.x\" ",
+            "content-desc=\"the web view\" enabled=\"true\" focusable=\"true\" ",
+            "bounds=\"[0,0][1080,2148]\" />",
+            "</hierarchy>",
+        );
+        let mut tree = build_tree(xml, &win(), WalkLimits::DEFAULT).unwrap();
+        tree.assign_ids();
+        assert_eq!(tree.root.children[0].role, AxRole::Document);
+        assert!(
+            tree.document_guidance().is_some(),
+            "the notice must still name it"
+        );
     }
 
     #[test]
