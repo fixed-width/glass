@@ -77,6 +77,43 @@ fn launches_testapp_and_finds_its_window() {
     p.stop_app().unwrap();
 }
 
+#[test]
+#[ignore = "mutates process environment and requires Xvfb; run via scripts/test-x11.sh"]
+fn from_env_without_glass_display_spawns_a_usable_private_xvfb() {
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                // SAFETY: `--test-threads=1` (see the header) means no concurrent env reader.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    let keys = ["GLASS_DISPLAY", "GLASS_XVFB_SCREEN", "DISPLAY"];
+    let _guard = EnvGuard(
+        keys.into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+    );
+    // SAFETY: `--test-threads=1` (see the header) means no concurrent env reader.
+    unsafe {
+        std::env::remove_var("GLASS_DISPLAY");
+        std::env::set_var("GLASS_XVFB_SCREEN", "640x480x24");
+        std::env::set_var("DISPLAY", ":65535");
+    }
+
+    let mut p = X11Platform::from_env().expect("spawn and connect to a private Xvfb");
+    let geom = p.start_app(&app_spec()).expect("launch on private Xvfb");
+    assert_eq!((geom.width, geom.height), (320, 240));
+    p.stop_app().unwrap();
+}
+
 fn pixel(frame: &glass_core::Frame, x: u32, y: u32) -> [u8; 4] {
     let i = ((y * frame.width + x) * 4) as usize;
     [
