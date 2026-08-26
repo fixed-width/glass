@@ -1,0 +1,429 @@
+//! A scriptable in-memory `Platform` so tool logic can be tested with no X
+//! server. Mirrors the one in glass-core's own tests.
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use glass_core::{
+    Accessibility, AppSpec, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget,
+    AxTree, Backend, BaselineStore, Frame, Glass, GlassError, KeyEvent, Platform, PlatformFactory,
+    PointerEvent, Region, Result, Stream, Truncation, TruncationLimit, WindowGeometry, WindowId,
+    WindowInfo, WindowOp,
+};
+
+use super::{OutContent, ToolOutput};
+
+#[derive(Default)]
+pub struct FakePlatform {
+    pub geometry: WindowGeometry,
+    pub frames: VecDeque<Frame>,
+    pub pending_logs: Vec<(Stream, String)>,
+    pub pointer_events: Vec<PointerEvent>,
+    pub key_events: Vec<KeyEvent>,
+    pub started: bool,
+    pub events: Arc<Mutex<Vec<String>>>,
+    pub clipboard: String,
+    /// Count of `capture_frame` calls — lets a test assert a settle actually captured
+    /// frames (e.g. `return:"snapshot"` settling before it folds the tree).
+    pub captures: Arc<Mutex<usize>>,
+    /// Specs `start_app` was handed, in order — the only observer of what the tool layer
+    /// built from `glass_start`'s arguments.
+    pub specs: Arc<Mutex<Vec<AppSpec>>>,
+}
+
+impl FakePlatform {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            geometry: WindowGeometry {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            ..Default::default()
+        }
+    }
+    pub fn with_frames(mut self, frames: Vec<Frame>) -> Self {
+        self.frames = frames.into();
+        self
+    }
+    pub fn with_logs(mut self, logs: Vec<(Stream, &str)>) -> Self {
+        self.pending_logs = logs.into_iter().map(|(s, t)| (s, t.to_string())).collect();
+        self
+    }
+    pub fn with_event_log(mut self, log: Arc<Mutex<Vec<String>>>) -> Self {
+        self.events = log;
+        self
+    }
+    pub fn with_capture_log(mut self, log: Arc<Mutex<usize>>) -> Self {
+        self.captures = log;
+        self
+    }
+    pub fn with_spec_log(mut self, log: Arc<Mutex<Vec<AppSpec>>>) -> Self {
+        self.specs = log;
+        self
+    }
+}
+
+/// A 4x4 opaque frame, constant everywhere except pixel (3,3), set to `corner` —
+/// a stand-in for a perpetually animating rect (a blinking caret, a clock) in
+/// `ignore`-masking tests. Mirrors glass-core's own test helper of the same name.
+pub fn frame_4x4_corner(corner: [u8; 4]) -> Frame {
+    let mut px = vec![0u8; 4 * 4 * 4];
+    for i in 0..16 {
+        px[i * 4 + 3] = 255; // alpha
+    }
+    let idx = (3 * 4 + 3) * 4;
+    px[idx..idx + 4].copy_from_slice(&corner);
+    Frame::new(4, 4, px).expect("4x4 frame is well-formed")
+}
+
+impl Platform for FakePlatform {
+    fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
+        self.specs.lock().unwrap().push(spec.clone());
+        self.started = true;
+        Ok(self.geometry.clone())
+    }
+    fn stop_app_by(&mut self, _deadline: glass_core::Deadline) -> Result<()> {
+        self.started = false;
+        Ok(())
+    }
+    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+        *self.captures.lock().unwrap() += 1;
+        let frame = match self.frames.pop_front() {
+            Some(f) => {
+                if self.frames.is_empty() {
+                    self.frames.push_back(f.clone());
+                }
+                f
+            }
+            None => return Err(GlassError::CaptureFailed("no scripted frames".into())),
+        };
+        match region {
+            Some(r) => frame.crop(r),
+            None => Ok(frame),
+        }
+    }
+    fn send_pointer(&mut self, e: &PointerEvent) -> Result<()> {
+        self.events.lock().unwrap().push(match e {
+            PointerEvent::Click { x, y, .. } => format!("click({x},{y})"),
+            PointerEvent::Move { x, y } => format!("move({x},{y})"),
+            PointerEvent::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                ..
+            } => {
+                format!("drag({from_x},{from_y}->{to_x},{to_y})")
+            }
+            PointerEvent::Scroll { x, y, dx, dy, .. } => format!("scroll({x},{y},{dx},{dy})"),
+            PointerEvent::Gesture { pointers, .. } => format!("gesture({})", pointers.len()),
+        });
+        self.pointer_events.push(e.clone());
+        Ok(())
+    }
+    fn send_key(&mut self, e: &KeyEvent) -> Result<()> {
+        self.events.lock().unwrap().push(match e {
+            KeyEvent::Text(t) => format!("type({t})"),
+            KeyEvent::Chord(c) => format!("key({c})"),
+        });
+        self.key_events.push(e.clone());
+        Ok(())
+    }
+    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+        match *op {
+            WindowOp::Resize { width, height } => {
+                self.geometry.width = width;
+                self.geometry.height = height;
+            }
+            WindowOp::Move { x, y } => {
+                self.geometry.x = x;
+                self.geometry.y = y;
+            }
+            WindowOp::Focus | WindowOp::Geometry => {}
+        }
+        Ok(self.geometry.clone())
+    }
+    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+        Ok(vec![WindowInfo {
+            id: WindowId(0),
+            title: Some("fake".into()),
+            class: None,
+            geometry: self.geometry.clone(),
+            active: true,
+        }])
+    }
+    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+        if id == WindowId(0) {
+            Ok(self.geometry.clone())
+        } else {
+            Err(GlassError::WindowNotFound)
+        }
+    }
+    fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+        std::mem::take(&mut self.pending_logs)
+    }
+    fn get_clipboard(&mut self) -> Result<String> {
+        Ok(self.clipboard.clone())
+    }
+    fn set_clipboard(&mut self, text: &str) -> Result<()> {
+        self.clipboard = text.to_string();
+        Ok(())
+    }
+}
+
+/// Build a `Glass` over a `FakePlatform` with a throwaway baseline dir.
+pub fn glass_with(platform: FakePlatform) -> Glass {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir); // keep the dir alive for the test
+    // Factory yields the pre-scripted platform once.
+    let mut held: Option<Box<dyn Platform + Send>> = Some(Box::new(platform));
+    let factory: PlatformFactory = Box::new(move |_backend| {
+        let platform = held
+            .take()
+            .ok_or_else(|| GlassError::Backend("test factory called twice".into()))?;
+        Ok(Backend::display_only(platform))
+    });
+    Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
+}
+
+/// What `FakeAccessibility::set_value` should do — lets a test model the
+/// backend rejecting a write (element not editable, or changed since the
+/// snapshot) so the tool layer's error propagation can be exercised.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum SetOutcome {
+    #[default]
+    Ok,
+    NotEditable,
+    Changed,
+}
+
+/// What `FakeAccessibility::invoke` should do. Default mirrors the trait's own
+/// default (unsupported) — a backend that never implemented the native action,
+/// so `click_element` falls back to the pointer path unless a test opts into
+/// [`InvokeOutcome::Ok`].
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum InvokeOutcome {
+    #[default]
+    Unsupported,
+    Ok,
+    /// The native action fired on a different element than the one named.
+    OkOnAnother(u32),
+}
+
+pub struct FakeAccessibility {
+    pub tree: AxTree,
+    pub set_log: std::sync::Arc<std::sync::Mutex<Vec<(AxTarget, String)>>>,
+    pub set_outcome: SetOutcome,
+    pub invoke_outcome: InvokeOutcome,
+}
+
+impl Accessibility for FakeAccessibility {
+    fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+        Ok(self.tree.clone())
+    }
+    fn set_value(&mut self, _ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+        match self.set_outcome {
+            SetOutcome::NotEditable => {
+                return Err(GlassError::AxElementNotEditable(target.id.0));
+            }
+            SetOutcome::Changed => return Err(GlassError::AxElementChanged(target.id.0)),
+            SetOutcome::Ok => {}
+        }
+        self.set_log
+            .lock()
+            .unwrap()
+            .push((target.clone(), text.to_string()));
+        Ok(())
+    }
+    fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
+        match self.invoke_outcome {
+            InvokeOutcome::Unsupported => Err(GlassError::AxUnsupported),
+            InvokeOutcome::Ok => Ok(None),
+            InvokeOutcome::OkOnAnother(id) => Ok(Some(AxNodeId(id))),
+        }
+    }
+}
+
+/// A Window #0 with a Button "Save" child at (10,10 20x20).
+pub fn fake_tree() -> AxTree {
+    let button = AxNode {
+        id: AxNodeId(0),
+        role: AxRole::Button,
+        raw_role: "push button".into(),
+        name: Some("Save".into()),
+        description: None,
+        value: None,
+        states: AxStates {
+            focusable: true,
+            enabled: true,
+            ..Default::default()
+        },
+        bounds: Some(AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        }),
+        children: vec![],
+    };
+    let root = AxNode {
+        id: AxNodeId(0),
+        role: AxRole::Window,
+        raw_role: "frame".into(),
+        name: Some("Win".into()),
+        description: None,
+        value: None,
+        states: AxStates::default(),
+        bounds: Some(AxRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }),
+        children: vec![button],
+    };
+    AxTree::new(root)
+}
+
+/// A window root with no child elements — the "app publishes no usable tree" shape.
+pub fn empty_tree() -> AxTree {
+    let root = AxNode {
+        id: AxNodeId(0),
+        role: AxRole::Window,
+        raw_role: "frame".into(),
+        name: Some("Win".into()),
+        description: None,
+        value: None,
+        states: AxStates::default(),
+        bounds: Some(AxRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }),
+        children: vec![],
+    };
+    AxTree::new(root)
+}
+
+/// `fake_tree` with `truncated` set — the "walk stopped early" shape, for testing that
+/// the truncation steer surfaces as its own trusted block rather than being baked into
+/// the untrusted-wrapped outline.
+pub fn truncated_tree() -> AxTree {
+    let mut t = fake_tree();
+    t.truncated = Some(Truncation {
+        limit: TruncationLimit::Nodes,
+        limit_value: 1500,
+        nodes_walked: 1500,
+    });
+    t
+}
+
+/// `fake_tree` with a childless `Document` child — the unpublished-web-content shape.
+pub fn unpublished_document_tree() -> AxTree {
+    let mut t = fake_tree();
+    t.root.children.push(AxNode {
+        id: AxNodeId(0),
+        role: AxRole::Document,
+        raw_role: "document web".into(),
+        name: Some("page".into()),
+        description: None,
+        value: None,
+        states: AxStates::default(),
+        bounds: Some(AxRect {
+            x: 0,
+            y: 40,
+            width: 100,
+            height: 60,
+        }),
+        children: vec![],
+    });
+    t.assign_ids();
+    t
+}
+
+pub fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
+    glass_with_a11y_outcome(platform, tree, SetOutcome::Ok)
+}
+
+/// Like [`glass_with_a11y`] but with a chosen `set_value` outcome, so a test can
+/// drive the not-editable / changed-since-snapshot rejection paths. `invoke` stays
+/// at its default (unsupported) — use [`glass_with_a11y_invoke_ok`] for the
+/// native-action path.
+pub fn glass_with_a11y_outcome(
+    platform: FakePlatform,
+    tree: AxTree,
+    set_outcome: SetOutcome,
+) -> Glass {
+    glass_with_a11y_full(platform, tree, set_outcome, InvokeOutcome::Unsupported)
+}
+
+/// Like [`glass_with_a11y`] but with `invoke` wired to succeed, so a test can drive
+/// `click_element`'s native-action path (no pointer event, no fallback disclosed).
+pub fn glass_with_a11y_invoke_ok(platform: FakePlatform, tree: AxTree) -> Glass {
+    glass_with_a11y_full(platform, tree, SetOutcome::Ok, InvokeOutcome::Ok)
+}
+
+/// [`glass_with_a11y_invoke_ok`] for a backend that actuates element `actuated` when
+/// asked for another one.
+pub fn glass_with_a11y_invoke_on_another(
+    platform: FakePlatform,
+    tree: AxTree,
+    actuated: u32,
+) -> Glass {
+    glass_with_a11y_full(
+        platform,
+        tree,
+        SetOutcome::Ok,
+        InvokeOutcome::OkOnAnother(actuated),
+    )
+}
+
+fn glass_with_a11y_full(
+    platform: FakePlatform,
+    tree: AxTree,
+    set_outcome: SetOutcome,
+    invoke_outcome: InvokeOutcome,
+) -> Glass {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    let mut held: Option<Backend> = Some(Backend {
+        platform: Box::new(platform),
+        accessibility: Some(Box::new(FakeAccessibility {
+            tree,
+            set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            set_outcome,
+            invoke_outcome,
+        })),
+    });
+    let factory: PlatformFactory = Box::new(move |_backend| {
+        held.take()
+            .ok_or_else(|| GlassError::Backend("test factory called twice".into()))
+    });
+    Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
+}
+
+/// Parse content block `i` as the `{ok,tool,result}` envelope.
+pub(crate) fn envelope_at(out: &ToolOutput, i: usize) -> serde_json::Value {
+    let OutContent::Text(t) = &out.0[i] else {
+        panic!("expected envelope text at block {i}")
+    };
+    serde_json::from_str(t).expect("envelope must be valid JSON")
+}
+
+/// Assert block 0 is the success envelope for `tool` — and that `tool` is a REGISTERED
+/// `#[tool]` name, so a co-typo shared between the tool impl's envelope literal and the
+/// test's expected string (both say `"glass_stopp"`) still fails loudly. Returns `result`.
+pub(crate) fn assert_envelope(out: &ToolOutput, tool: &str) -> serde_json::Value {
+    let v = envelope_at(out, 0);
+    assert_eq!(v["ok"], serde_json::json!(true), "envelope: {v}");
+    assert_eq!(v["tool"], serde_json::json!(tool), "envelope: {v}");
+    assert!(
+        crate::server::registered_tools().iter().any(|t| t == tool),
+        "envelope tool {tool:?} is not a registered #[tool]"
+    );
+    v["result"].clone()
+}
