@@ -12,8 +12,8 @@ use crate::params::*;
 use crate::tools::{OutContent, ToolOutput, ToolResult};
 
 pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult {
-    if a.name.is_none() && a.role.is_none() {
-        return Err("specify `name` and/or `role` to select an element".into());
+    if a.name.is_none() && a.description.is_none() && a.role.is_none() {
+        return Err("specify `name`, `description`, and/or `role` to select an element".into());
     }
     let role = match a.role.as_deref() {
         Some(r) => Some(AxRole::from_name(r).ok_or_else(|| format!("unknown role '{r}'"))?),
@@ -26,6 +26,7 @@ pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult
     };
     let params = WaitElementParams {
         name: a.name.clone(),
+        description: a.description.clone(),
         role,
         value_contains: a.value_contains.clone(),
         condition,
@@ -70,8 +71,11 @@ fn element_sibling(element: Option<glass_core::ElementInfo>) -> Vec<OutContent> 
 }
 
 pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResult {
-    if a.name.is_none() && a.role.is_none() {
-        return Err("specify `name` and/or `role` to select the element to scroll to".into());
+    if a.name.is_none() && a.description.is_none() && a.role.is_none() {
+        return Err(
+            "specify `name`, `description`, and/or `role` to select the element to scroll to"
+                .into(),
+        );
     }
     let role = match a.role.as_deref() {
         Some(r) => Some(AxRole::from_name(r).ok_or_else(|| format!("unknown role '{r}'"))?),
@@ -94,6 +98,7 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
     };
     let params = ScrollToElementParams {
         name: a.name.clone(),
+        description: a.description.clone(),
         role,
         value_contains: a.value_contains.clone(),
         direction,
@@ -233,6 +238,7 @@ mod tests {
             &mut g,
             &ScrollToElementArgs {
                 name: None,
+                description: None,
                 role: None,
                 value_contains: None,
                 direction: None,
@@ -249,6 +255,7 @@ mod tests {
     fn scroll_args() -> ScrollToElementArgs {
         ScrollToElementArgs {
             name: None,
+            description: None,
             role: None,
             value_contains: None,
             direction: None,
@@ -313,6 +320,27 @@ mod tests {
             }
             _ => panic!("expected untrusted element sibling"),
         }
+    }
+
+    #[test]
+    fn scroll_to_element_accepts_description_as_the_only_text_selector() {
+        let mut tree = fake_tree();
+        tree.root.children[0].name = None;
+        tree.root.children[0].description = Some("Search settings".into());
+        tree.root.children[0].role = AxRole::TextField;
+        let expected_id = 1;
+        let mut g = started_a11y_with(tree);
+        let mut a = scroll_args();
+        a.description = Some("Search settings".into());
+        a.role = Some("TextField".into());
+
+        let out = scroll_to_element(&mut g, &a).unwrap();
+
+        let OutContent::Text(sibling) = &out.0[1] else {
+            panic!("expected untrusted element sibling")
+        };
+        assert!(sibling.contains(&format!("\"id\":{expected_id}")));
+        assert!(sibling.contains("\"description\":\"Search settings\""));
     }
 
     /// Like `fake_tree()`'s "Save" but placed off-screen to the right of the
@@ -436,6 +464,7 @@ mod tests {
     fn elem_args() -> WaitForElementArgs {
         WaitForElementArgs {
             name: None,
+            description: None,
             role: None,
             condition: None,
             value_contains: None,

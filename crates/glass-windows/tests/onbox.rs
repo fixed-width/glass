@@ -1634,6 +1634,7 @@ fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
     let out = glass
         .wait_for_element(&glass_core::WaitElementParams {
             name: Some("no such element in charmap".into()),
+            description: None,
             role: None,
             value_contains: None,
             condition: glass_core::ElementCondition::Appears,
@@ -1690,6 +1691,7 @@ fn onbox_a_signal_more_than_halves_a_quiet_walk_count() {
         let out = glass
             .wait_for_element(&glass_core::WaitElementParams {
                 name: Some("no such element in charmap".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 condition: glass_core::ElementCondition::Appears,
@@ -1758,6 +1760,7 @@ fn onbox_a_subscription_establishes_and_the_first_read_still_answers() {
     let out = glass
         .wait_for_element(&glass_core::WaitElementParams {
             name: Some(name.clone()),
+            description: None,
             role: None,
             value_contains: None,
             condition: glass_core::ElementCondition::Appears,
@@ -1991,6 +1994,7 @@ fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
     // that gap.
     let wait_result = glass.wait_for_element(&glass_core::WaitElementParams {
         name: Some("Search".into()),
+        description: None,
         role: Some(AxRole::Button),
         value_contains: None,
         condition: glass_core::ElementCondition::Appears,
@@ -2095,6 +2099,7 @@ fn onbox_a_wait_for_enabled_falls_back_to_the_forced_reread() {
     let out = glass
         .wait_for_element(&glass_core::WaitElementParams {
             name: Some("Save".into()),
+            description: None,
             role: None,
             value_contains: None,
             condition: glass_core::ElementCondition::Enabled,

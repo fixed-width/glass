@@ -1,6 +1,7 @@
 //! `Glass` synchronization: wait-for-stable/element/region/log, scroll-to-element,
 //! and the wait/scroll parameter and outcome types.
 use super::*;
+use crate::accessibility::ElementSelector;
 
 /// How long to go on a signal's word alone before reading the tree anyway.
 ///
@@ -65,6 +66,7 @@ pub struct WaitStableOutcome {
 #[derive(Clone, Debug)]
 pub struct WaitElementParams {
     pub name: Option<String>,
+    pub description: Option<String>,
     pub role: Option<AxRole>,
     pub value_contains: Option<String>,
     pub condition: ElementCondition,
@@ -213,6 +215,7 @@ fn scroll_anchor(
 #[derive(Clone, Debug)]
 pub struct ScrollToElementParams {
     pub name: Option<String>,
+    pub description: Option<String>,
     pub role: Option<AxRole>,
     pub value_contains: Option<String>,
     /// Sweep direction; `None` = infer from the target's off-screen bounds
@@ -462,10 +465,13 @@ impl Glass {
                     Err(e) => return Err(e),
                 };
                 Ok(
-                    match tree.element_match(
-                        params.name.as_deref(),
-                        params.role,
-                        params.value_contains.as_deref(),
+                    match tree.element_match_selector(
+                        ElementSelector {
+                            name: params.name.as_deref(),
+                            description: params.description.as_deref(),
+                            role: params.role,
+                            value_contains: params.value_contains.as_deref(),
+                        },
                         params.condition,
                     ) {
                         ElementMatch::Satisfied(node) => Some(node.map(ElementInfo::from_node)),
@@ -620,10 +626,13 @@ impl Glass {
         // `?`, so a reader giving up at the deadline would turn the sweep's soft `{matched:false}`
         // into an error.
         let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
-        let found = match tree.element_match(
-            params.name.as_deref(),
-            params.role,
-            params.value_contains.as_deref(),
+        let found = match tree.element_match_selector(
+            ElementSelector {
+                name: params.name.as_deref(),
+                description: params.description.as_deref(),
+                role: params.role,
+                value_contains: params.value_contains.as_deref(),
+            },
             ElementCondition::Appears,
         ) {
             ElementMatch::Satisfied(node) => node.map(ElementInfo::from_node),
@@ -1229,6 +1238,7 @@ mod tests {
         let o = g
             .wait_for_element(&WaitElementParams {
                 name: Some("Save".into()),
+                description: None,
                 role: Some(AxRole::Button),
                 value_contains: None,
                 condition: ElementCondition::Enabled,
@@ -1254,6 +1264,7 @@ mod tests {
         g.start(&spec()).unwrap();
         g.wait_for_element(&WaitElementParams {
             name: Some("Ghost".into()), // never matches, so the wait reads more than once
+            description: None,
             role: None,
             value_contains: None,
             condition: ElementCondition::Appears,
@@ -1289,6 +1300,7 @@ mod tests {
         let o = g
             .wait_for_element(&WaitElementParams {
                 name: Some("Ghost".into()), // never in the tree
+                description: None,
                 role: None,
                 value_contains: None,
                 condition: ElementCondition::Appears,
@@ -1314,6 +1326,7 @@ mod tests {
         let o = g
             .wait_for_element(&WaitElementParams {
                 name: Some("Save".into()),
+                description: None,
                 role: Some(AxRole::Button),
                 value_contains: None,
                 condition: ElementCondition::Appears,
@@ -1343,6 +1356,7 @@ mod tests {
         g.start(&spec()).unwrap();
         g.scroll_to_element(&ScrollToElementParams {
             name: Some("Ghost".into()),
+            description: None,
             role: None,
             value_contains: None,
             direction: Some(ScrollDirection::Down),
@@ -1370,6 +1384,7 @@ mod tests {
         let o = g
             .wait_for_element(&WaitElementParams {
                 name: Some("Save".into()),
+                description: None,
                 role: Some(AxRole::Button),
                 value_contains: None,
                 condition: ElementCondition::Appears,
@@ -1393,6 +1408,7 @@ mod tests {
         let e = g
             .wait_for_element(&WaitElementParams {
                 name: Some("Save".into()),
+                description: None,
                 role: Some(AxRole::Button),
                 value_contains: None,
                 condition: ElementCondition::Appears,
@@ -1434,6 +1450,7 @@ mod tests {
     fn never_matches(interval_ms: u64, timeout_ms: u64) -> WaitElementParams {
         WaitElementParams {
             name: Some("Save".into()),
+            description: None,
             role: None,
             value_contains: None,
             condition: ElementCondition::Checked,
@@ -1500,6 +1517,7 @@ mod tests {
         let o = g
             .wait_for_element(&WaitElementParams {
                 name: Some("Save".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 condition: ElementCondition::Enabled,
@@ -1693,6 +1711,7 @@ mod tests {
         let o = g
             .wait_for_element(&WaitElementParams {
                 name: Some("Save".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 condition: ElementCondition::Checked, // never true in the fixed tree
@@ -1711,6 +1730,7 @@ mod tests {
         let o = g
             .wait_for_element(&WaitElementParams {
                 name: Some("Ghost".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 condition: ElementCondition::Disappears,
@@ -1729,6 +1749,7 @@ mod tests {
         let err = g
             .wait_for_element(&WaitElementParams {
                 name: Some("x".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 condition: ElementCondition::Appears,
@@ -1749,6 +1770,7 @@ mod tests {
         let out = g
             .scroll_to_element(&ScrollToElementParams {
                 name: Some("Save".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 direction: Some(ScrollDirection::Down),
@@ -1765,6 +1787,40 @@ mod tests {
     }
 
     #[test]
+    fn scroll_to_element_reveals_an_unnamed_description_match_and_returns_its_id() {
+        let before = fake_tree();
+        let mut revealed = fake_tree();
+        let field = &mut revealed.root.children[0];
+        field.id = AxNodeId(35);
+        field.role = AxRole::TextField;
+        field.name = None;
+        field.description = Some("Search settings".into());
+
+        let (mut g, _) =
+            glass_with_a11y_counted(FakePlatform::new(100, 100), vec![before, revealed], None);
+        g.start(&spec()).unwrap();
+
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: None,
+                description: Some("Search settings".into()),
+                role: Some(AxRole::TextField),
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+
+        assert!(out.matched);
+        assert_eq!(out.steps, 1);
+        let element = out.element.expect("matched element");
+        assert_eq!(element.id, AxNodeId(1));
+        assert_eq!(element.description.as_deref(), Some("Search settings"));
+    }
+
+    #[test]
     fn scroll_to_element_absent_sweeps_both_ends_then_reports_unmatched() {
         // The target never appears and the a11y tree's outline never changes (the
         // fixture tree is fixed), so each direction saturates after one step. The
@@ -1775,6 +1831,7 @@ mod tests {
         let out = g
             .scroll_to_element(&ScrollToElementParams {
                 name: Some("Ghost".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 direction: Some(ScrollDirection::Down),
@@ -1805,6 +1862,7 @@ mod tests {
         let out = g
             .scroll_to_element(&ScrollToElementParams {
                 name: None,
+                description: None,
                 role: Some(AxRole::Button),
                 value_contains: None,
                 direction: None,
@@ -1843,6 +1901,7 @@ mod tests {
         let out = g
             .scroll_to_element(&ScrollToElementParams {
                 name: Some("Ghost".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 direction: Some(ScrollDirection::Down),
@@ -1875,6 +1934,7 @@ mod tests {
         let out = g
             .scroll_to_element(&ScrollToElementParams {
                 name: Some("Ghost".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 direction: Some(ScrollDirection::Down),
@@ -1900,6 +1960,7 @@ mod tests {
         let out = g
             .scroll_to_element(&ScrollToElementParams {
                 name: Some("Ghost".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 direction: Some(ScrollDirection::Down),
@@ -1960,6 +2021,7 @@ mod tests {
         let out = g
             .scroll_to_element(&ScrollToElementParams {
                 name: Some("Ghost".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 direction: None,
@@ -1983,6 +2045,7 @@ mod tests {
         let out = g
             .scroll_to_element(&ScrollToElementParams {
                 name: Some("Ghost".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 direction: Some(ScrollDirection::Right),
@@ -2040,6 +2103,7 @@ mod tests {
         let out = g
             .scroll_to_element(&ScrollToElementParams {
                 name: Some("ZoomIn".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 direction: Some(ScrollDirection::Right),
@@ -2071,6 +2135,7 @@ mod tests {
         let out = g
             .scroll_to_element(&ScrollToElementParams {
                 name: Some("ZoomIn".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 direction: None,
@@ -2140,6 +2205,7 @@ mod tests {
         let out = g
             .scroll_to_element(&ScrollToElementParams {
                 name: Some("Deep".into()),
+                description: None,
                 role: None,
                 value_contains: None,
                 direction: None,
