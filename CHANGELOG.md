@@ -26,7 +26,7 @@ internal refactors, CI, or test-only changes.
 - MCP descriptions and the tool reference now distinguish current semantic state, current visual evidence, transition completion and visual quiescence, including `glass_wait_for_element` exact-value matching and direct routes for dialog dismissal, canvas changes and animation completion.
 
 ### Changed
-- The MCP schema and tool reference now describe Android `glass_start.run` as its actual APK/component tuple instead of as desktop argv: `[path/to/app.apk, package/activity]`, with the APK optional when the app is already installed.
+- The MCP schema and tool reference now describe Android `glass_start.run` as its actual APK/component tuple instead of as desktop argv: `[apk?, package/.Activity]` in either order, with the APK optional when the app is already installed.
 
 ### Fixed
 - On macOS, `glass doctor` no longer fails an otherwise healthy iOS backend because the separate macOS accessibility reader cannot answer its system-wide probe. The macOS reader check remains a hard failure when `macos` is selected, and is now an advisory warning when `ios` is selected, like the other inactive-backend checks.
