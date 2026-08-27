@@ -75,10 +75,21 @@ impl Deadline {
         budget: std::time::Duration,
         now: std::time::Instant,
     ) -> std::time::Duration {
-        // Not `cap(now + budget)`: materialising the instant overflows the addition for a budget
-        // near `Duration::MAX`.
-        self.remaining_at(now)
-            .map_or(budget, |left| budget.min(left))
+        self.budget(budget, now).0
+    }
+
+    /// The duration a call actually gets, and whose bound supplied it.
+    ///
+    /// A tie belongs to the callee, matching [`Self::resolve`].
+    pub fn budget(
+        self,
+        own: std::time::Duration,
+        now: std::time::Instant,
+    ) -> (std::time::Duration, Whose) {
+        match self.remaining_at(now) {
+            Some(left) if left < own => (left, Whose::Caller),
+            _ => (own, Whose::Callee),
+        }
     }
 
     /// This deadline pulled in by `reserve`, but never by more than half of what is left — for
@@ -210,6 +221,20 @@ mod tests {
             Deadline::UNBOUNDED.within(Duration::from_secs(20), now),
             Duration::from_secs(20)
         );
+    }
+
+    #[test]
+    fn budget_names_the_caller_only_when_it_is_strictly_nearer() {
+        let now = Instant::now();
+        let own = Duration::from_secs(5);
+        assert_eq!(
+            Deadline::at(now + Duration::from_secs(1))
+                .budget(own, now)
+                .1,
+            Whose::Caller
+        );
+        assert_eq!(Deadline::at(now + own).budget(own, now).1, Whose::Callee);
+        assert_eq!(Deadline::UNBOUNDED.budget(own, now), (own, Whose::Callee));
     }
 
     /// A share taken out of one budget, so two steps in sequence cannot each spend the whole.

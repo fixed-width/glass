@@ -278,6 +278,18 @@ pub trait Platform {
     /// whole window.
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame>;
 
+    /// [`Platform::capture_frame`] bounded by a caller's shared deadline.
+    fn capture_frame_by(
+        &mut self,
+        region: Option<&Region>,
+        deadline: crate::Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
+        self.capture_frame(region)
+    }
+
     /// Capture a specific window's region from the compositor/root WITHOUT changing
     /// the active window (unlike `select_window`). `region` (if set, relative to
     /// `id`'s own geometry) captures only that sub-rectangle; `None` captures the
@@ -287,6 +299,19 @@ pub trait Platform {
         Err(GlassError::Unsupported(
             "capture_window is not supported by this backend".into(),
         ))
+    }
+
+    /// [`Platform::capture_window`] bounded by a caller's shared deadline.
+    fn capture_window_by(
+        &mut self,
+        id: WindowId,
+        region: Option<&Region>,
+        deadline: crate::Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        self.capture_window(id, region)
     }
 
     /// Inject a pointer event (coordinates are window-relative).

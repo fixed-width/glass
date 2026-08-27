@@ -17,6 +17,9 @@ pub(crate) use std::time::Duration;
 /// asserting it (not `capture_frame`) was used, and with what arguments.
 pub(crate) type CaptureWindowLog = Arc<Mutex<Vec<(WindowId, Option<Region>)>>>;
 
+/// Every deadline handed to a fake platform capture.
+pub(crate) type CaptureDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
+
 /// The last `AxContext` a fake `Accessibility` was called with — see
 /// [`FakeAccessibility::ctx_log`].
 pub(crate) type CtxLog = Arc<Mutex<Option<AxContext>>>;
@@ -31,6 +34,7 @@ pub(crate) struct FakePlatform {
     key_events: Vec<KeyEvent>,
     started: bool,
     capture_log: Arc<Mutex<Vec<Option<Region>>>>,
+    capture_deadline_log: Option<CaptureDeadlineLog>,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
     log_batches: std::collections::VecDeque<Vec<(Stream, String)>>,
     key_log: Arc<Mutex<Vec<KeyEvent>>>,
@@ -86,6 +90,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_capture_log(mut self, log: Arc<Mutex<Vec<Option<Region>>>>) -> Self {
         self.capture_log = log;
+        self
+    }
+    pub(crate) fn with_capture_deadline_log(mut self, log: CaptureDeadlineLog) -> Self {
+        self.capture_deadline_log = Some(log);
         self
     }
     pub(crate) fn with_click_log(mut self, log: Arc<Mutex<Vec<(i32, i32)>>>) -> Self {
@@ -206,6 +214,15 @@ impl Platform for FakePlatform {
             Some(r) => frame.crop(r),
             None => Ok(frame),
         }
+    }
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        if let Some(log) = &self.capture_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
+        self.capture_frame(region)
     }
     fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
         self.capture_window_log
@@ -1021,6 +1038,33 @@ pub(crate) fn glass_with_a11y_until_deadline(
         platform,
         Box::new(UntilDeadline {
             tree: fake_tree_enabled(),
+            seen: seen.clone(),
+        }),
+    );
+    (g, seen)
+}
+
+pub(crate) struct RecordingDeadlines {
+    pub(crate) tree: AxTree,
+    pub(crate) seen: Arc<Mutex<Vec<Deadline>>>,
+}
+
+impl Accessibility for RecordingDeadlines {
+    fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        self.seen.lock().unwrap().push(ctx.deadline);
+        Ok(self.tree.clone())
+    }
+}
+
+pub(crate) fn glass_with_a11y_deadline_log(
+    platform: FakePlatform,
+    tree: AxTree,
+) -> (Glass, Arc<Mutex<Vec<Deadline>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let g = glass_with_backend(
+        platform,
+        Box::new(RecordingDeadlines {
+            tree,
             seen: seen.clone(),
         }),
     );

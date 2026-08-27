@@ -83,6 +83,9 @@ pub struct WaitElementOutcome {
     pub element: Option<ElementInfo>,
     /// Wall-clock milliseconds elapsed when the wait returned.
     pub elapsed_ms: u64,
+    /// Which timeout ended the wait. `None` when the predicate was satisfied.
+    #[doc(hidden)]
+    pub timed_out_by: Option<crate::Whose>,
 }
 
 /// Wheel notches per scroll step; chosen so a step realizes at most a few rows
@@ -246,6 +249,9 @@ pub struct ScrollToElementOutcome {
     pub reversed: bool,
     /// The resolved (possibly inferred) primary sweep direction.
     pub direction: ScrollDirection,
+    /// Which timeout ended the sweep. `None` for a match, saturation, or the step cap.
+    #[doc(hidden)]
+    pub timed_out_by: Option<crate::Whose>,
 }
 
 /// Parameters for [`Glass::wait_for_region`].
@@ -330,6 +336,22 @@ impl Glass {
     /// Not event-gated, and must not be: this waits on *pixels* settling, and an accessibility
     /// event says nothing about that — an animation emits none, and a tree change may move none.
     pub fn wait_stable(&mut self, params: &WaitStableParams) -> Result<WaitStableOutcome> {
+        self.wait_stable_by(params, Deadline::UNBOUNDED)
+    }
+
+    /// [`Self::wait_stable`] bounded by a caller's shared deadline.
+    pub fn wait_stable_by(
+        &mut self,
+        params: &WaitStableParams,
+        caller: Deadline,
+    ) -> Result<WaitStableOutcome> {
+        if caller.has_passed() {
+            return Err(GlassError::deadline_not_started("wait for stable"));
+        }
+        let started = std::time::Instant::now();
+        let (effective_duration, whose) =
+            caller.budget(std::time::Duration::from_millis(params.timeout_ms), started);
+        let deadline = Deadline::at(started + effective_duration);
         let active = self.require_active()?;
         // The active window's cached geometry only bounds a stability_region when
         // watching the active window itself; a specific `window` is validated by
@@ -348,29 +370,48 @@ impl Glass {
         // region-local coordinates, since `capture` crops to `region` and the settle
         // comparison and the mask must agree on that space.
         let mut tracker: Option<StabilityTracker> = None;
-        let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
-            // Poll only the watched region (cheap) when one is set; else the full window.
-            let frame = self.capture(window, region.as_ref())?;
-            let t = match tracker {
-                Some(ref mut t) => t,
-                None => {
-                    let mask =
-                        mask_for(&params.ignore, region.as_ref(), frame.width, frame.height)?;
-                    tracker.insert(StabilityTracker::with_mask(
-                        params.settle_frames,
-                        params.tolerance,
-                        mask,
-                    ))
-                }
-            };
-            Ok(if t.observe(frame)? { Some(()) } else { None })
-        })?;
+        let mut looked = false;
+        let outcome = crate::poll::poll_until_with_pause(
+            params.interval_ms,
+            effective_duration.as_millis() as u64,
+            |d| {
+                std::thread::sleep(deadline.remaining().unwrap_or(d).min(d));
+                true
+            },
+            || {
+                // Poll only the watched region (cheap) when one is set; else the full window.
+                let capture_deadline =
+                    if !looked && caller == Deadline::UNBOUNDED && params.timeout_ms == 0 {
+                        Deadline::UNBOUNDED
+                    } else {
+                        deadline
+                    };
+                looked = true;
+                let frame = self.capture_by(window, region.as_ref(), capture_deadline)?;
+                let t = match tracker {
+                    Some(ref mut t) => t,
+                    None => {
+                        let mask =
+                            mask_for(&params.ignore, region.as_ref(), frame.width, frame.height)?;
+                        tracker.insert(StabilityTracker::with_mask(
+                            params.settle_frames,
+                            params.tolerance,
+                            mask,
+                        ))
+                    }
+                };
+                Ok(if t.observe(frame)? { Some(()) } else { None })
+            },
+        )?;
         let tracker = tracker.expect("poll_until ticks at least once");
         let settled = outcome.value.is_some();
         // Return the full window: a fresh capture if we were polling a sub-region
         // (the genuinely-settled state), else the just-observed full frame.
         let frame = match region {
-            Some(_) => self.capture(window, None)?,
+            Some(_) if outcome.value.is_none() && whose == crate::Whose::Callee => {
+                self.capture(window, None)?
+            }
+            Some(_) => self.capture_by(window, None, deadline)?,
             None => tracker.last().cloned().expect("a frame was just observed"),
         };
         Ok(WaitStableOutcome {
@@ -387,11 +428,25 @@ impl Glass {
     /// element id is immediately usable with `click_element`). Errors immediately if
     /// the backend has no accessibility reader (the first snapshot fails).
     pub fn wait_for_element(&mut self, params: &WaitElementParams) -> Result<WaitElementOutcome> {
+        self.wait_for_element_by(params, Deadline::UNBOUNDED)
+    }
+
+    /// [`Self::wait_for_element`] bounded by a caller's shared deadline.
+    pub fn wait_for_element_by(
+        &mut self,
+        params: &WaitElementParams,
+        caller: Deadline,
+    ) -> Result<WaitElementOutcome> {
+        if caller.has_passed() {
+            return Err(GlassError::deadline_not_started("wait for element"));
+        }
         self.require_active()?; // fail fast; a11y_snapshot rechecks inside the loop
         let started = std::time::Instant::now();
         // Every read this wait makes carries when the wait stops: the tick is synchronous, so the
         // loop cannot take back a read a reader has started (glass#338).
-        let deadline = Deadline::from_millis(params.timeout_ms);
+        let (effective_duration, whose) =
+            caller.budget(std::time::Duration::from_millis(params.timeout_ms), started);
+        let deadline = Deadline::at(started + effective_duration);
         // Before the first walk, not after: a change landing in that gap is announced to nobody,
         // and the wait then burns its whole budget on a condition that already holds.
         //
@@ -403,8 +458,7 @@ impl Glass {
         // Subscribing spends the caller's budget, so the poll loop gets what is left. That
         // bounds the polling, not the call: a reader that does not honour `deadline` bounds its
         // own handshake in seconds, so a wait told to give up after 500ms can return later.
-        let remaining = params
-            .timeout_ms
+        let remaining = (effective_duration.as_millis() as u64)
             .saturating_sub(started.elapsed().as_millis() as u64);
         // Starts now rather than at the first read: the first tick follows immediately.
         let mut last_read = std::time::Instant::now();
@@ -447,10 +501,10 @@ impl Glass {
             },
             || {
                 // fresh snapshot; assigns ids, caches, pumps
-                let bound = if looked {
-                    deadline
-                } else {
+                let bound = if !looked && caller == Deadline::UNBOUNDED && params.timeout_ms == 0 {
                     Deadline::UNBOUNDED
+                } else {
+                    deadline
                 };
                 looked = true;
                 let tree = match self.a11y_resnapshot(bound) {
@@ -488,12 +542,14 @@ impl Glass {
         {
             return Err(e);
         }
+        let matched = outcome.value.is_some();
         Ok(WaitElementOutcome {
-            matched: outcome.value.is_some(),
+            matched,
             element: outcome.value.flatten(),
             // From before the subscription, not from the poll loop: the agent is told how long the
             // call took, and the subscribe is part of it.
             elapsed_ms: started.elapsed().as_millis() as u64,
+            timed_out_by: (!matched).then_some(whose),
         })
     }
 
@@ -537,8 +593,23 @@ impl Glass {
         &mut self,
         params: &ScrollToElementParams,
     ) -> Result<ScrollToElementOutcome> {
+        self.scroll_to_element_by(params, Deadline::UNBOUNDED)
+    }
+
+    /// [`Self::scroll_to_element`] bounded by a caller's shared deadline.
+    pub fn scroll_to_element_by(
+        &mut self,
+        params: &ScrollToElementParams,
+        caller: Deadline,
+    ) -> Result<ScrollToElementOutcome> {
+        if caller.has_passed() {
+            return Err(GlassError::deadline_not_started("scroll to element"));
+        }
         self.require_active()?;
         let start = std::time::Instant::now();
+        let (effective_duration, whose) =
+            caller.budget(std::time::Duration::from_millis(params.timeout_ms), start);
+        let deadline = Deadline::at(start + effective_duration);
         let geo = self.geometry()?;
         // Return a match once scrolling can't improve its visibility: it has an on-screen
         // clickable center, or its bounds are unknown (scrolling won't populate a
@@ -550,7 +621,12 @@ impl Glass {
 
         // One pre-sweep snapshot serves four jobs: early return if already visible,
         // direction inference, anchor derivation, and seeding the saturation outline.
-        let (found0, mut prev_outline) = self.snapshot_match_outline(params)?;
+        let first_deadline = if caller == Deadline::UNBOUNDED && params.timeout_ms == 0 {
+            Deadline::UNBOUNDED
+        } else {
+            deadline
+        };
+        let (found0, mut prev_outline) = self.snapshot_match_outline(params, first_deadline)?;
         let found0_bounds = found0.as_ref().and_then(|i| i.bounds);
 
         // Resolve the primary sweep direction: explicit, else inferred from the
@@ -563,17 +639,18 @@ impl Glass {
 
         // Every return shares this tail (elapsed_ms/direction); only the matched flag,
         // element, step count, and reversed flag vary.
-        let outcome = |matched, element, steps, reversed| ScrollToElementOutcome {
+        let outcome = |matched, element, steps, reversed, timed_out_by| ScrollToElementOutcome {
             matched,
             element,
             elapsed_ms: start.elapsed().as_millis() as u64,
             steps,
             reversed,
             direction: primary,
+            timed_out_by,
         };
 
         if let Some(info) = found0.filter(|i| ready(i)) {
-            return Ok(outcome(true, Some(info), 0, false));
+            return Ok(outcome(true, Some(info), 0, false, None));
         }
 
         let (ax, ay) = params
@@ -584,10 +661,11 @@ impl Glass {
         for (i, dir) in [primary, primary.opposite()].into_iter().enumerate() {
             let reversed = i == 1;
             loop {
-                if start.elapsed().as_millis() as u64 >= params.timeout_ms
-                    || steps >= SCROLL_TO_MAX_STEPS
-                {
-                    return Ok(outcome(false, None, steps, reversed));
+                if deadline.has_passed() {
+                    return Ok(outcome(false, None, steps, reversed, Some(whose)));
+                }
+                if steps >= SCROLL_TO_MAX_STEPS {
+                    return Ok(outcome(false, None, steps, reversed, None));
                 }
                 let (dx, dy) = dir.delta(params.step);
                 self.pointer(&PointerEvent::Scroll {
@@ -599,10 +677,14 @@ impl Glass {
                 })?;
                 steps += 1;
                 // Let the scrolled rows/columns realize in the a11y tree before re-reading.
-                std::thread::sleep(std::time::Duration::from_millis(SCROLL_TO_SETTLE_MS));
-                let (found, outline) = self.snapshot_match_outline(params)?;
+                let settle = std::time::Duration::from_millis(SCROLL_TO_SETTLE_MS);
+                std::thread::sleep(deadline.remaining().unwrap_or(settle).min(settle));
+                if deadline.has_passed() {
+                    return Ok(outcome(false, None, steps, reversed, Some(whose)));
+                }
+                let (found, outline) = self.snapshot_match_outline(params, deadline)?;
                 if let Some(info) = found.filter(|i| ready(i)) {
-                    return Ok(outcome(true, Some(info), steps, reversed));
+                    return Ok(outcome(true, Some(info), steps, reversed, None));
                 }
                 // No change in the a11y tree ⇒ the container did not advance ⇒ this
                 // end is reached; sweep the opposite direction.
@@ -613,7 +695,7 @@ impl Glass {
                 }
             }
         }
-        Ok(outcome(false, None, steps, true))
+        Ok(outcome(false, None, steps, true, None))
     }
 
     /// Snapshot the current view once; return the matched element (if the selector is
@@ -623,11 +705,12 @@ impl Glass {
     fn snapshot_match_outline(
         &mut self,
         params: &ScrollToElementParams,
+        deadline: Deadline,
     ) -> Result<(Option<ElementInfo>, String)> {
         // No deadline, though the sweep has a `timeout_ms`: this read propagates its error with
         // `?`, so a reader giving up at the deadline would turn the sweep's soft `{matched:false}`
         // into an error.
-        let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
+        let tree = self.a11y_resnapshot(deadline)?;
         let found = match tree.element_match_selector(
             ElementSelector {
                 name: params.name.as_deref(),
@@ -1733,6 +1816,140 @@ mod tests {
             .unwrap();
         assert!(!o.matched);
         assert!(o.element.is_none());
+        assert_eq!(o.timed_out_by, Some(crate::Whose::Callee));
+    }
+
+    #[test]
+    fn wait_for_element_names_its_own_timeout_callee() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree_enabled());
+        g.start(&spec()).unwrap();
+        let out = g.wait_for_element(&never_matches(0, 0)).unwrap();
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Callee));
+    }
+
+    #[test]
+    fn wait_for_element_names_the_sequence_timeout_caller() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree_enabled());
+        g.start(&spec()).unwrap();
+        let out = g
+            .wait_for_element_by(&never_matches(5, 1_000), Deadline::from_millis(20))
+            .unwrap();
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Caller));
+    }
+
+    #[test]
+    fn a_caller_deadline_bounds_the_first_wait_for_element_read() {
+        let (mut g, seen) = glass_with_a11y_until_deadline(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+        g.wait_for_element_by(&never_matches(0, 1_000), Deadline::from_millis(20))
+            .unwrap();
+        assert!(
+            seen.lock().unwrap()[0].is_some(),
+            "a bounded sequence must not grant the first read an unbounded exception"
+        );
+    }
+
+    #[test]
+    fn scroll_saturation_is_not_reported_as_a_timeout() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert_eq!(out.timed_out_by, None);
+    }
+
+    #[test]
+    fn scroll_to_element_passes_the_same_deadline_to_every_snapshot() {
+        let (mut g, seen) = glass_with_a11y_deadline_log(FakePlatform::new(100, 100), fake_tree());
+        g.start(&spec()).unwrap();
+        g.scroll_to_element_by(
+            &ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 2_000,
+            },
+            Deadline::from_millis(1_000),
+        )
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() > 1);
+        assert!(seen.iter().all(|deadline| *deadline == seen[0]));
+    }
+
+    #[test]
+    fn a_spent_caller_deadline_starts_no_settle_capture() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])])
+            .with_capture_log(captures.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let error = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 1_000,
+                    stability_region: None,
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                Deadline::from_millis(0),
+            )
+            .unwrap_err();
+        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+        assert!(captures.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sequence_deadline_during_settle_is_an_error_not_soft_settled_false() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![
+                Frame::solid(4, 4, [0, 0, 0, 255]),
+                Frame::solid(4, 4, [1, 1, 1, 255]),
+            ])
+            .with_capture_log(captures.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let error = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 50,
+                    settle_frames: 3,
+                    tolerance: 0,
+                    timeout_ms: 1_000,
+                    stability_region: Some(Region {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 2,
+                    }),
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                Deadline::from_millis(20),
+            )
+            .unwrap_err();
+        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+        assert_eq!(captures.lock().unwrap().len(), 1);
     }
 
     #[test]

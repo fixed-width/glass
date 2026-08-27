@@ -10,7 +10,17 @@ impl Glass {
         region: Option<Region>,
         window: Option<WindowId>,
     ) -> Result<Frame> {
-        self.capture(window, region.as_ref())
+        self.screenshot_by(region, window, Deadline::UNBOUNDED)
+    }
+
+    /// [`Self::screenshot`] bounded by a caller's shared deadline.
+    pub fn screenshot_by(
+        &mut self,
+        region: Option<Region>,
+        window: Option<WindowId>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        self.capture_by(window, region.as_ref(), deadline)
     }
 
     /// Capture `window`'s region (or, when `None`, the active window's), pumping
@@ -23,14 +33,27 @@ impl Glass {
         window: Option<WindowId>,
         region: Option<&Region>,
     ) -> Result<Frame> {
+        self.capture_by(window, region, Deadline::UNBOUNDED)
+    }
+
+    /// Internal capture carrying the deadline shared by a larger operation.
+    pub(super) fn capture_by(
+        &mut self,
+        window: Option<WindowId>,
+        region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
         let s = self.active_mut()?;
         let frame = match window {
-            Some(id) => s.platform.capture_window(id, region)?,
+            Some(id) => s.platform.capture_window_by(id, region, deadline)?,
             None => {
                 if let Some(r) = region {
                     r.check_fits(s.geometry.width, s.geometry.height)?;
                 }
-                s.platform.capture_frame(region)?
+                s.platform.capture_frame_by(region, deadline)?
             }
         };
         s.pump();
@@ -49,6 +72,38 @@ mod tests {
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
         assert_eq!(g.screenshot(None, None).unwrap(), frame);
+    }
+
+    #[test]
+    fn screenshot_by_passes_the_callers_deadline_to_the_platform() {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let deadline = Deadline::from_millis(1_000);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![Frame::solid(4, 4, [7, 7, 7, 255])])
+            .with_capture_deadline_log(deadlines.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        g.screenshot_by(None, None, deadline).unwrap();
+
+        assert_eq!(*deadlines.lock().unwrap(), vec![deadline]);
+    }
+
+    #[test]
+    fn screenshot_by_spent_deadline_does_not_capture() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![Frame::solid(4, 4, [7, 7, 7, 255])])
+            .with_capture_log(captures.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .screenshot_by(None, None, Deadline::from_millis(0))
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+        assert!(captures.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -267,6 +267,16 @@ pub enum GlassError {
 }
 
 impl GlassError {
+    /// A sequence step rejected before dispatch because its shared deadline was already spent.
+    pub fn deadline_not_started(op: &str) -> Self {
+        GlassError::Bounded {
+            kind: BoundKind::NotStarted,
+            message: format!(
+                "{op}: the deadline it shares with the rest of the call was already spent, so it was not started"
+            ),
+        }
+    }
+
     /// Whether a failed native-invoke attempt may safely fall back to the synthetic
     /// pointer path. True only for outcomes where **no native action was dispatched**:
     /// the backend has no invoke at all ([`GlassError::AxUnsupported`]), or the element
