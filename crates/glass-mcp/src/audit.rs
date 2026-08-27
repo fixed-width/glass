@@ -947,6 +947,8 @@ mod tests {
                     }),
                 ],
                 then: None,
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap(); // click (logged) + settle (read — not logged)

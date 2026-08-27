@@ -5,8 +5,8 @@ use serde_json::json;
 
 use crate::params::*;
 use crate::tools::{
-    OutContent, ToolOutput, ToolResult, click, diff, drag, key, mouse_move, screenshot, scroll,
-    type_text, wait_stable,
+    OutContent, ToolOutput, ToolResult, click, click_element, diff, drag, key, mouse_move,
+    screenshot, scroll, scroll_to_element, set_value, type_text, wait_for_element, wait_stable,
 };
 
 /// Split a sub-tool's enveloped output into (its `result` payload, its non-envelope
@@ -89,6 +89,10 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> ToolResult {
             // Err (bad region / capture failure) aborts. A non-settle (timeout)
             // is Ok and proceeds.
             Action::Settle(args) => ("settle", wait_stable(glass, &settle_args(args))),
+            Action::ClickElement(args) => ("click_element", click_element(glass, args)),
+            Action::SetValue(args) => ("set_value", set_value(glass, args)),
+            Action::WaitForElement(args) => ("wait_for_element", wait_for_element(glass, args)),
+            Action::ScrollToElement(args) => ("scroll_to_element", scroll_to_element(glass, args)),
         };
         if let Err(msg) = result {
             return Err(format!(
@@ -189,6 +193,8 @@ mod tests {
                     }),
                 ],
                 then: None,
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap();
@@ -217,6 +223,8 @@ mod tests {
                     }),
                 ],
                 then: None,
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap_err();
@@ -244,6 +252,8 @@ mod tests {
                     return_: Some("none".into()),
                 })],
                 then: None,
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap();
@@ -267,6 +277,8 @@ mod tests {
                     }), // never runs
                 ],
                 then: None,
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap_err();
@@ -288,6 +300,8 @@ mod tests {
             &DoArgs {
                 actions: vec![],
                 then: None,
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap_err();
@@ -314,6 +328,8 @@ mod tests {
                     diff: None,
                     screenshot: None,
                 }),
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap();
@@ -370,6 +386,8 @@ mod tests {
                     diff: None,
                     screenshot: None,
                 }),
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap();
@@ -407,6 +425,8 @@ mod tests {
                         window_id: None,
                     }),
                 }),
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap();
@@ -450,6 +470,8 @@ mod tests {
                     diff: None,
                     screenshot: None,
                 }),
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap();
@@ -481,6 +503,8 @@ mod tests {
                     }),
                     screenshot: None,
                 }),
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap();
@@ -517,6 +541,8 @@ mod tests {
                     }),
                     screenshot: None,
                 }),
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap();
@@ -558,6 +584,8 @@ mod tests {
                     }),
                     screenshot: None,
                 }),
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap_err();

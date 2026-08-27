@@ -3,7 +3,7 @@
 
 use glass_core::Region;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Error as _};
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RegionArgs {
@@ -513,6 +513,10 @@ pub enum Action {
     Type(TypeArgs),
     Key(KeyArgs),
     Settle(SettleArgs),
+    ClickElement(ClickElementArgs),
+    SetValue(SetValueArgs),
+    WaitForElement(WaitForElementArgs),
+    ScrollToElement(ScrollToElementArgs),
 }
 
 /// A mid-sequence or terminal settle — the `wait_stable` knobs, no image/return.
@@ -557,7 +561,7 @@ pub struct ThenArgs {
 }
 
 /// Arguments for `glass_do`: an ordered, non-empty action sequence + optional observe.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, JsonSchema)]
 pub struct DoArgs {
     /// Actions to run in order; must be non-empty. Fail-fast — the first failing
     /// action aborts the rest and reports its index, so a partial sequence may
@@ -566,6 +570,33 @@ pub struct DoArgs {
     /// Optional observe run once after the last action, in the order settle → diff
     /// → screenshot.
     pub then: Option<ThenArgs>,
+    pub timeout_ms: Option<u64>,
+    #[schemars(skip)]
+    pub(crate) encoded_argument_bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct DoArgsWire {
+    actions: Vec<Action>,
+    then: Option<ThenArgs>,
+    timeout_ms: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for DoArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let encoded_argument_bytes = serde_json::to_vec(&raw).map_err(D::Error::custom)?.len();
+        let wire = DoArgsWire::deserialize(raw).map_err(D::Error::custom)?;
+        Ok(Self {
+            actions: wire.actions,
+            then: wire.then,
+            timeout_ms: wire.timeout_ms,
+            encoded_argument_bytes,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -887,6 +918,7 @@ mod tests {
         assert!(matches!(a.actions[2], Action::Key(_)));
         assert!(matches!(a.actions[3], Action::Settle(_)));
         assert!(a.then.is_none());
+        assert!(a.timeout_ms.is_none());
     }
 
     #[test]
@@ -905,5 +937,46 @@ mod tests {
         assert_eq!(a.actions.len(), 1);
         assert!(a.then.is_some());
         assert!(a.then.unwrap().screenshot.is_some());
+        assert!(a.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn do_args_parse_semantic_actions_and_timeout() {
+        let a: DoArgs = serde_json::from_str(
+            r#"{
+            "actions":[
+              {"action":"click_element","id":3,"return":"snapshot"},
+              {"action":"set_value","id":4,"text":"Alice","return":"settle"},
+              {"action":"wait_for_element","description":"Name","value":"Alice"},
+              {"action":"scroll_to_element","name":"Row 250","direction":"down"}
+            ],
+            "timeout_ms":10000
+        }"#,
+        )
+        .unwrap();
+        assert!(matches!(a.actions[0], Action::ClickElement(_)));
+        assert!(matches!(a.actions[1], Action::SetValue(_)));
+        assert!(matches!(a.actions[2], Action::WaitForElement(_)));
+        assert!(matches!(a.actions[3], Action::ScrollToElement(_)));
+        assert_eq!(a.timeout_ms, Some(10_000));
+    }
+
+    #[test]
+    fn do_args_measure_compact_json_before_unknown_fields_are_ignored() {
+        let raw = r#"{"actions":[{"action":"key","chord":"a","ignored":"xxxxxxxx"}]}"#;
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let a: DoArgs = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            a.encoded_argument_bytes,
+            serde_json::to_vec(&value).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn do_args_schema_hides_internal_measurement() {
+        let schema = serde_json::to_value(schemars::schema_for!(DoArgs)).unwrap();
+        let text = schema.to_string();
+        assert!(text.contains("timeout_ms"));
+        assert!(!text.contains("encoded_argument_bytes"));
     }
 }
