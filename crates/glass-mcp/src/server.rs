@@ -12,13 +12,18 @@ use tokio::sync::Mutex;
 
 use crate::audit::AuditReport;
 use crate::params::*;
-use crate::tools::{self, OutContent, ToolOutput, ToolResult};
+use crate::tools::{self, BatchToolResult, OutContent, ToolOutput, ToolResult};
+
+enum ToolCallOutcome {
+    Success(ToolOutput),
+    Error(ToolOutput),
+}
 
 /// A synchronous tool body plus where to send its result — run on the dedicated
 /// `glass-platform` thread (see [`GlassServer::new`]).
 type Job = (
-    Box<dyn FnOnce(&mut Glass) -> ToolResult + Send>,
-    tokio::sync::oneshot::Sender<ToolResult>,
+    Box<dyn FnOnce(&mut Glass) -> ToolCallOutcome + Send>,
+    tokio::sync::oneshot::Sender<ToolCallOutcome>,
 );
 
 #[derive(Clone)]
@@ -31,9 +36,8 @@ pub struct GlassServer {
     tool_router: ToolRouter<GlassServer>,
 }
 
-fn to_call_result(out: ToolOutput) -> CallToolResult {
-    let contents = out
-        .0
+fn to_contents(out: ToolOutput) -> Vec<ContentBlock> {
+    out.0
         .into_iter()
         .map(|c| match c {
             OutContent::Text(t) => ContentBlock::text(t),
@@ -42,8 +46,14 @@ fn to_call_result(out: ToolOutput) -> CallToolResult {
                 ContentBlock::image(b64, "image/webp")
             }
         })
-        .collect();
-    CallToolResult::success(contents)
+        .collect()
+}
+
+fn map_call_outcome(outcome: ToolCallOutcome) -> CallToolResult {
+    match outcome {
+        ToolCallOutcome::Success(out) => CallToolResult::success(to_contents(out)),
+        ToolCallOutcome::Error(out) => CallToolResult::error(to_contents(out)),
+    }
 }
 
 /// Map a tool-logic result into an MCP call result. An `Err` becomes an MCP
@@ -52,10 +62,10 @@ fn to_call_result(out: ToolOutput) -> CallToolResult {
 /// call — the "no silent fallback" invariant at the protocol boundary. Kept pure
 /// (no async / no lock) so this contract is unit-testable.
 fn map_tool_result(result: ToolResult) -> CallToolResult {
-    match result {
-        Ok(out) => to_call_result(out),
-        Err(msg) => CallToolResult::error(vec![ContentBlock::text(msg)]),
-    }
+    map_call_outcome(match result {
+        Ok(out) => ToolCallOutcome::Success(out),
+        Err(msg) => ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(msg)])),
+    })
 }
 
 /// The `glass_doctor` result payload: the rendered report humans and existing
@@ -92,10 +102,14 @@ impl GlassServer {
                     let mut g = worker_glass.blocking_lock();
                     // A panicking tool becomes a loud error AND the thread survives — so it
                     // keeps serving calls and keeps parenting any still-running sandbox.
-                    let result =
+                    let outcome =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut g)))
-                            .unwrap_or_else(|_| Err("tool handler panicked".to_string()));
-                    let _ = reply.send(result);
+                            .unwrap_or_else(|_| {
+                                ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(
+                                    "tool handler panicked".to_string(),
+                                )]))
+                            });
+                    let _ = reply.send(outcome);
                 }
             })
             .expect("spawn glass-platform thread");
@@ -117,6 +131,28 @@ impl GlassServer {
     where
         F: FnOnce(&mut Glass) -> ToolResult + Send + 'static,
     {
+        self.run_outcome(move |g| match f(g) {
+            Ok(out) => ToolCallOutcome::Success(out),
+            Err(msg) => ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(msg)])),
+        })
+        .await
+    }
+
+    async fn run_batch<F>(&self, f: F) -> Result<CallToolResult, McpError>
+    where
+        F: FnOnce(&mut Glass) -> BatchToolResult + Send + 'static,
+    {
+        self.run_outcome(move |g| match f(g) {
+            Ok(out) => ToolCallOutcome::Success(out),
+            Err(out) => ToolCallOutcome::Error(out),
+        })
+        .await
+    }
+
+    async fn run_outcome<F>(&self, f: F) -> Result<CallToolResult, McpError>
+    where
+        F: FnOnce(&mut Glass) -> ToolCallOutcome + Send + 'static,
+    {
         // Hand the (synchronous, possibly slow) tool body to the dedicated glass-platform
         // thread and await its result: that thread, not an ephemeral blocking-pool thread,
         // parents any process the body spawns, so a sandboxed app's `--die-with-parent` only
@@ -124,14 +160,16 @@ impl GlassServer {
         // unanswered request.
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self.jobs.send((Box::new(f), reply_tx)).is_err() {
-            return Ok(map_tool_result(Err(
-                "glass-platform thread is gone".to_string()
-            )));
+            return Ok(map_call_outcome(ToolCallOutcome::Error(ToolOutput(vec![
+                OutContent::Text("glass-platform thread is gone".to_string()),
+            ]))));
         }
-        let outcome = reply_rx
-            .await
-            .unwrap_or_else(|_| Err("glass-platform thread dropped the job".to_string()));
-        Ok(map_tool_result(outcome))
+        let outcome = reply_rx.await.unwrap_or_else(|_| {
+            ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(
+                "glass-platform thread dropped the job".to_string(),
+            )]))
+        });
+        Ok(map_call_outcome(outcome))
     }
 
     #[tool(
@@ -439,9 +477,8 @@ impl GlassServer {
             tokio::task::spawn_blocking(move || crate::doctor::diagnose_with_audit(deep, &report))
                 .await
                 .expect("doctor task panicked");
-        Ok(to_call_result(ToolOutput::result(
-            "glass_doctor",
-            doctor_result(&diag, backend),
+        Ok(map_call_outcome(ToolCallOutcome::Success(
+            ToolOutput::result("glass_doctor", doctor_result(&diag, backend)),
         )))
     }
 
@@ -825,6 +862,28 @@ mod tests {
 
     fn first_text(r: &CallToolResult) -> String {
         r.content[0].as_text().expect("text content").text.clone()
+    }
+
+    #[test]
+    fn structured_error_preserves_every_content_block_and_sets_is_error() {
+        let out = ToolOutput(vec![
+            OutContent::Text(
+                r#"{"ok":false,"tool":"glass_do","error":{"code":"step_failed"}}"#.into(),
+            ),
+            OutContent::Text("detail".into()),
+        ]);
+        let r = map_call_outcome(ToolCallOutcome::Error(out));
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(r.content.len(), 2);
+        assert!(first_text(&r).contains("step_failed"));
+    }
+
+    #[test]
+    fn ordinary_string_error_keeps_its_one_block_wire_shape() {
+        let r = map_tool_result(Err("capture failed".to_string()));
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(r.content.len(), 1);
+        assert!(first_text(&r).contains("capture failed"));
     }
 
     #[test]

@@ -71,6 +71,9 @@ fn envelope(tool: &str, result: serde_json::Value) -> String {
 /// Tool result: Ok(content) or Err(agent-readable message).
 pub type ToolResult = Result<ToolOutput, String>;
 
+/// Batch tool result: either outcome may carry structured MCP content.
+pub(crate) type BatchToolResult = Result<ToolOutput, ToolOutput>;
+
 fn geometry_value(g: &WindowGeometry) -> serde_json::Value {
     json!({ "x": g.x, "y": g.y, "width": g.width, "height": g.height })
 }
