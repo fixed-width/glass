@@ -3955,6 +3955,24 @@ mod tests {
     }
 
     #[test]
+    fn hint_loss_reacquisition_requires_both_enabled_and_focused() {
+        let target = target_for(&built(&editable_field("old")), AxNodeId(1));
+        for missing_state in ["enabled", "focused"] {
+            let mut after = editable_field_slid("new", 700);
+            after["children"][0]["desc"] = Value::Null;
+            after["children"][0]["focused"] = json!(true);
+            after["children"][0][missing_state] = json!(false);
+
+            assert_eq!(
+                service_write_reading(&built(&after), &target, "new")
+                    .expect("an unsafe candidate remains unconfirmed"),
+                WriteReading::Missing,
+                "missing {missing_state} must prevent reacquisition"
+            );
+        }
+    }
+
+    #[test]
     fn two_editable_candidates_never_confirm_a_reacquired_write() {
         let before = editable_field("old");
         let mut after = editable_field_slid("new", 700);
