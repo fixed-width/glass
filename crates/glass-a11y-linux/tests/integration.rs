@@ -1248,6 +1248,7 @@ fn a_quiet_wait_stops_re_walking_the_tree() {
             name: Some("no such element in this fixture".into()),
             description: None,
             role: None,
+            value: None,
             value_contains: None,
             condition: glass_core::ElementCondition::Appears,
             interval_ms: 100,
