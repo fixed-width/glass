@@ -1,4 +1,5 @@
-//! Process lifecycle for the Windows backend: spawn the app **CREATE_SUSPENDED**,
+//! Process lifecycle for the Windows backend: spawn the app **CREATE_SUSPENDED** without a
+//! launcher console window,
 //! assign it to a `KILL_ON_JOB_CLOSE` Job before it can fork any children, wire
 //! up log readers, then resume — so a launcher that exits and hands off
 //! (Chromium/Electron) cannot escape the Job. Teardown asks the app's windows to close and
@@ -36,8 +37,8 @@ use windows::Win32::System::JobObjects::{
     SetInformationJobObject,
 };
 use windows::Win32::System::Threading::{
-    CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_QUERY_INFORMATION, PROCESS_SET_QUOTA,
-    PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_QUERY_INFORMATION,
+    PROCESS_SET_QUOTA, PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 
@@ -52,6 +53,8 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 /// here — the tree would instead be terminated as a side effect of the handle closing at process
 /// exit, which is the ungraceful teardown this whole path exists to avoid, arrived at slowly.
 const CLOSE_GRACE: Duration = Duration::from_millis(1500);
+
+const APP_CREATION_FLAGS: u32 = CREATE_SUSPENDED.0 | CREATE_NO_WINDOW.0;
 
 // Teardown must finish inside the budget it is given, or `glass-mcp` walks away mid-close. This
 // is the only thing keeping the two numbers — in different crates — honest about each other.
@@ -333,7 +336,8 @@ fn request_close(pids: &[u32]) -> Asked {
     }
 }
 
-/// Spawn `cmd` CREATE_SUSPENDED with piped stdout/stderr, create a KILL_ON_JOB_CLOSE Job,
+/// Spawn `cmd` CREATE_SUSPENDED and CREATE_NO_WINDOW with piped stdout/stderr, create a
+/// KILL_ON_JOB_CLOSE Job,
 /// assign the (still-suspended, child-less) process to it, and return the LaunchedApp
 /// WITHOUT resuming (so the caller can wire log readers before output starts).
 ///
@@ -346,7 +350,7 @@ pub(crate) fn spawn_suspended_in_job(
     level: SandboxLevel,
 ) -> Result<LaunchedApp> {
     let mut child = cmd
-        .creation_flags(CREATE_SUSPENDED.0)
+        .creation_flags(APP_CREATION_FLAGS)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -561,5 +565,16 @@ fn resume_process(pid: u32) {
             }
         }
         let _ = CloseHandle(snap);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_spawn_is_suspended_without_a_console_window() {
+        assert_ne!(APP_CREATION_FLAGS & CREATE_SUSPENDED.0, 0);
+        assert_ne!(APP_CREATION_FLAGS & CREATE_NO_WINDOW.0, 0);
     }
 }

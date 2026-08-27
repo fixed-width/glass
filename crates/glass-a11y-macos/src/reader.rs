@@ -20,7 +20,7 @@ use glass_core::coords::pixel_geometry_from_content_rect;
 use glass_core::platform::WindowGeometry;
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, GlassError,
-    Result, WalkBudget, read_back_confirms, write_took_no_effect,
+    Result, WalkBudget, normalize_name, read_back_confirms, write_took_no_effect,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
@@ -374,7 +374,7 @@ fn select_window(
 /// describe the node.
 fn read_label(el: &AXUIElement, attr_name: &str) -> Option<String> {
     match ffi::attribute_string_checked(el, attr_name) {
-        Ok(text) => text.filter(|t| !t.is_empty()),
+        Ok(text) => text.and_then(|text| normalize_name(&text)),
         Err(err) => {
             eprintln!(
                 "glass-a11y-macos: {attr_name} read failed: {err}; treating the element as \
