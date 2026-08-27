@@ -115,6 +115,7 @@ pub struct AxStateFacts {
     pub checkable: bool,
     pub expanded: bool,
     pub editable: bool,
+    pub secure: bool,
     pub visible: bool,
 }
 
@@ -130,6 +131,7 @@ pub fn map_states(f: &AxStateFacts) -> AxStates {
         checkable: f.checkable,
         expanded: f.expanded,
         editable: f.editable,
+        secure: f.secure,
     }
 }
 

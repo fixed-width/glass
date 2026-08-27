@@ -178,6 +178,8 @@ pub struct AxStates {
     pub checkable: bool,
     pub expanded: bool,
     pub editable: bool,
+    /// The element is a password or otherwise protected text field. Its value must never render.
+    pub secure: bool,
 }
 
 impl AxStates {
@@ -207,6 +209,9 @@ impl AxStates {
         }
         if self.editable {
             v.push("editable");
+        }
+        if self.secure {
+            v.push("secure");
         }
         v
     }
@@ -1689,6 +1694,7 @@ mod tests {
             checked: true,
             expanded: true,
             editable: true,
+            secure: true,
         };
         let off = AxStates::default();
 

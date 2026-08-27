@@ -23,6 +23,7 @@ internal refactors, CI, or test-only changes.
 - `Document` accessibility role: a browser page or embedded web view (AT-SPI `document web`/`document frame`, `AXWebArea`, Android `WebView`, UIA `Document` from a web engine) now reads as a `Document` whose children are the page's elements, on Linux, Windows, macOS and Android.
 
 ### Fixed
+- Compact accessibility snapshots now include bounded current values for editable controls, while distinguishing empty, unavailable, redacted, and truncated values and never disclosing secure-field contents.
 - `glass_wait_for_element` and `glass_scroll_to_element` can now select by accessible `description`, using the same case-sensitive substring semantics as `name`. This lets role-plus-description reveal unnamed controls such as Android fields labelled only by a hint, and returns the realized element id as usual.
 - `glass_set_value` no longer reports that a desktop accessibility write "did not take" when the element exposes a writable value but no readable value for confirmation. Linux, macOS and Windows now report the write as unconfirmed and steer the caller to re-snapshot instead of retrying a write that may already have landed.
 - A web view whose content the platform has not published is disclosed in the snapshot instead of arriving as an indistinguishable empty group: a childless `Document` is named by id and bounds and steers to a re-snapshot before pixels, while a placeholder the app published for content it withheld steers straight to pixels.

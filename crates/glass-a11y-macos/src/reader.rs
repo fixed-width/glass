@@ -445,7 +445,11 @@ fn walk(
     budget.visit();
 
     let ax_role = ffi::attribute_string(el, attr::ROLE).unwrap_or_default();
-    let subrole = read_subrole(el, &ax_role);
+    let subrole = if ax_role == "AXTextField" {
+        ffi::attribute_string(el, attr::SUBROLE)
+    } else {
+        read_subrole(el, &ax_role)
+    };
     let role = mapping::map_role(&ax_role, subrole.as_deref());
     // `raw_role` is normally the same AX role string `map_role` matched on — the token, not
     // `AXRoleDescription`'s localized human phrase ("button" / "bouton"), which is useless as a
@@ -646,6 +650,7 @@ fn gather_states(el: &AXUIElement, role: AxRole) -> AxStateFacts {
         focused: ffi::attribute_bool(el, attr::FOCUSED).unwrap_or(false),
         focusable: ffi::is_settable(el, attr::FOCUSED),
         editable: ffi::is_settable(el, attr::VALUE),
+        secure: subrole.as_deref() == Some("AXSecureTextField"),
         checkable,
         checked,
         ..Default::default()

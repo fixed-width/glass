@@ -60,7 +60,10 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
     // The device agent omits an empty text/desc rather than sending `""`, so both arrive as
     // `None` here; `labels` judges a blank one absent either way.
-    let text = v.get("text").and_then(Value::as_str);
+    let text = v
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| flag("editable").then_some(""));
     let desc = v.get("desc").and_then(Value::as_str);
     // Both keys are absent (not null) on an older companion; `get` returns `None` either way, so
     // no version check is needed to stay compatible with it.
@@ -122,6 +125,7 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
         states: AxStates {
             enabled: flag("enabled"),
             editable: flag("editable"),
+            secure: flag("password"),
             // Android "focusable" is keyboard-only; map isClickable -> focusable as the actability proxy.
             focusable: flag("clickable"),
             visible: true,

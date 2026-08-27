@@ -483,7 +483,8 @@ async fn walk(
     let raw_role = raw_role_res.unwrap_or_default();
     let name = nonempty(name_res.unwrap_or_default());
     let description = normalize_description(&description_res.unwrap_or_default(), name.as_deref());
-    let states = map_states(&state_res.map_err(bus_err)?);
+    let mut states = map_states(&state_res.map_err(bus_err)?);
+    states.secure = role == atspi::Role::PasswordText;
 
     let mut children = Vec::new();
     // Resolved before the gate: a childless node must never be reported truncated for
@@ -800,7 +801,7 @@ async fn read_value(
 ) -> Option<String> {
     use glass_core::AxRole::*;
     match role {
-        TextField | TextArea | ComboBox => read_text(proxy, conn).await.and_then(nonempty),
+        TextField | TextArea | ComboBox => read_text(proxy, conn).await,
         Slider | SpinButton | ProgressBar => read_number(proxy, conn).await,
         _ => None,
     }
