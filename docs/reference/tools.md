@@ -137,9 +137,24 @@ reads the protocol list itself and does distinguish them.
 
 ## Capture & visual comparison
 
+Glass uses four verification terms consistently:
+
+- **Current semantic state**: one accessibility observation from `glass_a11y_snapshot`.
+- **Current visual evidence**: one pixel observation from `glass_screenshot` or `glass_diff`.
+- **Transition completion**: a requested semantic or pixel condition reached by
+  `glass_wait_for_element` or `glass_wait_for_region`.
+- **Visual quiescence**: consecutive frames stopped changing in `glass_wait_stable`; this does not
+  prove that a particular semantic state or approved visual design was reached.
+
+Choose the strongest check for the claim: exact text uses `glass_wait_for_element` with `name`,
+`description` and/or `role` plus `value_contains`; dialog dismissal uses `condition:"disappears"`;
+canvas change uses `glass_wait_for_region`; animation completion uses `glass_wait_stable`.
+
 ### `glass_screenshot`
 
-Capture the app window, or an optional sub-rectangle, as a lossless WebP image.
+Capture current visual evidence from the app window, or an optional sub-rectangle, as a lossless
+WebP image. A screenshot proves only visible pixels at capture time, not semantic state, transition
+completion, or stability.
 
 - `region` (`{ x, y, width, height }`, window-relative) — capture just this rectangle; omit for the
   whole window. Vision cost scales with pixel area, so a tight region is a recurring token saving.
@@ -159,7 +174,8 @@ Returns `{name}`, echoing the saved name.
 
 ### `glass_diff`
 
-Diff the current frame against a named baseline; returns change stats and a bounding box **as text**.
+Compare current visual evidence with a named baseline; returns change stats and a bounding box
+**as text**. This is one comparison, not a wait for transition completion or stability.
 
 - `name` (string, **required**) — baseline to compare against.
 - `mode` (string) — `"perceptual"` (default) or `"exact"`.
@@ -187,7 +203,8 @@ than erroring — branch on that instead of retrying blindly.
 
 ### `glass_wait_stable`
 
-Wait until the window stops changing, then return the settled frame.
+Wait for visual quiescence, then return the last frame. This proves that consecutive frames stopped
+changing, not that expected semantics or pixels were reached.
 
 - `include_image` (boolean, default true) — set false for a text-only result (no image; cheap
   before a text `glass_diff`); `region` is ignored when false.
@@ -219,8 +236,9 @@ comparison; when it equals the compared area, the mask covered everything and no
 
 ### `glass_wait_for_element`
 
-Block until a UI element reaches a precise state, then return it as text. Errors if the app exposes
-no accessibility tree.
+Wait for semantic transition completion, then return the matching element as text. This verifies an
+accessible condition and optional value, not pixels. Errors if the app exposes no accessibility
+tree.
 
 - `name` (string) — substring of the element's accessible name (selector).
 - `description` (string) — substring of the element's accessible description (selector), useful
@@ -244,8 +262,9 @@ value, bounds, states}`) rides as an untrusted sibling text block, since its `na
 
 ### `glass_wait_for_region`
 
-Block until a visual region changes (diverges from a reference) or matches (converges to a saved
-baseline), then return text metrics.
+Wait for pixel transition completion: a visual region changes (diverges from a reference) or matches
+(converges to a saved baseline), then return text metrics. This verifies pixels, not semantic state
+or subsequent stability.
 
 - `until` (string) — `"changes"` (default; diverge from reference) or `"matches"` (converge to
   `baseline`).
@@ -291,10 +310,12 @@ no sibling on timeout. Resume reading from the returned `cursor`.
 
 ## Input
 
-Every tool in this section returns an empty `result:{}` on success — `ok:true` in the envelope is
-itself the confirmation that the action ran. The one exception is `glass_type`'s optional `return`
-observe, which folds settle metadata (or appends an accessibility outline) into the result — see
-its entry.
+Every tool in this section returns an empty `result:{}` on success. `ok:true` confirms only that
+glass dispatched the action without an input error; it does not prove runtime state. Verify the
+expected outcome with `glass_wait_for_element` (`name`, `description` and/or `role`, plus
+`value_contains` when needed), `glass_wait_for_region`, or `glass_wait_stable`. The one exception is
+`glass_type`'s optional `return` observe, which folds settle metadata or appends an accessibility
+outline into the result.
 
 `glass_click`, `glass_drag`, and `glass_scroll` accept an optional `modifiers` array — `"ctrl"`,
 `"shift"`, `"alt"`, or `"super"` (e.g. `["ctrl"]`, `["ctrl","shift"]`; macOS calls this key ⌘ and
