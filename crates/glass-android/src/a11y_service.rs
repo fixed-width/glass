@@ -1919,6 +1919,17 @@ mod tests {
     }
 
     #[test]
+    fn a_password_field_is_secure() {
+        let mut password = node_json(Some("secret"), Some("Password"), None, None);
+        password["class"] = json!("android.widget.EditText");
+        password["editable"] = json!(true);
+        password["password"] = json!(true);
+
+        assert!(mapped_node(&password).states.secure);
+        assert!(!mapped_editable(Some("visible"), Some("Name")).states.secure);
+    }
+
+    #[test]
     fn an_editable_node_with_no_desc_and_no_id_is_unnamed_not_named_by_its_contents() {
         // The device omits the key entirely for a field with no content description, and
         // `mapped_editable` omits `resource_id` too, so nothing is left to fall back to. Naming it
