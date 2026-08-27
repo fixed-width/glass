@@ -181,7 +181,11 @@ fn map_node(
     let role = class_to_role(class);
     let editable = role == AxRole::TextField || boolean("password");
     let content_desc = non_empty(attr("content-desc"));
-    let text = non_empty(attr("text"));
+    let text = if editable {
+        Some(attr("text").to_string())
+    } else {
+        non_empty(attr("text"))
+    };
     let resource_id = non_empty(attr("resource-id"));
     let (name, value, description) = labels(LabelInputs {
         text: text.as_deref(),
@@ -206,6 +210,7 @@ fn map_node(
         checkable: boolean("checkable") || boolean("checked"),
         expanded: false,
         editable,
+        secure: boolean("password"),
     };
     // Recursion is bounded by `budget` (depth, node count, siblings per level), so a
     // pathologically deep or wide device tree cannot blow the stack or the token budget.
@@ -325,10 +330,7 @@ pub(crate) fn labels(inputs: LabelInputs<'_>) -> (Option<String>, Option<String>
     )
 }
 
-/// Absent attribute and empty attribute are the same thing to `uiautomator`, which emits
-/// `text=""` on every node that has none. Kept even though [`labels`] judges the *name* itself,
-/// because it is also what keeps an empty field's `value` `None` rather than `Some("")` — the
-/// shape `typed_clear_landed` and a `value_contains` filter both read.
+/// Treat `uiautomator`'s empty attributes as absent on non-editable nodes.
 fn non_empty(s: &str) -> Option<String> {
     if s.is_empty() {
         None
@@ -805,14 +807,12 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_editable_node_reports_no_value_rather_than_an_empty_one() {
-        // `typed_clear_landed` and a `value_contains` filter both read "empty" as no value at
-        // all, so `text=""` must not surface as `Some("")`.
+    fn an_empty_editable_node_reports_an_empty_value() {
         let xml = edit_text_xml("", "Email");
         let tree = build_tree(&xml, &win(), WalkLimits::DEFAULT).unwrap();
         let field = &tree.root.children[0];
         assert_eq!(field.name.as_deref(), Some("Email"));
-        assert_eq!(field.value, None);
+        assert_eq!(field.value.as_deref(), Some(""));
     }
 
     #[test]

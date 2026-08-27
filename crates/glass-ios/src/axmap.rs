@@ -180,6 +180,8 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
     // none — so this is a plain field read, not an extra round-trip.
     let role = ax_role_with_subrole(&ax_type, s("subrole").as_deref());
     let editable = matches!(role, AxRole::TextField | AxRole::TextArea);
+    let secure =
+        s("subrole").as_deref() == Some("AXSecureTextField") || ax_type == "AXSecureTextField";
     let uid = s("AXUniqueId").and_then(|value| normalize_name(&value));
     let label = s("AXLabel").and_then(|value| normalize_name(&value));
     // Prefer the stable identifier for semantic addressing; fall back to the label.
@@ -191,8 +193,14 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
     // two sequential `if`s, so the compiler sees the label-moving arms are disjoint and skips
     // a clone.
     let (value, orphan_label) = match (editable, uid.is_some()) {
-        (true, true) => (s("AXValue"), label),
-        (true, false) => (s("AXValue"), None),
+        (true, true) => (
+            n.get("AXValue").and_then(Value::as_str).map(str::to_string),
+            label,
+        ),
+        (true, false) => (
+            n.get("AXValue").and_then(Value::as_str).map(str::to_string),
+            None,
+        ),
         (false, true) => (label, None),
         (false, false) => (None, None),
     };
@@ -210,6 +218,7 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
         visible: true,
         focused: false,
         editable,
+        secure,
         checkable,
         checked,
         ..AxStates::default()

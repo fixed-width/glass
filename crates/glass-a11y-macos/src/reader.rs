@@ -445,7 +445,11 @@ fn walk(
     budget.visit();
 
     let ax_role = ffi::attribute_string(el, attr::ROLE).unwrap_or_default();
-    let subrole = read_subrole(el, &ax_role);
+    let subrole = if ax_role == "AXTextField" {
+        ffi::attribute_string(el, attr::SUBROLE)
+    } else {
+        read_subrole(el, &ax_role)
+    };
     let role = mapping::map_role(&ax_role, subrole.as_deref());
     // `raw_role` is normally the same AX role string `map_role` matched on — the token, not
     // `AXRoleDescription`'s localized human phrase ("button" / "bouton"), which is useless as a
@@ -483,7 +487,11 @@ fn walk(
     );
     let value = ffi::attribute_string(el, attr::VALUE);
     let bounds = window_relative_rect(el, scale, win);
-    let states = mapping::map_states(&gather_states(el, role));
+    let states = mapping::map_states(&gather_states(
+        el,
+        role,
+        subrole.as_deref() == Some("AXSecureTextField"),
+    ));
 
     let mut children = Vec::new();
     // `ffi::children` returns `Ok(vec![])` for a legitimately-childless (or absent-
@@ -621,7 +629,7 @@ fn window_relative_rect(el: &AXUIElement, scale: f64, win: &WindowGeometry) -> O
 /// unreadable value claims neither). The remaining facts stay at their defaults — macOS doesn't
 /// expose them as simple universal attributes, and the reader never over-claims a state it
 /// didn't read.
-fn gather_states(el: &AXUIElement, role: AxRole) -> AxStateFacts {
+fn gather_states(el: &AXUIElement, role: AxRole, secure: bool) -> AxStateFacts {
     // Only a checkbox/radio/switch carries a checked state, so read the numeric `AXValue` (an
     // extra AX IPC round-trip) only for those roles — every other node skips it. `ToggleButton`
     // is where a switch lands, whichever base role its toolkit gave it.
@@ -646,6 +654,7 @@ fn gather_states(el: &AXUIElement, role: AxRole) -> AxStateFacts {
         focused: ffi::attribute_bool(el, attr::FOCUSED).unwrap_or(false),
         focusable: ffi::is_settable(el, attr::FOCUSED),
         editable: ffi::is_settable(el, attr::VALUE),
+        secure,
         checkable,
         checked,
         ..Default::default()

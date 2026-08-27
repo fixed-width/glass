@@ -19,6 +19,32 @@ use std::fmt::Write as _;
 
 use crate::accessibility::{AxNode, AxRole, AxTree};
 
+/// Maximum number of Unicode scalar values rendered from an editable value.
+const EDITABLE_VALUE_CHARS: usize = 80;
+
+fn write_editable_value(node: &AxNode, out: &mut String) {
+    if !node.states.editable {
+        return;
+    }
+    if node.states.secure {
+        let _ = write!(out, " value=<redacted>");
+        return;
+    }
+    if node.value.as_deref() == node.name.as_deref() {
+        return;
+    }
+    let Some(value) = &node.value else {
+        let _ = write!(out, " value=<unavailable>");
+        return;
+    };
+    let mut chars = value.chars();
+    let prefix: String = chars.by_ref().take(EDITABLE_VALUE_CHARS).collect();
+    let _ = write!(out, " value={prefix:?}");
+    if chars.next().is_some() {
+        out.push('…');
+    }
+}
+
 /// Whether `node` is pure structural scaffolding — a container that conveys nothing its
 /// single child does not already convey.
 ///
@@ -49,9 +75,8 @@ fn is_scaffolding(node: &AxNode) -> bool {
 /// reported. A bare `Other` therefore means the backend named no token at all, not that glass
 /// dropped one. `role:` selectors still will not match either.
 ///
-/// Shared by [`AxTree::to_outline`] and [`render_compact`] so the two renders cannot drift —
-/// a test asserts they are identical for a tree with nothing to elide.
-pub(crate) fn write_line(node: &AxNode, depth: usize, out: &mut String) {
+/// Shared line format. Editable values are compact-only. Full outlines drive scroll detection.
+pub(crate) fn write_line(node: &AxNode, depth: usize, out: &mut String, editable_values: bool) {
     let indent = "  ".repeat(depth);
     let _ = write!(out, "{indent}#{}", node.id.0);
     if node.role == AxRole::Other && !node.raw_role.is_empty() {
@@ -64,6 +89,9 @@ pub(crate) fn write_line(node: &AxNode, depth: usize, out: &mut String) {
     }
     if let Some(description) = &node.description {
         let _ = write!(out, " desc={description:?}");
+    }
+    if editable_values {
+        write_editable_value(node, out);
     }
     if let Some(b) = &node.bounds {
         let _ = write!(out, " {b}");
@@ -86,7 +114,7 @@ pub fn render_compact(tree: &AxTree) -> String {
     let mut out = String::new();
     // The root anchors the outline and is rendered unconditionally, even when it is itself
     // an unnamed single-child container.
-    write_line(&tree.root, 0, &mut out);
+    write_line(&tree.root, 0, &mut out, true);
     write_children(&tree.root, 1, &mut out);
     out
 }
@@ -105,7 +133,7 @@ fn write_children(parent: &AxNode, depth: usize, out: &mut String) {
             };
             node = only;
         }
-        write_line(node, depth, out);
+        write_line(node, depth, out, true);
         write_children(node, depth + 1, out);
     }
 }
@@ -431,5 +459,42 @@ mod tests {
             ..AxStates::default()
         };
         assert!(render_compact(&tree_of(wrap(b, 3))).contains("(12,40 80x24) [enabled]"));
+    }
+
+    #[test]
+    fn editable_values_distinguish_short_empty_unavailable_redacted_and_truncated() {
+        let render = |value: Option<&str>, secure: bool| {
+            let mut n = node(AxRole::TextField, Some("Email"));
+            n.value = value.map(Into::into);
+            n.states.editable = true;
+            n.states.secure = secure;
+            render_compact(&tree_of(n))
+        };
+        assert!(render(Some("alice@example.com"), false).contains("value=\"alice@example.com\""));
+        assert!(render(Some(""), false).contains("value=\"\""));
+        assert!(render(None, false).contains("value=<unavailable>"));
+        assert!(render(Some("secret"), true).contains("value=<redacted>"));
+        let long = "x".repeat(EDITABLE_VALUE_CHARS + 1);
+        let out = render(Some(&long), false);
+        assert!(out.contains(&format!("value=\"{}\"…", "x".repeat(EDITABLE_VALUE_CHARS))));
+        assert!(!out.contains(&long));
+    }
+
+    #[test]
+    fn editable_value_is_not_repeated_when_it_is_already_the_name() {
+        let mut n = node(AxRole::TextField, Some("same"));
+        n.value = Some("same".into());
+        n.states.editable = true;
+        assert!(!render_compact(&tree_of(n)).contains("value="));
+    }
+
+    #[test]
+    fn editable_values_are_compact_only() {
+        let mut n = node(AxRole::TextField, Some("Email"));
+        n.value = Some("alice@example.com".into());
+        n.states.editable = true;
+        let tree = tree_of(n);
+        assert!(render_compact(&tree).contains("value=\"alice@example.com\""));
+        assert!(!tree.to_outline().contains("value="));
     }
 }

@@ -70,6 +70,7 @@ pub(crate) fn map_states(states: &StateSet) -> AxStates {
         checkable: states.contains(State::Checkable),
         expanded: states.contains(State::Expanded),
         editable: states.contains(State::Editable),
+        secure: false,
     }
 }
 

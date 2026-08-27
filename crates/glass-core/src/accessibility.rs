@@ -178,6 +178,8 @@ pub struct AxStates {
     pub checkable: bool,
     pub expanded: bool,
     pub editable: bool,
+    /// Password or protected field; its value must never render.
+    pub secure: bool,
 }
 
 impl AxStates {
@@ -207,6 +209,9 @@ impl AxStates {
         }
         if self.editable {
             v.push("editable");
+        }
+        if self.secure {
+            v.push("secure");
         }
         v
     }
@@ -765,7 +770,7 @@ impl AxTree {
     /// this text in at the MCP boundary. See [`Self::truncation_notice`].
     pub fn to_outline(&self) -> String {
         fn walk(node: &AxNode, depth: usize, out: &mut String) {
-            crate::outline::write_line(node, depth, out);
+            crate::outline::write_line(node, depth, out, false);
             for child in &node.children {
                 walk(child, depth + 1, out);
             }
@@ -1689,6 +1694,7 @@ mod tests {
             checked: true,
             expanded: true,
             editable: true,
+            secure: true,
         };
         let off = AxStates::default();
 

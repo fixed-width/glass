@@ -58,9 +58,11 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
     walk.refs.push(device_ref);
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
-    // The device agent omits an empty text/desc rather than sending `""`, so both arrive as
-    // `None` here; `labels` judges a blank one absent either way.
-    let text = v.get("text").and_then(Value::as_str);
+    // The device omits empty text; preserve it as empty for editable nodes.
+    let text = v
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| flag("editable").then_some(""));
     let desc = v.get("desc").and_then(Value::as_str);
     // Both keys are absent (not null) on an older companion; `get` returns `None` either way, so
     // no version check is needed to stay compatible with it.
@@ -122,6 +124,7 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
         states: AxStates {
             enabled: flag("enabled"),
             editable: flag("editable"),
+            secure: flag("password"),
             // Android "focusable" is keyboard-only; map isClickable -> focusable as the actability proxy.
             focusable: flag("clickable"),
             visible: true,
@@ -1913,6 +1916,17 @@ mod tests {
         assert_eq!(node.name.as_deref(), Some("Email"));
         assert_eq!(node.value.as_deref(), Some("joe@x.com"));
         assert_eq!(node.description, None);
+    }
+
+    #[test]
+    fn a_password_field_is_secure() {
+        let mut password = node_json(Some("secret"), Some("Password"), None, None);
+        password["class"] = json!("android.widget.EditText");
+        password["editable"] = json!(true);
+        password["password"] = json!(true);
+
+        assert!(mapped_node(&password).states.secure);
+        assert!(!mapped_editable(Some("visible"), Some("Name")).states.secure);
     }
 
     #[test]

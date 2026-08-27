@@ -262,7 +262,7 @@ fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<Str
     // Value pattern: one fetch for both the value string and read-only (Edit/ComboBox/Document)
     let (value_text, readonly) = if matches!(ct_id, 50003 | 50004 | 50030) {
         match el.get_pattern::<UIValuePattern>() {
-            Ok(p) => (p.get_value().ok().and_then(nonempty), p.is_readonly().ok()),
+            Ok(p) => (p.get_value().ok(), p.is_readonly().ok()),
             Err(_) => (None, None),
         }
     } else {
@@ -297,6 +297,7 @@ fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<Str
         toggled_on,
         expanded,
         editable,
+        secure: el.is_password().unwrap_or(false),
         checkable,
     };
     (facts, value)
