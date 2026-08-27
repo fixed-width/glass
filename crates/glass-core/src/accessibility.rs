@@ -1446,6 +1446,7 @@ pub struct ElementSelector<'a> {
     pub name: Option<&'a str>,
     pub description: Option<&'a str>,
     pub role: Option<AxRole>,
+    pub value: Option<&'a str>,
     pub value_contains: Option<&'a str>,
 }
 
@@ -1482,12 +1483,14 @@ impl AxTree {
             name,
             description,
             role,
+            value,
             value_contains,
         } = selector;
         // Jetpack Compose can expose clickable controls as focusable `Group`/`Other` nodes, so a
         // qualified interactable role may match them; requiring a qualifier prevents role-only
         // queries from matching arbitrary focusable containers.
-        let has_disambiguator = name.is_some() || description.is_some() || value_contains.is_some();
+        let has_disambiguator =
+            name.is_some() || description.is_some() || value.is_some() || value_contains.is_some();
         let role_match = |n: &AxNode, r: AxRole| {
             n.role == r
                 || (r.is_interactable()
@@ -1503,6 +1506,7 @@ impl AxTree {
                         .is_some_and(|desc| desc.contains(q))
                 })
                 && role.is_none_or(|r| role_match(n, r))
+                && value.is_none_or(|v| n.value.as_deref() == Some(v))
                 && value_contains
                     .is_none_or(|v| n.value.as_deref().is_some_and(|val| val.contains(v)))
         };
@@ -3243,6 +3247,44 @@ mod tests {
                 Some("99%"),
                 ElementCondition::Appears
             ),
+            ElementMatch::Pending
+        ));
+    }
+
+    #[test]
+    fn element_match_value_is_exact_and_disambiguates_an_actable_group() {
+        let mut node = leaf(AxRole::Group, "");
+        node.name = None;
+        node.value = Some("hello glass".into());
+        node.states.focusable = true;
+        let tree = AxTree::new(AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "frame".into(),
+            name: Some("App".into()),
+            description: None,
+            value: None,
+            states: AxStates::default(),
+            bounds: None,
+            children: vec![node],
+        });
+        let exact = ElementSelector {
+            role: Some(AxRole::Button),
+            value: Some("hello glass"),
+            ..Default::default()
+        };
+        assert!(matches!(
+            tree.element_match_selector(exact, ElementCondition::Appears),
+            ElementMatch::Satisfied(Some(_))
+        ));
+
+        let prefix = ElementSelector {
+            role: Some(AxRole::Button),
+            value: Some("hello"),
+            ..Default::default()
+        };
+        assert!(matches!(
+            tree.element_match_selector(prefix, ElementCondition::Appears),
             ElementMatch::Pending
         ));
     }

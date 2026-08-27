@@ -186,7 +186,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Capture the app window (or an optional window-relative `region`) as a screenshot (lossless WebP image). A capture reaching off the display edge is clipped to the on-screen portion — the returned `width`/`height` are the actual captured size, so a frame smaller than the window/region means it was clipped; only a fully off-screen surface errors."
+        description = "Capture current visual evidence from the app window (or an optional window-relative `region`) as a lossless WebP screenshot. This proves only what pixels are visible at capture time, not semantic state or transition completion; use glass_wait_for_element for an accessible condition/value, glass_wait_for_region for pixel transition completion, or glass_wait_stable for visual quiescence. A capture reaching off the display edge is clipped to the on-screen portion — the returned `width`/`height` are the actual captured size, so a frame smaller than the window/region means it was clipped; only a fully off-screen surface errors."
     )]
     async fn glass_screenshot(
         &self,
@@ -197,7 +197,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Wait until the window stops changing, then return the settled frame. Optional `stability_region` watches only that sub-rectangle for settling (ignore unrelated motion); optional `region` crops the returned frame. Set `include_image: false` for a text-only `{settled,width,height}` result with no image (`region` ignored) — cheap before a text `glass_diff`."
+        description = "Wait for visual quiescence: consecutive frames stop changing, then return the last frame. This proves stability, not that an expected semantic state or pixel design was reached; use glass_wait_for_element for a semantic condition/value or glass_wait_for_region with a baseline for expected pixels. Optional `stability_region` watches only that sub-rectangle; optional `region` crops the returned frame. Set `include_image:false` for text-only metadata."
     )]
     async fn glass_wait_stable(
         &self,
@@ -398,7 +398,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Diff the current frame against a named baseline; returns change stats + bbox. Set `include_image: true` to also return the current frame cropped to the changed region (omitted when nothing changed)."
+        description = "Compare current visual evidence with a named pixel baseline; returns change stats and a bounding box. This is a single current-state comparison, not a wait for transition completion or stability; use glass_wait_for_region to wait for pixel change/match and glass_wait_stable for quiescence. Set `include_image:true` to return the changed crop when pixels differ."
     )]
     async fn glass_diff(
         &self,
@@ -494,8 +494,15 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Capture the active window's accessibility tree (semantic \
-                       elements: role, name, description, window-relative bounds) as compact \
+        description = "Capture the active window's current semantic state as a compact \
+                       accessibility tree (role, name, description, bounded editable value, \
+                       window-relative bounds and states). This is one observation, not proof of \
+                       transition completion or visual appearance. For exact runtime verification, \
+                       call glass_wait_for_element with the element's `name`, `description` and/or \
+                       `role`, plus `value` for an exact editable value (`value_contains` for a \
+                       substring). The compact value may be \
+                       unavailable, redacted or truncated; use that wait rather than repeated \
+                       snapshots when the full queryable value matters. Rendered as compact \
                        text — deterministic, low-token element addressing alongside \
                        screenshots. Each line is `#<id> <Role> \"<name>\" desc=\"<description>\" \
                        (x,y wxh) [states]`. desc carries a second label the platform exposes \
@@ -626,12 +633,16 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Block until a UI element reaches a precise state, then return it as text \
-                       (no image). Select by `name` (accessible-name substring) and/or `role` \
-                       (e.g. \"Button\"); `condition` (default appears): appears|disappears|enabled|\
+        description = "Wait for semantic transition completion: block until an accessible element \
+                       reaches a condition and optional value, then return it as text (no image). \
+                       This verifies runtime semantic state, not pixels or visual stability. Select \
+                       by `name` (accessible-name substring), `description` (accessible-description \
+                       substring) and/or `role` (e.g. \"Button\"); `condition` (default appears): \
+                       appears|disappears|enabled|\
                        disabled|checked|unchecked|selected|unselected|expanded|collapsed|focused|\
-                       visible|hidden; optional `value_contains`. Returns \
-                       {matched,elapsed_ms,element{id,role,name,bounds,states}} — the id is usable \
+                       visible|hidden; `value` additionally requires an exact editable value, while \
+                       `value_contains` requires a substring (combine either with a selector). Returns \
+                       {matched,elapsed_ms} plus the matched element, including value — its id is usable \
                        with glass_click_element. On timeout returns {matched:false}. Waits through a \
                        just-launched app that has not published its accessibility tree yet, and \
                        errors if none appeared before the timeout. Collapses screenshot poll-loops \
@@ -676,13 +687,16 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Block until a visual region changes (diverges from a reference) or matches \
-                       (converges to a saved baseline), then return text metrics (no image unless \
+        description = "Wait for pixel transition completion: block until a visual region changes \
+                       (diverges from a reference) or matches (converges to a saved baseline), then \
+                       return text metrics (no image unless \
                        `include_image:true`). `until`: \"changes\" (default) or \"matches\" (needs \
                        `baseline`); optional window-relative `region`; `mode` perceptual|exact with \
                        `threshold`/`tolerance`. Returns {matched,changed_pct,bbox,elapsed_ms}. Use \
                        \"matches\" to confirm the UI reached an approved design without spending \
-                       vision tokens."
+                       vision tokens. This verifies pixels, not semantic state or subsequent \
+                       stability; use glass_wait_for_element for accessible conditions/values and \
+                       glass_wait_stable when animation completion means visual quiescence."
     )]
     async fn glass_wait_for_region(
         &self,
@@ -744,19 +758,21 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      name, window-relative bounds, and a description where the element carries a second \
      label distinct from its name) — deterministic, no image tokens. Address \
      elements by #id: glass_click_element clicks one, glass_set_value writes an editable element's \
-     value, and glass_wait_for_element blocks until an element reaches a state (e.g. Save \
-     becomes enabled). Prefer this over screenshots and pixel-hunting whenever it works.\n\n\
+     value, and glass_wait_for_element verifies semantic transition completion, including exact \
+     editable text with value. Prefer this over screenshots and pixel-hunting whenever it works.\n\n\
      PIXELS ARE THE FALLBACK — for a canvas/black-box app with no tree (glass_a11y_snapshot \
      errors there): glass_screenshot to see it, then glass_click / glass_type / glass_key / \
      glass_scroll / glass_drag (glass_gesture for multi-touch where supported) to interact. \
-     Coordinates are WINDOW-RELATIVE — 0,0 is the app window's top-left. glass_wait_stable \
-     lets a render settle before you look or compare.\n\n\
+     Coordinates are WINDOW-RELATIVE — 0,0 is the app window's top-left. A screenshot is current \
+     visual evidence only; glass_wait_for_region verifies pixel transition completion and \
+     glass_wait_stable verifies visual quiescence.\n\n\
      VERIFY WITHOUT VISION TOKENS: glass_baseline_save a good frame, act, then glass_diff, \
      which returns changed_pct and a bbox as TEXT (no image). Only call glass_diff with \
      include_image=true (a cropped image of the changed region) when changed_pct shows \
      something moved — don't screenshot to check every step. glass_wait_for_region blocks \
      until a region changes or matches a saved baseline; glass_wait_for_log until a log line \
-     appears. Waits return text only and time out softly with {matched:false} — branch on \
+     appears. Successful input dispatch does not prove runtime state; verify the expected outcome \
+     with the strongest matching wait. Waits return text only and time out softly with {matched:false} — branch on \
      that rather than retrying blindly.\n\n\
      Batch a known input sequence into one call with glass_do (actions: click/type/key/\
      move/drag/scroll/settle), with an optional text-first `then` observe \
@@ -1273,6 +1289,43 @@ mod tests {
             "semantic addressing (glass_a11y_snapshot) must be introduced before \
              pixel capture (glass_screenshot)"
         );
+    }
+
+    #[test]
+    fn descriptions_route_common_verification_claims() {
+        let descriptions: BTreeMap<String, String> = GlassServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                (
+                    tool.name.to_string(),
+                    tool.description.unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+
+        let element = &descriptions["glass_wait_for_element"];
+        assert!(element.contains("semantic transition completion"));
+        assert!(element.contains("description"));
+        assert!(element.contains("`value`"));
+        assert!(element.contains("value_contains"));
+        assert!(element.contains("disappears"));
+
+        let region = &descriptions["glass_wait_for_region"];
+        assert!(region.contains("pixel transition completion"));
+        assert!(region.contains("glass_wait_stable"));
+
+        let stable = &descriptions["glass_wait_stable"];
+        assert!(stable.contains("visual quiescence"));
+        assert!(stable.contains("not that an expected semantic state or pixel design was reached"));
+
+        let snapshot = &descriptions["glass_a11y_snapshot"];
+        assert!(snapshot.contains("current semantic state"));
+        assert!(snapshot.contains("`value`"));
+
+        let screenshot = &descriptions["glass_screenshot"];
+        assert!(screenshot.contains("current visual evidence"));
+        assert!(screenshot.contains("not semantic state or transition completion"));
     }
 
     /// The tool reference is the only user-facing list of glass's tools. Bind it to the
