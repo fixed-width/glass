@@ -770,7 +770,7 @@ impl AxTree {
     /// this text in at the MCP boundary. See [`Self::truncation_notice`].
     pub fn to_outline(&self) -> String {
         fn walk(node: &AxNode, depth: usize, out: &mut String) {
-            crate::outline::write_line(node, depth, out);
+            crate::outline::write_line(node, depth, out, false);
             for child in &node.children {
                 walk(child, depth + 1, out);
             }
