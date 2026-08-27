@@ -3931,6 +3931,67 @@ mod tests {
     }
 
     #[test]
+    fn a_same_id_field_is_refused_when_either_editability_or_enabledness_is_lost() {
+        let target = target_for(&built(&editable_field("old")), AxNodeId(1));
+        for key in ["editable", "enabled"] {
+            let mut after = built(&editable_field("new"));
+            match key {
+                "editable" => after.root.children[0].states.editable = false,
+                "enabled" => after.root.children[0].states.enabled = false,
+                _ => unreachable!(),
+            }
+            let err = service_write_reading(&after, &target, "new")
+                .expect_err("either state loss makes the target unsafe to confirm");
+            assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_moved_candidate_is_not_editable_when_only_one_required_state_remains() {
+        let target = target_for(&built(&editable_field("old")), AxNodeId(1));
+        for key in ["editable", "enabled"] {
+            let mut after = built(&editable_field_slid("new", 700));
+            match key {
+                "editable" => after.root.children[0].states.editable = false,
+                "enabled" => after.root.children[0].states.enabled = false,
+                _ => unreachable!(),
+            }
+            let err = service_write_reading(&after, &target, "new")
+                .expect_err("reacquisition requires both editable and enabled");
+            assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        }
+    }
+
+    #[test]
+    fn same_id_with_new_geometry_is_reported_as_reacquired() {
+        let target = target_for(&built(&editable_field("old")), AxNodeId(1));
+        let after = built(&editable_field_slid("new", 700));
+
+        assert_eq!(
+            service_write_reading(&after, &target, "new").expect("unique moved field"),
+            WriteReading::Landed { reacquired: true }
+        );
+    }
+
+    #[test]
+    fn new_id_with_original_geometry_is_reported_as_reacquired() {
+        let target = target_for(&built(&editable_field("old")), AxNodeId(1));
+        let mut after = editable_field("new");
+        after["children"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "class": "android.widget.TextView", "text": "inserted",
+                "bounds": {"x": 800, "y": 0, "w": 100, "h": 50}, "enabled": true
+            }),
+        );
+
+        assert_eq!(
+            service_write_reading(&built(&after), &target, "new").expect("unique renumbered field"),
+            WriteReading::Landed { reacquired: true }
+        );
+    }
+
+    #[test]
     fn a_genuinely_disappeared_field_stays_pending_until_the_deadline() {
         let target = target_for(&built(&editable_field("old")), AxNodeId(1));
         let tree = built(&json!({
