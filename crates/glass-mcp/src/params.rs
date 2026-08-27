@@ -333,6 +333,9 @@ pub struct WaitStableArgs {
 pub struct WaitForElementArgs {
     /// Substring of the element's accessible name (selector).
     pub name: Option<String>,
+    /// Substring of the element's accessible description (selector). Useful for unnamed
+    /// controls whose platform label is exposed as a hint, help text, or description.
+    pub description: Option<String>,
     /// Element role filter, e.g. "Button", "ProgressBar", "Document" (selector).
     pub role: Option<String>,
     /// What to wait for (default "appears"): appears|disappears|enabled|disabled|
@@ -341,7 +344,7 @@ pub struct WaitForElementArgs {
     /// state) — a non-toggle element matches neither.
     pub condition: Option<String>,
     /// Additionally require the matched element's `value` to contain this substring.
-    /// Not a standalone selector — `name` and/or `role` is still required.
+    /// Not a standalone selector — `name`, `description`, and/or `role` is still required.
     pub value_contains: Option<String>,
     /// Poll interval (default 200ms — an a11y snapshot per tick).
     pub interval_ms: Option<u64>,
@@ -351,13 +354,15 @@ pub struct WaitForElementArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScrollToElementArgs {
-    /// Substring of the target element's accessible name (selector). `name` and/or
-    /// `role` is required.
+    /// Substring of the target element's accessible name (selector).
     pub name: Option<String>,
+    /// Substring of the target element's accessible description (selector). This can select
+    /// an unnamed control, including an Android text field labelled only by its hint.
+    pub description: Option<String>,
     /// Element role filter, e.g. "ListItem", "Button", "Document" (selector).
     pub role: Option<String>,
     /// Additionally require the matched element's `value` to contain this substring.
-    /// Not a standalone selector — `name` and/or `role` is still required.
+    /// Not a standalone selector — `name`, `description`, and/or `role` is still required.
     pub value_contains: Option<String>,
     /// Sweep direction: "up"/"down" (vertical) or "left"/"right" (horizontal).
     /// Omit to infer it from the target's off-screen position (falls back to a

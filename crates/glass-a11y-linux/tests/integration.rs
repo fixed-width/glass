@@ -997,6 +997,7 @@ fn scroll_to_element_reaches_a_virtualized_offscreen_row() {
     let out = glass
         .scroll_to_element(&glass_core::ScrollToElementParams {
             name: Some("Row 060".into()),
+            description: None,
             role: None,
             value_contains: None,
             direction: Some(glass_core::ScrollDirection::Down),
@@ -1050,6 +1051,7 @@ fn scroll_to_element_reports_unmatched_for_an_absent_row() {
     let out = glass
         .scroll_to_element(&glass_core::ScrollToElementParams {
             name: Some("Row 999".into()),
+            description: None,
             role: None,
             value_contains: None,
             direction: Some(glass_core::ScrollDirection::Down),
@@ -1244,6 +1246,7 @@ fn a_quiet_wait_stops_re_walking_the_tree() {
     let out = glass
         .wait_for_element(&glass_core::WaitElementParams {
             name: Some("no such element in this fixture".into()),
+            description: None,
             role: None,
             value_contains: None,
             condition: glass_core::ElementCondition::Appears,

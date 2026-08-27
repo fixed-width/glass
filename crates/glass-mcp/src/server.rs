@@ -500,8 +500,8 @@ impl GlassServer {
                        screenshots. Each line is `#<id> <Role> \"<name>\" desc=\"<description>\" \
                        (x,y wxh) [states]`. desc carries a second label the platform exposes \
                        apart from the name, and appears only where one exists and differs from \
-                       the name; it is display-only, since glass_wait_for_element and \
-                       glass_scroll_to_element select on name, not description. Pass an #id to \
+                       the name; glass_wait_for_element and glass_scroll_to_element can select \
+                       it with the description parameter. Pass an #id to \
                        glass_click_element. Errors if the backend or app exposes no \
                        accessibility tree (e.g. a canvas/black-box app) — fall back to \
                        glass_screenshot then. Web content arrives under a `Document` element, \

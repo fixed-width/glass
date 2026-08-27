@@ -1431,10 +1431,24 @@ impl ElementInfo {
     }
 }
 
+/// Accessibility properties that identify an element.
+///
+/// Every populated field must match. Text fields use case-sensitive substring matching and do
+/// not match an absent node property. If multiple nodes match, queries select the first node in
+/// stable tree pre-order.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ElementSelector<'a> {
+    pub name: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub role: Option<AxRole>,
+    pub value_contains: Option<&'a str>,
+}
+
 impl AxTree {
-    /// Evaluate `condition` against the first pre-order node matching the optional name, role,
-    /// and value filters. `Disappears` is satisfied only when no node matches the selector.
-    /// Name and value filters do not match missing fields.
+    /// Evaluate `condition` against the first pre-order node matching the optional name,
+    /// description, role, and value filters. String filters use case-sensitive substring
+    /// matching and do not match missing fields. When several nodes match, the first node in
+    /// stable tree pre-order wins. `Disappears` is satisfied only when no node matches.
     pub fn element_match(
         &self,
         name: Option<&str>,
@@ -1442,10 +1456,33 @@ impl AxTree {
         value_contains: Option<&str>,
         condition: ElementCondition,
     ) -> ElementMatch<'_> {
+        self.element_match_selector(
+            ElementSelector {
+                name,
+                role,
+                value_contains,
+                ..ElementSelector::default()
+            },
+            condition,
+        )
+    }
+
+    /// Evaluate `condition` against the first node matching `selector`.
+    pub fn element_match_selector(
+        &self,
+        selector: ElementSelector<'_>,
+        condition: ElementCondition,
+    ) -> ElementMatch<'_> {
+        let ElementSelector {
+            name,
+            description,
+            role,
+            value_contains,
+        } = selector;
         // Jetpack Compose can expose clickable controls as focusable `Group`/`Other` nodes, so a
         // qualified interactable role may match them; requiring a qualifier prevents role-only
         // queries from matching arbitrary focusable containers.
-        let has_disambiguator = name.is_some() || value_contains.is_some();
+        let has_disambiguator = name.is_some() || description.is_some() || value_contains.is_some();
         let role_match = |n: &AxNode, r: AxRole| {
             n.role == r
                 || (r.is_interactable()
@@ -1455,6 +1492,11 @@ impl AxTree {
         };
         let selector_match = |n: &AxNode| -> bool {
             name.is_none_or(|q| n.name.as_deref().is_some_and(|nm| nm.contains(q)))
+                && description.is_none_or(|q| {
+                    n.description
+                        .as_deref()
+                        .is_some_and(|desc| desc.contains(q))
+                })
                 && role.is_none_or(|r| role_match(n, r))
                 && value_contains
                     .is_none_or(|v| n.value.as_deref().is_some_and(|val| val.contains(v)))
@@ -2979,6 +3021,53 @@ mod tests {
             ElementMatch::Satisfied(Some(n)) => assert_eq!(n.id, AxNodeId(1)),
             other => panic!("expected Satisfied(Save), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn element_selector_matches_description_and_keeps_preorder_deterministic() {
+        let mut t = sample_tree();
+        t.assign_ids();
+        let mut second = t.root.children[0].clone();
+        t.root.children[0].name = None;
+        t.root.children[0].description = Some("Search settings primary".into());
+        second.id = AxNodeId(99);
+        second.name = None;
+        second.description = Some("Search settings secondary".into());
+        t.root.children.push(second);
+
+        match t.element_match_selector(
+            ElementSelector {
+                description: Some("Search settings"),
+                role: Some(AxRole::Button),
+                ..ElementSelector::default()
+            },
+            ElementCondition::Appears,
+        ) {
+            ElementMatch::Satisfied(Some(node)) => assert_eq!(node.id, AxNodeId(1)),
+            other => panic!("expected the first description match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn description_qualifies_an_unclassified_interactable_role_match() {
+        let mut t = sample_tree();
+        let node = &mut t.root.children[0];
+        node.role = AxRole::Group;
+        node.name = None;
+        node.description = Some("Search settings".into());
+        node.states.focusable = true;
+
+        assert!(matches!(
+            t.element_match_selector(
+                ElementSelector {
+                    description: Some("Search settings"),
+                    role: Some(AxRole::Button),
+                    ..ElementSelector::default()
+                },
+                ElementCondition::Appears,
+            ),
+            ElementMatch::Satisfied(Some(_))
+        ));
     }
 
     #[test]
