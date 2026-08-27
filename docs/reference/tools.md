@@ -223,15 +223,17 @@ Block until a UI element reaches a precise state, then return it as text. Errors
 no accessibility tree.
 
 - `name` (string) — substring of the element's accessible name (selector).
+- `description` (string) — substring of the element's accessible description (selector), useful
+  for unnamed controls exposed through a hint or help label.
 - `role` (string) — element role filter, e.g. `"Button"`, `"ProgressBar"` (selector).
 - `condition` (string, default `appears`) — one of `appears`, `disappears`, `enabled`, `disabled`,
   `checked`, `unchecked`, `selected`, `unselected`, `expanded`, `collapsed`, `focused`, `visible`,
   `hidden`.
 - `value_contains` (string) — additionally require the matched element's value to contain this
-  substring; not a standalone selector (`name` and/or `role` still required). Only an element that
-  reports a value can match one: on Android that is the editable elements alone (a change for the
-  on-device accessibility-service reader), so filter a label, button or check box there on `name`
-  instead — a `value_contains` against one waits out the whole timeout and returns
+  substring; not a standalone selector (`name`, `description`, and/or `role` still required). Only
+  an element that reports a value can match one: on Android that is the editable elements alone (a
+  change for the on-device accessibility-service reader), so filter a label, button or check box
+  there on `name` or `description` instead — a `value_contains` against one waits out the whole timeout and returns
   `{matched:false}`.
 - `interval_ms` (integer, default 200) — poll interval (one a11y snapshot per tick).
 - `timeout_ms` (integer, default 10000) — returns `{matched:false}` on timeout.
@@ -625,13 +627,15 @@ present in the a11y tree — so the returned `id` is usable with `glass_click_el
 non-virtualized container (a horizontal toolbar) whose off-screen items are always in the tree.
 Errors if the app exposes no accessibility tree.
 
-- `name` (string) — substring of the target's accessible name (selector); `name` and/or `role`
-  is required.
+- `name` (string) — substring of the target's accessible name (selector).
+- `description` (string) — substring of the target's accessible description (selector), useful
+  for unnamed controls exposed through a hint or help label. At least one of `name`, `description`,
+  or `role` is required.
 - `role` (string) — role filter, e.g. `"ListItem"`, `"Button"` (selector).
 - `value_contains` (string) — additionally require the matched element's value to contain this
   substring; not a standalone selector. Only an element that reports a value can match one: on
   Android's on-device accessibility-service reader that is the editable elements alone, so filter
-  a label, button or check box there on `name` instead.
+  a label, button or check box there on `name` or `description` instead.
 - `direction` (string) — `"up"`/`"down"` (vertical) or `"left"`/`"right"` (horizontal). **Omit
   to infer** the direction from the target's off-screen position (e.g. an item at `x ≥ width`
   scrolls right); inference falls back to a vertical `down`→`up` sweep when the target isn't in

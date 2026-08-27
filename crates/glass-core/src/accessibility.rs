@@ -3049,6 +3049,28 @@ mod tests {
     }
 
     #[test]
+    fn description_qualifies_an_unclassified_interactable_role_match() {
+        let mut t = sample_tree();
+        let node = &mut t.root.children[0];
+        node.role = AxRole::Group;
+        node.name = None;
+        node.description = Some("Search settings".into());
+        node.states.focusable = true;
+
+        assert!(matches!(
+            t.element_match_selector(
+                ElementSelector {
+                    description: Some("Search settings"),
+                    role: Some(AxRole::Button),
+                    ..ElementSelector::default()
+                },
+                ElementCondition::Appears,
+            ),
+            ElementMatch::Satisfied(Some(_))
+        ));
+    }
+
+    #[test]
     fn element_match_role_filters() {
         let mut t = sample_tree();
         t.assign_ids();
