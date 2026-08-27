@@ -280,8 +280,17 @@ impl Platform for AndroidPlatform {
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+        self.capture_frame_by(region, Deadline::UNBOUNDED)
+    }
+
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
         let win = self.refresh_window()?;
-        let bytes = self.adb().run_bytes(["exec-out", "screencap"])?;
+        let bytes = self
+            .adb()
+            .run_bytes_until(["exec-out", "screencap"], deadline)?;
         let display = decode_screencap(&bytes)?;
         let window_region = visible_window_region(&win, display.width, display.height)?;
         let window_frame = display.crop(&window_region)?;
@@ -705,6 +714,27 @@ mod platform_tests {
 
         // The dialog's frame, not the 1080x2400 display behind it.
         assert_eq!((frame.width, frame.height), (800, 800));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn android_screencap_uses_adb_run_bytes_until() {
+        let fake = launchable();
+        let mut platform = started(&fake);
+
+        let err = platform
+            .capture_frame_by(
+                None,
+                Deadline::at(Instant::now() - Duration::from_millis(1)),
+            )
+            .expect_err("a spent caller deadline must not start screencap");
+
+        assert_eq!(err.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert!(
+            !fake.called("exec-out screencap"),
+            "screencap ran despite the spent caller deadline: {:?}",
+            fake.calls()
+        );
     }
 
     #[test]

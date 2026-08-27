@@ -13,7 +13,7 @@ use glass_core::platform::{
     AppSpec, KeyEvent, Platform, PointerEvent, SandboxLevel, WindowGeometry, WindowId, WindowInfo,
     WindowOp,
 };
-use glass_core::{GlassError, Result};
+use glass_core::{Deadline, GlassError, Result};
 
 use crate::adoption_log::adoption_line;
 use crate::axwindow;
@@ -746,11 +746,20 @@ impl Platform for MacosPlatform {
     /// **Main-thread affinity:** like `start_app`, this reaches `ffi::app_kit_init()` and must
     /// run on the true main thread.
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+        self.capture_frame_by(region, Deadline::UNBOUNDED)
+    }
+
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
         match self.active_window {
-            Some(id) => crate::capture::capture_window_by_id(id, &[pid as i32], region),
-            None => crate::capture::capture_window(&[pid as i32], region),
+            Some(id) => {
+                crate::capture::capture_window_by_id_by(id, &[pid as i32], region, deadline)
+            }
+            None => crate::capture::capture_window_by(&[pid as i32], region, deadline),
         }
     }
     /// Map the active window into `input::send_pointer` — see `input.rs`'s module doc for the

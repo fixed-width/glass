@@ -159,7 +159,15 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        Ok(self.output(args, Deadline::UNBOUNDED)?.stdout)
+        self.run_bytes_until(args, Deadline::UNBOUNDED)
+    }
+
+    /// Run adb capturing raw stdout bytes within a caller's sequence deadline.
+    pub fn run_bytes_until<'a, I>(&self, args: I, deadline: Deadline) -> Result<Vec<u8>>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        Ok(self.output(args, deadline)?.stdout)
     }
 
     /// Run adb and return the completed process, erroring on spawn failure or non-zero

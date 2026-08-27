@@ -14,7 +14,7 @@
 //! `Retained<_>`/`CGImage` pointer.
 
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2::AnyThread;
@@ -29,7 +29,7 @@ use objc2_screen_capture_kit::{
 };
 
 use glass_core::frame::{Frame, Region};
-use glass_core::{GlassError, Result};
+use glass_core::{Deadline, GlassError, Result};
 
 use crate::scwindow::{find_on_screen_window, find_on_screen_window_by_id};
 
@@ -46,9 +46,13 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// `backend.rs::capture_frame`'s fallback path for when `MacosPlatform::active_window` is
 /// unset — see [`capture_window_by_id`] for its active-window (retargeted) counterpart.
-pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Frame> {
+pub(crate) fn capture_window_by(
+    pids: &[i32],
+    region: Option<&Region>,
+    deadline: Deadline,
+) -> Result<Frame> {
     let pids_owned: Vec<i32> = pids.to_vec();
-    capture_resolved(region, move |content| {
+    capture_resolved(region, deadline, move |content| {
         find_on_screen_window(content, &pids_owned)
     })
 }
@@ -61,13 +65,14 @@ pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Fr
 /// "first on-screen window for this pid", or a multi-window app silently captures the wrong
 /// one. The `pids` scoping additionally guards a stale or foreign `active_window` id — without
 /// it, `window_id` alone could match a window owned by a completely different app.
-pub(crate) fn capture_window_by_id(
+pub(crate) fn capture_window_by_id_by(
     window_id: u32,
     pids: &[i32],
     region: Option<&Region>,
+    deadline: Deadline,
 ) -> Result<Frame> {
     let pids_owned: Vec<i32> = pids.to_vec();
-    capture_resolved(region, move |content| {
+    capture_resolved(region, deadline, move |content| {
         find_on_screen_window_by_id(content, window_id, &pids_owned)
     })
 }
@@ -80,6 +85,7 @@ pub(crate) fn capture_window_by_id(
 /// completion block, so it must be `Send` (queue-hopped) but not `Sync` (called once).
 fn capture_resolved(
     region: Option<&Region>,
+    deadline: Deadline,
     resolve: impl Fn(&SCShareableContent) -> Option<(Retained<SCWindow>, i32)> + Send + 'static,
 ) -> Result<Frame> {
     crate::ffi::app_kit_init();
@@ -184,7 +190,8 @@ fn capture_resolved(
         );
     }
 
-    match rx.recv_timeout(CAPTURE_TIMEOUT) {
+    let timeout = capture_timeout_by(deadline, Instant::now())?;
+    match rx.recv_timeout(timeout) {
         Ok(CaptureReply::Ok(frame)) => Ok(frame),
         Ok(CaptureReply::Err(e)) => Err(e),
         Err(mpsc::RecvTimeoutError::Timeout) => Err(GlassError::CaptureFailed(
@@ -193,6 +200,15 @@ fn capture_resolved(
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(GlassError::Backend(
             "ScreenCaptureKit completion handler was dropped without replying".into(),
         )),
+    }
+}
+
+fn capture_timeout_by(deadline: Deadline, now: Instant) -> Result<Duration> {
+    let timeout = deadline.within(CAPTURE_TIMEOUT, now);
+    if timeout.is_zero() {
+        Err(GlassError::deadline_not_started("capture"))
+    } else {
+        Ok(timeout)
     }
 }
 
@@ -279,5 +295,22 @@ mod tests {
     fn capture_reply_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<CaptureReply>();
+    }
+
+    #[test]
+    fn macos_capture_caps_recv_timeout_by_caller() {
+        let now = Instant::now();
+        let caller_budget = Duration::from_millis(10);
+        assert_eq!(
+            capture_timeout_by(Deadline::at(now + caller_budget), now).unwrap(),
+            caller_budget
+        );
+        assert!(matches!(
+            capture_timeout_by(Deadline::at(now), now),
+            Err(GlassError::Bounded {
+                kind: glass_core::BoundKind::NotStarted,
+                ..
+            })
+        ));
     }
 }

@@ -10,7 +10,7 @@ use glass_core::{
     WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 
-use crate::capture::screenshot;
+use crate::capture::{screenshot, screenshot_by};
 use crate::idb::client::IdbClient;
 use crate::idb::companion::IdbCompanion;
 use crate::injector::IdbInjector;
@@ -613,8 +613,12 @@ impl Platform for IosPlatform {
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+        self.capture_frame_by(region, Deadline::UNBOUNDED)
+    }
+
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
         self.running()?;
-        let frame = screenshot(self.target.simctl(), self.target.udid())?;
+        let frame = screenshot_by(self.target.simctl(), self.target.udid(), deadline)?;
         match region {
             None => Ok(frame),
             Some(r) => frame.crop(r),
