@@ -22,6 +22,23 @@ fn started(platform: FakePlatform) -> Glass {
     g
 }
 
+fn started_a11y(platform: FakePlatform) -> Glass {
+    let mut g = glass_with_a11y(platform, fake_tree());
+    let a = StartArgs {
+        build: None,
+        run: vec!["app".into()],
+        backend: None,
+        sandbox: None,
+        cwd: None,
+        env: std::collections::BTreeMap::new(),
+        window_hint: None,
+        timeout_ms: None,
+        a11y: None,
+    };
+    start_tool(&mut g, &a).unwrap();
+    g
+}
+
 fn error_text(out: ToolOutput) -> String {
     match &out.0[0] {
         OutContent::Text(text) => text.clone(),
@@ -76,7 +93,7 @@ fn success_retains_existing_fields_and_adds_every_step_result() {
 fn type_return_snapshot_is_retained_in_content_blocks() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let frame = Frame::solid(100, 100, [0, 0, 0, 255]);
-    let mut g = started(
+    let mut g = started_a11y(
         FakePlatform::new(100, 100)
             .with_event_log(log.clone())
             .with_frames(vec![frame.clone(), frame.clone(), frame]),
@@ -86,7 +103,7 @@ fn type_return_snapshot_is_retained_in_content_blocks() {
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
                 text: "hi".into(),
-                return_: Some("settle".into()),
+                return_: Some("snapshot".into()),
             })],
             then: None,
             timeout_ms: None,
@@ -97,7 +114,12 @@ fn type_return_snapshot_is_retained_in_content_blocks() {
     assert_eq!(*log.lock().unwrap(), vec!["type(hi)"]);
     let result = assert_envelope(&out, "glass_do");
     assert_eq!(result["executed"], json!(1));
-    assert_eq!(result["steps"][0]["result"]["observed"]["settled"], true);
+    assert_eq!(result["steps"][0]["content_blocks"], json!([1]));
+    assert_eq!(out.0.len(), 2, "snapshot outline is retained as a sibling");
+    let OutContent::Text(snapshot) = &out.0[1] else {
+        panic!("snapshot sibling must be text");
+    };
+    assert!(snapshot.contains("untrusted content"));
 }
 
 #[test]
@@ -147,6 +169,9 @@ fn action_failure_is_structured_and_lists_unexecuted_steps() {
     let error: serde_json::Value = serde_json::from_str(&err).unwrap();
     assert_eq!(error["error"]["code"], "step_failed");
     assert_eq!(error["error"]["step"], 1);
+    assert_eq!(error["error"]["summary"], "action execution failed");
+    assert_eq!(error["outcome"]["steps"][1]["error"]["summary"], "action execution failed");
+    assert!(!err.contains("coordinate (100,10)"));
     assert_eq!(error["outcome"]["executed"], 1);
     assert_eq!(error["outcome"]["steps"][2]["status"], "unexecuted");
     assert_eq!(
@@ -194,7 +219,11 @@ fn semantic_action_is_rejected_until_dispatch_is_implemented() {
         },
     )
     .unwrap_err());
-    assert!(err.contains("not yet supported"), "got: {err}");
+    assert!(err.contains("action execution failed"), "got: {err}");
+    let error: serde_json::Value = serde_json::from_str(&err).unwrap();
+    let step = &error["outcome"]["steps"][0];
+    assert_eq!(step["attempted"], false);
+    assert_eq!(step["side_effects_may_have_occurred"], false);
 }
 
 #[test]
@@ -480,6 +509,8 @@ fn terminal_failure_keeps_completed_action_steps() {
     .unwrap_err());
     let error: serde_json::Value = serde_json::from_str(&err).unwrap();
     assert_eq!(error["error"]["code"], "terminal_observe_failed");
+    assert_eq!(error["error"]["summary"], "terminal observation failed");
+    assert!(!err.contains("baseline not found"));
     assert_eq!(error["outcome"]["executed"], 1);
 }
 

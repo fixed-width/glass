@@ -93,6 +93,19 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
     let mut siblings = Vec::new();
     for (i, action) in a.actions.iter().enumerate() {
         let kind = action.kind();
+        if !action.is_supported() {
+            return Err(step_failure(
+                &a.actions,
+                i,
+                kind,
+                false,
+                false,
+                "semantic action is not yet supported in glass_do",
+                steps,
+                siblings,
+                started.elapsed().as_millis(),
+            ));
+        }
         let result: ToolResult = match action {
             Action::Click(args) => click(glass, args),
             Action::Move(args) => mouse_move(glass, args),
@@ -104,7 +117,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
             // Err (bad region / capture failure) aborts. A non-settle (timeout)
             // is Ok and proceeds.
             Action::Settle(args) => wait_stable(glass, &settle_args(args)),
-            Action::ClickElement(_) | Action::SetValue(_) | Action::WaitForElement(_) | Action::ScrollToElement(_) => Err("semantic action is not yet supported in glass_do".into()),
+            Action::ClickElement(_) | Action::SetValue(_) | Action::WaitForElement(_) | Action::ScrollToElement(_) => unreachable!("unsupported actions return before dispatch"),
         };
         match result {
             Ok(out) => {
@@ -115,26 +128,17 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 steps.push(StepOutcome::Completed { index: i, action: kind, result, content_blocks });
             }
             Err(summary) => {
-                let start = siblings.len() + 1;
-                siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(&summary)));
-                steps.push(StepOutcome::Failed {
-                    index: i,
-                    action: kind,
-                    attempted: true,
-                    result: None,
-                    error: StepError { code: "action_failed", summary: summary.clone() },
-                    side_effects_may_have_occurred: action.is_mutating(),
-                    content_blocks: vec![start],
-                });
-                steps.extend(a.actions[i + 1..].iter().enumerate().map(|(offset, action)| {
-                    StepOutcome::Unexecuted { index: i + offset + 1, action: action.kind() }
-                }));
-                return Err(error_output(json!({
-                    "ok": false,
-                    "tool": "glass_do",
-                    "error": { "code": "step_failed", "step": i, "summary": summary },
-                    "outcome": failure_outcome(steps, i, started.elapsed().as_millis()),
-                }), siblings));
+                return Err(step_failure(
+                    &a.actions,
+                    i,
+                    kind,
+                    true,
+                    action.is_mutating(),
+                    &summary,
+                    steps,
+                    siblings,
+                    started.elapsed().as_millis(),
+                ));
             }
         }
     }
@@ -146,15 +150,52 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 result["then"] = meta;
                 siblings.append(&mut extra);
             }
-            Err(summary) => return Err(error_output(json!({
+            Err(detail) => {
+                siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(&detail)));
+                return Err(error_output(json!({
                 "ok": false,
                 "tool": "glass_do",
-                "error": { "code": "terminal_observe_failed", "summary": summary },
+                "error": { "code": "terminal_observe_failed", "summary": "terminal observation failed" },
                 "outcome": failure_outcome(steps, n, started.elapsed().as_millis()),
-            }), siblings)),
+                }), siblings));
+            }
         }
     }
     Ok(ToolOutput::result_with("glass_do", result, siblings))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_failure(
+    actions: &[Action],
+    index: usize,
+    action: &'static str,
+    attempted: bool,
+    side_effects_may_have_occurred: bool,
+    detail: &str,
+    mut steps: Vec<StepOutcome>,
+    mut siblings: Vec<OutContent>,
+    elapsed_ms: u128,
+) -> ToolOutput {
+    let content_block = siblings.len() + 1;
+    siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(detail)));
+    steps.push(StepOutcome::Failed {
+        index,
+        action,
+        attempted,
+        result: None,
+        error: StepError { code: "action_failed", summary: "action execution failed".into() },
+        side_effects_may_have_occurred,
+        content_blocks: vec![content_block],
+    });
+    steps.extend(actions[index + 1..].iter().enumerate().map(|(offset, action)| {
+        StepOutcome::Unexecuted { index: index + offset + 1, action: action.kind() }
+    }));
+    error_output(json!({
+        "ok": false,
+        "tool": "glass_do",
+        "error": { "code": "step_failed", "step": index, "summary": "action execution failed" },
+        "outcome": failure_outcome(steps, index, elapsed_ms),
+    }), siblings)
 }
 
 fn validation_error(summary: &str) -> ToolOutput {
@@ -182,6 +223,10 @@ fn failure_outcome(steps: Vec<StepOutcome>, executed: usize, elapsed_ms: u128) -
 }
 
 impl Action {
+    fn is_supported(&self) -> bool {
+        matches!(self, Action::Click(_) | Action::Move(_) | Action::Drag(_) | Action::Scroll(_) | Action::Type(_) | Action::Key(_) | Action::Settle(_))
+    }
+
     fn kind(&self) -> &'static str {
         match self {
             Action::Click(_) => "click",
