@@ -21,7 +21,7 @@
 //! backend — a known limitation.
 use glass_core::accessibility::{
     AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, WalkBudget, WalkLimits,
-    normalize_description,
+    normalize_description, normalize_name,
 };
 use glass_core::{GlassError, Result, WindowGeometry};
 use serde_json::Value;
@@ -180,8 +180,8 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
     // none — so this is a plain field read, not an extra round-trip.
     let role = ax_role_with_subrole(&ax_type, s("subrole").as_deref());
     let editable = matches!(role, AxRole::TextField | AxRole::TextArea);
-    let uid = s("AXUniqueId");
-    let label = s("AXLabel");
+    let uid = s("AXUniqueId").and_then(|value| normalize_name(&value));
+    let label = s("AXLabel").and_then(|value| normalize_name(&value));
     // Prefer the stable identifier for semantic addressing; fall back to the label.
     let name = uid.clone().or_else(|| label.clone());
     // Editable → value is `AXValue`; non-editable with a uid → the uid already displaced the

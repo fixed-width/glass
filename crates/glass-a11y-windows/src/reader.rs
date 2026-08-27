@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal,
-    GlassError, Result, WalkBudget, normalize_description, read_back_confirms,
+    GlassError, Result, WalkBudget, normalize_description, normalize_name, read_back_confirms,
     write_took_no_effect,
 };
 use uiautomation::patterns::{
@@ -341,7 +341,7 @@ fn window_relative_bounds(el: &UIElement, origin: (i32, i32)) -> Option<AxRect> 
 }
 
 fn nonempty(s: String) -> Option<String> {
-    (!s.is_empty()).then_some(s)
+    normalize_name(&s)
 }
 
 /// The element's UIA `FrameworkId`, which `map_role_with_framework` decides a `Document` on.

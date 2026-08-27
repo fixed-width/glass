@@ -356,6 +356,13 @@ pub struct AxNode {
     pub children: Vec<AxNode>,
 }
 
+/// A node name, or `None` when the platform supplied no non-whitespace content.
+/// The original string is preserved so meaningful leading, trailing, and interior spacing
+/// remains available to selectors and target fingerprints.
+pub fn normalize_name(raw: &str) -> Option<String> {
+    (!raw.trim().is_empty()).then(|| raw.to_string())
+}
+
 /// A node's description, or `None` when it would add nothing: empty, whitespace-only, or the
 /// same string as `name` (platforms routinely report both fields with one label in them).
 /// Every backend normalizes through this so the rule cannot drift per-platform.
@@ -3679,10 +3686,16 @@ mod tests {
         assert_eq!(normalize_description("   ", None), None);
         // A description identical to the name would print the same label twice per line.
         assert_eq!(normalize_description("Save", Some("Save")), None);
-        // Both sides are trimmed, and the name side is reachable: the readers' `nonempty`
-        // helper does not trim, so a name can arrive as `Some("Save ")`.
+        // Both sides are trimmed while meaningful spacing remains stored verbatim.
         assert_eq!(normalize_description("  Save  ", Some("Save")), None);
         assert_eq!(normalize_description("Save", Some("  Save  ")), None);
+    }
+
+    #[test]
+    fn normalize_name_drops_only_names_without_content() {
+        assert_eq!(normalize_name(""), None);
+        assert_eq!(normalize_name("   \t"), None);
+        assert_eq!(normalize_name("  Save  "), Some("  Save  ".into()));
     }
 
     #[test]

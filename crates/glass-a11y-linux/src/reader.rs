@@ -11,7 +11,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
     A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, Deadline,
-    GlassError, Result, WalkBudget, normalize_description, read_back_confirms,
+    GlassError, Result, WalkBudget, normalize_description, normalize_name, read_back_confirms,
     write_took_no_effect,
 };
 
@@ -837,7 +837,7 @@ async fn read_number(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Op
 }
 
 fn nonempty(s: String) -> Option<String> {
-    (!s.is_empty()).then_some(s)
+    normalize_name(&s)
 }
 
 /// Records a null `child_ref` on `budget` as content the app has not exposed, and says whether it
