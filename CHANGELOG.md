@@ -24,6 +24,7 @@ internal refactors, CI, or test-only changes.
 - MCP descriptions and the tool reference now distinguish current semantic state, current visual evidence, transition completion and visual quiescence, including `glass_wait_for_element` exact-value matching and direct routes for dialog dismissal, canvas changes and animation completion.
 
 ### Fixed
+- On macOS, `glass doctor` no longer fails an otherwise healthy iOS backend because the separate macOS accessibility reader cannot answer its system-wide probe. The macOS reader check remains a hard failure when `macos` is selected, and is now an advisory warning when `ios` is selected, like the other inactive-backend checks.
 - On Android, the accessibility-service reader no longer reports an untouched editable field's displayed hint as entered content: the hint remains its `description`, its `value` is absent while Android says the hint is showing, and entered text becomes the value once the hint stops showing. Older companion APKs that do not publish that state keep the previous value mapping.
 - Compact accessibility snapshots now include bounded current values for editable controls, while distinguishing empty, unavailable, redacted, and truncated values and never disclosing secure-field contents.
 - `glass_wait_for_element` and `glass_scroll_to_element` can now select by accessible `description`, using the same case-sensitive substring semantics as `name`. This lets role-plus-description reveal unnamed controls such as Android fields labelled only by a hint, and returns the realized element id as usual.

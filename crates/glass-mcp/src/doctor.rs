@@ -206,7 +206,7 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         // `glass_macos::accessibility_granted()` fact and remedy string.
         sections.push(Section::new(
             "accessibility (macos)",
-            None,
+            Some("macos".into()),
             macos_a11y_checks(
                 glass_a11y_macos::doctor::probe(),
                 glass_macos::accessibility_granted(),
@@ -810,6 +810,13 @@ mod tests {
         // iOS's section follows the same non-empty shape, but only exists on macOS.
         #[cfg(target_os = "macos")]
         {
+            let macos_a11y = d
+                .sections
+                .iter()
+                .find(|s| s.title == "accessibility (macos)")
+                .expect("macos accessibility section");
+            assert_eq!(macos_a11y.backend.as_deref(), Some("macos"));
+
             let ios = d
                 .sections
                 .iter()
