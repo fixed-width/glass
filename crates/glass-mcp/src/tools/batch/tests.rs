@@ -120,6 +120,7 @@ fn type_return_snapshot_is_retained_in_content_blocks() {
         panic!("snapshot sibling must be text");
     };
     assert!(snapshot.contains("untrusted content"));
+    assert!(snapshot.contains("Save"), "snapshot sibling: {snapshot}");
 }
 
 #[test]
