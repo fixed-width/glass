@@ -125,6 +125,7 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
             enabled: flag("enabled"),
             editable: flag("editable"),
             secure: flag("password"),
+            focused: flag("focused"),
             // Android "focusable" is keyboard-only; map isClickable -> focusable as the actability proxy.
             focusable: flag("clickable"),
             visible: true,
@@ -521,6 +522,25 @@ fn service_write_reading(tree: &AxTree, target: &AxTarget, text: &str) -> Result
         }
     }
 
+    fn collect_confirmed_focused<'a>(
+        node: &'a AxNode,
+        target: &AxTarget,
+        text: &str,
+        out: &mut Vec<&'a AxNode>,
+    ) {
+        if node.role == target.role
+            && node.states.editable
+            && node.states.enabled
+            && node.states.focused
+            && node.value.as_deref().unwrap_or("") == text
+        {
+            out.push(node);
+        }
+        for child in &node.children {
+            collect_confirmed_focused(child, target, text, out);
+        }
+    }
+
     if let Some(node) = tree.find(target.id)
         && target.matches(node.role, node.name.as_deref())
         && target.bounds_consistent(node.bounds, 8)
@@ -563,7 +583,19 @@ fn service_write_reading(tree: &AxTree, target: &AxTarget, text: &str) -> Result
     }
     let Some(node) = editable.first().copied() else {
         if matches.is_empty() {
-            return Ok(WriteReading::Missing);
+            let mut focused = Vec::new();
+            collect_confirmed_focused(&tree.root, target, text, &mut focused);
+            return match focused.as_slice() {
+                [] => Ok(WriteReading::Missing),
+                [_] => Ok(WriteReading::Landed { reacquired: true }),
+                many => Err(GlassError::AxWriteUnconfirmed(
+                    target.id.0,
+                    format!(
+                        "{} focused editable elements have the requested value, so target reacquisition is ambiguous",
+                        many.len()
+                    ),
+                )),
+            };
         }
         return Err(GlassError::AxWriteUnconfirmed(
             target.id.0,
@@ -3906,6 +3938,38 @@ mod tests {
             .expect("one semantically identical editable remains in the active window");
 
         assert_eq!(reading, WriteReading::Landed { reacquired: true });
+    }
+
+    #[test]
+    fn a_focused_field_is_reacquired_after_its_hint_name_disappears() {
+        let before = editable_field("old");
+        let target = target_for(&built(&before), AxNodeId(1));
+        let mut after = editable_field_slid("new", 700);
+        after["children"][0]["desc"] = Value::Null;
+        after["children"][0]["focused"] = json!(true);
+
+        let reading = service_write_reading(&built(&after), &target, "new")
+            .expect("one focused editable has the exact requested value");
+
+        assert_eq!(reading, WriteReading::Landed { reacquired: true });
+    }
+
+    #[test]
+    fn hint_loss_reacquisition_requires_both_enabled_and_focused() {
+        let target = target_for(&built(&editable_field("old")), AxNodeId(1));
+        for missing_state in ["enabled", "focused"] {
+            let mut after = editable_field_slid("new", 700);
+            after["children"][0]["desc"] = Value::Null;
+            after["children"][0]["focused"] = json!(true);
+            after["children"][0][missing_state] = json!(false);
+
+            assert_eq!(
+                service_write_reading(&built(&after), &target, "new")
+                    .expect("an unsafe candidate remains unconfirmed"),
+                WriteReading::Missing,
+                "missing {missing_state} must prevent reacquisition"
+            );
+        }
     }
 
     #[test]

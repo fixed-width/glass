@@ -59,11 +59,9 @@ pub struct WindowHintArgs {
 pub struct StartArgs {
     /// Optional shell command to run (in `cwd`) before launching.
     pub build: Option<String>,
-    /// What to launch, then its arguments. `run[0]` is the executable on a desktop backend, an
-    /// `.app` path or bundle id on `ios`, and a `package/.Activity` component — optionally with
-    /// an `.apk` to install first — on `android`. `run[1..]` are the app's own arguments;
-    /// `android` has no argument vector to put them in and returns an error rather than
-    /// ignoring them.
+    /// What to launch: desktop `[executable, args...]`; iOS `[.app-or-bundle-id, args...]`;
+    /// Android `[apk?, package/.Activity]` in either order, for example
+    /// `["/absolute/path/app.apk", "com.example.app/.MainActivity"]`.
     pub run: Vec<String>,
     /// Backend to launch under: `"x11"` or `"wayland"` (Linux), `"windows"` (on a
     /// Windows host), `"macos"` (on a macOS host), `"android"` (an AVD emulator, any
