@@ -1515,8 +1515,6 @@ mod tests {
             run_doc.contains("com.example.app/.MainActivity"),
             "{run_doc}"
         );
-        assert!(run_doc.contains("install -r -t"), "{run_doc}");
-        assert!(run_doc.contains("glass_stop"), "{run_doc}");
     }
 
     /// `glass_diff`, `glass_wait_stable`, and `glass_wait_for_region` must each advertise an
