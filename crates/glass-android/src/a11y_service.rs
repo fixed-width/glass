@@ -510,11 +510,7 @@ enum WriteReading {
     Landed { reacquired: bool },
 }
 
-/// Read a dispatched write against the one editable node that still carries the target's semantic
-/// identity. The active-window snapshot and package check in `set_value` bound this search; unlike
-/// `AxTarget::relocate`, geometry is deliberately not a disqualifier because opening the IME can
-/// replace and move the field. Searching the whole complete tree even when the old id still matches
-/// prevents a duplicate editable from being hidden by the id fast path.
+/// Finds the unique matching editable in the active-window tree because an IME relayout can replace or move it.
 fn service_write_reading(tree: &AxTree, target: &AxTarget, text: &str) -> Result<WriteReading> {
     fn collect<'a>(node: &'a AxNode, target: &AxTarget, out: &mut Vec<&'a AxNode>) {
         if target.matches(node.role, node.name.as_deref()) {
