@@ -766,9 +766,7 @@ impl GlassServer {
         description = "Run an ordered sequence of input actions in ONE call (collapsing per-action \
                        round-trips), then optionally observe. `actions` is a list of \
                        {\"action\":\"click|move|drag|scroll|type|key|settle\", …same fields as the \
-                       matching tool — except `type`'s `return` observe, rejected here (use a \
-                       settle action or `then`)}; `settle` waits for the screen to stop changing \
-                       between steps. \
+                       matching tool; `settle` waits for the screen to stop changing between steps. \
                        Optional `then` runs after all actions succeed: {settle?, diff?, screenshot?} \
                        (text-only unless screenshot/diff image). Fails fast: if an action errors it \
                        reports which index failed and how many ran. Use for KNOWN sequences (login, \
@@ -779,7 +777,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<DoArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::do_actions(g, &a)).await
+        self.run_batch(move |g| tools::do_actions(g, &a)).await
     }
 }
 

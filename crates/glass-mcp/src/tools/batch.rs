@@ -2,12 +2,22 @@
 
 use glass_core::Glass;
 use serde_json::json;
+use std::time::Instant;
 
 use crate::params::*;
 use crate::tools::{
-    OutContent, ToolOutput, ToolResult, click, diff, drag, key, mouse_move, screenshot, scroll,
-    type_text, wait_stable,
+    BatchToolResult, OutContent, ToolOutput, ToolResult, click, diff, drag, key, mouse_move,
+    screenshot, scroll, type_text, wait_stable,
 };
+
+mod model;
+
+use model::{StepError, StepOutcome};
+
+const MAX_ACTIONS: usize = 64;
+const MAX_ARGUMENT_BYTES: usize = 65_536;
+const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const MAX_TIMEOUT_MS: u64 = 120_000;
 
 /// Split a sub-tool's enveloped output into (its `result` payload, its non-envelope
 /// sibling blocks — images and the IMAGE_NOTE). The envelope text block itself is consumed.
@@ -57,71 +67,152 @@ fn settle_args(s: &SettleArgs) -> WaitStableArgs {
 /// Fail-fast: the first failing action aborts with its index/kind/message and
 /// the count that ran. A `then` failure is reported distinctly (the actions
 /// already executed).
-pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> ToolResult {
+pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
+    let started = Instant::now();
     if a.actions.is_empty() {
-        return Err("`actions` must contain at least one action".into());
+        return Err(validation_error("`actions` must contain at least one action"));
     }
-    // Pre-flight: a `type` action's `return` observe would have its output discarded
-    // mid-sequence, so it's rejected — and the rejection is decidable from the argument
-    // list alone, so it happens BEFORE any input is injected (never a half-applied
-    // sequence for a pure argument-shape error). An explicit `"none"` is the documented
-    // no-observe default and passes.
-    for (i, action) in a.actions.iter().enumerate() {
-        if let Action::Type(args) = action
-            && matches!(args.return_.as_deref(), Some(r) if r != "none")
-        {
-            return Err(format!(
-                "action[{i}] (type): `return` is not accepted inside glass_do — use a \
-                     `settle` action or the terminal `then` observe"
-            ));
-        }
+    if a.actions.len() > MAX_ACTIONS {
+        return Err(validation_error(&format!(
+            "`actions` must contain at most {MAX_ACTIONS} actions"
+        )));
+    }
+    if a.encoded_argument_bytes > MAX_ARGUMENT_BYTES {
+        return Err(validation_error(&format!(
+            "encoded arguments exceed the {MAX_ARGUMENT_BYTES}-byte limit"
+        )));
+    }
+    let timeout_ms = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
+        return Err(validation_error(&format!(
+            "`timeout_ms` must be between 1 and {MAX_TIMEOUT_MS}"
+        )));
     }
     let n = a.actions.len();
+    let mut steps = Vec::with_capacity(n);
+    let mut siblings = Vec::new();
     for (i, action) in a.actions.iter().enumerate() {
-        let (kind, result): (&str, ToolResult) = match action {
-            Action::Click(args) => ("click", click(glass, args)),
-            Action::Move(args) => ("move", mouse_move(glass, args)),
-            Action::Drag(args) => ("drag", drag(glass, args)),
-            Action::Scroll(args) => ("scroll", scroll(glass, args)),
-            Action::Type(args) => ("type", type_text(glass, args)),
-            Action::Key(args) => ("key", key(glass, args)),
+        let kind = action.kind();
+        let result: ToolResult = match action {
+            Action::Click(args) => click(glass, args),
+            Action::Move(args) => mouse_move(glass, args),
+            Action::Drag(args) => drag(glass, args),
+            Action::Scroll(args) => scroll(glass, args),
+            Action::Type(args) => type_text(glass, args),
+            Action::Key(args) => key(glass, args),
             // A settle's text-only output is discarded mid-sequence; only its
             // Err (bad region / capture failure) aborts. A non-settle (timeout)
             // is Ok and proceeds.
-            Action::Settle(args) => ("settle", wait_stable(glass, &settle_args(args))),
-            Action::ClickElement(_) => (
-                "click_element",
-                Err("semantic action is not yet supported in glass_do".into()),
-            ),
-            Action::SetValue(_) => (
-                "set_value",
-                Err("semantic action is not yet supported in glass_do".into()),
-            ),
-            Action::WaitForElement(_) => (
-                "wait_for_element",
-                Err("semantic action is not yet supported in glass_do".into()),
-            ),
-            Action::ScrollToElement(_) => (
-                "scroll_to_element",
-                Err("semantic action is not yet supported in glass_do".into()),
-            ),
+            Action::Settle(args) => wait_stable(glass, &settle_args(args)),
+            Action::ClickElement(_) | Action::SetValue(_) | Action::WaitForElement(_) | Action::ScrollToElement(_) => Err("semantic action is not yet supported in glass_do".into()),
         };
-        if let Err(msg) = result {
-            return Err(format!(
-                "action[{i}] ({kind}) failed: {msg} — {i} of {n} actions executed before the failure"
-            ));
+        match result {
+            Ok(out) => {
+                let (result, mut extra) = split_sub(out);
+                let start = siblings.len() + 1;
+                let content_blocks = (start..start + extra.len()).collect();
+                siblings.append(&mut extra);
+                steps.push(StepOutcome::Completed { index: i, action: kind, result, content_blocks });
+            }
+            Err(summary) => {
+                let start = siblings.len() + 1;
+                siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(&summary)));
+                steps.push(StepOutcome::Failed {
+                    index: i,
+                    action: kind,
+                    attempted: true,
+                    result: None,
+                    error: StepError { code: "action_failed", summary: summary.clone() },
+                    side_effects_may_have_occurred: action.is_mutating(),
+                    content_blocks: vec![start],
+                });
+                steps.extend(a.actions[i + 1..].iter().enumerate().map(|(offset, action)| {
+                    StepOutcome::Unexecuted { index: i + offset + 1, action: action.kind() }
+                }));
+                return Err(error_output(json!({
+                    "ok": false,
+                    "tool": "glass_do",
+                    "error": { "code": "step_failed", "step": i, "summary": summary },
+                    "outcome": failure_outcome(steps, i, started.elapsed().as_millis()),
+                }), siblings));
+            }
         }
     }
 
-    let mut result = json!({ "executed": n });
-    let mut siblings = Vec::new();
+    let mut result = json!({ "executed": n, "steps": steps });
     if let Some(then) = &a.then {
-        let (meta, sib) = run_then(glass, then)
-            .map_err(|msg| format!("all {n} actions executed; terminal observe failed: {msg}"))?;
-        result["then"] = meta;
-        siblings = sib;
+        match run_then(glass, then) {
+            Ok((meta, mut extra)) => {
+                result["then"] = meta;
+                siblings.append(&mut extra);
+            }
+            Err(summary) => return Err(error_output(json!({
+                "ok": false,
+                "tool": "glass_do",
+                "error": { "code": "terminal_observe_failed", "summary": summary },
+                "outcome": failure_outcome(steps, n, started.elapsed().as_millis()),
+            }), siblings)),
+        }
     }
     Ok(ToolOutput::result_with("glass_do", result, siblings))
+}
+
+fn validation_error(summary: &str) -> ToolOutput {
+    error_output(json!({
+        "ok": false,
+        "tool": "glass_do",
+        "error": { "code": "invalid_sequence", "summary": summary },
+    }), Vec::new())
+}
+
+fn error_output(envelope: serde_json::Value, mut siblings: Vec<OutContent>) -> ToolOutput {
+    let mut content = vec![OutContent::Text(envelope.to_string())];
+    content.append(&mut siblings);
+    ToolOutput(content)
+}
+
+fn failure_outcome(steps: Vec<StepOutcome>, executed: usize, elapsed_ms: u128) -> serde_json::Value {
+    json!({
+        "status": "failed",
+        "executed": executed,
+        "steps": steps,
+        "effects_rolled_back": false,
+        "elapsed_ms": elapsed_ms,
+    })
+}
+
+impl Action {
+    fn kind(&self) -> &'static str {
+        match self {
+            Action::Click(_) => "click",
+            Action::Move(_) => "move",
+            Action::Drag(_) => "drag",
+            Action::Scroll(_) => "scroll",
+            Action::Type(_) => "type",
+            Action::Key(_) => "key",
+            Action::Settle(_) => "settle",
+            Action::ClickElement(args) => {
+                let _ = args;
+                "click_element"
+            }
+            Action::SetValue(args) => {
+                let _ = args;
+                "set_value"
+            }
+            Action::WaitForElement(args) => {
+                let _ = args;
+                "wait_for_element"
+            }
+            Action::ScrollToElement(args) => {
+                let _ = args;
+                "scroll_to_element"
+            }
+        }
+    }
+
+    fn is_mutating(&self) -> bool {
+        !matches!(self, Action::Move(_) | Action::Settle(_) | Action::WaitForElement(_))
+    }
 }
 
 /// Run the terminal observe in fixed order: settle → diff → screenshot. Returns
@@ -151,523 +242,6 @@ fn run_then(
     Ok((meta, siblings))
 }
 
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tools::start as start_tool;
-    use crate::tools::testutil::*;
-    use crate::tools::{OutContent, baseline_save};
-    use glass_core::Frame;
-    use std::sync::{Arc, Mutex};
-
-    fn started(platform: FakePlatform) -> Glass {
-        let mut g = glass_with(platform);
-        let a = StartArgs {
-            build: None,
-            run: vec!["app".into()],
-            backend: None,
-            sandbox: None,
-            cwd: None,
-            env: std::collections::BTreeMap::new(),
-            window_hint: None,
-            timeout_ms: None,
-            a11y: None,
-        };
-        start_tool(&mut g, &a).unwrap();
-        g
-    }
-
-    fn click(x: i32, y: i32) -> Action {
-        Action::Click(ClickArgs {
-            x,
-            y,
-            button: None,
-            count: None,
-            modifiers: None,
-        })
-    }
-
-    #[test]
-    fn runs_actions_in_order() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![
-                    click(10, 20),
-                    Action::Type(TypeArgs {
-                        text: "alice".into(),
-                        return_: None,
-                    }),
-                    Action::Key(KeyArgs {
-                        chord: "Tab".into(),
-                    }),
-                ],
-                then: None,
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            *log.lock().unwrap(),
-            vec!["click(10,20)", "type(alice)", "key(Tab)"]
-        );
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["executed"], json!(3));
-    }
-
-    #[test]
-    fn type_action_with_return_is_rejected_before_any_action_runs() {
-        // The rejection is decidable from the argument list alone, so it must
-        // pre-flight: no earlier action may be injected before the batch errors.
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
-        let err = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![
-                    click(10, 10),
-                    Action::Type(TypeArgs {
-                        text: "hi".into(),
-                        return_: Some("settle".into()),
-                    }),
-                ],
-                then: None,
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("action[1]"), "got: {err}");
-        assert!(err.contains("`return`"), "got: {err}");
-        assert!(err.contains("terminal `then` observe"), "got: {err}");
-        assert!(
-            log.lock().unwrap().is_empty(),
-            "pre-flight must reject before any input is injected: {:?}",
-            log.lock().unwrap()
-        );
-    }
-
-    #[test]
-    fn type_action_with_return_none_is_allowed() {
-        // "none" is the documented no-observe default — an explicit `"return":"none"`
-        // is semantically identical to omitting the field and must not be rejected.
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![Action::Type(TypeArgs {
-                    text: "hi".into(),
-                    return_: Some("none".into()),
-                })],
-                then: None,
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap();
-        assert_eq!(*log.lock().unwrap(), vec!["type(hi)"]);
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["executed"], json!(1));
-    }
-
-    #[test]
-    fn fail_fast_reports_index_and_stops() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
-        let err = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![
-                    click(10, 10),  // ok
-                    click(100, 10), // out of bounds (valid 0..=99) -> fails
-                    Action::Key(KeyArgs {
-                        chord: "Return".into(),
-                    }), // never runs
-                ],
-                then: None,
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("action[1]"), "got: {err}");
-        assert!(err.contains("click"), "got: {err}");
-        assert!(err.contains("1 of 3"), "got: {err}");
-        assert_eq!(
-            *log.lock().unwrap(),
-            vec!["click(10,10)"],
-            "only the first action executed"
-        );
-    }
-
-    #[test]
-    fn empty_actions_rejected() {
-        let mut g = started(FakePlatform::new(10, 10));
-        let err = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![],
-                then: None,
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("at least one"), "got: {err}");
-    }
-
-    #[test]
-    fn semantic_action_is_rejected_until_dispatch_is_implemented() {
-        let mut g = started(FakePlatform::new(10, 10));
-        let err = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![Action::WaitForElement(WaitForElementArgs {
-                    name: Some("missing".into()),
-                    description: None,
-                    role: None,
-                    condition: None,
-                    value: None,
-                    value_contains: None,
-                    interval_ms: Some(0),
-                    timeout_ms: Some(0),
-                })],
-                then: None,
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("not yet supported"), "got: {err}");
-    }
-
-    #[test]
-    fn then_settle_is_text_only() {
-        let f = Frame::solid(2, 2, [5, 5, 5, 255]);
-        let mut g = started(FakePlatform::new(2, 2).with_frames(vec![f.clone(), f]));
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: Some(SettleArgs {
-                        interval_ms: Some(0),
-                        settle_frames: Some(2),
-                        tolerance: None,
-                        timeout_ms: Some(200),
-                        stability_region: None,
-                        ignore: None,
-                    }),
-                    diff: None,
-                    screenshot: None,
-                }),
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            out.0.len(),
-            1,
-            "settle folded into the envelope, no separate/image block"
-        );
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["then"]["settle"]["settled"], json!(true));
-    }
-
-    #[test]
-    fn then_settle_ignore_masks_a_blinking_pixel_so_it_settles() {
-        // `settle_args()` must forward `SettleArgs.ignore` into `WaitStableParams.ignore`:
-        // with no `#[serde(deny_unknown_fields)]` in this crate, a dropped field still parses
-        // and just does nothing. Pixel (1,1) blinks across the three scripted frames while
-        // the rest of the 2x2 stays constant, so only masking it settles within
-        // `settle_frames`.
-        //
-        // Pinning the capture count to 3 rules out settling by outlasting the frames into
-        // `FakePlatform`'s repeat-forever fallback.
-        let log = Arc::new(Mutex::new(0usize));
-        let mut f0 = Frame::solid(2, 2, [10, 10, 10, 255]);
-        let mut f1 = f0.clone();
-        let mut f2 = f0.clone();
-        let idx = 3 * 4; // pixel (1,1): row 1 * width 2 + col 1 = 3, 4 bytes/pixel
-        f0.pixels[idx] = 10;
-        f1.pixels[idx] = 20;
-        f2.pixels[idx] = 30;
-        let mut g = started(
-            FakePlatform::new(2, 2)
-                .with_frames(vec![f0, f1, f2])
-                .with_capture_log(log.clone()),
-        );
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: Some(SettleArgs {
-                        interval_ms: Some(0),
-                        settle_frames: Some(2),
-                        tolerance: None,
-                        timeout_ms: Some(1000),
-                        stability_region: None,
-                        ignore: Some(vec![RegionArgs {
-                            x: 1,
-                            y: 1,
-                            width: 1,
-                            height: 1,
-                        }]),
-                    }),
-                    diff: None,
-                    screenshot: None,
-                }),
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap();
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(
-            result["then"]["settle"]["settled"],
-            json!(true),
-            "the blinking pixel is masked, so the stream is stable: {result}"
-        );
-        assert_eq!(
-            result["then"]["settle"]["saw_motion"],
-            json!(false),
-            "masked motion must never set saw_motion: {result}"
-        );
-        assert_eq!(
-            *log.lock().unwrap(),
-            3,
-            "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
-        );
-    }
-
-    #[test]
-    fn then_screenshot_appends_image() {
-        let mut g =
-            started(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [1, 2, 3, 255])]));
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(1, 1)],
-                then: Some(ThenArgs {
-                    settle: None,
-                    diff: None,
-                    screenshot: Some(ScreenshotArgs {
-                        region: None,
-                        window_id: None,
-                    }),
-                }),
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap();
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["executed"], json!(1));
-        assert_eq!(result["then"]["screenshot"]["width"], json!(4));
-        assert!(
-            matches!(out.0[1], OutContent::Image(_)),
-            "screenshot image appended"
-        );
-        assert_eq!(
-            out.0.len(),
-            3,
-            "envelope + screenshot image + IMAGE_NOTE (dims folded into result.then.screenshot)"
-        );
-        assert!(
-            matches!(&out.0[2], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
-            "IMAGE_NOTE last"
-        );
-    }
-
-    #[test]
-    fn then_settle_timeout_still_succeeds() {
-        // settle_frames=2 but timeout_ms=0 -> one tick, never settles -> settled:false,
-        // yet do_actions returns Ok (a settle timeout is not a batch failure).
-        let mut g =
-            started(FakePlatform::new(2, 2).with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]));
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: Some(SettleArgs {
-                        interval_ms: Some(0),
-                        settle_frames: Some(2),
-                        tolerance: None,
-                        timeout_ms: Some(0),
-                        stability_region: None,
-                        ignore: None,
-                    }),
-                    diff: None,
-                    screenshot: None,
-                }),
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap();
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["then"]["settle"]["settled"], json!(false));
-    }
-
-    #[test]
-    fn then_diff_reports_change_text_only() {
-        let base = Frame::solid(2, 2, [0, 0, 0, 255]);
-        let mut changed = base.clone();
-        changed.pixels[0] = 255;
-        let mut g = started(FakePlatform::new(2, 2).with_frames(vec![base, changed]));
-        baseline_save(&mut g, &BaselineSaveArgs { name: "m".into() }).unwrap();
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: None,
-                    diff: Some(DiffArgs {
-                        region: None,
-                        name: "m".into(),
-                        mode: None,
-                        threshold: None,
-                        tolerance: None,
-                        include_image: Some(false),
-                        ignore: None,
-                    }),
-                    screenshot: None,
-                }),
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            out.0.len(),
-            1,
-            "no image -> the envelope alone, no nested envelope"
-        );
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["then"]["diff"]["changed_pixels"], json!(1));
-    }
-
-    #[test]
-    fn then_diff_with_image_appends_image_sibling() {
-        let base = Frame::solid(2, 2, [0, 0, 0, 255]);
-        let mut changed = base.clone();
-        changed.pixels[0] = 255;
-        let mut g = started(FakePlatform::new(2, 2).with_frames(vec![base, changed]));
-        baseline_save(&mut g, &BaselineSaveArgs { name: "m".into() }).unwrap();
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: None,
-                    diff: Some(DiffArgs {
-                        region: None,
-                        name: "m".into(),
-                        mode: None,
-                        threshold: None,
-                        tolerance: None,
-                        include_image: Some(true),
-                        ignore: None,
-                    }),
-                    screenshot: None,
-                }),
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap();
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["then"]["diff"]["changed_pixels"], json!(1));
-        assert_eq!(
-            out.0.len(),
-            3,
-            "envelope + diff image + IMAGE_NOTE (metrics folded into result.then.diff)"
-        );
-        assert!(
-            matches!(out.0[1], OutContent::Image(_)),
-            "diff's changed-region image rides alongside as a sibling"
-        );
-        assert!(
-            matches!(&out.0[2], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
-            "IMAGE_NOTE follows the image"
-        );
-    }
-
-    #[test]
-    fn terminal_observe_failure_is_distinct() {
-        let mut g =
-            started(FakePlatform::new(2, 2).with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]));
-        let err = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: None,
-                    diff: Some(DiffArgs {
-                        region: None,
-                        name: "absent".into(),
-                        mode: None,
-                        threshold: None,
-                        tolerance: None,
-                        include_image: None,
-                        ignore: None,
-                    }),
-                    screenshot: None,
-                }),
-                timeout_ms: None,
-                encoded_argument_bytes: 0,
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("all 1 actions executed"), "got: {err}");
-        assert!(err.contains("terminal observe failed"), "got: {err}");
-        assert!(err.contains("baseline"), "got: {err}");
-    }
-
-    #[test]
-    fn split_sub_requires_ok_and_tool_and_keeps_siblings() {
-        // A well-formed sub-tool output (screenshot's shape): [Image, envelope, IMAGE_NOTE].
-        // The envelope carries a `result` key alongside `ok`/`tool`; a bare JSON object
-        // with only a `result` key (no `ok`/`tool`) must NOT match the tightened
-        // predicate — it's included here as a leading sibling to prove that.
-        let out = ToolOutput(vec![
-            OutContent::Text(json!({ "result": "not the real envelope" }).to_string()),
-            OutContent::Image(vec![1, 2, 3]),
-            OutContent::Text(
-                json!({ "ok": true, "tool": "glass_screenshot", "result": { "width": 4 } })
-                    .to_string(),
-            ),
-            OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
-        ]);
-        let (result, siblings) = split_sub(out);
-        assert_eq!(
-            result,
-            json!({ "width": 4 }),
-            "real envelope's result extracted"
-        );
-        assert_eq!(
-            siblings.len(),
-            3,
-            "the fake-envelope text, image, and IMAGE_NOTE all ride as siblings"
-        );
-        assert!(
-            matches!(&siblings[0], OutContent::Text(t) if t.contains("not the real envelope")),
-            "JSON with `result` but no ok/tool is not misclassified as the envelope"
-        );
-        assert!(
-            matches!(siblings[1], OutContent::Image(_)),
-            "image sibling preserved"
-        );
-        assert!(
-            matches!(&siblings[2], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE),
-            "IMAGE_NOTE sibling preserved"
-        );
-    }
-}
+mod tests;
