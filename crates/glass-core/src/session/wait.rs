@@ -627,7 +627,19 @@ impl Glass {
         } else {
             deadline
         };
-        let (found0, mut prev_outline) = self.snapshot_match_outline(params, first_deadline)?;
+        let Some((found0, mut prev_outline)) =
+            self.snapshot_match_outline(params, first_deadline)?
+        else {
+            return Ok(ScrollToElementOutcome {
+                matched: false,
+                element: None,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                steps: 0,
+                reversed: false,
+                direction: params.direction.unwrap_or(ScrollDirection::Down),
+                timed_out_by: Some(whose),
+            });
+        };
         let found0_bounds = found0.as_ref().and_then(|i| i.bounds);
 
         // Resolve the primary sweep direction: explicit, else inferred from the
@@ -683,7 +695,9 @@ impl Glass {
                 if deadline.has_passed() {
                     return Ok(outcome(false, None, steps, reversed, Some(whose)));
                 }
-                let (found, outline) = self.snapshot_match_outline(params, deadline)?;
+                let Some((found, outline)) = self.snapshot_match_outline(params, deadline)? else {
+                    return Ok(outcome(false, None, steps, reversed, Some(whose)));
+                };
                 if let Some(info) = found.filter(|i| ready(i)) {
                     return Ok(outcome(true, Some(info), steps, reversed, None));
                 }
@@ -707,11 +721,12 @@ impl Glass {
         &mut self,
         params: &ScrollToElementParams,
         deadline: Deadline,
-    ) -> Result<(Option<ElementInfo>, String)> {
-        // No deadline, though the sweep has a `timeout_ms`: this read propagates its error with
-        // `?`, so a reader giving up at the deadline would turn the sweep's soft `{matched:false}`
-        // into an error.
-        let tree = self.a11y_resnapshot(deadline)?;
+    ) -> Result<Option<(Option<ElementInfo>, String)>> {
+        let tree = match self.a11y_resnapshot(deadline) {
+            Ok(tree) => tree,
+            Err(GlassError::AccessibilityNotReady(_)) if deadline.has_passed() => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let found = match tree.element_match_selector(
             ElementSelector {
                 name: params.name.as_deref(),
@@ -725,7 +740,7 @@ impl Glass {
             ElementMatch::Satisfied(node) => node.map(ElementInfo::from_node),
             ElementMatch::Pending => None,
         };
-        Ok((found, tree.to_outline()))
+        Ok(Some((found, tree.to_outline())))
     }
 
     /// Block until a watched region diverges from / converges to a reference.
@@ -1472,14 +1487,8 @@ mod tests {
         );
     }
 
-    /// The sweep has a `timeout_ms` of its own and still leaves the reader unbounded, because its
-    /// read propagates with `?` — a reader giving up at the deadline would turn the soft
-    /// `{matched:false}` a spent sweep promises into an error.
-    ///
-    /// The asymmetry with `wait_for_element` is deliberate and lived only in a comment, one line
-    /// from a `timeout_ms` inviting a contributor to "fix" it.
     #[test]
-    fn a_scroll_sweep_leaves_the_reader_its_own_budget() {
+    fn a_scroll_sweep_bounds_the_reader_by_its_own_budget() {
         let (mut g, ctx_log) = glass_with_a11y_ctx(FakePlatform::new(100, 100), fake_tree());
         g.start(&spec()).unwrap();
         g.scroll_to_element(&ScrollToElementParams {
@@ -1494,15 +1503,128 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(
+        assert!(
             ctx_log
                 .lock()
                 .unwrap()
                 .as_ref()
                 .expect("the sweep read the tree")
-                .deadline,
-            Deadline::UNBOUNDED,
+                .deadline
+                .remaining()
+                .is_some(),
+            "the sweep did not pass its effective deadline to the reader"
         );
+    }
+
+    #[test]
+    fn standalone_scroll_snapshot_deadline_returns_a_soft_callee_timeout() {
+        let (mut g, _) = glass_with_a11y_not_ready_at_deadline(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 20,
+            })
+            .expect("an own snapshot deadline is a soft scroll timeout");
+
+        assert!(!out.matched);
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Callee));
+    }
+
+    #[test]
+    fn caller_scroll_snapshot_deadline_returns_a_soft_caller_timeout() {
+        let (mut g, _) = glass_with_a11y_not_ready_at_deadline(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+
+        let out = g
+            .scroll_to_element_by(
+                &ScrollToElementParams {
+                    name: Some("Ghost".into()),
+                    description: None,
+                    role: None,
+                    value_contains: None,
+                    direction: Some(ScrollDirection::Down),
+                    anchor: None,
+                    step: SCROLL_TO_DEFAULT_STEP,
+                    timeout_ms: 1_000,
+                },
+                Deadline::from_millis(20),
+            )
+            .expect("a caller snapshot deadline is a soft scroll timeout");
+
+        assert!(!out.matched);
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Caller));
+    }
+
+    #[test]
+    fn scroll_zero_timeout_first_snapshot_remains_unbounded() {
+        let (mut g, seen) = glass_with_a11y_not_ready_at_deadline(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Save".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 0,
+            })
+            .unwrap();
+
+        assert!(out.matched);
+        assert_eq!(*seen.lock().unwrap(), vec![Deadline::UNBOUNDED]);
+    }
+
+    #[test]
+    fn scroll_predeadline_not_ready_still_propagates() {
+        let (mut g, _) = glass_with_a11y_not_ready(FakePlatform::new(100, 100), 1);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 1_000,
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, GlassError::AccessibilityNotReady(_)));
+    }
+
+    #[test]
+    fn scroll_accessibility_failure_still_propagates() {
+        let mut g = glass_with_a11y_unavailable(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 1_000,
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, GlassError::AccessibilityUnavailable(_)));
     }
 
     #[test]

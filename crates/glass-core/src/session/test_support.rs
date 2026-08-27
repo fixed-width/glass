@@ -1052,6 +1052,52 @@ pub(crate) fn glass_with_a11y_until_deadline(
     (g, seen)
 }
 
+/// A reader that starts inside a bounded snapshot budget, consumes the rest of it, and reports the
+/// same readiness error used by deadline-honouring platform readers. Unbounded reads answer.
+pub(crate) struct NotReadyAtDeadline {
+    pub(crate) tree: AxTree,
+    pub(crate) seen: Arc<Mutex<Vec<Deadline>>>,
+}
+
+impl Accessibility for NotReadyAtDeadline {
+    fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        self.seen.lock().unwrap().push(ctx.deadline);
+        if let Some(left) = ctx.deadline.remaining() {
+            std::thread::sleep(left);
+            return Err(GlassError::AccessibilityNotReady(
+                "no accessibility tree within the time this call allowed".into(),
+            ));
+        }
+        Ok(self.tree.clone())
+    }
+}
+
+pub(crate) fn glass_with_a11y_not_ready_at_deadline(
+    platform: FakePlatform,
+) -> (Glass, Arc<Mutex<Vec<Deadline>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let g = glass_with_backend(
+        platform,
+        Box::new(NotReadyAtDeadline {
+            tree: fake_tree_enabled(),
+            seen: seen.clone(),
+        }),
+    );
+    (g, seen)
+}
+
+pub(crate) struct UnavailableAccessibility;
+
+impl Accessibility for UnavailableAccessibility {
+    fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+        Err(GlassError::AccessibilityUnavailable("reader failed".into()))
+    }
+}
+
+pub(crate) fn glass_with_a11y_unavailable(platform: FakePlatform) -> Glass {
+    glass_with_backend(platform, Box::new(UnavailableAccessibility))
+}
+
 pub(crate) struct RecordingDeadlines {
     pub(crate) tree: AxTree,
     pub(crate) seen: Arc<Mutex<Vec<Deadline>>>,
