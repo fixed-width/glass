@@ -56,6 +56,13 @@ a change to a platform crate they report clean without having looked at it —
 [docs/how-to/verify-a-change.md](docs/how-to/verify-a-change.md) has the per-target commands that
 do, most of which run from any host.
 
+## Git workflow
+
+- **Never commit directly to `master`.** Before making a commit, create or switch to a descriptively
+  named feature branch for the issue or task.
+- If work began on `master`, move the changes to a feature branch before committing. Do not advance
+  local `master` with task commits.
+
 ## Invariants
 
 - **External automation only** — drive apps as a black box; never require the app to be glass-aware.

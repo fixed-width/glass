@@ -503,6 +503,84 @@ const WRITE_VERIFY_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// See [`WRITE_VERIFY_BUDGET`].
 const WRITE_VERIFY_POLL: std::time::Duration = std::time::Duration::from_millis(150);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WriteReading {
+    Missing,
+    Pending(String),
+    Landed { reacquired: bool },
+}
+
+/// Finds the unique matching editable in the active-window tree because an IME relayout can replace or move it.
+fn service_write_reading(tree: &AxTree, target: &AxTarget, text: &str) -> Result<WriteReading> {
+    fn collect<'a>(node: &'a AxNode, target: &AxTarget, out: &mut Vec<&'a AxNode>) {
+        if target.matches(node.role, node.name.as_deref()) {
+            out.push(node);
+        }
+        for child in &node.children {
+            collect(child, target, out);
+        }
+    }
+
+    if let Some(node) = tree.find(target.id)
+        && target.matches(node.role, node.name.as_deref())
+        && target.bounds_consistent(node.bounds, 8)
+    {
+        if !node.states.editable || !node.states.enabled {
+            return Err(GlassError::AxWriteUnconfirmed(
+                target.id.0,
+                "the element is disabled or no longer editable, so its value cannot be read back"
+                    .into(),
+            ));
+        }
+        return Ok(if node.value.as_deref().unwrap_or("") == text {
+            WriteReading::Landed { reacquired: false }
+        } else {
+            WriteReading::Pending(node.value.clone().unwrap_or_default())
+        });
+    }
+    if !tree.can_prove_absence() {
+        return Err(GlassError::AxWriteUnconfirmed(
+            target.id.0,
+            "the active-window tree is incomplete, so target reacquisition cannot be proven safe"
+                .into(),
+        ));
+    }
+    let mut matches = Vec::new();
+    collect(&tree.root, target, &mut matches);
+    let editable: Vec<_> = matches
+        .iter()
+        .copied()
+        .filter(|node| node.states.editable && node.states.enabled)
+        .collect();
+    if editable.len() > 1 {
+        return Err(GlassError::AxWriteUnconfirmed(
+            target.id.0,
+            format!(
+                "{} editable elements now match its role and name, so target reacquisition is ambiguous",
+                editable.len()
+            ),
+        ));
+    }
+    let Some(node) = editable.first().copied() else {
+        if matches.is_empty() {
+            return Ok(WriteReading::Missing);
+        }
+        return Err(GlassError::AxWriteUnconfirmed(
+            target.id.0,
+            "the matching element is disabled or no longer editable, so its value cannot be read back"
+                .into(),
+        ));
+    };
+    let reacquired = node.id != target.id || !target.bounds_consistent(node.bounds, 8);
+    if node.value.as_deref().unwrap_or("") == text {
+        Ok(WriteReading::Landed { reacquired })
+    } else {
+        Ok(WriteReading::Pending(
+            node.value.clone().unwrap_or_default(),
+        ))
+    }
+}
+
 impl Accessibility for ServiceA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         Ok(self.snapshot_with_refs(ctx)?.tree)
@@ -512,6 +590,7 @@ impl Accessibility for ServiceA11y {
         // Guard: re-snapshot and verify the id still points at the same editable element before
         // acting — `invoke`'s guard plus the editable check.
         let rt = self.snapshot_with_refs(ctx)?;
+        let acting_package = rt.acting_on(&self.package).to_owned();
         // Addressed by the node the guard approved, not by the id the caller named, so a guard
         // that ever relaxes into a search cannot dispatch to a node it never approved.
         let device_ref = rt.device_ref(resolved_editable_target(&rt.tree, target)?.id)?;
@@ -528,55 +607,52 @@ impl Accessibility for ServiceA11y {
             // `set_value_failed_after_writing` accepts, or the session keeps the value it cached
             // for a write that went out and refuses the retry as drift (glass#405).
             let after = self
-                .snapshot(ctx)
+                .snapshot_with_refs(ctx)
                 .map_err(|e| read_back_failed(target, &e))?;
-            // `find` answers `None` for a node that is gone and for one holding nothing, and
-            // folding them together confirms a clear on the evidence that the element could not be
-            // found. Keep polling — a tree mid-update loses it briefly.
-            let Some(node) = after.find(target.id) else {
-                if std::time::Instant::now() >= deadline {
-                    return Err(GlassError::AxWriteUnconfirmed(
-                        target.id.0,
-                        "the element is no longer in the tree, so its value could not be read back"
-                            .into(),
-                    ));
-                }
-                std::thread::sleep(WRITE_VERIFY_POLL);
-                continue;
-            };
-            // Before the value check, not after: a collapsed row maps its text to `name` and
-            // reports no value, so `"" == ""` would confirm a *clear* on the evidence that the
-            // field stopped being a field. `AndroidA11y` re-checks it too, through the shared
-            // `glass_core::verify_typed_write`.
-            if !node.states.editable {
+            let after_package = after.acting_on(&self.package);
+            if after_package != acting_package {
                 return Err(GlassError::AxWriteUnconfirmed(
                     target.id.0,
-                    "the element no longer reports itself editable, so its value cannot be read \
-                     back"
-                        .into(),
+                    format!(
+                        "the active app moved from {acting_package} to {after_package}, so target reacquisition was refused"
+                    ),
                 ));
             }
-            let got = node.value.clone();
-            // An empty field reports no value (None), not Some(""), so compare against "".
-            if got.as_deref().unwrap_or("") == text {
-                return Ok(());
+            let reading = service_write_reading(&after.tree, target, text)?;
+            match &reading {
+                WriteReading::Landed { reacquired } => {
+                    if *reacquired {
+                        eprintln!(
+                            "glass android set_value: internally reacquired accessibility target {} after active-window relayout",
+                            target.id.0
+                        );
+                    }
+                    return Ok(());
+                }
+                WriteReading::Missing | WriteReading::Pending(_) => {}
             }
             if std::time::Instant::now() >= deadline {
-                // The mapper drops an empty value, so an emptied field arrives as `None` — which
-                // the verdict reserves for a reading nobody took.
-                let observed = got.as_deref().unwrap_or("");
+                let WriteReading::Pending(observed) = reading else {
+                    return Err(GlassError::AxWriteUnconfirmed(
+                        target.id.0,
+                        "the element is no longer in the tree for the active app window, so its value could not be read back"
+                            .into(),
+                    ));
+                };
                 // The clause explains a field that never moved; on one holding something else the
                 // write did reach it, and "clear it first" would name a field already empty.
-                return Err(if write_took_no_effect(observed, target.value.as_deref()) {
-                    GlassError::value_not_applied_because(
-                        target.id.0,
-                        text,
-                        Some(observed),
-                        COMPOSE_SET_TEXT_NO_OP,
-                    )
-                } else {
-                    GlassError::value_not_applied(target.id.0, text, Some(observed))
-                });
+                return Err(
+                    if write_took_no_effect(&observed, target.value.as_deref()) {
+                        GlassError::value_not_applied_because(
+                            target.id.0,
+                            text,
+                            Some(&observed),
+                            COMPOSE_SET_TEXT_NO_OP,
+                        )
+                    } else {
+                        GlassError::value_not_applied(target.id.0, text, Some(&observed))
+                    },
+                );
             }
             std::thread::sleep(WRITE_VERIFY_POLL);
         }
@@ -3810,6 +3886,120 @@ mod tests {
         let mut a = ServiceA11y::new(client, "com.example.app".to_string());
         a.write_verify_budget = std::time::Duration::ZERO;
         a
+    }
+
+    #[test]
+    fn a_replaced_field_is_reacquired_after_an_ime_relayout() {
+        let before = editable_field("old");
+        let mut after = editable_field_slid("new", 700);
+        after["children"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "class": "android.widget.TextView", "text": "keyboard spacer",
+                "bounds": {"x": 0, "y": 0, "w": 100, "h": 50}, "enabled": true
+            }),
+        );
+        let target = target_for(&built(&before), AxNodeId(1));
+        let tree = built(&after);
+
+        let reading = service_write_reading(&tree, &target, "new")
+            .expect("one semantically identical editable remains in the active window");
+
+        assert_eq!(reading, WriteReading::Landed { reacquired: true });
+    }
+
+    #[test]
+    fn two_editable_candidates_never_confirm_a_reacquired_write() {
+        let before = editable_field("old");
+        let mut after = editable_field_slid("new", 700);
+        after["children"]
+            .as_array_mut()
+            .unwrap()
+            .push(editable_field_slid("new", 20)["children"][0].clone());
+        let target = target_for(&built(&before), AxNodeId(1));
+        let tree = built(&after);
+
+        let err = service_write_reading(&tree, &target, "new")
+            .expect_err("two matching editable fields are ambiguous");
+
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.to_string().contains("2 editable elements"), "{err}");
+    }
+
+    #[test]
+    fn a_same_id_field_is_refused_when_either_editability_or_enabledness_is_lost() {
+        let target = target_for(&built(&editable_field("old")), AxNodeId(1));
+        for key in ["editable", "enabled"] {
+            let mut after = built(&editable_field("new"));
+            match key {
+                "editable" => after.root.children[0].states.editable = false,
+                "enabled" => after.root.children[0].states.enabled = false,
+                _ => unreachable!(),
+            }
+            let err = service_write_reading(&after, &target, "new")
+                .expect_err("either state loss makes the target unsafe to confirm");
+            assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_moved_candidate_is_not_editable_when_only_one_required_state_remains() {
+        let target = target_for(&built(&editable_field("old")), AxNodeId(1));
+        for key in ["editable", "enabled"] {
+            let mut after = built(&editable_field_slid("new", 700));
+            match key {
+                "editable" => after.root.children[0].states.editable = false,
+                "enabled" => after.root.children[0].states.enabled = false,
+                _ => unreachable!(),
+            }
+            let err = service_write_reading(&after, &target, "new")
+                .expect_err("reacquisition requires both editable and enabled");
+            assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        }
+    }
+
+    #[test]
+    fn same_id_with_new_geometry_is_reported_as_reacquired() {
+        let target = target_for(&built(&editable_field("old")), AxNodeId(1));
+        let after = built(&editable_field_slid("new", 700));
+
+        assert_eq!(
+            service_write_reading(&after, &target, "new").expect("unique moved field"),
+            WriteReading::Landed { reacquired: true }
+        );
+    }
+
+    #[test]
+    fn new_id_with_original_geometry_is_reported_as_reacquired() {
+        let target = target_for(&built(&editable_field("old")), AxNodeId(1));
+        let mut after = editable_field("new");
+        after["children"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "class": "android.widget.TextView", "text": "inserted",
+                "bounds": {"x": 800, "y": 0, "w": 100, "h": 50}, "enabled": true
+            }),
+        );
+
+        assert_eq!(
+            service_write_reading(&built(&after), &target, "new").expect("unique renumbered field"),
+            WriteReading::Landed { reacquired: true }
+        );
+    }
+
+    #[test]
+    fn a_genuinely_disappeared_field_stays_pending_until_the_deadline() {
+        let target = target_for(&built(&editable_field("old")), AxNodeId(1));
+        let tree = built(&json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
+            "children": []
+        }));
+
+        assert_eq!(
+            service_write_reading(&tree, &target, "new").expect("absence can be transient"),
+            WriteReading::Missing
+        );
     }
 
     #[test]
