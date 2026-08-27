@@ -343,6 +343,9 @@ pub struct WaitForElementArgs {
     /// `checked`/`unchecked` only match a checkable element (one exposing a real toggle
     /// state) — a non-toggle element matches neither.
     pub condition: Option<String>,
+    /// Require the matched element's complete accessible value to equal this string.
+    /// Case-sensitive, not a standalone selector, and mutually exclusive with `value_contains`.
+    pub value: Option<String>,
     /// Additionally require the matched element's `value` to contain this substring.
     /// Not a standalone selector — `name`, `description`, and/or `role` is still required.
     pub value_contains: Option<String>,

@@ -147,7 +147,7 @@ Glass uses four verification terms consistently:
   prove that a particular semantic state or approved visual design was reached.
 
 Choose the strongest check for the claim: exact text uses `glass_wait_for_element` with `name`,
-`description` and/or `role` plus `value_contains`; dialog dismissal uses `condition:"disappears"`;
+`description` and/or `role` plus `value`; dialog dismissal uses `condition:"disappears"`;
 canvas change uses `glass_wait_for_region`; animation completion uses `glass_wait_stable`.
 
 ### `glass_screenshot`
@@ -247,6 +247,9 @@ tree.
 - `condition` (string, default `appears`) — one of `appears`, `disappears`, `enabled`, `disabled`,
   `checked`, `unchecked`, `selected`, `unselected`, `expanded`, `collapsed`, `focused`, `visible`,
   `hidden`.
+- `value` (string) — additionally require the matched element's complete accessible value to equal
+  this string exactly (case-sensitive); not a standalone selector and mutually exclusive with
+  `value_contains`.
 - `value_contains` (string) — additionally require the matched element's value to contain this
   substring; not a standalone selector (`name`, `description`, and/or `role` still required). Only
   an element that reports a value can match one: on Android that is the editable elements alone (a
@@ -313,7 +316,8 @@ no sibling on timeout. Resume reading from the returned `cursor`.
 Every tool in this section returns an empty `result:{}` on success. `ok:true` confirms only that
 glass dispatched the action without an input error; it does not prove runtime state. Verify the
 expected outcome with `glass_wait_for_element` (`name`, `description` and/or `role`, plus
-`value_contains` when needed), `glass_wait_for_region`, or `glass_wait_stable`. The one exception is
+`value` for exact text or `value_contains` for a substring), `glass_wait_for_region`, or
+`glass_wait_stable`. The one exception is
 `glass_type`'s optional `return` observe, which folds settle metadata or appends an accessibility
 outline into the result.
 

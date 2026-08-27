@@ -21,7 +21,7 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 - `Document` accessibility role: a browser page or embedded web view (AT-SPI `document web`/`document frame`, `AXWebArea`, Android `WebView`, UIA `Document` from a web engine) now reads as a `Document` whose children are the page's elements, on Linux, Windows, macOS and Android.
-- MCP descriptions and the tool reference now distinguish current semantic state, current visual evidence, transition completion and visual quiescence, including direct routes for exact editable values, dialog dismissal, canvas changes and animation completion.
+- MCP descriptions and the tool reference now distinguish current semantic state, current visual evidence, transition completion and visual quiescence, including `glass_wait_for_element` exact-value matching and direct routes for dialog dismissal, canvas changes and animation completion.
 
 ### Fixed
 - Compact accessibility snapshots now include bounded current values for editable controls, while distinguishing empty, unavailable, redacted, and truncated values and never disclosing secure-field contents.

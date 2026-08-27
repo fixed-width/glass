@@ -15,6 +15,9 @@ pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult
     if a.name.is_none() && a.description.is_none() && a.role.is_none() {
         return Err("specify `name`, `description`, and/or `role` to select an element".into());
     }
+    if a.value.is_some() && a.value_contains.is_some() {
+        return Err("specify `value` for exact matching or `value_contains` for substring matching, not both".into());
+    }
     let role = match a.role.as_deref() {
         Some(r) => Some(AxRole::from_name(r).ok_or_else(|| format!("unknown role '{r}'"))?),
         None => None,
@@ -28,6 +31,7 @@ pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult
         name: a.name.clone(),
         description: a.description.clone(),
         role,
+        value: a.value.clone(),
         value_contains: a.value_contains.clone(),
         condition,
         interval_ms: a.interval_ms.unwrap_or(200),
@@ -467,6 +471,7 @@ mod tests {
             description: None,
             role: None,
             condition: None,
+            value: None,
             value_contains: None,
             interval_ms: Some(0),
             timeout_ms: Some(1000),
@@ -542,6 +547,47 @@ mod tests {
             }
             _ => panic!("expected untrusted element sibling"),
         }
+    }
+
+    #[test]
+    fn element_value_matches_exactly() {
+        let mut tree = fake_tree();
+        tree.root.children[0].value = Some("hello glass".into());
+        let mut g = started_a11y_with(tree);
+        let mut a = elem_args();
+        a.role = Some("Button".into());
+        a.value = Some("hello glass".into());
+        assert_eq!(
+            assert_envelope(
+                &wait_for_element(&mut g, &a).unwrap(),
+                "glass_wait_for_element",
+            )["matched"],
+            json!(true)
+        );
+
+        let mut mismatch = elem_args();
+        mismatch.role = Some("Button".into());
+        mismatch.value = Some("hello".into());
+        mismatch.timeout_ms = Some(0);
+        let v = assert_envelope(
+            &wait_for_element(&mut g, &mismatch).unwrap(),
+            "glass_wait_for_element",
+        );
+        assert_eq!(v["matched"], json!(false));
+    }
+
+    #[test]
+    fn element_rejects_exact_and_contains_values_together() {
+        let mut g = started_a11y();
+        let mut a = elem_args();
+        a.role = Some("Button".into());
+        a.value = Some("Save".into());
+        a.value_contains = Some("Sav".into());
+        assert!(
+            wait_for_element(&mut g, &a)
+                .unwrap_err()
+                .contains("not both")
+        );
     }
 
     #[test]

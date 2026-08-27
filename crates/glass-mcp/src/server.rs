@@ -499,7 +499,8 @@ impl GlassServer {
                        window-relative bounds and states). This is one observation, not proof of \
                        transition completion or visual appearance. For exact runtime verification, \
                        call glass_wait_for_element with the element's `name`, `description` and/or \
-                       `role`, plus `value_contains` for an editable value. The compact value may be \
+                       `role`, plus `value` for an exact editable value (`value_contains` for a \
+                       substring). The compact value may be \
                        unavailable, redacted or truncated; use that wait rather than repeated \
                        snapshots when the full queryable value matters. Rendered as compact \
                        text — deterministic, low-token element addressing alongside \
@@ -639,8 +640,8 @@ impl GlassServer {
                        substring) and/or `role` (e.g. \"Button\"); `condition` (default appears): \
                        appears|disappears|enabled|\
                        disabled|checked|unchecked|selected|unselected|expanded|collapsed|focused|\
-                       visible|hidden; `value_contains` additionally verifies an editable value \
-                       (combine it with a selector). Returns \
+                       visible|hidden; `value` additionally requires an exact editable value, while \
+                       `value_contains` requires a substring (combine either with a selector). Returns \
                        {matched,elapsed_ms} plus the matched element, including value — its id is usable \
                        with glass_click_element. On timeout returns {matched:false}. Waits through a \
                        just-launched app that has not published its accessibility tree yet, and \
@@ -758,7 +759,7 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      label distinct from its name) — deterministic, no image tokens. Address \
      elements by #id: glass_click_element clicks one, glass_set_value writes an editable element's \
      value, and glass_wait_for_element verifies semantic transition completion, including exact \
-     editable text with value_contains. Prefer this over screenshots and pixel-hunting whenever it works.\n\n\
+     editable text with value. Prefer this over screenshots and pixel-hunting whenever it works.\n\n\
      PIXELS ARE THE FALLBACK — for a canvas/black-box app with no tree (glass_a11y_snapshot \
      errors there): glass_screenshot to see it, then glass_click / glass_type / glass_key / \
      glass_scroll / glass_drag (glass_gesture for multi-touch where supported) to interact. \
@@ -1306,6 +1307,7 @@ mod tests {
         let element = &descriptions["glass_wait_for_element"];
         assert!(element.contains("semantic transition completion"));
         assert!(element.contains("description"));
+        assert!(element.contains("`value`"));
         assert!(element.contains("value_contains"));
         assert!(element.contains("disappears"));
 
@@ -1319,7 +1321,7 @@ mod tests {
 
         let snapshot = &descriptions["glass_a11y_snapshot"];
         assert!(snapshot.contains("current semantic state"));
-        assert!(snapshot.contains("value_contains"));
+        assert!(snapshot.contains("`value`"));
 
         let screenshot = &descriptions["glass_screenshot"];
         assert!(screenshot.contains("current visual evidence"));
