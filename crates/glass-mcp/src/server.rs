@@ -1495,6 +1495,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn start_metadata_documents_the_android_run_tuple() {
+        let start = GlassServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "glass_start")
+            .expect("glass_start is registered");
+        let run_doc = start
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.get("run"))
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str())
+            .expect("run param has a description");
+
+        assert!(run_doc.contains("/absolute/path/app.apk"), "{run_doc}");
+        assert!(
+            run_doc.contains("com.example.app/.MainActivity"),
+            "{run_doc}"
+        );
+        assert!(run_doc.contains("install -r -t"), "{run_doc}");
+        assert!(run_doc.contains("glass_stop"), "{run_doc}");
+    }
+
     /// `glass_diff`, `glass_wait_stable`, and `glass_wait_for_region` must each advertise an
     /// `ignore` schema property typed as an array (`Option<Vec<RegionArgs>>` renders as
     /// `type: ["array","null"]` under schemars 1.x) — the shape an agent's MCP client reads to

@@ -86,6 +86,11 @@ Build, launch, and locate a native GUI app; returns its window geometry.
 - `run` (array of string, **required**) — what to launch, then its arguments. `run[0]` is the
   executable on a desktop backend, an `.app` path or bundle id on `ios`, and a
   `package/.Activity` component — optionally with an `.apk` to install first — on `android`.
+  For example: `run: ["/absolute/path/app.apk", "com.example.app/.MainActivity"]`. Android accepts
+  relative (`package/.Activity`) and fully qualified (`package/com.example.Activity`) components.
+  The APK is optional and is installed with `adb install -r -t`, replacing an existing installation.
+  Invalid lengths or malformed components fail with the expected form. `glass_stop` force-stops the
+  component package; it leaves the installed APK and emulator intact.
   `run[1..]` are the app's own arguments, passed to the launched process; `android` launches an
   activity rather than a command line, so it has nowhere to put them and returns an error naming
   what it could not use rather than ignoring it.

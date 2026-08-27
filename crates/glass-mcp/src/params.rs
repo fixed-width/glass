@@ -59,11 +59,16 @@ pub struct WindowHintArgs {
 pub struct StartArgs {
     /// Optional shell command to run (in `cwd`) before launching.
     pub build: Option<String>,
-    /// What to launch, then its arguments. `run[0]` is the executable on a desktop backend, an
-    /// `.app` path or bundle id on `ios`, and a `package/.Activity` component — optionally with
-    /// an `.apk` to install first — on `android`. `run[1..]` are the app's own arguments;
-    /// `android` has no argument vector to put them in and returns an error rather than
-    /// ignoring them.
+    /// What to launch, then its arguments. `run[0]` is the executable on a desktop backend or an
+    /// `.app` path/bundle id on `ios`. On `android`, pass exactly one component, optionally plus
+    /// one APK in either order: `["/absolute/path/app.apk", "com.example.app/.MainActivity"]`.
+    /// The APK is installed with `adb install -r -t` (replacing an existing installation), then
+    /// the exact component is launched. Relative (`package/.Activity`) and fully qualified
+    /// (`package/com.example.Activity`) activity forms are accepted. A missing/malformed component,
+    /// extra entry, install failure, or component rejected by Android returns an actionable error.
+    /// The APK is optional; `glass_stop` force-stops the component's package and leaves the emulator
+    /// and installation intact. Desktop/iOS `run[1..]` are app arguments; Android has no argument
+    /// vector and rejects extras rather than ignoring them.
     pub run: Vec<String>,
     /// Backend to launch under: `"x11"` or `"wayland"` (Linux), `"windows"` (on a
     /// Windows host), `"macos"` (on a macOS host), `"android"` (an AVD emulator, any
