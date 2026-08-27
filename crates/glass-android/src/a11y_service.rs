@@ -58,11 +58,19 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
     walk.refs.push(device_ref);
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let editable = flag("editable");
     // The device omits empty text; preserve it as empty for editable nodes.
     let text = v
         .get("text")
         .and_then(Value::as_str)
-        .or_else(|| flag("editable").then_some(""));
+        .or_else(|| editable.then_some(""));
+    // Android can publish its displayed hint through `text`.
+    // Older companions omit the flag, preserving their legacy text mapping.
+    let text = if flag("showing_hint_text") {
+        None
+    } else {
+        text
+    };
     let desc = v.get("desc").and_then(Value::as_str);
     // Both keys are absent (not null) on an older companion; `get` returns `None` either way, so
     // no version check is needed to stay compatible with it.
@@ -73,7 +81,7 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
         desc,
         resource_id,
         hint,
-        editable: flag("editable"),
+        editable,
     });
     let b = v
         .get("bounds")
@@ -1984,6 +1992,14 @@ mod tests {
         mapped_node(&v)
     }
 
+    fn mapped_hint_state(text: &str, showing_hint_text: bool) -> AxNode {
+        let mut v = node_json(Some(text), None, None, Some("Search settings"));
+        v["class"] = json!("android.widget.EditText");
+        v["editable"] = json!(true);
+        v["showing_hint_text"] = json!(showing_hint_text);
+        mapped_node(&v)
+    }
+
     #[test]
     fn the_content_description_a_text_displaced_becomes_the_description() {
         let node = mapped(Some("Save"), Some("Save changes"));
@@ -2081,6 +2097,34 @@ mod tests {
         );
         assert_eq!(node.name.as_deref(), Some("q"));
         assert_eq!(node.description.as_deref(), Some("Search settings"));
+    }
+
+    #[test]
+    fn a_displayed_hint_is_not_claimed_as_the_editable_value() {
+        let node = mapped_hint_state("Search settings", true);
+        assert_eq!(node.name, None);
+        assert_eq!(node.description.as_deref(), Some("Search settings"));
+        assert_eq!(node.value, None);
+    }
+
+    #[test]
+    fn entered_text_remains_the_value_after_the_hint_stops_showing() {
+        let node = mapped_hint_state("head-to-head", false);
+        assert_eq!(node.description.as_deref(), Some("Search settings"));
+        assert_eq!(node.value.as_deref(), Some("head-to-head"));
+    }
+
+    #[test]
+    fn an_older_companion_without_hint_state_keeps_the_legacy_value_mapping() {
+        let node = mapped_full(
+            Some("Search settings"),
+            None,
+            None,
+            Some("Search settings"),
+            true,
+        );
+        assert_eq!(node.description.as_deref(), Some("Search settings"));
+        assert_eq!(node.value.as_deref(), Some("Search settings"));
     }
 
     #[test]
