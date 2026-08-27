@@ -64,8 +64,8 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
         .get("text")
         .and_then(Value::as_str)
         .or_else(|| editable.then_some(""));
-    // Android also publishes a displayed hint through `text`. The additive flag is absent on
-    // older companions, where `flag` deliberately defaults to false and preserves legacy mapping.
+    // Android can publish its displayed hint through `text`.
+    // Older companions omit the flag, preserving their legacy text mapping.
     let text = if flag("showing_hint_text") {
         None
     } else {
