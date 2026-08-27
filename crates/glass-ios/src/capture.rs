@@ -50,15 +50,22 @@ mod tests {
     fn ios_screenshot_uses_simctl_caller_deadline() {
         let fake = FakeSimctl::new();
         let simctl = Simctl::at(fake.program());
+        fake.slow("io", 30);
 
+        let at = Instant::now();
         let err = screenshot_by(
             &simctl,
             "test-udid",
-            Deadline::at(Instant::now() - Duration::from_millis(1)),
+            Deadline::at(Instant::now() + Duration::from_millis(300)),
         )
-        .expect_err("a spent caller deadline must not start simctl");
+        .expect_err("a live caller deadline must bound simctl");
 
-        assert_eq!(err.bound(), Some(glass_core::BoundKind::NotStarted));
-        assert!(fake.calls().is_empty(), "simctl ran despite the deadline");
+        assert!(
+            at.elapsed() < Duration::from_secs(2),
+            "waited {:?}: {err}",
+            at.elapsed()
+        );
+        assert_eq!(err.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert!(fake.called("io test-udid screenshot"), "{:?}", fake.calls());
     }
 }

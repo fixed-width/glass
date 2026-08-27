@@ -146,11 +146,18 @@ impl AndroidPlatform {
     /// layout change can move/resize it since it was cached. Best-effort: keeps the cached
     /// geometry if the window isn't currently listed (mirrors `app_pids`' live re-scan).
     fn refresh_window(&mut self) -> Result<WindowGeometry> {
+        self.refresh_window_until(Deadline::UNBOUNDED)
+    }
+
+    /// Like [`Self::refresh_window`], bounded by a capture sequence's caller deadline.
+    fn refresh_window_until(&mut self, deadline: Deadline) -> Result<WindowGeometry> {
         let (package, active_id) = {
             let app = self.running()?;
             (app.package.clone(), app.active_id)
         };
-        let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
+        let dump = self
+            .adb()
+            .run_until(["shell", "dumpsys", "window", "windows"], deadline)?;
         let parsed = parse_app_windows(&dump, &package);
         let fresh = parsed
             .iter()
@@ -280,14 +287,22 @@ impl Platform for AndroidPlatform {
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        self.capture_frame_by(region, Deadline::UNBOUNDED)
+        let win = self.refresh_window()?;
+        let bytes = self.adb().run_bytes(["exec-out", "screencap"])?;
+        let display = decode_screencap(&bytes)?;
+        let window_region = visible_window_region(&win, display.width, display.height)?;
+        let window_frame = display.crop(&window_region)?;
+        match region {
+            Some(r) => window_frame.crop(r),
+            None => Ok(window_frame),
+        }
     }
 
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("capture"));
         }
-        let win = self.refresh_window()?;
+        let win = self.refresh_window_until(deadline)?;
         let bytes = self
             .adb()
             .run_bytes_until(["exec-out", "screencap"], deadline)?;
@@ -559,11 +574,11 @@ mod platform_tests {
         // shows nothing. A deadline computed backwards makes that first look the answer.
         let empty = Answer::says("");
         let windows = Answer::says(WINDOWS);
-        let started = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
         let pid = Answer::says("4321\n");
         let silent = Answer::Silent;
         let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&started]),
+            ("shell am start *", vec![&launch_reply]),
             (
                 "shell dumpsys window windows",
                 vec![&empty, &empty, &windows],
@@ -583,9 +598,9 @@ mod platform_tests {
     #[cfg(unix)]
     fn a_window_that_never_appears_ends_the_launch_rather_than_the_wait_going_on() {
         let empty = Answer::says("");
-        let started = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
         let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&started]),
+            ("shell am start *", vec![&launch_reply]),
             ("shell dumpsys window windows", vec![&empty]),
             ("*", vec![&Answer::Silent]),
         ]);
@@ -629,9 +644,9 @@ mod platform_tests {
     #[cfg(unix)]
     fn a_launch_whose_window_never_appears_does_not_leave_the_app_running() {
         let empty = Answer::says("");
-        let started = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
         let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&started]),
+            ("shell am start *", vec![&launch_reply]),
             ("shell dumpsys window windows", vec![&empty]),
             ("*", vec![&Answer::Silent]),
         ]);
@@ -719,20 +734,78 @@ mod platform_tests {
     #[test]
     #[cfg(unix)]
     fn android_screencap_uses_adb_run_bytes_until() {
-        let fake = launchable();
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let windows = Answer::says(WINDOWS);
+        let pid = Answer::says("4321\n");
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&launch_reply]),
+            ("shell dumpsys window windows", vec![&windows, &windows]),
+            ("shell pidof *", vec![&pid]),
+            ("exec-out screencap", vec![&Answer::Lingers]),
+            ("*", vec![&Answer::Silent]),
+        ]);
         let mut platform = started(&fake);
 
+        let at = Instant::now();
         let err = platform
             .capture_frame_by(
                 None,
-                Deadline::at(Instant::now() - Duration::from_millis(1)),
+                Deadline::at(Instant::now() + Duration::from_millis(300)),
             )
-            .expect_err("a spent caller deadline must not start screencap");
+            .expect_err("a live caller deadline must bound screencap");
 
-        assert_eq!(err.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert!(
+            at.elapsed() < Duration::from_secs(2),
+            "waited {:?}: {err}",
+            at.elapsed()
+        );
+        assert_eq!(err.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert!(
+            fake.called("exec-out screencap"),
+            "screencap did not reach the deadline-aware runner: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn android_refresh_uses_the_capture_caller_deadline() {
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let windows = Answer::says(WINDOWS);
+        let pid = Answer::says("4321\n");
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&launch_reply]),
+            (
+                "shell dumpsys window windows",
+                vec![&windows, &Answer::Lingers],
+            ),
+            ("shell pidof *", vec![&pid]),
+            (
+                "exec-out screencap",
+                vec![&Answer::says(frame_bytes(1080, 2400))],
+            ),
+            ("*", vec![&Answer::Silent]),
+        ]);
+        let mut platform = started(&fake);
+
+        let at = Instant::now();
+        let err = platform
+            .capture_frame_by(
+                None,
+                Deadline::at(Instant::now() + Duration::from_millis(300)),
+            )
+            .expect_err("a live caller deadline must bound refresh");
+
+        assert!(
+            at.elapsed() < Duration::from_secs(2),
+            "waited {:?}: {err}",
+            at.elapsed()
+        );
+        assert_eq!(err.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert!(fake.called("shell dumpsys window windows"));
         assert!(
             !fake.called("exec-out screencap"),
-            "screencap ran despite the spent caller deadline: {:?}",
+            "refresh spent the deadline but screencap still started: {:?}",
             fake.calls()
         );
     }
