@@ -409,7 +409,7 @@ impl Glass {
         // (the genuinely-settled state), else the just-observed full frame.
         let frame = match region {
             Some(_) if outcome.value.is_none() && whose == crate::Whose::Callee => {
-                self.capture(window, None)?
+                self.capture_by(window, None, caller)?
             }
             Some(_) => self.capture_by(window, None, deadline)?,
             None => tracker.last().cloned().expect("a frame was just observed"),
@@ -476,8 +476,9 @@ impl Glass {
             remaining,
             |d| {
                 let paused_at = std::time::Instant::now();
+                let pause_budget = deadline.remaining().unwrap_or(d).min(d);
                 let read_now = match signal.as_mut() {
-                    Some(s) => match s.wait(d) {
+                    Some(s) => match s.wait(pause_budget) {
                         ChangeWait::Changed => true,
                         // Read anyway now and then — see `REREAD_AFTER`.
                         ChangeWait::Quiet => last_read.elapsed() >= REREAD_AFTER,
@@ -496,7 +497,7 @@ impl Glass {
                 // progress bar) would otherwise drive back-to-back walks with no gap, hammering the
                 // same bus the app is trying to serve — and a signal that returns early without
                 // blocking, which nothing here can enforce, would spin this loop at full tilt.
-                std::thread::sleep(d.saturating_sub(paused_at.elapsed()));
+                std::thread::sleep(pause_budget.saturating_sub(paused_at.elapsed()));
                 read_now
             },
             || {
@@ -919,6 +920,43 @@ mod tests {
             })
             .unwrap();
         assert!(!outcome.settled);
+    }
+
+    #[test]
+    fn callee_timeout_final_settle_capture_keeps_the_bounded_caller_deadline() {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let caller = Deadline::from_millis(1_000);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])])
+            .with_capture_deadline_log(deadlines.clone())
+            .with_capture_delay(Duration::from_millis(20));
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let outcome = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 10,
+                    stability_region: Some(Region {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 2,
+                    }),
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                caller,
+            )
+            .unwrap();
+
+        assert!(!outcome.settled);
+        let deadlines = deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), 2);
+        assert_eq!(deadlines[1], caller);
     }
 
     #[test]
@@ -1570,6 +1608,28 @@ mod tests {
             walks.load(Ordering::Relaxed),
             2,
             "a quiet wait re-walked on the interval"
+        );
+    }
+
+    #[test]
+    fn caller_deadline_caps_an_element_wait_interval_and_signal_wait() {
+        let (mut g, _walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            vec![fake_tree_enabled()],
+            Some(|| Box::new(NeverSignals) as Box<dyn ChangeSignal>),
+        );
+        g.start(&spec()).unwrap();
+        let started = std::time::Instant::now();
+
+        let outcome = g
+            .wait_for_element_by(&never_matches(1_000, 5_000), Deadline::from_millis(30))
+            .unwrap();
+
+        assert_eq!(outcome.timed_out_by, Some(crate::Whose::Caller));
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "a 30ms caller deadline was stretched to {:?} by the 1s interval",
+            started.elapsed()
         );
     }
 

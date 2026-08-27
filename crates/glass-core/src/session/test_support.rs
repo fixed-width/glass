@@ -35,6 +35,7 @@ pub(crate) struct FakePlatform {
     started: bool,
     capture_log: Arc<Mutex<Vec<Option<Region>>>>,
     capture_deadline_log: Option<CaptureDeadlineLog>,
+    capture_delay: Option<Duration>,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
     log_batches: std::collections::VecDeque<Vec<(Stream, String)>>,
     key_log: Arc<Mutex<Vec<KeyEvent>>>,
@@ -94,6 +95,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_capture_deadline_log(mut self, log: CaptureDeadlineLog) -> Self {
         self.capture_deadline_log = Some(log);
+        self
+    }
+    pub(crate) fn with_capture_delay(mut self, delay: Duration) -> Self {
+        self.capture_delay = Some(delay);
         self
     }
     pub(crate) fn with_click_log(mut self, log: Arc<Mutex<Vec<(i32, i32)>>>) -> Self {
@@ -200,6 +205,9 @@ impl Platform for FakePlatform {
         self.stop_app()
     }
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+        if let Some(delay) = self.capture_delay {
+            std::thread::sleep(delay);
+        }
         self.capture_log.lock().unwrap().push(region.copied());
         let frame = match self.frames.pop_front() {
             Some(f) => {
