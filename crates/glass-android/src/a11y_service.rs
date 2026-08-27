@@ -58,8 +58,7 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
     walk.refs.push(device_ref);
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
-    // The device agent omits an empty text/desc rather than sending `""`, so both arrive as
-    // `None` here; `labels` judges a blank one absent either way.
+    // The device omits empty text; preserve it as empty for editable nodes.
     let text = v
         .get("text")
         .and_then(Value::as_str)

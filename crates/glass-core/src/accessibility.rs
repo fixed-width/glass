@@ -178,7 +178,7 @@ pub struct AxStates {
     pub checkable: bool,
     pub expanded: bool,
     pub editable: bool,
-    /// The element is a password or otherwise protected text field. Its value must never render.
+    /// Password or protected field; its value must never render.
     pub secure: bool,
 }
 

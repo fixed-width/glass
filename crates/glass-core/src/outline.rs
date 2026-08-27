@@ -75,9 +75,7 @@ fn is_scaffolding(node: &AxNode) -> bool {
 /// reported. A bare `Other` therefore means the backend named no token at all, not that glass
 /// dropped one. `role:` selectors still will not match either.
 ///
-/// Shared by [`AxTree::to_outline`] and [`render_compact`] so their common fields cannot drift.
-/// `editable_values` is enabled only for the compact, agent-facing snapshot contract; the full
-/// outline remains the structural representation used by scroll-saturation detection.
+/// Shared line format. Editable values are compact-only. Full outlines drive scroll detection.
 pub(crate) fn write_line(node: &AxNode, depth: usize, out: &mut String, editable_values: bool) {
     let indent = "  ".repeat(depth);
     let _ = write!(out, "{indent}#{}", node.id.0);

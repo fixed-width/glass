@@ -330,9 +330,7 @@ pub(crate) fn labels(inputs: LabelInputs<'_>) -> (Option<String>, Option<String>
     )
 }
 
-/// Absent attribute and empty attribute are the same thing to `uiautomator`, which emits
-/// `text=""` on every node that has none. Kept even though [`labels`] judges the *name* itself,
-/// because non-editable nodes still use it to avoid manufacturing values from empty attributes.
+/// Treat `uiautomator`'s empty attributes as absent on non-editable nodes.
 fn non_empty(s: &str) -> Option<String> {
     if s.is_empty() {
         None
@@ -810,9 +808,6 @@ mod tests {
 
     #[test]
     fn an_empty_editable_node_reports_an_empty_value() {
-        // Compact snapshots distinguish an empty value from a value the backend could not read.
-        // `typed_clear_landed` accepts both shapes, so preserving the distinction is compatible
-        // with clear verification.
         let xml = edit_text_xml("", "Email");
         let tree = build_tree(&xml, &win(), WalkLimits::DEFAULT).unwrap();
         let field = &tree.root.children[0];
