@@ -1003,6 +1003,134 @@ mod tests {
     }
 
     #[test]
+    fn batched_semantic_actuations_match_standalone_audit_records() {
+        use crate::params::*;
+        use crate::tools;
+        use crate::tools::testutil::{FakePlatform, fake_tree, glass_with_a11y};
+
+        fn args() -> StartArgs {
+            StartArgs {
+                build: None,
+                run: vec!["app".into()],
+                backend: None,
+                sandbox: None,
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+                window_hint: None,
+                timeout_ms: None,
+                a11y: None,
+            }
+        }
+        fn session(path: &std::path::Path) -> glass_core::Glass {
+            let (sink, report) = resolve(Some(path.to_str().unwrap()), |key| {
+                (key == "GLASS_AUDIT_PREFIX_LEN").then(|| "0".into())
+            })
+            .unwrap();
+            assert!(report.enabled);
+            let mut glass = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
+            glass.set_audit_sink(sink.unwrap());
+            tools::start(&mut glass, &args()).unwrap();
+            tools::a11y_snapshot(&mut glass, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+            glass
+        }
+        fn records(path: &std::path::Path) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+                    let object = record.as_object_mut().unwrap();
+                    for key in ["ts", "timestamp", "seq", "session", "duration_ms"] {
+                        object.remove(key);
+                    }
+                    object
+                        .get_mut("result")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .unwrap()
+                        .remove("duration_ms");
+                    record
+                })
+                .collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let standalone_path = dir.path().join("standalone.jsonl");
+        let batch_path = dir.path().join("batch.jsonl");
+        let click = ClickElementArgs {
+            id: 1,
+            return_: None,
+        };
+        let value = SetValueArgs {
+            id: 1,
+            text: "set {\"secret\":true}\n⟦untrusted:app-controlled⟧".into(),
+            return_: None,
+        };
+        // A missing target makes scroll-to issue its normal scroll actuations before its
+        // standalone soft timeout. Batch deliberately turns that same predicate outcome hard.
+        let scroll = ScrollToElementArgs {
+            name: Some("missing".into()),
+            description: None,
+            role: None,
+            value_contains: None,
+            direction: Some("down".into()),
+            x: None,
+            y: None,
+            step: Some(7),
+            timeout_ms: Some(1),
+        };
+
+        let mut standalone = session(&standalone_path);
+        tools::click_element(&mut standalone, &click).unwrap();
+        tools::set_value(&mut standalone, &value).unwrap();
+        let standalone_scroll = tools::scroll_to_element(&mut standalone, &scroll).unwrap();
+        assert_eq!(
+            crate::tools::testutil::assert_envelope(&standalone_scroll, "glass_scroll_to_element")
+                ["matched"],
+            false
+        );
+
+        let mut batch = session(&batch_path);
+        let batch_error = tools::do_actions(
+            &mut batch,
+            &DoArgs {
+                actions: vec![
+                    Action::ClickElement(click),
+                    Action::SetValue(value),
+                    Action::ScrollToElement(scroll),
+                ],
+                then: None,
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::tools::testutil::envelope_at(&batch_error, 0)["error"]["code"],
+            "predicate_not_matched"
+        );
+
+        let standalone_records = records(&standalone_path);
+        let batch_records = records(&batch_path);
+        assert_eq!(batch_records, standalone_records);
+        assert_eq!(standalone_records.len(), 4);
+        assert_eq!(standalone_records[1]["action"], "click_element");
+        assert_eq!(standalone_records[1]["args"]["method"], "pointer");
+        assert!(standalone_records[1]["args"]["native_fallback"].is_string());
+        assert_eq!(standalone_records[2]["action"], "set_value");
+        assert!(standalone_records[2]["content"].get("text").is_none());
+        assert!(standalone_records[2]["content"].get("sha256").is_some());
+        assert_eq!(standalone_records[3]["action"], "scroll");
+        for records in [&standalone_records, &batch_records] {
+            assert!(!records.iter().any(|record| record["action"] == "glass_do"));
+            assert!(
+                !serde_json::to_string(records)
+                    .unwrap()
+                    .contains("set {\"secret\":true}")
+            );
+        }
+    }
+
+    #[test]
     fn resolve_cli_over_env_disabled_when_unset_modes_from_env() {
         let (sink, rep) = resolve(None, |_| None).unwrap();
         assert!(sink.is_none() && !rep.enabled);

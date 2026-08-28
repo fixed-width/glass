@@ -763,15 +763,15 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Run an ordered sequence of input actions in ONE call (collapsing per-action \
-                       round-trips), then optionally observe. `actions` is a list of \
-                       {\"action\":\"click|move|drag|scroll|type|key|settle\", …same fields as the \
-                       matching tool; `settle` waits for the screen to stop changing between steps. \
-                       Optional `then` runs after all actions succeed: {settle?, diff?, screenshot?} \
-                       (text-only unless screenshot/diff image). Fails fast: if an action errors it \
-                       reports which index failed and how many ran. Use for KNOWN sequences (login, \
-                       form-fill, menu→item); if you must see a result to choose the next action, \
-                       don't batch that part."
+        description = "Run fixed static ordered actions in one call: click, move, drag, scroll, type, \
+                       key, settle, click_element, set_value, wait_for_element, scroll_to_element. \
+                       At most 64 actions and 65536 compact argument bytes. Optional absolute sequence \
+                       timeout_ms defaults to 30000ms, is at most 120000ms, and is shared by actions and \
+                       terminal settle/diff/screenshot. Fail-fast on action errors, sequence deadline, \
+                       and unmatched batched wait_for_element/scroll_to_element predicates; standalone \
+                       predicates remain soft. Optional terminal order settle, diff, screenshot adds \
+                       structured outcomes. type retains return:\"none|settle|snapshot\" support. No variables, \
+                       result bindings, interpolation, branching, loops, retries, or dynamic action generation."
     )]
     async fn glass_do(
         &self,
@@ -809,10 +809,15 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      appears. Successful input dispatch does not prove runtime state; verify the expected outcome \
      with the strongest matching wait. Waits return text only and time out softly with {matched:false} — branch on \
      that rather than retrying blindly.\n\n\
-     Batch a known input sequence into one call with glass_do (actions: click/type/key/\
-     move/drag/scroll/settle), with an optional text-first `then` observe \
-     (settle/diff/screenshot) — fewer round-trips, and it fails fast naming the action \
-     that broke.\n\n\
+     Batch fixed static ordered actions into one glass_do call: click, move, drag, scroll, type, key, \
+     settle, click_element, set_value, wait_for_element, scroll_to_element. It accepts at most 64 \
+     actions and 65536 compact argument bytes. Its optional absolute sequence timeout_ms defaults to \
+     30000ms, is at most 120000ms, and is shared by actions and terminal settle/diff/screenshot. \
+     Fail-fast on action errors, sequence deadline, and unmatched batched wait_for_element/\
+     scroll_to_element predicates; standalone predicates remain soft. Optional terminal order settle, \
+     diff, screenshot adds structured outcomes. type retains return:\"none|settle|snapshot\" support. \
+     No variables, result bindings, interpolation, branching, loops, retries, or dynamic action \
+     generation.\n\n\
      Multiple windows: glass_list_windows and glass_select_window. Errors are real — a \
      failed capture or input returns a message, never a blank or stale frame; fix the \
      cause instead of retrying blindly.";
@@ -857,6 +862,80 @@ pub(crate) fn registered_tools() -> std::collections::BTreeSet<String> {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn glass_do_schema_and_description_advertise_the_bounded_static_contract() {
+        let tool = GlassServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "glass_do")
+            .expect("glass_do is registered");
+        let schema = serde_json::Value::Object((*tool.input_schema).clone()).to_string();
+        for action in [
+            "click",
+            "move",
+            "drag",
+            "scroll",
+            "type",
+            "key",
+            "settle",
+            "click_element",
+            "set_value",
+            "wait_for_element",
+            "scroll_to_element",
+        ] {
+            assert!(
+                schema.contains(&format!("\"{action}\"")),
+                "missing {action}: {schema}"
+            );
+        }
+        assert!(schema.contains("\"timeout_ms\""), "{schema}");
+        assert!(!schema.contains("encoded_argument_bytes"), "{schema}");
+
+        let description = tool.description.as_deref().expect("description");
+        for required in [
+            "fixed static ordered actions",
+            "64 actions",
+            "65536 compact argument bytes",
+            "timeout_ms",
+            "30000",
+            "120000",
+            "click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element",
+            "Fail-fast",
+            "wait_for_element",
+            "scroll_to_element",
+            "terminal order settle, diff, screenshot",
+            "type retains return:\"none|settle|snapshot\"",
+            "No variables, result bindings, interpolation, branching, loops, retries, or dynamic action generation",
+        ] {
+            assert!(
+                description.contains(required),
+                "description missing {required:?}: {description}"
+            );
+        }
+        assert!(
+            !description.contains("type.return is rejected"),
+            "{description}"
+        );
+
+        for required in [
+            "fixed static ordered actions",
+            "64 actions",
+            "65536 compact argument bytes",
+            "timeout_ms",
+            "30000",
+            "120000",
+            "click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element",
+            "standalone predicates remain soft",
+            "terminal order settle, diff, screenshot",
+            "No variables, result bindings, interpolation, branching, loops, retries, or dynamic action generation",
+        ] {
+            assert!(
+                SERVER_INSTRUCTIONS.contains(required),
+                "instructions missing {required:?}"
+            );
+        }
+    }
 
     fn first_text(r: &CallToolResult) -> String {
         r.content[0].as_text().expect("text content").text.clone()
