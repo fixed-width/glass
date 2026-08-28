@@ -277,7 +277,10 @@ impl Conn {
         if let Err(install_error) = install {
             if let Err(restore_error) = self.restore_timeouts() {
                 self.poison();
-                return Err(restore_error);
+                return Err(GlassError::Backend(format!(
+                    "socket timeout installation and restoration both failed: {install_error}; \
+                     {restore_error}"
+                )));
             }
             return Err(install_error);
         }
@@ -479,5 +482,33 @@ mod tests {
             .filter_map(|r| r.get("id").and_then(Value::as_i64))
             .collect();
         assert_eq!(ids, [1, 2, 3]);
+    }
+
+    #[test]
+    fn install_and_restore_failures_are_aggregated_and_poison_the_connection() {
+        let (port, seen) = fake_agent(HELLO, vec![OK]);
+        let mut conn = Conn::open(port).expect("the hello arrives");
+        conn.inject_timeout_fault(TimeoutFault::ReadInstall);
+        conn.inject_timeout_fault(TimeoutFault::ReadRestore);
+
+        let result = conn.call_within(
+            json!({"op": "ping"}),
+            Deadline::from_millis(1_000),
+            "agent request",
+        );
+
+        let Err(GlassError::Backend(message)) = result else {
+            panic!("setup failure must remain an outer, pre-dispatch error");
+        };
+        assert!(message.contains("ReadInstall"), "{message}");
+        assert!(message.contains("ReadRestore"), "{message}");
+        assert!(
+            conn.ensure_usable().is_err(),
+            "the connection was not poisoned"
+        );
+        assert!(
+            seen.lock().expect("request log").is_empty(),
+            "a request was dispatched despite failed timeout installation"
+        );
     }
 }

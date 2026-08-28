@@ -1449,13 +1449,23 @@ fn disabled_error(target: u32, disabled: AxNodeId) -> GlassError {
 /// written — the other two may already have set the field, so they answer in a verdict
 /// `set_value_failed_after_writing` accepts (glass#405).
 fn write_error(target: u32, f: CallFailure) -> GlassError {
+    let pending_dispatch = match &f {
+        CallFailure::NotSent(_) => glass_core::BoundDispatch::NotDispatched,
+        CallFailure::AnswerLost(_) | CallFailure::Refused(_) => {
+            glass_core::BoundDispatch::MayHaveDispatched
+        }
+    };
     let caller_owned = match &f {
         CallFailure::NotSent(e) | CallFailure::AnswerLost(e) | CallFailure::Refused(e) => {
             e.bound_owner() == Some(glass_core::Whose::Caller)
         }
     };
     if caller_owned {
-        return f.into_error();
+        let mut error = f.into_error();
+        if let GlassError::Bounded { dispatch, .. } = &mut error {
+            *dispatch = pending_dispatch;
+        }
+        return error;
     }
     match f {
         CallFailure::NotSent(e) => GlassError::AccessibilityUnavailable(format!(
@@ -3071,6 +3081,8 @@ mod tests {
         /// Read the request, then drop the socket without answering — the shape of an answer
         /// lost to a read timeout, a rebinding service or a reset `adb forward` tunnel.
         DropWithoutAnswering,
+        /// Hold the request until its caller deadline expires, then drop without answering.
+        DelayThenDrop(std::time::Duration),
     }
 
     /// What a fake `tree` reply's `package` field says, relative to what was asked.
@@ -3240,6 +3252,10 @@ mod tests {
                             match this_action {
                                 OnAction::Ok => json!({"id": id, "ok": true}),
                                 OnAction::DropWithoutAnswering => break,
+                                OnAction::DelayThenDrop(delay) => {
+                                    std::thread::sleep(delay);
+                                    break;
+                                }
                             }
                         }
                         _ => json!({"id": id, "ok": true}),
@@ -3423,6 +3439,31 @@ mod tests {
             .expect_err("the reconnect rearm outlasted the caller");
 
         assert_semantic_caller_timeout(&error, glass_core::BoundDispatch::MayHaveDispatched);
+    }
+
+    #[test]
+    fn semantic_caller_deadline_before_service_recovery_preserves_answer_lost_delivery() {
+        let tree = editable_field("old");
+        let (port, ops) = fake_service(
+            vec![tree.clone()],
+            OnAction::DelayThenDrop(std::time::Duration::from_millis(300)),
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a11y = ServiceA11y::new(client, "com.example.app".to_string());
+        let target = target_for(&built(&tree), AxNodeId(1));
+        let mut context = ctx();
+        context.deadline = Deadline::from_millis(150);
+
+        let error = a11y
+            .set_value(&context, &target, "new")
+            .expect_err("the first mutation lost its answer as the deadline expired");
+
+        assert_semantic_caller_timeout(&error, glass_core::BoundDispatch::MayHaveDispatched);
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn1:set_text ref=1".to_string(),],
+            "recovery started after the first mutation exhausted the deadline"
+        );
     }
 
     #[test]
