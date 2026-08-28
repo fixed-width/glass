@@ -26,6 +26,7 @@ enum DeadlineBehavior {
     SetValueCallerDeadline,
     SetValueBackendDeadline,
     SetValueTransportFailure,
+    SetValueWorkerSpawnFailure,
     NoActiveSession,
     MissingElement,
     StaleElement,
@@ -211,6 +212,12 @@ impl Accessibility for DeadlineAccessibility {
                     })
                 })
             }),
+            DeadlineBehavior::SetValueWorkerSpawnFailure => Err(
+                GlassError::AccessibilityUnavailable(
+                    "could not start the scripted accessibility worker".into(),
+                )
+                .before_dispatch(),
+            ),
             _ => Ok(()),
         }
     }
@@ -327,7 +334,8 @@ impl Platform for DeadlinePlatform {
             | DeadlineBehavior::A11yBoundedLate
             | DeadlineBehavior::SetValueCallerDeadline
             | DeadlineBehavior::SetValueBackendDeadline
-            | DeadlineBehavior::SetValueTransportFailure => self.inner.send_pointer(event),
+            | DeadlineBehavior::SetValueTransportFailure
+            | DeadlineBehavior::SetValueWorkerSpawnFailure => self.inner.send_pointer(event),
         }
     }
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> GlassResult<()> {
@@ -1380,6 +1388,33 @@ fn set_value_transport_failure_keeps_post_write_retry_guidance() {
         "post-write retry guidance was redacted: {}",
         output_text(&error)
     );
+    assert_eq!(*events.lock().unwrap(), vec!["set_value(secret)"]);
+}
+
+#[test]
+fn set_value_worker_spawn_failure_is_unattempted_and_safe_to_retry() {
+    let (mut g, _, _, events) = deadline_a11y_glass_with_behavior(
+        DeadlineBehavior::SetValueWorkerSpawnFailure,
+        vec![],
+    );
+    let error = do_actions(
+        &mut g,
+        &do_args(
+            vec![Action::SetValue(SetValueArgs {
+                id: 1,
+                text: "secret".into(),
+                return_: None,
+            })],
+            1_000,
+        ),
+    )
+    .unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(step["attempted"], false);
+    assert_eq!(step["side_effects_may_have_occurred"], false);
+    assert!(!output_text(&error).contains("secret"));
     assert_eq!(*events.lock().unwrap(), vec!["set_value(secret)"]);
 }
 

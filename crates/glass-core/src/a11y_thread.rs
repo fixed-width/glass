@@ -356,6 +356,14 @@ impl A11yThread {
         ))
     }
 
+    fn worker_spawn_failed(&self, error: std::io::Error) -> GlassError {
+        GlassError::AccessibilityUnavailable(format!(
+            "could not start the {} accessibility worker: {error}",
+            self.backend
+        ))
+        .before_dispatch()
+    }
+
     /// `on_timeout` rather than a `Whose`: only a snapshot has two bounds to choose between, and
     /// handing the other two a verdict this never read let them pass a wrong one unnoticed.
     fn detached<T: Send + 'static>(
@@ -375,12 +383,7 @@ impl A11yThread {
             .spawn(move || {
                 let _ = tx.send(job());
             })
-            .map_err(|e| {
-                GlassError::AccessibilityUnavailable(format!(
-                    "could not start the {} accessibility worker: {e}",
-                    self.backend
-                ))
-            })?;
+            .map_err(|error| self.worker_spawn_failed(error))?;
         match rx.recv_timeout(wait) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => Err(on_timeout()),
@@ -622,6 +625,18 @@ mod tests {
             .invoke(Deadline::UNBOUNDED, || panic!("unwound after dispatch"))
             .unwrap_err();
         assert!(e.to_string().contains("may still land"), "{e}");
+    }
+
+    #[test]
+    fn a_worker_spawn_failure_is_explicitly_not_dispatched() {
+        let error = reader().worker_spawn_failed(std::io::Error::other("thread limit reached"));
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::NotDispatched),
+            "the worker and native value mutation never started: {error}"
+        );
+        assert!(!error.set_value_failed_after_writing(), "{error}");
     }
 
     #[test]
