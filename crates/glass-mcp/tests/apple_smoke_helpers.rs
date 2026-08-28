@@ -126,6 +126,35 @@ fn production_policy_scales_the_minimum_for_larger_rois() {
 }
 
 #[test]
+fn production_policy_uses_floor_division_of_non_square_roi_area() {
+    let before = RgbaImage::from_pixel(90, 111, Rgba([20, 30, 40, 255]));
+    let mut after = RgbaImage::from_pixel(92, 114, Rgba([20, 30, 40, 255]));
+    let roi = ElementRoi {
+        id: 7,
+        x: 2,
+        y: 3,
+        width: 90,
+        height: 111,
+    };
+    for x in 0..8 {
+        after.put_pixel(roi.x + x, roi.y, Rgba([45, 30, 40, 255]));
+    }
+
+    let error = assert_roi_changed(&before, &after, roi, "fixture status")
+        .expect_err("a 9,990-pixel ROI must reject eight significant changes");
+    assert!(
+        error.contains("changed 8 pixels, expected at least 9"),
+        "{error}"
+    );
+
+    after.put_pixel(roi.x + 8, roi.y, Rgba([45, 30, 40, 255]));
+    assert_eq!(
+        assert_roi_changed(&before, &after, roi, "fixture status").unwrap(),
+        9
+    );
+}
+
+#[test]
 fn terminal_proof_maps_asymmetric_nonuniform_roi_axes_and_extents() {
     let roi = ElementRoi {
         id: 7,
