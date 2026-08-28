@@ -184,6 +184,7 @@ mod tests {
         );
         g.start(&spec()).unwrap();
         g.save_baseline("main").unwrap();
+        log.lock().unwrap().clear();
         let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(1));
 
         g.diff_baseline_with_frame_by("main", None, &[], 0, deadline)
@@ -203,6 +204,7 @@ mod tests {
         );
         g.start(&spec()).unwrap();
         g.save_baseline("main").unwrap();
+        log.lock().unwrap().clear();
         let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(1));
 
         g.diff_baseline_perceptual_with_frame_by("main", None, &[], 0.1, deadline)
