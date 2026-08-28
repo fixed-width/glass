@@ -4,7 +4,7 @@
 //! through a temp PNG file that is then decoded to raw RGBA. Callers crop to a region
 //! with [`glass_core::Frame::crop`].
 
-use glass_core::{Deadline, Frame, GlassError, Region, Result};
+use glass_core::{Deadline, Frame, GlassError, Region, Result, Whose};
 
 use crate::simctl::Simctl;
 
@@ -83,6 +83,13 @@ fn require_capture_time(deadline: Deadline, dispatched: bool) -> Result<()> {
 }
 
 fn finish_capture<T>(deadline: Deadline, dispatched: bool, result: Result<T>) -> Result<T> {
+    // Subprocess bounds resolve ownership before kill/reap, whose cleanup may outlive the caller.
+    if result
+        .as_ref()
+        .is_err_and(|error| error.bound_owner() == Some(Whose::Callee))
+    {
+        return result;
+    }
     require_capture_time(deadline, dispatched)?;
     result
 }
@@ -222,6 +229,36 @@ mod tests {
             "simctl itself did not answer before expiry"
         );
         assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn backend_screenshot_timeout_survives_caller_expiry_before_finalization() {
+        let mut screenshot = std::process::Command::new("/bin/sleep");
+        screenshot.arg("30");
+        let result = glass_core::run_bounded(
+            &mut screenshot,
+            Duration::from_millis(5),
+            "simctl:io screenshot",
+        )
+        .map(|_| ());
+        let backend_error = result
+            .as_ref()
+            .expect_err("the screenshot stand-in must reach its backend ceiling");
+        assert_eq!(backend_error.bound_owner(), Some(glass_core::Whose::Callee));
+
+        let deadline = Deadline::from_millis(1);
+        while !deadline.has_passed() {
+            std::thread::yield_now();
+        }
+        let error = finish_capture(deadline, true, result)
+            .expect_err("caller expiry must not replace a resolved backend timeout");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Callee));
         assert_eq!(
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::MayHaveDispatched)
