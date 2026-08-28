@@ -89,8 +89,9 @@ impl Accessibility for MacosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let deadline = SemanticDeadline::snapshot(ctx.deadline);
         deadline.require()?;
-        let deadline = deadline.after_dispatch();
-        let (window_el, scale) = resolve_window(ctx, deadline)?;
+        let (trusted, deadline) = deadline.dispatch_snapshot(ffi::accessibility_is_trusted)?;
+        require_accessibility_grant(trusted)?;
+        let (window_el, scale) = resolve_window_after_grant(ctx, deadline)?;
 
         let mut budget = WalkBudget::with_limits(ctx.limits);
         let root = walk(&window_el, &ctx.window, scale, 0, &mut budget, deadline)?;
@@ -304,21 +305,34 @@ fn write_verdict(
     }
 }
 
-/// Resolve the `AXWindow` + point→pixel `scale` for `ctx`: the grant gate, pid, app element,
-/// and window selection `snapshot` and `set_value` both need — shared so both address the
-/// identical window.
+/// Resolve the `AXWindow` + point→pixel `scale` for a semantic operation that has not yet checked
+/// the grant. Snapshot performs that first AX call at its dispatch boundary, then enters
+/// [`resolve_window_after_grant`]; mutations use this wrapper while they are still pre-dispatch.
 fn resolve_window(
     ctx: &AxContext,
     deadline: SemanticDeadline,
 ) -> Result<(CFRetained<AXUIElement>, f64)> {
     // Grant gate first — fail closed with an actionable error, never a stub tree.
-    if !deadline.observe(ffi::accessibility_is_trusted)? {
-        return Err(GlassError::PermissionDenied {
+    require_accessibility_grant(deadline.observe(ffi::accessibility_is_trusted)?)?;
+
+    resolve_window_after_grant(ctx, deadline)
+}
+
+fn require_accessibility_grant(trusted: bool) -> Result<()> {
+    if trusted {
+        Ok(())
+    } else {
+        Err(GlassError::PermissionDenied {
             which: "Accessibility".into(),
             remedy: ACCESSIBILITY_REMEDY.into(),
-        });
+        })
     }
+}
 
+fn resolve_window_after_grant(
+    ctx: &AxContext,
+    deadline: SemanticDeadline,
+) -> Result<(CFRetained<AXUIElement>, f64)> {
     deadline.require()?;
     let &pid = ctx.pids.first().ok_or(GlassError::WindowNotFound)?;
     let app = deadline.observe(|| ffi::app_element(pid as i32))?;

@@ -72,6 +72,18 @@ impl SemanticPhase {
     }
 
     fn finish<T>(self, deadline: Deadline, result: Result<T>) -> Result<T> {
+        // The RPC layer's no-start gate is more precise than a phase set by its caller. Preserve
+        // that proof before re-reading a deadline that may now have elapsed.
+        if matches!(self, Self::Snapshot { .. })
+            && matches!(
+                &result,
+                Err(error)
+                    if error.bound_dispatch()
+                        == Some(glass_core::BoundDispatch::NotDispatched)
+            )
+        {
+            return result;
+        }
         self.require(deadline)?;
         match result {
             Ok(value) => Ok(value),
@@ -83,6 +95,22 @@ impl SemanticPhase {
     fn run<T>(self, deadline: Deadline, work: impl FnOnce() -> Result<T>) -> Result<T> {
         self.require(deadline)?;
         self.finish(deadline, work())
+    }
+
+    fn finish_snapshot_rpc<T>(self, deadline: Deadline, result: Result<T>) -> Result<(T, Self)> {
+        // Only a result other than the RPC layer's explicit no-start refusal proves that this
+        // snapshot crossed the external dispatch boundary.
+        let phase = if matches!(
+            &result,
+            Err(error)
+                if error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched)
+        ) {
+            self
+        } else {
+            self.after_snapshot_dispatch()
+        };
+        let value = phase.finish(deadline, result)?;
+        Ok((value, phase))
     }
 }
 
@@ -107,8 +135,8 @@ impl IosA11y {
             phase.require(deadline)?;
             return Ok((scale, phase));
         }
-        let phase = phase.after_snapshot_dispatch();
-        let dimensions = phase.finish(deadline, self.client.describe_by(deadline))?;
+        let (dimensions, phase) =
+            phase.finish_snapshot_rpc(deadline, self.client.describe_by(deadline))?;
         let scale = phase.run(deadline, || {
             crate::platform::checked_scale(dimensions.density)
         })?;
@@ -123,8 +151,8 @@ impl IosA11y {
     fn describe(&mut self, ctx: &AxContext, phase: SemanticPhase) -> Result<(AxTree, f64)> {
         phase.require(ctx.deadline)?;
         let (scale, phase) = self.scale(ctx.deadline, phase)?;
-        let phase = phase.after_snapshot_dispatch();
-        let json = phase.finish(ctx.deadline, self.client.describe_all_by(ctx.deadline))?;
+        let (json, phase) =
+            phase.finish_snapshot_rpc(ctx.deadline, self.client.describe_all_by(ctx.deadline))?;
         let tree = phase.run(ctx.deadline, || {
             let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
             tree.assign_ids();
@@ -405,6 +433,67 @@ mod tests {
         assert_eq!(
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn snapshot_scale_rpc_refusal_at_its_dispatch_gate_stays_not_dispatched() {
+        let error = SemanticPhase::Snapshot { dispatched: true }
+            .finish::<()>(
+                glass_core::Deadline::from_millis(0),
+                Err(GlassError::deadline_not_started("idb describe")),
+            )
+            .expect_err("the lower RPC gate proved that describe did not start");
+
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::NotStarted),
+            "{error}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn snapshot_tree_rpc_refusal_at_its_dispatch_gate_stays_not_dispatched() {
+        let error = SemanticPhase::Snapshot { dispatched: true }
+            .finish::<()>(
+                glass_core::Deadline::from_millis(0),
+                Err(GlassError::deadline_not_started("idb accessibility_info")),
+            )
+            .expect_err("the lower RPC gate proved that accessibility_info did not start");
+
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::NotStarted),
+            "{error}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn live_snapshot_no_tree_result_stays_accessibility_not_ready() {
+        let error = SemanticPhase::Snapshot { dispatched: true }
+            .finish::<()>(
+                glass_core::Deadline::UNBOUNDED,
+                Err(GlassError::AccessibilityNotReady(
+                    "the app has not published a tree yet".into(),
+                )),
+            )
+            .expect_err("a live no-tree result must remain retryable");
+
+        assert!(
+            matches!(error, GlassError::AccessibilityNotReady(_)),
             "{error}"
         );
     }

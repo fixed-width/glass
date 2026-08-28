@@ -131,6 +131,29 @@ impl SemanticDeadline {
         self.after_dispatch().finish(work())
     }
 
+    pub(crate) fn dispatch_snapshot<T>(
+        self,
+        work: impl FnOnce() -> T,
+    ) -> Result<(T, SemanticDeadline)> {
+        self.dispatch_snapshot_with_clock(Instant::now, work)
+    }
+
+    fn dispatch_snapshot_with_clock<T>(
+        self,
+        mut now: impl FnMut() -> Instant,
+        work: impl FnOnce() -> T,
+    ) -> Result<(T, SemanticDeadline)> {
+        debug_assert_eq!(self.operation, SemanticOperation::Snapshot);
+        debug_assert!(!self.dispatched);
+        // Keep the final no-start check and the first AX call in one helper. Once this check
+        // succeeds, any expiry belongs to a snapshot whose native read may have started.
+        self.require_at(now())?;
+        let dispatched = self.after_dispatch();
+        let value = work();
+        dispatched.require_at(now())?;
+        Ok((value, dispatched))
+    }
+
     pub(crate) fn phase(self, own: Instant) -> EffectiveDeadline {
         let (ends, owner) = self.deadline.resolve(own);
         EffectiveDeadline { ends, owner }
@@ -205,6 +228,7 @@ impl EffectiveDeadline {
 mod tests {
     use super::*;
     use glass_core::{BoundDispatch, Whose};
+    use std::cell::Cell;
 
     #[test]
     fn a_spent_snapshot_deadline_is_not_started() {
@@ -213,6 +237,32 @@ mod tests {
             .require_at(now)
             .unwrap_err();
 
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn snapshot_expiry_at_the_first_native_gate_is_not_dispatched() {
+        let before = Instant::now();
+        let expires = before + Duration::from_secs(1);
+        let deadline = SemanticDeadline::snapshot(Deadline::at(expires));
+        deadline
+            .require_at(before)
+            .expect("the outer snapshot check is still live");
+        let called = Cell::new(false);
+
+        let error = deadline
+            .dispatch_snapshot_with_clock(
+                || expires,
+                || {
+                    called.set(true);
+                    true
+                },
+            )
+            .expect_err("expiry at the native gate must prevent the first AX call");
+
+        assert!(!called.get(), "the first AX call must not begin");
         assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
         assert_eq!(error.bound_owner(), Some(Whose::Caller));
         assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
