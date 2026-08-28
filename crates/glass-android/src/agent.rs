@@ -624,6 +624,50 @@ mod tests {
         (port, requests, join)
     }
 
+    /// Start conn1's answer, let its caller time out, then finish that stale answer after the next
+    /// request could have started. A safe client retires conn1 and sends only the distinct second
+    /// mutation on conn2.
+    fn agent_with_late_partial_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_reader = BufReader::new(first);
+            let mut line = String::new();
+            first_reader
+                .read_line(&mut line)
+                .expect("read conn1 request");
+            let request: Value = serde_json::from_str(&line).expect("conn1 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((1, request));
+            write!(first_writer, r#"{{"id":{id},"#).expect("write partial conn1 answer");
+            first_writer.flush().expect("flush partial conn1 answer");
+            std::thread::sleep(Duration::from_millis(180));
+            let _ = writeln!(first_writer, r#""ok":true}}"#);
+
+            let (second, _) = listener.accept().expect("accept conn2");
+            let mut second_writer = second.try_clone().expect("clone conn2");
+            writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+            let mut second_reader = BufReader::new(second);
+            let mut line = String::new();
+            second_reader
+                .read_line(&mut line)
+                .expect("read conn2 request");
+            let request: Value = serde_json::from_str(&line).expect("conn2 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((2, request));
+            writeln!(second_writer, "{}", json!({"id": id, "ok": true}))
+                .expect("answer conn2 request");
+        });
+        (port, requests, join)
+    }
+
     #[test]
     fn read_timeout_install_failure_aborts_before_dispatch() {
         let (port, requests, _) = counting_agent();
@@ -782,6 +826,37 @@ mod tests {
             assert_eq!(seen[0].0, 1, "{expected_op}");
             assert_eq!(seen[0].1["op"], expected_op, "{expected_op}");
         }
+    }
+
+    #[test]
+    fn answer_lost_retires_partial_stream_before_the_next_distinct_mutation() {
+        let (port, requests, join) = agent_with_late_partial_answer();
+        let client = AgentClient::connect(port).expect("connect");
+
+        let first = client
+            .key_by("a", Deadline::from_millis(100))
+            .expect_err("conn1 finishes its answer after the caller deadline");
+        assert_eq!(
+            first.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{first}"
+        );
+        assert_eq!(
+            first.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{first}"
+        );
+        client
+            .key_by("b", Deadline::from_millis(1_000))
+            .expect("the distinct mutation uses a clean conn2");
+
+        join.join().expect("fake agent");
+        let seen = requests.lock().expect("request log");
+        assert_eq!(seen.len(), 2, "a mutation was replayed or lost: {seen:?}");
+        assert_eq!((seen[0].0, seen[0].1["op"].as_str()), (1, Some("key")));
+        assert_eq!(seen[0].1["chord"], "a");
+        assert_eq!((seen[1].0, seen[1].1["op"].as_str()), (2, Some("key")));
+        assert_eq!(seen[1].1["chord"], "b");
     }
 
     #[test]

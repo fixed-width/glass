@@ -126,13 +126,9 @@ impl Conn {
             #[cfg(test)]
             timeout_faults: Default::default(),
         };
-        let hello = c.read_line().map_err(|e| {
-            if deadline.has_passed() {
-                GlassError::caller_deadline_elapsed("agent hello")
-            } else {
-                e
-            }
-        })?;
+        let hello = c
+            .read_line_by(deadline, "agent hello")
+            .map_err(CallFailure::into_error)?;
         if deadline.has_passed() {
             return Err(GlassError::caller_deadline_elapsed("agent hello"));
         }
@@ -154,7 +150,7 @@ impl Conn {
     pub(crate) fn ensure_usable(&self) -> glass_core::Result<()> {
         if self.poisoned {
             Err(GlassError::Backend(
-                "agent connection is unusable after socket timeout restoration failed".into(),
+                "agent connection is unusable after its transport state became uncertain".into(),
             ))
         } else {
             Ok(())
@@ -166,18 +162,6 @@ impl Conn {
         // A poisoned connection cannot be reused. Close it now so a companion with a sequential
         // accept/read loop can leave conn1 and accept the replacement before this value is dropped.
         let _ = self.writer.shutdown(Shutdown::Both);
-    }
-
-    pub(crate) fn read_line(&mut self) -> glass_core::Result<String> {
-        let mut line = String::new();
-        let n = self
-            .reader
-            .read_line(&mut line)
-            .map_err(|e| GlassError::Backend(format!("agent read: {e}")))?;
-        if n == 0 {
-            return Err(GlassError::Backend("agent closed the connection".into()));
-        }
-        Ok(line.trim_end().to_string())
     }
 
     /// Bound how long the next reads may block for, or restore the standing timeout when the
@@ -285,6 +269,16 @@ impl Conn {
         })
     }
 
+    fn retire_answer_lost(
+        &mut self,
+        outcome: std::result::Result<Value, CallFailure>,
+    ) -> std::result::Result<Value, CallFailure> {
+        if matches!(&outcome, Err(CallFailure::AnswerLost(_))) {
+            self.poison();
+        }
+        outcome
+    }
+
     fn transport_failure(dispatched: bool, error: GlassError) -> CallFailure {
         if dispatched {
             CallFailure::AnswerLost(error)
@@ -323,6 +317,56 @@ impl Conn {
             }
         }
         Ok(())
+    }
+
+    fn read_line_by(
+        &mut self,
+        deadline: Deadline,
+        op: &str,
+    ) -> std::result::Result<String, CallFailure> {
+        let mut line = Vec::new();
+        loop {
+            let wait = Self::phase_wait(deadline, op, true)?;
+            self.read_within(wait).map_err(CallFailure::AnswerLost)?;
+            let (consumed, complete) = match self.reader.fill_buf() {
+                Ok([]) => {
+                    return Err(CallFailure::AnswerLost(GlassError::Backend(
+                        "agent closed the connection".into(),
+                    )));
+                }
+                Ok(available) => {
+                    let consumed = available
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(available.len(), |newline| newline + 1);
+                    line.extend_from_slice(&available[..consumed]);
+                    (consumed, available[consumed - 1] == b'\n')
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) && deadline.remaining().is_some() =>
+                {
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(CallFailure::AnswerLost(GlassError::Backend(format!(
+                        "agent read: {error}"
+                    ))));
+                }
+            };
+            self.reader.consume(consumed);
+            if complete {
+                let line = String::from_utf8(line).map_err(|error| {
+                    CallFailure::AnswerLost(GlassError::Backend(format!(
+                        "agent read: invalid UTF-8: {error}"
+                    )))
+                })?;
+                return Ok(line.trim_end().to_string());
+            }
+        }
     }
 
     /// Run one request under `deadline`. The outer error is a pre-dispatch setup failure; the
@@ -369,39 +413,30 @@ impl Conn {
             outcome = Self::deadline_outcome(outcome, op);
         }
 
-        match self.restore_timeouts() {
+        let outcome = match self.restore_timeouts() {
             Ok(()) => {
                 if deadline.has_passed() {
                     outcome = Self::deadline_outcome(outcome, op);
                 }
-                Ok(outcome)
+                outcome
             }
             Err(error) => {
                 self.poison();
-                Ok(Err(match outcome {
+                Err(match outcome {
                     Ok(_) => CallFailure::Refused(error),
                     Err(failure) => failure.with_error(error),
-                }))
+                })
             }
-        }
+        };
+        Ok(self.retire_answer_lost(outcome))
     }
 
     /// Send one request object (an `id` is injected) and return the response `Value`.
     /// A failure is classified by how far the request got — see [`CallFailure`].
     #[cfg(test)]
-    pub(crate) fn call(&mut self, mut req: Value) -> std::result::Result<Value, CallFailure> {
-        self.ensure_usable().map_err(CallFailure::NotSent)?;
-        let id = self.next_id;
-        self.next_id += 1;
-        req["id"] = json!(id);
-        let mut line = serde_json::to_string(&req).expect("serialize request");
-        line.push('\n');
-        self.writer
-            .write_all(line.as_bytes())
-            .and_then(|_| self.writer.flush())
-            .map_err(|e| CallFailure::NotSent(GlassError::Backend(format!("agent write: {e}"))))?;
-        let resp_line = self.read_line().map_err(CallFailure::AnswerLost)?;
-        Self::parse_response(id, &resp_line)
+    pub(crate) fn call(&mut self, req: Value) -> std::result::Result<Value, CallFailure> {
+        self.call_within(req, Deadline::UNBOUNDED, "agent request")
+            .map_err(CallFailure::NotSent)?
     }
 
     fn call_by(
@@ -425,9 +460,7 @@ impl Conn {
             CallFailure::AnswerLost(GlassError::Backend(format!("agent flush: {e}")))
         })?;
 
-        let wait = Self::phase_wait(deadline, op, true)?;
-        self.read_within(wait).map_err(CallFailure::AnswerLost)?;
-        let resp_line = self.read_line().map_err(CallFailure::AnswerLost)?;
+        let resp_line = self.read_line_by(deadline, op)?;
         Self::parse_response(id, &resp_line)
     }
 
@@ -547,17 +580,56 @@ mod tests {
         port
     }
 
+    /// Send a syntactically valid reply in chunks whose individual gaps fit the original socket
+    /// timeout, but whose total duration exceeds the caller's absolute deadline.
+    fn trickled_reply(chunk_gap: Duration) -> u16 {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept connection");
+            let mut writer = stream.try_clone().expect("clone socket");
+            writeln!(writer, "{HELLO}").expect("write hello");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let request: Value = serde_json::from_str(&line).expect("request json");
+            let chunks = [
+                format!(r#"{{"id":{},"#, request["id"]),
+                "\"ok\":".to_string(),
+                "true".to_string(),
+                "}\n".to_string(),
+            ];
+            for (index, chunk) in chunks.iter().enumerate() {
+                if index != 0 {
+                    std::thread::sleep(chunk_gap);
+                }
+                if writer.write_all(chunk.as_bytes()).is_err() || writer.flush().is_err() {
+                    return;
+                }
+            }
+        });
+        port
+    }
+
     #[test]
     fn a_bounded_read_gives_up_at_the_bound_and_not_at_the_standing_timeout() {
         // A caller that named a deadline gets it. Without this the wait is the 30s standing
         // timeout, which is the single-threaded MCP loop blocked for half a minute on a
         // companion that has already stopped talking.
         let mut conn = Conn::open(silent_after_hello()).expect("the hello arrives");
-        conn.read_within(Some(Duration::from_millis(200)))
-            .expect("install the bounded read timeout");
-
         let started = Instant::now();
-        let Err(failure) = conn.call(json!({"op": "ping"})) else {
+        let outcome = conn
+            .call_within(
+                json!({"op": "ping"}),
+                Deadline::from_millis(200),
+                "agent request",
+            )
+            .expect("install the bounded socket timeouts");
+        let Err(failure) = outcome else {
             panic!("a companion that answers nothing cannot have answered");
         };
         assert!(
@@ -606,6 +678,40 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(540),
             "write and read each received the full relative wait: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn trickled_response_chunks_share_one_absolute_read_deadline() {
+        let mut conn =
+            Conn::open(trickled_reply(Duration::from_millis(120))).expect("the hello arrives");
+        let started = Instant::now();
+
+        let outcome = conn
+            .call_within(
+                json!({"op": "ping"}),
+                Deadline::from_millis(200),
+                "agent request",
+            )
+            .expect("socket timeout setup succeeds");
+
+        let error = outcome
+            .expect_err("the trickled reply exceeds the one caller deadline")
+            .into_error();
+        assert_eq!(
+            error.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "each response chunk reused the original socket timeout: {:?}",
             started.elapsed()
         );
     }

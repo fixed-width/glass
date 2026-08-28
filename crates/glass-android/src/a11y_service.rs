@@ -3117,6 +3117,72 @@ mod tests {
         fake_service_ex(trees, vec![on_action], vec![TreePackage::Echo])
     }
 
+    /// Conn1 starts answering its click, then completes that stale line after the caller has left.
+    /// Conn2 serves a tree re-arm before accepting the next distinct click.
+    fn fake_service_with_late_partial_action_answer(
+        tree: Value,
+    ) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+        let tree = with_refs(&tree);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let ops: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&ops);
+        let join = std::thread::spawn(move || {
+            for conn in 1..=2 {
+                let (sock, _) = listener.accept().expect("accept connection");
+                let mut writer = sock.try_clone().expect("clone connection");
+                let mut reader = std::io::BufReader::new(sock);
+                writeln!(writer, r#"{{"hello":{{"proto":1}}}}"#).expect("write hello");
+                let mut tree_confirmed = false;
+                loop {
+                    let mut line = String::new();
+                    if !matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+                        break;
+                    }
+                    let req: Value = serde_json::from_str(&line).expect("request json");
+                    let id = req["id"].clone();
+                    match req["op"].as_str().unwrap_or_default() {
+                        "tree" => {
+                            log.lock().unwrap().push(format!("conn{conn}:tree"));
+                            tree_confirmed = true;
+                            writeln!(
+                                writer,
+                                "{}",
+                                json!({
+                                    "id": id,
+                                    "ok": true,
+                                    "tree": tree,
+                                    "package": req["package"],
+                                })
+                            )
+                            .expect("answer tree");
+                        }
+                        "action" if tree_confirmed => {
+                            log.lock().unwrap().push(format!(
+                                "conn{conn}:{} ref={}",
+                                req["action"].as_str().unwrap_or_default(),
+                                req["ref"]
+                            ));
+                            if conn == 1 {
+                                write!(writer, r#"{{"id":{id},"#)
+                                    .expect("write partial conn1 answer");
+                                writer.flush().expect("flush partial conn1 answer");
+                                std::thread::sleep(std::time::Duration::from_millis(180));
+                                let _ = writeln!(writer, r#""ok":true}}"#);
+                                break;
+                            }
+                            writeln!(writer, "{}", json!({"id": id, "ok": true}))
+                                .expect("answer conn2 action");
+                            break;
+                        }
+                        _ => panic!("action arrived before conn{conn} tree re-arm: {req}"),
+                    }
+                }
+            }
+        });
+        (port, ops, join)
+    }
+
     /// [`fake_service`], plus two knobs, each varying by its own count (not each other's):
     /// - `on_action` — indexed **by connection** (index 0 = the first connection, clamped to
     ///   the last entry): a later connection's action can succeed after an earlier one failed,
@@ -3303,7 +3369,11 @@ mod tests {
         );
         assert_eq!(error.bound_dispatch(), Some(dispatch), "{error}");
         assert!(!error.invoke_fallback_eligible(), "{error}");
-        assert!(!error.set_value_failed_after_writing(), "{error}");
+        assert_eq!(
+            error.set_value_failed_after_writing(),
+            dispatch == glass_core::BoundDispatch::MayHaveDispatched,
+            "{error}"
+        );
     }
 
     #[test]
@@ -3346,6 +3416,34 @@ mod tests {
                 "{fault:?}: conn1 mutation replayed or conn2 was not rearmed first"
             );
         }
+    }
+
+    #[test]
+    fn answer_lost_reconnects_rearms_and_cannot_desync_the_next_distinct_click() {
+        let (port, ops, join) = fake_service_with_late_partial_action_answer(compose_like());
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        client.tree("com.example.app").expect("arm conn1");
+
+        let first = client
+            .click(1, "com.example.app", Deadline::from_millis(100))
+            .expect_err("conn1 completes its answer after the caller deadline");
+        assert!(matches!(first, CallFailure::AnswerLost(_)));
+        client
+            .click(2, "com.example.app", Deadline::from_millis(1_000))
+            .map_err(CallFailure::into_error)
+            .expect("the distinct click reconnects, rearms, then dispatches on conn2");
+
+        join.join().expect("fake service");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:click ref=1".to_string(),
+                "conn2:tree".to_string(),
+                "conn2:click ref=2".to_string(),
+            ],
+            "conn1's click was replayed or conn2 did not rearm before the distinct click"
+        );
     }
 
     #[test]
