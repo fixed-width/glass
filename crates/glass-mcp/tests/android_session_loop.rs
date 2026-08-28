@@ -20,6 +20,8 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{Peer, RoleClient, ServiceExt};
 use serde_json::{Value, json};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Ceiling on the wait for the fixture's counter to reflect the click — the poll returns as soon
 /// as it changes.
@@ -64,27 +66,63 @@ fn session_glass(device: &Companions) -> Glass {
     )
 }
 
+/// An HTTP MCP client and the server task that owns its session. The outer test always awaits the
+/// server's graceful shutdown, even if the spawned proof task panics.
+struct McpHarness {
+    client: RunningService<RoleClient, ()>,
+    cancel: CancellationToken,
+    server: JoinHandle<anyhow::Result<()>>,
+}
+
+impl McpHarness {
+    fn peer(&self) -> Peer<RoleClient> {
+        self.client.peer().clone()
+    }
+
+    async fn shutdown(self) {
+        self.client.cancel().await.ok();
+        self.cancel.cancel();
+        let result = self.server.await.expect("MCP server task must not panic");
+        result.expect("MCP server graceful shutdown must succeed");
+    }
+}
+
 /// Boot a token-protected Streamable HTTP MCP session for a caller-provided Android session.
-async fn boot_mcp(glass: Glass) -> RunningService<RoleClient, ()> {
+async fn boot_mcp(glass: Glass) -> McpHarness {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind an ephemeral loopback port");
     let addr = listener.local_addr().expect("read loopback address");
     let report = glass_mcp::audit::report_from_config(None, |_| None);
-    tokio::spawn(async move {
+    let cancel = CancellationToken::new();
+    let shutdown = cancel.clone();
+    let server = tokio::spawn(async move {
         let cfg = ServeConfig {
             addr,
             token: Some("android-loop".into()),
         };
-        let _ = glass_mcp::serve::run_on(listener, cfg, glass, report).await;
+        glass_mcp::serve::run_on_until(listener, cfg, glass, report, async move {
+            shutdown.cancelled().await;
+        })
+        .await
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let mut cfg = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/"));
     cfg = cfg.auth_header("android-loop".to_string());
-    ().serve(StreamableHttpClientTransport::from_config(cfg))
-        .await
-        .expect("initialize Android MCP client")
+    let client = match ().serve(StreamableHttpClientTransport::from_config(cfg)).await {
+        Ok(client) => client,
+        Err(error) => {
+            cancel.cancel();
+            let _ = server.await;
+            panic!("initialize Android MCP client: {error}");
+        }
+    };
+    McpHarness {
+        client,
+        cancel,
+        server,
+    }
 }
 
 /// Parse only a complete trusted success envelope for this tool. Untrusted app-derived sibling
@@ -126,19 +164,77 @@ async fn call(client: &Peer<RoleClient>, tool: &str, args: Value) -> (Value, Str
     (result, all_text)
 }
 
-fn id_from_outline(outline: &str, marker: &str) -> u32 {
-    let line = outline
+#[derive(Debug)]
+struct OutlineNode<'a> {
+    id: u32,
+    indent: usize,
+    shape: &'a str,
+}
+
+fn outline_nodes(outline: &str) -> Vec<OutlineNode<'_>> {
+    outline
         .lines()
-        .find(|line| line.contains(marker))
-        .unwrap_or_else(|| panic!("missing {marker:?} in outline:\n{outline}"));
-    line.trim_start()
-        .strip_prefix('#')
-        .expect("outline node ID prefix")
-        .split_whitespace()
-        .next()
-        .expect("outline node ID")
-        .parse()
-        .expect("numeric outline node ID")
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let id_and_shape = trimmed.strip_prefix('#')?;
+            let (id, shape) = id_and_shape.split_once(char::is_whitespace)?;
+            Some(OutlineNode {
+                id: id.parse().ok()?,
+                indent: line.len() - trimmed.len(),
+                shape: shape.trim_start(),
+            })
+        })
+        .collect()
+}
+
+fn unique_outline_id(
+    outline: &str,
+    label: &str,
+    candidates: impl Iterator<Item = u32>,
+) -> Result<u32, String> {
+    let candidates = candidates.collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [id] => Ok(*id),
+        _ => Err(format!(
+            "expected exactly one {label} candidate, found {}:\n{outline}",
+            candidates.len()
+        )),
+    }
+}
+
+fn name_id_from_outline_result(outline: &str) -> Result<u32, String> {
+    let nodes = outline_nodes(outline);
+    unique_outline_id(
+        outline,
+        "TextField \"Name\"",
+        nodes
+            .iter()
+            .filter(|node| node.shape.starts_with("TextField \"Name\" value="))
+            .map(|node| node.id),
+    )
+}
+
+fn name_id_from_outline(outline: &str) -> u32 {
+    name_id_from_outline_result(outline).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn save_button_id_from_outline_result(outline: &str) -> Result<u32, String> {
+    let nodes = outline_nodes(outline);
+    unique_outline_id(
+        outline,
+        "Save Button",
+        nodes.iter().enumerate().filter_map(|(index, node)| {
+            let previous = index.checked_sub(1).and_then(|index| nodes.get(index))?;
+            (node.shape.starts_with("Button (")
+                && previous.indent == node.indent
+                && previous.shape.starts_with("Label \"Save\" ("))
+            .then_some(node.id)
+        }),
+    )
+}
+
+fn save_button_id_from_outline(outline: &str) -> u32 {
+    save_button_id_from_outline_result(outline).unwrap_or_else(|error| panic!("{error}"))
 }
 
 /// The registries whose `ensure` switches something on for the whole device, put back when this
@@ -245,8 +341,15 @@ async fn glass_do_android_ime_form_is_confirmed_end_to_end() {
         a11y: A11yServiceRegistry::new(),
         emulators: EmulatorRegistry::new(),
     };
-    let client = boot_mcp(session_glass(&device)).await;
+    let mcp = boot_mcp(session_glass(&device)).await;
+    let peer = mcp.peer();
+    let proof = tokio::spawn(async move { ime_form_proof(peer, fixture).await });
+    let proof = proof.await;
+    mcp.shutdown().await;
+    proof.expect("Android semantic IME proof panicked");
+}
 
+async fn ime_form_proof(client: Peer<RoleClient>, fixture: String) {
     call(
         &client,
         "glass_start",
@@ -258,8 +361,8 @@ async fn glass_do_android_ime_form_is_confirmed_end_to_end() {
     )
     .await;
     let (_metadata, outline) = call(&client, "glass_a11y_snapshot", json!({})).await;
-    let name_id = id_from_outline(&outline, "\"Name\"");
-    let save_id = id_from_outline(&outline, "Button");
+    let name_id = name_id_from_outline(&outline);
+    let save_id = save_button_id_from_outline(&outline);
 
     let (result, all_text) = call(
         &client,
@@ -281,21 +384,59 @@ async fn glass_do_android_ime_form_is_confirmed_end_to_end() {
     assert!(result["elapsed_ms"].is_number(), "{all_text}");
     let steps = result["steps"].as_array().expect("four batch steps");
     assert_eq!(steps.len(), 4, "{all_text}");
-    for (step, action) in steps.iter().zip([
-        "set_value",
-        "wait_for_element",
-        "click_element",
-        "wait_for_element",
-    ]) {
+    for (index, (step, action)) in steps
+        .iter()
+        .zip([
+            "set_value",
+            "wait_for_element",
+            "click_element",
+            "wait_for_element",
+        ])
+        .enumerate()
+    {
+        assert_eq!(step["index"], json!(index), "{all_text}");
         assert_eq!(step["status"], json!("completed"), "{all_text}");
         assert_eq!(step["action"], json!(action), "{all_text}");
     }
-    if let Some(method) = steps[2]["result"]["method"].as_str() {
-        assert_eq!(method, "native-action", "{all_text}");
-    }
+    assert_eq!(
+        steps[2]["result"]["method"],
+        json!("native-action"),
+        "{all_text}"
+    );
 
     call(&client, "glass_stop", json!({})).await;
-    client.cancel().await.ok();
+}
+
+#[test]
+fn outline_selectors_require_the_observed_unique_control_shapes() {
+    let outline = r#"
+  #3 TextField "Name" value="" (63,338 735x147) [focusable,enabled,visible,editable]
+    #5 Label "Save" (126,522 80x53) [enabled,visible]
+    #6 Button (63,496 206x105) [enabled,visible]
+"#;
+    assert_eq!(name_id_from_outline(outline), 3);
+    assert_eq!(save_button_id_from_outline(outline), 6);
+}
+
+#[test]
+fn outline_selectors_reject_ambiguous_controls() {
+    let outline = r#"
+  #3 TextField "Name" value="" (63,338 735x147) [focusable,enabled,visible,editable]
+  #4 TextField "Name" value="" (63,338 735x147) [focusable,enabled,visible,editable]
+"#;
+    let error = name_id_from_outline_result(outline).unwrap_err();
+    assert!(error.contains("expected exactly one TextField \"Name\""));
+    assert!(error.contains(outline.trim()));
+
+    let outline = r#"
+    #5 Label "Save" (126,522 80x53) [enabled,visible]
+    #6 Button (63,496 206x105) [enabled,visible]
+    #7 Label "Save" (126,622 80x53) [enabled,visible]
+    #8 Button (63,596 206x105) [enabled,visible]
+"#;
+    let error = save_button_id_from_outline_result(outline).unwrap_err();
+    assert!(error.contains("expected exactly one Save Button"));
+    assert!(error.contains(outline.trim()));
 }
 
 /// The fixture's click counter, as the a11y tree reports it.

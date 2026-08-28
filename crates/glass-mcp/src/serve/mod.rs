@@ -5,6 +5,7 @@ pub mod config;
 pub mod session_gate;
 pub mod token;
 
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -149,6 +150,26 @@ pub async fn run_on(
     glass: glass_core::Glass,
     report: crate::audit::AuditReport,
 ) -> anyhow::Result<()> {
+    run_on_until(
+        listener,
+        cfg,
+        glass,
+        report,
+        crate::shutdown::shutdown_signal(),
+    )
+    .await
+}
+
+/// Serve on an already-bound listener until `shutdown` resolves, then tear down the active
+/// session through the same bounded path as a process signal. `run_on` supplies the process
+/// signal; embedding callers can supply an owned cancellation future and await this future.
+pub async fn run_on_until(
+    listener: tokio::net::TcpListener,
+    cfg: ServeConfig,
+    glass: glass_core::Glass,
+    report: crate::audit::AuditReport,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let server = GlassServer::new(glass, report);
     let sessions = server.sessions();
     let cancel = CancellationToken::new();
@@ -156,7 +177,7 @@ pub async fn run_on(
 
     let r = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            crate::shutdown::shutdown_signal().await;
+            shutdown.await;
             cancel.cancel();
         })
         .await
@@ -273,6 +294,30 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "/healthz must not be reachable on a non-loopback bind"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_on_until_cancellation_runs_the_graceful_shutdown_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cancel = CancellationToken::new();
+        let shutdown = cancel.clone();
+        let task = tokio::spawn(run_on_until(
+            listener,
+            cfg("127.0.0.1:0", Some("token")),
+            crate::boot(None),
+            crate::audit::report_from_config(None, |_| None),
+            async move { shutdown.cancelled().await },
+        ));
+
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("cancellation must stop the server")
+            .expect("server task must not panic");
+        assert!(
+            result.is_ok(),
+            "graceful server shutdown failed: {result:?}"
         );
     }
 }
