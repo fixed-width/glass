@@ -60,10 +60,22 @@ impl CallFailure {
 /// single-threaded MCP loop forever.
 pub(crate) const STANDING_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TimeoutFault {
+    ReadInstall,
+    WriteInstall,
+    ReadRestore,
+    WriteRestore,
+}
+
 pub(crate) struct Conn {
     pub(crate) writer: TcpStream,
     pub(crate) reader: BufReader<TcpStream>,
     pub(crate) next_id: i64,
+    poisoned: bool,
+    #[cfg(test)]
+    timeout_faults: std::collections::VecDeque<TimeoutFault>,
 }
 
 impl Conn {
@@ -98,18 +110,21 @@ impl Conn {
         }
         stream
             .set_write_timeout(Some(setup_wait.unwrap_or(STANDING_TIMEOUT)))
-            .ok();
+            .map_err(|e| GlassError::Backend(format!("agent write timeout install: {e}")))?;
         let read_half = stream
             .try_clone()
             .map_err(|e| GlassError::Backend(format!("agent clone: {e}")))?;
         read_half
             .set_read_timeout(Some(setup_wait.unwrap_or(STANDING_TIMEOUT)))
-            .ok();
+            .map_err(|e| GlassError::Backend(format!("agent read timeout install: {e}")))?;
         let reader = BufReader::new(read_half);
         let mut c = Conn {
             writer: stream,
             reader,
             next_id: 1,
+            poisoned: false,
+            #[cfg(test)]
+            timeout_faults: Default::default(),
         };
         let hello = c.read_line().map_err(|e| {
             if deadline.has_passed() {
@@ -132,9 +147,22 @@ impl Conn {
                 "agent protocol mismatch: got {proto:?}, want {PROTO}"
             )));
         }
-        c.read_within(None);
-        c.write_within(None);
+        c.restore_timeouts()?;
         Ok(c)
+    }
+
+    pub(crate) fn ensure_usable(&self) -> glass_core::Result<()> {
+        if self.poisoned {
+            Err(GlassError::Backend(
+                "agent connection is unusable after socket timeout restoration failed".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     pub(crate) fn read_line(&mut self) -> glass_core::Result<String> {
@@ -157,22 +185,133 @@ impl Conn {
     ///
     /// Do not set this on `writer`: a read timeout does not carry across `try_clone` on Windows,
     /// where a bound set there left the read on the 30s standing one instead.
-    pub(crate) fn read_within(&mut self, wait: Option<Duration>) {
+    pub(crate) fn read_within(&mut self, wait: Option<Duration>) -> glass_core::Result<()> {
+        self.read_within_for(wait, false)
+    }
+
+    fn read_within_for(
+        &mut self,
+        wait: Option<Duration>,
+        _restoring: bool,
+    ) -> glass_core::Result<()> {
+        self.ensure_usable()?;
+        #[cfg(test)]
+        self.maybe_timeout_fault(if _restoring {
+            TimeoutFault::ReadRestore
+        } else {
+            TimeoutFault::ReadInstall
+        })?;
         self.reader
             .get_ref()
             .set_read_timeout(Some(wait.unwrap_or(STANDING_TIMEOUT)))
-            .ok();
+            .map_err(|e| GlassError::Backend(format!("agent read timeout update: {e}")))
     }
 
-    pub(crate) fn write_within(&mut self, wait: Option<Duration>) {
+    pub(crate) fn write_within(&mut self, wait: Option<Duration>) -> glass_core::Result<()> {
+        self.write_within_for(wait, false)
+    }
+
+    fn write_within_for(
+        &mut self,
+        wait: Option<Duration>,
+        _restoring: bool,
+    ) -> glass_core::Result<()> {
+        self.ensure_usable()?;
+        #[cfg(test)]
+        self.maybe_timeout_fault(if _restoring {
+            TimeoutFault::WriteRestore
+        } else {
+            TimeoutFault::WriteInstall
+        })?;
         self.writer
             .set_write_timeout(Some(wait.unwrap_or(STANDING_TIMEOUT)))
-            .ok();
+            .map_err(|e| GlassError::Backend(format!("agent write timeout update: {e}")))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_timeout_fault(&mut self, fault: TimeoutFault) {
+        self.timeout_faults.push_back(fault);
+    }
+
+    #[cfg(test)]
+    fn maybe_timeout_fault(&mut self, fault: TimeoutFault) -> glass_core::Result<()> {
+        if self.timeout_faults.front() == Some(&fault) {
+            self.timeout_faults.pop_front();
+            Err(GlassError::Backend(format!(
+                "injected {fault:?} socket timeout failure"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn restore_timeouts(&mut self) -> glass_core::Result<()> {
+        let read = self.read_within_for(None, true);
+        let write = self.write_within_for(None, true);
+        match (read, write) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+            (Err(read), Err(write)) => Err(GlassError::Backend(format!(
+                "socket timeout restoration failed twice: {read}; {write}"
+            ))),
+        }
+    }
+
+    /// Run one request under `deadline`. The outer error is a pre-dispatch setup failure; the
+    /// inner result retains how far a dispatched request got.
+    pub(crate) fn call_within(
+        &mut self,
+        req: Value,
+        deadline: Deadline,
+        op: &str,
+    ) -> glass_core::Result<std::result::Result<Value, CallFailure>> {
+        self.ensure_usable()?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(op));
+        }
+
+        let wait = deadline.remaining();
+        let install = self
+            .read_within(wait)
+            .and_then(|()| self.write_within(wait));
+        if let Err(install_error) = install {
+            if let Err(restore_error) = self.restore_timeouts() {
+                self.poison();
+                return Err(restore_error);
+            }
+            return Err(install_error);
+        }
+
+        let outcome = if deadline.has_passed() {
+            Err(CallFailure::NotSent(GlassError::deadline_not_started(op)))
+        } else {
+            let outcome = self.call(req);
+            if deadline.has_passed() {
+                Err(match outcome {
+                    Ok(_) => CallFailure::Refused(GlassError::caller_deadline_elapsed(op)),
+                    Err(failure) => failure.with_error(GlassError::caller_deadline_elapsed(op)),
+                })
+            } else {
+                outcome
+            }
+        };
+
+        match self.restore_timeouts() {
+            Ok(()) => Ok(outcome),
+            Err(error) => {
+                self.poison();
+                Ok(Err(match outcome {
+                    Ok(_) => CallFailure::Refused(error),
+                    Err(failure) => failure.with_error(error),
+                }))
+            }
+        }
     }
 
     /// Send one request object (an `id` is injected) and return the response `Value`.
     /// A failure is classified by how far the request got — see [`CallFailure`].
     pub(crate) fn call(&mut self, mut req: Value) -> std::result::Result<Value, CallFailure> {
+        self.ensure_usable().map_err(CallFailure::NotSent)?;
         let id = self.next_id;
         self.next_id += 1;
         req["id"] = json!(id);
@@ -280,7 +419,8 @@ mod tests {
         // timeout, which is the single-threaded MCP loop blocked for half a minute on a
         // companion that has already stopped talking.
         let mut conn = Conn::open(silent_after_hello()).expect("the hello arrives");
-        conn.read_within(Some(Duration::from_millis(200)));
+        conn.read_within(Some(Duration::from_millis(200)))
+            .expect("install the bounded read timeout");
 
         let started = Instant::now();
         let Err(failure) = conn.call(json!({"op": "ping"})) else {

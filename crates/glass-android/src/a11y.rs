@@ -407,7 +407,7 @@ impl AndroidA11y {
     /// for retries a [`snapshot_bound`] would not give it — immediately after typing, where the
     /// tree is expected to be unreadable for a moment and no deadline says how long to allow.
     fn snapshot_within(&mut self, ctx: &AxContext, bound: RetryBound) -> Result<AxTree> {
-        let adb = self.ensure_adb()?;
+        let adb = self.ensure_adb_within(ctx.deadline)?;
         let tree = snapshot_with_runner(&mut adb_runner(&adb), ctx, bound)?;
         self.warmed = true;
         Ok(tree)
@@ -434,9 +434,19 @@ impl AndroidA11y {
     }
 
     /// Bind the adb client to a device serial on first use (lazy).
+    #[cfg(test)]
     fn ensure_adb(&mut self) -> Result<Adb> {
+        self.ensure_adb_within(Deadline::UNBOUNDED)
+    }
+
+    fn ensure_adb_within(&mut self, deadline: Deadline) -> Result<Adb> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "Android accessibility target resolution",
+            ));
+        }
         if !self.resolved {
-            let listing = self.adb.run(["devices"])?;
+            let listing = self.adb.run_until(["devices"], deadline)?;
             let online: Vec<_> = parse_devices(&listing)
                 .into_iter()
                 .filter(|d| d.state == "device")
@@ -540,10 +550,29 @@ impl Accessibility for AndroidA11y {
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+        fn require_time(deadline: Deadline, dispatched: bool) -> Result<()> {
+            if !deadline.has_passed() {
+                return Ok(());
+            }
+            Err(if dispatched {
+                GlassError::caller_deadline_elapsed("Android accessibility set_value")
+            } else {
+                GlassError::deadline_not_started("Android accessibility set_value")
+            })
+        }
+
+        require_time(ctx.deadline, false)?;
         let window = ctx.window.clone();
-        let adb = self.ensure_adb()?;
+        let adb = self.ensure_adb_within(ctx.deadline)?;
         // Re-snapshot and number nodes to locate the target by its pre-order id.
-        let (cx, cy) = locate_for_write(&mut adb_runner(&adb), ctx, target)?;
+        let (cx, cy) = locate_for_write(&mut adb_runner(&adb), ctx, target).map_err(|e| {
+            if ctx.deadline.has_passed() {
+                GlassError::deadline_not_started("Android accessibility target resolution")
+            } else {
+                e
+            }
+        })?;
+        require_time(ctx.deadline, false)?;
         self.warmed = true;
         // Tap to focus, select-all, delete, type — reusing the P2 input builders.
         let tap = PointerEvent::Click {
@@ -553,8 +582,18 @@ impl Accessibility for AndroidA11y {
             count: 1,
             modifiers: vec![],
         };
+        let mut dispatched = false;
         for argv in pointer_commands(&window, &tap) {
-            adb.run(argv.iter().map(String::as_str))?;
+            require_time(ctx.deadline, dispatched)?;
+            adb.run_until(argv.iter().map(String::as_str), ctx.deadline)
+                .map_err(|e| {
+                    if ctx.deadline.has_passed() && dispatched {
+                        GlassError::caller_deadline_elapsed("Android accessibility set_value")
+                    } else {
+                        e
+                    }
+                })?;
+            dispatched = true;
         }
         for ev in [
             KeyEvent::Chord("ctrl+a".into()),
@@ -562,7 +601,16 @@ impl Accessibility for AndroidA11y {
             KeyEvent::Text(text.to_string()),
         ] {
             for argv in key_commands(&ev)? {
-                adb.run(argv.iter().map(String::as_str))?;
+                require_time(ctx.deadline, dispatched)?;
+                adb.run_until(argv.iter().map(String::as_str), ctx.deadline)
+                    .map_err(|e| {
+                        if ctx.deadline.has_passed() && dispatched {
+                            GlassError::caller_deadline_elapsed("Android accessibility set_value")
+                        } else {
+                            e
+                        }
+                    })?;
+                dispatched = true;
             }
         }
 
@@ -573,13 +621,25 @@ impl Accessibility for AndroidA11y {
         // and typed into — so it says so, because a caller that retries blindly types twice. Each
         // read retries a not-ready device even on a warmed reader: the IME and any suggestion strip
         // are still animating, which is exactly when a dump comes back not-ready.
-        let phase_ends = Instant::now() + Duration::from_millis(VERIFY_PHASE_BUDGET_MS);
+        let (phase_ends, phase_owner) = ctx
+            .deadline
+            .resolve(Instant::now() + Duration::from_millis(VERIFY_PHASE_BUDGET_MS));
         let mut last = None;
         for _ in 0..VERIFY_ATTEMPTS {
-            std::thread::sleep(Duration::from_millis(VERIFY_SETTLE_MS));
-            let mut after = self
-                .snapshot_within(ctx, VERIFY_BOUND)
-                .map_err(|e| read_back_failed(target, &e))?;
+            require_time(ctx.deadline, dispatched)?;
+            let requested = Duration::from_millis(VERIFY_SETTLE_MS)
+                .min(phase_ends.saturating_duration_since(Instant::now()));
+            std::thread::sleep(ctx.deadline.remaining().unwrap_or(requested).min(requested));
+            require_time(ctx.deadline, dispatched)?;
+            let mut after = self.snapshot_within(ctx, VERIFY_BOUND).map_err(|e| {
+                if ctx.deadline.has_passed() || e.bound_owner() == Some(Whose::Caller) {
+                    GlassError::caller_deadline_elapsed(
+                        "Android accessibility set_value verification",
+                    )
+                } else {
+                    read_back_failed(target, &e)
+                }
+            })?;
             after.assign_ids();
             match verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED) {
                 Ok(()) => return Ok(()),
@@ -589,6 +649,11 @@ impl Accessibility for AndroidA11y {
                 Err(e) => return Err(e),
             }
             if Instant::now() >= phase_ends {
+                if phase_owner == Whose::Caller {
+                    return Err(GlassError::caller_deadline_elapsed(
+                        "Android accessibility set_value verification",
+                    ));
+                }
                 break;
             }
         }
@@ -610,7 +675,7 @@ mod tests {
     use glass_core::accessibility::{
         AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree, WalkLimits,
     };
-    use glass_core::{BoundKind, GlassError, Result, WindowGeometry};
+    use glass_core::{BoundDispatch, BoundKind, GlassError, Result, Whose, WindowGeometry};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
@@ -1051,6 +1116,44 @@ mod tests {
             limits: WalkLimits::DEFAULT,
             deadline: Deadline::UNBOUNDED,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn semantic_caller_deadline_stops_before_uiautomator_target_resolution() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+        let mut ctx = write_ctx();
+        ctx.deadline = Deadline::from_millis(0);
+        let target = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: None,
+            value: None,
+        };
+
+        let error = reader
+            .set_value(&ctx, &target, "new")
+            .expect_err("a spent semantic deadline stops before target resolution");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::NotDispatched),
+            "{error}"
+        );
+        assert!(!error.invoke_fallback_eligible(), "{error}");
+        assert!(!error.set_value_failed_after_writing(), "{error}");
+        assert!(
+            fake.calls().is_empty(),
+            "a later device phase started after the caller deadline: {:?}",
+            fake.calls()
+        );
     }
 
     /// The retry the deadline exists to permit actually happens: a caller still waiting gets its

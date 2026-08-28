@@ -49,17 +49,12 @@ impl AgentClient {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("agent request"));
         }
-        let wait = deadline.remaining();
-        conn.read_within(wait);
-        conn.write_within(wait);
-        if deadline.has_passed() {
-            conn.read_within(None);
-            conn.write_within(None);
-            return Err(GlassError::deadline_not_started("agent request"));
+        if conn.ensure_usable().is_err() {
+            *conn = Conn::open_by(self.port, deadline)?;
         }
-        let first = conn.call(req.clone());
-        conn.read_within(None);
-        conn.write_within(None);
+        let first = conn
+            .call_within(req.clone(), deadline, "agent request")
+            .map_err(|e| CallFailure::NotSent(e).into_error())?;
         match first {
             Ok(v) => Ok(v),
             Err(f) if f.is_transport() => {
@@ -73,17 +68,9 @@ impl AgentClient {
                 if deadline.has_passed() {
                     return Err(GlassError::deadline_not_started("agent retry"));
                 }
-                let wait = deadline.remaining();
-                conn.read_within(wait);
-                conn.write_within(wait);
-                if deadline.has_passed() {
-                    conn.read_within(None);
-                    conn.write_within(None);
-                    return Err(GlassError::deadline_not_started("agent retry"));
-                }
-                let retried = conn.call(req);
-                conn.read_within(None);
-                conn.write_within(None);
+                let retried = conn
+                    .call_within(req, deadline, "agent retry")
+                    .map_err(|e| CallFailure::NotSent(e).into_error())?;
                 retried.map_err(CallFailure::into_error)
             }
             Err(f) => Err(f.into_error()),
@@ -455,6 +442,7 @@ fn wait_for_agent_until(port: u16, deadline: Instant) -> Result<AgentClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conn::TimeoutFault;
 
     /// The deadline-bearing half of the agent's teardown — without it a wedged device leaks an
     /// `adb forward` into a server that outlives glass (glass#422).
@@ -523,6 +511,157 @@ mod tests {
 
     const HELLO: &str = r#"{"hello":{"proto":1}}"#;
     const OK: &str = r#"{"ok":true}"#;
+
+    type CountedRequests = Arc<Mutex<Vec<(usize, Value)>>>;
+
+    fn counting_agent() -> (u16, CountedRequests, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let request_log = Arc::clone(&requests);
+        let connection_count = Arc::clone(&connections);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let connection = connection_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let log = Arc::clone(&request_log);
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().expect("clone socket");
+                    let mut reader = BufReader::new(stream);
+                    if writeln!(writer, "{HELLO}").is_err() {
+                        return;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        if !matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).expect("request json");
+                        let id = req["id"].clone();
+                        log.lock().expect("request log").push((connection, req));
+                        if writeln!(writer, "{}", json!({"id": id, "ok": true})).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, requests, connections)
+    }
+
+    #[test]
+    fn read_timeout_install_failure_aborts_before_dispatch() {
+        let (port, requests, _) = counting_agent();
+        let client = AgentClient::connect(port).expect("connect");
+        client
+            .conn
+            .lock()
+            .expect("lock")
+            .inject_timeout_fault(TimeoutFault::ReadInstall);
+
+        let result = client.key_by("enter", Deadline::from_millis(1_000));
+
+        assert!(
+            result.is_err(),
+            "timeout installation failure was discarded"
+        );
+        assert!(
+            requests.lock().expect("request log").is_empty(),
+            "the request was dispatched after timeout installation failed"
+        );
+    }
+
+    #[test]
+    fn write_timeout_install_failure_aborts_before_dispatch() {
+        let (port, requests, _) = counting_agent();
+        let client = AgentClient::connect(port).expect("connect");
+        client
+            .conn
+            .lock()
+            .expect("lock")
+            .inject_timeout_fault(TimeoutFault::WriteInstall);
+
+        let result = client.key_by("enter", Deadline::from_millis(1_000));
+
+        assert!(
+            result.is_err(),
+            "timeout installation failure was discarded"
+        );
+        assert!(
+            requests.lock().expect("request log").is_empty(),
+            "the request was dispatched after timeout installation failed"
+        );
+    }
+
+    #[test]
+    fn unbounded_timeout_install_failure_aborts_before_dispatch() {
+        let (port, requests, _) = counting_agent();
+        let client = AgentClient::connect(port).expect("connect");
+        client
+            .conn
+            .lock()
+            .expect("lock")
+            .inject_timeout_fault(TimeoutFault::ReadInstall);
+
+        let result = client.key("enter");
+
+        assert!(
+            result.is_err(),
+            "timeout installation failure was discarded"
+        );
+        assert!(
+            requests.lock().expect("request log").is_empty(),
+            "the unbounded request was dispatched after timeout installation failed"
+        );
+    }
+
+    #[test]
+    fn restoration_failure_poisoned_connection_reconnects_before_next_request() {
+        use std::sync::atomic::Ordering;
+
+        let (port, requests, connections) = counting_agent();
+        let client = AgentClient::connect(port).expect("connect");
+        client
+            .conn
+            .lock()
+            .expect("lock")
+            .inject_timeout_fault(TimeoutFault::ReadRestore);
+
+        let first = client.key_by("enter", Deadline::from_millis(1_000));
+        assert!(first.is_err(), "timeout restoration failure was discarded");
+        client.ping().expect("the next request reconnects");
+
+        let seen = requests.lock().expect("request log");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, 1);
+        assert_eq!(seen[1].0, 2, "the poisoned connection was reused");
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn restoration_failure_after_reply_is_not_retried_as_the_same_mutation() {
+        let (port, requests, _) = counting_agent();
+        let client = AgentClient::connect(port).expect("connect");
+        client
+            .conn
+            .lock()
+            .expect("lock")
+            .inject_timeout_fault(TimeoutFault::ReadRestore);
+
+        let result = client.key_by("enter", Deadline::from_millis(1_000));
+
+        assert!(result.is_err(), "timeout restoration failure was discarded");
+        let mutation_request_count = requests
+            .lock()
+            .expect("request log")
+            .iter()
+            .filter(|(_, request)| request["op"] == "key")
+            .count();
+        assert_eq!(mutation_request_count, 1);
+    }
 
     #[test]
     fn connect_checks_proto() {
