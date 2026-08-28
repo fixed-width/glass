@@ -434,7 +434,7 @@ impl AndroidA11y {
     }
 
     /// Bind the adb client to a device serial on first use (lazy).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn ensure_adb(&mut self) -> Result<Adb> {
         self.ensure_adb_within(Deadline::UNBOUNDED)
     }
@@ -675,7 +675,9 @@ mod tests {
     use glass_core::accessibility::{
         AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree, WalkLimits,
     };
-    use glass_core::{BoundDispatch, BoundKind, GlassError, Result, Whose, WindowGeometry};
+    #[cfg(unix)]
+    use glass_core::{BoundDispatch, Whose};
+    use glass_core::{BoundKind, GlassError, Result, WindowGeometry};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
