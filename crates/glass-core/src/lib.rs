@@ -34,21 +34,21 @@ pub mod pixels;
 pub use pixels::{SourceOrder, to_opaque_rgba, to_opaque_rgba_in_place};
 
 pub mod drag;
-pub use drag::{DragGesture, DragSink, run_drag};
+pub use drag::{DragGesture, DragSink, run_drag, run_drag_by};
 
 pub mod pinch;
 pub use pinch::{NotAPinch, Pinch};
 
 pub mod chord;
-pub use chord::{CHORD_DWELL, ChordSink, run_chord};
+pub use chord::{CHORD_DWELL, ChordSink, run_chord, run_chord_by};
 
 pub mod coords;
 
 pub mod scroll;
-pub use scroll::{SCROLL_DWELL, ScrollSink, run_scroll};
+pub use scroll::{SCROLL_DWELL, ScrollSink, run_scroll, run_scroll_by};
 
 pub mod typing;
-pub use typing::{TYPE_DWELL, TypeSink, run_type};
+pub use typing::{TYPE_DWELL, TypeSink, run_type, run_type_by};
 
 pub mod keys;
 pub use keys::Modifier;

@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use crate::{Deadline, GlassError};
+
 /// Dwell between a modified scroll's phases (modifier-down → wheel → modifier-up). A modifier+wheel
 /// injected as one burst is drained by a frame-based GUI (egui/winit) into a SINGLE frame, so the
 /// frame-aggregate modifier reads as already-released and a `ctrl/shift + wheel` gesture (zoom,
@@ -23,28 +25,91 @@ pub trait ScrollSink {
     fn wheel(&mut self) -> crate::Result<()>;
 }
 
-/// Drive a scroll against a backend `sink`. A *plain* scroll (`has_modifiers == false`) emits the
-/// wheel directly — the hot, latency-sensitive path takes no dwell. A *modified* scroll holds the
-/// modifier → **dwell** so the GUI registers it → emit the wheel (modifier still held) → **dwell** →
-/// release: the same frame-aware sequencing as [`crate::run_chord`], so `i.modifiers` reads held in
-/// the wheel's frame. Releasing the modifier strictly after the wheel's frame is what lets a handler
-/// gating on `i.modifiers.ctrl` see it.
+/// Drive a scroll without a caller deadline.
 pub fn run_scroll<S: ScrollSink>(sink: &mut S, has_modifiers: bool) -> crate::Result<()> {
-    if !has_modifiers {
-        return sink.wheel();
+    run_scroll_by(sink, has_modifiers, Deadline::UNBOUNDED)
+}
+
+fn require_time(deadline: Deadline, started: bool) -> crate::Result<()> {
+    if !deadline.has_passed() {
+        return Ok(());
     }
-    sink.modifiers(true)?;
-    std::thread::sleep(SCROLL_DWELL);
-    sink.wheel()?;
-    std::thread::sleep(SCROLL_DWELL);
+    if started {
+        Err(GlassError::caller_deadline_elapsed("scroll"))
+    } else {
+        Err(GlassError::deadline_not_started("scroll"))
+    }
+}
+
+fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
+    require_time(deadline, true)?;
+    let sleep_for = deadline.remaining().unwrap_or(requested).min(requested);
+    std::thread::sleep(sleep_for);
+    require_time(deadline, true)
+}
+
+fn cleanup_modifiers<S: ScrollSink>(sink: &mut S) {
+    // A release is mandatory safety cleanup once modifier-down may have landed,
+    // even when the deadline has elapsed or the wheel dispatch failed.
+    let _ = sink.modifiers(false);
+}
+
+/// Drive a scroll against a backend `sink`, stopping at `deadline`.
+///
+/// A plain scroll emits only the wheel. A modified scroll keeps the legacy
+/// modifier-down → dwell → wheel → dwell → modifier-up sequence while bounding
+/// both dwells and checking the deadline around every normal event dispatch.
+pub fn run_scroll_by<S: ScrollSink>(
+    sink: &mut S,
+    has_modifiers: bool,
+    deadline: Deadline,
+) -> crate::Result<()> {
+    require_time(deadline, false)?;
+    if !has_modifiers {
+        sink.wheel()?;
+        return require_time(deadline, true);
+    }
+
+    let modifiers_down = true;
+    if let Err(error) = sink.modifiers(true) {
+        cleanup_modifiers(sink);
+        return Err(error);
+    }
+    if let Err(error) = require_time(deadline, true) {
+        cleanup_modifiers(sink);
+        return Err(error);
+    }
+
+    if let Err(error) = sleep_by(deadline, SCROLL_DWELL) {
+        cleanup_modifiers(sink);
+        return Err(error);
+    }
+    if let Err(error) = sink.wheel() {
+        cleanup_modifiers(sink);
+        return Err(error);
+    }
+    if let Err(error) = require_time(deadline, true) {
+        cleanup_modifiers(sink);
+        return Err(error);
+    }
+
+    if let Err(error) = sleep_by(deadline, SCROLL_DWELL) {
+        cleanup_modifiers(sink);
+        return Err(error);
+    }
+    if let Err(error) = require_time(deadline, modifiers_down) {
+        cleanup_modifiers(sink);
+        return Err(error);
+    }
     sink.modifiers(false)?;
-    Ok(())
+    require_time(deadline, true)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SCROLL_DWELL, ScrollSink, run_scroll};
-    use crate::Result;
+    use super::{SCROLL_DWELL, ScrollSink, run_scroll, run_scroll_by};
+    use crate::{BoundDispatch, BoundKind, Deadline, GlassError, Result};
+    use std::time::{Duration, Instant};
 
     #[derive(Debug, PartialEq)]
     enum Call {
@@ -100,5 +165,100 @@ mod tests {
             "a modified scroll must sleep both phase dwells (only {:?} elapsed)",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn run_scroll_by_spent_deadline_emits_no_events() {
+        let mut sink = RecordingSink::default();
+        let deadline = Deadline::at(Instant::now() - Duration::from_millis(1));
+
+        let error = run_scroll_by(&mut sink, true, deadline).unwrap_err();
+
+        assert!(sink.calls.is_empty());
+        assert_eq!(error.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn run_scroll_by_deadline_expiring_mid_sequence_stops_before_the_next_event() {
+        use Call::*;
+        let mut full_sink = RecordingSink::default();
+        run_scroll(&mut full_sink, true).unwrap();
+        let full_sequence = full_sink.calls;
+
+        let mut sink = RecordingSink::default();
+        let started = Instant::now();
+        let error = run_scroll_by(&mut sink, true, Deadline::from_millis(10)).unwrap_err();
+
+        assert!(sink.calls.len() < full_sequence.len());
+        assert_eq!(sink.calls, vec![Mods(true), Mods(false)]);
+        assert!(
+            started.elapsed() < SCROLL_DWELL,
+            "the modifier dwell must be capped by the deadline"
+        );
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn run_scroll_by_unbounded_wrapper_preserves_the_legacy_sequence() {
+        use Call::*;
+        let mut sink = RecordingSink::default();
+
+        run_scroll(&mut sink, true).unwrap();
+
+        assert_eq!(sink.calls, vec![Mods(true), Wheel, Mods(false)]);
+    }
+
+    #[test]
+    fn run_scroll_by_expiry_after_a_sink_event_is_may_have_dispatched() {
+        struct SlowWheelSink(RecordingSink);
+
+        impl ScrollSink for SlowWheelSink {
+            fn modifiers(&mut self, down: bool) -> Result<()> {
+                self.0.modifiers(down)
+            }
+
+            fn wheel(&mut self) -> Result<()> {
+                self.0.wheel()?;
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(())
+            }
+        }
+
+        let mut sink = SlowWheelSink(RecordingSink::default());
+        let error = run_scroll_by(&mut sink, false, Deadline::from_millis(5)).unwrap_err();
+
+        assert_eq!(sink.0.calls, vec![Call::Wheel]);
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn run_scroll_by_attempts_modifier_cleanup_when_wheel_fails() {
+        struct FailingWheelSink(RecordingSink);
+
+        impl ScrollSink for FailingWheelSink {
+            fn modifiers(&mut self, down: bool) -> Result<()> {
+                self.0.modifiers(down)
+            }
+
+            fn wheel(&mut self) -> Result<()> {
+                self.0.wheel()?;
+                Err(GlassError::Backend("wheel failed".into()))
+            }
+        }
+
+        let mut sink = FailingWheelSink(RecordingSink::default());
+        let error = run_scroll_by(&mut sink, true, Deadline::UNBOUNDED).unwrap_err();
+
+        assert!(error.to_string().contains("wheel failed"));
+        assert_eq!(sink.0.calls.last(), Some(&Call::Mods(false)));
     }
 }

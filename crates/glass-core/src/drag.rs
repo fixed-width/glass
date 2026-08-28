@@ -3,6 +3,8 @@
 
 use std::time::Duration;
 
+use crate::{Deadline, GlassError};
+
 /// Points to warp the pointer through for a straight drag from `from` to `to`,
 /// linearly interpolated at ~1px along the dominant axis (capped at
 /// `MAX_STEPS`). Endpoints are exact (`path[0] == from`, `path[last] == to`); a
@@ -101,30 +103,129 @@ pub trait DragSink {
     fn modifiers(&mut self, down: bool) -> crate::Result<()>;
 }
 
-/// Drive a planned drag against a backend `sink`. This is the single definition
-/// of the gesture — and of the endpoint-dwell fix — shared by every backend:
-/// place → modifiers down → press → paced moves → **dwell at the endpoint** →
-/// **re-assert the exact endpoint** → release → modifiers up.
+/// Drive a planned drag without a caller deadline.
 pub fn run_drag<S: DragSink>(sink: &mut S, gesture: &DragGesture) -> crate::Result<()> {
+    run_drag_by(sink, gesture, Deadline::UNBOUNDED)
+}
+
+fn require_time(deadline: Deadline, started: bool) -> crate::Result<()> {
+    if !deadline.has_passed() {
+        return Ok(());
+    }
+    if started {
+        Err(GlassError::caller_deadline_elapsed("drag"))
+    } else {
+        Err(GlassError::deadline_not_started("drag"))
+    }
+}
+
+fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
+    require_time(deadline, true)?;
+    let sleep_for = deadline.remaining().unwrap_or(requested).min(requested);
+    std::thread::sleep(sleep_for);
+    require_time(deadline, true)
+}
+
+fn cleanup_drag<S: DragSink>(sink: &mut S, button_down: bool, modifiers_down: bool) {
+    // Releases are safety cleanup, not continued gesture dispatch. Once a press may
+    // have landed they must still be attempted after expiry, in dependency order.
+    if button_down {
+        let _ = sink.button(false);
+    }
+    if modifiers_down {
+        let _ = sink.modifiers(false);
+    }
+}
+
+/// Drive a planned drag against a backend `sink`, stopping at `deadline`.
+///
+/// Every gesture event is checked immediately before and after dispatch, and
+/// pacing sleeps never exceed the remaining caller budget. If a failure occurs
+/// after a button or modifier press may have landed, releases are still attempted
+/// in button-then-modifier order so the backend is not left in a held state.
+pub fn run_drag_by<S: DragSink>(
+    sink: &mut S,
+    gesture: &DragGesture,
+    deadline: Deadline,
+) -> crate::Result<()> {
     let (start, rest) = gesture
         .waypoints
         .split_first()
         .expect("a drag gesture always has at least one waypoint");
     let end = *gesture.waypoints.last().expect("non-empty waypoints");
 
+    require_time(deadline, false)?;
     sink.place(start.0, start.1)?;
-    sink.modifiers(true)?;
-    sink.button(true)?;
-    for &(px, py) in rest {
-        std::thread::sleep(gesture.step);
-        sink.move_to(px, py)?;
+    require_time(deadline, true)?;
+
+    require_time(deadline, true)?;
+    let modifiers_down = true;
+    if let Err(error) = sink.modifiers(true) {
+        cleanup_drag(sink, false, modifiers_down);
+        return Err(error);
     }
-    // --- endpoint dwell + re-assert (the fix) ---
-    std::thread::sleep(gesture.dwell); // hold at the destination, button still down
-    sink.move_to(end.0, end.1)?; // definitive motion to the exact endpoint
-    sink.button(false)?; // release at the endpoint
-    sink.modifiers(false)?;
-    Ok(())
+    if let Err(error) = require_time(deadline, true) {
+        cleanup_drag(sink, false, modifiers_down);
+        return Err(error);
+    }
+
+    require_time(deadline, true)?;
+    let button_down = true;
+    if let Err(error) = sink.button(true) {
+        cleanup_drag(sink, button_down, modifiers_down);
+        return Err(error);
+    }
+    if let Err(error) = require_time(deadline, true) {
+        cleanup_drag(sink, button_down, modifiers_down);
+        return Err(error);
+    }
+
+    for &(px, py) in rest {
+        if let Err(error) = sleep_by(deadline, gesture.step) {
+            cleanup_drag(sink, button_down, modifiers_down);
+            return Err(error);
+        }
+        if let Err(error) = sink.move_to(px, py) {
+            cleanup_drag(sink, button_down, modifiers_down);
+            return Err(error);
+        }
+        if let Err(error) = require_time(deadline, true) {
+            cleanup_drag(sink, button_down, modifiers_down);
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = sleep_by(deadline, gesture.dwell) {
+        cleanup_drag(sink, button_down, modifiers_down);
+        return Err(error);
+    }
+    if let Err(error) = sink.move_to(end.0, end.1) {
+        cleanup_drag(sink, button_down, modifiers_down);
+        return Err(error);
+    }
+    if let Err(error) = require_time(deadline, true) {
+        cleanup_drag(sink, button_down, modifiers_down);
+        return Err(error);
+    }
+
+    if let Err(error) = require_time(deadline, true) {
+        cleanup_drag(sink, button_down, modifiers_down);
+        return Err(error);
+    }
+    let button_result = sink.button(false);
+    let button_deadline = require_time(deadline, true);
+
+    // Always release modifiers after the button release attempt. This ordering is
+    // part of the gesture contract even when the first cleanup event fails.
+    let modifier_pre_deadline = require_time(deadline, true);
+    let modifier_result = sink.modifiers(false);
+    let modifier_deadline = require_time(deadline, true);
+
+    button_result?;
+    button_deadline?;
+    modifier_pre_deadline?;
+    modifier_result?;
+    modifier_deadline
 }
 
 #[cfg(test)]
@@ -229,9 +330,9 @@ mod tests {
 
 #[cfg(test)]
 mod run_drag_tests {
-    use super::{DragGesture, DragSink, run_drag};
-    use crate::Result;
-    use std::time::Duration;
+    use super::{DragGesture, DragSink, run_drag, run_drag_by};
+    use crate::{BoundDispatch, BoundKind, Deadline, GlassError, Result};
+    use std::time::{Duration, Instant};
 
     #[derive(Debug, PartialEq)]
     enum Call {
@@ -333,5 +434,156 @@ mod run_drag_tests {
             "run_drag must sleep the dwell (only {:?} elapsed)",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn run_drag_by_spent_deadline_emits_no_events() {
+        let mut sink = RecordingSink::default();
+        let deadline = Deadline::at(Instant::now() - Duration::from_millis(1));
+
+        let error = run_drag_by(&mut sink, &gesture(vec![(0, 0), (10, 0)]), deadline).unwrap_err();
+
+        assert!(sink.calls.is_empty());
+        assert_eq!(error.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn run_drag_by_deadline_expiring_mid_sequence_stops_before_the_next_event() {
+        use Call::*;
+        let gesture = DragGesture {
+            waypoints: vec![(0, 0), (5, 0), (10, 0)],
+            step: Duration::from_millis(250),
+            dwell: Duration::ZERO,
+        };
+        let mut full_sink = RecordingSink::default();
+        run_drag(&mut full_sink, &gesture).unwrap();
+        let full_sequence = full_sink.calls;
+
+        let mut sink = RecordingSink::default();
+        let started = Instant::now();
+        let error = run_drag_by(&mut sink, &gesture, Deadline::from_millis(10)).unwrap_err();
+
+        assert!(sink.calls.len() < full_sequence.len());
+        assert_eq!(
+            sink.calls,
+            vec![
+                Place(0, 0),
+                Mods(true),
+                Button(true),
+                Button(false),
+                Mods(false)
+            ]
+        );
+        assert!(
+            started.elapsed() < gesture.step,
+            "the inter-waypoint sleep must be capped by the deadline"
+        );
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn run_drag_by_unbounded_wrapper_preserves_the_legacy_sequence() {
+        use Call::*;
+        let mut sink = RecordingSink::default();
+
+        run_drag(&mut sink, &gesture(vec![(0, 0), (5, 0), (10, 0)])).unwrap();
+
+        assert_eq!(
+            sink.calls,
+            vec![
+                Place(0, 0),
+                Mods(true),
+                Button(true),
+                Move(5, 0),
+                Move(10, 0),
+                Move(10, 0),
+                Button(false),
+                Mods(false),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_drag_by_expiry_after_a_sink_event_is_may_have_dispatched() {
+        struct SlowPlaceSink(RecordingSink);
+
+        impl DragSink for SlowPlaceSink {
+            fn place(&mut self, x: i32, y: i32) -> Result<()> {
+                self.0.place(x, y)?;
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(())
+            }
+
+            fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
+                self.0.move_to(x, y)
+            }
+
+            fn button(&mut self, down: bool) -> Result<()> {
+                self.0.button(down)
+            }
+
+            fn modifiers(&mut self, down: bool) -> Result<()> {
+                self.0.modifiers(down)
+            }
+        }
+
+        let mut sink = SlowPlaceSink(RecordingSink::default());
+        let error = run_drag_by(
+            &mut sink,
+            &gesture(vec![(0, 0), (10, 0)]),
+            Deadline::from_millis(5),
+        )
+        .unwrap_err();
+
+        assert_eq!(sink.0.calls, vec![Call::Place(0, 0)]);
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn run_drag_by_attempts_modifier_cleanup_when_button_release_fails() {
+        struct FailingReleaseSink(RecordingSink);
+
+        impl DragSink for FailingReleaseSink {
+            fn place(&mut self, x: i32, y: i32) -> Result<()> {
+                self.0.place(x, y)
+            }
+
+            fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
+                self.0.move_to(x, y)
+            }
+
+            fn button(&mut self, down: bool) -> Result<()> {
+                self.0.button(down)?;
+                if down {
+                    Ok(())
+                } else {
+                    Err(GlassError::Backend("button release failed".into()))
+                }
+            }
+
+            fn modifiers(&mut self, down: bool) -> Result<()> {
+                self.0.modifiers(down)
+            }
+        }
+
+        let mut sink = FailingReleaseSink(RecordingSink::default());
+        let error = run_drag_by(
+            &mut sink,
+            &gesture(vec![(0, 0), (10, 0)]),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("button release failed"));
+        assert_eq!(sink.0.calls.last(), Some(&Call::Mods(false)));
     }
 }

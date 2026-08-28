@@ -4,6 +4,8 @@
 
 use std::time::Duration;
 
+use crate::{Deadline, GlassError};
+
 /// Default dwell between consecutive typed characters. Used by the Windows backend (tunable
 /// via `GLASS_TYPE_DWELL_MS`): injecting `KEYEVENTF_UNICODE` keystrokes faster than the
 /// target drains its queue races a downstream OS bug that collapses a run of characters to
@@ -22,27 +24,61 @@ pub trait TypeSink {
     fn character(&mut self, c: char) -> crate::Result<()>;
 }
 
-/// Type `text` against a backend `sink`, one character at a time, sleeping `dwell` *between*
-/// characters (so there are `n-1` dwells — none before the first or after the last). Each
-/// character is its own committed keystroke; together with the dwell this keeps a string
-/// from being delivered faster than the target can drain it.
+/// Type `text` without a caller deadline.
 pub fn run_type<S: TypeSink>(sink: &mut S, text: &str, dwell: Duration) -> crate::Result<()> {
+    run_type_by(sink, text, dwell, Deadline::UNBOUNDED)
+}
+
+fn require_time(deadline: Deadline, started: bool) -> crate::Result<()> {
+    if !deadline.has_passed() {
+        return Ok(());
+    }
+    if started {
+        Err(GlassError::caller_deadline_elapsed("typing"))
+    } else {
+        Err(GlassError::deadline_not_started("typing"))
+    }
+}
+
+fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
+    require_time(deadline, true)?;
+    let sleep_for = deadline.remaining().unwrap_or(requested).min(requested);
+    std::thread::sleep(sleep_for);
+    require_time(deadline, true)
+}
+
+/// Type `text` against a backend `sink`, stopping at `deadline`.
+///
+/// Characters remain individually committed and `dwell` remains strictly
+/// inter-character, but each dispatch is checked before and after and every
+/// dwell is capped by the caller's remaining budget.
+pub fn run_type_by<S: TypeSink>(
+    sink: &mut S,
+    text: &str,
+    dwell: Duration,
+    deadline: Deadline,
+) -> crate::Result<()> {
+    require_time(deadline, false)?;
     let mut first = true;
+    let mut started = false;
     for c in text.chars() {
         if !first {
-            std::thread::sleep(dwell);
+            sleep_by(deadline, dwell)?;
         }
         first = false;
+        require_time(deadline, started)?;
+        started = true;
         sink.character(c)?;
+        require_time(deadline, true)?;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TypeSink, run_type};
-    use crate::Result;
-    use std::time::Duration;
+    use super::{TypeSink, run_type, run_type_by};
+    use crate::{BoundDispatch, BoundKind, Deadline, Result};
+    use std::time::{Duration, Instant};
 
     #[derive(Default)]
     struct RecordingSink {
@@ -94,6 +130,75 @@ mod tests {
             started.elapsed() >= dwell * 3,
             "run_type must dwell the given duration between characters (only {:?} elapsed)",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_type_by_spent_deadline_emits_no_events() {
+        let mut sink = RecordingSink::default();
+        let deadline = Deadline::at(Instant::now() - Duration::from_millis(1));
+
+        let error = run_type_by(&mut sink, "abc", Duration::ZERO, deadline).unwrap_err();
+
+        assert!(sink.chars.is_empty());
+        assert_eq!(error.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn run_type_by_deadline_expiring_mid_sequence_stops_before_the_next_event() {
+        let mut full_sink = RecordingSink::default();
+        run_type(&mut full_sink, "abc", Duration::ZERO).unwrap();
+        let full_sequence = full_sink.chars;
+
+        let dwell = Duration::from_millis(250);
+        let mut sink = RecordingSink::default();
+        let started = Instant::now();
+        let error = run_type_by(&mut sink, "abc", dwell, Deadline::from_millis(10)).unwrap_err();
+
+        assert!(sink.chars.len() < full_sequence.len());
+        assert_eq!(sink.chars, vec!['a']);
+        assert!(
+            started.elapsed() < dwell,
+            "the inter-character sleep must be capped by the deadline"
+        );
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn run_type_by_unbounded_wrapper_preserves_the_legacy_sequence() {
+        let mut sink = RecordingSink::default();
+
+        run_type(&mut sink, "aab c", Duration::ZERO).unwrap();
+
+        assert_eq!(sink.chars, vec!['a', 'a', 'b', ' ', 'c']);
+    }
+
+    #[test]
+    fn run_type_by_expiry_after_a_sink_event_is_may_have_dispatched() {
+        struct SlowSink(RecordingSink);
+
+        impl TypeSink for SlowSink {
+            fn character(&mut self, c: char) -> Result<()> {
+                self.0.character(c)?;
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(())
+            }
+        }
+
+        let mut sink = SlowSink(RecordingSink::default());
+        let error =
+            run_type_by(&mut sink, "abc", Duration::ZERO, Deadline::from_millis(5)).unwrap_err();
+
+        assert_eq!(sink.0.chars, vec!['a']);
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
         );
     }
 }
