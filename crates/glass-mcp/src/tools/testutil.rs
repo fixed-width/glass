@@ -126,12 +126,15 @@ impl Platform for FakePlatform {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("window capture"));
         }
-        let frame = self
-            .window_frame
-            .as_ref()
-            .filter(|(scripted_id, _)| *scripted_id == id)
-            .map(|(_, frame)| frame.clone())
-            .ok_or(GlassError::WindowNotFound)?;
+        let Some((scripted_id, frame)) = &self.window_frame else {
+            return Err(GlassError::Unsupported(
+                "capture_window is not supported by this backend".into(),
+            ));
+        };
+        if *scripted_id != id {
+            return Err(GlassError::WindowNotFound);
+        }
+        let frame = frame.clone();
         match region {
             Some(region) => frame.crop(region),
             None => Ok(frame),
