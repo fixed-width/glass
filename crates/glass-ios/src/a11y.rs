@@ -3,12 +3,14 @@
 //! on a different element), focuses it, then clears and types it in one batch of synthetic HID
 //! input, and finally reads the element back and reports the write as not applied if it does not
 //! hold the text.
-use glass_core::accessibility::{Accessibility, AxContext, AxRect, AxTarget, AxTree, Located};
+use glass_core::accessibility::{
+    Accessibility, AxContext, AxNodeId, AxRect, AxTarget, AxTree, Located,
+};
 use std::time::Duration;
 
 use glass_core::{
-    GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, read_back_failed,
-    verify_typed_write,
+    Deadline, GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, Whose,
+    read_back_failed, verify_typed_write,
 };
 
 use crate::axmap;
@@ -23,6 +25,52 @@ pub struct IosA11y {
     /// The target's scale, fetched on first need and kept: a property of the device, so it
     /// does not change between snapshots.
     scale: Option<f64>,
+}
+
+#[derive(Clone, Copy)]
+enum SemanticPhase {
+    Snapshot,
+    Invoke,
+    SetValue { dispatched: bool },
+}
+
+impl SemanticPhase {
+    fn expired(self) -> GlassError {
+        match self {
+            Self::Snapshot => GlassError::AccessibilityNotReady(
+                "no accessibility tree within the time this call allowed".into(),
+            ),
+            Self::Invoke => GlassError::deadline_not_started("native accessibility invoke"),
+            Self::SetValue { dispatched: false } => {
+                GlassError::deadline_not_started("native accessibility set_value")
+            }
+            Self::SetValue { dispatched: true } => {
+                GlassError::caller_deadline_elapsed("native accessibility set_value")
+            }
+        }
+    }
+
+    fn require(self, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            Err(self.expired())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish<T>(self, deadline: Deadline, result: Result<T>) -> Result<T> {
+        self.require(deadline)?;
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) if error.bound_owner() == Some(Whose::Caller) => Err(self.expired()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn run<T>(self, deadline: Deadline, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.require(deadline)?;
+        self.finish(deadline, work())
+    }
 }
 
 impl IosA11y {
@@ -40,23 +88,34 @@ impl IosA11y {
     /// unavailable at all for the second or so an app takes to render. The platform's
     /// injector converts with the device's scale, so a reader using a different one would
     /// report bounds that tap somewhere else.
-    fn scale(&mut self) -> Result<f64> {
+    fn scale(&mut self, deadline: Deadline, phase: SemanticPhase) -> Result<f64> {
+        phase.require(deadline)?;
         if let Some(scale) = self.scale {
+            phase.require(deadline)?;
             return Ok(scale);
         }
-        let scale = crate::platform::checked_scale(self.client.describe()?.density)?;
+        let dimensions = phase.finish(deadline, self.client.describe_by(deadline))?;
+        let scale = phase.run(deadline, || {
+            crate::platform::checked_scale(dimensions.density)
+        })?;
         self.scale = Some(scale);
+        phase.require(deadline)?;
         Ok(scale)
     }
 
     /// One describe round-trip: fetch the accessibility JSON and map the id-assigned tree at
     /// the target's scale. Returns the scale alongside it, since `set_value` places synthetic
     /// input at the same one.
-    fn describe(&mut self, ctx: &AxContext) -> Result<(AxTree, f64)> {
-        let scale = self.scale()?;
-        let json = self.client.describe_all()?;
-        let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
-        tree.assign_ids();
+    fn describe(&mut self, ctx: &AxContext, phase: SemanticPhase) -> Result<(AxTree, f64)> {
+        phase.require(ctx.deadline)?;
+        let scale = self.scale(ctx.deadline, phase)?;
+        let json = phase.finish(ctx.deadline, self.client.describe_all_by(ctx.deadline))?;
+        let tree = phase.run(ctx.deadline, || {
+            let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
+            tree.assign_ids();
+            Ok(tree)
+        })?;
+        phase.require(ctx.deadline)?;
         Ok((tree, scale))
     }
 }
@@ -109,6 +168,13 @@ const _: () = assert!(
     "set_value reports the last read-back, so there must be one"
 );
 
+fn bounded_sleep_at(deadline: Deadline, requested: Duration, now: std::time::Instant) -> Duration {
+    deadline
+        .remaining_at(now)
+        .unwrap_or(requested)
+        .min(requested)
+}
+
 /// The write's keystrokes as one batch of HID events: select-all, delete, then the text.
 ///
 /// Do not send these a group at a time again: each `IdbClient::hid` is its own RPC, and the
@@ -136,30 +202,53 @@ fn dispatch_write(
     tap: &PointerEvent,
     target_id: u32,
     text: &str,
+    deadline: Deadline,
 ) -> Result<()> {
+    require_set_value_time(deadline, false)?;
     let keys = clear_and_type_keys(injector, text)?;
+    require_set_value_time(deadline, false)?;
     send(injector.pointer_events(tap)?)?;
+    require_set_value_time(deadline, true)?;
     send(keys).map_err(|e| {
+        if e.bound_owner() == Some(Whose::Caller) {
+            return e;
+        }
         GlassError::AxWriteUnconfirmed(
             target_id,
             format!("sending the keystrokes failed part-way through ({e}), so the field may have been cleared without receiving the text"),
         )
+    })?;
+    require_set_value_time(deadline, true)
+}
+
+fn require_set_value_time(deadline: Deadline, dispatched: bool) -> Result<()> {
+    if !deadline.has_passed() {
+        return Ok(());
+    }
+    Err(if dispatched {
+        GlassError::caller_deadline_elapsed("iOS accessibility set_value")
+    } else {
+        GlassError::deadline_not_started("iOS accessibility set_value")
     })
 }
 
 impl Accessibility for IosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        Ok(self.describe(ctx)?.0)
+        Ok(self.describe(ctx, SemanticPhase::Snapshot)?.0)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+        let before_dispatch = SemanticPhase::SetValue { dispatched: false };
+        before_dispatch.require(ctx.deadline)?;
         // One describe serves both the guard and the injector's scale — no second read before the
         // keystrokes go out.
-        let (tree, scale) = self.describe(ctx)?;
-        let bounds = verify(&tree, target)?;
-        let (cx, cy) = bounds
-            .clamped_center(ctx.window.width, ctx.window.height)
-            .ok_or(GlassError::AxElementNotClickable(target.id.0))?;
+        let (tree, scale) = self.describe(ctx, before_dispatch)?;
+        let bounds = before_dispatch.run(ctx.deadline, || verify(&tree, target))?;
+        let (cx, cy) = before_dispatch.run(ctx.deadline, || {
+            bounds
+                .clamped_center(ctx.window.width, ctx.window.height)
+                .ok_or(GlassError::AxElementNotClickable(target.id.0))
+        })?;
         // Focus by tapping the element, select-all + delete to clear, then type — all
         // through an injector at this describe's scale.
         let injector = IdbInjector::new(scale);
@@ -174,22 +263,33 @@ impl Accessibility for IosA11y {
         // loses the text.
         let client = &self.client;
         dispatch_write(
-            &mut |events| client.hid(events),
+            &mut |events| client.hid_by(events, ctx.deadline),
             &injector,
             &tap,
             target.id.0,
             text,
+            ctx.deadline,
         )?;
 
         // A failure of this read is not a failure of the write — the field has already been cleared
         // and typed into — so it says so rather than letting a caller retry blindly and type twice.
+        let after_dispatch = SemanticPhase::SetValue { dispatched: true };
         let mut last = None;
         for _ in 0..VERIFY_ATTEMPTS {
-            std::thread::sleep(VERIFY_SETTLE);
-            let (after, _) = self
-                .describe(ctx)
-                .map_err(|e| read_back_failed(target, &e))?;
-            match verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED) {
+            after_dispatch.require(ctx.deadline)?;
+            let sleep = bounded_sleep_at(ctx.deadline, VERIFY_SETTLE, std::time::Instant::now());
+            std::thread::sleep(sleep);
+            after_dispatch.require(ctx.deadline)?;
+            let (after, _) = self.describe(ctx, after_dispatch).map_err(|error| {
+                if error.bound_owner() == Some(Whose::Caller) {
+                    error
+                } else {
+                    read_back_failed(target, &error)
+                }
+            })?;
+            match after_dispatch.run(ctx.deadline, || {
+                verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED)
+            }) {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later describe: drift and truncation
                 // are structural, so re-describing for them reaches the same answer more slowly.
@@ -199,7 +299,12 @@ impl Accessibility for IosA11y {
         }
         // The const assert on `VERIFY_ATTEMPTS` is what makes `last` always set; the fallback only
         // avoids an unwrap.
+        after_dispatch.require(ctx.deadline)?;
         Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
+    }
+
+    fn invoke(&mut self, ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
+        SemanticPhase::Invoke.run(ctx.deadline, || Err(GlassError::AxUnsupported))
     }
 }
 
@@ -207,6 +312,88 @@ impl Accessibility for IosA11y {
 mod tests {
     use super::*;
     use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
+
+    fn ctx(deadline: glass_core::Deadline) -> AxContext {
+        AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 200,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline,
+        }
+    }
+
+    #[test]
+    fn snapshot_with_a_spent_deadline_starts_no_describe() {
+        let mut a11y = IosA11y::new(IdbClient::for_test());
+
+        let error = a11y
+            .snapshot(&ctx(glass_core::Deadline::from_millis(0)))
+            .expect_err("a spent snapshot deadline must stop before idb describe");
+
+        assert!(
+            matches!(error, GlassError::AccessibilityNotReady(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn invoke_with_a_spent_deadline_is_not_dispatched() {
+        let mut a11y = IosA11y::new(IdbClient::for_test());
+
+        let error = a11y
+            .invoke(
+                &ctx(glass_core::Deadline::from_millis(0)),
+                &matching_target(),
+            )
+            .expect_err("a spent invoke deadline must win over pointer fallback");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn set_value_with_a_spent_deadline_starts_no_describe_or_hid() {
+        let mut a11y = IosA11y::new(IdbClient::for_test());
+
+        let error = a11y
+            .set_value(
+                &ctx(glass_core::Deadline::from_millis(0)),
+                &matching_target(),
+                "new",
+            )
+            .expect_err("a spent set_value deadline must stop before idb describe");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn verification_sleep_is_capped_by_the_absolute_caller_deadline() {
+        let now = std::time::Instant::now();
+        let left = Duration::from_millis(5);
+
+        assert_eq!(
+            bounded_sleep_at(
+                glass_core::Deadline::at(now + left),
+                Duration::from_millis(300),
+                now,
+            ),
+            left
+        );
+    }
 
     fn leaf(id: u32, role: AxRole, name: &str, r: AxRect) -> AxNode {
         AxNode {
@@ -302,7 +489,15 @@ mod tests {
         // the text loses the text.
         let injector = IdbInjector::new(2.0);
         let mut log = Vec::new();
-        dispatch_write(&mut recording_send(&mut log), &injector, &a_tap(), 1, "hi").unwrap();
+        dispatch_write(
+            &mut recording_send(&mut log),
+            &injector,
+            &a_tap(),
+            1,
+            "hi",
+            glass_core::Deadline::UNBOUNDED,
+        )
+        .unwrap();
 
         assert_eq!(log.len(), 2, "the tap, then every keystroke in one call");
         assert_eq!(log[0], injector.pointer_events(&a_tap()).unwrap());
@@ -318,7 +513,15 @@ mod tests {
             calls += 1;
             Err(GlassError::Backend("idb: connection reset".into()))
         };
-        let err = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi").unwrap_err();
+        let err = dispatch_write(
+            &mut send,
+            &injector,
+            &a_tap(),
+            1,
+            "hi",
+            glass_core::Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
         assert_eq!(calls, 1, "the keystrokes must not follow a tap that failed");
         assert!(
             !err.set_value_failed_after_writing(),
@@ -340,7 +543,15 @@ mod tests {
                 Err(GlassError::Backend("idb hid timed out after 30s".into()))
             }
         };
-        let err = dispatch_write(&mut send, &injector, &a_tap(), 7, "hi").unwrap_err();
+        let err = dispatch_write(
+            &mut send,
+            &injector,
+            &a_tap(),
+            7,
+            "hi",
+            glass_core::Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
         assert!(matches!(err, GlassError::AxWriteUnconfirmed(7, _)), "{err}");
         assert!(
             err.set_value_failed_after_writing(),
@@ -361,6 +572,7 @@ mod tests {
             &a_tap(),
             1,
             "café",
+            glass_core::Deadline::UNBOUNDED,
         )
         .unwrap_err();
         assert!(matches!(err, GlassError::Unsupported(_)), "{err}");
@@ -369,6 +581,73 @@ mod tests {
             "nothing may be sent for a write that cannot be built"
         );
         assert!(!err.set_value_failed_after_writing(), "{err}");
+    }
+
+    #[test]
+    fn deadline_expiring_after_the_focus_tap_prevents_the_keystroke_batch() {
+        let injector = IdbInjector::new(1.0);
+        let deadline = glass_core::Deadline::from_millis(5);
+        let mut sends = 0;
+        let mut send = |_events| {
+            sends += 1;
+            if sends == 1 {
+                while !deadline.has_passed() {
+                    std::thread::yield_now();
+                }
+            }
+            Ok(())
+        };
+
+        let error = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi", deadline)
+            .expect_err("the keystrokes must not begin after the shared deadline expires");
+
+        assert_eq!(sends, 1, "the keystroke batch started after expiry");
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn caller_timeout_from_the_keystroke_stream_keeps_its_dispatch_ownership() {
+        let injector = IdbInjector::new(1.0);
+        let mut sends = 0;
+        let mut send = |_events| {
+            sends += 1;
+            if sends == 1 {
+                Ok(())
+            } else {
+                Err(GlassError::caller_deadline_elapsed("idb hid"))
+            }
+        };
+
+        let error = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi", Deadline::UNBOUNDED)
+            .expect_err("the caller-owned HID timeout must propagate without AxWriteUnconfirmed");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn an_ordinary_verification_error_observed_after_expiry_stays_caller_owned() {
+        let deadline = glass_core::Deadline::at(std::time::Instant::now());
+
+        let error = SemanticPhase::SetValue { dispatched: true }
+            .finish(
+                deadline,
+                Err::<(), _>(GlassError::AxElementChanged(matching_target().id.0)),
+            )
+            .expect_err("expiry after HID dispatch must override an ordinary verification error");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
     }
 
     #[test]

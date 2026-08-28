@@ -28,6 +28,7 @@ use objc2_core_foundation::CFRetained;
 use crate::ffi::{self, attr};
 use crate::mapping::{self, AxStateFacts};
 use crate::select_diagnostic::{CandidateOutcome, candidate_line};
+use crate::semantic_deadline::{EffectiveDeadline, SemanticDeadline};
 
 /// Per-axis pixel tolerance when matching an `AXWindow`'s origin against the backend's
 /// reported window origin. Same basis as `axwindow.rs`'s geometry-match fallback. Sized for
@@ -86,44 +87,55 @@ impl MacosA11y {
 
 impl Accessibility for MacosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        let (window_el, scale) = resolve_window(ctx)?;
+        let deadline = SemanticDeadline::snapshot(ctx.deadline);
+        deadline.require()?;
+        let (window_el, scale) = resolve_window(ctx, deadline)?;
 
         let mut budget = WalkBudget::with_limits(ctx.limits);
-        let root = walk(&window_el, &ctx.window, scale, 0, &mut budget);
-        let mut tree = AxTree::new(root);
-        tree.truncated = budget.truncation();
-        tree.unreadable = budget.unreadable();
-        // Ids/count are assigned by `glass-core` (`AxTree::assign_ids`) so numbering is
-        // identical across OS backends.
-        Ok(tree)
+        let root = walk(&window_el, &ctx.window, scale, 0, &mut budget, deadline)?;
+        deadline.run(|| {
+            let mut tree = AxTree::new(root);
+            tree.truncated = budget.truncation();
+            tree.unreadable = budget.unreadable();
+            // Ids/count are assigned by `glass-core` (`AxTree::assign_ids`) so numbering is
+            // identical across OS backends.
+            Ok(tree)
+        })
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
-        let (window_el, scale) = resolve_window(ctx)?;
+        let deadline = SemanticDeadline::set_value(ctx.deadline);
+        deadline.require()?;
+        let (window_el, scale) = resolve_window(ctx, deadline)?;
 
         // Start at 0 so `find_nth`'s pre-order numbering matches `snapshot`'s `walk` +
         // `AxTree::assign_ids` (root id = 0); the role+name+bounds fingerprint below
         // backstops any residual drift between the snapshot and this re-walk.
         let mut budget = WalkBudget::with_limits(ctx.limits);
-        let el = find_nth(window_el, 0, &mut budget, target.id.0)
-            .ok_or(GlassError::AxElementNotFound(target.id.0))?;
+        let found = find_nth(window_el, 0, &mut budget, target.id.0, deadline)?;
+        deadline.require()?;
+        let el = found.ok_or(GlassError::AxElementNotFound(target.id.0))?;
 
         // Verify role + name + bounds (guards a stale id / tree drift): if drift landed a
         // different same-role+name element on this pre-order id, its bounds sit elsewhere
         // and it is rejected here rather than silently overwritten.
-        let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
-        let role = mapping::map_role(&ax_role, read_subrole(&el, &ax_role).as_deref());
+        let ax_role = deadline
+            .observe(|| ffi::attribute_string(&el, attr::ROLE))?
+            .unwrap_or_default();
+        let subrole = read_subrole(&el, &ax_role, deadline)?;
+        let role = mapping::map_role(&ax_role, subrole.as_deref());
         // Same rule `walk` derived this element's `name` from, so a fingerprint can never be
         // computed from a differently-read name and reject an element that never moved.
-        let name = read_name(&el);
-        let bounds = window_relative_rect(&el, scale, &ctx.window);
+        let name = read_name(&el, deadline)?;
+        let bounds = window_relative_rect(&el, scale, &ctx.window, deadline)?;
+        deadline.require()?;
         if !target.matches(role, name.as_deref())
             || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
         {
             return Err(GlassError::AxElementChanged(target.id.0));
         }
 
-        if !ffi::is_settable(&el, attr::VALUE) {
+        if !deadline.observe(|| ffi::is_settable(&el, attr::VALUE))? {
             return Err(GlassError::AxElementNotEditable(target.id.0));
         }
 
@@ -133,10 +145,12 @@ impl Accessibility for MacosA11y {
         // (whose `get_value()` returns `Ok("")` for empty). `None` — a failed or absent pre-read —
         // means the baseline is unknown, and `read_back_confirms` then requires an exact match
         // rather than trusting a "differs from before" signal it cannot compute.
-        let before = ffi::attribute_string_checked(&el, attr::VALUE)
+        let before = deadline
+            .observe(|| ffi::attribute_string_checked(&el, attr::VALUE))?
             .ok()
             .flatten();
-        ffi::set_string_value(&el, text)?;
+        deadline.dispatch(|| ffi::set_string_value(&el, text))?;
+        let dispatched = deadline.after_dispatch();
 
         // Read-back poll: some editables accept the AX write without an `AXError` but never
         // actually change `AXValue` (a misleading success) — require the read-back to show the
@@ -144,42 +158,53 @@ impl Accessibility for MacosA11y {
         // *error-aware*: a failed or absent post-read maps to `None`, which is inconclusive and
         // never confirms, so we keep polling to the deadline rather than mistaking a failed read
         // for a change.
-        let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
+        let verification =
+            dispatched.phase(Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS));
         loop {
-            let after = ffi::attribute_string_checked(&el, attr::VALUE)
-                .ok()
-                .flatten();
-            if read_back_confirms(after.as_deref(), before.as_deref(), text) {
-                return Ok(());
+            let Some(after) = verification.observe(dispatched, || {
+                ffi::attribute_string_checked(&el, attr::VALUE)
+            })?
+            else {
+                return Err(write_verdict(target.id.0, text, before.as_deref(), None));
+            };
+            let after = after.ok().flatten();
+            if verification.callee_expired(dispatched)? {
+                return Err(write_verdict(
+                    target.id.0,
+                    text,
+                    before.as_deref(),
+                    after.as_deref(),
+                ));
             }
-            if Instant::now() >= deadline {
-                // A read that failed, or one showing a value the element reformatted, is not
-                // evidence of a projection that accepted the write and kept its value.
-                return Err(match after.as_deref() {
-                    None => GlassError::AxWriteUnconfirmed(
+            match verification.observe(dispatched, || {
+                read_back_confirms(after.as_deref(), before.as_deref(), text)
+            })? {
+                Some(true) => return Ok(()),
+                Some(false) => {}
+                None => {
+                    return Err(write_verdict(
                         target.id.0,
-                        "the element exposes a writable value but no readable value was available after the write"
-                            .into(),
-                    ),
-                    Some(seen) if write_took_no_effect(seen, before.as_deref()) => {
-                        GlassError::value_not_applied_because(
-                            target.id.0,
-                            text,
-                            Some(seen),
-                            READ_ONLY_PROJECTION,
-                        )
-                    }
-                    Some(seen) => {
-                        GlassError::value_not_applied(target.id.0, text, Some(seen))
-                    }
-                });
+                        text,
+                        before.as_deref(),
+                        after.as_deref(),
+                    ));
+                }
             }
-            std::thread::sleep(Duration::from_millis(SET_VALUE_POLL_MS));
+            if !verification.sleep(dispatched, Duration::from_millis(SET_VALUE_POLL_MS))? {
+                return Err(write_verdict(
+                    target.id.0,
+                    text,
+                    before.as_deref(),
+                    after.as_deref(),
+                ));
+            }
         }
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
-        let (window_el, scale) = resolve_window(ctx)?;
+        let deadline = SemanticDeadline::invoke(ctx.deadline);
+        deadline.require()?;
+        let (window_el, scale) = resolve_window(ctx, deadline)?;
 
         // Start at 0, same numbering rationale as `set_value`. Unlike `set_value` (whose
         // miss is `AxElementNotFound` — the id itself is unknown), a miss here is
@@ -187,22 +212,31 @@ impl Accessibility for MacosA11y {
         // classification the Linux/Windows readers' `invoke` use), which is also what the
         // fingerprint mismatch just below reports.
         let mut budget = WalkBudget::with_limits(ctx.limits);
-        let el = find_nth(window_el, 0, &mut budget, target.id.0)
-            .ok_or(GlassError::AxElementChanged(target.id.0))?;
+        let found = find_nth(window_el, 0, &mut budget, target.id.0, deadline)?;
+        deadline.require()?;
+        let el = found.ok_or(GlassError::AxElementChanged(target.id.0))?;
 
         // Same fingerprint gate as set_value: role + name + bounds.
-        let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
-        let role = mapping::map_role(&ax_role, read_subrole(&el, &ax_role).as_deref());
+        let ax_role = deadline
+            .observe(|| ffi::attribute_string(&el, attr::ROLE))?
+            .unwrap_or_default();
+        let subrole = read_subrole(&el, &ax_role, deadline)?;
+        let role = mapping::map_role(&ax_role, subrole.as_deref());
         // `name` derived exactly as in `walk` and `set_value` — see there.
-        let name = read_name(&el);
-        let bounds = window_relative_rect(&el, scale, &ctx.window);
+        let name = read_name(&el, deadline)?;
+        let bounds = window_relative_rect(&el, scale, &ctx.window, deadline)?;
+        deadline.require()?;
         if !target.matches(role, name.as_deref())
             || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
         {
             return Err(GlassError::AxElementChanged(target.id.0));
         }
 
-        if !ffi::action_names(&el).iter().any(|a| a == "AXPress") {
+        if !deadline
+            .observe(|| ffi::action_names(&el))?
+            .iter()
+            .any(|a| a == "AXPress")
+        {
             return Err(GlassError::AxActionUnavailable(target.id.0));
         }
         // No post-actuation verify here (unlike the Linux/Windows toggle rungs): AXPress is a
@@ -210,26 +244,56 @@ impl Accessibility for MacosA11y {
         // button's nothing, a menu item's opened menu — so there is nothing to confirm against.
         // Accepted parity gap: a control that accepts AXPress without acting reports success.
         // This reader actuates the element it resolved, so it never substitutes another.
-        ffi::perform_action(&el, "AXPress")
-            .map(|()| None)
-            .map_err(|e| GlassError::AxActionFailed(target.id.0, e))
+        deadline.dispatch(|| {
+            ffi::perform_action(&el, "AXPress")
+                .map_err(|error| GlassError::AxActionFailed(target.id.0, error))
+        })?;
+        Ok(None)
+    }
+}
+
+fn write_verdict(
+    id: u32,
+    requested: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> GlassError {
+    // A read that failed, or one showing a value the element reformatted, is not evidence of a
+    // projection that accepted the write and kept its value.
+    match after {
+        None => GlassError::AxWriteUnconfirmed(
+            id,
+            "the element exposes a writable value but no readable value was available after the write"
+                .into(),
+        ),
+        Some(seen) if write_took_no_effect(seen, before) => GlassError::value_not_applied_because(
+            id,
+            requested,
+            Some(seen),
+            READ_ONLY_PROJECTION,
+        ),
+        Some(seen) => GlassError::value_not_applied(id, requested, Some(seen)),
     }
 }
 
 /// Resolve the `AXWindow` + point→pixel `scale` for `ctx`: the grant gate, pid, app element,
 /// and window selection `snapshot` and `set_value` both need — shared so both address the
 /// identical window.
-fn resolve_window(ctx: &AxContext) -> Result<(CFRetained<AXUIElement>, f64)> {
+fn resolve_window(
+    ctx: &AxContext,
+    deadline: SemanticDeadline,
+) -> Result<(CFRetained<AXUIElement>, f64)> {
     // Grant gate first — fail closed with an actionable error, never a stub tree.
-    if !ffi::accessibility_is_trusted() {
+    if !deadline.observe(ffi::accessibility_is_trusted)? {
         return Err(GlassError::PermissionDenied {
             which: "Accessibility".into(),
             remedy: ACCESSIBILITY_REMEDY.into(),
         });
     }
 
+    deadline.require()?;
     let &pid = ctx.pids.first().ok_or(GlassError::WindowNotFound)?;
-    let app = ffi::app_element(pid as i32);
+    let app = deadline.observe(|| ffi::app_element(pid as i32))?;
 
     // The app's `AXWindows` list can be transiently EMPTY right after launch (the window
     // server registers the AX window a beat after the window exists), so a snapshot taken
@@ -238,16 +302,23 @@ fn resolve_window(ctx: &AxContext) -> Result<(CFRetained<AXUIElement>, f64)> {
     // geometry mismatch (it logs its diagnostics), which retrying would not fix, so it is
     // returned immediately rather than polled. A failed `AXWindows` read reads as "no windows"
     // and is likewise retried until the budget, then `WindowNotFound`.
-    let deadline = Instant::now() + Duration::from_millis(RESOLVE_WINDOW_BUDGET_MS);
+    let resolution =
+        deadline.phase(Instant::now() + Duration::from_millis(RESOLVE_WINDOW_BUDGET_MS));
     loop {
-        let windows = ffi::app_windows(&app).unwrap_or_default();
+        let Some(windows) = resolution.observe(deadline, || ffi::app_windows(&app))? else {
+            return Err(GlassError::WindowNotFound);
+        };
+        let windows = windows.unwrap_or_default();
         if !windows.is_empty() {
-            return select_window(&windows, &ctx.window).ok_or(GlassError::WindowNotFound);
+            return select_window(&windows, &ctx.window, deadline, resolution)?
+                .ok_or(GlassError::WindowNotFound);
         }
-        if Instant::now() >= deadline {
+        if resolution.callee_expired(deadline)? {
             return Err(GlassError::WindowNotFound);
         }
-        std::thread::sleep(Duration::from_millis(RESOLVE_WINDOW_POLL_MS));
+        if !resolution.sleep(deadline, Duration::from_millis(RESOLVE_WINDOW_POLL_MS))? {
+            return Err(GlassError::WindowNotFound);
+        }
     }
 }
 
@@ -268,15 +339,26 @@ fn resolve_window(ctx: &AxContext) -> Result<(CFRetained<AXUIElement>, f64)> {
 fn select_window(
     windows: &[CFRetained<AXUIElement>],
     win: &WindowGeometry,
-) -> Option<(CFRetained<AXUIElement>, f64)> {
+    deadline: SemanticDeadline,
+    resolution: EffectiveDeadline,
+) -> Result<Option<(CFRetained<AXUIElement>, f64)>> {
     let mut best: Option<(i64, CFRetained<AXUIElement>, f64)> = None;
     let mut diagnostics: Vec<String> = Vec::new();
     for w in windows {
+        if resolution.callee_expired(deadline)? {
+            return Ok(None);
+        }
         // Read first, so a candidate that fails every subsequent read still names what it is
         // (#263) — see the doc comment above for why that matters.
-        let role = ffi::attribute_string(w, attr::ROLE);
+        let Some(role) = resolution.observe(deadline, || ffi::attribute_string(w, attr::ROLE))?
+        else {
+            return Ok(None);
+        };
         let role = role.as_deref();
-        let (ax_w, ax_h) = match ffi::ax_size(w) {
+        let Some(size) = resolution.observe(deadline, || ffi::ax_size(w))? else {
+            return Ok(None);
+        };
+        let (ax_w, ax_h) = match size {
             Ok(size) => size,
             Err(e) => {
                 diagnostics.push(candidate_line(
@@ -303,7 +385,10 @@ fn select_window(
             ));
             continue;
         }
-        let (ax_x, ax_y) = match ffi::ax_position(w) {
+        let Some(position) = resolution.observe(deadline, || ffi::ax_position(w))? else {
+            return Ok(None);
+        };
+        let (ax_x, ax_y) = match position {
             Ok(pos) => pos,
             Err(e) => {
                 diagnostics.push(candidate_line(
@@ -349,6 +434,9 @@ fn select_window(
         }
     }
     if best.is_none() {
+        if resolution.callee_expired(deadline)? {
+            return Ok(None);
+        }
         // Fail-closed dev-tool diagnostic (stderr only, no new error variant): a
         // `WindowNotFound` with no clue why is much harder to debug than one that shows
         // exactly how close (or not) each candidate came.
@@ -357,7 +445,10 @@ fn select_window(
             diagnostics.join("; ")
         );
     }
-    best.map(|(_, w, scale)| (w, scale))
+    if resolution.callee_expired(deadline)? {
+        return Ok(None);
+    }
+    Ok(best.map(|(_, w, scale)| (w, scale)))
 }
 
 /// One of the label attributes a node's `name`/`description` come from (`AXTitle`,
@@ -372,25 +463,31 @@ fn select_window(
 /// must not fail a snapshot — but it logs first. `AXTitle` earns it twice over: it decides `name`,
 /// half the `AxTarget` fingerprint `set_value` re-walks against, and which attribute is left to
 /// describe the node.
-fn read_label(el: &AXUIElement, attr_name: &str) -> Option<String> {
-    match ffi::attribute_string_checked(el, attr_name) {
-        Ok(text) => text.and_then(|text| normalize_name(&text)),
+fn read_label(
+    el: &AXUIElement,
+    attr_name: &str,
+    deadline: SemanticDeadline,
+) -> Result<Option<String>> {
+    match deadline.observe(|| ffi::attribute_string_checked(el, attr_name))? {
+        Ok(text) => Ok(text.and_then(|text| normalize_name(&text))),
         Err(err) => {
             eprintln!(
                 "glass-a11y-macos: {attr_name} read failed: {err}; treating the element as \
                  having no {attr_name}"
             );
-            None
+            Ok(None)
         }
     }
 }
 
 /// `el`'s `name` as [`walk`] records it: the fingerprint `set_value`/`invoke` re-walk against has
 /// to come from the same reads, in the same order, that produced the name in the snapshot.
-fn read_name(el: &AXUIElement) -> Option<String> {
-    mapping::node_name(read_label(el, attr::TITLE), || {
-        read_label(el, attr::DESCRIPTION)
-    })
+fn read_name(el: &AXUIElement, deadline: SemanticDeadline) -> Result<Option<String>> {
+    let title = read_label(el, attr::TITLE, deadline)?;
+    match title {
+        Some(title) => Ok(Some(title)),
+        None => read_label(el, attr::DESCRIPTION, deadline),
+    }
 }
 
 /// `el`'s `AXSubrole`, but only for the base roles whose subrole actually changes the mapped
@@ -415,20 +512,45 @@ fn read_name(el: &AXUIElement) -> Option<String> {
 /// than an obviously-wrong one, marked nowhere in the emitted tree. Clicking it still works (this
 /// backend actuates by pointer or native action, neither consulting the role), so the symptom is a
 /// switch an agent cannot select by role or verify by state, not one it cannot press.
-fn read_subrole(el: &AXUIElement, ax_role: &str) -> Option<String> {
+fn read_subrole(
+    el: &AXUIElement,
+    ax_role: &str,
+    deadline: SemanticDeadline,
+) -> Result<Option<String>> {
     if !mapping::subrole_matters(ax_role) {
-        return None;
+        deadline.require()?;
+        return Ok(None);
     }
-    match ffi::attribute_string_checked(el, attr::SUBROLE) {
-        Ok(sub) => sub,
+    match deadline.observe(|| ffi::attribute_string_checked(el, attr::SUBROLE))? {
+        Ok(sub) => Ok(sub),
         Err(err) => {
             eprintln!(
                 "glass-a11y-macos: AXSubrole read failed for role={ax_role:?}: {err}; \
                  treating the element as having no subrole"
             );
-            None
+            Ok(None)
         }
     }
+}
+
+fn read_labels(
+    el: &AXUIElement,
+    deadline: SemanticDeadline,
+) -> Result<(Option<String>, Option<String>)> {
+    let title = read_label(el, attr::TITLE, deadline)?;
+    if title.is_none() {
+        let description = read_label(el, attr::DESCRIPTION, deadline)?;
+        let help = read_label(el, attr::HELP, deadline)?;
+        return deadline.run(|| Ok(mapping::labels(title, || description, || help)));
+    }
+
+    let help = read_label(el, attr::HELP, deadline)?;
+    let description = if help.is_none() {
+        read_label(el, attr::DESCRIPTION, deadline)?
+    } else {
+        None
+    };
+    deadline.run(|| Ok(mapping::labels(title, || description, || help)))
 }
 
 /// Pre-order walk: build this element's [`AxNode`], then recurse into its (non-skipped)
@@ -441,14 +563,18 @@ fn walk(
     scale: f64,
     depth: usize,
     budget: &mut WalkBudget,
-) -> AxNode {
+    deadline: SemanticDeadline,
+) -> Result<AxNode> {
+    deadline.require()?;
     budget.visit();
 
-    let ax_role = ffi::attribute_string(el, attr::ROLE).unwrap_or_default();
+    let ax_role = deadline
+        .observe(|| ffi::attribute_string(el, attr::ROLE))?
+        .unwrap_or_default();
     let subrole = if ax_role == "AXTextField" {
-        ffi::attribute_string(el, attr::SUBROLE)
+        deadline.observe(|| ffi::attribute_string(el, attr::SUBROLE))?
     } else {
-        read_subrole(el, &ax_role)
+        read_subrole(el, &ax_role, deadline)?
     };
     let role = mapping::map_role(&ax_role, subrole.as_deref());
     // `raw_role` is normally the same AX role string `map_role` matched on — the token, not
@@ -464,7 +590,9 @@ fn walk(
     // If both are absent `raw_role` stays empty: a "role unknown" signal, not a guaranteed
     // field.
     let raw_role = if ax_role.is_empty() || ax_role == "AXUnknown" {
-        ffi::attribute_string(el, attr::ROLE_DESCRIPTION).unwrap_or(ax_role)
+        deadline
+            .observe(|| ffi::attribute_string(el, attr::ROLE_DESCRIPTION))?
+            .unwrap_or(ax_role)
     } else {
         match &subrole {
             Some(sub)
@@ -480,18 +608,15 @@ fn walk(
     // Which attribute names the node and which is left to describe it is decided in
     // `mapping::labels`, where the rule — and which reads it declines to make — is unit-tested on
     // any host.
-    let (name, description) = mapping::labels(
-        read_label(el, attr::TITLE),
-        || read_label(el, attr::DESCRIPTION),
-        || read_label(el, attr::HELP),
-    );
-    let value = ffi::attribute_string(el, attr::VALUE);
-    let bounds = window_relative_rect(el, scale, win);
+    let (name, description) = read_labels(el, deadline)?;
+    let value = deadline.observe(|| ffi::attribute_string(el, attr::VALUE))?;
+    let bounds = window_relative_rect(el, scale, win, deadline)?;
     let states = mapping::map_states(&gather_states(
         el,
         role,
         subrole.as_deref() == Some("AXSecureTextField"),
-    ));
+        deadline,
+    )?);
 
     let mut children = Vec::new();
     // `ffi::children` returns `Ok(vec![])` for a legitimately-childless (or absent-
@@ -503,14 +628,16 @@ fn walk(
     //
     // Resolved before the gate below: a childless node must never be reported truncated
     // for declining to explore a list that was already empty.
-    let child_els = ffi::children(el).unwrap_or_else(|err| {
-        budget.note_unreadable();
-        eprintln!(
-            "glass-a11y-macos: walk: AXChildren read failed for role={raw_role:?} \
+    let child_els = deadline
+        .observe(|| ffi::children(el))?
+        .unwrap_or_else(|err| {
+            budget.note_unreadable();
+            eprintln!(
+                "glass-a11y-macos: walk: AXChildren read failed for role={raw_role:?} \
              bounds={bounds:?}: {err}; treating as no children"
-        );
-        Vec::new()
-    });
+            );
+            Vec::new()
+        });
     // Gated on the raw `child_els`, not filtered by `should_skip` first. A node whose children
     // are all skipped, reached once the node/depth budget is spent, still records a truncation
     // though nothing real was declined. Pre-filtering would mean calling `should_skip` — a live
@@ -521,16 +648,18 @@ fn walk(
         // could otherwise iterate without ever tripping it. `MAX_SIBLINGS` bounds the
         // per-level scan regardless of how many are skipped (mirrors the Windows reader).
         for (scanned, child) in child_els.into_iter().enumerate() {
+            deadline.require()?;
             if !budget.may_visit_sibling(scanned) {
                 break;
             }
-            if !should_skip(&child) {
-                children.push(walk(&child, win, scale, depth + 1, budget));
+            if !should_skip(&child, deadline)? {
+                children.push(walk(&child, win, scale, depth + 1, budget, deadline)?);
             }
         }
     }
 
-    AxNode {
+    deadline.require()?;
+    Ok(AxNode {
         id: AxNodeId(0), // assigned by glass_core::AxTree::assign_ids
         role,
         raw_role,
@@ -540,7 +669,7 @@ fn walk(
         states,
         bounds,
         children,
-    }
+    })
 }
 
 /// Whether to prune `el` from the walk: it has no positive-area geometry (zero-size /
@@ -548,8 +677,11 @@ fn walk(
 /// reusable predicate so [`find_nth`] prunes identically and its pre-order ids line up with
 /// this walk's. A node whose size can't be read is *kept* (its `bounds` become `None`)
 /// rather than pruned, so an unreadable-geometry container never silently drops its subtree.
-fn should_skip(el: &AXUIElement) -> bool {
-    matches!(ffi::ax_size(el), Ok((w, h)) if w <= 0.0 || h <= 0.0)
+fn should_skip(el: &AXUIElement, deadline: SemanticDeadline) -> Result<bool> {
+    Ok(matches!(
+        deadline.observe(|| ffi::ax_size(el))?,
+        Ok((w, h)) if w <= 0.0 || h <= 0.0
+    ))
 }
 
 /// Pre-order walk mirroring [`walk`]'s traversal — same `should_skip` predicate, same
@@ -567,59 +699,77 @@ fn find_nth(
     depth: usize,
     budget: &mut WalkBudget,
     target: u32,
-) -> Option<CFRetained<AXUIElement>> {
+    deadline: SemanticDeadline,
+) -> Result<Option<CFRetained<AXUIElement>>> {
+    deadline.require()?;
     if budget.nodes_walked() == target as usize {
-        return Some(el);
+        return Ok(Some(el));
     }
     budget.visit();
     // Resolved before the gate: a childless node must never be reported truncated for
     // declining to explore a list that was already empty.
     // Counted and logged exactly as `walk` does — the same failure was diagnosable in one
     // traversal and invisible in the other.
-    let child_els = ffi::children(&el).unwrap_or_else(|err| {
-        budget.note_unreadable();
-        eprintln!(
-            "glass-a11y-macos: find_nth: AXChildren read failed: {err}; treating as no children"
-        );
-        Vec::new()
-    });
+    let child_els = deadline
+        .observe(|| ffi::children(&el))?
+        .unwrap_or_else(|err| {
+            budget.note_unreadable();
+            eprintln!(
+                "glass-a11y-macos: find_nth: AXChildren read failed: {err}; treating as no children"
+            );
+            Vec::new()
+        });
     // Same gap as `walk`: gated on the raw `child_els`, before `should_skip` runs. A node whose
     // children are all skipped, reached once the budget is spent, still records a truncation
     // though nothing real was declined — left as-is for the same reason: pre-filtering means
     // calling `should_skip` over the whole list, the scan `MAX_SIBLINGS` exists to bound.
     if child_els.is_empty() || !budget.may_explore_children(depth) {
-        return None;
+        deadline.require()?;
+        return Ok(None);
     }
     // Same per-level bound as walk(), so find_nth can't spin either.
     for (scanned, child) in child_els.into_iter().enumerate() {
+        deadline.require()?;
         if !budget.may_visit_sibling(scanned) {
             break;
         }
-        if !should_skip(&child)
-            && let Some(found) = find_nth(child, depth + 1, budget, target)
+        if !should_skip(&child, deadline)?
+            && let Some(found) = find_nth(child, depth + 1, budget, target, deadline)?
         {
-            return Some(found);
+            return Ok(Some(found));
         }
     }
-    None
+    deadline.require()?;
+    Ok(None)
 }
 
 /// `el`'s window-relative bounds in pixels, or `None` when position/size can't be read or
 /// the element has zero area. Shares `glass_core::coords`'s point→pixel conversion with the
 /// capture/input path so a11y bounds and click geometry can't drift.
-fn window_relative_rect(el: &AXUIElement, scale: f64, win: &WindowGeometry) -> Option<AxRect> {
-    let (pos_x, pos_y) = ffi::ax_position(el).ok()?;
-    let (size_w, size_h) = ffi::ax_size(el).ok()?;
+fn window_relative_rect(
+    el: &AXUIElement,
+    scale: f64,
+    win: &WindowGeometry,
+    deadline: SemanticDeadline,
+) -> Result<Option<AxRect>> {
+    let Ok((pos_x, pos_y)) = deadline.observe(|| ffi::ax_position(el))? else {
+        return Ok(None);
+    };
+    let Ok((size_w, size_h)) = deadline.observe(|| ffi::ax_size(el))? else {
+        return Ok(None);
+    };
     let g = pixel_geometry_from_content_rect(pos_x, pos_y, size_w, size_h, scale);
     if g.width == 0 || g.height == 0 {
-        return None;
+        deadline.require()?;
+        return Ok(None);
     }
-    Some(AxRect {
+    deadline.require()?;
+    Ok(Some(AxRect {
         x: g.x - win.x,
         y: g.y - win.y,
         width: g.width,
         height: g.height,
-    })
+    }))
 }
 
 /// Gather the plain state facts `mapping::map_states` normalizes: `AXEnabled`/`AXFocused`
@@ -629,12 +779,17 @@ fn window_relative_rect(el: &AXUIElement, scale: f64, win: &WindowGeometry) -> O
 /// unreadable value claims neither). The remaining facts stay at their defaults — macOS doesn't
 /// expose them as simple universal attributes, and the reader never over-claims a state it
 /// didn't read.
-fn gather_states(el: &AXUIElement, role: AxRole, secure: bool) -> AxStateFacts {
+fn gather_states(
+    el: &AXUIElement,
+    role: AxRole,
+    secure: bool,
+    deadline: SemanticDeadline,
+) -> Result<AxStateFacts> {
     // Only a checkbox/radio/switch carries a checked state, so read the numeric `AXValue` (an
     // extra AX IPC round-trip) only for those roles — every other node skips it. `ToggleButton`
     // is where a switch lands, whichever base role its toolkit gave it.
     let (checkable, checked) = if mapping::role_carries_checked(role) {
-        let value = ffi::attribute_i64(el, attr::VALUE);
+        let value = deadline.observe(|| ffi::attribute_i64(el, attr::VALUE))?;
         if value.is_none() {
             // A control of this role with no readable numeric value claims neither checked nor
             // unchecked (the #170 invariant), so `condition:"checked"` silently matches nothing —
@@ -647,16 +802,90 @@ fn gather_states(el: &AXUIElement, role: AxRole, secure: bool) -> AxStateFacts {
         }
         mapping::checkable_checked(role, value)
     } else {
+        deadline.require()?;
         (false, false)
     };
-    AxStateFacts {
-        enabled: ffi::attribute_bool(el, attr::ENABLED).unwrap_or(false),
-        focused: ffi::attribute_bool(el, attr::FOCUSED).unwrap_or(false),
-        focusable: ffi::is_settable(el, attr::FOCUSED),
-        editable: ffi::is_settable(el, attr::VALUE),
+    let enabled = deadline
+        .observe(|| ffi::attribute_bool(el, attr::ENABLED))?
+        .unwrap_or(false);
+    let focused = deadline
+        .observe(|| ffi::attribute_bool(el, attr::FOCUSED))?
+        .unwrap_or(false);
+    let focusable = deadline.observe(|| ffi::is_settable(el, attr::FOCUSED))?;
+    let editable = deadline.observe(|| ffi::is_settable(el, attr::VALUE))?;
+    deadline.require()?;
+    Ok(AxStateFacts {
+        enabled,
+        focused,
+        focusable,
+        editable,
         secure,
         checkable,
         checked,
         ..Default::default()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glass_core::{BoundDispatch, BoundKind, Deadline, WalkLimits};
+
+    fn context(deadline: Deadline) -> AxContext {
+        AxContext {
+            pids: vec![1],
+            window: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 200,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline,
+        }
+    }
+
+    fn target() -> AxTarget {
+        AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Note".into()),
+            bounds: None,
+            value: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_with_a_spent_deadline_starts_no_ax_read() {
+        let mut a11y = MacosA11y::new();
+        let error = a11y
+            .snapshot(&context(Deadline::from_millis(0)))
+            .expect_err("a spent snapshot must stop before checking AX trust");
+
+        assert!(matches!(error, GlassError::AccessibilityNotReady(_)));
+    }
+
+    #[test]
+    fn set_value_with_a_spent_deadline_cannot_dispatch() {
+        let mut a11y = MacosA11y::new();
+        let error = a11y
+            .set_value(&context(Deadline::from_millis(0)), &target(), "new")
+            .expect_err("a spent set_value must stop before resolving the target");
+
+        assert_eq!(error.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn invoke_with_a_spent_deadline_cannot_dispatch() {
+        let mut a11y = MacosA11y::new();
+        let error = a11y
+            .invoke(&context(Deadline::from_millis(0)), &target())
+            .expect_err("a spent invoke must stop before resolving the target");
+
+        assert_eq!(error.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
     }
 }

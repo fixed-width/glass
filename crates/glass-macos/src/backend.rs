@@ -317,10 +317,18 @@ impl MacosPlatform {
     ///
     /// Scoped to `&[pid]` so a stale or foreign id can never silently resolve to another app's
     /// window — it surfaces `GlassError::WindowNotFound` instead.
-    fn resolve_active_window(&self, pid: i32) -> Result<crate::scwindow::WindowMatch> {
+    fn resolve_active_window(
+        &self,
+        pid: i32,
+        deadline: Deadline,
+    ) -> Result<crate::scwindow::WindowMatch> {
         match self.active_window {
-            Some(id) => crate::scwindow::find_window_by_id(id, &[pid], WINDOW_RESOLVE_TIMEOUT),
-            None => crate::scwindow::find_window_for_pids(&[pid], WINDOW_RESOLVE_TIMEOUT),
+            Some(id) => {
+                crate::scwindow::find_window_by_id_by(id, &[pid], WINDOW_RESOLVE_TIMEOUT, deadline)
+            }
+            None => {
+                crate::scwindow::find_window_for_pids_by(&[pid], WINDOW_RESOLVE_TIMEOUT, deadline)
+            }
         }
     }
 
@@ -792,7 +800,7 @@ impl Platform for MacosPlatform {
         }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
-        let m = self.resolve_active_window(pid as i32)?;
+        let m = self.resolve_active_window(pid as i32, deadline)?;
         check_pointer_bounds(event, &m.geometry)?;
         crate::input::send_pointer_by(event, m.pid, m.scale, m.origin_pt, deadline)
     }
@@ -814,7 +822,7 @@ impl Platform for MacosPlatform {
         }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
-        let m = self.resolve_active_window(pid as i32)?;
+        let m = self.resolve_active_window(pid as i32, deadline)?;
         crate::input::send_key_by(event, m.pid, deadline)
     }
     /// Resolve the active window's `AXUIElement` (fresh every call, same rationale as
