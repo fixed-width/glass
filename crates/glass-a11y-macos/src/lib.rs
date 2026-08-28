@@ -7,6 +7,7 @@
 
 pub mod doctor; // pure probe->Check mapping (cross-platform) + the macOS-only AX probe
 pub mod mapping; // pure AX->normalized mapping — cross-platform, unit-tested on any host
+pub mod messaging_timeout; // one process-global AX timeout owner shared with glass-macos
 pub mod select_diagnostic; // pure select_window candidate-line rendering — cross-platform, unit-tested on any host
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -21,3 +22,6 @@ mod ffi;
 mod reader;
 #[cfg(target_os = "macos")]
 pub use reader::MacosA11y;
+
+#[cfg(test)]
+mod messaging_timeout_tests;

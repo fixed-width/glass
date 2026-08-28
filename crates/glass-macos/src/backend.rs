@@ -587,9 +587,13 @@ fn window_info_from(w: crate::scwindow::AppWindow, active_window: Option<u32>) -
 /// step after `Focus`/`Move`/`Resize`'s mutation, and the sole step for `Geometry`. Reuses
 /// `coords::pixel_geometry_from_content_rect`'s point->pixel scaling so this crate keeps one
 /// scaling implementation, not two.
-fn read_ax_geometry(el: &AXUIElement, scale: f64) -> Result<WindowGeometry> {
-    let (x, y) = axwindow::ax_position(el)?;
-    let (width, height) = axwindow::ax_size(el)?;
+fn read_ax_geometry(
+    scope: &mut axwindow::AxMessageScope<'_, '_>,
+    el: &AXUIElement,
+    scale: f64,
+) -> Result<WindowGeometry> {
+    let (x, y) = axwindow::ax_position(scope, el)?;
+    let (width, height) = axwindow::ax_size(scope, el)?;
     Ok(coords::pixel_geometry_from_content_rect(
         x, y, width, height, scale,
     ))
@@ -856,66 +860,79 @@ impl Platform for MacosPlatform {
         // `&[pid as i32]`-scoped (final-review fix 1): `id` came from this backend's own
         // `active_window`, but scoping the lookup here too means a stale/foreign id can
         // never resolve to another app's window.
-        let m = crate::scwindow::find_window_by_id_by(
-            id,
-            &[pid as i32],
-            WINDOW_RESOLVE_TIMEOUT,
-            deadline,
-        )
-        .map_err(|error| {
-            if error.bound_owner() == Some(glass_core::Whose::Caller)
-                && error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched)
-            {
-                GlassError::caller_deadline_elapsed("macOS window query")
-            } else {
-                error
-            }
-        })?;
         let mut mutation_dispatched = false;
-        let result = axwindow::with_messaging_timeout_by(deadline, || {
-            let el =
-                axwindow::ax_window_for_cgwindowid(pid as i32, id, m.geometry.clone(), m.scale)?;
+        let result = axwindow::with_window_query_by(
+            deadline,
+            || {
+                crate::scwindow::find_window_by_id_by(
+                    id,
+                    &[pid as i32],
+                    WINDOW_RESOLVE_TIMEOUT,
+                    deadline,
+                )
+                .map_err(|error| {
+                    if error.bound_owner() == Some(glass_core::Whose::Caller)
+                        && error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched)
+                    {
+                        GlassError::caller_deadline_elapsed("macOS window query")
+                    } else {
+                        error
+                    }
+                })
+            },
+            |m, scope| {
+                let el = axwindow::ax_window_for_cgwindowid(
+                    scope,
+                    pid as i32,
+                    id,
+                    m.geometry.clone(),
+                    m.scale,
+                )?;
 
-            match *op {
-                WindowOp::Focus => {
-                    mutation_dispatched = true;
-                    crate::input::focus(pid as i32)?;
-                    axwindow::ax_raise(&el)?;
-                    axwindow::ax_set_main(&el)?;
-                    read_ax_geometry(&el, m.scale)
-                }
-                WindowOp::Move { x, y } => {
-                    let target_pt = coords::global_pixel_to_point((x, y), m.scale);
-                    mutation_dispatched = true;
-                    axwindow::ax_set_position(&el, target_pt)?;
-                    let geom = read_ax_geometry(&el, m.scale)?;
-                    if !move_took_effect(&m.geometry, &geom, x, y) {
-                        return Err(GlassError::Backend(format!(
-                            "window move to ({x},{y}) px did not take; window is at ({},{})",
-                            geom.x, geom.y
-                        )));
+                match *op {
+                    WindowOp::Focus => {
+                        if deadline.has_passed() {
+                            return Err(GlassError::caller_deadline_elapsed("macOS window focus"));
+                        }
+                        mutation_dispatched = true;
+                        crate::input::focus(pid as i32)?;
+                        axwindow::ax_raise(scope, &el)?;
+                        axwindow::ax_set_main(scope, &el)?;
+                        read_ax_geometry(scope, &el, m.scale)
                     }
-                    Ok(geom)
-                }
-                WindowOp::Resize { width, height } => {
-                    let target_size_pt = (width as f64 / m.scale, height as f64 / m.scale);
-                    mutation_dispatched = true;
-                    axwindow::ax_set_size(&el, target_size_pt)?;
-                    let pos = axwindow::ax_position(&el)?;
-                    axwindow::ax_set_position(&el, pos)?;
-                    axwindow::ax_set_size(&el, target_size_pt)?;
-                    let geom = read_ax_geometry(&el, m.scale)?;
-                    if resize_was_refused(&m.geometry, &geom, width, height) {
-                        return Err(GlassError::Backend(format!(
-                            "window resize to {width}x{height} px was refused; window remains {}x{}",
-                            geom.width, geom.height
-                        )));
+                    WindowOp::Move { x, y } => {
+                        let target_pt = coords::global_pixel_to_point((x, y), m.scale);
+                        mutation_dispatched = true;
+                        axwindow::ax_set_position(scope, &el, target_pt)?;
+                        let geom = read_ax_geometry(scope, &el, m.scale)?;
+                        if !move_took_effect(&m.geometry, &geom, x, y) {
+                            return Err(GlassError::Backend(format!(
+                                "window move to ({x},{y}) px did not take; window is at ({},{})",
+                                geom.x, geom.y
+                            )));
+                        }
+                        Ok(geom)
                     }
-                    Ok(geom)
+                    WindowOp::Resize { width, height } => {
+                        let target_size_pt = (width as f64 / m.scale, height as f64 / m.scale);
+                        mutation_dispatched = true;
+                        axwindow::ax_set_size(scope, &el, target_size_pt)?;
+                        let pos = axwindow::ax_position(scope, &el)?;
+                        axwindow::ax_set_position(scope, &el, pos)?;
+                        axwindow::ax_set_size(scope, &el, target_size_pt)?;
+                        let geom = read_ax_geometry(scope, &el, m.scale)?;
+                        if resize_was_refused(&m.geometry, &geom, width, height) {
+                            return Err(GlassError::Backend(format!(
+                                "window resize to {width}x{height} px was refused; window remains {}x{}",
+                                geom.width, geom.height
+                            )));
+                        }
+                        Ok(geom)
+                    }
+                    WindowOp::Geometry => read_ax_geometry(scope, &el, m.scale),
                 }
-                WindowOp::Geometry => read_ax_geometry(&el, m.scale),
-            }
-        });
+            },
+        );
         let result = if mutation_dispatched {
             result.map_err(GlassError::after_dispatch)
         } else {

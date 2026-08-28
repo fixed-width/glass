@@ -92,9 +92,9 @@ const FALLBACK_TOLERANCE_PX: i32 = 8;
 /// module; not a supported way to configure glass in normal use.
 const FORCE_AX_GEOMETRY_FALLBACK_ENV: &str = "GLASS_MACOS_FORCE_AX_GEOMETRY_FALLBACK";
 
-struct SystemWideAxMessaging;
+pub(crate) struct SystemWideAxMessaging;
 
-impl crate::ax_timeout::AxMessaging for SystemWideAxMessaging {
+impl glass_a11y_macos::messaging_timeout::AxMessaging for SystemWideAxMessaging {
     type Element = CFRetained<AXUIElement>;
 
     fn system_wide_element(&self) -> Self::Element {
@@ -117,13 +117,17 @@ impl crate::ax_timeout::AxMessaging for SystemWideAxMessaging {
     }
 }
 
+pub(crate) type AxMessageScope<'owner, 'ax> =
+    glass_a11y_macos::messaging_timeout::MessageScope<'owner, 'ax, SystemWideAxMessaging>;
+
 /// Run all exact AX object creation and work under one serialized process-global timeout scope.
 /// Unbounded callers are serialized with bounded scopes but leave AX's default timeout untouched.
-pub(crate) fn with_messaging_timeout_by<T>(
+pub(crate) fn with_window_query_by<Q, T>(
     deadline: Deadline,
-    operation: impl FnOnce() -> Result<T>,
+    query: impl FnOnce() -> Result<Q>,
+    operation: impl FnOnce(Q, &mut AxMessageScope<'_, '_>) -> Result<T>,
 ) -> Result<T> {
-    crate::ax_timeout::with_messaging_timeout_by(&SystemWideAxMessaging, deadline, operation)
+    crate::ax_timeout::with_window_query_by(&SystemWideAxMessaging, deadline, query, operation)
 }
 
 /// Resolve the `AXUIElement` window for `pid` whose `CGWindowID` is `window_id`.
@@ -140,6 +144,7 @@ pub(crate) fn with_messaging_timeout_by<T>(
 /// this goes straight to the geometry fallback (test-only diagnostic — see that constant's
 /// doc).
 pub(crate) fn ax_window_for_cgwindowid(
+    scope: &mut AxMessageScope<'_, '_>,
     pid: i32,
     window_id: u32,
     geometry_px: WindowGeometry,
@@ -149,14 +154,15 @@ pub(crate) fn ax_window_for_cgwindowid(
     // contract (the binding itself `.expect()`s on this); `pid` is a plain process id with
     // no aliasing/lifetime preconditions.
     let app = unsafe { AXUIElement::new_application(pid) };
-    let windows = ax_windows(&app)?;
+    let windows = ax_windows(scope, &app)?;
 
     if std::env::var_os(FORCE_AX_GEOMETRY_FALLBACK_ENV).is_some() {
         eprintln!(
             "glass-macos: {FORCE_AX_GEOMETRY_FALLBACK_ENV} set; skipping _AXUIElementGetWindow \
              and forcing the geometry fallback for CGWindowID {window_id} (test-only diagnostic)"
         );
-        return geometry_fallback(&windows, &geometry_px, scale).ok_or(GlassError::WindowNotFound);
+        return geometry_fallback(scope, &windows, &geometry_px, scale)?
+            .ok_or(GlassError::WindowNotFound);
     }
 
     let mut any_private_call_succeeded = false;
@@ -165,7 +171,11 @@ pub(crate) fn ax_window_for_cgwindowid(
         // SAFETY: `w` is a live `AXUIElement` window just yielded by `kAXWindows`; `wid`
         // is a valid local out-param. See the symbol's declaration above for the broader
         // private-API contract this call relies on.
-        let err = unsafe { _AXUIElementGetWindow(&w, &mut wid) };
+        let err = scope.message("resolve AX window id", || {
+            // SAFETY: `w` is a live `AXUIElement` window just yielded by `kAXWindows`; `wid`
+            // is a valid local out-param. See the symbol declaration for the private API contract.
+            Ok(unsafe { _AXUIElementGetWindow(&w, &mut wid) })
+        })?;
         if err == AXError::Success {
             any_private_call_succeeded = true;
             if wid == window_id {
@@ -179,7 +189,7 @@ pub(crate) fn ax_window_for_cgwindowid(
             "glass-macos: _AXUIElementGetWindow errored on every AX window for pid {pid}; \
              falling back to geometry match for CGWindowID {window_id}"
         );
-        if let Some(w) = geometry_fallback(&windows, &geometry_px, scale) {
+        if let Some(w) = geometry_fallback(scope, &windows, &geometry_px, scale)? {
             return Ok(w);
         }
     }
@@ -188,8 +198,11 @@ pub(crate) fn ax_window_for_cgwindowid(
 
 /// Read `el`'s `AXPosition` (top-left, in points — Quartz's global screen space, same unit
 /// `coords.rs`'s `global_pixel_to_point`/`point_to_global_pixel` convert to/from).
-pub(crate) fn ax_position(el: &AXUIElement) -> Result<(f64, f64)> {
-    let value = attribute_axvalue(el, "AXPosition")?;
+pub(crate) fn ax_position(
+    scope: &mut AxMessageScope<'_, '_>,
+    el: &AXUIElement,
+) -> Result<(f64, f64)> {
+    let value = attribute_axvalue(scope, el, "AXPosition")?;
     let mut point = CGPoint { x: 0.0, y: 0.0 };
     // SAFETY: `value` was just verified (via `downcast`) to be a real `AXValue`; `point`
     // is a valid local out-param whose type matches the requested `AXValueType::CGPoint` —
@@ -204,8 +217,8 @@ pub(crate) fn ax_position(el: &AXUIElement) -> Result<(f64, f64)> {
 }
 
 /// Read `el`'s `AXSize` (width/height, in points).
-pub(crate) fn ax_size(el: &AXUIElement) -> Result<(f64, f64)> {
-    let value = attribute_axvalue(el, "AXSize")?;
+pub(crate) fn ax_size(scope: &mut AxMessageScope<'_, '_>, el: &AXUIElement) -> Result<(f64, f64)> {
+    let value = attribute_axvalue(scope, el, "AXSize")?;
     let mut size = CGSize {
         width: 0.0,
         height: 0.0,
@@ -224,8 +237,13 @@ pub(crate) fn ax_size(el: &AXUIElement) -> Result<(f64, f64)> {
 /// success; does not read back to verify the value actually took — that's `backend.rs`'s
 /// `window(op)` (Task 4), which reads back every mutating op through `ax_position`/
 /// `ax_size` and returns a structured error if the change didn't land.
-pub(crate) fn ax_set_position(el: &AXUIElement, pos: (f64, f64)) -> Result<()> {
+pub(crate) fn ax_set_position(
+    scope: &mut AxMessageScope<'_, '_>,
+    el: &AXUIElement,
+    pos: (f64, f64),
+) -> Result<()> {
     set_axvalue(
+        scope,
         el,
         "AXPosition",
         AXValueType::CGPoint,
@@ -235,8 +253,13 @@ pub(crate) fn ax_set_position(el: &AXUIElement, pos: (f64, f64)) -> Result<()> {
 
 /// Set `el`'s `AXSize` to `size` (points). Same no-read-back-verify contract as
 /// [`ax_set_position`].
-pub(crate) fn ax_set_size(el: &AXUIElement, size: (f64, f64)) -> Result<()> {
+pub(crate) fn ax_set_size(
+    scope: &mut AxMessageScope<'_, '_>,
+    el: &AXUIElement,
+    size: (f64, f64),
+) -> Result<()> {
     set_axvalue(
+        scope,
         el,
         "AXSize",
         AXValueType::CGSize,
@@ -248,11 +271,12 @@ pub(crate) fn ax_set_size(el: &AXUIElement, size: (f64, f64)) -> Result<()> {
 }
 
 /// Raise `el` to the front of its application's window list (`kAXRaiseAction`).
-pub(crate) fn ax_raise(el: &AXUIElement) -> Result<()> {
+pub(crate) fn ax_raise(scope: &mut AxMessageScope<'_, '_>, el: &AXUIElement) -> Result<()> {
     let action = CFString::from_str("AXRaise");
-    // SAFETY: `el` is a live `AXUIElement`; matches `AXUIElementPerformAction`'s
-    // documented contract (element + action name, no other preconditions).
-    let err = unsafe { el.perform_action(&action) };
+    let err = scope.message("AXRaise", || {
+        // SAFETY: `el` is live; matches `AXUIElementPerformAction`'s documented contract.
+        Ok(unsafe { el.perform_action(&action) })
+    })?;
     if err != AXError::Success {
         return Err(ax_backend_err("AXRaise", err));
     }
@@ -260,15 +284,16 @@ pub(crate) fn ax_raise(el: &AXUIElement) -> Result<()> {
 }
 
 /// Mark `el` as its application's main window (`kAXMainAttribute` = true).
-pub(crate) fn ax_set_main(el: &AXUIElement) -> Result<()> {
+pub(crate) fn ax_set_main(scope: &mut AxMessageScope<'_, '_>, el: &AXUIElement) -> Result<()> {
     let attr = CFString::from_str("AXMain");
     // SAFETY: `kCFBooleanTrue` is a framework-owned singleton that is always live for the
     // process's lifetime; reading the extern static is a plain global read.
     let value = unsafe { kCFBooleanTrue }
         .ok_or_else(|| GlassError::Backend("kCFBooleanTrue unavailable".into()))?;
-    // SAFETY: `el` is live; `value` derefs to `&CFType` (see the module doc's CFType-memory
-    // section); matches `AXUIElementSetAttributeValue`'s documented contract.
-    let err = unsafe { el.set_attribute_value(&attr, value) };
+    let err = scope.message("AXMain", || {
+        // SAFETY: `el` is live; `value` derefs to `&CFType`; matches the documented setter.
+        Ok(unsafe { el.set_attribute_value(&attr, value) })
+    })?;
     if err != AXError::Success {
         return Err(ax_backend_err("AXMain", err));
     }
@@ -276,8 +301,11 @@ pub(crate) fn ax_set_main(el: &AXUIElement) -> Result<()> {
 }
 
 /// Copy `app`'s `kAXWindows` attribute and reinterpret it as a typed `CFArray<AXUIElement>`.
-fn ax_windows(app: &AXUIElement) -> Result<CFRetained<CFArray<AXUIElement>>> {
-    let cftype = copy_attribute(app, "AXWindows")?;
+fn ax_windows(
+    scope: &mut AxMessageScope<'_, '_>,
+    app: &AXUIElement,
+) -> Result<CFRetained<CFArray<AXUIElement>>> {
+    let cftype = copy_attribute(scope, app, "AXWindows")?;
     let arr = cftype
         .downcast::<CFArray>()
         .map_err(|_| GlassError::Backend("kAXWindowsAttribute did not return a CFArray".into()))?;
@@ -290,8 +318,12 @@ fn ax_windows(app: &AXUIElement) -> Result<CFRetained<CFArray<AXUIElement>>> {
 
 /// Copy `el`'s `attr_name` attribute value, downcast-checked to a concrete `AXValue`
 /// (position/size are always `AXValue`-wrapped `CGPoint`/`CGSize`, never a bare `CFType`).
-fn attribute_axvalue(el: &AXUIElement, attr_name: &str) -> Result<CFRetained<AXValue>> {
-    let cftype = copy_attribute(el, attr_name)?;
+fn attribute_axvalue(
+    scope: &mut AxMessageScope<'_, '_>,
+    el: &AXUIElement,
+    attr_name: &str,
+) -> Result<CFRetained<AXValue>> {
+    let cftype = copy_attribute(scope, el, attr_name)?;
     cftype
         .downcast::<AXValue>()
         .map_err(|_| GlassError::Backend(format!("{attr_name} did not return an AXValue")))
@@ -300,12 +332,17 @@ fn attribute_axvalue(el: &AXUIElement, attr_name: &str) -> Result<CFRetained<AXV
 /// `AXUIElementCopyAttributeValue(el, attr_name, ...)`, wrapping the already-retained (+1,
 /// per Core Foundation's Copy/Create rule — see the module doc) raw result in a
 /// `CFRetained<CFType>` so it's released automatically when dropped.
-fn copy_attribute(el: &AXUIElement, attr_name: &str) -> Result<CFRetained<CFType>> {
+fn copy_attribute(
+    scope: &mut AxMessageScope<'_, '_>,
+    el: &AXUIElement,
+    attr_name: &str,
+) -> Result<CFRetained<CFType>> {
     let attr = CFString::from_str(attr_name);
     let mut raw: *const CFType = std::ptr::null();
-    // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
-    // `AXUIElementCopyAttributeValue`'s documented signature. No other preconditions.
-    let err = unsafe { el.copy_attribute_value(&attr, NonNull::from(&mut raw)) };
+    let err = scope.message(attr_name, || {
+        // SAFETY: `el` is live; `raw` is a valid out-param matching the documented signature.
+        Ok(unsafe { el.copy_attribute_value(&attr, NonNull::from(&mut raw)) })
+    })?;
     if err != AXError::Success {
         return Err(ax_backend_err(attr_name, err));
     }
@@ -323,6 +360,7 @@ fn copy_attribute(el: &AXUIElement, attr_name: &str) -> Result<CFRetained<CFType
 /// `AXValueCreate(value_type, value)` + `AXUIElementSetAttributeValue(el, attr_name, ...)`
 /// — the shared body of [`ax_set_position`]/[`ax_set_size`].
 fn set_axvalue<T>(
+    scope: &mut AxMessageScope<'_, '_>,
     el: &AXUIElement,
     attr_name: &str,
     value_type: AXValueType,
@@ -336,9 +374,10 @@ fn set_axvalue<T>(
     let ax_value = unsafe { AXValue::new(value_type, NonNull::from(value).cast()) }
         .ok_or_else(|| GlassError::Backend(format!("AXValueCreate({attr_name}) failed")))?;
     let attr = CFString::from_str(attr_name);
-    // SAFETY: `el` is live; `ax_value` derefs to `&CFType` (see the module doc); matches
-    // `AXUIElementSetAttributeValue`'s documented contract.
-    let err = unsafe { el.set_attribute_value(&attr, &ax_value) };
+    let err = scope.message(attr_name, || {
+        // SAFETY: `el` is live; `ax_value` derefs to `&CFType`; matches the documented setter.
+        Ok(unsafe { el.set_attribute_value(&attr, &ax_value) })
+    })?;
     if err != AXError::Success {
         return Err(ax_backend_err(attr_name, err));
     }
@@ -359,14 +398,17 @@ fn ax_backend_err(context: &str, err: AXError) -> GlassError {
 /// within tolerance (including if reading any candidate's geometry itself fails — a window
 /// this fallback can't measure is not a usable match).
 fn geometry_fallback(
+    scope: &mut AxMessageScope<'_, '_>,
     windows: &CFArray<AXUIElement>,
     target_px: &WindowGeometry,
     scale: f64,
-) -> Option<CFRetained<AXUIElement>> {
+) -> Result<Option<CFRetained<AXUIElement>>> {
     let mut best: Option<(i64, CFRetained<AXUIElement>)> = None;
     for w in windows.iter() {
-        let Ok(geom) = ax_geometry_px(&w, scale) else {
-            continue;
+        let geom = match ax_geometry_px(scope, &w, scale) {
+            Ok(geometry) => geometry,
+            Err(error) if error.bound().is_some() => return Err(error),
+            Err(_) => continue,
         };
         if !within_tolerance(&geom, target_px) {
             continue;
@@ -380,14 +422,18 @@ fn geometry_fallback(
             best = Some((score, w));
         }
     }
-    best.map(|(_, w)| w)
+    Ok(best.map(|(_, w)| w))
 }
 
 /// Read `el`'s position/size (points) and convert to pixel `WindowGeometry` via `scale` —
 /// the same `point_to_global_pixel` conversion `coords.rs` documents for window ops.
-fn ax_geometry_px(el: &AXUIElement, scale: f64) -> Result<WindowGeometry> {
-    let (x, y) = point_to_global_pixel(ax_position(el)?, scale);
-    let (w, h) = point_to_global_pixel(ax_size(el)?, scale);
+fn ax_geometry_px(
+    scope: &mut AxMessageScope<'_, '_>,
+    el: &AXUIElement,
+    scale: f64,
+) -> Result<WindowGeometry> {
+    let (x, y) = point_to_global_pixel(ax_position(scope, el)?, scale);
+    let (w, h) = point_to_global_pixel(ax_size(scope, el)?, scale);
     Ok(WindowGeometry {
         x,
         y,
