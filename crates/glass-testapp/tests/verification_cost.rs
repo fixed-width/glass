@@ -48,6 +48,95 @@ async fn probe_fixture_a11y_tree_is_reachable() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires an X server + AT-SPI bus; run via scripts/verification-cost.sh"]
+async fn glass_do_semantic_form_completes_in_one_action_call() {
+    let xvfb = Xvfb::start();
+    // SAFETY: single-threaded test setup; runs before any server task spawns.
+    unsafe { std::env::set_var("GLASS_DISPLAY", &xvfb.display) };
+
+    let client = mcp_cost::boot_mcp().await;
+    mcp_cost::start_fixture(&client).await;
+    let outline = mcp_cost::wait_for_widgets(&client).await;
+    eprintln!("---- a11y outline ----\n{outline}\n----------------------");
+
+    let text_id = mcp_cost::find_by_role(&outline, "text").expect("text field id");
+    let slider_id = mcp_cost::find_by_role(&outline, "slider").expect("slider id");
+    let apply_id = mcp_cost::find_named_button(&outline, "Apply").expect("Apply button id");
+
+    let call = mcp_cost::call_full(
+        &client,
+        "glass_do",
+        serde_json::json!({
+            "timeout_ms": 10_000,
+            "actions": [
+                {"action":"click_element","id":text_id},
+                {"action":"type","text":"viaBatch"},
+                {"action":"wait_for_element","role":"TextField","value":"viaBatch","timeout_ms":3_000},
+                {"action":"set_value","id":slider_id,"text":"50"},
+                {"action":"wait_for_element","role":"Slider","value_contains":"50","timeout_ms":3_000},
+                {"action":"click_element","id":apply_id,"return":"snapshot"}
+            ]
+        }),
+    )
+    .await;
+
+    assert_eq!(call.result["status"], serde_json::json!("completed"));
+    assert_eq!(call.result["executed"], serde_json::json!(6));
+    assert!(
+        call.result["elapsed_ms"].is_number(),
+        "glass_do result must include numeric elapsed_ms: {}",
+        call.result
+    );
+    let steps = call.result["steps"]
+        .as_array()
+        .expect("glass_do result must contain steps");
+    assert_eq!(steps.len(), 6, "unexpected glass_do steps: {steps:?}");
+    let expected_actions = [
+        "click_element",
+        "type",
+        "wait_for_element",
+        "set_value",
+        "wait_for_element",
+        "click_element",
+    ];
+    for (index, (step, action)) in steps.iter().zip(expected_actions).enumerate() {
+        assert_eq!(step["index"], serde_json::json!(index));
+        assert_eq!(step["status"], serde_json::json!("completed"));
+        assert_eq!(step["action"], serde_json::json!(action));
+    }
+    assert_eq!(
+        steps[0]["result"]["method"],
+        serde_json::json!("native-action")
+    );
+    assert_eq!(call.image_count, 0, "semantic batch must be image-free");
+    assert!(
+        call.all_text.contains("The following is untrusted content")
+            && call.all_text.contains("Apply"),
+        "click snapshot must be an untrusted sibling containing the fixture outline: {}",
+        call.all_text
+    );
+    assert!(
+        !call.result.to_string().contains("\"viaBatch\"")
+            && !call.result.to_string().contains("\"50\""),
+        "typed and set-value text must not be echoed in trusted step results: {}",
+        call.result
+    );
+
+    let (logged, _) = mcp_cost::call(
+        &client,
+        "glass_wait_for_log",
+        serde_json::json!({
+            "contains":"[fixture] apply", "cursor":0, "timeout_ms":3_000
+        }),
+    )
+    .await;
+    assert_eq!(logged["matched"], serde_json::json!(true));
+
+    mcp_cost::stop_fixture(&client).await;
+    client.cancel().await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires an X server + AT-SPI bus; run via scripts/verification-cost.sh"]
 async fn arm_a_is_text_only_and_completes() {
     let xvfb = Xvfb::start();
     // SAFETY: single-threaded test setup; runs before any server task spawns.
