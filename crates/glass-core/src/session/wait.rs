@@ -379,6 +379,9 @@ impl Glass {
                 true
             },
             || {
+                if looked && whose == crate::Whose::Callee && deadline.has_passed() {
+                    return Ok(None);
+                }
                 // Restrict polling to the watched region when present.
                 let compatibility_capture = !looked && params.timeout_ms == 0;
                 let capture_deadline = if compatibility_capture || whose == crate::Whose::Caller {
@@ -1109,6 +1112,31 @@ mod tests {
         let deadlines = deadlines.lock().unwrap();
         assert_eq!(deadlines.len(), 2);
         assert_eq!(deadlines[1], caller);
+    }
+
+    #[test]
+    fn callee_timeout_does_not_start_a_capture_at_the_spent_action_deadline() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])])
+            .with_capture_log(captures.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 50,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 10,
+                stability_region: None,
+                ignore: Vec::new(),
+                window: None,
+            })
+            .unwrap();
+
+        assert!(!outcome.settled);
+        assert_eq!(captures.lock().unwrap().len(), 1);
     }
 
     #[test]
