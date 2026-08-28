@@ -803,8 +803,7 @@ fn type_return_snapshot_is_retained_in_content_blocks() {
 
 #[test]
 fn type_action_with_return_none_is_allowed() {
-    // "none" is the documented no-observe default — an explicit `"return":"none"`
-    // is semantically identical to omitting the field and must not be rejected.
+    // Explicit `"return":"none"` must match the documented omission default.
     let log = Arc::new(Mutex::new(Vec::new()));
     let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
     let out = do_actions(
@@ -1435,14 +1434,8 @@ fn then_settle_is_text_only() {
 
 #[test]
 fn then_settle_ignore_masks_a_blinking_pixel_so_it_settles() {
-    // `settle_args()` must forward `SettleArgs.ignore` into `WaitStableParams.ignore`:
-    // with no `#[serde(deny_unknown_fields)]` in this crate, a dropped field still parses
-    // and just does nothing. Pixel (1,1) blinks across the three scripted frames while
-    // the rest of the 2x2 stays constant, so only masking it settles within
-    // `settle_frames`.
-    //
-    // Pinning the capture count to 3 rules out settling by outlasting the frames into
-    // `FakePlatform`'s repeat-forever fallback.
+    // Pixel (1,1) blinks for three captures, so only forwarding `ignore` settles before
+    // `FakePlatform` repeats its final frame.
     let log = Arc::new(Mutex::new(0usize));
     let mut f0 = Frame::solid(2, 2, [10, 10, 10, 255]);
     let mut f1 = f0.clone();
@@ -1541,8 +1534,7 @@ fn then_screenshot_appends_image() {
 
 #[test]
 fn then_settle_timeout_still_succeeds() {
-    // settle_frames=2 but timeout_ms=0 -> one tick, never settles -> settled:false,
-    // yet do_actions returns Ok (a settle timeout is not a batch failure).
+    // A zero timeout permits one tick, while failure to settle remains a successful batch outcome.
     let mut g =
         started(FakePlatform::new(2, 2).with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]));
     let out = do_actions(
@@ -2003,10 +1995,8 @@ fn terminal_content_blocks_reference_images_and_notes_in_response_order() {
 
 #[test]
 fn split_sub_requires_ok_and_tool_and_keeps_siblings() {
-    // A well-formed sub-tool output (screenshot's shape): [Image, envelope, IMAGE_NOTE].
-    // The envelope carries a `result` key alongside `ok`/`tool`; a bare JSON object
-    // with only a `result` key (no `ok`/`tool`) must NOT match the tightened
-    // predicate — it's included here as a leading sibling to prove that.
+    // A leading bare `{"result":...}` sibling must not match the valid
+    // `[Image, envelope, IMAGE_NOTE]` shape.
     let out = ToolOutput(vec![
         OutContent::Text(json!({ "result": "not the real envelope" }).to_string()),
         OutContent::Image(vec![1, 2, 3]),

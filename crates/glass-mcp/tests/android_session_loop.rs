@@ -28,16 +28,13 @@ use tokio_util::sync::CancellationToken;
 const AWAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const AWAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 const MCP_CLIENT_CANCEL_BUDGET: Duration = Duration::from_secs(2);
-// The server has a 3s HTTP drain and a 3s bounded session teardown. Leave 2s for scheduling and
-// transport cancellation without turning a real cleanup stall into an indefinite test hang.
+// Allow 8s for both 3s server cleanup phases plus scheduling and transport cancellation.
 const MCP_SERVER_JOIN_BUDGET: Duration = Duration::from_secs(8);
 
-/// Build the same session factory that `glass_mcp::boot` uses, with registries owned by the
-/// caller's cleanup guard.
+/// Build `glass_mcp::boot`'s session factory with registries owned by the cleanup guard.
 fn session_glass(device: &Companions) -> Glass {
-    // The two shapes of `boot`'s own factory closure: `make_platform` takes the iOS Simulator
-    // registry on macOS only. The registries are handles to shared state, so the closure's clones
-    // are the ones `device` shuts down.
+    // On macOS, `make_platform` also captures the iOS registry whose cloned handle lets `device`
+    // shut down shared state.
     #[cfg(target_os = "macos")]
     let sim = glass_ios::SimulatorRegistry::new();
     #[cfg(target_os = "macos")]
@@ -70,8 +67,7 @@ fn session_glass(device: &Companions) -> Glass {
     )
 }
 
-/// An HTTP MCP client and the server task that owns its session. The outer test always awaits the
-/// server's graceful shutdown, even if the spawned proof task panics.
+/// An HTTP MCP client whose server task is gracefully shut down even after a proof panic.
 struct McpHarness {
     client: RunningService<RoleClient, ()>,
     cancel: CancellationToken,
@@ -89,8 +85,7 @@ impl McpHarness {
             cancel,
             server,
         } = self;
-        // Signal the server before waiting on the client transport: a stalled DELETE must not
-        // delay the server's own bounded drain and session teardown.
+        // Signal first so a stalled DELETE cannot delay bounded server drain and session teardown.
         cancel.cancel();
         let client = await_cleanup(
             "MCP client cancellation",
@@ -179,8 +174,7 @@ async fn boot_mcp(glass: Glass) -> McpHarness {
     }
 }
 
-/// Parse only a complete trusted success envelope for this tool. Untrusted app-derived sibling
-/// blocks remain diagnostics and never provide a result.
+/// Parse only the requested tool's complete trusted success envelope, never app-derived siblings.
 fn successful_envelope_result(text: &str, tool: &str) -> Option<Value> {
     let envelope = serde_json::from_str::<Value>(text).ok()?;
     (envelope.get("ok") == Some(&Value::Bool(true))
@@ -380,10 +374,8 @@ fn a_session_click_reports_the_native_accessibility_action() {
     glass.stop().expect("stop the session");
 }
 
-/// The Compose fixture's outline names the editable field `"Name"`, exposes the Save control as
-/// its sole `Button`, and gives the counter `desc="Counter"` with `"Clicked 1"` after the click.
-/// The waits deliberately run inside the one batch so the IME-induced relayout is confirmed
-/// semantically.
+/// Prove one batch survives IME relayout across the unique Name field, Save button, and Counter
+/// `"Clicked 1"` state.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a booted AVD + GLASS_ADB + GLASS_ANDROID_A11Y_APK + GLASS_ANDROID_FIXTURE_APK"]
 async fn glass_do_android_ime_form_is_confirmed_end_to_end() {

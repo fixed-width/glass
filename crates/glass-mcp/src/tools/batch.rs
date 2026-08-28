@@ -340,8 +340,7 @@ fn step_failure(
 
 fn redacted_error_detail(action: &Action, detail: &str) -> String {
     match action {
-        // A dispatch failure may include the submitted text in an escaped, encoded, or
-        // otherwise transformed form. Its raw detail is therefore secret-tainted.
+        // Raw dispatch errors are secret-tainted because submitted text may appear transformed.
         Action::Type(_) | Action::SetValue(_) => {
             "input dispatch failed; submitted text withheld".into()
         }

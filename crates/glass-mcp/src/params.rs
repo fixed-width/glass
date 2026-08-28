@@ -142,9 +142,8 @@ pub struct ClickElementArgs {
     /// control itself, the native action fires on the enclosing control and the
     /// result carries `actuated_id` — the element actually clicked.
     pub id: u32,
-    /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
-    /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI
-    /// to stop changing, text-only), or "none" (default).
+    /// Terminal observation: "snapshot" settles and refreshes/folds a11y, "settle" waits for text
+    /// stability, and "none" skips observation (default).
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }
@@ -265,9 +264,8 @@ pub struct TypeArgs {
     /// focus a field, so click or `glass_click_element` one first. Sent as synthetic
     /// key events, not pasted, so an app's per-keystroke handlers run.
     pub text: String,
-    /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
-    /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI
-    /// to stop changing, text-only), or "none" (default).
+    /// Terminal observation: "snapshot" settles and refreshes/folds a11y, "settle" waits for text
+    /// stability, and "none" skips observation (default).
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }

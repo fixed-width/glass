@@ -249,7 +249,7 @@ pub struct ScrollToElementOutcome {
     pub reversed: bool,
     /// The resolved (possibly inferred) primary sweep direction.
     pub direction: ScrollDirection,
-    /// Which timeout ended the sweep. `None` for a match, saturation, or the step cap.
+    /// The ending timeout, or `None` for a match, saturation, or the step cap.
     #[doc(hidden)]
     pub timed_out_by: Option<crate::Whose>,
 }
@@ -379,7 +379,7 @@ impl Glass {
                 true
             },
             || {
-                // Poll only the watched region (cheap) when one is set; else the full window.
+                // Restrict polling to the watched region when present.
                 let compatibility_capture = !looked && params.timeout_ms == 0;
                 let capture_deadline = if compatibility_capture || whose == crate::Whose::Caller {
                     caller

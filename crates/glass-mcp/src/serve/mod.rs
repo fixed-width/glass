@@ -20,8 +20,7 @@ use crate::server::GlassServer;
 use config::{Exposure, ServeConfig};
 use session_gate::SingleSessionManager;
 
-/// Once shutdown begins, give in-flight HTTP responses a finite chance to drain before dropping
-/// the serving future and entering the independently bounded session teardown path.
+/// HTTP drain allowance after shutdown begins and before bounded session teardown.
 const HTTP_GRACEFUL_DRAIN_BUDGET: Duration = Duration::from_secs(3);
 
 /// The fail-closed bind gate (spec D4): refuse to bind a network-exposed address
@@ -165,9 +164,8 @@ pub async fn run_on(
     .await
 }
 
-/// Serve on an already-bound listener until `shutdown` resolves, then tear down the active
-/// session through the same bounded path as a process signal. `run_on` supplies the process
-/// signal; embedding callers can supply an owned cancellation future and await this future.
+/// Serve a bound listener until caller-supplied shutdown, then run the bounded teardown that
+/// `run_on` triggers from a process signal.
 pub async fn run_on_until(
     listener: tokio::net::TcpListener,
     cfg: ServeConfig,
@@ -200,9 +198,7 @@ pub async fn run_on_until(
     }
 }
 
-/// Complete the bounded session teardown whether the server exits normally or its graceful drain
-/// times out. Keeping this ordering in one seam lets the persistent-drain test prove teardown is
-/// not skipped when the serving future is dropped.
+/// Complete bounded session teardown even if graceful HTTP drain times out.
 async fn run_server_then_teardown<T>(
     server: impl Future<Output = T>,
     shutdown: impl Future<Output = ()>,
@@ -215,9 +211,8 @@ async fn run_server_then_teardown<T>(
     result
 }
 
-/// Run the server normally until it exits or the caller requests shutdown. Only after shutdown is
-/// requested does `drain_budget` apply. Cancelling the shared token first stops active MCP
-/// transports while Axum drains outstanding HTTP work.
+/// Serve until exit or shutdown, then cancel MCP transports and apply `drain_budget` to outstanding
+/// HTTP work.
 async fn wait_for_server_or_shutdown<T>(
     server: impl Future<Output = T>,
     shutdown: impl Future<Output = ()>,

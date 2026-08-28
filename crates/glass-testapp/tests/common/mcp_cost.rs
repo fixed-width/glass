@@ -130,10 +130,8 @@ fn successful_envelope_result(text: &str, tool: &str) -> Option<Value> {
     .flatten()
 }
 
-/// Call a tool while retaining its trusted result, every text block, and image count.
-///
-/// Only a successful envelope for the requested tool supplies `result`; wrapped target-app
-/// content is retained in `all_text` but never parsed as trusted output.
+/// Call a tool while retaining its trusted result, all text blocks, and image count without
+/// treating app-derived text as trusted output.
 pub async fn call_full(client: &Peer<RoleClient>, tool: &str, args: Value) -> CallView {
     let arguments = args
         .as_object()

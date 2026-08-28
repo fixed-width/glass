@@ -83,9 +83,7 @@ impl Deadline {
         self.budget(budget, now).0
     }
 
-    /// The duration a call actually gets, and whose bound supplied it.
-    ///
-    /// A tie belongs to the callee, matching [`Self::resolve`].
+    /// The effective duration and owner, with ties resolving to the callee as in [`Self::resolve`].
     pub fn budget(
         self,
         own: std::time::Duration,

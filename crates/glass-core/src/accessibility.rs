@@ -1243,30 +1243,17 @@ pub trait Accessibility {
         Err(crate::error::GlassError::AxUnsupported)
     }
 
-    /// Actuate the element identified by `target` through the platform's native
-    /// accessibility operation appropriate to the element. This is usually
-    /// press/activate for command controls and may be focus for editable text
-    /// controls. The backend re-walks pre-order to `target.id`, verifies the
-    /// fingerprint (role+name, and bounds where its `set_value` does), then
-    /// confirms the operation's required semantic effect.
+    /// Actuate `target` through its role-appropriate native accessibility operation after
+    /// rewalking by id, verifying its fingerprint, and confirming the required effect.
     ///
-    /// Returns the element the action actually fired on, when that is **not**
-    /// `target.id` — a backend whose toolkit carries a control's activation on an
-    /// ancestor of the node that carries its label actuates that ancestor, and the
-    /// caller reports the substitution. `None` means the target itself was actuated.
+    /// Returns a substituted element id when the toolkit actuates an ancestor, or `None` when it
+    /// actuates `target`.
     ///
-    /// **Error contract.** The caller falls back to a synthetic pointer click for
-    /// exactly two outcomes, both meaning *nothing was dispatched*:
-    /// [`crate::GlassError::AxUnsupported`] (this backend has no invoke) and
-    /// [`crate::GlassError::AxActionUnavailable`] (the element exposes no activation
-    /// action). Every other error propagates to the agent. So an implementation MUST
-    /// report anything that may have dispatched — an action the toolkit ran but
-    /// reported failed, a transport error whose answer was lost, a timeout — as
-    /// `AxActionFailed`/`AccessibilityUnavailable`, and MUST NOT flatten such a case
-    /// into `AxActionUnavailable`: a pointer click layered on top of a native action
-    /// that still lands actuates the control twice. `AxElementChanged` (fingerprint
-    /// mismatch) likewise propagates — a drifted tree would mis-click by stale
-    /// coordinates too.
+    /// Only [`crate::GlassError::AxUnsupported`] and
+    /// [`crate::GlassError::AxActionUnavailable`] guarantee no dispatch and permit pointer
+    /// fallback. Backends must preserve possibly-dispatched failures as `AxActionFailed` or
+    /// `AccessibilityUnavailable`; `AxElementChanged` also propagates to prevent stale-coordinate
+    /// clicks.
     ///
     /// Default: unsupported.
     fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
@@ -1277,10 +1264,8 @@ pub trait Accessibility {
 /// How `click_element` actuated the target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClickMethod {
-    /// A native accessibility operation actuated the target; no pointer was synthesized.
-    /// The operation may be press/activate or another role-appropriate effect such as focusing
-    /// an editable text control. `actuated` names the element acted on when it is not the one the
-    /// caller asked for, and is `None` when they are the same element.
+    /// Native accessibility actuated the target without a pointer, with `actuated` naming a
+    /// substituted element or `None` for `target`.
     NativeAction { actuated: Option<AxNodeId> },
     /// The synthetic pointer path ran; `native_fallback` says why the native
     /// action was not used (there is always a reason — invoke is attempted first).

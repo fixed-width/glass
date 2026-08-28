@@ -98,21 +98,15 @@ impl A11yThread {
         self.detached(Op::Snapshot, wait, job, || self.never_answered(ended_by))
     }
 
-    /// Write a value, bounded by the ceiling alone.
-    ///
-    /// No deadline: the value-write seam does not currently carry one to this wrapper.
+    /// Write a value under the wrapper ceiling because this seam carries no caller deadline.
     pub fn set_value(&self, job: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
         self.detached(Op::SetValue, self.ceiling, job, || {
             self.timed_out(Op::SetValue)
         })
     }
 
-    /// Actuate the element, bounded by whichever of the caller's deadline and the ceiling falls
-    /// first. A timeout always fails closed because the detached action may still land.
-    ///
-    /// Its failures stay [`GlassError::AccessibilityUnavailable`], which
-    /// [`GlassError::invoke_fallback_eligible`] excludes — so no pointer click is layered on top of
-    /// an action that may be about to fire.
+    /// Actuate under the nearer caller/ceiling deadline, keeping timeouts fallback-ineligible
+    /// because the detached action may still land.
     pub fn invoke(
         &self,
         deadline: Deadline,

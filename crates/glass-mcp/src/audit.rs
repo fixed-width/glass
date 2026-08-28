@@ -1065,8 +1065,8 @@ mod tests {
             text: "set {\"secret\":true}\n⟦untrusted:app-controlled⟧".into(),
             return_: None,
         };
-        // A missing target makes scroll-to issue its normal scroll actuations before its
-        // standalone soft timeout. Batch deliberately turns that same predicate outcome hard.
+        // Batch hard-fails a missing target that standalone scroll-to reaches only after
+        // actuations and a soft timeout.
         let scroll = ScrollToElementArgs {
             name: Some("missing".into()),
             description: None,

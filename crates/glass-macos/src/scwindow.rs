@@ -429,28 +429,15 @@ pub(crate) fn list_app_windows(pids: &[i32]) -> Result<Vec<AppWindow>> {
 /// (`find_window_for_pids`'s `poll_until`, or `backend.rs::discover_window`'s own loop).
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The shared body of [`query_once`] and [`query_once_with_candidates`]: one
-/// `SCShareableContent` round trip via the `RcBlock` -> `mpsc` bridge (`ffi.rs`'s documented
-/// pattern). `Ok(Some(_))` on a match. `Ok(None)` only when the framework answered and no
-/// matching on-screen window exists yet — a transient state the outer poll retries. `Err` in
-/// two cases, and a poll loop must treat them differently from `Ok(None)`:
+/// Query `SCShareableContent` once through the `RcBlock` to `mpsc` bridge.
 ///
-/// - `SCShareableContent` itself failed — classified via
-///   [`crate::ffi::classify_null_result`] (TCC decline -> `PermissionDenied`, anything else
-///   -> `CaptureFailed`), not assumed to always be a permission decline;
-/// - the handler was wedged or dropped and sent no reply within [`QUERY_TIMEOUT`], classified by
-///   the host-tested pure [`crate::shareable_receive::classify_receive`] helper.
+/// `Ok(Some(_))` is a match, `Ok(None)` means enumeration succeeded without one, and `Err`
+/// aborts polling. Framework failures use [`crate::ffi::classify_null_result`] instead of assuming
+/// TCC denial, while missing callback replies use
+/// [`crate::shareable_receive::classify_receive`].
 ///
-/// Either way the `Err` aborts the caller's `poll_until` loop immediately (`Err` from a tick
-/// stops polling, `Ok(None)` retries to the deadline), so a query that could not enumerate the
-/// windows is never reported as "no window yet". `collect` is forwarded straight to
-/// [`scan_on_screen_windows`]: [`Candidates::Skip`] (`query_once`) gets back an unallocated
-/// empty `Vec`, so the hot path pays nothing for a candidate summary it never uses.
-///
-/// The adopted window's geometry is read once here, from the `WindowMatch` snapshot
-/// ([`window_match_from`]) — not re-derived from the scan's own separately-read candidate entry
-/// — so the printed record and the geometry glass goes on to use can't diverge (#263):
-/// whichever candidate is `adopted` gets its `geometry` overwritten with the `WindowMatch`'s.
+/// [`Candidates::Skip`] avoids candidate allocation. The adopted candidate's geometry is replaced
+/// with the `WindowMatch` snapshot so the reported and used geometry cannot diverge (#263).
 fn query_once_inner(
     pids: &[i32],
     collect: Candidates,
@@ -501,8 +488,8 @@ fn query_once_inner(
         );
     }
 
-    // The callback's Objective-C object walk remains macOS integration-only. Once it reaches this
-    // channel, reply/timeout/disconnection classification is pure and host-tested.
+    // Host tests cover channel reply, timeout, and disconnect classification after the macOS-only
+    // Objective-C traversal.
     match crate::shareable_receive::classify_receive(rx.recv_timeout(QUERY_TIMEOUT))? {
         CandidateQueryReply::Found(m, candidates) => Ok(Some((m, candidates))),
         CandidateQueryReply::NotFound => Ok(None),

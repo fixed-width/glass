@@ -462,10 +462,8 @@ impl Glass {
             // No cache patch here either: the verify poll below re-snapshots, so `last_ax`
             // holds the tree that observed the toggle.
             self.click_element_inner(id, deadline)?; // the toggle actuation (a swipe for a row-shaped control)
-            // Not event-gated: this branch runs only on iOS, whose reader has no event stream.
-            // The strict nearer of the caller and glass's own verification timeout bounds every
-            // read. Kept as the poll runs, not re-read afterwards: a read taken after the winning
-            // bound elapsed could catch a state that arrived late and contradict the verdict.
+            // iOS has no event stream, so polling uses the nearer caller/verification deadline
+            // and never accepts state read after expiry.
             let now = std::time::Instant::now();
             let (budget, whose) = deadline.budget(
                 std::time::Duration::from_millis(TOGGLE_VERIFY_TIMEOUT_MS),
@@ -3709,8 +3707,8 @@ mod tests {
                 _text: &str,
             ) -> Result<()> {
                 self.stages.lock().unwrap().push(("dispatch", ctx.deadline));
-                // `Accessibility::set_value` is core's contract boundary. A real backend performs
-                // its post-write relocation/read-back before returning through this same context.
+                // Real backends complete post-write relocation and read-back before returning
+                // through this core contract.
                 self.stages
                     .lock()
                     .unwrap()

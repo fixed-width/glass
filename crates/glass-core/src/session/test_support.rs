@@ -1133,8 +1133,8 @@ pub(crate) fn glass_with_a11y_until_deadline(
     (g, seen)
 }
 
-/// A reader that starts inside a bounded snapshot budget, consumes the rest of it, and reports the
-/// same readiness error used by deadline-honouring platform readers. Unbounded reads answer.
+/// A reader that consumes bounded snapshot budgets with the platform readiness error but answers
+/// unbounded reads.
 pub(crate) struct NotReadyAtDeadline {
     pub(crate) tree: AxTree,
     pub(crate) seen: Arc<Mutex<Vec<Deadline>>>,

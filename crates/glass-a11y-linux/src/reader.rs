@@ -858,14 +858,11 @@ async fn verify_toggle_flipped(
     ))
 }
 
-/// Actuate the element identified by `target` via its role-appropriate native AT-SPI operation — the
-/// backend for `Accessibility::invoke`. Re-walks pre-order to `target.id`, verifies
-/// the fingerprint (same gate as `set_value_async`, guarding a stale id / mirror
-/// drift), then focuses a text editor or fires the first action in [`ACTIVATE_ACTION_NAMES`].
+/// Actuate `target` through its role-appropriate AT-SPI operation after rewalking by id and
+/// verifying the same stale-target fingerprint as `set_value_async`.
 ///
-/// When the action that fired is [`TOGGLE_ACTION`], the ack alone is not accepted as
-/// success: the control's boolean state must be observed to change (see
-/// [`verify_toggle_flipped`]).
+/// Text editors receive focus, while other controls fire the first [`ACTIVATE_ACTION_NAMES`] match.
+/// [`TOGGLE_ACTION`] succeeds only after [`verify_toggle_flipped`] observes a state change.
 async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
     let (app_ref, conn) = find_app(ctx).await?;
     let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;

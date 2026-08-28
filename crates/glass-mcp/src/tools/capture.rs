@@ -76,10 +76,8 @@ pub(crate) fn wait_stable_with(
     let outcome = glass
         .wait_stable_by(&params, context.deadline)
         .map_err(|e| {
-            // A zero-timeout wait still performs its compatibility capture. Core marks a
-            // successful capture that answered after a bounded caller left as `TimedOut`.
-            // Use that typed provenance only when the actual shared deadline is now spent;
-            // ordinary capture/region/backend errors have no bound and stay action failures.
+            // Core marks a successful zero-timeout compatibility capture `TimedOut` only after
+            // the shared deadline, while unrelated errors remain action failures.
             if params.timeout_ms == 0
                 && e.bound() == Some(glass_core::BoundKind::TimedOut)
                 && context.deadline.has_passed()
