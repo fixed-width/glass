@@ -116,14 +116,22 @@ impl IdbInjector {
     /// single-contact (a second concurrent DOWN relocates the same finger), so a pinch is
     /// the only multi-contact gesture there is anything to map onto.
     pub fn pointer_events(&self, e: &PointerEvent) -> Result<Vec<proto::HidEvent>> {
+        glass_core::validate_pointer_input(e)?;
         let s = self.scale;
         Ok(match *e {
             PointerEvent::Move { .. } => vec![], // touch has no hover
             // A touch has no modifier concept (unlike a mouse click with Ctrl/Shift
             // held), so any `modifiers` on the event are intentionally not applied.
             PointerEvent::Click { x, y, count, .. } => {
-                let mut v = Vec::new();
-                for _ in 0..count.max(1) {
+                let capacity = usize::try_from(count)
+                    .ok()
+                    .and_then(|count| count.checked_mul(2))
+                    .ok_or_else(|| {
+                        GlassError::InvalidPointerInput("click event count overflowed")
+                            .before_dispatch()
+                    })?;
+                let mut v = Vec::with_capacity(capacity);
+                for _ in 0..count {
                     v.push(touch(point(x, y, s), true));
                     v.push(touch(point(x, y, s), false));
                 }
@@ -146,8 +154,8 @@ impl IdbInjector {
             }
             PointerEvent::Scroll { x, y, dx, dy, .. } => {
                 // Touch scroll = swipe opposite the wheel direction, anchored at the point.
-                let ex = x - dx * SCROLL_STEP_PX;
-                let ey = y - dy * SCROLL_STEP_PX;
+                let ex = x.saturating_sub(dx.saturating_mul(SCROLL_STEP_PX));
+                let ey = y.saturating_sub(dy.saturating_mul(SCROLL_STEP_PX));
                 vec![swipe(point(x, y, s), point(ex, ey, s), SWIPE_SECS)]
             }
             // The vendored proto's `HIDEvent` oneof carries one multi-contact event: a canned

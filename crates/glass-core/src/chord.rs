@@ -49,24 +49,17 @@ fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
 }
 
 fn attach_cleanup_failure(
-    mut primary: GlassError,
+    primary: GlassError,
     cleanup: GlassError,
-    release: &str,
+    release: &'static str,
 ) -> GlassError {
-    let note = format!("; cleanup failed while releasing {release}: {cleanup}");
-    match &mut primary {
-        GlassError::Backend(message) | GlassError::Bounded { message, .. } => {
-            message.push_str(&note);
-        }
-        _ => eprintln!("glass-core: {primary}{note}"),
-    }
-    primary
+    GlassError::input_cleanup_failed(release, primary, cleanup)
 }
 
 fn combine_cleanup(
     primary: crate::Result<()>,
     cleanup: crate::Result<()>,
-    release: &str,
+    release: &'static str,
 ) -> crate::Result<()> {
     match (primary, cleanup) {
         (Err(primary), Err(cleanup)) => Err(attach_cleanup_failure(primary, cleanup, release)),
@@ -79,7 +72,7 @@ fn combine_cleanup(
 fn preserve_primary_after_cleanup(primary: GlassError, cleanup: crate::Result<()>) -> GlassError {
     match cleanup {
         Ok(()) => primary,
-        Err(cleanup) => attach_cleanup_failure(primary, cleanup, "the chord"),
+        Err(cleanup) => attach_cleanup_failure(primary, cleanup, "releasing the chord"),
     }
 }
 
@@ -92,7 +85,7 @@ fn cleanup_chord<S: ChordSink>(
     // failed key release never prevents the modifier release attempt.
     let key = if key_down { sink.key(false) } else { Ok(()) };
     if modifiers_down {
-        combine_cleanup(key, sink.modifiers(false), "the chord modifiers")
+        combine_cleanup(key, sink.modifiers(false), "releasing the chord modifiers")
     } else {
         key
     }
@@ -326,6 +319,21 @@ mod tests {
 
         assert!(error.to_string().contains("key release failed"));
         assert!(error.to_string().contains("modifier cleanup failed"));
+        let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("both chord release failures must stay structured");
+        };
+        assert_eq!(operation, "releasing the chord");
+        assert!(
+            matches!(*primary, GlassError::Backend(message) if message == "key release failed")
+        );
+        assert!(
+            matches!(*cleanup, GlassError::Backend(message) if message == "modifier cleanup failed")
+        );
         assert_eq!(sink.0.calls.last(), Some(&Call::Mods(false)));
     }
 }

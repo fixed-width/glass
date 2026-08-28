@@ -122,6 +122,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 false,
                 Some(SafeErrorCategory::SequenceDeadlineExceeded),
                 "sequence deadline exceeded before action started",
+                None,
                 true,
                 steps,
                 siblings,
@@ -200,6 +201,11 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 let detail = redacted_error_detail(action, &error);
                 let attempted =
                     error.bound_dispatch != Some(glass_core::BoundDispatch::NotDispatched);
+                let summary = matches!(
+                    error.category,
+                    SafeErrorCategory::InvalidValue | SafeErrorCategory::OptionNotFound
+                )
+                .then_some(error.safe_summary);
                 return Err(step_failure(
                     &a.actions,
                     i,
@@ -208,6 +214,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                     attempted && action.is_side_effecting(),
                     Some(error.category),
                     detail,
+                    summary,
                     error.sequence_deadline_exceeded,
                     steps,
                     siblings,
@@ -322,16 +329,18 @@ fn step_failure(
     side_effects_may_have_occurred: bool,
     category: Option<SafeErrorCategory>,
     detail: &str,
+    summary: Option<&str>,
     sequence_deadline_exceeded: bool,
     mut steps: Vec<StepOutcome>,
     mut siblings: Vec<OutContent>,
     elapsed_ms: u128,
 ) -> ToolOutput {
-    let (code, summary) = if sequence_deadline_exceeded {
+    let (code, default_summary) = if sequence_deadline_exceeded {
         ("sequence_deadline_exceeded", "sequence deadline exceeded")
     } else {
         ("action_failed", "action execution failed")
     };
+    let summary = summary.unwrap_or(default_summary);
     let content_block = siblings.len() + 1;
     siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(detail)));
     steps.push(StepOutcome::Failed {

@@ -36,6 +36,8 @@ enum DeadlineBehavior {
     UnsupportedAccessibility,
     PermissionDenied,
     TransportFailure,
+    InvalidBoolean,
+    OptionNotFound,
     OtherFailure,
     ResizeAfterOneScroll,
 }
@@ -220,6 +222,14 @@ impl Accessibility for DeadlineAccessibility {
                 )
                 .before_dispatch())
             }
+            DeadlineBehavior::InvalidBoolean => {
+                Err(GlassError::AxValueNotBoolean(target.id.0, text.to_owned()))
+            }
+            DeadlineBehavior::OptionNotFound => Err(GlassError::AxOptionNotFound(
+                target.id.0,
+                text.to_owned(),
+                "app-derived option list".into(),
+            )),
             _ => Ok(()),
         }
     }
@@ -350,7 +360,9 @@ impl Platform for DeadlinePlatform {
             | DeadlineBehavior::SetValueCallerDeadline
             | DeadlineBehavior::SetValueBackendDeadline
             | DeadlineBehavior::SetValueTransportFailure
-            | DeadlineBehavior::SetValueWorkerSpawnFailure => self.inner.send_pointer(event),
+            | DeadlineBehavior::SetValueWorkerSpawnFailure
+            | DeadlineBehavior::InvalidBoolean
+            | DeadlineBehavior::OptionNotFound => self.inner.send_pointer(event),
         }
     }
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> GlassResult<()> {
@@ -607,6 +619,65 @@ fn set_value_secret_failure_preserves_no_active_session_without_echoing_input() 
         "no_active_session"
     );
     assert_secret_absent(&error, secret);
+}
+
+fn assert_safe_set_value_category(
+    behavior: DeadlineBehavior,
+    secret: &str,
+    expected_category: &str,
+    expected_summary: &str,
+) {
+    let (mut glass, _, _, _) =
+        deadline_a11y_glass_with_behavior(behavior, vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+    let error = do_actions(
+        &mut glass,
+        &DoArgs {
+            actions: vec![Action::SetValue(SetValueArgs {
+                id: 1,
+                text: secret.into(),
+                return_: None,
+            })],
+            then: None,
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+
+    let trusted = envelope(&error);
+    assert_eq!(
+        trusted["outcome"]["steps"][0]["error"]["category"],
+        expected_category
+    );
+    assert_eq!(
+        trusted["outcome"]["steps"][0]["error"]["summary"],
+        expected_summary
+    );
+    assert_secret_absent(&error, secret);
+    assert!(
+        !output_text(&error).contains("app-derived option list"),
+        "app-derived option details must stay out of trusted set_value diagnostics"
+    );
+}
+
+#[test]
+fn set_value_invalid_boolean_keeps_a_fixed_actionable_category_without_echoing_input() {
+    assert_safe_set_value_category(
+        DeadlineBehavior::InvalidBoolean,
+        "boolean-secret-value",
+        "invalid_value",
+        "element expects a boolean value",
+    );
+}
+
+#[test]
+fn set_value_missing_option_keeps_a_fixed_actionable_category_without_echoing_input() {
+    assert_safe_set_value_category(
+        DeadlineBehavior::OptionNotFound,
+        "option-secret-value",
+        "option_not_found",
+        "requested option was not found",
+    );
 }
 
 #[test]

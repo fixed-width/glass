@@ -122,6 +122,8 @@ pub(crate) enum SafeErrorCategory {
     NoActiveSession,
     StaleElement,
     NotEditable,
+    InvalidValue,
+    OptionNotFound,
     UnsupportedAccessibility,
     PermissionDenied,
     TransportFailure,
@@ -143,6 +145,8 @@ impl SafeErrorCategory {
             | glass_core::GlassError::AxElementChanged(_)
             | glass_core::GlassError::AxElementGone(_) => Self::StaleElement,
             glass_core::GlassError::AxElementNotEditable(_) => Self::NotEditable,
+            glass_core::GlassError::AxValueNotBoolean(..) => Self::InvalidValue,
+            glass_core::GlassError::AxOptionNotFound(..) => Self::OptionNotFound,
             glass_core::GlassError::AxUnsupported
             | glass_core::GlassError::AxActionUnavailable(_) => Self::UnsupportedAccessibility,
             glass_core::GlassError::PermissionDenied { .. } => Self::PermissionDenied,
@@ -161,6 +165,8 @@ impl SafeErrorCategory {
             Self::NoActiveSession => "no active session",
             Self::StaleElement => "element is stale or missing",
             Self::NotEditable => "element is not editable",
+            Self::InvalidValue => "element expects a boolean value",
+            Self::OptionNotFound => "requested option was not found",
             Self::UnsupportedAccessibility => "accessibility operation is unsupported",
             Self::PermissionDenied => "permission denied",
             Self::TransportFailure => "backend transport failed",
@@ -211,6 +217,7 @@ impl ContextualError {
                 &error,
                 glass_core::GlassError::CoordOutOfBounds { .. }
                     | glass_core::GlassError::AxValueNotBoolean(..)
+                    | glass_core::GlassError::AxOptionNotFound(..)
             )
             .then_some(BoundDispatch::NotDispatched)
         });

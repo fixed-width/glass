@@ -67,6 +67,7 @@ pub(crate) fn send_pointer_by(
     origin_pt: (f64, f64),
     deadline: Deadline,
 ) -> Result<()> {
+    glass_core::validate_pointer_input(event)?;
     // `Gesture` is unconditionally unsupported on macOS regardless of `pid`'s validity —
     // checked ahead of `focus` so it fails fast without raising/activating the app for an
     // operation that can never succeed, and so `focus`'s missing-process check can't mask
@@ -116,7 +117,7 @@ pub(crate) fn send_pointer_by(
             // One down/up pair stamped with `clicks` in `kCGMouseEventClickState`, rather
             // than `clicks` separate down/up pairs — the documented CGEvent technique for
             // synthesizing a double/triple click.
-            let clicks = i64::from(count.max(1));
+            let clicks = i64::from(count);
             let down = mouse_event(source.as_deref(), down_ty, point, cg_button, flags)?;
             CGEvent::set_integer_value_field(
                 Some(&down),

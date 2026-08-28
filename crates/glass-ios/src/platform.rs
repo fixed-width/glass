@@ -636,6 +636,7 @@ impl Platform for IosPlatform {
     }
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("iOS pointer input"));
         }

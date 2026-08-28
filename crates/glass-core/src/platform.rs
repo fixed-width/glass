@@ -128,6 +128,12 @@ pub struct Segment {
 /// Max simultaneous pointers a `Gesture` may carry (Android tops out around this).
 pub const MAX_GESTURE_POINTERS: usize = 10;
 
+/// Maximum consecutive clicks accepted by public tools and defensive backend entry points.
+pub const MAX_CLICK_COUNT: u32 = 10;
+
+/// Maximum absolute wheel-notch count accepted on either scroll axis.
+pub const MAX_SCROLL_NOTCHES: u32 = 100;
+
 /// A pointer action in **window-relative** coordinates (0,0 = top-left).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PointerEvent {
@@ -164,6 +170,44 @@ pub enum PointerEvent {
         pointers: Vec<Segment>,
         duration_ms: u64,
     },
+}
+
+/// Validate a click work factor before any backend allocation, loop, or native dispatch.
+pub fn validate_click_count(count: u32) -> crate::Result<()> {
+    if (1..=MAX_CLICK_COUNT).contains(&count) {
+        Ok(())
+    } else {
+        Err(
+            GlassError::InvalidPointerInput("click count must be between 1 and 10")
+                .before_dispatch(),
+        )
+    }
+}
+
+/// Validate and return a scroll delta's unsigned magnitude without negating `i32::MIN`.
+pub fn validate_scroll_delta(delta: i32) -> crate::Result<u32> {
+    let magnitude = delta.unsigned_abs();
+    if magnitude <= MAX_SCROLL_NOTCHES {
+        Ok(magnitude)
+    } else {
+        Err(
+            GlassError::InvalidPointerInput("scroll dx and dy must each be between -100 and 100")
+                .before_dispatch(),
+        )
+    }
+}
+
+/// Defensively bound scalar pointer work at core and backend entry points.
+pub fn validate_pointer_input(event: &PointerEvent) -> crate::Result<()> {
+    match event {
+        PointerEvent::Click { count, .. } => validate_click_count(*count),
+        PointerEvent::Scroll { dx, dy, .. } => {
+            validate_scroll_delta(*dx)?;
+            validate_scroll_delta(*dy)?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A keyboard action: either literal text to type or a chord like `ctrl+s`.
@@ -486,6 +530,72 @@ mod tests {
             a11y: false,
         };
         assert_eq!(spec.run[0], "./app");
+    }
+
+    fn assert_invalid_pointer_work(event: PointerEvent) {
+        let error = validate_pointer_input(&event).expect_err("unsafe input work must be rejected");
+        assert!(matches!(error.cause(), GlassError::InvalidPointerInput(_)));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn click_count_validation_rejects_zero_and_oversized_work() {
+        for count in [0, 11, u32::MAX] {
+            assert_invalid_pointer_work(PointerEvent::Click {
+                x: 0,
+                y: 0,
+                button: MouseButton::Left,
+                count,
+                modifiers: vec![],
+            });
+        }
+    }
+
+    #[test]
+    fn scroll_validation_rejects_overflowing_and_oversized_magnitudes() {
+        for delta in [-101, 101, i32::MIN, i32::MAX] {
+            assert_invalid_pointer_work(PointerEvent::Scroll {
+                x: 0,
+                y: 0,
+                dx: delta,
+                dy: 0,
+                modifiers: vec![],
+            });
+            assert_invalid_pointer_work(PointerEvent::Scroll {
+                x: 0,
+                y: 0,
+                dx: 0,
+                dy: delta,
+                modifiers: vec![],
+            });
+        }
+    }
+
+    #[test]
+    fn bounded_click_and_scroll_work_is_accepted() {
+        for count in [1, 10] {
+            validate_pointer_input(&PointerEvent::Click {
+                x: 0,
+                y: 0,
+                button: MouseButton::Left,
+                count,
+                modifiers: vec![],
+            })
+            .unwrap();
+        }
+        for delta in [-100, 0, 100] {
+            validate_pointer_input(&PointerEvent::Scroll {
+                x: 0,
+                y: 0,
+                dx: delta,
+                dy: delta,
+                modifiers: vec![],
+            })
+            .unwrap();
+        }
     }
 
     /// A bare-minimum `Platform` that overrides nothing — every optional method

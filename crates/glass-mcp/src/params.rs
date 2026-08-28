@@ -5,8 +5,8 @@ use glass_core::Region;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, de::Error as _};
 
-pub(crate) const MAX_CLICK_COUNT: u32 = 10;
-pub(crate) const MAX_SCROLL_NOTCHES: i32 = 100;
+pub(crate) const MAX_CLICK_COUNT: u32 = glass_core::MAX_CLICK_COUNT;
+pub(crate) const MAX_SCROLL_NOTCHES: i32 = glass_core::MAX_SCROLL_NOTCHES as i32;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RegionArgs {

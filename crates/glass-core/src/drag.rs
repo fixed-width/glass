@@ -127,24 +127,17 @@ fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
 }
 
 fn attach_cleanup_failure(
-    mut primary: GlassError,
+    primary: GlassError,
     cleanup: GlassError,
-    release: &str,
+    release: &'static str,
 ) -> GlassError {
-    let note = format!("; cleanup failed while releasing {release}: {cleanup}");
-    match &mut primary {
-        GlassError::Backend(message) | GlassError::Bounded { message, .. } => {
-            message.push_str(&note);
-        }
-        _ => eprintln!("glass-core: {primary}{note}"),
-    }
-    primary
+    GlassError::input_cleanup_failed(release, primary, cleanup)
 }
 
 fn combine_cleanup(
     primary: crate::Result<()>,
     cleanup: crate::Result<()>,
-    release: &str,
+    release: &'static str,
 ) -> crate::Result<()> {
     match (primary, cleanup) {
         (Err(primary), Err(cleanup)) => Err(attach_cleanup_failure(primary, cleanup, release)),
@@ -157,7 +150,7 @@ fn combine_cleanup(
 fn preserve_primary_after_cleanup(primary: GlassError, cleanup: crate::Result<()>) -> GlassError {
     match cleanup {
         Ok(()) => primary,
-        Err(cleanup) => attach_cleanup_failure(primary, cleanup, "the drag"),
+        Err(cleanup) => attach_cleanup_failure(primary, cleanup, "releasing the drag"),
     }
 }
 
@@ -174,7 +167,11 @@ fn cleanup_drag<S: DragSink>(
         Ok(())
     };
     if modifiers_down {
-        combine_cleanup(button, sink.modifiers(false), "the drag modifiers")
+        combine_cleanup(
+            button,
+            sink.modifiers(false),
+            "releasing the drag modifiers",
+        )
     } else {
         button
     }
@@ -271,7 +268,7 @@ pub fn run_drag_by<S: DragSink>(
     combine_cleanup(
         before_modifier_cleanup,
         modifier_result,
-        "the drag modifiers",
+        "releasing the drag modifiers",
     )
     .and(modifier_deadline)
 }
@@ -638,6 +635,21 @@ mod run_drag_tests {
 
         assert!(error.to_string().contains("button release failed"));
         assert!(error.to_string().contains("modifier cleanup failed"));
+        let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("both drag release failures must stay structured");
+        };
+        assert_eq!(operation, "releasing the drag modifiers");
+        assert!(
+            matches!(*primary, GlassError::Backend(message) if message == "button release failed")
+        );
+        assert!(
+            matches!(*cleanup, GlassError::Backend(message) if message == "modifier cleanup failed")
+        );
         assert_eq!(sink.0.calls.last(), Some(&Call::Mods(false)));
     }
 

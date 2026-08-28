@@ -792,6 +792,7 @@ impl Platform for MacosPlatform {
     /// `self.app_pid` — the same pid today, but `m.pid` is the one tied to the window being
     /// clicked.
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
         if deadline
             .remaining()
             .is_some_and(|left| left < Duration::from_millis(300))

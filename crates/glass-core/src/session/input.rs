@@ -73,6 +73,7 @@ impl Glass {
         event: &PointerEvent,
         deadline: Deadline,
     ) -> Result<()> {
+        crate::validate_pointer_input(event)?;
         self.check_bounds(event)?;
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("pointer input"));
@@ -244,6 +245,30 @@ mod tests {
             err.unwrap_err(),
             GlassError::CoordOutOfBounds { .. }
         ));
+    }
+
+    #[test]
+    fn unsafe_pointer_work_is_rejected_before_backend_dispatch() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with(FakePlatform::new(10, 10).with_pointer_deadline_log(log.clone()));
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .pointer(&PointerEvent::Click {
+                x: 1,
+                y: 1,
+                button: MouseButton::Left,
+                count: u32::MAX,
+                modifiers: vec![],
+            })
+            .expect_err("an unbounded click must not reach the backend");
+
+        assert!(matches!(error.cause(), GlassError::InvalidPointerInput(_)));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::NotDispatched)
+        );
+        assert!(log.lock().unwrap().is_empty());
     }
 
     #[test]

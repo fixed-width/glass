@@ -629,7 +629,7 @@ impl Accessibility for AndroidA11y {
         };
         let mut external_dispatched = false;
         let mut value_dispatched = false;
-        for argv in pointer_commands(&window, &tap) {
+        for argv in pointer_commands(&window, &tap)? {
             require_time(
                 ctx.deadline,
                 target.id.0,

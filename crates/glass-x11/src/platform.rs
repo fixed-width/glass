@@ -62,6 +62,18 @@ impl X11Dispatch {
     }
 
     fn classify(&self, op: &str, mut error: GlassError) -> GlassError {
+        if let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        {
+            return GlassError::input_cleanup_failed(
+                operation,
+                self.classify(op, *primary),
+                *cleanup,
+            );
+        }
         if self.0.get()
             && error.bound_owner() == Some(Whose::Caller)
             && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
@@ -150,15 +162,8 @@ fn run_x11_type_by<S: glass_core::TypeSink>(
     glass_core::run_type_by(sink, text, dwell, deadline)
 }
 
-fn attach_cleanup_failure(mut primary: GlassError, cleanup: GlassError) -> GlassError {
-    let note = format!("; cleanup failed after pointer input: {cleanup}");
-    match &mut primary {
-        GlassError::Backend(message) | GlassError::Bounded { message, .. } => {
-            message.push_str(&note);
-        }
-        _ => eprintln!("glass-x11: {primary}{note}"),
-    }
-    primary
+fn attach_cleanup_failure(primary: GlassError, cleanup: GlassError) -> GlassError {
+    GlassError::input_cleanup_failed("releasing X11 pointer input", primary, cleanup)
 }
 
 fn run_clicks_by(
@@ -167,9 +172,10 @@ fn run_clicks_by(
     mut button: impl FnMut(bool) -> Result<()>,
     cleanup: impl FnOnce(bool, bool) -> Result<()>,
 ) -> Result<()> {
+    glass_core::validate_click_count(count)?;
     let mut button_down = false;
     let outcome = (|| {
-        for _ in 0..count.max(1) {
+        for _ in 0..count {
             if deadline_passed() {
                 return Err(GlassError::deadline_not_started("pointer input"));
             }
@@ -199,11 +205,8 @@ fn run_scroll_buttons_by(
     mut deadline_passed: impl FnMut() -> bool,
     mut button: impl FnMut(bool, u8) -> Result<()>,
 ) -> Result<()> {
-    let (btn, times) = if delta >= 0 {
-        (pos_btn, delta)
-    } else {
-        (neg_btn, -delta)
-    };
+    let times = glass_core::validate_scroll_delta(delta)?;
+    let btn = if delta >= 0 { pos_btn } else { neg_btn };
     for _ in 0..times {
         if deadline_passed() {
             return Err(GlassError::deadline_not_started("pointer input"));
@@ -1406,6 +1409,7 @@ impl Platform for X11Platform {
     }
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
         run_x11_call_by(deadline, "pointer input", |dispatch| {
             let origin = self.window_geometry()?;
             let (ox, oy) = (origin.x, origin.y);
@@ -1865,6 +1869,19 @@ mod tests {
             Some(BoundDispatch::MayHaveDispatched)
         );
         assert!(error.to_string().contains("cleanup sync failed"));
+        let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("click cleanup failure must remain structured");
+        };
+        assert_eq!(operation, "releasing X11 pointer input");
+        assert!(matches!(*primary, GlassError::Bounded { .. }));
+        assert!(
+            matches!(*cleanup, GlassError::Backend(message) if message == "cleanup sync failed")
+        );
     }
 
     #[test]
@@ -1887,6 +1904,55 @@ mod tests {
             Some(BoundDispatch::MayHaveDispatched)
         );
         assert!(error.to_string().contains("cleanup sync failed"));
+        assert!(matches!(error, GlassError::InputCleanupFailed { .. }));
+    }
+
+    #[test]
+    fn click_work_factor_is_rejected_before_button_or_cleanup_dispatch() {
+        for count in [0, 11, u32::MAX] {
+            let button_calls = Cell::new(0);
+            let cleanup_calls = Cell::new(0);
+            let error = run_clicks_by(
+                count,
+                || true,
+                |_| {
+                    button_calls.set(button_calls.get() + 1);
+                    Ok(())
+                },
+                |_, _| {
+                    cleanup_calls.set(cleanup_calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect_err("invalid click count must be rejected before any event");
+
+            assert!(matches!(error.cause(), GlassError::InvalidPointerInput(_)));
+            assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+            assert_eq!(button_calls.get(), 0);
+            assert_eq!(cleanup_calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn scroll_work_factor_rejects_extreme_magnitudes_without_panicking_or_dispatching() {
+        for delta in [-101, 101, i32::MIN, i32::MAX] {
+            let button_calls = Cell::new(0);
+            let error = run_scroll_buttons_by(
+                5,
+                4,
+                delta,
+                || true,
+                |_, _| {
+                    button_calls.set(button_calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect_err("invalid scroll magnitude must be rejected before any event");
+
+            assert!(matches!(error.cause(), GlassError::InvalidPointerInput(_)));
+            assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+            assert_eq!(button_calls.get(), 0);
+        }
     }
 
     #[test]
@@ -1898,7 +1964,7 @@ mod tests {
             run_scroll_buttons_by(
                 5,
                 4,
-                1_000,
+                100,
                 || {
                     checks.set(checks.get() + 1);
                     checks.get() > 1

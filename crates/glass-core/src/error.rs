@@ -118,6 +118,9 @@ pub enum GlassError {
     #[error("invalid region: {0}")]
     InvalidRegion(String),
 
+    #[error("invalid pointer input: {0}")]
+    InvalidPointerInput(&'static str),
+
     #[error("frames differ in size: {a:?} vs {b:?}")]
     SizeMismatch { a: (u32, u32), b: (u32, u32) },
 
@@ -303,6 +306,18 @@ pub enum GlassError {
         restore: Box<GlassError>,
     },
 
+    /// Both an input operation and its mandatory held-input release failed. The primary and cleanup
+    /// failures remain separately inspectable because either can carry actionable tool output or
+    /// deadline ownership. A failed release makes the resulting input state uncertain regardless of
+    /// either inner failure's individual dispatch annotation.
+    #[error("{primary}; cleanup failed while {operation}: {cleanup}")]
+    InputCleanupFailed {
+        operation: &'static str,
+        #[source]
+        primary: Box<GlassError>,
+        cleanup: Box<GlassError>,
+    },
+
     /// An unchanged ordinary failure from a step that provably did not dispatch external work.
     /// The wrapped cause and its message remain authoritative; only dispatch provenance changes.
     #[error(transparent)]
@@ -383,6 +398,7 @@ impl GlassError {
             GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => error.cause(),
             GlassError::AxWriteUnconfirmedCaused { source, .. } => source.cause(),
             GlassError::WindowRestoreFailed { primary, .. } => primary.cause(),
+            GlassError::InputCleanupFailed { primary, .. } => primary.cause(),
             error => error,
         }
     }
@@ -413,6 +429,11 @@ impl GlassError {
             GlassError::WindowRestoreFailed { primary, restore } => {
                 primary.set_value_failed_after_writing() || restore.set_value_failed_after_writing()
             }
+            GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            } => {
+                primary.set_value_failed_after_writing() || cleanup.set_value_failed_after_writing()
+            }
             _ => false,
         }
     }
@@ -426,7 +447,8 @@ impl GlassError {
         match self {
             error @ (GlassError::BeforeDispatch(_)
             | GlassError::AfterDispatch(_)
-            | GlassError::Bounded { .. }) => error,
+            | GlassError::Bounded { .. }
+            | GlassError::InputCleanupFailed { .. }) => error,
             error => GlassError::BeforeDispatch(Box::new(error)),
         }
     }
@@ -439,7 +461,7 @@ impl GlassError {
     /// annotation is idempotent.
     pub fn after_dispatch(self) -> Self {
         match self {
-            error @ GlassError::AfterDispatch(_) => error,
+            error @ (GlassError::AfterDispatch(_) | GlassError::InputCleanupFailed { .. }) => error,
             error @ GlassError::Bounded {
                 dispatch: BoundDispatch::MayHaveDispatched,
                 ..
@@ -507,6 +529,19 @@ impl GlassError {
         }
     }
 
+    /// Preserve both a failed input operation and the mandatory release that also failed.
+    pub fn input_cleanup_failed(
+        operation: &'static str,
+        primary: GlassError,
+        cleanup: GlassError,
+    ) -> GlassError {
+        GlassError::InputCleanupFailed {
+            operation,
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        }
+    }
+
     /// Which of glass's own bounds ended this call, if one did rather than the tool answering.
     ///
     /// The question a backend asks before retrying, before offering a wedged-tool remedy, and
@@ -522,6 +557,9 @@ impl GlassError {
             GlassError::WindowRestoreFailed { primary, restore } => {
                 primary.bound().or_else(|| restore.bound())
             }
+            GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            } => primary.bound().or_else(|| cleanup.bound()),
             _ => None,
         }
     }
@@ -536,6 +574,9 @@ impl GlassError {
             GlassError::WindowRestoreFailed { primary, restore } => {
                 primary.bound_owner().or_else(|| restore.bound_owner())
             }
+            GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            } => primary.bound_owner().or_else(|| cleanup.bound_owner()),
             _ => None,
         }
     }
@@ -565,6 +606,7 @@ impl GlassError {
                     (None, None) => None,
                 }
             }
+            GlassError::InputCleanupFailed { .. } => Some(BoundDispatch::MayHaveDispatched),
             _ => None,
         }
     }
@@ -586,6 +628,9 @@ impl GlassError {
             GlassError::WindowRestoreFailed { primary, restore } => {
                 primary.tool_said().or_else(|| restore.tool_said())
             }
+            GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            } => primary.tool_said().or_else(|| cleanup.tool_said()),
             _ => None,
         }
     }
@@ -664,6 +709,38 @@ mod tests {
     #[test]
     fn ordinary_backend_errors_have_no_bound_dispatch() {
         assert_eq!(GlassError::Backend("down".into()).bound_dispatch(), None);
+    }
+
+    #[test]
+    fn input_cleanup_failure_preserves_both_sources_and_metadata() {
+        let error = GlassError::InputCleanupFailed {
+            operation: "releasing held input",
+            primary: Box::new(GlassError::caller_deadline_elapsed("pointer input")),
+            cleanup: Box::new(GlassError::ToolFailed {
+                call: "release-input".into(),
+                said: "  device refused release  ".into(),
+            }),
+        };
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(error.tool_said(), Some("device refused release"));
+        assert!(matches!(error.cause(), GlassError::Bounded { .. }));
+        let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("cleanup failure must remain structurally inspectable");
+        };
+        assert_eq!(operation, "releasing held input");
+        assert!(matches!(*primary, GlassError::Bounded { .. }));
+        assert!(matches!(*cleanup, GlassError::ToolFailed { .. }));
     }
 
     #[test]

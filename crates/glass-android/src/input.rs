@@ -22,13 +22,14 @@ const SWIPE_MS: u64 = 300;
 /// command; an empty vec means "nothing to inject" (a touch `Move` has no hover
 /// equivalent). Mouse button and keyboard modifiers are ignored — a touch
 /// contact is single-button and can't carry modifiers.
-pub fn pointer_commands(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Vec<String>> {
+pub fn pointer_commands(origin: &WindowGeometry, event: &PointerEvent) -> Result<Vec<Vec<String>>> {
+    glass_core::validate_pointer_input(event)?;
     let abs = |x: i32, y: i32| (origin.x + x, origin.y + y);
-    match *event {
+    Ok(match *event {
         PointerEvent::Move { .. } => vec![],
         PointerEvent::Click { x, y, count, .. } => {
             let (ax, ay) = abs(x, y);
-            (0..count.max(1)).map(|_| tap(ax, ay)).collect()
+            (0..count).map(|_| tap(ax, ay)).collect()
         }
         PointerEvent::Drag {
             from_x,
@@ -65,7 +66,7 @@ pub fn pointer_commands(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Ve
             vec![swipe(cx, cy, ex, ey, SWIPE_MS)]
         }
         PointerEvent::Gesture { .. } => vec![], // adb has no multi-touch; ShellInjector refuses
-    }
+    })
 }
 
 fn tap(x: i32, y: i32) -> Vec<String> {
@@ -246,7 +247,7 @@ pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Ve
         PointerEvent::Move { .. } => vec![],
         PointerEvent::Click { x, y, count, .. } => {
             let (ax, ay) = abs(x, y);
-            (0..count.max(1))
+            (0..count)
                 .map(|_| {
                     vec![Pt {
                         x: ax,
@@ -325,6 +326,7 @@ impl Injector for AgentInjector {
         event: &PointerEvent,
         deadline: Deadline,
     ) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
         if let PointerEvent::Gesture {
             pointers,
             duration_ms,
@@ -371,12 +373,13 @@ impl Injector for ShellInjector {
         event: &PointerEvent,
         deadline: Deadline,
     ) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
         if let PointerEvent::Gesture { .. } = event {
             return Err(GlassError::Unsupported(
                 "multi-touch requires the on-device agent (not yet wired)".into(),
             ));
         }
-        run_compound(pointer_commands(origin, event), |argv| {
+        run_compound(pointer_commands(origin, event)?, |argv| {
             adb.run_until(argv.iter().map(String::as_str), deadline)
                 .map(|_| ())
         })
@@ -589,7 +592,7 @@ mod agent_inject_tests {
             count: 1,
             modifiers: vec![],
         };
-        let argv = pointer_commands(&o, &click);
+        let argv = pointer_commands(&o, &click).unwrap();
         let path = agent_pointer(&o, &click);
         assert_eq!(
             argv[0],
@@ -613,7 +616,7 @@ mod agent_inject_tests {
             dy: 1,
             modifiers: vec![],
         };
-        let sargv = pointer_commands(&o, &scroll);
+        let sargv = pointer_commands(&o, &scroll).unwrap();
         let spath = agent_pointer(&o, &scroll);
         assert_eq!((sargv[0][3].as_str(), sargv[0][4].as_str()), ("350", "600"));
         assert_eq!(
@@ -642,7 +645,7 @@ mod agent_inject_tests {
             modifiers: vec![],
         };
 
-        let argv = pointer_commands(&o, &up_and_left);
+        let argv = pointer_commands(&o, &up_and_left).unwrap();
         assert_eq!((argv[0][5].as_str(), argv[0][6].as_str()), ("599", "999"));
 
         let path = agent_pointer(&o, &up_and_left);
@@ -863,6 +866,53 @@ mod injector_tests {
     }
 
     #[test]
+    fn shell_injector_rejects_invalid_pointer_work_before_adb_dispatch() {
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let events = [
+            PointerEvent::Click {
+                x: 10,
+                y: 20,
+                button: MouseButton::Left,
+                count: 0,
+                modifiers: vec![],
+            },
+            PointerEvent::Click {
+                x: 10,
+                y: 20,
+                button: MouseButton::Left,
+                count: 11,
+                modifiers: vec![],
+            },
+            PointerEvent::Click {
+                x: 10,
+                y: 20,
+                button: MouseButton::Left,
+                count: u32::MAX,
+                modifiers: vec![],
+            },
+            PointerEvent::Scroll {
+                x: 10,
+                y: 20,
+                dx: i32::MIN,
+                dy: i32::MAX,
+                modifiers: vec![],
+            },
+        ];
+
+        for event in events {
+            let error = ShellInjector
+                .pointer_by(fake.adb(), &origin(), &event, Deadline::UNBOUNDED)
+                .expect_err("invalid pointer work must not reach adb");
+            assert!(matches!(error.cause(), GlassError::InvalidPointerInput(_)));
+            assert_eq!(
+                error.bound_dispatch(),
+                Some(glass_core::BoundDispatch::NotDispatched)
+            );
+        }
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    #[test]
     fn first_tap_success_plus_later_not_dispatched_is_may_have_dispatched() {
         let mut tap = 0;
 
@@ -982,7 +1032,11 @@ mod pointer_tests {
 
     #[test]
     fn move_injects_nothing() {
-        assert!(pointer_commands(&win(), &PointerEvent::Move { x: 5, y: 5 }).is_empty());
+        assert!(
+            pointer_commands(&win(), &PointerEvent::Move { x: 5, y: 5 })
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -995,7 +1049,7 @@ mod pointer_tests {
             modifiers: vec![],
         };
         assert_eq!(
-            pointer_commands(&win(), &ev),
+            pointer_commands(&win(), &ev).unwrap(),
             vec![vec![
                 "shell".to_string(),
                 "input".into(),
@@ -1015,7 +1069,7 @@ mod pointer_tests {
             count: 2,
             modifiers: vec![],
         };
-        assert_eq!(pointer_commands(&win(), &ev).len(), 2);
+        assert_eq!(pointer_commands(&win(), &ev).unwrap().len(), 2);
     }
 
     #[test]
@@ -1030,7 +1084,7 @@ mod pointer_tests {
             duration_ms: 250,
         };
         assert_eq!(
-            pointer_commands(&win(), &ev),
+            pointer_commands(&win(), &ev).unwrap(),
             vec![vec![
                 "shell".to_string(),
                 "input".into(),
@@ -1053,7 +1107,7 @@ mod pointer_tests {
             dy: 1,
             modifiers: vec![],
         };
-        let got = pointer_commands(&win(), &ev);
+        let got = pointer_commands(&win(), &ev).unwrap();
         assert_eq!(
             got,
             vec![vec![
@@ -1078,7 +1132,7 @@ mod pointer_tests {
             dy: 100,
             modifiers: vec![],
         };
-        let got = pointer_commands(&win(), &ev);
+        let got = pointer_commands(&win(), &ev).unwrap();
         let end_y = &got[0][6];
         assert_eq!(end_y, "63");
     }

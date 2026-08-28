@@ -587,7 +587,7 @@ enum ActionAttempt {
     /// failed `DoAction` may still have reached the toolkit. Distinct from
     /// `Fired(false)` (the toolkit answered "I did not run it") so a caller can't
     /// report a transport failure as a truthful "did not run".
-    Error(String),
+    Error(GlassError),
 }
 
 /// Fire the node's first Action whose name is in `names`.
@@ -615,12 +615,12 @@ async fn try_action(
     };
     let n = match a.n_actions().await {
         Ok(n) => n,
-        Err(e) => return ActionAttempt::Error(format!("NActions: {e}")),
+        Err(e) => return ActionAttempt::Error(bus_err(format!("NActions: {e}"))),
     };
     for i in 0..n {
         let name = match a.get_name(i).await {
             Ok(name) => name.to_ascii_lowercase(),
-            Err(e) => return ActionAttempt::Error(format!("GetName({i}): {e}")),
+            Err(e) => return ActionAttempt::Error(bus_err(format!("GetName({i}): {e}"))),
         };
         if names.contains(&name.as_str()) {
             let result = dispatch
@@ -628,11 +628,21 @@ async fn try_action(
                 .await;
             return match result {
                 Ok(ok) => ActionAttempt::Fired { ok, action: name },
-                Err(e) => ActionAttempt::Error(format!("DoAction({i}): {e}")),
+                Err(e) => ActionAttempt::Error(e),
             };
         }
     }
     ActionAttempt::Unavailable
+}
+
+fn toggle_action_result(attempt: ActionAttempt, id: u32) -> Result<()> {
+    match attempt {
+        ActionAttempt::Fired { ok: true, .. } => Ok(()),
+        ActionAttempt::Fired { ok: false, .. } | ActionAttempt::Unavailable => {
+            Err(GlassError::AxElementNotEditable(id))
+        }
+        ActionAttempt::Error(error) => Err(error),
+    }
 }
 
 /// The AT-SPI state flag carrying a widget's boolean state: toggle buttons expose it as
@@ -665,18 +675,10 @@ async fn set_toggle(
     if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
         return Ok(()); // already in the desired state
     }
-    // `Error` (an AT-SPI call that failed) folds in with "did not fire" here, keeping
-    // `set_value`'s behavior unchanged: this path verifies the state below and reports
-    // `AxValueNotApplied` on no change, so an ambiguous outcome is caught by that check
-    // rather than needing its own classification.
-    if !matches!(
+    toggle_action_result(
         try_action(conn, node, TOGGLE_ACTION_NAMES, dispatch).await,
-        ActionAttempt::Fired { ok: true, .. }
-    ) {
-        // No toggle action (e.g. a GTK4 GtkCheckButton exposes none) — can't set it
-        // through accessibility; the caller should drive it with click_element.
-        return Err(GlassError::AxElementNotEditable(id));
-    }
+        id,
+    )?;
     // Poll until the toolkit applies it; a no-op activation never converges.
     let mut last_on = None;
     for _ in 0..VERIFY_POLLS {
@@ -950,9 +952,7 @@ async fn invoke_async(
         // Not `AxActionUnavailable`: the call may have reached the toolkit, so this must not
         // be fallback-eligible (see `GlassError::invoke_fallback_eligible`) — a pointer click
         // on top of a landed action would actuate the control twice.
-        ActionAttempt::Error(msg) => Err(GlassError::AccessibilityUnavailable(format!(
-            "AT-SPI action call failed: {msg}"
-        ))),
+        ActionAttempt::Error(error) => Err(error),
     }
 }
 
@@ -1064,6 +1064,29 @@ mod toggle_label_tests {
         // caller asked for, alongside "did not take".
         assert_eq!(toggle_state_label(false), "off");
         assert_eq!(toggle_state_label(true), "on");
+    }
+}
+
+#[cfg(test)]
+mod toggle_action_tests {
+    use super::{ActionAttempt, toggle_action_result};
+    use glass_core::{BoundDispatch, BoundKind, GlassError, Whose};
+
+    #[test]
+    fn toggle_action_propagates_the_structured_dispatch_error() {
+        let error = toggle_action_result(
+            ActionAttempt::Error(GlassError::caller_deadline_elapsed("native toggle action")),
+            17,
+        )
+        .expect_err("a native dispatch failure must not become not-editable");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(matches!(error.cause(), GlassError::Bounded { .. }));
     }
 }
 

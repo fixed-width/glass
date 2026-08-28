@@ -48,15 +48,8 @@ fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
     require_time(deadline, true)
 }
 
-fn attach_cleanup_failure(mut primary: GlassError, cleanup: GlassError) -> GlassError {
-    let note = format!("; cleanup failed while releasing the scroll modifiers: {cleanup}");
-    match &mut primary {
-        GlassError::Backend(message) | GlassError::Bounded { message, .. } => {
-            message.push_str(&note);
-        }
-        _ => eprintln!("glass-core: {primary}{note}"),
-    }
-    primary
+fn attach_cleanup_failure(primary: GlassError, cleanup: GlassError) -> GlassError {
+    GlassError::input_cleanup_failed("releasing the scroll modifiers", primary, cleanup)
 }
 
 fn preserve_primary_after_cleanup(primary: GlassError, cleanup: crate::Result<()>) -> GlassError {
@@ -283,6 +276,19 @@ mod tests {
 
         assert!(error.to_string().contains("wheel failed"));
         assert!(error.to_string().contains("modifier cleanup failed"));
+        let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("scroll and modifier release failures must stay structured");
+        };
+        assert_eq!(operation, "releasing the scroll modifiers");
+        assert!(matches!(*primary, GlassError::Backend(message) if message == "wheel failed"));
+        assert!(
+            matches!(*cleanup, GlassError::Backend(message) if message == "modifier cleanup failed")
+        );
         assert_eq!(sink.0.calls.last(), Some(&Call::Mods(false)));
     }
 

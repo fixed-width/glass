@@ -357,6 +357,7 @@ mod backend {
             event: &PointerEvent,
             deadline: glass_core::Deadline,
         ) -> Result<()> {
+            glass_core::validate_pointer_input(event)?;
             if deadline.has_passed() {
                 return Err(GlassError::deadline_not_started("pointer input"));
             }

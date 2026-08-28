@@ -77,6 +77,18 @@ impl WaylandDispatch {
     }
 
     fn classify(&self, op: &str, mut error: GlassError) -> GlassError {
+        if let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        {
+            return GlassError::input_cleanup_failed(
+                operation,
+                self.classify(op, *primary),
+                *cleanup,
+            );
+        }
         if self.0.get()
             && error.bound_owner() == Some(Whose::Caller)
             && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
@@ -1614,15 +1626,8 @@ impl Held {
     }
 }
 
-fn attach_cleanup_failure(mut primary: GlassError, cleanup: GlassError) -> GlassError {
-    let note = format!("; input cleanup failed: {cleanup}");
-    match &mut primary {
-        GlassError::Backend(message) | GlassError::Bounded { message, .. } => {
-            message.push_str(&note);
-        }
-        _ => eprintln!("glass-wayland: {primary}{note}"),
-    }
-    primary
+fn attach_cleanup_failure(primary: GlassError, cleanup: GlassError) -> GlassError {
+    GlassError::input_cleanup_failed("releasing Wayland input", primary, cleanup)
 }
 
 fn finish_input_cleanup<T>(
@@ -2286,6 +2291,7 @@ impl Platform for WaylandPlatform {
     }
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
         run_wayland_call_by(deadline, "pointer input", |dispatch| {
             let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
             require_healthy_input(session)?;
@@ -2357,7 +2363,7 @@ impl Platform for WaylandPlatform {
                     };
                     let b = evdev_button(button);
                     let clicks = |session: &mut ActiveSession, held: &mut Held| -> Result<()> {
-                        for _ in 0..count.max(1) {
+                        for _ in 0..count {
                             if deadline.has_passed() {
                                 return Err(GlassError::deadline_not_started("pointer input"));
                             }
@@ -2649,6 +2655,7 @@ mod pure_tests {
 
     use super::*;
     use crate::testw::on_a_thread;
+    use glass_core::MouseButton;
     use glass_exec_unix::is_executable_file;
 
     /// The budget the pure waits below are given. `on_a_thread` allows a multiple of it, so a lost
@@ -2701,6 +2708,48 @@ mod pure_tests {
     }
 
     #[test]
+    fn invalid_pointer_work_is_rejected_before_session_lookup() {
+        let mut platform = WaylandPlatform {
+            sway: PathBuf::new(),
+            logs: Arc::new(Mutex::new(Vec::new())),
+            active: None,
+            clipboard_owner: None,
+            dbus: None,
+        };
+        let events = [
+            PointerEvent::Click {
+                x: 0,
+                y: 0,
+                button: MouseButton::Left,
+                count: 0,
+                modifiers: vec![],
+            },
+            PointerEvent::Click {
+                x: 0,
+                y: 0,
+                button: MouseButton::Left,
+                count: u32::MAX,
+                modifiers: vec![],
+            },
+            PointerEvent::Scroll {
+                x: 0,
+                y: 0,
+                dx: i32::MIN,
+                dy: i32::MAX,
+                modifiers: vec![],
+            },
+        ];
+        for event in events {
+            let error = platform
+                .send_pointer_by(&event, Deadline::UNBOUNDED)
+                .expect_err("invalid pointer work must fail before backend/session work");
+
+            assert!(matches!(error.cause(), GlassError::InvalidPointerInput(_)));
+            assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        }
+    }
+
+    #[test]
     fn failed_cleanup_flush_preserves_primary_provenance_and_poisons_input() {
         let mut poison = None;
         let primary = Err::<(), _>(GlassError::caller_deadline_elapsed("pointer input"));
@@ -2715,6 +2764,19 @@ mod pure_tests {
             Some(BoundDispatch::MayHaveDispatched)
         );
         assert!(error.to_string().contains("cleanup flush failed"));
+        let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("Wayland cleanup failure must remain structured");
+        };
+        assert_eq!(operation, "releasing Wayland input");
+        assert!(matches!(*primary, GlassError::Bounded { .. }));
+        assert!(
+            matches!(*cleanup, GlassError::Backend(message) if message == "cleanup flush failed")
+        );
         assert_eq!(
             poison.as_deref(),
             Some("backend error: cleanup flush failed")
@@ -2739,6 +2801,7 @@ mod pure_tests {
             Some(BoundDispatch::MayHaveDispatched)
         );
         assert!(error.to_string().contains("cleanup flush failed"));
+        assert!(matches!(error, GlassError::InputCleanupFailed { .. }));
     }
 
     #[test]

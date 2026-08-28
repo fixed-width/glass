@@ -375,6 +375,7 @@ impl Platform for AndroidPlatform {
     }
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
         let origin = self.running()?.window.clone();
         self.injector
             .pointer_by(self.target.adb(), &origin, event, deadline)

@@ -463,6 +463,28 @@ impl A11yThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll};
+
+    struct CountedReady {
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl Future for CountedReady {
+        type Output = Result<()>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn poll_once<T>(future: Pin<&mut impl Future<Output = T>>) -> Poll<T> {
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        future.poll(&mut context)
+    }
 
     const CEILING: Duration = Duration::from_secs(10);
     /// Short enough that a test can wait out the whole thing.
@@ -777,6 +799,42 @@ mod tests {
         );
         assert!(matches!(error.cause(), GlassError::Backend(_)), "{error}");
         assert!(error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn racing_async_dispatch_attempts_poll_only_the_winning_mutation_future() {
+        let dispatch = A11yMutationDispatch::new("set_value");
+        let first = dispatch.duplicate();
+        let second = dispatch.duplicate();
+        let winner_polls = Arc::new(AtomicUsize::new(0));
+        let loser_polls = Arc::new(AtomicUsize::new(0));
+        let mut winner = Box::pin(first.dispatch_async(CountedReady {
+            polls: Arc::clone(&winner_polls),
+        }));
+        let mut loser = Box::pin(second.dispatch_async(CountedReady {
+            polls: Arc::clone(&loser_polls),
+        }));
+
+        assert!(matches!(poll_once(winner.as_mut()), Poll::Ready(Ok(()))));
+        assert!(matches!(poll_once(loser.as_mut()), Poll::Ready(Err(_))));
+        assert_eq!(winner_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(loser_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancelled_async_dispatch_never_polls_the_mutation_future() {
+        let dispatch = A11yMutationDispatch::new("set_value");
+        assert!(!dispatch.cancel_or_dispatched());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut cancelled = Box::pin(dispatch.dispatch_async(CountedReady {
+            polls: Arc::clone(&polls),
+        }));
+
+        let Poll::Ready(Err(error)) = poll_once(cancelled.as_mut()) else {
+            panic!("a cancelled dispatch must refuse before awaiting its mutation");
+        };
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
