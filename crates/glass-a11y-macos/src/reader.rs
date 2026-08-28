@@ -89,6 +89,7 @@ impl Accessibility for MacosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let deadline = SemanticDeadline::snapshot(ctx.deadline);
         deadline.require()?;
+        let deadline = deadline.after_dispatch();
         let (window_el, scale) = resolve_window(ctx, deadline)?;
 
         let mut budget = WalkBudget::with_limits(ctx.limits);
@@ -980,7 +981,9 @@ mod tests {
             .snapshot(&context(Deadline::from_millis(0)))
             .expect_err("a spent snapshot must stop before checking AX trust");
 
-        assert!(matches!(error, GlassError::AccessibilityNotReady(_)));
+        assert_eq!(error.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub struct IosA11y {
 
 #[derive(Clone, Copy)]
 enum SemanticPhase {
-    Snapshot,
+    Snapshot { dispatched: bool },
     Invoke,
     SetValue { dispatched: bool },
 }
@@ -37,9 +37,15 @@ enum SemanticPhase {
 impl SemanticPhase {
     fn expired(self) -> GlassError {
         match self {
-            Self::Snapshot => GlassError::AccessibilityNotReady(
-                "no accessibility tree within the time this call allowed".into(),
-            ),
+            Self::Snapshot { dispatched: false } => {
+                GlassError::deadline_not_started("native accessibility snapshot")
+            }
+            Self::Snapshot { dispatched: true } => {
+                GlassError::caller_deadline_elapsed_with_guidance(
+                    "native accessibility snapshot",
+                    "no accessibility tree became available within the time this call allowed",
+                )
+            }
             Self::Invoke => GlassError::deadline_not_started("native accessibility invoke"),
             Self::SetValue { dispatched: false } => {
                 GlassError::deadline_not_started("native accessibility set_value")
@@ -47,6 +53,13 @@ impl SemanticPhase {
             Self::SetValue { dispatched: true } => {
                 GlassError::caller_deadline_elapsed("native accessibility set_value")
             }
+        }
+    }
+
+    fn after_snapshot_dispatch(self) -> Self {
+        match self {
+            Self::Snapshot { .. } => Self::Snapshot { dispatched: true },
+            phase => phase,
         }
     }
 
@@ -88,19 +101,20 @@ impl IosA11y {
     /// unavailable at all for the second or so an app takes to render. The platform's
     /// injector converts with the device's scale, so a reader using a different one would
     /// report bounds that tap somewhere else.
-    fn scale(&mut self, deadline: Deadline, phase: SemanticPhase) -> Result<f64> {
+    fn scale(&mut self, deadline: Deadline, phase: SemanticPhase) -> Result<(f64, SemanticPhase)> {
         phase.require(deadline)?;
         if let Some(scale) = self.scale {
             phase.require(deadline)?;
-            return Ok(scale);
+            return Ok((scale, phase));
         }
+        let phase = phase.after_snapshot_dispatch();
         let dimensions = phase.finish(deadline, self.client.describe_by(deadline))?;
         let scale = phase.run(deadline, || {
             crate::platform::checked_scale(dimensions.density)
         })?;
         self.scale = Some(scale);
         phase.require(deadline)?;
-        Ok(scale)
+        Ok((scale, phase))
     }
 
     /// One describe round-trip: fetch the accessibility JSON and map the id-assigned tree at
@@ -108,7 +122,8 @@ impl IosA11y {
     /// input at the same one.
     fn describe(&mut self, ctx: &AxContext, phase: SemanticPhase) -> Result<(AxTree, f64)> {
         phase.require(ctx.deadline)?;
-        let scale = self.scale(ctx.deadline, phase)?;
+        let (scale, phase) = self.scale(ctx.deadline, phase)?;
+        let phase = phase.after_snapshot_dispatch();
         let json = phase.finish(ctx.deadline, self.client.describe_all_by(ctx.deadline))?;
         let tree = phase.run(ctx.deadline, || {
             let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
@@ -247,7 +262,9 @@ fn post_write_error(target: &AxTarget, error: GlassError) -> GlassError {
 
 impl Accessibility for IosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        Ok(self.describe(ctx, SemanticPhase::Snapshot)?.0)
+        Ok(self
+            .describe(ctx, SemanticPhase::Snapshot { dispatched: false })?
+            .0)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -355,8 +372,39 @@ mod tests {
             .snapshot(&ctx(glass_core::Deadline::from_millis(0)))
             .expect_err("a spent snapshot deadline must stop before idb describe");
 
-        assert!(
-            matches!(error, GlassError::AccessibilityNotReady(_)),
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::NotStarted),
+            "{error}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn snapshot_expiry_after_describe_dispatch_is_a_caller_timeout() {
+        let error = SemanticPhase::Snapshot { dispatched: true }
+            .finish::<()>(
+                glass_core::Deadline::from_millis(0),
+                Err(GlassError::caller_deadline_elapsed(
+                    "idb accessibility describe",
+                )),
+            )
+            .expect_err("an in-flight describe ended at the caller deadline");
+
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
             "{error}"
         );
     }

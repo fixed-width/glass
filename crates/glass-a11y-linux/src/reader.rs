@@ -10,8 +10,8 @@ use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
-    A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, Deadline,
-    GlassError, Result, SetValueDispatch, WalkBudget, Whose, normalize_description, normalize_name,
+    A11yMutationDispatch, A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget,
+    AxTree, Deadline, GlassError, Result, WalkBudget, Whose, normalize_description, normalize_name,
     read_back_confirms, write_took_no_effect,
 };
 
@@ -56,8 +56,10 @@ impl Accessibility for LinuxA11y {
         let ctx = ctx.clone();
         let target = target.clone();
         // This reader actuates the element it resolved, so it never substitutes another.
-        BUS.invoke(ctx.deadline, move || run_invoke(&ctx, &target))
-            .map(|()| None)
+        invoke_with_thread(&BUS, ctx, move |ctx, dispatch| {
+            run_invoke(&ctx, &target, dispatch)
+        })
+        .map(|()| None)
     }
 }
 
@@ -65,9 +67,17 @@ fn set_value_with_thread(
     thread: &A11yThread,
     ctx: AxContext,
     target: u32,
-    job: impl FnOnce(AxContext, &SetValueDispatch) -> Result<()> + Send + 'static,
+    job: impl FnOnce(AxContext, &A11yMutationDispatch) -> Result<()> + Send + 'static,
 ) -> Result<()> {
     thread.set_value(target, ctx.deadline, move |dispatch| job(ctx, dispatch))
+}
+
+fn invoke_with_thread(
+    thread: &A11yThread,
+    ctx: AxContext,
+    job: impl FnOnce(AxContext, &A11yMutationDispatch) -> Result<()> + Send + 'static,
+) -> Result<()> {
+    thread.invoke(ctx.deadline, move |dispatch| job(ctx, dispatch))
 }
 
 fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
@@ -82,7 +92,7 @@ fn run_set_value(
     ctx: &AxContext,
     target: &AxTarget,
     text: &str,
-    dispatch: &SetValueDispatch,
+    dispatch: &A11yMutationDispatch,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -91,12 +101,12 @@ fn run_set_value(
     rt.block_on(set_value_async(ctx, target, text, dispatch))
 }
 
-fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
+fn run_invoke(ctx: &AxContext, target: &AxTarget, dispatch: &A11yMutationDispatch) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
-    rt.block_on(invoke_async(ctx, target))
+    rt.block_on(invoke_async(ctx, target, dispatch))
 }
 
 fn bus_err(e: impl std::fmt::Display) -> GlassError {
@@ -208,7 +218,7 @@ async fn set_value_async(
     ctx: &AxContext,
     target: &AxTarget,
     text: &str,
-    dispatch: &SetValueDispatch,
+    dispatch: &A11yMutationDispatch,
 ) -> Result<()> {
     let (app_ref, conn) = find_app(ctx).await?;
     let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
@@ -589,7 +599,7 @@ async fn try_action(
     conn: &zbus::Connection,
     node: &AccessibleProxy<'_>,
     names: &[&str],
-    value_dispatch: Option<&SetValueDispatch>,
+    dispatch: &A11yMutationDispatch,
 ) -> ActionAttempt {
     let dest = node.inner().destination().to_owned();
     let path = node.inner().path().to_owned();
@@ -613,14 +623,9 @@ async fn try_action(
             Err(e) => return ActionAttempt::Error(format!("GetName({i}): {e}")),
         };
         if names.contains(&name.as_str()) {
-            let result = match value_dispatch {
-                Some(dispatch) => {
-                    dispatch
-                        .dispatch_async(async { a.do_action(i).await.map_err(bus_err) })
-                        .await
-                }
-                None => a.do_action(i).await.map_err(bus_err),
-            };
+            let result = dispatch
+                .dispatch_async(async { a.do_action(i).await.map_err(bus_err) })
+                .await;
             return match result {
                 Ok(ok) => ActionAttempt::Fired { ok, action: name },
                 Err(e) => ActionAttempt::Error(format!("DoAction({i}): {e}")),
@@ -654,7 +659,7 @@ async fn set_toggle(
     target_on: bool,
     requested: &str,
     id: u32,
-    dispatch: &SetValueDispatch,
+    dispatch: &A11yMutationDispatch,
 ) -> Result<()> {
     let flag = toggle_state_flag(role);
     if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
@@ -665,7 +670,7 @@ async fn set_toggle(
     // `AxValueNotApplied` on no change, so an ambiguous outcome is caught by that check
     // rather than needing its own classification.
     if !matches!(
-        try_action(conn, node, TOGGLE_ACTION_NAMES, Some(dispatch)).await,
+        try_action(conn, node, TOGGLE_ACTION_NAMES, dispatch).await,
         ActionAttempt::Fired { ok: true, .. }
     ) {
         // No toggle action (e.g. a GTK4 GtkCheckButton exposes none) — can't set it
@@ -788,6 +793,7 @@ async fn focus_text_editor(
     conn: &zbus::Connection,
     node: &AccessibleProxy<'_>,
     id: u32,
+    dispatch: &A11yMutationDispatch,
 ) -> Result<()> {
     const OP: &str = "native accessibility focus";
     if ctx.deadline.has_passed() {
@@ -812,9 +818,13 @@ async fn focus_text_editor(
     if ctx.deadline.has_passed() {
         return Err(GlassError::deadline_not_started(OP));
     }
-    let focus_reply = await_caller_deadline(ctx.deadline, component.grab_focus())
-        .await
-        .map_err(|()| GlassError::caller_deadline_elapsed(OP))?;
+    let focus_reply = dispatch
+        .dispatch_async(async {
+            await_caller_deadline(ctx.deadline, component.grab_focus())
+                .await
+                .map_err(|()| GlassError::caller_deadline_elapsed(OP))
+        })
+        .await?;
     if ctx.deadline.has_passed() {
         return Err(GlassError::caller_deadline_elapsed(OP));
     }
@@ -898,7 +908,11 @@ async fn verify_toggle_flipped(
 ///
 /// Text editors receive focus, while other controls fire the first [`ACTIVATE_ACTION_NAMES`] match.
 /// [`TOGGLE_ACTION`] succeeds only after [`verify_toggle_flipped`] observes a state change.
-async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
+async fn invoke_async(
+    ctx: &AxContext,
+    target: &AxTarget,
+    dispatch: &A11yMutationDispatch,
+) -> Result<()> {
     let (app_ref, conn) = find_app(ctx).await?;
     let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
     let mut budget = WalkBudget::with_limits(ctx.limits);
@@ -914,7 +928,7 @@ async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
         return Err(GlassError::AxElementChanged(target.id.0));
     }
     if native_invoke_kind(role) == NativeInvokeKind::Focus {
-        return focus_text_editor(ctx, &conn, &node, target.id.0).await;
+        return focus_text_editor(ctx, &conn, &node, target.id.0, dispatch).await;
     }
     // Read the control's boolean state BEFORE firing, so a `toggle` action can be verified by
     // an actual flip below — afterwards there is nothing left to compare against. Costs one
@@ -923,7 +937,7 @@ async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
     // button), which is why only the `toggle` rung consults it.
     let flag = toggle_state_flag(role);
     let was_on = node.get_state().await.map_err(bus_err)?.contains(flag);
-    match try_action(&conn, &node, ACTIVATE_ACTION_NAMES, None).await {
+    match try_action(&conn, &node, ACTIVATE_ACTION_NAMES, dispatch).await {
         ActionAttempt::Fired { ok: true, action } if action == TOGGLE_ACTION => {
             verify_toggle_flipped(&node, flag, was_on, target.id.0).await
         }
@@ -1113,6 +1127,74 @@ mod tests {
         );
         assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
         assert!(error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn linux_invoke_timeout_before_native_dispatch_cancels_the_late_action() {
+        let ctx = AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(20),
+        };
+        let thread = A11yThread::new("test a11y bus", Duration::from_secs(1));
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_invoked = std::sync::Arc::clone(&invoked);
+
+        let error = invoke_with_thread(&thread, ctx, move |_, dispatch| {
+            std::thread::sleep(Duration::from_millis(60));
+            dispatch.dispatch(|| {
+                worker_invoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .expect_err("the caller stops during target resolution");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "the Linux wrapper allowed a detached invoke to dispatch after timeout"
+        );
+    }
+
+    #[test]
+    fn linux_invoke_timeout_after_native_dispatch_remains_may_have_dispatched() {
+        let ctx = AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(20),
+        };
+        let thread = A11yThread::new("test a11y bus", Duration::from_secs(1));
+
+        let error = invoke_with_thread(&thread, ctx, |_, dispatch| {
+            dispatch.dispatch(|| {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(())
+            })
+        })
+        .expect_err("the native action outlives the caller");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
     }
 
     #[test]

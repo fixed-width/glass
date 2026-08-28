@@ -31,17 +31,17 @@ pub struct A11yThread {
     ceiling: Duration,
 }
 
-const SET_VALUE_PENDING: u8 = 0;
-const SET_VALUE_DISPATCHED: u8 = 1;
-const SET_VALUE_CANCELLED: u8 = 2;
+const MUTATION_PENDING: u8 = 0;
+const MUTATION_DISPATCHED: u8 = 1;
+const MUTATION_CANCELLED: u8 = 2;
 
-/// The operation-specific dispatch gate for a detached native value mutation.
+/// The operation-specific dispatch gate for one detached native accessibility mutation.
 ///
 /// A backend performs all target resolution and guard reads before calling [`Self::dispatch`]. The
 /// first call through the borrowed capability atomically claims permission to begin the native
-/// setter. Every later call is refused. If the waiting caller has already timed out, the setter is
-/// also refused, so a timeout reported as pre-write cannot later mutate the value on the detached
-/// worker.
+/// mutation. Every later call is refused. If the waiting caller has already timed out, the mutation
+/// is also refused, so a timeout reported as pre-dispatch cannot later change the app on the
+/// detached worker.
 ///
 /// The capability is borrowed by the worker job and cannot escape to a detached helper that
 /// dispatches after the job returns:
@@ -50,8 +50,7 @@ const SET_VALUE_CANCELLED: u8 = 2;
 /// use glass_core::{A11yThread, Deadline, Result};
 /// use std::time::Duration;
 ///
-/// let _: Result<()> = A11yThread::new("example", Duration::from_secs(1)).set_value(
-///     7,
+/// let _: Result<()> = A11yThread::new("example", Duration::from_secs(1)).invoke(
 ///     Deadline::UNBOUNDED,
 ///     |dispatch| {
 ///         let late = dispatch.clone();
@@ -60,48 +59,53 @@ const SET_VALUE_CANCELLED: u8 = 2;
 ///     },
 /// );
 /// ```
-pub struct SetValueDispatch {
+pub struct A11yMutationDispatch {
     state: Arc<AtomicU8>,
+    operation: &'static str,
 }
 
-impl SetValueDispatch {
-    fn new() -> Self {
+impl A11yMutationDispatch {
+    fn new(operation: &'static str) -> Self {
         Self {
-            state: Arc::new(AtomicU8::new(SET_VALUE_PENDING)),
+            state: Arc::new(AtomicU8::new(MUTATION_PENDING)),
+            operation,
         }
     }
 
     fn duplicate(&self) -> Self {
         Self {
             state: Arc::clone(&self.state),
+            operation: self.operation,
         }
     }
 
     fn begin(&self) -> Result<()> {
         match self.state.compare_exchange(
-            SET_VALUE_PENDING,
-            SET_VALUE_DISPATCHED,
+            MUTATION_PENDING,
+            MUTATION_DISPATCHED,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
             Ok(_) => Ok(()),
-            Err(SET_VALUE_DISPATCHED) => Err(GlassError::Backend(
-                "native accessibility set_value mutation was already dispatched".to_string(),
-            )),
-            Err(SET_VALUE_CANCELLED) => Err(GlassError::deadline_not_started(
-                "native accessibility set_value mutation",
-            )),
-            Err(other) => unreachable!("unknown set_value dispatch state {other}"),
+            Err(MUTATION_DISPATCHED) => Err(GlassError::Backend(format!(
+                "native accessibility {} mutation was already dispatched",
+                self.operation
+            ))),
+            Err(MUTATION_CANCELLED) => Err(GlassError::deadline_not_started(&format!(
+                "native accessibility {} mutation",
+                self.operation
+            ))),
+            Err(other) => unreachable!("unknown accessibility mutation dispatch state {other}"),
         }
     }
 
-    /// Begin one native value mutation, or refuse it if the caller already stopped waiting.
+    /// Begin one native mutation, or refuse it if the caller already stopped waiting.
     pub fn dispatch<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
         self.begin()?;
         work()
     }
 
-    /// Async form of [`Self::dispatch`] for native setters driven by an async accessibility API.
+    /// Async form of [`Self::dispatch`] for mutations driven by an async accessibility API.
     pub async fn dispatch_async<T>(
         &self,
         work: impl std::future::Future<Output = Result<T>>,
@@ -113,35 +117,38 @@ impl SetValueDispatch {
     /// Atomically seal an unclaimed mutation capability. Returns whether dispatch already won.
     fn cancel_or_dispatched(&self) -> bool {
         match self.state.compare_exchange(
-            SET_VALUE_PENDING,
-            SET_VALUE_CANCELLED,
+            MUTATION_PENDING,
+            MUTATION_CANCELLED,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) | Err(SET_VALUE_CANCELLED) => false,
-            Err(SET_VALUE_DISPATCHED) => true,
-            Err(other) => unreachable!("unknown set_value dispatch state {other}"),
+            Ok(_) | Err(MUTATION_CANCELLED) => false,
+            Err(MUTATION_DISPATCHED) => true,
+            Err(other) => unreachable!("unknown accessibility mutation dispatch state {other}"),
         }
     }
 
     fn was_dispatched(&self) -> bool {
-        self.state.load(Ordering::Acquire) == SET_VALUE_DISPATCHED
+        self.state.load(Ordering::Acquire) == MUTATION_DISPATCHED
     }
 }
 
-struct SetValueCompletion(SetValueDispatch);
+/// Compatibility name for callers that only use the dispatch gate with `set_value`.
+pub type SetValueDispatch = A11yMutationDispatch;
 
-impl Drop for SetValueCompletion {
+struct MutationCompletion(A11yMutationDispatch);
+
+impl Drop for MutationCompletion {
     fn drop(&mut self) {
         self.0.cancel_or_dispatched();
     }
 }
 
-fn run_set_value_job(
-    dispatch: SetValueDispatch,
-    job: impl FnOnce(&SetValueDispatch) -> Result<()>,
+fn run_mutation_job(
+    dispatch: A11yMutationDispatch,
+    job: impl FnOnce(&A11yMutationDispatch) -> Result<()>,
 ) -> Result<()> {
-    let _completion = SetValueCompletion(dispatch.duplicate());
+    let _completion = MutationCompletion(dispatch.duplicate());
     job(&dispatch)
 }
 
@@ -228,7 +235,7 @@ impl A11yThread {
         &self,
         target: u32,
         deadline: Deadline,
-        job: impl FnOnce(&SetValueDispatch) -> Result<()> + Send + 'static,
+        job: impl FnOnce(&A11yMutationDispatch) -> Result<()> + Send + 'static,
     ) -> Result<()> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started(
@@ -236,14 +243,14 @@ impl A11yThread {
             ));
         }
         let (wait, ended_by) = self.bounded_wait(deadline);
-        let dispatch = SetValueDispatch::new();
+        let dispatch = A11yMutationDispatch::new("set_value");
         let worker_dispatch = dispatch.duplicate();
         let timeout_dispatch = dispatch.duplicate();
         let panic_dispatch = dispatch.duplicate();
         let result = self.detached(
             Op::SetValue,
             wait,
-            move || run_set_value_job(worker_dispatch, job),
+            move || run_mutation_job(worker_dispatch, job),
             || self.set_value_no_answer(target, ended_by, &timeout_dispatch),
             || self.set_value_panicked(target, &panic_dispatch),
         );
@@ -260,12 +267,13 @@ impl A11yThread {
         }
     }
 
-    /// Actuate under the nearer caller/ceiling deadline, keeping timeouts fallback-ineligible
-    /// because the detached action may still land.
+    /// Actuate under the nearer caller/ceiling deadline. A timeout atomically cancels an unclaimed
+    /// mutation gate; if the worker claimed it first, the action remains fallback-ineligible because
+    /// it may still land.
     pub fn invoke(
         &self,
         deadline: Deadline,
-        job: impl FnOnce() -> Result<()> + Send + 'static,
+        job: impl FnOnce(&A11yMutationDispatch) -> Result<()> + Send + 'static,
     ) -> Result<()> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started(
@@ -273,26 +281,61 @@ impl A11yThread {
             ));
         }
         let (wait, ended_by) = self.bounded_wait(deadline);
-        self.detached(
+        let dispatch = A11yMutationDispatch::new("invoke");
+        let worker_dispatch = dispatch.duplicate();
+        let timeout_dispatch = dispatch.duplicate();
+        let panic_dispatch = dispatch.duplicate();
+        let result = self.detached(
             Op::Invoke,
             wait,
-            job,
-            || match ended_by {
-                Whose::Caller => GlassError::caller_deadline_elapsed_with_guidance(
-                    "native accessibility invoke",
-                    "the action may still land; re-snapshot before retrying",
-                ),
-                Whose::Callee => self.timed_out(Op::Invoke),
+            move || run_mutation_job(worker_dispatch, job),
+            || self.invoke_no_answer(ended_by, &timeout_dispatch),
+            || self.invoke_panicked(&panic_dispatch),
+        );
+        dispatch.cancel_or_dispatched();
+        result
+    }
+
+    fn invoke_no_answer(&self, ended_by: Whose, dispatch: &A11yMutationDispatch) -> GlassError {
+        match (ended_by, dispatch.cancel_or_dispatched()) {
+            (Whose::Caller, true) => GlassError::caller_deadline_elapsed_with_guidance(
+                "native accessibility invoke",
+                "the action may still land; re-snapshot before retrying",
+            ),
+            (Whose::Caller, false) => GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                whose: Whose::Caller,
+                dispatch: BoundDispatch::NotDispatched,
+                message: "native accessibility invoke: the caller deadline elapsed during target resolution; the action was not dispatched"
+                    .into(),
             },
-            || self.worker_panicked(Op::Invoke),
-        )
+            (Whose::Callee, true) => self.timed_out(Op::Invoke).after_dispatch(),
+            (Whose::Callee, false) => GlassError::AccessibilityUnavailable(format!(
+                "accessibility invoke timed out ({} not responding) before the native action was dispatched",
+                self.backend
+            ))
+            .before_dispatch(),
+        }
+    }
+
+    fn invoke_panicked(&self, dispatch: &A11yMutationDispatch) -> GlassError {
+        let error = self.worker_panicked(Op::Invoke);
+        if dispatch.was_dispatched() {
+            error.after_dispatch()
+        } else {
+            GlassError::AccessibilityUnavailable(format!(
+                "the {} accessibility worker panicked during invoke before the native action was dispatched — the panic is on glass's stderr",
+                self.backend
+            ))
+            .before_dispatch()
+        }
     }
 
     fn set_value_no_answer(
         &self,
         target: u32,
         ended_by: Whose,
-        dispatch: &SetValueDispatch,
+        dispatch: &A11yMutationDispatch,
     ) -> GlassError {
         if dispatch.cancel_or_dispatched() {
             let (detail, source) = match ended_by {
@@ -330,7 +373,7 @@ impl A11yThread {
         }
     }
 
-    fn set_value_panicked(&self, target: u32, dispatch: &SetValueDispatch) -> GlassError {
+    fn set_value_panicked(&self, target: u32, dispatch: &A11yMutationDispatch) -> GlassError {
         if dispatch.was_dispatched() {
             GlassError::write_unconfirmed_because(
                 target,
@@ -538,7 +581,7 @@ mod tests {
         assert!(e.to_string().contains("set_value timed out"), "{e}");
 
         let e = impatient()
-            .invoke(Deadline::UNBOUNDED, hangs())
+            .invoke(Deadline::UNBOUNDED, |dispatch| dispatch.dispatch(hangs()))
             .unwrap_err();
         assert!(e.to_string().contains("invoke timed out"), "{e}");
         // The variant, not the prose, is what withholds the pointer-click fallback from an action
@@ -557,7 +600,7 @@ mod tests {
                 })
                 .unwrap_err(),
             impatient()
-                .invoke(Deadline::UNBOUNDED, hangs())
+                .invoke(Deadline::UNBOUNDED, |dispatch| dispatch.dispatch(hangs()))
                 .unwrap_err(),
         ] {
             assert!(e.to_string().contains("may still land"), "{e}");
@@ -645,7 +688,9 @@ mod tests {
     #[test]
     fn a_panicking_action_still_says_it_may_have_landed() {
         let e = reader()
-            .invoke(Deadline::UNBOUNDED, || panic!("unwound after dispatch"))
+            .invoke(Deadline::UNBOUNDED, |dispatch| {
+                dispatch.dispatch(|| panic!("unwound after dispatch"))
+            })
             .unwrap_err();
         assert!(e.to_string().contains("may still land"), "{e}");
     }
@@ -665,7 +710,7 @@ mod tests {
     #[test]
     fn a_spent_invoke_deadline_starts_no_worker() {
         let (started, ran) = mpsc::channel();
-        let r = reader().invoke(Deadline::from_millis(0), move || {
+        let r = reader().invoke(Deadline::from_millis(0), move |_| {
             let _ = started.send(());
             Ok(())
         });
@@ -784,10 +829,10 @@ mod tests {
 
     #[test]
     fn worker_completion_seals_a_pending_noop_before_returning_its_result() {
-        let dispatch = SetValueDispatch::new();
+        let dispatch = A11yMutationDispatch::new("set_value");
         let escaped = dispatch.duplicate();
 
-        let result = run_set_value_job(dispatch, |_| Ok(()));
+        let result = run_mutation_job(dispatch, |_| Ok(()));
 
         assert!(result.is_ok(), "{result:?}");
         assert!(
@@ -798,10 +843,10 @@ mod tests {
 
     #[test]
     fn worker_completion_seals_a_pending_pre_write_error_before_returning_it() {
-        let dispatch = SetValueDispatch::new();
+        let dispatch = A11yMutationDispatch::new("set_value");
         let escaped = dispatch.duplicate();
 
-        let result = run_set_value_job(dispatch, |_| Err(GlassError::AxUnsupported));
+        let result = run_mutation_job(dispatch, |_| Err(GlassError::AxUnsupported));
 
         assert!(
             matches!(result, Err(GlassError::AxUnsupported)),
@@ -815,11 +860,11 @@ mod tests {
 
     #[test]
     fn worker_completion_seals_a_pending_token_before_unwinding() {
-        let dispatch = SetValueDispatch::new();
+        let dispatch = A11yMutationDispatch::new("set_value");
         let escaped = dispatch.duplicate();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _: Result<()> = run_set_value_job(dispatch, |_| panic!("scripted worker panic"));
+            let _: Result<()> = run_mutation_job(dispatch, |_| panic!("scripted worker panic"));
         }));
 
         assert!(result.is_err(), "the scripted worker must unwind");
@@ -945,7 +990,9 @@ mod tests {
     fn a_hanging_invoke_returns_a_caller_owned_timeout() {
         let started = Instant::now();
         let error = reader()
-            .invoke(Deadline::from_millis(20), hangs())
+            .invoke(Deadline::from_millis(20), |dispatch| {
+                dispatch.dispatch(hangs())
+            })
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_millis(200));
         assert_eq!(error.bound_owner(), Some(Whose::Caller));
@@ -958,6 +1005,64 @@ mod tests {
         assert!(
             error.to_string().contains("action may still land"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_pre_invoke_worker_cannot_dispatch_the_action_later() {
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_invoked = std::sync::Arc::clone(&invoked);
+
+        let error = reader()
+            .invoke(Deadline::from_millis(20), move |dispatch| {
+                std::thread::sleep(Duration::from_millis(60));
+                dispatch.dispatch(|| {
+                    worker_invoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+            .expect_err("the caller stops during pre-invoke target resolution");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "the detached worker dispatched after the caller timed out"
+        );
+    }
+
+    #[test]
+    fn a_backend_timeout_cancels_an_unclaimed_invoke_action() {
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_invoked = std::sync::Arc::clone(&invoked);
+
+        let error = impatient()
+            .invoke(Deadline::UNBOUNDED, move |dispatch| {
+                std::thread::sleep(Duration::from_millis(60));
+                dispatch.dispatch(|| {
+                    worker_invoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+            .expect_err("the backend ceiling stops during pre-invoke target resolution");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::AccessibilityUnavailable(_)),
+            "{error}"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "the detached worker dispatched after the backend ceiling timed out"
         );
     }
 
@@ -975,7 +1080,7 @@ mod tests {
     fn an_unbounded_invoke_retains_the_backend_ceiling() {
         let started = Instant::now();
         let e = impatient()
-            .invoke(Deadline::UNBOUNDED, hangs())
+            .invoke(Deadline::UNBOUNDED, |dispatch| dispatch.dispatch(hangs()))
             .unwrap_err();
         assert!(started.elapsed() >= IMPATIENT, "{:?}", started.elapsed());
         assert!(e.to_string().contains("invoke timed out"), "{e}");

@@ -6,8 +6,8 @@
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal,
-    GlassError, Result, SetValueDispatch, WalkBudget, normalize_description, normalize_name,
+    A11yMutationDispatch, A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget,
+    AxTree, ChangeSignal, GlassError, Result, WalkBudget, normalize_description, normalize_name,
     read_back_confirms, write_took_no_effect,
 };
 use uiautomation::patterns::{
@@ -73,8 +73,10 @@ impl Accessibility for WindowsA11y {
         let ctx = ctx.clone();
         let target = target.clone();
         // This reader actuates the element it resolved, so it never substitutes another.
-        UIA.invoke(ctx.deadline, move || run_invoke(&ctx, &target))
-            .map(|()| None)
+        invoke_with_thread(&UIA, ctx, move |ctx, dispatch| {
+            run_invoke(&ctx, &target, dispatch)
+        })
+        .map(|()| None)
     }
 }
 
@@ -82,9 +84,17 @@ fn set_value_with_thread(
     thread: &A11yThread,
     ctx: AxContext,
     target: u32,
-    job: impl FnOnce(AxContext, &SetValueDispatch) -> Result<()> + Send + 'static,
+    job: impl FnOnce(AxContext, &A11yMutationDispatch) -> Result<()> + Send + 'static,
 ) -> Result<()> {
     thread.set_value(target, ctx.deadline, move |dispatch| job(ctx, dispatch))
+}
+
+fn invoke_with_thread(
+    thread: &A11yThread,
+    ctx: AxContext,
+    job: impl FnOnce(AxContext, &A11yMutationDispatch) -> Result<()> + Send + 'static,
+) -> Result<()> {
+    thread.invoke(ctx.deadline, move |dispatch| job(ctx, dispatch))
 }
 
 fn uia_err(e: impl std::fmt::Display) -> GlassError {
@@ -373,7 +383,7 @@ fn run_set_value(
     ctx: &AxContext,
     target: &AxTarget,
     text: &str,
-    dispatch: &SetValueDispatch,
+    dispatch: &A11yMutationDispatch,
 ) -> Result<()> {
     let automation = UIAutomation::new().map_err(|e| {
         GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))
@@ -471,7 +481,7 @@ fn run_set_value(
 /// `Is<Pattern>Available` properties that could tell the two apart, but acting on them would turn
 /// a disagreement between property and `get_pattern` into a hard, non-falling-back click failure
 /// (an error after dispatch never falls back), trading a harmless pointer click for a dead one.
-fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
+fn run_invoke(ctx: &AxContext, target: &AxTarget, dispatch: &A11yMutationDispatch) -> Result<()> {
     let automation = UIAutomation::new().map_err(|e| {
         GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))
     })?;
@@ -501,7 +511,7 @@ fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
 
     let fail = |e: uiautomation::Error| GlassError::AxActionFailed(target.id.0, e.to_string());
     if let Ok(p) = el.get_pattern::<UIInvokePattern>() {
-        return p.invoke().map_err(fail);
+        return dispatch.dispatch(|| p.invoke().map_err(fail));
     }
     if let Ok(p) = el.get_pattern::<UITogglePattern>() {
         // Toggle is the one rung with a readable post-state, so don't take the ack as proof:
@@ -515,7 +525,7 @@ fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
         // outcome is `AxActionUnavailable` and a single pointer click, whereas an error here
         // would propagate (an error after dispatch never falls back) and kill the click.
         if let Ok(before) = p.get_toggle_state() {
-            p.toggle().map_err(fail)?;
+            dispatch.dispatch(|| p.toggle().map_err(fail))?;
             let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
             loop {
                 // Past the dispatch, a failed read IS a failure: `fail` (AxActionFailed) is
@@ -536,11 +546,12 @@ fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
         }
     }
     if let Ok(p) = el.get_pattern::<UISelectionItemPattern>() {
-        return p.select().map_err(fail);
+        return dispatch.dispatch(|| p.select().map_err(fail));
     }
     if let Ok(p) = el.get_pattern::<UIExpandCollapsePattern>() {
         let expanded = p.get_state().map_err(fail)? == ExpandCollapseState::Expanded;
-        return if expanded { p.collapse() } else { p.expand() }.map_err(fail);
+        return dispatch
+            .dispatch(|| if expanded { p.collapse() } else { p.expand() }.map_err(fail));
     }
     Err(GlassError::AxActionUnavailable(target.id.0))
 }
@@ -644,10 +655,82 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
+            matches!(error, GlassError::AxWriteUnconfirmedCaused { id: 7, .. }),
             "{error}"
         );
         assert!(error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn windows_invoke_timeout_before_native_dispatch_cancels_the_late_action() {
+        let ctx = AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline: glass_core::Deadline::from_millis(20),
+        };
+        let thread = A11yThread::new("test UIA", Duration::from_secs(1));
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_invoked = std::sync::Arc::clone(&invoked);
+
+        let error = invoke_with_thread(&thread, ctx, move |_, dispatch| {
+            std::thread::sleep(Duration::from_millis(60));
+            dispatch.dispatch(|| {
+                worker_invoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .expect_err("the caller stops during target resolution");
+
+        assert_eq!(
+            error.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "the Windows wrapper allowed a detached invoke to dispatch after timeout"
+        );
+    }
+
+    #[test]
+    fn windows_invoke_timeout_after_native_dispatch_remains_may_have_dispatched() {
+        let ctx = AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline: glass_core::Deadline::from_millis(20),
+        };
+        let thread = A11yThread::new("test UIA", Duration::from_secs(1));
+
+        let error = invoke_with_thread(&thread, ctx, |_, dispatch| {
+            dispatch.dispatch(|| {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(())
+            })
+        })
+        .expect_err("the native action outlives the caller");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
     }
 
     /// The failure mode this guards: if an absent child ever stopped arriving as a zero code,

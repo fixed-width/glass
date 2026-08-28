@@ -50,9 +50,15 @@ impl SemanticDeadline {
 
     pub(crate) fn expired(self) -> GlassError {
         match (self.operation, self.dispatched) {
-            (SemanticOperation::Snapshot, _) => GlassError::AccessibilityNotReady(
-                "no accessibility tree within the time this call allowed".into(),
-            ),
+            (SemanticOperation::Snapshot, false) => {
+                GlassError::deadline_not_started("native accessibility snapshot")
+            }
+            (SemanticOperation::Snapshot, true) => {
+                GlassError::caller_deadline_elapsed_with_guidance(
+                    "native accessibility snapshot",
+                    "no accessibility tree became available within the time this call allowed",
+                )
+            }
             (SemanticOperation::SetValue(_), false) => {
                 GlassError::deadline_not_started("native accessibility set_value")
             }
@@ -201,13 +207,31 @@ mod tests {
     use glass_core::{BoundDispatch, Whose};
 
     #[test]
-    fn a_spent_snapshot_deadline_reports_not_ready() {
+    fn a_spent_snapshot_deadline_is_not_started() {
         let now = Instant::now();
         let error = SemanticDeadline::snapshot(Deadline::at(now))
             .require_at(now)
             .unwrap_err();
 
-        assert!(matches!(error, GlassError::AccessibilityNotReady(_)));
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn a_snapshot_deadline_expiring_after_dispatch_is_a_caller_timeout() {
+        let now = Instant::now();
+        let error = SemanticDeadline::snapshot(Deadline::at(now))
+            .after_dispatch()
+            .require_at(now)
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
     }
 
     #[test]
