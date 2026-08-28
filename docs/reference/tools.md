@@ -434,28 +434,51 @@ the event — glass reports the binary and its build info if yours does not. Oth
 
 ### `glass_do`
 
-Run an ordered sequence of input actions in one call (collapsing per-action round-trips), then
-optionally observe.
+Run a bounded, fixed sequence of actions in one call, then optionally observe. The sequence is a
+static list: it cannot use variables, references to earlier results, interpolation, branching,
+loops, retries, or dynamically generated actions.
 
-- `actions` (array, **required**, non-empty) — each item is `{ action: "click"|"move"|"drag"|
-  "scroll"|"type"|"key"|"settle", ...fields }`. Click/move/drag/scroll/type/key take the same
-  fields as their matching tool, except that a `type` action rejects `return` (its observe output
-  would be discarded mid-sequence — use a `settle` action or `then`; an explicit `"none"` is
-  accepted). A `settle` action takes a *subset* of `glass_wait_stable`'s
-  fields — `interval_ms`, `settle_frames`, `tolerance`, `timeout_ms`, `stability_region`, and
-  `ignore` (the same window-relative-rectangles knob) — but no `window_id`, `region`, or
-  `include_image`: it always settles the active window and never returns an image. It waits for
-  the screen to stop changing between steps.
-- `then` (`{ settle?, diff?, screenshot? }`) — a terminal observe after all actions succeed; text-
-  first, returning an image only for `screenshot` (or `diff` with its own `include_image`).
+- `actions` (array, **required**, 1–64 items) — each item uses one discriminator: `click`, `move`,
+  `drag`, `scroll`, `type`, `key`, `settle`, `click_element`, `set_value`, `wait_for_element`, or
+  `scroll_to_element`. Each action reuses the fields of its standalone tool, including per-action
+  `return` where the standalone tool supports it. A `settle` action uses `interval_ms`,
+  `settle_frames`, `tolerance`, `timeout_ms`, `stability_region`, and `ignore`; it targets the active
+  window and does not return an image.
+- `then` (`{ settle?, diff?, screenshot? }`) — terminal observation after every action succeeds,
+  performed in that order. Images are returned only when requested by `screenshot` or by a `diff`
+  whose `include_image` is true.
+- `timeout_ms` (integer, default 30000, range 1–120000) — one absolute deadline shared by all
+  actions and terminal observations. A blocking operation's own timeout remains a shorter ceiling
+  when it expires first.
 
-Fails fast: if an action errors it reports which index failed and how many ran. Use for **known**
-sequences (login, form-fill, menu→item); if you must see a result to choose the next action, don't
-batch that part.
+The compact UTF-8 JSON encoding of the complete arguments object may be at most 65,536 bytes.
+Execution is fail-fast. In a batch, `wait_for_element` or `scroll_to_element` returning
+`matched:false` fails the sequence; the standalone tools keep their soft `{matched:false}` result.
 
-Returns `{executed}` (the number of actions that ran) plus, when `then` was given, a `then` object
-keyed by whichever of `settle`/`diff`/`screenshot` you asked for — each key holds that sub-tool's
-own `result` shape from its entry above.
+On success, `result` contains `{status, executed, steps, elapsed_ms, then?, terminal_steps?}`.
+`steps` records each action's index, discriminator, `completed` status, trusted result, and any
+zero-based references into the MCP content blocks. Failed execution remains an MCP error with
+`is_error:true`; its structured outcome records completed, failed, and unexecuted steps and retains
+content-block references. App-derived names, descriptions, values, outlines, images, and raw error
+details remain untrusted sibling blocks rather than trusted result fields. Text supplied to `type`
+or `set_value` is never echoed in trusted results.
+
+Completed GUI effects are not rolled back. After an error, inspect the outcomes and current app
+state; do not automatically replay mutations already marked completed.
+
+Example, using element ids obtained before the call:
+
+```json
+{
+  "actions": [
+    {"action":"set_value","id":12,"text":"Alice"},
+    {"action":"wait_for_element","description":"Name","role":"Text","value":"Alice","timeout_ms":3000},
+    {"action":"click_element","id":16,"return":"snapshot"},
+    {"action":"wait_for_element","name":"Clicked 1","description":"Counter","timeout_ms":3000}
+  ],
+  "timeout_ms":10000
+}
+```
 
 ## Windows
 
