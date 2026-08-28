@@ -267,8 +267,7 @@ pub struct TypeArgs {
     pub text: String,
     /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
     /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI
-    /// to stop changing, text-only), or "none" (default). Not accepted inside a `glass_do`
-    /// `type` action — use a `settle` action or the terminal `then` observe there.
+    /// to stop changing, text-only), or "none" (default).
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }

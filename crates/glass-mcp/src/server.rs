@@ -766,7 +766,7 @@ impl GlassServer {
         description = "Run fixed static ordered actions in one call: click, move, drag, scroll, type, \
                        key, settle, click_element, set_value, wait_for_element, scroll_to_element. \
                        At most 64 actions and 65536 compact argument bytes. Optional absolute sequence \
-                       timeout_ms defaults to 30000ms, is at most 120000ms, and is shared by actions and \
+                       timeout_ms defaults to 30000ms, is valid from 1 through 120000ms, and uses one absolute deadline shared by all actions and \
                        terminal settle/diff/screenshot. Fail-fast on action errors, sequence deadline, \
                        and unmatched batched wait_for_element/scroll_to_element predicates; standalone \
                        predicates remain soft. Optional terminal order settle, diff, screenshot adds \
@@ -812,7 +812,7 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      Batch fixed static ordered actions into one glass_do call: click, move, drag, scroll, type, key, \
      settle, click_element, set_value, wait_for_element, scroll_to_element. It accepts at most 64 \
      actions and 65536 compact argument bytes. Its optional absolute sequence timeout_ms defaults to \
-     30000ms, is at most 120000ms, and is shared by actions and terminal settle/diff/screenshot. \
+     30000ms, is valid from 1 through 120000ms, and uses one absolute deadline shared by all actions and terminal settle/diff/screenshot work. \
      Fail-fast on action errors, sequence deadline, and unmatched batched wait_for_element/\
      scroll_to_element predicates; standalone predicates remain soft. Optional terminal order settle, \
      diff, screenshot adds structured outcomes. type retains return:\"none|settle|snapshot\" support. \
@@ -870,8 +870,20 @@ mod tests {
             .into_iter()
             .find(|tool| tool.name == "glass_do")
             .expect("glass_do is registered");
-        let schema = serde_json::Value::Object((*tool.input_schema).clone()).to_string();
-        for action in [
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        let defs = schema["$defs"].as_object().expect("schema definitions");
+        let alternatives = defs["Action"]["oneOf"]
+            .as_array()
+            .expect("Action alternatives");
+        let discriminators: BTreeSet<&str> = alternatives
+            .iter()
+            .map(|alternative| {
+                alternative["properties"]["action"]["const"]
+                    .as_str()
+                    .expect("action discriminator const")
+            })
+            .collect();
+        let expected: BTreeSet<&str> = [
             "click",
             "move",
             "drag",
@@ -883,14 +895,23 @@ mod tests {
             "set_value",
             "wait_for_element",
             "scroll_to_element",
-        ] {
-            assert!(
-                schema.contains(&format!("\"{action}\"")),
-                "missing {action}: {schema}"
-            );
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(discriminators, expected);
+        assert!(schema["properties"].get("timeout_ms").is_some(), "{schema}");
+        fn has_property(value: &serde_json::Value, name: &str) -> bool {
+            value.as_object().is_some_and(|object| {
+                object
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|properties| properties.contains_key(name))
+                    || object.values().any(|child| has_property(child, name))
+            }) || value
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| has_property(item, name)))
         }
-        assert!(schema.contains("\"timeout_ms\""), "{schema}");
-        assert!(!schema.contains("encoded_argument_bytes"), "{schema}");
+        assert!(!has_property(&schema, "encoded_argument_bytes"), "{schema}");
 
         let description = tool.description.as_deref().expect("description");
         for required in [
@@ -899,9 +920,12 @@ mod tests {
             "65536 compact argument bytes",
             "timeout_ms",
             "30000",
+            "1 through 120000",
             "120000",
             "click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element",
             "Fail-fast",
+            "action errors, sequence deadline, and unmatched batched wait_for_element/scroll_to_element predicates",
+            "standalone predicates remain soft",
             "wait_for_element",
             "scroll_to_element",
             "terminal order settle, diff, screenshot",
@@ -924,10 +948,13 @@ mod tests {
             "65536 compact argument bytes",
             "timeout_ms",
             "30000",
+            "1 through 120000",
             "120000",
             "click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element",
             "standalone predicates remain soft",
+            "Fail-fast on action errors, sequence deadline, and unmatched batched wait_for_element/scroll_to_element predicates",
             "terminal order settle, diff, screenshot",
+            "type retains return:\"none|settle|snapshot\"",
             "No variables, result bindings, interpolation, branching, loops, retries, or dynamic action generation",
         ] {
             assert!(

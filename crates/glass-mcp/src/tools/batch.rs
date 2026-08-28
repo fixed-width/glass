@@ -186,13 +186,14 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 });
             }
             Err(error) => {
+                let detail = redacted_error_detail(action, &error.message);
                 return Err(step_failure(
                     &a.actions,
                     i,
                     kind,
                     true,
                     action.is_mutating(),
-                    &error.message,
+                    &detail,
                     error.sequence_deadline_exceeded,
                     steps,
                     siblings,
@@ -334,6 +335,18 @@ fn step_failure(
         }),
         siblings,
     )
+}
+
+fn redacted_error_detail(action: &Action, detail: &str) -> String {
+    let secret = match action {
+        Action::Type(args) => Some(&args.text),
+        Action::SetValue(args) => Some(&args.text),
+        _ => None,
+    };
+    match secret.filter(|secret| !secret.is_empty()) {
+        Some(secret) => detail.replace(secret, "[redacted]"),
+        None => detail.to_owned(),
+    }
 }
 
 fn validation_error(summary: &str) -> ToolOutput {

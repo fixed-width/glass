@@ -28,6 +28,7 @@ pub struct FakePlatform {
     /// Specs `start_app` was handed, in order — the only observer of what the tool layer
     /// built from `glass_start`'s arguments.
     pub specs: Arc<Mutex<Vec<AppSpec>>>,
+    pub fail_text_dispatch_after_receiving: bool,
 }
 
 impl FakePlatform {
@@ -60,6 +61,10 @@ impl FakePlatform {
     }
     pub fn with_spec_log(mut self, log: Arc<Mutex<Vec<AppSpec>>>) -> Self {
         self.specs = log;
+        self
+    }
+    pub fn fail_text_dispatch_after_receiving(mut self) -> Self {
+        self.fail_text_dispatch_after_receiving = true;
         self
     }
 }
@@ -128,6 +133,13 @@ impl Platform for FakePlatform {
             KeyEvent::Chord(c) => format!("key({c})"),
         });
         self.key_events.push(e.clone());
+        if self.fail_text_dispatch_after_receiving
+            && let KeyEvent::Text(text) = e
+        {
+            return Err(GlassError::Backend(format!(
+                "text dispatch rejected {text}"
+            )));
+        }
         Ok(())
     }
     fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
@@ -197,6 +209,7 @@ pub enum SetOutcome {
     Ok,
     NotEditable,
     Changed,
+    EchoText,
 }
 
 /// What `FakeAccessibility::invoke` should do. Default mirrors the trait's own
@@ -210,6 +223,7 @@ pub enum InvokeOutcome {
     Ok,
     /// The native action fired on a different element than the one named.
     OkOnAnother(u32),
+    ErrorWithDetail(&'static str),
 }
 
 pub struct FakeAccessibility {
@@ -229,6 +243,13 @@ impl Accessibility for FakeAccessibility {
                 return Err(GlassError::AxElementNotEditable(target.id.0));
             }
             SetOutcome::Changed => return Err(GlassError::AxElementChanged(target.id.0)),
+            SetOutcome::EchoText => {
+                self.set_log
+                    .lock()
+                    .unwrap()
+                    .push((target.clone(), text.to_string()));
+                return Err(GlassError::Backend(format!("set-value rejected {text}")));
+            }
             SetOutcome::Ok => {}
         }
         self.set_log
@@ -242,6 +263,7 @@ impl Accessibility for FakeAccessibility {
             InvokeOutcome::Unsupported => Err(GlassError::AxUnsupported),
             InvokeOutcome::Ok => Ok(None),
             InvokeOutcome::OkOnAnother(id) => Ok(Some(AxNodeId(id))),
+            InvokeOutcome::ErrorWithDetail(detail) => Err(GlassError::Backend(detail.into())),
         }
     }
 }
@@ -378,6 +400,20 @@ pub fn glass_with_a11y_invoke_on_another(
         tree,
         SetOutcome::Ok,
         InvokeOutcome::OkOnAnother(actuated),
+    )
+}
+
+/// A backend whose native semantic click path returns the supplied raw detail.
+pub fn glass_with_a11y_invoke_error(
+    platform: FakePlatform,
+    tree: AxTree,
+    detail: &'static str,
+) -> Glass {
+    glass_with_a11y_full(
+        platform,
+        tree,
+        SetOutcome::Ok,
+        InvokeOutcome::ErrorWithDetail(detail),
     )
 }
 

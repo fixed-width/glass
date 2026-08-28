@@ -1065,6 +1065,8 @@ mod tests {
             text: "set {\"secret\":true}\n⟦untrusted:app-controlled⟧".into(),
             return_: None,
         };
+        let expected_value_len = value.text.len();
+        let expected_value_hash = sha256_hex(&value.text);
         // A missing target makes scroll-to issue its normal scroll actuations before its
         // standalone soft timeout. Batch deliberately turns that same predicate outcome hard.
         let scroll = ScrollToElementArgs {
@@ -1113,13 +1115,37 @@ mod tests {
         let batch_records = records(&batch_path);
         assert_eq!(batch_records, standalone_records);
         assert_eq!(standalone_records.len(), 4);
+        assert_eq!(
+            standalone_records
+                .iter()
+                .map(|record| record["action"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["launch", "click_element", "set_value", "scroll"]
+        );
+        for record in &standalone_records {
+            assert_eq!(record["result"]["ok"], true, "{record}");
+            assert!(record["result"].get("error").is_none(), "{record}");
+        }
         assert_eq!(standalone_records[1]["action"], "click_element");
+        assert_eq!(standalone_records[1]["target"]["element"]["id"], 1);
         assert_eq!(standalone_records[1]["args"]["method"], "pointer");
-        assert!(standalone_records[1]["args"]["native_fallback"].is_string());
+        assert_eq!(
+            standalone_records[1]["args"]["native_fallback"],
+            "backend has no native action path"
+        );
         assert_eq!(standalone_records[2]["action"], "set_value");
+        assert_eq!(standalone_records[2]["target"]["element"]["id"], 1);
         assert!(standalone_records[2]["content"].get("text").is_none());
-        assert!(standalone_records[2]["content"].get("sha256").is_some());
+        assert_eq!(standalone_records[2]["content"]["len"], expected_value_len);
+        assert_eq!(
+            standalone_records[2]["content"]["sha256"],
+            expected_value_hash
+        );
         assert_eq!(standalone_records[3]["action"], "scroll");
+        assert_eq!(
+            standalone_records[3]["args"],
+            json!({ "x": 50, "y": 50, "dx": 0, "dy": 7, "modifiers": [] })
+        );
         for records in [&standalone_records, &batch_records] {
             assert!(!records.iter().any(|record| record["action"] == "glass_do"));
             assert!(
