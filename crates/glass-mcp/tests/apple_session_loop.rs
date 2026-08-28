@@ -13,27 +13,31 @@
 //! iOS Simulator, with a booted Simulator and `idb_companion` on `PATH`:
 //!
 //! ```sh
-//! ./examples/ios-fixture/build.sh
-//! GLASS_IOS_APP="$PWD/examples/ios-fixture/build/GlassFixture.app" \
-//!   cargo test -p glass-mcp --test apple_session_loop \
+//! cargo test -p glass-mcp --test apple_session_loop \
 //!   glass_do_ios_click_is_semantically_confirmed_with_terminal_screenshot \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 
 #![cfg(target_os = "macos")]
 
+#[path = "common/apple_smoke.rs"]
+mod apple_smoke;
 mod common;
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use apple_smoke::{ElementRoi, assert_roi_changed, unique_named_element};
 use common::mcp_http::{CallView, ImageView, ProcessMcpHarness, call, call_full};
+use image::RgbaImage;
 use rmcp::{Peer, RoleClient};
 use serde_json::json;
 
 static APPLE_ONBOX_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const TREE_DEADLINE: Duration = Duration::from_secs(10);
+const PIXEL_DELTA_TOLERANCE: u8 = 24;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "on-box only: needs macOS Screen Recording + Accessibility grants and swiftc"]
@@ -47,11 +51,10 @@ async fn glass_do_macos_click_is_semantically_confirmed_with_terminal_screenshot
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "on-box only: needs macOS + Xcode + a booted iOS Simulator + idb_companion + GLASS_IOS_APP"]
+#[ignore = "on-box only: needs macOS + Xcode + a booted iOS Simulator + idb_companion"]
 async fn glass_do_ios_click_is_semantically_confirmed_with_terminal_screenshot() {
     let _serial = APPLE_ONBOX_TEST.lock().await;
-    let fixture = std::env::var("GLASS_IOS_APP")
-        .expect("GLASS_IOS_APP must point at the built examples/ios-fixture .app bundle");
+    let fixture = build_ios_fixture();
     let mcp = ProcessMcpHarness::spawn(env!("CARGO_BIN_EXE_glass-mcp"), "ios-loop").await;
     let peer = mcp.peer();
     let proof = tokio::spawn(async move { ios_proof(peer, fixture).await }).await;
@@ -72,14 +75,21 @@ async fn macos_proof(client: Peer<RoleClient>, fixture: &Path) {
     )
     .await;
 
-    let enable_id = wait_for_named_id(&client, "Enable").await;
+    let enable = wait_for_named_element(&client, "Enable").await;
+    assert_semantic_state(
+        &client,
+        json!({"name": "Enable", "condition": "unchecked", "timeout_ms": 1_000}),
+        "macOS Enable must start unchecked",
+    )
+    .await;
+    let before = capture_pre_action_roi(&client, enable, "macOS unchecked Enable").await;
     let batch = call_full(
         &client,
         "glass_do",
         json!({
             "timeout_ms": 15_000,
             "actions": [
-                {"action": "click_element", "id": enable_id},
+                {"action": "click_element", "id": enable.id},
                 {
                     "action": "wait_for_element",
                     "name": "Enable",
@@ -91,7 +101,8 @@ async fn macos_proof(client: Peer<RoleClient>, fixture: &Path) {
         }),
     )
     .await;
-    assert_completed_batch_with_screenshot(&batch, "macos");
+    let after = completed_terminal_screenshot(&batch, "macos");
+    assert_post_action_pixels(&before, &after, enable, "macOS Enable unchecked→checked");
 
     let (semantic, text) = call(
         &client,
@@ -102,12 +113,12 @@ async fn macos_proof(client: Peer<RoleClient>, fixture: &Path) {
     assert_eq!(semantic["matched"], json!(true), "{text}");
 }
 
-async fn ios_proof(client: Peer<RoleClient>, fixture: String) {
+async fn ios_proof(client: Peer<RoleClient>, fixture: PathBuf) {
     call(
         &client,
         "glass_start",
         json!({
-            "run": [fixture],
+            "run": [fixture.to_string_lossy()],
             "backend": "ios",
             "sandbox": "off",
             "timeout_ms": 30_000,
@@ -115,14 +126,22 @@ async fn ios_proof(client: Peer<RoleClient>, fixture: String) {
     )
     .await;
 
-    let tap_id = wait_for_named_id(&client, "tapButton").await;
+    let status = wait_for_named_element(&client, "statusLabel").await;
+    assert_semantic_state(
+        &client,
+        json!({"name": "statusLabel", "value": "READY", "timeout_ms": 1_000}),
+        "iOS statusLabel must start READY",
+    )
+    .await;
+    let before = capture_pre_action_roi(&client, status, "iOS READY statusLabel").await;
+    let tap = wait_for_named_element(&client, "tapButton").await;
     let batch = call_full(
         &client,
         "glass_do",
         json!({
             "timeout_ms": 20_000,
             "actions": [
-                {"action": "click_element", "id": tap_id},
+                {"action": "click_element", "id": tap.id},
                 {
                     "action": "wait_for_element",
                     "name": "statusLabel",
@@ -134,7 +153,8 @@ async fn ios_proof(client: Peer<RoleClient>, fixture: String) {
         }),
     )
     .await;
-    assert_completed_batch_with_screenshot(&batch, "ios");
+    let after = completed_terminal_screenshot(&batch, "ios");
+    assert_post_action_pixels(&before, &after, status, "iOS statusLabel READY→TAPPED");
 
     let (semantic, text) = call(
         &client,
@@ -145,12 +165,12 @@ async fn ios_proof(client: Peer<RoleClient>, fixture: String) {
     assert_eq!(semantic["matched"], json!(true), "{text}");
 }
 
-async fn wait_for_named_id(client: &Peer<RoleClient>, name: &str) -> u32 {
+async fn wait_for_named_element(client: &Peer<RoleClient>, name: &str) -> ElementRoi {
     let deadline = Instant::now() + TREE_DEADLINE;
     loop {
         let (_, outline) = call(client, "glass_a11y_snapshot", json!({})).await;
-        if let Ok(id) = unique_named_id(&outline, name) {
-            return id;
+        if let Ok(element) = unique_named_element(&outline, name) {
+            return element;
         }
         assert!(
             Instant::now() < deadline,
@@ -160,29 +180,66 @@ async fn wait_for_named_id(client: &Peer<RoleClient>, name: &str) -> u32 {
     }
 }
 
-fn unique_named_id(outline: &str, name: &str) -> Result<u32, String> {
-    let needle = format!("\"{name}\"");
-    let ids = outline
-        .lines()
-        .filter_map(|line| {
-            let body = line.trim_start().strip_prefix('#')?;
-            let (id, shape) = body.split_once(char::is_whitespace)?;
-            shape
-                .contains(&needle)
-                .then(|| id.parse::<u32>().ok())
-                .flatten()
-        })
-        .collect::<Vec<_>>();
-    match ids.as_slice() {
-        [id] => Ok(*id),
-        _ => Err(format!(
-            "expected one element named {name:?}, found {}:\n{outline}",
-            ids.len()
-        )),
-    }
+async fn assert_semantic_state(client: &Peer<RoleClient>, args: serde_json::Value, label: &str) {
+    let (semantic, text) = call(client, "glass_wait_for_element", args).await;
+    assert_eq!(semantic["matched"], json!(true), "{label}: {text}");
 }
 
-fn assert_completed_batch_with_screenshot(call: &CallView, backend: &str) {
+async fn capture_pre_action_roi(
+    client: &Peer<RoleClient>,
+    roi: ElementRoi,
+    label: &str,
+) -> RgbaImage {
+    let call = call_full(
+        client,
+        "glass_screenshot",
+        json!({
+            "region": {
+                "x": roi.x,
+                "y": roi.y,
+                "width": roi.width,
+                "height": roi.height,
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        call.result["width"],
+        json!(roi.width),
+        "{label}: {}",
+        call.all_text
+    );
+    assert_eq!(
+        call.result["height"],
+        json!(roi.height),
+        "{label}: {}",
+        call.all_text
+    );
+    assert_eq!(call.images.len(), 1, "{label}: {}", call.all_text);
+    assert_eq!(call.images[0].index, 0, "{label}: {}", call.all_text);
+    decode_real_webp(&call.images[0], label)
+}
+
+fn assert_post_action_pixels(
+    before_roi: &RgbaImage,
+    terminal_frame: &RgbaImage,
+    roi: ElementRoi,
+    label: &str,
+) {
+    let area = u64::from(roi.width) * u64::from(roi.height);
+    let minimum_changed_pixels = (area / 1_000).max(8);
+    assert_roi_changed(
+        before_roi,
+        terminal_frame,
+        roi,
+        PIXEL_DELTA_TOLERANCE,
+        minimum_changed_pixels,
+        label,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+}
+
+fn completed_terminal_screenshot(call: &CallView, backend: &str) -> RgbaImage {
     assert_eq!(
         call.result["status"],
         json!("completed"),
@@ -242,10 +299,10 @@ fn assert_completed_batch_with_screenshot(call: &CallView, backend: &str) {
     );
     assert_eq!(call.images.len(), 1, "{backend}: {}", call.all_text);
     assert_eq!(call.images[0].index, 1, "{backend}: {}", call.all_text);
-    assert_real_webp(&call.images[0], backend);
+    decode_real_webp(&call.images[0], backend)
 }
 
-fn assert_real_webp(image: &ImageView, backend: &str) {
+fn decode_real_webp(image: &ImageView, backend: &str) -> RgbaImage {
     assert_eq!(image.mime_type, "image/webp", "{backend}: wrong image MIME");
     let bytes = image
         .decode()
@@ -264,6 +321,7 @@ fn assert_real_webp(image: &ImageView, backend: &str) {
         frame.pixels().any(|pixel| pixel != first),
         "{backend}: terminal screenshot is uniform/blank"
     );
+    frame
 }
 
 async fn finish_proof(mcp: ProcessMcpHarness, proof: Result<(), tokio::task::JoinError>) {
@@ -291,11 +349,7 @@ impl MacosFixture {
 }
 
 fn build_macos_fixture() -> MacosFixture {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("repo root is two levels above crates/glass-mcp")
-        .to_path_buf();
+    let root = repo_root();
     let source = root.join("crates/glass-macos/fixture/a11y_fixture.swift");
     let dir = tempfile::tempdir().expect("create macOS fixture build directory");
     let binary = dir.path().join("a11y_fixture");
@@ -315,12 +369,38 @@ fn build_macos_fixture() -> MacosFixture {
     MacosFixture { _dir: dir, binary }
 }
 
-#[test]
-fn named_outline_selector_requires_exactly_one_public_id() {
-    let outline = r#"
-  #3 CheckBox "Enable" (20,40 120x24) [enabled,visible,checkable]
-  #4 Button "Other" (20,80 80x24) [enabled,visible]
-"#;
-    assert_eq!(unique_named_id(outline, "Enable").unwrap(), 3);
-    assert!(unique_named_id(outline, "Missing").is_err());
+fn build_ios_fixture() -> PathBuf {
+    let fixture = repo_root().join("examples/ios-fixture");
+    let script = fixture.join("build.sh");
+    let status = Command::new(&script)
+        .current_dir(&fixture)
+        .status()
+        .unwrap_or_else(|error| panic!("run {}: {error}", script.display()));
+    assert!(status.success(), "{} failed", script.display());
+
+    let app = fixture.join("build/GlassFixture.app");
+    let built_info = app.join("Info.plist");
+    let source_info = fixture.join("Info.plist");
+    assert_eq!(
+        fs::read(&built_info)
+            .unwrap_or_else(|error| panic!("read {}: {error}", built_info.display())),
+        fs::read(&source_info)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source_info.display())),
+        "built iOS fixture metadata must be copied from the repository fixture"
+    );
+    let executable = app.join("GlassFixture");
+    assert!(
+        executable.is_file(),
+        "missing built fixture executable {}",
+        executable.display()
+    );
+    app
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repo root is two levels above crates/glass-mcp")
+        .to_path_buf()
 }
