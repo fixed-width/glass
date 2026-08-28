@@ -131,7 +131,11 @@ impl Glass {
     /// trailing-toggle backend (see [`AxRect::trailing_toggle_swipe`]). The returned
     /// [`ClickMethod`] says which path actually fired.
     pub fn click_element(&mut self, id: AxNodeId) -> Result<ClickMethod> {
-        self.audited_click(id, Self::click_element_inner)
+        self.click_element_by(id, Deadline::UNBOUNDED)
+    }
+
+    pub fn click_element_by(&mut self, id: AxNodeId, deadline: Deadline) -> Result<ClickMethod> {
+        self.audited_click(id, |g, id| g.click_element_inner(id, deadline))
     }
 
     /// Run one element click and record it through the audit seam. Both clicks that stand on
@@ -161,19 +165,22 @@ impl Glass {
         result
     }
 
-    fn click_element_inner(&mut self, id: AxNodeId) -> Result<ClickMethod> {
+    fn click_element_inner(&mut self, id: AxNodeId, deadline: Deadline) -> Result<ClickMethod> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("click element"));
+        }
         // Native action first: works for occluded/off-screen/boundless elements, and on a
         // backend whose action API is out-of-band it doesn't move the cursor.
         //
         // Do not widen the fallback to a denylist: only an attempt that dispatched NOTHING may
         // retry with the pointer (see [`GlassError::invoke_fallback_eligible`]), or a native
         // action that may still land actuates the control twice.
-        let native_fallback = match self.try_native_invoke(id) {
+        let native_fallback = match self.try_native_invoke(id, deadline) {
             Ok(actuated) => return Ok(ClickMethod::NativeAction { actuated }),
             Err(e) if !e.invoke_fallback_eligible() => return Err(e),
             Err(e) => native_fallback_reason(&e),
         };
-        self.click_element_pointer_only(id)
+        self.click_element_pointer_only(id, deadline)
             .map(|()| ClickMethod::Pointer { native_fallback })
     }
 
@@ -182,7 +189,10 @@ impl Glass {
     /// one, or swiped across the trailing control for a row-shaped checkable on a
     /// trailing-toggle backend. Callable directly by an internal caller that must NOT take
     /// the native action (see [`Glass::set_combo_value`]).
-    fn click_element_pointer_only(&mut self, id: AxNodeId) -> Result<()> {
+    fn click_element_pointer_only(&mut self, id: AxNodeId, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("click element"));
+        }
         let (bounds, checkable, trailing_toggle_backend, active_geo) = {
             let s = self.require_active()?;
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
@@ -202,6 +212,9 @@ impl Glass {
         // The probe is best-effort: an `Err` degrades to an empty list rather than failing a
         // normal click on a backend where `list_windows` is heavy or flaky.
         let windows = self.list_windows().unwrap_or_default();
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("click element"));
+        }
         if let Some(popover_id) = owning_popover(bounds, &active_geo, &windows) {
             let popover_geo = windows
                 .iter()
@@ -216,13 +229,16 @@ impl Glass {
             .ok_or(GlassError::AxElementInUnmappedPopover(id.0))?;
             let prev = windows.iter().find(|w| w.active).map(|w| w.id);
             self.select_window(popover_id)?;
-            let result = self.pointer_inner(&PointerEvent::Click {
-                x: bounds.x - container.x,
-                y: bounds.y - container.y,
-                button: MouseButton::Left,
-                count: 1,
-                modifiers: vec![],
-            });
+            let result = self.pointer_inner_by(
+                &PointerEvent::Click {
+                    x: bounds.x - container.x,
+                    y: bounds.y - container.y,
+                    button: MouseButton::Left,
+                    count: 1,
+                    modifiers: vec![],
+                },
+                deadline,
+            );
             // Best-effort restore: the click's own result (ok or err) still wins.
             if let Some(prev) = prev {
                 let _ = self.select_window(prev);
@@ -243,33 +259,44 @@ impl Glass {
             let seg = bounds
                 .trailing_toggle_swipe(active_geo.width, active_geo.height)
                 .ok_or(GlassError::AxElementNotClickable(id.0))?;
-            self.pointer_inner(&PointerEvent::Drag {
-                from_x: seg.from_x,
-                from_y: seg.from_y,
-                to_x: seg.to_x,
-                to_y: seg.to_y,
-                duration_ms: TOGGLE_SWIPE_MS,
-                button: MouseButton::Left,
-                modifiers: vec![],
-            })
+            self.pointer_inner_by(
+                &PointerEvent::Drag {
+                    from_x: seg.from_x,
+                    from_y: seg.from_y,
+                    to_x: seg.to_x,
+                    to_y: seg.to_y,
+                    duration_ms: TOGGLE_SWIPE_MS,
+                    button: MouseButton::Left,
+                    modifiers: vec![],
+                },
+                deadline,
+            )
         } else {
             let (x, y) = bounds
                 .clamped_center(active_geo.width, active_geo.height)
                 .ok_or(GlassError::AxElementNotClickable(id.0))?;
-            self.pointer_inner(&PointerEvent::Click {
-                x,
-                y,
-                button: MouseButton::Left,
-                count: 1,
-                modifiers: vec![],
-            })
+            self.pointer_inner_by(
+                &PointerEvent::Click {
+                    x,
+                    y,
+                    button: MouseButton::Left,
+                    count: 1,
+                    modifiers: vec![],
+                },
+                deadline,
+            )
         }
     }
 
     /// One native-invoke attempt: the same fingerprint + context assembly as
     /// `set_value_inner` (over freshly re-read window geometry — see below), then the
     /// backend's `invoke`. Passes on the element the backend actuated when it is not `id`.
-    fn try_native_invoke(&mut self, id: AxNodeId) -> Result<Option<AxNodeId>> {
+    fn try_native_invoke(&mut self, id: AxNodeId, deadline: Deadline) -> Result<Option<AxNodeId>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility action",
+            ));
+        }
         {
             let s = self.active_mut()?;
             // Reader-presence check up front (mirrors `snapshot_at_current_limits`) so
@@ -288,70 +315,10 @@ impl Glass {
                 s.geometry = window;
             }
         }
-        let (target, ctx) = {
-            let s = self.require_active()?;
-            let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
-            let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
-            let target = AxTarget {
-                id,
-                role: node.role,
-                name: node.name.clone(),
-                bounds: node.bounds,
-                value: node.value.clone(),
-            };
-            let ctx = AxContext {
-                pids: s.platform.app_pids(),
-                window: s.geometry.clone(),
-                window_handle: s.platform.active_window_handle(),
-                a11y_bus_addr: s.platform.a11y_bus_addr(),
-                limits: s.a11y_limits,
-                deadline: Deadline::UNBOUNDED,
-            };
-            (target, ctx)
-        };
-        let s = self.active_mut()?;
-        let actuated = s
-            .accessibility
-            .as_mut()
-            .ok_or(GlassError::AxUnsupported)?
-            .invoke(&ctx, &target)?;
-        s.pump();
-        Ok(actuated)
-    }
-
-    /// Set the value/text of element `id` (from the latest `a11y_snapshot`) via the
-    /// platform a11y API. Errors `NoAxSnapshot`/`AxElementNotFound` (id not in the
-    /// cached snapshot), `AxUnsupported` (no reader), or — from the backend —
-    /// `AxElementNotEditable`/`AxElementChanged`.
-    pub fn set_value(&mut self, id: AxNodeId, text: &str) -> Result<()> {
-        let t = std::time::Instant::now();
-        let element = self.element_ref(id);
-        let result = self.set_value_inner(id, text);
-        self.emit_audit(
-            &crate::audit::Actuation::SetValue { element, text },
-            crate::audit::AuditOutcome::from_result(&result),
-            t.elapsed(),
-        );
-        result
-    }
-
-    fn set_value_inner(&mut self, id: AxNodeId, text: &str) -> Result<()> {
-        {
-            let s = self.active_mut()?;
-            // Reader-presence check up front so `AxUnsupported` keeps precedence over — and a
-            // reader-less backend skips — the geometry round-trip below.
-            if s.accessibility.is_none() {
-                return Err(GlassError::AxUnsupported);
-            }
-            // Re-read the window geometry: the Windows/macOS `set_value` fingerprints the
-            // element by window-RELATIVE bounds derived from `ctx.window`, so a window moved
-            // since the snapshot reads as drift and rejects.
-            //
-            // Best-effort, unlike the snapshot's strict refresh: an `Err` keeps the cached
-            // value so a geometry-probe hiccup can't fail a write.
-            if let Ok(window) = s.platform.window(&WindowOp::Geometry) {
-                s.geometry = window;
-            }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility action",
+            ));
         }
         let (target, ctx) = {
             let s = self.require_active()?;
@@ -370,7 +337,87 @@ impl Glass {
                 window_handle: s.platform.active_window_handle(),
                 a11y_bus_addr: s.platform.a11y_bus_addr(),
                 limits: s.a11y_limits,
-                deadline: Deadline::UNBOUNDED,
+                deadline,
+            };
+            (target, ctx)
+        };
+        let s = self.active_mut()?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility action",
+            ));
+        }
+        let actuated = s
+            .accessibility
+            .as_mut()
+            .ok_or(GlassError::AxUnsupported)?
+            .invoke(&ctx, &target)?;
+        s.pump();
+        Ok(actuated)
+    }
+
+    /// Set the value/text of element `id` (from the latest `a11y_snapshot`) via the
+    /// platform a11y API. Errors `NoAxSnapshot`/`AxElementNotFound` (id not in the
+    /// cached snapshot), `AxUnsupported` (no reader), or — from the backend —
+    /// `AxElementNotEditable`/`AxElementChanged`.
+    pub fn set_value(&mut self, id: AxNodeId, text: &str) -> Result<()> {
+        self.set_value_by(id, text, Deadline::UNBOUNDED)
+    }
+
+    pub fn set_value_by(&mut self, id: AxNodeId, text: &str, deadline: Deadline) -> Result<()> {
+        let t = std::time::Instant::now();
+        let element = self.element_ref(id);
+        let result = self.set_value_inner(id, text, deadline);
+        self.emit_audit(
+            &crate::audit::Actuation::SetValue { element, text },
+            crate::audit::AuditOutcome::from_result(&result),
+            t.elapsed(),
+        );
+        result
+    }
+
+    fn set_value_inner(&mut self, id: AxNodeId, text: &str, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("set value"));
+        }
+        {
+            let s = self.active_mut()?;
+            // Reader-presence check up front so `AxUnsupported` keeps precedence over — and a
+            // reader-less backend skips — the geometry round-trip below.
+            if s.accessibility.is_none() {
+                return Err(GlassError::AxUnsupported);
+            }
+            // Re-read the window geometry: the Windows/macOS `set_value` fingerprints the
+            // element by window-RELATIVE bounds derived from `ctx.window`, so a window moved
+            // since the snapshot reads as drift and rejects.
+            //
+            // Best-effort, unlike the snapshot's strict refresh: an `Err` keeps the cached
+            // value so a geometry-probe hiccup can't fail a write.
+            if let Ok(window) = s.platform.window(&WindowOp::Geometry) {
+                s.geometry = window;
+            }
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("set value"));
+        }
+        let (target, ctx) = {
+            let s = self.require_active()?;
+            let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
+            let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
+            let target = AxTarget {
+                id,
+                role: node.role,
+                name: node.name.clone(),
+                bounds: node.bounds,
+                value: node.value.clone(),
+            };
+            let ctx = AxContext {
+                pids: s.platform.app_pids(),
+                window: s.geometry.clone(),
+                window_handle: s.platform.active_window_handle(),
+                a11y_bus_addr: s.platform.a11y_bus_addr(),
+                limits: s.a11y_limits,
+                deadline,
             };
             (target, ctx)
         };
@@ -380,7 +427,7 @@ impl Glass {
         // No cache patch on this path: every `Ok` either actuated nothing or followed an
         // `a11y_resnapshot`, which replaces `last_ax` wholesale.
         if target.role == AxRole::ComboBox {
-            return self.set_combo_value(id, &target, text);
+            return self.set_combo_value(id, &target, text, deadline);
         }
         // iOS's value-set (tap+type) can't drive a checkable: a tap doesn't toggle a UISwitch
         // and there's no text to type, so it takes the trailing-edge swipe instead.
@@ -414,26 +461,43 @@ impl Glass {
             }
             // No cache patch here either: the verify poll below re-snapshots, so `last_ax`
             // holds the tree that observed the toggle.
-            self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
+            self.click_element_inner(id, deadline)?; // the toggle actuation (a swipe for a row-shaped control)
             // Not event-gated: this branch runs only on iOS, whose reader has no event stream.
-            // Unbounded here too: a `Deadline` carries the *caller's* bound, and
-            // `TOGGLE_VERIFY_TIMEOUT_MS` is glass's own.
-            // Kept as the poll runs, not re-read afterwards — a read taken after the bound elapsed
-            // could catch a state that arrived late and contradict the verdict.
+            // The strict nearer of the caller and glass's own verification timeout bounds every
+            // read. Kept as the poll runs, not re-read afterwards: a read taken after the winning
+            // bound elapsed could catch a state that arrived late and contradict the verdict.
+            let now = std::time::Instant::now();
+            let (budget, whose) = deadline.budget(
+                std::time::Duration::from_millis(TOGGLE_VERIFY_TIMEOUT_MS),
+                now,
+            );
+            let verify_deadline = Deadline::at(now + budget);
             let mut seen = None;
-            let outcome = crate::poll::poll_until(
-                TOGGLE_VERIFY_INTERVAL_MS,
-                TOGGLE_VERIFY_TIMEOUT_MS,
-                || {
-                    let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
-                    seen = find_checkable_near(&tree.root, target.bounds.as_ref())
-                        .map(|n| n.states.checked);
-                    Ok((seen == Some(want)).then_some(()))
-                },
-            )?;
-            return if outcome.value.is_some() {
-                Ok(())
-            } else {
+            loop {
+                if verify_deadline.has_passed() {
+                    break;
+                }
+                let tree = self.a11y_resnapshot(verify_deadline)?;
+                if verify_deadline.has_passed() {
+                    break;
+                }
+                seen = find_checkable_near(&tree.root, target.bounds.as_ref())
+                    .map(|n| n.states.checked);
+                if seen == Some(want) {
+                    return Ok(());
+                }
+                let left = verify_deadline.remaining().unwrap_or_default();
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::sleep(
+                    left.min(std::time::Duration::from_millis(TOGGLE_VERIFY_INTERVAL_MS)),
+                );
+            }
+            if whose == crate::deadline::Whose::Caller {
+                return Err(GlassError::caller_deadline_elapsed("toggle verification"));
+            }
+            return {
                 // `None` is no checkable near the target's bounds on the last tick — the swipe
                 // moved the screen — so it reports as a reading nobody took, not as a state.
                 Err(GlassError::value_not_applied_because(
@@ -445,6 +509,9 @@ impl Glass {
             };
         }
         let s = self.active_mut()?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("set value"));
+        }
         let result = s
             .accessibility
             .as_mut()
@@ -475,7 +542,13 @@ impl Glass {
     /// Select an option in a dropdown/combo by label (case-insensitive). Opens the
     /// popup, arrow-navigates from the current selection to the target, and presses
     /// Enter to commit — verifying the button label changed (else `AxValueNotApplied`).
-    fn set_combo_value(&mut self, id: AxNodeId, target: &AxTarget, text: &str) -> Result<()> {
+    fn set_combo_value(
+        &mut self,
+        id: AxNodeId,
+        target: &AxTarget,
+        text: &str,
+        deadline: Deadline,
+    ) -> Result<()> {
         let want = text.trim();
         // Already showing it? (the combo's name is its current selection label)
         if target
@@ -489,15 +562,15 @@ impl Glass {
         // (UIA's `ExpandCollapsePattern`) opens the popup without moving keyboard focus, so the
         // Down/Up/Return below would go to whatever held focus instead.
         self.audited_click(id, |g, id| {
-            g.click_element_pointer_only(id)
+            g.click_element_pointer_only(id, deadline)
                 .map(|()| ClickMethod::Pointer {
                     native_fallback: COMBO_OPEN_POINTER_REASON.into(),
                 })
         })?;
-        self.settle_for_popup();
+        self.settle_for_popup(deadline)?;
         // Ids don't survive a re-snapshot, so match the open (`expanded`) combo, else the one
         // nearest the target's bounds.
-        let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
+        let tree = self.a11y_resnapshot(deadline)?;
         let combo = find_expanded_combo(&tree.root)
             .or_else(|| find_combo_near(&tree.root, target.bounds.as_ref()))
             .ok_or(GlassError::AxElementChanged(id.0))?;
@@ -510,7 +583,9 @@ impl Glass {
             .position(|(label, _)| label.eq_ignore_ascii_case(want));
         let Some(target_idx) = target_idx else {
             // Unknown option — dismiss the popup so the UI is left neutral, then report.
-            let _ = self.key(&KeyEvent::Chord("Escape".to_string()));
+            if !deadline.has_passed() {
+                let _ = self.semantic_key_by(&KeyEvent::Chord("Escape".to_string()), deadline);
+            }
             let choices = options
                 .iter()
                 .map(|(l, _)| l.clone())
@@ -529,13 +604,13 @@ impl Glass {
         // the chord is never sent — not observable either way.
         let chord = if delta.is_negative() { "Up" } else { "Down" };
         for _ in 0..delta.unsigned_abs() {
-            self.key(&KeyEvent::Chord(chord.to_string()))?;
+            self.semantic_key_by(&KeyEvent::Chord(chord.to_string()), deadline)?;
         }
-        self.key(&KeyEvent::Chord("Return".to_string()))?;
-        self.settle_for_popup();
+        self.semantic_key_by(&KeyEvent::Chord("Return".to_string()), deadline)?;
+        self.settle_for_popup(deadline)?;
         // Verify the model actually committed — the *target* combo (matched by bounds,
         // now closed so nothing is `expanded`) must read the wanted label.
-        let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
+        let tree = self.a11y_resnapshot(deadline)?;
         let shows =
             find_combo_near(&tree.root, target.bounds.as_ref()).and_then(|c| c.name.clone());
         if shows
@@ -557,8 +632,23 @@ impl Glass {
     }
 
     /// Let a just-opened/closed popup realize in the a11y tree before re-reading.
-    fn settle_for_popup(&self) {
-        std::thread::sleep(std::time::Duration::from_millis(250));
+    fn settle_for_popup(&self, deadline: Deadline) -> Result<()> {
+        let settle = std::time::Duration::from_millis(250);
+        if let Some(left) = deadline.remaining()
+            && left < settle
+        {
+            std::thread::sleep(left);
+            return Err(GlassError::caller_deadline_elapsed("combo popup settle"));
+        }
+        std::thread::sleep(settle);
+        Ok(())
+    }
+
+    fn semantic_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("semantic key input"));
+        }
+        self.key_by(event, deadline)
     }
 }
 
@@ -3572,5 +3662,126 @@ mod tests {
             assert_eq!(parse_bool(f), Some(false));
         }
         assert_eq!(parse_bool("banana"), None);
+    }
+
+    #[test]
+    fn click_element_by_passes_deadline_to_native_invoke() {
+        let (mut g, _, ctx) = glass_with_a11y_invoke_ctx(
+            FakePlatform::new(100, 100),
+            fake_tree(),
+            InvokeBehavior::Succeed,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        let deadline = Deadline::from_millis(10_000);
+        g.click_element_by(AxNodeId(1), deadline).unwrap();
+        assert_eq!(ctx.lock().unwrap().as_ref().unwrap().deadline, deadline);
+    }
+
+    #[test]
+    fn click_element_pointer_fallback_uses_pointer_inner_by() {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with_a11y(
+            FakePlatform::new(100, 100).with_pointer_deadline_log(deadlines.clone()),
+            fake_tree(),
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        let deadline = Deadline::from_millis(10_000);
+        g.click_element_by(AxNodeId(1), deadline).unwrap();
+        assert_eq!(&*deadlines.lock().unwrap(), &[deadline]);
+    }
+
+    #[test]
+    fn set_value_by_passes_deadline_to_backend_and_verify_reads() {
+        let (mut g, ctx) = glass_with_a11y_ctx(FakePlatform::new(100, 100), fake_tree());
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        let deadline = Deadline::from_millis(10_000);
+        g.set_value_by(AxNodeId(1), "updated", deadline).unwrap();
+        assert_eq!(ctx.lock().unwrap().as_ref().unwrap().deadline, deadline);
+    }
+
+    #[test]
+    fn combo_set_value_uses_one_deadline_for_open_wait_select_and_verify() {
+        let pointer_deadlines = Arc::new(Mutex::new(Vec::new()));
+        let key_deadlines = Arc::new(Mutex::new(Vec::new()));
+        let deadline = Deadline::from_millis(10_000);
+        let platform = FakePlatform::new(340, 300)
+            .with_pointer_deadline_log(pointer_deadlines.clone())
+            .with_key_deadline_log(key_deadlines.clone());
+        let (mut g, _, ax_deadlines) = glass_with_a11y_seq_deadlines(
+            platform,
+            vec![
+                combo("Acme", &[]),
+                combo("Acme", &["Acme", "Globex"]),
+                combo("Globex", &[]),
+            ],
+            InvokeBehavior::Unsupported,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        ax_deadlines.lock().unwrap().clear();
+        g.set_value_by(AxNodeId(1), "Globex", deadline).unwrap();
+        assert_eq!(&*pointer_deadlines.lock().unwrap(), &[deadline]);
+        assert_eq!(&*key_deadlines.lock().unwrap(), &[deadline, deadline]);
+        assert_eq!(&*ax_deadlines.lock().unwrap(), &[deadline, deadline]);
+
+        let short_keys = Arc::new(Mutex::new(Vec::new()));
+        let short_platform = FakePlatform::new(340, 300).with_key_deadline_log(short_keys.clone());
+        let (mut short, _, _) = glass_with_a11y_seq_deadlines(
+            short_platform,
+            vec![combo("Acme", &[]), combo("Acme", &["Acme", "Globex"])],
+            InvokeBehavior::Unsupported,
+        );
+        short.start(&spec()).unwrap();
+        short.a11y_snapshot(None).unwrap();
+        assert!(
+            short
+                .set_value_by(AxNodeId(1), "Globex", Deadline::from_millis(20))
+                .is_err()
+        );
+        assert!(short_keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn toggle_verify_stops_at_the_nearer_caller_deadline() {
+        let drags = Arc::new(Mutex::new(Vec::new()));
+        let deadline = Deadline::from_millis(350);
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        let (mut g, _, ax_deadlines) = glass_with_a11y_seq_deadlines(
+            platform,
+            vec![sw(false), sw(false)],
+            InvokeBehavior::Unsupported,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        ax_deadlines.lock().unwrap().clear();
+        let err = g.set_value_by(AxNodeId(1), "true", deadline).unwrap_err();
+        assert!(matches!(err, GlassError::Bounded { .. }), "{err}");
+        assert_eq!(drags.lock().unwrap().len(), 1);
+        let reads = ax_deadlines.lock().unwrap();
+        assert!(!reads.is_empty());
+        assert!(reads.iter().all(|seen| *seen == deadline), "{reads:?}");
+    }
+
+    #[test]
+    fn spent_deadline_dispatches_no_semantic_actuation() {
+        let pointer = Arc::new(Mutex::new(Vec::new()));
+        let (mut g, invoke) = glass_with_a11y_invoke(
+            FakePlatform::new(100, 100).with_pointer_deadline_log(pointer.clone()),
+            fake_tree(),
+            InvokeBehavior::Succeed,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        assert!(
+            g.click_element_by(AxNodeId(1), Deadline::from_millis(0))
+                .is_err()
+        );
+        assert!(invoke.lock().unwrap().is_empty());
+        assert!(pointer.lock().unwrap().is_empty());
     }
 }

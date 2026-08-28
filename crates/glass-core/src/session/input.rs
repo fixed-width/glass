@@ -58,11 +58,6 @@ impl Glass {
         result
     }
 
-    // pub(super): also used by the `a11y` submodule to actuate element clicks.
-    pub(super) fn pointer_inner(&mut self, event: &PointerEvent) -> Result<()> {
-        self.pointer_inner_by(event, Deadline::UNBOUNDED)
-    }
-
     pub(super) fn pointer_inner_by(
         &mut self,
         event: &PointerEvent,
