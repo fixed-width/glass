@@ -456,7 +456,7 @@ fn wait_for_agent_until(port: u16, deadline: Instant) -> Result<AgentClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conn::TimeoutFault;
+    use crate::conn::{TimeoutFault, WriteFault};
 
     /// The deadline-bearing half of the agent's teardown — without it a wedged device leaks an
     /// `adb forward` into a server that outlives glass (glass#422).
@@ -622,6 +622,43 @@ mod tests {
             }
         });
         (port, requests, join)
+    }
+
+    /// Conn1 receives only a request prefix before the client retires it. Conn2 answers one later,
+    /// distinct request so a replay of the first mutation is observable.
+    fn agent_after_partial_request() -> (u16, std::thread::JoinHandle<(Vec<u8>, Value)>) {
+        use std::io::{BufRead, BufReader, Read};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_bytes = Vec::new();
+            first
+                .take(4 * 1024)
+                .read_to_end(&mut first_bytes)
+                .expect("read conn1 prefix through retirement");
+
+            let (second, _) = listener.accept().expect("accept conn2");
+            let mut second_writer = second.try_clone().expect("clone conn2");
+            writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+            let mut second_reader = BufReader::new(second);
+            let mut line = String::new();
+            second_reader
+                .read_line(&mut line)
+                .expect("read conn2 request");
+            let request: Value = serde_json::from_str(&line).expect("conn2 request json");
+            writeln!(
+                second_writer,
+                "{}",
+                json!({"id": request["id"], "ok": true})
+            )
+            .expect("answer conn2 request");
+            (first_bytes, request)
+        });
+        (port, join)
     }
 
     /// Start conn1's answer, let its caller time out, then finish that stale answer after the next
@@ -1032,6 +1069,39 @@ mod tests {
         assert_eq!(seen[0].1["chord"], "a");
         assert_eq!((seen[1].0, seen[1].1["op"].as_str()), (2, Some("key")));
         assert_eq!(seen[1].1["chord"], "b");
+    }
+
+    #[test]
+    fn partial_request_write_faults_do_not_replay_and_the_next_mutation_uses_conn2() {
+        for fault in [WriteFault::Timeout, WriteFault::Zero, WriteFault::Error] {
+            let (port, join) = agent_after_partial_request();
+            let client = AgentClient::connect(port).expect("connect");
+            client
+                .conn
+                .lock()
+                .expect("lock conn1")
+                .inject_write_faults([WriteFault::Short(16), fault]);
+
+            let first = client
+                .key_by("a", Deadline::from_millis(1_000))
+                .expect_err("a partially written mutation cannot be reported unsent");
+            assert!(
+                first.to_string().contains("agent write"),
+                "{fault:?}: {first}"
+            );
+            client
+                .key_by("b", Deadline::from_millis(1_000))
+                .expect("the distinct mutation opens a fresh conn2");
+
+            let (partial, second) = join.join().expect("fake agent");
+            assert!(!partial.is_empty(), "{fault:?}: conn1 received no prefix");
+            assert!(
+                !partial.ends_with(b"\n"),
+                "{fault:?}: conn1 received a full frame"
+            );
+            assert_eq!(second["op"], "key", "{fault:?}");
+            assert_eq!(second["chord"], "b", "{fault:?}: mutation a was replayed");
+        }
     }
 
     #[test]

@@ -299,16 +299,12 @@ fn run_compound<T>(
     for step in steps {
         match dispatch(step) {
             Ok(()) => dispatched = true,
-            Err(mut error) => {
-                if dispatched
-                    && let GlassError::Bounded {
-                        dispatch: certainty,
-                        ..
-                    } = &mut error
-                {
-                    *certainty = glass_core::BoundDispatch::MayHaveDispatched;
-                }
-                return Err(error);
+            Err(error) => {
+                return Err(if dispatched {
+                    error.after_dispatch()
+                } else {
+                    error
+                });
             }
         }
     }
@@ -890,6 +886,82 @@ mod injector_tests {
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::MayHaveDispatched),
             "the first tap already succeeded: {error}"
+        );
+    }
+
+    #[test]
+    fn earlier_success_upgrades_a_wrapped_before_dispatch_failure() {
+        let error = run_compound([0, 1], |step| {
+            if step == 0 {
+                Ok(())
+            } else {
+                Err(GlassError::Backend("second tap could not start".into()).before_dispatch())
+            }
+        })
+        .expect_err("the second tap fails before its own dispatch");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "the successful first tap is part of the compound result: {error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "second tap could not start"),
+            "the later failure remains the cause: {error}"
+        );
+    }
+
+    #[test]
+    fn earlier_success_preserves_a_nested_caused_failure() {
+        let mut later = Some(GlassError::write_unconfirmed_because(
+            7,
+            "a nested confirmation failed",
+            GlassError::ToolFailed {
+                call: "adb shell input".into(),
+                said: " device disconnected \n".into(),
+            }
+            .before_dispatch(),
+        ));
+        let error = run_compound([0, 1], |step| {
+            if step == 0 {
+                Ok(())
+            } else {
+                Err(later.take().expect("the failing step runs once"))
+            }
+        })
+        .expect_err("the second compound step fails");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "the compound operation retains its earlier delivery evidence: {error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::ToolFailed { call, .. } if call == "adb shell input"),
+            "the nested tool failure remains the cause: {error}"
+        );
+        assert_eq!(error.tool_said(), Some("device disconnected"), "{error}");
+    }
+
+    #[test]
+    fn earlier_success_does_not_weaken_existing_after_dispatch_evidence() {
+        let error = run_compound([0, 1], |step| {
+            if step == 0 {
+                Ok(())
+            } else {
+                Err(GlassError::Backend("answer lost".into()).after_dispatch())
+            }
+        })
+        .expect_err("the second compound step loses its answer");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "existing delivery evidence must not be erased: {error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "answer lost"),
+            "the original failure remains the cause: {error}"
         );
     }
 }

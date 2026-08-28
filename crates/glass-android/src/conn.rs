@@ -90,6 +90,15 @@ pub(crate) enum TimeoutFault {
     WriteRestore,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteFault {
+    Short(usize),
+    Timeout,
+    Zero,
+    Error,
+}
+
 pub(crate) struct Conn {
     pub(crate) writer: TcpStream,
     pub(crate) reader: BufReader<TcpStream>,
@@ -98,7 +107,7 @@ pub(crate) struct Conn {
     #[cfg(test)]
     timeout_faults: std::collections::VecDeque<TimeoutFault>,
     #[cfg(test)]
-    before_write_delay: Duration,
+    write_faults: std::collections::VecDeque<WriteFault>,
 }
 
 impl Conn {
@@ -149,7 +158,7 @@ impl Conn {
             #[cfg(test)]
             timeout_faults: Default::default(),
             #[cfg(test)]
-            before_write_delay: Duration::ZERO,
+            write_faults: Default::default(),
         };
         let hello = c
             .read_line_by(deadline, "agent hello")
@@ -246,11 +255,6 @@ impl Conn {
     }
 
     #[cfg(test)]
-    pub(crate) fn delay_next_write(&mut self, delay: Duration) {
-        self.before_write_delay = delay;
-    }
-
-    #[cfg(test)]
     fn maybe_timeout_fault(&mut self, fault: TimeoutFault) -> glass_core::Result<()> {
         if self.timeout_faults.front() == Some(&fault) {
             self.timeout_faults.pop_front();
@@ -260,6 +264,36 @@ impl Conn {
         } else {
             Ok(())
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_write_faults(&mut self, faults: impl IntoIterator<Item = WriteFault>) {
+        self.write_faults.extend(faults);
+    }
+
+    fn write_chunk(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if let Some(fault) = self.write_faults.pop_front() {
+            return match fault {
+                WriteFault::Short(limit) => {
+                    assert!(limit > 0, "an injected short write must write something");
+                    assert!(bytes.len() > 1, "an injected short write needs a remainder");
+                    let count = limit.min(bytes.len() - 1);
+                    self.writer.write_all(&bytes[..count])?;
+                    Ok(count)
+                }
+                WriteFault::Timeout => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "injected write timeout",
+                )),
+                WriteFault::Zero => Ok(0),
+                WriteFault::Error => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected write failure",
+                )),
+            };
+        }
+        self.writer.write(bytes)
     }
 
     fn restore_timeouts(&mut self) -> glass_core::Result<()> {
@@ -329,7 +363,7 @@ impl Conn {
             let wait = Self::phase_wait(deadline, op, dispatched)?;
             self.write_within(wait)
                 .map_err(|error| Self::transport_failure(dispatched, error))?;
-            match self.writer.write(&bytes[written..]) {
+            match self.write_chunk(&bytes[written..]) {
                 Ok(0) => {
                     return Err(Self::transport_failure(
                         dispatched,
@@ -491,11 +525,6 @@ impl Conn {
         let mut line = serde_json::to_string(&req).expect("serialize request");
         line.push('\n');
 
-        #[cfg(test)]
-        {
-            let delay = std::mem::take(&mut self.before_write_delay);
-            std::thread::sleep(delay);
-        }
         self.write_all_by(line.as_bytes(), deadline, op)?;
 
         let wait = Self::phase_wait(deadline, op, true)?;
@@ -731,6 +760,33 @@ mod tests {
             "write and read each received the full relative wait: {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_successful_short_write_makes_every_later_write_fault_answer_lost() {
+        for fault in [WriteFault::Timeout, WriteFault::Zero, WriteFault::Error] {
+            let mut conn = Conn::open(silent_after_hello()).expect("the hello arrives");
+            conn.inject_write_faults([WriteFault::Short(8), fault]);
+
+            let outcome = conn
+                .call_within(
+                    json!({"op": "key", "chord": "a"}),
+                    Deadline::from_millis(1_000),
+                    "agent request",
+                )
+                .expect("socket timeout setup succeeds");
+            let failure = outcome.expect_err("the second write does not complete the request");
+
+            assert!(
+                matches!(&failure, CallFailure::AnswerLost(_)),
+                "{fault:?} after a successful short write was not AnswerLost"
+            );
+            assert!(!failure.nothing_sent(), "{fault:?}");
+            assert!(
+                conn.ensure_usable().is_err(),
+                "{fault:?} left the partially written stream reusable"
+            );
+        }
     }
 
     #[test]

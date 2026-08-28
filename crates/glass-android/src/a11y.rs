@@ -616,13 +616,7 @@ impl Accessibility for AndroidA11y {
         let window = ctx.window.clone();
         let adb = self.ensure_adb_within(ctx.deadline)?;
         // Re-snapshot and number nodes to locate the target by its pre-order id.
-        let (cx, cy) = locate_for_write(&mut adb_runner(&adb), ctx, target).map_err(|e| {
-            if ctx.deadline.has_passed() {
-                GlassError::deadline_not_started("Android accessibility target resolution")
-            } else {
-                e
-            }
-        })?;
+        let (cx, cy) = locate_for_write(&mut adb_runner(&adb), ctx, target)?;
         require_time(ctx.deadline, target.id.0, false, false)?;
         self.warmed = true;
         // Tap to focus, select-all, delete, type — reusing the P2 input builders.
@@ -1236,6 +1230,39 @@ mod tests {
             "a later device phase started after the caller deadline: {:?}",
             fake.calls()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_late_target_resolution_failure_preserves_the_error_from_work_that_ran() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let fake = FakeAdb::new(&[("*uiautomator dump*", Answer::Lingers)]);
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+        let mut ctx = write_ctx();
+        ctx.deadline = Deadline::from_millis(100);
+        let target = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: None,
+            value: None,
+        };
+
+        let error = reader
+            .set_value(&ctx, &target, "new")
+            .expect_err("the uiautomator dump outlasts the caller deadline");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "the dump process was started before it timed out: {error}"
+        );
+        assert!(!fake.calls().is_empty(), "target resolution never started");
     }
 
     /// The retry the deadline exists to permit actually happens: a caller still waiting gets its

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use glass_core::Deadline;
 use glass_core::accessibility::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
-    Subject, WalkBudget, WalkLimits,
+    Located, Subject, WalkBudget, WalkLimits,
 };
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result, write_took_no_effect};
@@ -176,7 +176,7 @@ impl RefTree {
 
     /// The app whose nodes these refs number: what the tree actually described, falling back to
     /// what was asked about when the companion made no claim. A ref is only meaningful against
-    /// that app — see [`rearm_tree`].
+    /// that app and the tree that supplied it.
     fn acting_on<'a>(&'a self, asked: &'a str) -> &'a str {
         self.tree.subject.as_ref().map_or(asked, |s| &s.actual)
     }
@@ -228,8 +228,6 @@ struct TreeReply {
 pub struct ServiceClient {
     conn: Mutex<Conn>,
     port: u16,
-    #[cfg(test)]
-    retry_before_write_delay: std::time::Duration,
 }
 
 impl ServiceClient {
@@ -238,20 +236,14 @@ impl ServiceClient {
         Ok(ServiceClient {
             conn: Mutex::new(conn),
             port,
-            #[cfg(test)]
-            retry_before_write_delay: std::time::Duration::ZERO,
         })
     }
 
     /// Run a request, reconnecting once and re-sending when `resend` accepts the failure.
-    /// `rearm` is `None` for a request that IS the re-arm (`tree`); `Some(pkg)` re-serves `tree`
-    /// for `pkg` on the fresh connection first and, only once its reply confirms `pkg` is still
-    /// foreground, lets `req` follow it — see [`rearm_tree`].
     fn call_with(
         &self,
         req: Value,
         resend: fn(&CallFailure) -> bool,
-        rearm: Option<&str>,
         deadline: Deadline,
     ) -> std::result::Result<Value, CallFailure> {
         if deadline.has_passed() {
@@ -267,9 +259,6 @@ impl ServiceClient {
         }
         if conn.ensure_usable().is_err() {
             *conn = Conn::open_by(self.port, deadline).map_err(CallFailure::NotSent)?;
-            if let Some(pkg) = rearm {
-                rearm_or_retire(&mut conn, pkg, deadline).map_err(CallFailure::NotSent)?;
-            }
         }
         let first = conn
             .call_within(
@@ -283,13 +272,6 @@ impl ServiceClient {
             Err(f) if resend(&f) => {
                 // The service's accept loop accepts a fresh connection after a drop.
                 *conn = Conn::open_by(self.port, deadline).map_err(|e| f.with_error(e))?;
-                if let Some(pkg) = rearm {
-                    // `f`'s classification, not the re-arm's own: recovering from `f` says no
-                    // more about whether `req` was delivered, whichever step trips.
-                    rearm_or_retire(&mut conn, pkg, deadline).map_err(|e| f.with_error(e))?;
-                }
-                #[cfg(test)]
-                conn.delay_next_write(self.retry_before_write_delay);
                 conn.call_within(req, deadline, "Android accessibility service retry")
                     .map_err(|e| f.with_error(e))?
                     .map_err(|retry| f.merge_retry(retry))
@@ -334,23 +316,31 @@ impl ServiceClient {
 
     /// Run a request that can be run twice without consequence, transparently reconnecting
     /// once if the socket dropped. A dead socket usually surfaces on the *read*, not the write.
-    fn call(
-        &self,
-        req: Value,
-        rearm: Option<&str>,
-        deadline: Deadline,
-    ) -> std::result::Result<Value, CallFailure> {
-        self.call_with(req, CallFailure::is_transport, rearm, deadline)
+    fn call(&self, req: Value, deadline: Deadline) -> std::result::Result<Value, CallFailure> {
+        self.call_with(req, CallFailure::is_transport, deadline)
     }
 
-    /// [`Self::call`] for a side-effecting request: re-send only what provably never went out.
-    fn call_once_sent(
+    /// Run one tree-scoped action on the already-primed connection. A raw device ref belongs to
+    /// that connection's served tree, so reconnecting here would make its destination ambiguous.
+    fn action_once(
         &self,
         req: Value,
-        rearm: Option<&str>,
         deadline: Deadline,
     ) -> std::result::Result<Value, CallFailure> {
-        self.call_with(req, CallFailure::nothing_sent, rearm, deadline)
+        if deadline.has_passed() {
+            return Err(CallFailure::NotSent(GlassError::deadline_not_started(
+                "Android accessibility service action",
+            )));
+        }
+        let mut conn = self.lock_by(deadline)?;
+        if deadline.has_passed() {
+            return Err(CallFailure::NotSent(GlassError::deadline_not_started(
+                "Android accessibility service action",
+            )));
+        }
+        conn.ensure_usable().map_err(CallFailure::NotSent)?;
+        conn.call_within(req, deadline, "Android accessibility service action")
+            .map_err(CallFailure::NotSent)?
     }
 
     /// Serve the tree for `package` on the connection's standing timeout — the readiness probe and
@@ -365,7 +355,7 @@ impl ServiceClient {
     /// timeouts against a caller who asked for less than one (glass#338).
     fn tree_within(&self, package: &str, deadline: Deadline) -> Result<TreeReply> {
         let r = self
-            .call(json!({"op": "tree", "package": package}), None, deadline)
+            .call(json!({"op": "tree", "package": package}), deadline)
             .map_err(CallFailure::into_error)?;
         let tree = r
             .get("tree")
@@ -377,97 +367,33 @@ impl ServiceClient {
         })
     }
 
-    /// Fire `ACTION_CLICK` on device node `ref_id`. Never re-sent once delivered; the failure
-    /// keeps its delivery classification. `package` never reaches the wire here — it only
-    /// re-arms a reconnected connection's `tree` call — see [`Self::call_with`].
+    /// Fire `ACTION_CLICK` once on device node `ref_id` from the connection's served tree.
     fn click(
         &self,
         ref_id: u32,
-        package: &str,
+        _package: &str,
         deadline: Deadline,
     ) -> std::result::Result<(), CallFailure> {
-        self.call_once_sent(
+        self.action_once(
             json!({"op": "action", "ref": ref_id, "action": "click"}),
-            Some(package),
             deadline,
         )
         .map(|_| ())
     }
 
-    /// Fire `ACTION_SET_TEXT` on device node `ref_id`. Idempotent, so this takes the
-    /// reconnecting path. `package` never reaches the wire here — it only re-arms a
-    /// reconnected connection's `tree` call — see [`Self::call_with`].
+    /// Fire `ACTION_SET_TEXT` once on device node `ref_id` from the connection's served tree.
     fn set_text(
         &self,
         ref_id: u32,
         text: &str,
-        package: &str,
+        _package: &str,
         deadline: Deadline,
     ) -> std::result::Result<(), CallFailure> {
-        self.call(
+        self.action_once(
             json!({"op": "action", "ref": ref_id, "action": "set_text", "text": text}),
-            Some(package),
             deadline,
         )
         .map(|_| ())
-    }
-}
-
-/// Rearm a freshly opened service connection, retiring it if the tree cannot be proven to belong
-/// to the app whose refs the pending request addresses.
-fn rearm_or_retire(conn: &mut Conn, pkg: &str, deadline: Deadline) -> Result<()> {
-    let result = rearm_tree(conn, pkg, deadline);
-    if result.is_err() {
-        conn.poison();
-    }
-    result
-}
-
-/// Re-serve `tree` for `pkg` on a freshly reconnected connection, and confirm the reply still
-/// names `pkg` before letting the pending request that triggered the reconnect follow it.
-///
-/// `pkg` must be the app the *served* tree actually described (`AxTree::subject`'s `actual`,
-/// when set) — the one whose refs the pending request addresses — not the one originally asked
-/// about: a permission dialog's tree answers for the dialog, not the app behind it. Re-arming
-/// against whatever is foreground *now* would match by construction and authorise the pending
-/// request against a window its ref never came from.
-///
-/// Returns a plain [`GlassError`], never a [`CallFailure`] — only the caller's own `f` (see
-/// [`ServiceClient::call_with`]) classifies whether the *pending* request was delivered.
-fn rearm_tree(conn: &mut Conn, pkg: &str, deadline: Deadline) -> Result<()> {
-    fn contextualize(error: GlassError) -> GlassError {
-        if error.bound_owner() == Some(glass_core::Whose::Caller) {
-            error
-        } else {
-            GlassError::Backend(format!(
-                "reconnect could not re-arm the connection: {error}"
-            ))
-        }
-    }
-
-    let reply = conn
-        .call_within(
-            json!({"op": "tree", "package": pkg}),
-            deadline,
-            "Android accessibility service rearm",
-        )
-        .map_err(contextualize)?
-        .map_err(CallFailure::into_error)
-        .map_err(contextualize)?;
-    let actual = reply.get("package").and_then(Value::as_str);
-    let Some(actual) = actual else {
-        return Err(GlassError::Backend(format!(
-            "the reconnect could not confirm {pkg} is still the foreground app; the pending \
-             request was not re-sent"
-        )));
-    };
-    match subject_of(pkg, Some(actual)) {
-        None => Ok(()),
-        Some(s) => Err(GlassError::Backend(format!(
-            "the foreground app moved from {} to {} while reconnecting; the pending request \
-             was not re-sent",
-            s.asked, s.actual
-        ))),
     }
 }
 
@@ -556,6 +482,25 @@ impl ServiceA11y {
         }
     }
 
+    /// Obtain a new ref namespace after an action was provably not sent, retaining the package
+    /// identity that made the original ref safe to use.
+    fn refreshed_action_tree(
+        &mut self,
+        ctx: &AxContext,
+        acting_package: &str,
+        action: &str,
+    ) -> std::result::Result<RefTree, CallFailure> {
+        let fresh = self.snapshot_with_refs(ctx).map_err(CallFailure::NotSent)?;
+        let fresh_package = fresh.acting_on(&self.package);
+        if fresh_package != acting_package {
+            return Err(CallFailure::NotSent(GlassError::Backend(format!(
+                "the active app moved from {acting_package} to {fresh_package} while recovering a \
+                 provably unsent {action}; the action was not sent"
+            ))));
+        }
+        Ok(fresh)
+    }
+
     /// Poll until the actuated control reports `checked == want`. The toolkit's UI update
     /// reaches the accessibility tree a beat after the action; `set_value` polls for the same
     /// reason.
@@ -608,14 +553,34 @@ impl ServiceA11y {
         rt: &RefTree,
     ) -> Result<Option<AxNodeId>> {
         let device_ref = rt.device_ref(plan.actuated.id)?;
+        let acting_package = rt.acting_on(&self.package).to_owned();
         require_semantic_time(ctx.deadline, "Android accessibility click", false)?;
-        self.client
+        let mut retried_plan = None;
+        match self
+            .client
             .click(device_ref, rt.acting_on(&self.package), ctx.deadline)
-            .map_err(|f| action_error(target.id.0, f))?;
-        if let Some(want) = plan.want_checked {
-            self.wait_for_check(ctx, plan, want)?;
+        {
+            Ok(()) => {}
+            Err(CallFailure::NotSent(_)) => {
+                let fresh = self
+                    .refreshed_action_tree(ctx, &acting_package, "click")
+                    .map_err(|failure| action_error(target.id.0, failure))?;
+                let fresh_target = relocated_target(&fresh.tree, target)?;
+                let fresh_plan = invoke_plan(&fresh.tree, &fresh_target)?;
+                let fresh_ref = fresh.device_ref(fresh_plan.actuated.id)?;
+                require_semantic_time(ctx.deadline, "Android accessibility click", false)?;
+                self.client
+                    .click(fresh_ref, fresh.acting_on(&self.package), ctx.deadline)
+                    .map_err(|failure| action_error(target.id.0, failure))?;
+                retried_plan = Some(fresh_plan);
+            }
+            Err(failure) => return Err(action_error(target.id.0, failure)),
         }
-        Ok(plan.substituted())
+        let completed_plan = retried_plan.as_ref().unwrap_or(plan);
+        if let Some(want) = completed_plan.want_checked {
+            self.wait_for_check(ctx, completed_plan, want)?;
+        }
+        Ok(completed_plan.substituted())
     }
 
     /// [`Accessibility::snapshot`], keeping each node's device `ref` — what an action addressed
@@ -785,9 +750,30 @@ impl Accessibility for ServiceA11y {
         #[cfg(test)]
         std::thread::sleep(self.before_set_text_delay);
         require_semantic_time(ctx.deadline, "Android accessibility set_text", false)?;
-        self.client
+        match self
+            .client
             .set_text(device_ref, text, rt.acting_on(&self.package), ctx.deadline)
-            .map_err(|f| write_error(target.id.0, f))?;
+        {
+            Ok(()) => {}
+            Err(CallFailure::NotSent(_)) => {
+                let fresh = self
+                    .refreshed_action_tree(ctx, &acting_package, "set_text")
+                    .map_err(|failure| write_error(target.id.0, failure))?;
+                let fresh_target = relocated_target(&fresh.tree, target)?;
+                let fresh_ref =
+                    fresh.device_ref(resolved_editable_target(&fresh.tree, &fresh_target)?.id)?;
+                require_semantic_time(ctx.deadline, "Android accessibility set_text", false)?;
+                self.client
+                    .set_text(
+                        fresh_ref,
+                        text,
+                        fresh.acting_on(&self.package),
+                        ctx.deadline,
+                    )
+                    .map_err(|failure| write_error(target.id.0, failure))?;
+            }
+            Err(failure) => return Err(write_error(target.id.0, failure)),
+        }
         // Verify the value actually took. ACTION_SET_TEXT returns success but silently no-ops when
         // *replacing* existing text in a Compose field, so a bare Ok could lie (glass forbids silent
         // fallbacks). The set is async (Compose recompose → a11y update), so poll briefly for the
@@ -1277,6 +1263,21 @@ fn movement_candidates<'a>(tree: &'a AxTree, target: &AxTarget) -> Vec<&'a AxNod
     let mut out = Vec::new();
     walk(&tree.root, target, &mut out);
     out
+}
+
+/// Rebind a captured target's positional id to the same element in a fresh tree. `relocate`
+/// requires a complete tree, a unique role/name match, and overlapping bounds before accepting a
+/// moved id; the regular action guard then rechecks the full Android fingerprint.
+fn relocated_target(tree: &AxTree, target: &AxTarget) -> Result<AxTarget> {
+    let node = match target.relocate(tree) {
+        Located::AtId(node) | Located::Moved(node) => node,
+        Located::Ambiguous(_) | Located::Gone | Located::Unproven => {
+            return Err(target.drift_error(tree));
+        }
+    };
+    let mut relocated = target.clone();
+    relocated.id = node.id;
+    Ok(relocated)
 }
 
 /// A rectangle as `(x,y wxh)`.
@@ -3097,9 +3098,6 @@ mod tests {
         Echo,
         /// A different package than asked — the foreground changed since the last `tree`.
         Other(String),
-        /// The key omitted, as an older companion sends it, or one that cannot name the active
-        /// window.
-        Unnamed,
     }
 
     /// Whether a fake `tree` request is served normally (per `packages`) or refused outright —
@@ -3309,7 +3307,6 @@ mod tests {
                                             reply["package"] = req["package"].clone();
                                         }
                                         TreePackage::Other(p) => reply["package"] = json!(p),
-                                        TreePackage::Unnamed => {}
                                     }
                                     reply
                                 }
@@ -3373,6 +3370,37 @@ mod tests {
         ops.lock().unwrap().clone()
     }
 
+    /// Break the current connection after its guard tree is served but before `set_text` starts.
+    /// `before_set_text_delay` makes the ordering deterministic rather than scheduler-dependent.
+    fn break_set_text_write_after_guard(
+        a11y: &mut ServiceA11y,
+        ops: &Arc<Mutex<Vec<String>>>,
+    ) -> std::thread::JoinHandle<()> {
+        let write_half = a11y
+            .client
+            .conn
+            .lock()
+            .expect("lock")
+            .writer
+            .try_clone()
+            .expect("clone write half");
+        a11y.before_set_text_delay = std::time::Duration::from_millis(100);
+        let seen_ops = Arc::clone(ops);
+        std::thread::spawn(move || {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !ops_of(&seen_ops).iter().any(|op| op == "conn1:tree") {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "the guard tree was never served"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            write_half
+                .shutdown(std::net::Shutdown::Write)
+                .expect("shutdown write half");
+        })
+    }
+
     fn assert_generic_semantic_caller_timeout(
         error: &GlassError,
         dispatch: glass_core::BoundDispatch,
@@ -3421,7 +3449,7 @@ mod tests {
     }
 
     #[test]
-    fn restoration_fault_after_click_poison_reconnects_rearms_and_never_replays() {
+    fn restoration_fault_after_click_requires_a_fresh_tree_before_the_next_action() {
         for fault in [TimeoutFault::ReadRestore, TimeoutFault::WriteRestore] {
             let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
             let client = ServiceClient::connect(port).expect("connect to the fake service");
@@ -3445,9 +3473,12 @@ mod tests {
                 "{fault:?} restoration fault did not poison conn1"
             );
             client
+                .tree("com.example.app")
+                .expect("the caller obtains conn2's fresh ref namespace");
+            client
                 .click(2, "com.example.app", Deadline::from_millis(1_000))
                 .map_err(CallFailure::into_error)
-                .expect("the distinct mutation reopens, rearms, then dispatches on conn2");
+                .expect("the distinct mutation uses the fresh tree on conn2");
 
             assert_eq!(
                 ops_of(&ops),
@@ -3463,7 +3494,7 @@ mod tests {
     }
 
     #[test]
-    fn answer_lost_reconnects_rearms_and_cannot_desync_the_next_distinct_click() {
+    fn answer_lost_requires_a_fresh_tree_before_the_next_distinct_click() {
         let (port, ops, join) = fake_service_with_late_partial_action_answer(compose_like());
         let client = ServiceClient::connect(port).expect("connect to the fake service");
         client.tree("com.example.app").expect("arm conn1");
@@ -3473,9 +3504,12 @@ mod tests {
             .expect_err("conn1 completes its answer after the caller deadline");
         assert!(matches!(first, CallFailure::AnswerLost(_)));
         client
+            .tree("com.example.app")
+            .expect("the caller obtains conn2's fresh ref namespace");
+        client
             .click(2, "com.example.app", Deadline::from_millis(1_000))
             .map_err(CallFailure::into_error)
-            .expect("the distinct click reconnects, rearms, then dispatches on conn2");
+            .expect("the distinct click uses the fresh tree on conn2");
 
         join.join().expect("fake service");
         assert_eq!(
@@ -3491,16 +3525,12 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_rearm_retires_the_replacement_before_the_next_request() {
+    fn a_poisoned_connection_returns_not_sent_until_a_fresh_tree_is_fetched() {
         let tree = editable_field("old");
         let (port, ops) = fake_service_ex(
             vec![tree],
-            vec![OnAction::DropWithoutAnswering, OnAction::Ok, OnAction::Ok],
-            vec![
-                TreePackage::Echo,
-                TreePackage::Other("com.other.app".into()),
-                TreePackage::Echo,
-            ],
+            vec![OnAction::DropWithoutAnswering, OnAction::Ok],
+            vec![TreePackage::Echo],
         );
         let client = ServiceClient::connect(port).expect("connect to the fake service");
         client.tree("com.example.app").expect("arm conn1");
@@ -3508,13 +3538,17 @@ mod tests {
         client
             .click(1, "com.example.app", Deadline::from_millis(1_000))
             .expect_err("conn1 loses the first click answer");
-        client
+        let second = client
             .click(2, "com.example.app", Deadline::from_millis(1_000))
-            .expect_err("conn2 rearms against a different app");
+            .expect_err("a raw ref cannot reconnect itself onto another tree");
+        assert!(matches!(second, CallFailure::NotSent(_)));
+        client
+            .tree("com.example.app")
+            .expect("the caller fetches a fresh tree on conn2");
         client
             .click(3, "com.example.app", Deadline::from_millis(1_000))
             .map_err(CallFailure::into_error)
-            .expect("the next request opens conn3, rearms it, then dispatches");
+            .expect("the caller-selected fresh ref dispatches on conn2");
 
         assert_eq!(
             ops_of(&ops),
@@ -3522,10 +3556,9 @@ mod tests {
                 "conn1:tree".to_string(),
                 "conn1:click ref=1".to_string(),
                 "conn2:tree".to_string(),
-                "conn3:tree".to_string(),
-                "conn3:click ref=3".to_string(),
+                "conn2:click ref=3".to_string(),
             ],
-            "the failed rearm left conn2 reusable for an unarmed mutation"
+            "the stale second ref was sent or the fresh tree was skipped"
         );
     }
 
@@ -3686,7 +3719,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_caller_deadline_during_service_rearm_preserves_owner_and_delivery() {
+    fn semantic_caller_deadline_during_fresh_tree_recovery_preserves_owner_and_delivery() {
         let tree = editable_field("old");
         let (port, _ops) = fake_service_full(
             vec![tree.clone()],
@@ -3705,7 +3738,7 @@ mod tests {
 
         let error = a11y
             .set_value(&context, &target, "new")
-            .expect_err("the reconnect rearm outlasted the caller");
+            .expect_err("the fresh-tree recovery outlasted the caller");
 
         assert_unconfirmed_value_write(&error, target.id);
     }
@@ -3815,9 +3848,9 @@ mod tests {
     }
 
     #[test]
-    fn a_reconnect_re_arms_the_fresh_connection_before_resending() {
-        // conn1's tree primes its gate; the set_text is then dropped in flight (a transport
-        // failure, not a refusal), so the idempotent path reconnects.
+    fn an_answer_lost_set_text_is_never_replayed() {
+        // The raw ref is scoped to conn1's tree. Even though set_text is value-idempotent, its
+        // destination is not: conn2 can number a different node with the same ref.
         let (port, ops) = fake_service_ex(
             vec![json!({})],
             vec![OnAction::DropWithoutAnswering, OnAction::Ok],
@@ -3828,172 +3861,13 @@ mod tests {
         assert!(
             client
                 .set_text(1, "hi", "com.example.app", Deadline::UNBOUNDED)
-                .is_ok(),
-            "re-arm confirms the same package, so the resend goes through"
+                .is_err_and(|failure| matches!(failure, CallFailure::AnswerLost(_))),
+            "an action whose answer was lost must remain ambiguous"
         );
         assert_eq!(
             ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:set_text ref=1".to_string(),
-                "conn2:tree".to_string(),
-                "conn2:set_text ref=1".to_string(),
-            ],
-            "conn2:tree (the re-arm) must precede conn2:set_text (the resend)"
-        );
-    }
-
-    #[test]
-    fn a_reconnect_whose_rearm_names_a_different_package_is_refused_without_resending() {
-        // The foreground moved between the dropped attempt and the reconnect: re-sending
-        // anyway would authorise the action against a window the caller's ref never came from.
-        let (port, ops) = fake_service_ex(
-            vec![json!({})],
-            vec![OnAction::DropWithoutAnswering],
-            vec![
-                TreePackage::Echo,
-                TreePackage::Other("com.other.app".into()),
-            ],
-        );
-        let client = ServiceClient::connect(port).expect("connect to the fake service");
-        client.tree("com.example.app").expect("primes conn1");
-        let Err(f) = client.set_text(1, "hi", "com.example.app", Deadline::UNBOUNDED) else {
-            panic!("a different foreground must refuse the resend");
-        };
-        let msg = f.into_error().to_string();
-        assert!(msg.contains("com.example.app"), "{msg}");
-        assert!(msg.contains("com.other.app"), "{msg}");
-        assert!(msg.contains("moved"), "{msg}");
-        assert_eq!(
-            ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:set_text ref=1".to_string(),
-                "conn2:tree".to_string(),
-            ],
-            "no set_text on conn2 — the mismatch must stop the resend, not just be reported"
-        );
-    }
-
-    #[test]
-    fn a_reconnect_whose_rearm_names_no_package_cannot_confirm_and_is_refused() {
-        // An older companion, or one that cannot name the active window, on the re-arm: absent
-        // is not a match, so it cannot authorise the resend either.
-        let (port, ops) = fake_service_ex(
-            vec![json!({})],
-            vec![OnAction::DropWithoutAnswering],
-            vec![TreePackage::Echo, TreePackage::Unnamed],
-        );
-        let client = ServiceClient::connect(port).expect("connect to the fake service");
-        client.tree("com.example.app").expect("primes conn1");
-        let Err(f) = client.set_text(1, "hi", "com.example.app", Deadline::UNBOUNDED) else {
-            panic!("an unconfirmed foreground must refuse the resend");
-        };
-        let msg = f.into_error().to_string();
-        assert!(msg.contains("com.example.app"), "{msg}");
-        assert!(msg.contains("could not confirm"), "{msg}");
-        assert!(!msg.contains("moved"), "{msg}");
-        assert_eq!(
-            ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:set_text ref=1".to_string(),
-                "conn2:tree".to_string(),
-            ],
-            "no set_text on conn2 — an unconfirmed foreground must stop the resend"
-        );
-    }
-
-    #[test]
-    fn a_rearm_refused_by_the_companion_keeps_the_original_failures_own_classification() {
-        // conn1's action is dropped (AnswerLost); the re-arm on conn2 is then refused outright
-        // (`Server.kt`'s `Response.error(id, "no active window")`, `CallFailure::Refused`).
-        // Read via `call` directly, not `set_text`: `set_text`'s public `Result<()>` erases
-        // which `CallFailure` variant it was, and that variant is exactly what this pins.
-        let (port, _ops) = fake_service_full(
-            vec![json!({})],
-            vec![OnAction::DropWithoutAnswering],
-            vec![TreePackage::Echo],
-            vec![OnTree::Serve, OnTree::Refused("no active window")],
-        );
-        let client = ServiceClient::connect(port).expect("connect to the fake service");
-        client.tree("com.example.app").expect("primes conn1");
-        let e = client
-            .call(
-                json!({"op": "action", "ref": 1, "action": "set_text", "text": "hi"}),
-                Some("com.example.app"),
-                Deadline::UNBOUNDED,
-            )
-            .expect_err("a refused re-arm must still fail — just not overwrite the original's classification");
-        assert!(
-            matches!(e, CallFailure::AnswerLost(_)),
-            "conn1's own failure was AnswerLost; a re-arm the companion refuses must not \
-             relabel it Refused (which a click would then report as the action itself having \
-             failed, or worse — Refused's own AnswerLost sibling would read as a lost result \
-             for an action that never left the host): {}",
-            e.into_error()
-        );
-    }
-
-    #[test]
-    fn a_retry_not_sent_cannot_erase_an_answer_lost_set_text() {
-        let (port, ops) = fake_service_ex(
-            vec![json!({})],
-            vec![OnAction::DropWithoutAnswering, OnAction::Ok],
-            vec![TreePackage::Echo],
-        );
-        let mut client = ServiceClient::connect(port).expect("connect to the fake service");
-        client.retry_before_write_delay = std::time::Duration::from_millis(150);
-        client.tree("com.example.app").expect("primes conn1");
-
-        let failure = client
-            .set_text(1, "hi", "com.example.app", Deadline::from_millis(100))
-            .expect_err("conn1 loses its answer and conn2's retry misses the deadline");
-        match &failure {
-            CallFailure::AnswerLost(cause) => {
-                assert_eq!(
-                    cause.bound_owner(),
-                    Some(glass_core::Whose::Caller),
-                    "{cause}"
-                );
-            }
-            CallFailure::NotSent(cause) => {
-                panic!("the retry erased conn1's possible dispatch: {cause}")
-            }
-            CallFailure::Refused(cause) => {
-                panic!("the fake never refused either set_text: {cause}")
-            }
-        }
-
-        let error = write_error(1, failure);
-        assert_unconfirmed_value_write(&error, AxNodeId(1));
-        assert_eq!(
-            error.bound_owner(),
-            Some(glass_core::Whose::Caller),
-            "{error}"
-        );
-        assert_eq!(
-            error.bound(),
-            Some(glass_core::BoundKind::TimedOut),
-            "{error}"
-        );
-        assert_eq!(
-            error.bound_dispatch(),
-            Some(glass_core::BoundDispatch::MayHaveDispatched),
-            "the final verdict must keep batch side-effect reporting conservative: {error}"
-        );
-        assert!(
-            matches!(error.cause(), GlassError::Bounded { .. }),
-            "{error}"
-        );
-        assert_eq!(
-            ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:set_text ref=1".to_string(),
-                "conn2:tree".to_string(),
-            ],
-            "conn2 must rearm successfully, then the retry must expire before its first byte"
+            vec!["conn1:tree".to_string(), "conn1:set_text ref=1".to_string(),],
+            "the raw ref must never be replayed on a replacement connection"
         );
     }
 
@@ -4529,9 +4403,9 @@ mod tests {
     }
 
     #[test]
-    fn set_values_call_site_sends_its_own_configured_package_to_the_rearm() {
+    fn set_values_call_site_uses_its_configured_package_for_the_fresh_tree() {
         // Pins `set_value`'s fallback to `self.package` when the served tree carries no subject
-        // (`TreePackage::Echo`, so asked == actual): the re-arm reply's package is fixed
+        // (`TreePackage::Echo`, so asked == actual): the fresh reply's package is fixed
         // regardless of what was asked, so this only passes if the fallback is `ServiceA11y`'s
         // own configured package.
         let field = |value: &str| {
@@ -4545,9 +4419,9 @@ mod tests {
                 ]
             })
         };
-        let (port, _ops) = fake_service_ex(
+        let (port, ops) = fake_service_ex(
             vec![field("old"), field("old"), field("new")],
-            vec![OnAction::DropWithoutAnswering, OnAction::Ok],
+            vec![OnAction::Ok],
             vec![
                 TreePackage::Echo,
                 TreePackage::Other("com.example.app".into()),
@@ -4557,14 +4431,16 @@ mod tests {
         let mut a = ServiceA11y::new(client, "com.example.app".to_string());
         let t = built(&field("old"));
         let target = target_for(&t, AxNodeId(1));
+        let breaker = break_set_text_write_after_guard(&mut a, &ops);
         a.set_value(&ctx(), &target, "new")
-            .expect("the caller's own configured package must match the rearm's fixed reply");
+            .expect("the caller's configured package must match the fresh tree's fixed reply");
+        breaker.join().expect("connection breaker");
     }
 
     #[test]
-    fn invokes_call_site_sends_its_own_configured_package_to_the_rearm() {
+    fn invokes_call_site_uses_its_configured_package_for_the_fresh_tree() {
         // Mirrors the `set_value` test above, for `invoke`'s fallback to `self.package` when the
-        // plan's tree carries no subject. `click`'s resend fires only on a real
+        // plan's tree carries no subject. `click`'s fresh-tree retry fires only on a real
         // `CallFailure::NotSent`, never `AnswerLost`, and that failure only arises strictly
         // BETWEEN `invoke`'s snapshot/plan step and its click — a window `invoke`'s own single
         // call never exposes to a caller. So this drives `invoke`'s own two halves directly —
@@ -4607,14 +4483,69 @@ mod tests {
             .expect("shutdown");
 
         a.dispatch_click(&ctx(), &target, &plan, &rt)
-            .expect("the caller's own configured package must match the rearm's fixed reply");
+            .expect("the caller's configured package must match the fresh tree's fixed reply");
     }
 
     #[test]
-    fn dispatch_clicks_rearm_asks_about_the_acting_app_not_the_asked_about_one() {
+    fn a_not_sent_click_re_resolves_the_target_before_using_a_fresh_trees_ref() {
+        let initial = json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
+            "children": [
+                {"class": "android.widget.Button", "desc": "Save",
+                 "bounds": {"x": 0, "y": 100, "w": 200, "h": 100},
+                 "clickable": true, "enabled": true}
+            ]
+        });
+        let reordered = json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
+            "children": [
+                {"class": "android.widget.Button", "desc": "Cancel",
+                 "bounds": {"x": 300, "y": 100, "w": 200, "h": 100},
+                 "clickable": true, "enabled": true},
+                {"class": "android.widget.Button", "desc": "Save",
+                 "bounds": {"x": 0, "y": 100, "w": 200, "h": 100},
+                 "clickable": true, "enabled": true}
+            ]
+        });
+        let (port, ops) = fake_service_ex(
+            vec![initial.clone(), reordered],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let target = target_for(&built(&initial), AxNodeId(1));
+        let rt = a.snapshot_with_refs(&ctx()).expect("snapshot");
+        let plan = invoke_plan(&rt.tree, &target).expect("plan resolves");
+
+        a.client
+            .conn
+            .lock()
+            .expect("lock")
+            .writer
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown");
+
+        a.dispatch_click(&ctx(), &target, &plan, &rt)
+            .expect("a provably unsent click may be re-resolved once");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn2:tree".to_string(),
+                "conn2:click ref=2".to_string(),
+            ],
+            "ref 1 belongs to Cancel in the fresh tree and must never be replayed"
+        );
+    }
+
+    #[test]
+    fn dispatch_clicks_fresh_tree_must_match_the_acting_app_not_the_asked_about_one() {
         // Sibling of the test above, on the same `shutdown(Write)` seam, but with a subject:
         // the served tree answered for `com.other.app`, not the configured
-        // `com.example.app` — `target`'s ref is numbered from THAT tree. The rearm's reply names
+        // `com.example.app` — `target`'s ref is numbered from THAT tree. The fresh reply names
         // the ASKED app instead. Comparing against the asked app (the bug) would match by
         // construction and replay the click against whatever unrelated node ref 1 resolves to in
         // the real app; comparing against the acting app (`com.other.app`) sees the mismatch and
@@ -4654,7 +4585,7 @@ mod tests {
 
         let e = a
             .dispatch_click(&ctx(), &target, &plan, &rt)
-            .expect_err("the rearm names the asked-about app, not the app the ref came from");
+            .expect_err("the fresh tree names the asked-about app, not the app the ref came from");
         let msg = e.to_string();
         assert!(msg.contains("com.other.app"), "{msg}");
         assert!(msg.contains("com.example.app"), "{msg}");
@@ -4662,12 +4593,12 @@ mod tests {
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string(), "conn2:tree".to_string()],
-            "no click on conn2 — comparing against the acting app must stop the resend"
+            "no click on conn2 — comparing against the acting app must stop the retry"
         );
     }
 
     /// A field whose editable EditText reports `value`, wrapped exactly like the fixture used by
-    /// [`set_values_call_site_sends_its_own_configured_package_to_the_rearm`].
+    /// [`set_values_call_site_uses_its_configured_package_for_the_fresh_tree`].
     fn editable_field(value: &str) -> Value {
         json!({
             "class": "android.widget.FrameLayout",
@@ -4701,6 +4632,65 @@ mod tests {
         let mut a = ServiceA11y::new(client, "com.example.app".to_string());
         a.write_verify_budget = std::time::Duration::ZERO;
         a
+    }
+
+    #[test]
+    fn a_not_sent_set_text_re_resolves_the_target_before_using_a_fresh_trees_ref() {
+        let initial = editable_field("old");
+        let mut reordered = editable_field("old");
+        reordered["children"]
+            .as_array_mut()
+            .expect("children")
+            .insert(
+                0,
+                json!({
+                    "class": "android.widget.TextView", "text": "prefix",
+                    "bounds": {"x": 700, "y": 100, "w": 200, "h": 100},
+                    "enabled": true
+                }),
+            );
+        let mut written = reordered.clone();
+        written["children"][1]["text"] = json!("new");
+        let (port, ops) = fake_service(vec![initial.clone(), reordered, written], OnAction::Ok);
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let write_half = client
+            .conn
+            .lock()
+            .expect("lock")
+            .writer
+            .try_clone()
+            .expect("clone write half");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        a.before_set_text_delay = std::time::Duration::from_millis(100);
+        let target = target_for(&built(&initial), AxNodeId(1));
+        let seen_ops = Arc::clone(&ops);
+        let breaker = std::thread::spawn(move || {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !ops_of(&seen_ops).iter().any(|op| op == "conn1:tree") {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "the guard tree was never served"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            write_half
+                .shutdown(std::net::Shutdown::Write)
+                .expect("shutdown write half");
+        });
+
+        a.set_value(&ctx(), &target, "new")
+            .expect("a provably unsent write may be re-resolved once");
+        breaker.join().expect("connection breaker");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn2:tree".to_string(),
+                "conn2:set_text ref=2".to_string(),
+                "conn2:tree".to_string(),
+            ],
+            "ref 1 belongs to the inserted prefix in the fresh tree and must never be replayed"
+        );
     }
 
     #[test]
@@ -4947,7 +4937,7 @@ mod tests {
 
         let err = a
             .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
-            .expect_err("the reconnect cannot re-send into a different foreground app");
+            .expect_err("the lost answer must not trigger any re-send");
         assert!(
             matches!(err, GlassError::AxWriteUnconfirmedCaused { id: 1, .. }),
             "{err}"
@@ -5002,11 +4992,11 @@ mod tests {
     }
 
     #[test]
-    fn a_rearm_matching_the_asked_about_app_does_not_authorise_a_stale_acting_apps_ref() {
+    fn a_fresh_tree_for_the_asked_app_does_not_authorise_the_acting_apps_target() {
         // The served tree answered for `com.other.app` (a dialog), not the configured
         // `com.example.app` — `target`'s ref is numbered from the DIALOG's nodes. `set_text` is
-        // dropped in flight; while reconnecting the dialog dismisses and `com.example.app` (the
-        // asked-about app) comes forward, so the rearm's reply names it. Comparing against the
+        // not sent; while recovering, the dialog dismisses and `com.example.app` (the
+        // asked-about app) comes forward, so the fresh reply names it. Comparing against the
         // ASKED app (the bug) would match by construction here and replay the write against
         // whatever unrelated node ref 1 resolves to in the real app — it must instead compare
         // against the ACTING app (`com.other.app`), see the reply naming something else, and
@@ -5028,40 +5018,37 @@ mod tests {
         let t = built(&editable_field("old"));
         let target = target_for(&t, AxNodeId(1));
 
-        // `OnAction::Ok` is wired for conn2 so a wrongly-authorised resend would go on to
+        // `OnAction::Ok` is wired for conn2 so a wrongly-authorised retry would go on to
         // SUCCEED — the false success this pins, not just a differently-worded refusal.
+        let breaker = break_set_text_write_after_guard(&mut a, &ops);
         let e = a
             .set_value(&ctx(), &target, "new")
-            .expect_err("the rearm names the asked-about app, not the dialog the ref came from");
+            .expect_err("the fresh tree names the asked-about app, not the dialog target");
+        breaker.join().expect("connection breaker");
         let msg = e.to_string();
         assert!(msg.contains("com.other.app"), "{msg}");
         assert!(msg.contains("com.example.app"), "{msg}");
         assert!(msg.contains("moved"), "{msg}");
         assert_eq!(
             ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:set_text ref=1".to_string(),
-                "conn2:tree".to_string(),
-            ],
-            "no set_text on conn2 — comparing against the acting app must stop the resend"
+            vec!["conn1:tree".to_string(), "conn2:tree".to_string(),],
+            "no set_text may use refs from either stale or mismatched trees"
         );
     }
 
     #[test]
-    fn a_rearm_matching_the_acting_app_resends_even_though_it_differs_from_the_asked_about_app() {
-        // Mirrors the test above with the dialog still foreground at the rearm: the reply again
-        // names `com.other.app`, the same app the served tree described, so this is safe to
-        // resend even though it still differs from the configured `com.example.app`. Comparing
-        // against the asked app (the bug) would see that mismatch and spuriously refuse a resend
-        // that was actually safe.
+    fn a_fresh_tree_matching_the_acting_app_allows_one_newly_resolved_set_text() {
+        // Mirrors the test above with the dialog still foreground in the fresh tree: the reply
+        // names `com.other.app`, the same app the served tree described, so one fresh-ref write is
+        // safe even though it still differs from the configured `com.example.app`. Comparing
+        // against the asked app (the bug) would see that mismatch and spuriously refuse the retry.
         let (port, ops) = fake_service_ex(
             vec![
                 editable_field("old"),
                 editable_field("old"),
                 editable_field("new"),
             ],
-            vec![OnAction::DropWithoutAnswering, OnAction::Ok],
+            vec![OnAction::Ok],
             vec![
                 TreePackage::Other("com.other.app".into()),
                 TreePackage::Other("com.other.app".into()),
@@ -5071,19 +5058,20 @@ mod tests {
         let mut a = ServiceA11y::new(client, "com.example.app".to_string());
         let t = built(&editable_field("old"));
         let target = target_for(&t, AxNodeId(1));
+        let breaker = break_set_text_write_after_guard(&mut a, &ops);
 
         a.set_value(&ctx(), &target, "new")
-            .expect("the acting app did not change, so the resend must go through");
+            .expect("the acting app did not change, so one fresh-ref write may run");
+        breaker.join().expect("connection breaker");
         assert_eq!(
             ops_of(&ops),
             vec![
                 "conn1:tree".to_string(),
-                "conn1:set_text ref=1".to_string(),
                 "conn2:tree".to_string(),
                 "conn2:set_text ref=1".to_string(),
                 "conn2:tree".to_string(),
             ],
-            "conn2:set_text (the resend) must follow conn2:tree (the rearm); the last conn2:tree \
+            "conn2:set_text must follow conn2's fresh tree; the last conn2:tree \
              is set_value's own post-write verification read"
         );
     }
