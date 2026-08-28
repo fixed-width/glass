@@ -316,13 +316,22 @@ impl Platform for AndroidPlatform {
     }
 
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+        self.send_pointer_by(event, Deadline::UNBOUNDED)
+    }
+
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
         let origin = self.running()?.window.clone();
-        self.injector.pointer(self.target.adb(), &origin, event)
+        self.injector
+            .pointer_by(self.target.adb(), &origin, event, deadline)
     }
 
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+        self.send_key_by(event, Deadline::UNBOUNDED)
+    }
+
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         self.running()?; // require an active session
-        self.injector.key(self.target.adb(), event)
+        self.injector.key_by(self.target.adb(), event, deadline)
     }
 
     fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {

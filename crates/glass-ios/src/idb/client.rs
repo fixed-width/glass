@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use glass_core::{GlassError, Result};
+use glass_core::{Deadline, GlassError, Result, Whose};
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint, Uri};
 
@@ -102,12 +102,14 @@ fn map_hid_outcome<T>(
     bin: &Path,
     build_info: Option<&str>,
     timeout: Duration,
+    whose: Whose,
     outcome: std::result::Result<
         std::result::Result<T, tonic::Status>,
         tokio::time::error::Elapsed,
     >,
 ) -> Result<()> {
     match outcome {
+        Err(_) if whose == Whose::Caller => Err(GlassError::caller_deadline_elapsed("idb hid")),
         Ok(Err(status)) if unimplemented_event(&status) => Err(unimplemented_event_error_with(
             bin,
             &status,
@@ -250,10 +252,18 @@ impl IdbClient {
     /// Send one HID event stream (client-streaming `hid`). A tap is two events
     /// (touch DOWN, touch UP); a chord is modifier + key down/up pairs.
     pub fn hid(&self, events: Vec<proto::HidEvent>) -> Result<()> {
+        self.hid_by(events, Deadline::UNBOUNDED)
+    }
+
+    pub fn hid_by(&self, events: Vec<proto::HidEvent>, deadline: Deadline) -> Result<()> {
         self.ensure_off_runtime("idb hid")?;
         // Derive the deadline from the gesture's own duration so a long swipe isn't
         // aborted mid-stream by a flat timeout (issue #116); see [`hid_timeout`].
-        let timeout = hid_timeout(&events);
+        let own_timeout = hid_timeout(&events);
+        let (timeout, whose) = deadline.budget(own_timeout, std::time::Instant::now());
+        if timeout.is_zero() && whose == Whose::Caller {
+            return Err(GlassError::deadline_not_started("idb hid"));
+        }
         let mut client = self.client.clone();
         let outcome = self.rt.block_on(async move {
             let stream = tokio_stream::iter(events);
@@ -262,7 +272,13 @@ impl IdbClient {
         // Swapping this line for a bare `map_timed` compiles and keeps every off-device test
         // green; only `a_pinch_is_accepted_by_a_companion_that_implements_it`, run on-box
         // against a companion that predates the event, catches it.
-        map_hid_outcome(&self.bin, self.build_info.as_deref(), timeout, outcome)
+        map_hid_outcome(
+            &self.bin,
+            self.build_info.as_deref(),
+            timeout,
+            whose,
+            outcome,
+        )
     }
 
     /// Guard the `block_on` threading invariant (see the type doc): calling an RPC from a
@@ -416,6 +432,7 @@ mod tests {
             std::path::Path::new("/somewhere/idb_companion"),
             Some("build 2022"),
             Duration::from_secs(30),
+            Whose::Callee,
             outcome,
         )
         .unwrap_err();
@@ -437,6 +454,7 @@ mod tests {
             std::path::Path::new("/somewhere/idb_companion"),
             None,
             Duration::from_secs(30),
+            Whose::Callee,
             outcome,
         )
         .unwrap_err();
@@ -455,6 +473,7 @@ mod tests {
             std::path::Path::new("/somewhere/idb_companion"),
             None,
             Duration::from_secs(30),
+            Whose::Callee,
             Err::<std::result::Result<(), tonic::Status>, _>(elapsed()),
         )
         .unwrap_err();
@@ -567,6 +586,19 @@ mod tests {
     fn hid_timeout_of_a_stream_without_swipes_is_the_base_deadline() {
         // A tap or key chord carries no swipe, so it keeps the flat base deadline.
         assert_eq!(hid_timeout(&[touch_event(), touch_event()]), RPC_TIMEOUT);
+    }
+
+    #[test]
+    fn idb_hid_uses_the_nearer_of_gesture_budget_and_caller_deadline() {
+        let now = std::time::Instant::now();
+        let caller = Deadline::at(now + Duration::from_millis(250));
+        let (budget, whose) = caller.budget(RPC_TIMEOUT, now);
+        assert_eq!(budget, Duration::from_millis(250));
+        assert_eq!(whose, Whose::Caller);
+
+        let (budget, whose) = Deadline::UNBOUNDED.budget(RPC_TIMEOUT, now);
+        assert_eq!(budget, RPC_TIMEOUT);
+        assert_eq!(whose, Whose::Callee);
     }
 
     #[test]

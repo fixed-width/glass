@@ -277,6 +277,14 @@ impl GlassError {
         }
     }
 
+    /// A bounded operation started, then the caller's shared deadline elapsed before it answered.
+    pub fn caller_deadline_elapsed(op: &str) -> Self {
+        GlassError::Bounded {
+            kind: BoundKind::TimedOut,
+            message: format!("{op}: the caller deadline elapsed before the operation answered"),
+        }
+    }
+
     /// Whether a failed native-invoke attempt may safely fall back to the synthetic
     /// pointer path. True only for outcomes where **no native action was dispatched**:
     /// the backend has no invoke at all ([`GlassError::AxUnsupported`]), or the element

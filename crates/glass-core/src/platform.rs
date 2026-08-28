@@ -317,8 +317,24 @@ pub trait Platform {
     /// Inject a pointer event (coordinates are window-relative).
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()>;
 
+    /// [`Platform::send_pointer`] bounded by a caller's shared deadline.
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: crate::Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("pointer input"));
+        }
+        self.send_pointer(event)
+    }
+
     /// Inject a keyboard event.
     fn send_key(&mut self, event: &KeyEvent) -> Result<()>;
+
+    /// [`Platform::send_key`] bounded by a caller's shared deadline.
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: crate::Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("key input"));
+        }
+        self.send_key(event)
+    }
 
     /// Read the clipboard as UTF-8 text ("" if it holds no text).
     fn get_clipboard(&mut self) -> Result<String> {

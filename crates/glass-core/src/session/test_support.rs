@@ -19,6 +19,7 @@ pub(crate) type CaptureWindowLog = Arc<Mutex<Vec<(WindowId, Option<Region>)>>>;
 
 /// Every deadline handed to a fake platform capture.
 pub(crate) type CaptureDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
+pub(crate) type InputDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
 
 /// The last `AxContext` a fake `Accessibility` was called with — see
 /// [`FakeAccessibility::ctx_log`].
@@ -35,6 +36,8 @@ pub(crate) struct FakePlatform {
     started: bool,
     capture_log: Arc<Mutex<Vec<Option<Region>>>>,
     capture_deadline_log: Option<CaptureDeadlineLog>,
+    pointer_deadline_log: Option<InputDeadlineLog>,
+    key_deadline_log: Option<InputDeadlineLog>,
     capture_delay: Option<Duration>,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
     log_batches: std::collections::VecDeque<Vec<(Stream, String)>>,
@@ -95,6 +98,14 @@ impl FakePlatform {
     }
     pub(crate) fn with_capture_deadline_log(mut self, log: CaptureDeadlineLog) -> Self {
         self.capture_deadline_log = Some(log);
+        self
+    }
+    pub(crate) fn with_pointer_deadline_log(mut self, log: InputDeadlineLog) -> Self {
+        self.pointer_deadline_log = Some(log);
+        self
+    }
+    pub(crate) fn with_key_deadline_log(mut self, log: InputDeadlineLog) -> Self {
+        self.key_deadline_log = Some(log);
         self
     }
     pub(crate) fn with_capture_delay(mut self, delay: Duration) -> Self {
@@ -260,6 +271,16 @@ impl Platform for FakePlatform {
         self.pointer_events.push(event.clone());
         Ok(())
     }
+
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        if let Some(log) = &self.pointer_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("pointer input"));
+        }
+        self.send_pointer(event)
+    }
     fn app_pid(&self) -> Option<u32> {
         Some(4242)
     }
@@ -270,6 +291,16 @@ impl Platform for FakePlatform {
         self.key_events.push(event.clone());
         self.key_log.lock().unwrap().push(event.clone());
         Ok(())
+    }
+
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        if let Some(log) = &self.key_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("key input"));
+        }
+        self.send_key(event)
     }
     fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
         match *op {

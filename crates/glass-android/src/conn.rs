@@ -127,6 +127,12 @@ impl Conn {
             .ok();
     }
 
+    pub(crate) fn write_within(&mut self, wait: Option<Duration>) {
+        self.writer
+            .set_write_timeout(Some(wait.unwrap_or(STANDING_TIMEOUT)))
+            .ok();
+    }
+
     /// Send one request object (an `id` is injected) and return the response `Value`.
     /// A failure is classified by how far the request got — see [`CallFailure`].
     pub(crate) fn call(&mut self, mut req: Value) -> std::result::Result<Value, CallFailure> {

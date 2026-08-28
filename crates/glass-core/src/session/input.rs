@@ -44,8 +44,12 @@ impl Glass {
     }
 
     pub fn pointer(&mut self, event: &PointerEvent) -> Result<()> {
+        self.pointer_by(event, Deadline::UNBOUNDED)
+    }
+
+    pub fn pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
         let t = std::time::Instant::now();
-        let result = self.pointer_inner(event);
+        let result = self.pointer_inner_by(event, deadline);
         self.emit_audit(
             &crate::audit::Actuation::Pointer { event },
             crate::audit::AuditOutcome::from_result(&result),
@@ -56,16 +60,38 @@ impl Glass {
 
     // pub(super): also used by the `a11y` submodule to actuate element clicks.
     pub(super) fn pointer_inner(&mut self, event: &PointerEvent) -> Result<()> {
+        self.pointer_inner_by(event, Deadline::UNBOUNDED)
+    }
+
+    pub(super) fn pointer_inner_by(
+        &mut self,
+        event: &PointerEvent,
+        deadline: Deadline,
+    ) -> Result<()> {
         self.check_bounds(event)?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("pointer input"));
+        }
+        if let PointerEvent::Drag { duration_ms, .. } = event {
+            let required = std::time::Duration::from_millis(*duration_ms)
+                .saturating_add(std::time::Duration::from_millis(48));
+            if deadline.remaining().is_some_and(|left| left < required) {
+                return Err(GlassError::deadline_not_started("drag"));
+            }
+        }
         let s = self.active_mut()?;
-        s.platform.send_pointer(event)?;
+        s.platform.send_pointer_by(event, deadline)?;
         s.pump();
         Ok(())
     }
 
     pub fn key(&mut self, event: &KeyEvent) -> Result<()> {
+        self.key_by(event, Deadline::UNBOUNDED)
+    }
+
+    pub fn key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         let t = std::time::Instant::now();
-        let result = self.key_inner(event);
+        let result = self.key_inner_by(event, deadline);
         self.emit_audit(
             &crate::audit::Actuation::Key { event },
             crate::audit::AuditOutcome::from_result(&result),
@@ -74,9 +100,9 @@ impl Glass {
         result
     }
 
-    fn key_inner(&mut self, event: &KeyEvent) -> Result<()> {
+    fn key_inner_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         let s = self.active_mut()?;
-        s.platform.send_key(event)?;
+        s.platform.send_key_by(event, deadline)?;
         s.pump();
         Ok(())
     }
@@ -85,6 +111,69 @@ impl Glass {
 #[cfg(test)]
 mod tests {
     use crate::session::test_support::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn pointer_by_spent_deadline_rejects_before_backend_and_audits_failure() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with(FakePlatform::new(10, 10).with_pointer_deadline_log(log.clone()));
+        g.start(&spec()).unwrap();
+        let event = PointerEvent::Move { x: 1, y: 1 };
+        assert!(g.pointer_by(&event, Deadline::from_millis(0)).is_err());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn key_by_passes_the_exact_deadline_to_platform() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with(FakePlatform::new(10, 10).with_key_deadline_log(log.clone()));
+        g.start(&spec()).unwrap();
+        let deadline = Deadline::from_millis(1_000);
+        g.key_by(&KeyEvent::Chord("enter".into()), deadline)
+            .unwrap();
+        assert_eq!(&*log.lock().unwrap(), &[deadline]);
+    }
+
+    #[test]
+    fn drag_that_cannot_fit_is_refused_before_pointer_down() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with(FakePlatform::new(100, 100).with_drag_log(log.clone()));
+        g.start(&spec()).unwrap();
+        let event = PointerEvent::Drag {
+            from_x: 1,
+            from_y: 1,
+            to_x: 50,
+            to_y: 50,
+            button: crate::platform::MouseButton::Left,
+            modifiers: vec![],
+            duration_ms: 200,
+        };
+        assert!(g.pointer_by(&event, Deadline::from_millis(247)).is_err());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unbounded_pointer_and_key_keep_existing_behavior() {
+        let pointer_log = Arc::new(Mutex::new(Vec::new()));
+        let key_log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with(
+            FakePlatform::new(10, 10)
+                .with_scroll_log(pointer_log.clone())
+                .with_key_log(key_log.clone()),
+        );
+        g.start(&spec()).unwrap();
+        g.pointer(&PointerEvent::Scroll {
+            x: 1,
+            y: 1,
+            dx: 0,
+            dy: 1,
+            modifiers: vec![],
+        })
+        .unwrap();
+        g.key(&KeyEvent::Chord("enter".into())).unwrap();
+        assert_eq!(pointer_log.lock().unwrap().len(), 1);
+        assert_eq!(key_log.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn pointer_out_of_bounds_is_rejected_before_backend() {

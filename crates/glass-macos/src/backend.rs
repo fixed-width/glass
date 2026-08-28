@@ -773,11 +773,21 @@ impl Platform for MacosPlatform {
     /// `self.app_pid` — the same pid today, but `m.pid` is the one tied to the window being
     /// clicked.
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+        self.send_pointer_by(event, Deadline::UNBOUNDED)
+    }
+
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        if deadline
+            .remaining()
+            .is_some_and(|left| left < Duration::from_millis(300))
+        {
+            return Err(GlassError::deadline_not_started("macOS input focus"));
+        }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
         let m = self.resolve_active_window(pid as i32)?;
         check_pointer_bounds(event, &m.geometry)?;
-        crate::input::send_pointer(event, m.pid, m.scale, m.origin_pt)
+        crate::input::send_pointer_by(event, m.pid, m.scale, m.origin_pt, deadline)
     }
     /// Map the active window into `input::send_key` — see `input.rs`'s module doc for the
     /// CGEvent keyboard details.
@@ -789,10 +799,20 @@ impl Platform for MacosPlatform {
     /// window has closed, this surfaces `GlassError::WindowNotFound` instead of silently posting
     /// keys to whatever else is focused.
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+        self.send_key_by(event, Deadline::UNBOUNDED)
+    }
+
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        if deadline
+            .remaining()
+            .is_some_and(|left| left < Duration::from_millis(300))
+        {
+            return Err(GlassError::deadline_not_started("macOS input focus"));
+        }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
         let m = self.resolve_active_window(pid as i32)?;
-        crate::input::send_key(event, m.pid)
+        crate::input::send_key_by(event, m.pid, deadline)
     }
     /// Resolve the active window's `AXUIElement` (fresh every call, same rationale as
     /// `resolve_active_window`) and dispatch `op` onto it:

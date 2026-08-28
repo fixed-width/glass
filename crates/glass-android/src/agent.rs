@@ -38,16 +38,38 @@ impl AgentClient {
 
     /// Run a request, transparently reconnecting once if the socket dropped.
     fn call(&self, req: Value) -> Result<Value> {
+        self.call_by(req, Deadline::UNBOUNDED)
+    }
+
+    fn call_by(&self, req: Value, deadline: Deadline) -> Result<Value> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("agent request"));
+        }
         let mut conn = self
             .conn
             .lock()
             .map_err(|_| GlassError::Backend("agent client lock poisoned".into()))?;
-        match conn.call(req.clone()) {
+        let wait = deadline.remaining();
+        conn.read_within(wait);
+        conn.write_within(wait);
+        let first = conn.call(req.clone());
+        conn.read_within(None);
+        conn.write_within(None);
+        match first {
             Ok(v) => Ok(v),
             Err(f) if f.is_transport() => {
                 // The agent's accept loop accepts a fresh connection after a drop.
+                if deadline.has_passed() {
+                    return Err(f.into_error());
+                }
                 *conn = Conn::open(self.port)?;
-                conn.call(req).map_err(CallFailure::into_error)
+                let wait = deadline.remaining();
+                conn.read_within(wait);
+                conn.write_within(wait);
+                let retried = conn.call(req);
+                conn.read_within(None);
+                conn.write_within(None);
+                retried.map_err(CallFailure::into_error)
             }
             Err(f) => Err(f.into_error()),
         }
@@ -70,14 +92,23 @@ impl AgentClient {
             .map(|_| ())
     }
     pub fn pointer(&self, gesture: &[Pt], button: &str) -> Result<()> {
+        self.pointer_by(gesture, button, Deadline::UNBOUNDED)
+    }
+    pub fn pointer_by(&self, gesture: &[Pt], button: &str, deadline: Deadline) -> Result<()> {
         let g: Vec<Value> = gesture
             .iter()
             .map(|p| json!({"x": p.x, "y": p.y, "t_ms": p.t_ms}))
             .collect();
-        self.call(json!({"op": "pointer", "gesture": g, "button": button}))
-            .map(|_| ())
+        self.call_by(
+            json!({"op": "pointer", "gesture": g, "button": button}),
+            deadline,
+        )
+        .map(|_| ())
     }
     pub fn gesture(&self, paths: &[Vec<Pt>]) -> Result<()> {
+        self.gesture_by(paths, Deadline::UNBOUNDED)
+    }
+    pub fn gesture_by(&self, paths: &[Vec<Pt>], deadline: Deadline) -> Result<()> {
         let pointers: Vec<Value> = paths
             .iter()
             .map(|path| {
@@ -88,14 +119,22 @@ impl AgentClient {
                 )
             })
             .collect();
-        self.call(json!({ "op": "gesture", "pointers": pointers }))
+        self.call_by(json!({ "op": "gesture", "pointers": pointers }), deadline)
             .map(|_| ())
     }
     pub fn key(&self, chord: &str) -> Result<()> {
-        self.call(json!({"op": "key", "chord": chord})).map(|_| ())
+        self.key_by(chord, Deadline::UNBOUNDED)
+    }
+    pub fn key_by(&self, chord: &str, deadline: Deadline) -> Result<()> {
+        self.call_by(json!({"op": "key", "chord": chord}), deadline)
+            .map(|_| ())
     }
     pub fn text(&self, s: &str) -> Result<()> {
-        self.call(json!({"op": "text", "text": s})).map(|_| ())
+        self.text_by(s, Deadline::UNBOUNDED)
+    }
+    pub fn text_by(&self, s: &str, deadline: Deadline) -> Result<()> {
+        self.call_by(json!({"op": "text", "text": s}), deadline)
+            .map(|_| ())
     }
 }
 
@@ -520,6 +559,24 @@ mod tests {
         assert_eq!(sent[1]["pointers"][1][1]["x"], 7);
         assert_eq!(sent[2]["chord"], "ctrl+a");
         assert_eq!(sent[3]["text"], "hi");
+    }
+
+    #[test]
+    fn agent_call_restores_socket_timeouts_after_a_bounded_request() {
+        let (port, _) = fake_agent(HELLO, vec![OK]);
+        let client = AgentClient::connect(port).unwrap();
+        client
+            .key_by("enter", Deadline::from_millis(1_000))
+            .unwrap();
+        let conn = client.conn.lock().unwrap();
+        assert_eq!(
+            conn.writer.write_timeout().unwrap(),
+            Some(crate::conn::STANDING_TIMEOUT)
+        );
+        assert_eq!(
+            conn.reader.get_ref().read_timeout().unwrap(),
+            Some(crate::conn::STANDING_TIMEOUT)
+        );
     }
 
     #[test]

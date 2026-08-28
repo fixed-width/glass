@@ -38,7 +38,8 @@ use objc2_core_graphics::{
 use glass_core::keys::Modifier;
 use glass_core::platform::{KeyEvent, MouseButton, PointerEvent};
 use glass_core::{
-    DragGesture, DragSink, GlassError, Result, ScrollSink, TypeSink, run_drag, run_scroll, run_type,
+    Deadline, DragGesture, DragSink, GlassError, Result, ScrollSink, TypeSink, run_drag,
+    run_scroll, run_type,
 };
 
 use crate::coords::pixel_to_global_point;
@@ -60,11 +61,12 @@ const FOCUS_SETTLE: Duration = Duration::from_millis(300);
 /// mapping coordinates through `scale`/`origin_pt` (the active session's `pointPixelScale`
 /// and window `contentRect.origin`, carried by `MacosPlatform` since the last `start_app` —
 /// see `coords.rs`'s module doc).
-pub(crate) fn send_pointer(
+pub(crate) fn send_pointer_by(
     event: &PointerEvent,
     pid: i32,
     scale: f64,
     origin_pt: (f64, f64),
+    deadline: Deadline,
 ) -> Result<()> {
     // `Gesture` is unconditionally unsupported on macOS regardless of `pid`'s validity —
     // checked ahead of `focus` so it fails fast without raising/activating the app for an
@@ -77,7 +79,7 @@ pub(crate) fn send_pointer(
             crate::MULTI_TOUCH.note,
         ));
     }
-    focus(pid)?;
+    focus_by(pid, deadline)?;
 
     // Passing `None` here is a documented-valid `CGEventCreateMouseEvent`/
     // `CGEventCreateScrollWheelEvent2` argument (falls back to the combined session state),
@@ -180,8 +182,8 @@ const KEY_TYPE_DWELL: Duration = Duration::from_millis(12);
 
 /// Inject `event` as keyboard CGEvents targeting the app at `pid`, focusing it first (same
 /// best-effort `focus` helper/settle `send_pointer` uses above).
-pub(crate) fn send_key(event: &KeyEvent, pid: i32) -> Result<()> {
-    focus(pid)?;
+pub(crate) fn send_key_by(event: &KeyEvent, pid: i32, deadline: Deadline) -> Result<()> {
+    focus_by(pid, deadline)?;
 
     // See `send_pointer`'s doc for why a `None` source is a documented-valid, gracefully
     // degrading `CGEventCreateKeyboardEvent` argument rather than an error.
@@ -308,6 +310,13 @@ fn resolve_chord_key(token: &str) -> Option<(u16, bool)> {
 /// `pub(crate)`: also the activation step of `backend::MacosPlatform::window`'s
 /// `WindowOp::Focus` branch, ahead of its `axwindow::ax_raise`/`ax_set_main`.
 pub(crate) fn focus(pid: i32) -> Result<()> {
+    focus_by(pid, Deadline::UNBOUNDED)
+}
+
+pub(crate) fn focus_by(pid: i32, deadline: Deadline) -> Result<()> {
+    if deadline.remaining().is_some_and(|left| left < FOCUS_SETTLE) {
+        return Err(GlassError::deadline_not_started("macOS input focus"));
+    }
     let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
         .ok_or(GlassError::AppExited(None))?;
     app.activateWithOptions(NSApplicationActivationOptions::empty());
@@ -503,6 +512,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn macos_input_refuses_a_deadline_shorter_than_focus_settle_before_injection() {
+        let err = focus_by(
+            i32::MAX,
+            Deadline::from_millis(FOCUS_SETTLE.as_millis() as u64 - 1),
+        )
+        .unwrap_err();
+        assert!(matches!(err, GlassError::Bounded { .. }));
+    }
+
+    #[test]
     fn to_flags_maps_each_modifier_and_combines() {
         assert_eq!(to_flags(&[]), CGEventFlags::empty());
         assert_eq!(to_flags(&[Modifier::Shift]), CGEventFlags::MaskShift);
@@ -556,7 +575,7 @@ mod tests {
 
     #[test]
     fn gesture_is_unsupported() {
-        let err = send_pointer(
+        let err = send_pointer_by(
             &PointerEvent::Gesture {
                 pointers: vec![],
                 duration_ms: 0,
@@ -564,6 +583,7 @@ mod tests {
             1,
             1.0,
             (0.0, 0.0),
+            Deadline::UNBOUNDED,
         );
         assert!(
             matches!(&err, Err(GlassError::Unsupported(_))),

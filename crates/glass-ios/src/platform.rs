@@ -626,18 +626,26 @@ impl Platform for IosPlatform {
     }
 
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+        self.send_pointer_by(event, Deadline::UNBOUNDED)
+    }
+
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
         let (driver, injector) = self.input()?;
         let events = injector.pointer_events(event)?;
         if events.is_empty() {
             // A `Move` has no touch equivalent, so there is nothing to inject.
             return Ok(());
         }
-        driver.client.hid(events)
+        driver.client.hid_by(events, deadline)
     }
 
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+        self.send_key_by(event, Deadline::UNBOUNDED)
+    }
+
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         let (driver, injector) = self.input()?;
-        driver.client.hid(injector.key_events(event)?)
+        driver.client.hid_by(injector.key_events(event)?, deadline)
     }
 
     fn get_clipboard(&mut self) -> Result<String> {

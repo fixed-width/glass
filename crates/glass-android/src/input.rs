@@ -7,7 +7,9 @@ use std::sync::Arc;
 use crate::adb::Adb;
 use crate::agent::{AgentClient, Pt};
 use glass_core::keys::parse_chord;
-use glass_core::{GlassError, KeyEvent, Modifier, PointerEvent, Result, Segment, WindowGeometry};
+use glass_core::{
+    Deadline, GlassError, KeyEvent, Modifier, PointerEvent, Result, Segment, WindowGeometry,
+};
 
 /// Pixels of swipe travel per scroll "click" (`Scroll.dx/dy` are wheel clicks —
 /// X11 clicks the wheel `|delta|` times). Tunable.
@@ -296,26 +298,32 @@ pub(crate) struct AgentInjector {
 }
 
 impl Injector for AgentInjector {
-    fn pointer(&self, _adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()> {
+    fn pointer_by(
+        &self,
+        _adb: &Adb,
+        origin: &WindowGeometry,
+        event: &PointerEvent,
+        deadline: Deadline,
+    ) -> Result<()> {
         if let PointerEvent::Gesture {
             pointers,
             duration_ms,
         } = event
         {
             let paths = agent_gesture_paths(origin, pointers, *duration_ms);
-            return self.agent.gesture(&paths);
+            return self.agent.gesture_by(&paths, deadline);
         }
         // One agent request per gesture: a Click{count:N} sends N sequential taps.
         for gesture in agent_pointer(origin, event) {
-            self.agent.pointer(&gesture, "left")?;
+            self.agent.pointer_by(&gesture, "left", deadline)?;
         }
         Ok(())
     }
-    fn key(&self, _adb: &Adb, event: &KeyEvent) -> Result<()> {
+    fn key_by(&self, _adb: &Adb, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         match event {
             KeyEvent::Text(s) if s.is_empty() => Ok(()),
-            KeyEvent::Text(s) => self.agent.text(s),
-            KeyEvent::Chord(c) => self.agent.key(c),
+            KeyEvent::Text(s) => self.agent.text_by(s, deadline),
+            KeyEvent::Chord(c) => self.agent.key_by(c, deadline),
         }
     }
 }
@@ -323,29 +331,41 @@ impl Injector for AgentInjector {
 /// Pointer/key injection seam. `ShellInjector` shells out via `adb input`; a
 /// future on-device agent can implement this for lower-latency injection.
 pub trait Injector {
-    fn pointer(&self, adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()>;
-    fn key(&self, adb: &Adb, event: &KeyEvent) -> Result<()>;
+    fn pointer_by(
+        &self,
+        adb: &Adb,
+        origin: &WindowGeometry,
+        event: &PointerEvent,
+        deadline: Deadline,
+    ) -> Result<()>;
+    fn key_by(&self, adb: &Adb, event: &KeyEvent, deadline: Deadline) -> Result<()>;
 }
 
 /// Injects by running `adb shell input …` commands.
 pub struct ShellInjector;
 
 impl Injector for ShellInjector {
-    fn pointer(&self, adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()> {
+    fn pointer_by(
+        &self,
+        adb: &Adb,
+        origin: &WindowGeometry,
+        event: &PointerEvent,
+        deadline: Deadline,
+    ) -> Result<()> {
         if let PointerEvent::Gesture { .. } = event {
             return Err(GlassError::Unsupported(
                 "multi-touch requires the on-device agent (not yet wired)".into(),
             ));
         }
         for argv in pointer_commands(origin, event) {
-            adb.run(argv.iter().map(String::as_str))?;
+            adb.run_until(argv.iter().map(String::as_str), deadline)?;
         }
         Ok(())
     }
 
-    fn key(&self, adb: &Adb, event: &KeyEvent) -> Result<()> {
+    fn key_by(&self, adb: &Adb, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         for argv in key_commands(event)? {
-            adb.run(argv.iter().map(String::as_str))?;
+            adb.run_until(argv.iter().map(String::as_str), deadline)?;
         }
         Ok(())
     }
@@ -746,12 +766,22 @@ mod injector_tests {
         // and a real client would send taps to whatever device the developer has attached.
         let fake = FakeAdb::new(&[("*", Answer::Silent)]);
 
-        injector.pointer(fake.adb(), &origin(), &click()).unwrap();
         injector
-            .key(fake.adb(), &KeyEvent::Text("hi".into()))
+            .pointer_by(fake.adb(), &origin(), &click(), Deadline::UNBOUNDED)
             .unwrap();
         injector
-            .key(fake.adb(), &KeyEvent::Text(String::new()))
+            .key_by(
+                fake.adb(),
+                &KeyEvent::Text("hi".into()),
+                Deadline::UNBOUNDED,
+            )
+            .unwrap();
+        injector
+            .key_by(
+                fake.adb(),
+                &KeyEvent::Text(String::new()),
+                Deadline::UNBOUNDED,
+            )
             .unwrap();
 
         assert_eq!(ops_seen(&seen), ["pointer", "text"]);
@@ -773,7 +803,7 @@ mod injector_tests {
         };
         let fake = FakeAdb::new(&[("*", Answer::Silent)]);
         let err = ShellInjector
-            .pointer(fake.adb(), &origin(), &gesture)
+            .pointer_by(fake.adb(), &origin(), &gesture, Deadline::UNBOUNDED)
             .unwrap_err();
         assert!(matches!(err, GlassError::Unsupported(_)), "{err}");
         // Refused BEFORE anything reached the device — otherwise this "unsupported" gesture
@@ -785,10 +815,24 @@ mod injector_tests {
     fn the_shell_injector_reports_a_chord_it_cannot_map() {
         let fake = FakeAdb::new(&[("*", Answer::Silent)]);
         let err = ShellInjector
-            .key(fake.adb(), &KeyEvent::Chord("ctrl+/".into()))
+            .key_by(
+                fake.adb(),
+                &KeyEvent::Chord("ctrl+/".into()),
+                Deadline::UNBOUNDED,
+            )
             .unwrap_err();
         assert!(matches!(err, GlassError::InvalidKey(_)), "{err}");
         assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn shell_injector_passes_one_deadline_to_every_adb_command() {
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let deadline = Deadline::from_millis(1_000);
+        ShellInjector
+            .pointer_by(fake.adb(), &origin(), &click(), deadline)
+            .unwrap();
+        assert_eq!(fake.calls().len(), 1);
     }
 }
 
