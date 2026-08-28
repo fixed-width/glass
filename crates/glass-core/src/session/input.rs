@@ -1,6 +1,16 @@
 //! `Glass` input actuation: pointer and key events with bounds checks.
 use super::*;
 
+fn drag_fits_at(
+    deadline: Deadline,
+    required: std::time::Duration,
+    now: std::time::Instant,
+) -> bool {
+    deadline
+        .remaining_at(now)
+        .is_none_or(|left| left >= required)
+}
+
 impl Glass {
     /// Validate that any window-relative coordinates in `event` fall inside the
     /// current window.
@@ -70,7 +80,7 @@ impl Glass {
         if let PointerEvent::Drag { duration_ms, .. } = event {
             let required = std::time::Duration::from_millis(*duration_ms)
                 .saturating_add(std::time::Duration::from_millis(48));
-            if deadline.remaining().is_some_and(|left| left < required) {
+            if !drag_fits_at(deadline, required, std::time::Instant::now()) {
                 return Err(GlassError::deadline_not_started("drag"));
             }
         }
@@ -112,10 +122,15 @@ mod tests {
     fn pointer_by_spent_deadline_rejects_before_backend_and_audits_failure() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut g = glass_with(FakePlatform::new(10, 10).with_pointer_deadline_log(log.clone()));
+        let audit = RecordingSink::default();
+        let records = audit.0.clone();
+        g.set_audit_sink(Box::new(audit));
         g.start(&spec()).unwrap();
+        records.lock().unwrap().clear();
         let event = PointerEvent::Move { x: 1, y: 1 };
         assert!(g.pointer_by(&event, Deadline::from_millis(0)).is_err());
         assert!(log.lock().unwrap().is_empty());
+        assert_eq!(&*records.lock().unwrap(), &["move:false"]);
     }
 
     #[test]
@@ -145,6 +160,33 @@ mod tests {
         };
         assert!(g.pointer_by(&event, Deadline::from_millis(247)).is_err());
         assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn drag_preflight_accepts_exactly_the_required_budget() {
+        let now = std::time::Instant::now();
+        let required = std::time::Duration::from_millis(248);
+        let deadline = Deadline::at(now + required);
+        assert!(super::drag_fits_at(deadline, required, now));
+    }
+
+    #[test]
+    fn accepted_drag_passes_the_exact_deadline_to_platform() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with(FakePlatform::new(100, 100).with_pointer_deadline_log(log.clone()));
+        g.start(&spec()).unwrap();
+        let event = PointerEvent::Drag {
+            from_x: 1,
+            from_y: 1,
+            to_x: 50,
+            to_y: 50,
+            button: crate::platform::MouseButton::Left,
+            modifiers: vec![],
+            duration_ms: 200,
+        };
+        let deadline = Deadline::from_millis(1_000);
+        g.pointer_by(&event, deadline).unwrap();
+        assert_eq!(&*log.lock().unwrap(), &[deadline]);
     }
 
     #[test]

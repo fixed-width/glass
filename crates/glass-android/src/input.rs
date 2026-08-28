@@ -829,10 +829,18 @@ mod injector_tests {
     fn shell_injector_passes_one_deadline_to_every_adb_command() {
         let fake = FakeAdb::new(&[("*", Answer::Silent)]);
         let deadline = Deadline::from_millis(1_000);
+        let repeated_click = PointerEvent::Click {
+            x: 10,
+            y: 20,
+            button: MouseButton::Left,
+            count: 3,
+            modifiers: vec![],
+        };
         ShellInjector
-            .pointer_by(fake.adb(), &origin(), &click(), deadline)
+            .pointer_by(fake.adb(), &origin(), &repeated_click, deadline)
             .unwrap();
-        assert_eq!(fake.calls().len(), 1);
+        assert_eq!(fake.calls().len(), 3);
+        assert_eq!(fake.deadlines(), vec![deadline; 3]);
     }
 }
 

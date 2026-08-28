@@ -438,8 +438,8 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// - `SCShareableContent` itself failed — classified via
 ///   [`crate::ffi::classify_null_result`] (TCC decline -> `PermissionDenied`, anything else
 ///   -> `CaptureFailed`), not assumed to always be a permission decline;
-/// - the handler was wedged or dropped and sent no reply within [`QUERY_TIMEOUT`] (the two
-///   `Err` arms below).
+/// - the handler was wedged or dropped and sent no reply within [`QUERY_TIMEOUT`], classified by
+///   the host-tested pure [`crate::shareable_receive::classify_receive`] helper.
 ///
 /// Either way the `Err` aborts the caller's `poll_until` loop immediately (`Err` from a tick
 /// stops polling, `Ok(None)` retries to the deadline), so a query that could not enumerate the
@@ -501,19 +501,12 @@ fn query_once_inner(
         );
     }
 
-    match rx.recv_timeout(QUERY_TIMEOUT) {
-        Ok(CandidateQueryReply::Found(m, candidates)) => Ok(Some((m, candidates))),
-        Ok(CandidateQueryReply::NotFound) => Ok(None),
-        Ok(CandidateQueryReply::Failed(e)) => Err(e),
-        // A wedged handler is a query failure, not a "found nothing" answer — the same
-        // distinction `list_app_windows` makes. Reading it as `Ok(None)` would blame the app
-        // for a window ScreenCaptureKit could not enumerate (glass#467).
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(GlassError::Backend(
-            "SCShareableContent completion handler did not reply within the query timeout".into(),
-        )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(GlassError::Backend(
-            "SCShareableContent completion handler was dropped without replying".into(),
-        )),
+    // The callback's Objective-C object walk remains macOS integration-only. Once it reaches this
+    // channel, reply/timeout/disconnection classification is pure and host-tested.
+    match crate::shareable_receive::classify_receive(rx.recv_timeout(QUERY_TIMEOUT))? {
+        CandidateQueryReply::Found(m, candidates) => Ok(Some((m, candidates))),
+        CandidateQueryReply::NotFound => Ok(None),
+        CandidateQueryReply::Failed(e) => Err(e),
     }
 }
 

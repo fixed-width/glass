@@ -89,6 +89,8 @@ impl AdbOp {
 pub struct Adb {
     bin: String,
     serial: Option<String>,
+    #[cfg(test)]
+    deadline_log: Option<std::sync::Arc<std::sync::Mutex<Vec<Deadline>>>>,
 }
 
 impl Adb {
@@ -98,7 +100,12 @@ impl Adb {
     pub fn from_env() -> Self {
         let get = |k: &str| std::env::var(k).ok();
         let bin = crate::sdk::resolve_adb(&get, &|p| p.exists()).bin();
-        Self { bin, serial: None }
+        Self {
+            bin,
+            serial: None,
+            #[cfg(test)]
+            deadline_log: None,
+        }
     }
 
     /// Return a copy bound to `serial`.
@@ -106,6 +113,8 @@ impl Adb {
         Self {
             bin: self.bin.clone(),
             serial: Some(serial.into()),
+            #[cfg(test)]
+            deadline_log: self.deadline_log.clone(),
         }
     }
 
@@ -177,6 +186,10 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
+        #[cfg(test)]
+        if let Some(log) = &self.deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
         let args: Vec<&str> = args.into_iter().collect();
         let op = AdbOp::for_args(&args);
         let argv = build_argv(self.serial.as_deref(), &args);
@@ -417,6 +430,7 @@ impl FakeAdb {
             adb: Adb {
                 bin: bin.to_string_lossy().into_owned(),
                 serial: None,
+                deadline_log: Some(Default::default()),
             },
             dir,
         }
@@ -433,6 +447,17 @@ impl FakeAdb {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    /// The caller deadline attached to every invocation, in call order.
+    pub(crate) fn deadlines(&self) -> Vec<Deadline> {
+        self.adb
+            .deadline_log
+            .as_ref()
+            .expect("FakeAdb always records deadlines")
+            .lock()
+            .unwrap()
+            .clone()
     }
 
     /// Whether any invocation's argv contains `needle`.
@@ -559,6 +584,7 @@ pub(crate) fn a_real_spawn_failure() -> GlassError {
     let adb = Adb {
         bin: "/nonexistent/glass-test-adb".to_string(),
         serial: None,
+        deadline_log: None,
     };
     let e = adb
         .run(["devices"])
@@ -635,6 +661,7 @@ mod tests {
         let adb = Adb {
             bin: "/bin/sh".to_string(),
             serial: None,
+            deadline_log: None,
         };
         use glass_core::Deadline;
 
@@ -677,6 +704,7 @@ mod tests {
         let adb = Adb {
             bin: bin.to_string(),
             serial: None,
+            deadline_log: None,
         };
 
         let e = adb
@@ -702,6 +730,7 @@ mod tests {
         let adb = Adb {
             bin: bin.to_string(),
             serial: None,
+            deadline_log: None,
         };
 
         let e = adb
