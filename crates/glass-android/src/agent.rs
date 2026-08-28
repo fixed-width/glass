@@ -727,6 +727,122 @@ mod tests {
         (port, requests, join)
     }
 
+    /// Answer conn1's first mutation with malformed JSON, then queue the valid answer that belongs
+    /// to it. Reusing conn1 lets that queued line answer or desynchronize the next mutation; retiring
+    /// conn1 sends only the distinct mutation on conn2.
+    fn agent_with_malformed_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            first
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("bound conn1 observation");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_reader = BufReader::new(first);
+            let mut line = String::new();
+            first_reader
+                .read_line(&mut line)
+                .expect("read conn1 request");
+            let request: Value = serde_json::from_str(&line).expect("conn1 request json");
+            let first_id = request["id"].clone();
+            request_log.lock().expect("request log").push((1, request));
+            writeln!(first_writer, "not json").expect("write malformed conn1 answer");
+            writeln!(first_writer, "{}", json!({"id": first_id, "ok": true}))
+                .expect("queue the actual conn1 answer");
+            first_writer.flush().expect("flush conn1 answers");
+
+            line.clear();
+            if matches!(first_reader.read_line(&mut line), Ok(n) if n > 0) {
+                let request: Value =
+                    serde_json::from_str(&line).expect("second conn1 request json");
+                let id = request["id"].clone();
+                request_log.lock().expect("request log").push((1, request));
+                let _ = writeln!(first_writer, "{}", json!({"id": id, "ok": true}));
+                return;
+            }
+
+            let (second, _) = listener.accept().expect("accept conn2");
+            let mut second_writer = second.try_clone().expect("clone conn2");
+            writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+            let mut second_reader = BufReader::new(second);
+            line.clear();
+            second_reader
+                .read_line(&mut line)
+                .expect("read conn2 request");
+            let request: Value = serde_json::from_str(&line).expect("conn2 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((2, request));
+            writeln!(second_writer, "{}", json!({"id": id, "ok": true}))
+                .expect("answer conn2 request");
+        });
+        (port, requests, join)
+    }
+
+    /// Refuse conn1's first request with a matching ID, then answer the distinct second request.
+    /// A synchronized refusal leaves conn1 reusable; poisoning it moves that second request to conn2.
+    fn agent_with_reusable_refusal() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            first
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("bound conn1 observation");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_reader = BufReader::new(first);
+            let mut line = String::new();
+            first_reader
+                .read_line(&mut line)
+                .expect("read first conn1 request");
+            let request: Value = serde_json::from_str(&line).expect("first conn1 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((1, request));
+            writeln!(
+                first_writer,
+                "{}",
+                json!({"id": id, "ok": false, "error": "denied"})
+            )
+            .expect("refuse first conn1 request");
+
+            line.clear();
+            if matches!(first_reader.read_line(&mut line), Ok(n) if n > 0) {
+                let request: Value =
+                    serde_json::from_str(&line).expect("second conn1 request json");
+                let id = request["id"].clone();
+                request_log.lock().expect("request log").push((1, request));
+                writeln!(first_writer, "{}", json!({"id": id, "ok": true}))
+                    .expect("answer second conn1 request");
+                return;
+            }
+
+            let (second, _) = listener.accept().expect("accept conn2");
+            let mut second_writer = second.try_clone().expect("clone conn2");
+            writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+            let mut second_reader = BufReader::new(second);
+            line.clear();
+            second_reader
+                .read_line(&mut line)
+                .expect("read conn2 request");
+            let request: Value = serde_json::from_str(&line).expect("conn2 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((2, request));
+            writeln!(second_writer, "{}", json!({"id": id, "ok": true}))
+                .expect("answer conn2 request");
+        });
+        (port, requests, join)
+    }
+
     #[test]
     fn read_timeout_install_failure_aborts_before_dispatch() {
         let (port, requests, _) = counting_agent();
@@ -935,6 +1051,45 @@ mod tests {
         assert_eq!(seen.len(), 2, "a mutation was replayed or lost: {seen:?}");
         assert_eq!((seen[0].0, seen[0].1["chord"].as_str()), (1, Some("a")));
         assert_eq!((seen[1].0, seen[1].1["chord"].as_str()), (2, Some("b")));
+    }
+
+    #[test]
+    fn malformed_response_retires_stream_before_the_next_distinct_mutation() {
+        let (port, requests, join) = agent_with_malformed_answer();
+        let client = AgentClient::connect(port).expect("connect");
+
+        let first = client
+            .key("a")
+            .expect_err("malformed JSON cannot answer the first mutation");
+        assert!(first.to_string().contains("agent resp parse"), "{first}");
+        let second = client.key("b");
+
+        join.join().expect("fake agent");
+        second.expect("the distinct mutation reconnects instead of consuming conn1's queued reply");
+        let seen = requests.lock().expect("request log");
+        assert_eq!(seen.len(), 2, "a mutation was replayed or lost: {seen:?}");
+        assert_eq!((seen[0].0, seen[0].1["chord"].as_str()), (1, Some("a")));
+        assert_eq!((seen[1].0, seen[1].1["chord"].as_str()), (2, Some("b")));
+    }
+
+    #[test]
+    fn matching_id_refusal_leaves_stream_reusable_for_the_next_distinct_request() {
+        let (port, requests, join) = agent_with_reusable_refusal();
+        let client = AgentClient::connect(port).expect("connect");
+
+        let first = client
+            .key("a")
+            .expect_err("the agent refuses the first request");
+        assert!(first.to_string().contains("denied"), "{first}");
+        client
+            .key("b")
+            .expect("the distinct request stays on synchronized conn1");
+
+        join.join().expect("fake agent");
+        let seen = requests.lock().expect("request log");
+        assert_eq!(seen.len(), 2, "a request was replayed or lost: {seen:?}");
+        assert_eq!((seen[0].0, seen[0].1["chord"].as_str()), (1, Some("a")));
+        assert_eq!((seen[1].0, seen[1].1["chord"].as_str()), (1, Some("b")));
     }
 
     #[test]
