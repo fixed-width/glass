@@ -37,7 +37,6 @@ use serde_json::json;
 
 static APPLE_ONBOX_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const TREE_DEADLINE: Duration = Duration::from_secs(10);
-const PIXEL_DELTA_TOLERANCE: u8 = 24;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "on-box only: needs macOS Screen Recording + Accessibility grants and swiftc"]
@@ -226,17 +225,8 @@ fn assert_post_action_pixels(
     roi: ElementRoi,
     label: &str,
 ) {
-    let area = u64::from(roi.width) * u64::from(roi.height);
-    let minimum_changed_pixels = (area / 1_000).max(8);
-    assert_roi_changed(
-        before_roi,
-        terminal_frame,
-        roi,
-        PIXEL_DELTA_TOLERANCE,
-        minimum_changed_pixels,
-        label,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    assert_roi_changed(before_roi, terminal_frame, roi, label)
+        .unwrap_or_else(|error| panic!("{error}"));
 }
 
 fn completed_terminal_screenshot(call: &CallView, backend: &str) -> RgbaImage {

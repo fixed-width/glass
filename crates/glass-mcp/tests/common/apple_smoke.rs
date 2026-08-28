@@ -7,6 +7,10 @@ pub struct ElementRoi {
     pub height: u32,
 }
 
+const MINIMUM_CHANGED_PIXELS: u64 = 8;
+const PIXELS_PER_REQUIRED_CHANGE: u64 = 1_000;
+const PIXEL_DELTA_TOLERANCE: u8 = 24;
+
 pub fn unique_named_element(outline: &str, name: &str) -> Result<ElementRoi, String> {
     let needle = format!("\"{name}\"");
     let elements = outline
@@ -43,10 +47,10 @@ pub fn assert_roi_changed(
     before_roi: &image::RgbaImage,
     after_frame: &image::RgbaImage,
     roi: ElementRoi,
-    tolerance: u8,
-    minimum_changed_pixels: u64,
     label: &str,
 ) -> Result<u64, String> {
+    let area = u64::from(roi.width) * u64::from(roi.height);
+    let minimum_changed_pixels = (area / PIXELS_PER_REQUIRED_CHANGE).max(MINIMUM_CHANGED_PIXELS);
     if before_roi.dimensions() != (roi.width, roi.height) {
         return Err(format!(
             "{label}: pre-action ROI is {}x{}, expected {}x{}",
@@ -85,12 +89,12 @@ pub fn assert_roi_changed(
                 .0
                 .iter()
                 .zip(after.0.iter())
-                .any(|(&a, &b)| a.abs_diff(b) > tolerance)
+                .any(|(&a, &b)| a.abs_diff(b) > PIXEL_DELTA_TOLERANCE)
         })
         .count() as u64;
     if changed < minimum_changed_pixels {
         return Err(format!(
-            "{label}: terminal screenshot ROI is stale/pre-action: changed {changed} pixels, expected at least {minimum_changed_pixels} above tolerance {tolerance}"
+            "{label}: terminal screenshot ROI is stale/pre-action: changed {changed} pixels, expected at least {minimum_changed_pixels} above tolerance {PIXEL_DELTA_TOLERANCE}"
         ));
     }
     Ok(changed)
