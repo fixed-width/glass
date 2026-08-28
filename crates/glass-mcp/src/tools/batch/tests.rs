@@ -30,6 +30,7 @@ enum DeadlineBehavior {
     PermissionDenied,
     TransportFailure,
     OtherFailure,
+    CoordOutOfBoundsAfterOneScroll,
 }
 
 struct DeadlinePlatform {
@@ -271,6 +272,18 @@ impl Platform for DeadlinePlatform {
                 Err(GlassError::Backend("transport disconnected".into()))
             }
             DeadlineBehavior::OtherFailure => Err(GlassError::InvalidKey("bad".into())),
+            DeadlineBehavior::CoordOutOfBoundsAfterOneScroll => {
+                if self.inner.pointer_events.is_empty() {
+                    self.inner.send_pointer(event)
+                } else {
+                    Err(GlassError::CoordOutOfBounds {
+                        x: 50,
+                        y: 50,
+                        width: 50,
+                        height: 50,
+                    })
+                }
+            }
             DeadlineBehavior::ReturnNotDispatched
             | DeadlineBehavior::CaptureCompletesLate
             | DeadlineBehavior::CaptureFailsLate
@@ -1849,6 +1862,40 @@ fn scroll_to_element_unmatched_warns_that_side_effects_may_have_occurred() {
     assert_eq!(step["result"]["matched"], false);
     assert!(step["result"].get("scrolled").is_some());
     assert_eq!(step["side_effects_may_have_occurred"], true);
+}
+
+#[test]
+fn scroll_to_element_later_coord_failure_reports_that_an_earlier_scroll_dispatched() {
+    let (mut g, _, _, events) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::CoordOutOfBoundsAfterOneScroll, vec![]);
+    let error = do_actions(
+        &mut g,
+        &do_args(
+            vec![Action::ScrollToElement(ScrollToElementArgs {
+                name: Some("missing".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some("down".into()),
+                x: None,
+                y: None,
+                step: None,
+                timeout_ms: Some(1_000),
+            })],
+            2_000,
+        ),
+    )
+    .unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["scroll(50,50,0,3)"],
+        "the first scroll must land before the later coordinate failure"
+    );
+    assert_eq!(step["attempted"], true, "{envelope}");
+    assert_eq!(step["side_effects_may_have_occurred"], true, "{envelope}");
 }
 
 #[test]

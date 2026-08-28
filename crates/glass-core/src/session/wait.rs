@@ -47,6 +47,15 @@ fn resolve_nested_accessibility_bound(
     }
 }
 
+fn after_scroll_dispatch(error: GlassError) -> GlassError {
+    match error {
+        error @ GlassError::CoordOutOfBounds { .. } => GlassError::Backend(format!(
+            "scroll to element failed after an earlier scroll step dispatched: {error}"
+        )),
+        error => error.after_dispatch(),
+    }
+}
+
 /// Parameters for [`Glass::wait_stable`].
 #[derive(Clone, Debug)]
 pub struct WaitStableParams {
@@ -787,7 +796,7 @@ impl Glass {
                     action_deadline,
                 );
                 if steps > 0 {
-                    scroll.map_err(GlassError::after_dispatch)?;
+                    scroll.map_err(after_scroll_dispatch)?;
                 } else {
                     scroll?;
                 }
@@ -800,7 +809,7 @@ impl Glass {
                 }
                 let Some((found, outline)) = self
                     .snapshot_match_outline(params, action_deadline)
-                    .map_err(GlassError::after_dispatch)?
+                    .map_err(after_scroll_dispatch)?
                 else {
                     return Ok(outcome(false, None, steps, reversed, Some(whose)));
                 };
