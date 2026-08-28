@@ -684,6 +684,14 @@ const TOGGLE_ACTION: &str = "toggle";
 const ACTIVATE_ACTION_NAMES: &[&str] =
     &["click", "activate", "press", "push", "jump", TOGGLE_ACTION];
 
+/// Plain text editors need a pointer click to establish toolkit text-input focus.
+fn requires_pointer_focus(role: glass_core::AxRole) -> bool {
+    matches!(
+        role,
+        glass_core::AxRole::TextField | glass_core::AxRole::TextArea
+    )
+}
+
 /// Confirm a fired `toggle` action actually moved the control: poll its boolean state until
 /// it differs from `was_on`. Without this, a toolkit that accepts and acknowledges the action
 /// but never applies it (or applies it to nothing) reports a successful click on a control
@@ -730,6 +738,9 @@ async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
     let name = nonempty(node.name().await.unwrap_or_default());
     if !target.matches(role, name.as_deref()) {
         return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    if requires_pointer_focus(role) {
+        return Err(GlassError::AxActionUnavailable(target.id.0));
     }
     // Read the control's boolean state BEFORE firing, so a `toggle` action can be verified by
     // an actual flip below — afterwards there is nothing left to compare against. Costs one
@@ -873,6 +884,27 @@ mod tests {
     use atspi_common::ObjectRef;
 
     use super::*;
+
+    #[test]
+    fn text_roles_require_pointer_focus() {
+        use glass_core::AxRole::*;
+
+        for role in [TextField, TextArea] {
+            assert!(requires_pointer_focus(role), "{role:?}");
+        }
+        for role in [
+            Button,
+            ToggleButton,
+            CheckBox,
+            ComboBox,
+            SpinButton,
+            Slider,
+            Link,
+            MenuItem,
+        ] {
+            assert!(!requires_pointer_focus(role), "{role:?}");
+        }
+    }
 
     /// The reading behind the skip (Brave 151 on X11, 2026-08-24): the browser window's one child
     /// is a null ObjectRef while renderer accessibility is off, and the proxy build's error read
