@@ -1242,9 +1242,10 @@ pub trait Accessibility {
     /// session cached for the element; keeping it makes a field that settled *after* the failure
     /// look like drift, and the caller's retry is refused for a write that succeeded (glass#405).
     ///
-    /// A transport failure counts as having written whenever the request may have reached the
-    /// device. Classify at the point that knows — do not flatten it into a generic error on the way
-    /// out, which is how three exits of the Android on-device reader came to be misclassified.
+    /// Generic transport or bounded dispatch provenance is insufficient: it may describe a guard
+    /// snapshot, target resolution, or focus operation that ran before the value mutation. Classify
+    /// at the backend point that knows the value mutation itself may have reached the device, and
+    /// convert every later failure to one of the explicit verdicts above.
     fn set_value(&mut self, _ctx: &AxContext, _target: &AxTarget, _text: &str) -> Result<()> {
         Err(crate::error::GlassError::AxUnsupported)
     }

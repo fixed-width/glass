@@ -104,7 +104,7 @@ impl Accessibility for MacosA11y {
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
-        let deadline = SemanticDeadline::set_value(ctx.deadline);
+        let deadline = SemanticDeadline::set_value(ctx.deadline, target.id.0);
         deadline.require()?;
         let (window_el, scale) = resolve_window(ctx, deadline)?;
 

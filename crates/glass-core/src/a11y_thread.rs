@@ -13,6 +13,8 @@
 //! The other readers do not need this: macOS AX runs inline, and the Android and iOS readers bound
 //! their own subprocess calls.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -27,6 +29,77 @@ use crate::{GlassError, Result};
 pub struct A11yThread {
     backend: &'static str,
     ceiling: Duration,
+}
+
+const SET_VALUE_PENDING: u8 = 0;
+const SET_VALUE_DISPATCHED: u8 = 1;
+const SET_VALUE_CANCELLED: u8 = 2;
+
+/// The operation-specific dispatch gate for a detached native value mutation.
+///
+/// A backend performs all target resolution and guard reads before calling [`Self::dispatch`]. The
+/// call atomically claims permission to begin the native setter. If the waiting caller has already
+/// timed out, the setter is refused, so a timeout reported as pre-write cannot later mutate the
+/// value on the detached worker.
+#[derive(Clone)]
+pub struct SetValueDispatch {
+    state: Arc<AtomicU8>,
+}
+
+impl SetValueDispatch {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(SET_VALUE_PENDING)),
+        }
+    }
+
+    fn begin(&self) -> Result<()> {
+        match self.state.compare_exchange(
+            SET_VALUE_PENDING,
+            SET_VALUE_DISPATCHED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(SET_VALUE_DISPATCHED) => Ok(()),
+            Err(SET_VALUE_CANCELLED) => Err(GlassError::deadline_not_started(
+                "native accessibility set_value mutation",
+            )),
+            Err(other) => unreachable!("unknown set_value dispatch state {other}"),
+        }
+    }
+
+    /// Begin one native value mutation, or refuse it if the caller already stopped waiting.
+    pub fn dispatch<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.begin()?;
+        work()
+    }
+
+    /// Async form of [`Self::dispatch`] for native setters driven by an async accessibility API.
+    pub async fn dispatch_async<T>(
+        &self,
+        work: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        self.begin()?;
+        work.await
+    }
+
+    /// Atomically stop a still-pre-write worker. Returns whether mutation dispatch already won.
+    fn cancel_or_dispatched(&self) -> bool {
+        match self.state.compare_exchange(
+            SET_VALUE_PENDING,
+            SET_VALUE_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(SET_VALUE_CANCELLED) => false,
+            Err(SET_VALUE_DISPATCHED) => true,
+            Err(other) => unreachable!("unknown set_value dispatch state {other}"),
+        }
+    }
+
+    fn was_dispatched(&self) -> bool {
+        self.state.load(Ordering::Acquire) == SET_VALUE_DISPATCHED
+    }
 }
 
 /// A bounded call, for the message its failure carries.
@@ -97,15 +170,22 @@ impl A11yThread {
             ));
         }
         let (wait, ended_by) = self.bounded_wait(deadline);
-        self.detached(Op::Snapshot, wait, job, || self.never_answered(ended_by))
+        self.detached(
+            Op::Snapshot,
+            wait,
+            job,
+            || self.never_answered(ended_by),
+            || self.worker_panicked(Op::Snapshot),
+        )
     }
 
     /// Write under the nearer caller/ceiling deadline. The detached write may still land after the
     /// caller stops waiting, so a caller timeout remains post-dispatch and fallback-ineligible.
     pub fn set_value(
         &self,
+        target: u32,
         deadline: Deadline,
-        job: impl FnOnce() -> Result<()> + Send + 'static,
+        job: impl FnOnce(SetValueDispatch) -> Result<()> + Send + 'static,
     ) -> Result<()> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started(
@@ -113,13 +193,28 @@ impl A11yThread {
             ));
         }
         let (wait, ended_by) = self.bounded_wait(deadline);
-        self.detached(Op::SetValue, wait, job, || match ended_by {
-            Whose::Caller => GlassError::caller_deadline_elapsed_with_guidance(
-                "native accessibility set_value",
-                "the write may still land; re-snapshot before retrying",
-            ),
-            Whose::Callee => self.timed_out(Op::SetValue),
-        })
+        let dispatch = SetValueDispatch::new();
+        let worker_dispatch = dispatch.clone();
+        let timeout_dispatch = dispatch.clone();
+        let panic_dispatch = dispatch.clone();
+        let result = self.detached(
+            Op::SetValue,
+            wait,
+            move || job(worker_dispatch),
+            || self.set_value_no_answer(target, ended_by, &timeout_dispatch),
+            || self.set_value_panicked(target, &panic_dispatch),
+        );
+        match result {
+            Err(error) if dispatch.was_dispatched() && !error.set_value_failed_after_writing() => {
+                Err(GlassError::AxWriteUnconfirmed(
+                    target,
+                    format!(
+                        "the native value mutation was dispatched but failed before it could be confirmed ({error})"
+                    ),
+                ))
+            }
+            result => result,
+        }
     }
 
     /// Actuate under the nearer caller/ceiling deadline, keeping timeouts fallback-ineligible
@@ -135,13 +230,63 @@ impl A11yThread {
             ));
         }
         let (wait, ended_by) = self.bounded_wait(deadline);
-        self.detached(Op::Invoke, wait, job, || match ended_by {
+        self.detached(
+            Op::Invoke,
+            wait,
+            job,
+            || match ended_by {
+                Whose::Caller => GlassError::caller_deadline_elapsed_with_guidance(
+                    "native accessibility invoke",
+                    "the action may still land; re-snapshot before retrying",
+                ),
+                Whose::Callee => self.timed_out(Op::Invoke),
+            },
+            || self.worker_panicked(Op::Invoke),
+        )
+    }
+
+    fn set_value_no_answer(
+        &self,
+        target: u32,
+        ended_by: Whose,
+        dispatch: &SetValueDispatch,
+    ) -> GlassError {
+        if dispatch.cancel_or_dispatched() {
+            let cause = match ended_by {
+                Whose::Caller => "the caller deadline elapsed",
+                Whose::Callee => "the accessibility backend timed out",
+            };
+            return GlassError::AxWriteUnconfirmed(
+                target,
+                format!(
+                    "{cause} after the native value mutation was dispatched; it may still land"
+                ),
+            );
+        }
+        match ended_by {
             Whose::Caller => GlassError::caller_deadline_elapsed_with_guidance(
-                "native accessibility invoke",
-                "the action may still land; re-snapshot before retrying",
+                "native accessibility set_value pre-write work",
+                "the value mutation was not dispatched",
             ),
-            Whose::Callee => self.timed_out(Op::Invoke),
-        })
+            Whose::Callee => GlassError::AccessibilityUnavailable(format!(
+                "accessibility set_value timed out ({} not responding) before the value mutation was dispatched",
+                self.backend
+            )),
+        }
+    }
+
+    fn set_value_panicked(&self, target: u32, dispatch: &SetValueDispatch) -> GlassError {
+        if dispatch.was_dispatched() {
+            GlassError::AxWriteUnconfirmed(
+                target,
+                format!(
+                    "the {} accessibility worker panicked after the native value mutation was dispatched",
+                    self.backend
+                ),
+            )
+        } else {
+            self.worker_panicked(Op::SetValue)
+        }
     }
 
     /// The verdict for a read that never answered. A caller-owned bound remains structural so the
@@ -182,10 +327,11 @@ impl A11yThread {
     /// handing the other two a verdict this never read let them pass a wrong one unnoticed.
     fn detached<T: Send + 'static>(
         &self,
-        op: Op,
+        _op: Op,
         wait: Duration,
         job: impl FnOnce() -> Result<T> + Send + 'static,
         on_timeout: impl FnOnce() -> GlassError,
+        on_disconnect: impl FnOnce() -> GlassError,
     ) -> Result<T> {
         let (tx, rx) = mpsc::channel();
         // Named and fallible, unlike a bare `spawn`: a timed-out worker outlives its wait holding
@@ -207,7 +353,7 @@ impl A11yThread {
             Err(RecvTimeoutError::Timeout) => Err(on_timeout()),
             // The sender drops unsent only when the worker unwinds, so this is a panic, not a
             // slow answer — a timeout would claim the backend is alive and still working.
-            Err(RecvTimeoutError::Disconnected) => Err(self.worker_panicked(op)),
+            Err(RecvTimeoutError::Disconnected) => Err(on_disconnect()),
         }
     }
 }
@@ -321,14 +467,14 @@ mod tests {
     #[test]
     fn the_jobs_own_error_is_returned_rather_than_a_timeout() {
         let r: Result<()> =
-            reader().set_value(Deadline::UNBOUNDED, || Err(GlassError::AxUnsupported));
+            reader().set_value(0, Deadline::UNBOUNDED, |_| Err(GlassError::AxUnsupported));
         assert!(matches!(r, Err(GlassError::AxUnsupported)), "{r:?}");
     }
 
     #[test]
     fn a_job_that_outruns_the_ceiling_names_the_operation_that_timed_out() {
         let e = impatient()
-            .set_value(Deadline::UNBOUNDED, hangs())
+            .set_value(0, Deadline::UNBOUNDED, |_| hangs()())
             .unwrap_err();
         assert!(e.to_string().contains("set_value timed out"), "{e}");
 
@@ -347,7 +493,9 @@ mod tests {
     fn a_write_or_an_action_that_timed_out_says_it_may_still_land() {
         for e in [
             impatient()
-                .set_value(Deadline::UNBOUNDED, hangs())
+                .set_value(0, Deadline::UNBOUNDED, |dispatch| {
+                    dispatch.dispatch(hangs())
+                })
                 .unwrap_err(),
             impatient()
                 .invoke(Deadline::UNBOUNDED, hangs())
@@ -412,7 +560,9 @@ mod tests {
     #[test]
     fn a_worker_that_panicked_is_not_reported_as_a_backend_that_went_quiet() {
         let e: GlassError = reader()
-            .set_value(Deadline::UNBOUNDED, || panic!("the backend crate unwound"))
+            .set_value(0, Deadline::UNBOUNDED, |_| {
+                panic!("the backend crate unwound")
+            })
             .unwrap_err();
         assert!(e.to_string().contains("panicked"), "{e}");
         assert!(!e.to_string().contains("timed out"), "{e}");
@@ -459,7 +609,7 @@ mod tests {
     #[test]
     fn a_hanging_set_value_returns_a_caller_owned_timeout() {
         let error = reader()
-            .set_value(Deadline::from_millis(20), hangs())
+            .set_value(0, Deadline::from_millis(20), |_| hangs()())
             .unwrap_err();
 
         assert_eq!(error.bound_owner(), Some(Whose::Caller));
@@ -469,8 +619,59 @@ mod tests {
             Some(crate::BoundDispatch::MayHaveDispatched)
         );
         assert!(
-            error.to_string().contains("write may still land"),
+            error
+                .to_string()
+                .contains("value mutation was not dispatched"),
             "{error}"
+        );
+        assert!(!error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn a_timeout_during_pre_write_work_is_not_an_unconfirmed_value_write() {
+        let error = reader()
+            .set_value(7, Deadline::from_millis(20), |_| hangs()())
+            .expect_err("pre-write resolution outlives the caller");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert!(!error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn a_timeout_after_native_value_dispatch_is_an_unconfirmed_write() {
+        let error = reader()
+            .set_value(7, Deadline::from_millis(20), |dispatch| {
+                dispatch.dispatch(hangs())
+            })
+            .expect_err("the native setter outlives the caller");
+
+        assert!(
+            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
+            "{error}"
+        );
+        assert!(error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn a_timed_out_pre_write_worker_cannot_dispatch_the_value_later() {
+        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_wrote = std::sync::Arc::clone(&wrote);
+
+        let error = reader()
+            .set_value(7, Deadline::from_millis(20), move |dispatch| {
+                std::thread::sleep(Duration::from_millis(60));
+                dispatch.dispatch(|| {
+                    worker_wrote.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+            .expect_err("the caller stops during pre-write work");
+        assert!(!error.set_value_failed_after_writing(), "{error}");
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !wrote.load(std::sync::atomic::Ordering::SeqCst),
+            "the detached worker dispatched after the caller had retained its cached value"
         );
     }
 
@@ -497,7 +698,7 @@ mod tests {
     #[test]
     fn an_unbounded_set_value_retains_the_backend_ceiling() {
         let error = impatient()
-            .set_value(Deadline::UNBOUNDED, hangs())
+            .set_value(0, Deadline::UNBOUNDED, |_| hangs()())
             .unwrap_err();
 
         assert!(matches!(error, GlassError::AccessibilityUnavailable(_)));

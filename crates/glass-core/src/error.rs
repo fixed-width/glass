@@ -336,9 +336,10 @@ impl GlassError {
 
     /// Whether a failed value-write is **proven** to have gone out or may have gone out before
     /// failing — the only cases where the session's captured value is stale and must be dropped.
-    /// True for two post-dispatch verdicts, [`GlassError::AxValueNotApplied`] and
-    /// [`GlassError::AxWriteUnconfirmed`], and for a bounded failure that records
-    /// [`BoundDispatch::MayHaveDispatched`].
+    /// True only for the two operation-specific post-dispatch verdicts,
+    /// [`GlassError::AxValueNotApplied`] and [`GlassError::AxWriteUnconfirmed`]. Generic bounded
+    /// dispatch provenance can describe a pre-write snapshot or transport call, so it is not
+    /// evidence that the value mutation itself went out.
     ///
     /// Same "did anything dispatch?" question as [`Self::invoke_fallback_eligible`], but ordinary
     /// errors are decided by an allowlist because the two mistakes are not symmetric. Keeping the
@@ -346,15 +347,14 @@ impl GlassError {
     /// the caller to re-snapshot, recoverable. Dropping it can only make the guard accept more, and
     /// what it then accepts is a write onto the wrong element, reported as `Ok`.
     ///
-    /// Some verdicts cannot be classified at all: Android raises `ToolFailed`, `Bounded` and
-    /// `AccessibilityUnavailable` on *both* sides of the dispatch — its pre-write re-snapshot and
-    /// adb handshake fail the same way its post-write read-back does — so no variant-level split
-    /// separates them, and the recoverable answer has to win.
+    /// Some generic errors occur on both sides of the mutation — Android's pre-write re-snapshot
+    /// and its post-write read-back can fail through the same transport variants. Backends must
+    /// convert only the latter at the point that knows the mutation already dispatched.
     pub fn set_value_failed_after_writing(&self) -> bool {
         matches!(
             self,
             GlassError::AxValueNotApplied { .. } | GlassError::AxWriteUnconfirmed(..)
-        ) || self.bound_dispatch() == Some(BoundDispatch::MayHaveDispatched)
+        )
     }
 
     /// Preserve a compound operation's dispatch history on a later bounded refusal.
@@ -362,7 +362,7 @@ impl GlassError {
     /// Once an earlier mutation succeeded, a later `NotDispatched` sub-operation no longer proves
     /// the compound operation was side-effect free. Its bound and owner still describe the failed
     /// sub-operation, so only the dispatch verdict is upgraded.
-    pub(crate) fn after_dispatch(self) -> Self {
+    pub fn after_dispatch(self) -> Self {
         match self {
             GlassError::Bounded {
                 kind,
@@ -791,23 +791,14 @@ mod tests {
     }
 
     #[test]
-    fn a_post_dispatch_verdict_or_bound_invalidates_the_captured_value() {
-        // The read-back verdict is reached only after the write went out.
+    fn only_operation_specific_post_write_verdicts_invalidate_the_captured_value() {
+        // These verdicts are reached only after the value mutation itself went out.
         assert!(
             GlassError::value_not_applied(3, "world", Some("hello"))
                 .set_value_failed_after_writing()
         );
-        assert!(
-            GlassError::Bounded {
-                kind: BoundKind::TimedOut,
-                whose: Whose::Caller,
-                dispatch: BoundDispatch::MayHaveDispatched,
-                message: "the write may have gone out".into(),
-            }
-            .set_value_failed_after_writing()
-        );
-        // Everything else keeps the captured value: the pre-dispatch rejections, the transport
-        // errors raised on either side of the dispatch, and any variant not named (the wildcard).
+        // Everything else keeps the captured value: the pre-write rejections, generic transport
+        // evidence that may describe a guard read, and any variant not named (the wildcard).
         for e in [
             GlassError::AxElementNotFound(3),
             GlassError::AxElementChanged(3),
@@ -823,6 +814,12 @@ mod tests {
                 whose: Whose::Callee,
                 dispatch: BoundDispatch::NotDispatched,
                 message: "the write was refused before dispatch".into(),
+            },
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                whose: Whose::Caller,
+                dispatch: BoundDispatch::MayHaveDispatched,
+                message: "a pre-write snapshot may have gone out".into(),
             },
             GlassError::ToolFailed {
                 call: "adb shell uiautomator dump /sdcard/x.xml".into(),

@@ -5,7 +5,7 @@ use glass_core::{Deadline, GlassError, Result, Whose};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SemanticOperation {
     Snapshot,
-    SetValue,
+    SetValue(u32),
     Invoke,
 }
 
@@ -25,10 +25,10 @@ impl SemanticDeadline {
         }
     }
 
-    pub(crate) fn set_value(deadline: Deadline) -> Self {
+    pub(crate) fn set_value(deadline: Deadline, target: u32) -> Self {
         Self {
             deadline,
-            operation: SemanticOperation::SetValue,
+            operation: SemanticOperation::SetValue(target),
             dispatched: false,
         }
     }
@@ -53,12 +53,13 @@ impl SemanticDeadline {
             (SemanticOperation::Snapshot, _) => GlassError::AccessibilityNotReady(
                 "no accessibility tree within the time this call allowed".into(),
             ),
-            (SemanticOperation::SetValue, false) => {
+            (SemanticOperation::SetValue(_), false) => {
                 GlassError::deadline_not_started("native accessibility set_value")
             }
-            (SemanticOperation::SetValue, true) => {
-                GlassError::caller_deadline_elapsed("native accessibility set_value")
-            }
+            (SemanticOperation::SetValue(target), true) => GlassError::AxWriteUnconfirmed(
+                target,
+                "the caller deadline elapsed after the native value mutation was dispatched".into(),
+            ),
             (SemanticOperation::Invoke, false) => {
                 GlassError::deadline_not_started("native accessibility invoke")
             }
@@ -88,6 +89,21 @@ impl SemanticDeadline {
         self.require()?;
         match result {
             Err(error) if error.bound_owner() == Some(Whose::Caller) => Err(self.expired()),
+            Err(error)
+                if matches!(self.operation, SemanticOperation::SetValue(_))
+                    && self.dispatched
+                    && !error.set_value_failed_after_writing() =>
+            {
+                let SemanticOperation::SetValue(target) = self.operation else {
+                    unreachable!("guarded by the set_value operation match")
+                };
+                Err(GlassError::AxWriteUnconfirmed(
+                    target,
+                    format!(
+                        "the native value mutation was dispatched but failed before it could be confirmed ({error})"
+                    ),
+                ))
+            }
             result => result,
         }
     }
@@ -198,7 +214,7 @@ mod tests {
     fn spent_mutations_have_not_dispatched() {
         let now = Instant::now();
         for guard in [
-            SemanticDeadline::set_value(Deadline::at(now)),
+            SemanticDeadline::set_value(Deadline::at(now), 7),
             SemanticDeadline::invoke(Deadline::at(now)),
         ] {
             let error = guard.require_at(now).unwrap_err();
@@ -208,18 +224,18 @@ mod tests {
     }
 
     #[test]
-    fn a_deadline_expiring_after_dispatch_keeps_dispatch_uncertain() {
+    fn a_deadline_expiring_after_dispatch_is_an_unconfirmed_value_write() {
         let now = Instant::now();
-        let error = SemanticDeadline::set_value(Deadline::at(now))
+        let error = SemanticDeadline::set_value(Deadline::at(now), 7)
             .after_dispatch()
             .require_at(now)
             .unwrap_err();
 
-        assert_eq!(error.bound_owner(), Some(Whose::Caller));
-        assert_eq!(
-            error.bound_dispatch(),
-            Some(BoundDispatch::MayHaveDispatched)
+        assert!(
+            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
+            "{error}"
         );
+        assert!(error.set_value_failed_after_writing(), "{error}");
     }
 
     #[test]
@@ -236,7 +252,7 @@ mod tests {
     fn confirmation_finishing_at_the_caller_deadline_cannot_return_true() {
         let now = Instant::now();
         let ends = now + Duration::from_millis(5);
-        let guard = SemanticDeadline::set_value(Deadline::at(ends)).after_dispatch();
+        let guard = SemanticDeadline::set_value(Deadline::at(ends), 7).after_dispatch();
         let verification = guard.phase(now + Duration::from_secs(1));
         let mut observations = [now, ends].into_iter();
 
@@ -248,10 +264,9 @@ mod tests {
             )
             .expect_err("confirmation observed at expiry must not report success");
 
-        assert_eq!(error.bound_owner(), Some(Whose::Caller));
-        assert_eq!(
-            error.bound_dispatch(),
-            Some(BoundDispatch::MayHaveDispatched)
+        assert!(
+            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
+            "{error}"
         );
     }
 

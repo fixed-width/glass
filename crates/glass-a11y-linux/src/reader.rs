@@ -11,7 +11,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
     A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, Deadline,
-    GlassError, Result, WalkBudget, Whose, normalize_description, normalize_name,
+    GlassError, Result, SetValueDispatch, WalkBudget, Whose, normalize_description, normalize_name,
     read_back_confirms, write_took_no_effect,
 };
 
@@ -47,7 +47,9 @@ impl Accessibility for LinuxA11y {
         let ctx = ctx.clone();
         let target = target.clone();
         let text = text.to_string();
-        set_value_with_thread(&BUS, ctx, move |ctx| run_set_value(&ctx, &target, &text))
+        set_value_with_thread(&BUS, ctx, target.id.0, move |ctx, dispatch| {
+            run_set_value(&ctx, &target, &text, dispatch)
+        })
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
@@ -62,9 +64,10 @@ impl Accessibility for LinuxA11y {
 fn set_value_with_thread(
     thread: &A11yThread,
     ctx: AxContext,
-    job: impl FnOnce(AxContext) -> Result<()> + Send + 'static,
+    target: u32,
+    job: impl FnOnce(AxContext, SetValueDispatch) -> Result<()> + Send + 'static,
 ) -> Result<()> {
-    thread.set_value(ctx.deadline, move || job(ctx))
+    thread.set_value(target, ctx.deadline, move |dispatch| job(ctx, dispatch))
 }
 
 fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
@@ -75,12 +78,17 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     rt.block_on(snapshot_async(ctx))
 }
 
-fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+fn run_set_value(
+    ctx: &AxContext,
+    target: &AxTarget,
+    text: &str,
+    dispatch: SetValueDispatch,
+) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
-    rt.block_on(set_value_async(ctx, target, text))
+    rt.block_on(set_value_async(ctx, target, text, &dispatch))
 }
 
 fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
@@ -196,7 +204,12 @@ const VERIFY_INTERVAL: Duration = Duration::from_millis(120);
 const ACKNOWLEDGED_NOT_APPLIED: &str = "this element's accessibility interface acknowledged the write without applying it — focus the \
      element and type into it instead";
 
-async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+async fn set_value_async(
+    ctx: &AxContext,
+    target: &AxTarget,
+    text: &str,
+    dispatch: &SetValueDispatch,
+) -> Result<()> {
     let (app_ref, conn) = find_app(ctx).await?;
     let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
     let mut budget = WalkBudget::with_limits(ctx.limits);
@@ -221,7 +234,7 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
         if matches!(role, CheckBox | ToggleButton | RadioButton)
             && let Some(on) = parse_bool(text)
         {
-            return set_toggle(&conn, &node, role, on, text, target.id.0).await;
+            return set_toggle(&conn, &node, role, on, text, target.id.0, dispatch).await;
         }
     }
 
@@ -242,7 +255,10 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
             // The baseline for the confirmation below: without one, only an exact read-back
             // confirms.
             let before = read_text(&node, &conn).await;
-            match et.set_text_contents(text).await {
+            match dispatch
+                .dispatch_async(async { et.set_text_contents(text).await.map_err(bus_err) })
+                .await
+            {
                 Ok(true) => {
                     return confirm_write(
                         &node,
@@ -257,7 +273,7 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
                 }
                 // EditableText is present but rejected the write — don't try Value.
                 Ok(false) => return Err(GlassError::AxElementNotEditable(target.id.0)),
-                Err(_) => {} // interface absent / call failed — fall through to Value
+                Err(error) => return Err(error),
             }
         }
     }
@@ -270,18 +286,19 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
             && let Ok(vp) = b.build().await
         {
             let before = read_number(&node, &conn).await;
-            if vp.set_current_value(v).await.is_ok() {
-                return confirm_write(
-                    &node,
-                    &conn,
-                    WrittenVia::Value,
-                    before,
-                    text,
-                    target.id.0,
-                    ctx.deadline,
-                )
-                .await;
-            }
+            dispatch
+                .dispatch_async(async { vp.set_current_value(v).await.map_err(bus_err) })
+                .await?;
+            return confirm_write(
+                &node,
+                &conn,
+                WrittenVia::Value,
+                before,
+                text,
+                target.id.0,
+                ctx.deadline,
+            )
+            .await;
         }
     }
     Err(GlassError::AxElementNotEditable(target.id.0))
@@ -572,6 +589,7 @@ async fn try_action(
     conn: &zbus::Connection,
     node: &AccessibleProxy<'_>,
     names: &[&str],
+    value_dispatch: Option<&SetValueDispatch>,
 ) -> ActionAttempt {
     let dest = node.inner().destination().to_owned();
     let path = node.inner().path().to_owned();
@@ -595,7 +613,15 @@ async fn try_action(
             Err(e) => return ActionAttempt::Error(format!("GetName({i}): {e}")),
         };
         if names.contains(&name.as_str()) {
-            return match a.do_action(i).await {
+            let result = match value_dispatch {
+                Some(dispatch) => {
+                    dispatch
+                        .dispatch_async(async { a.do_action(i).await.map_err(bus_err) })
+                        .await
+                }
+                None => a.do_action(i).await.map_err(bus_err),
+            };
+            return match result {
                 Ok(ok) => ActionAttempt::Fired { ok, action: name },
                 Err(e) => ActionAttempt::Error(format!("DoAction({i}): {e}")),
             };
@@ -628,6 +654,7 @@ async fn set_toggle(
     target_on: bool,
     requested: &str,
     id: u32,
+    dispatch: &SetValueDispatch,
 ) -> Result<()> {
     let flag = toggle_state_flag(role);
     if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
@@ -638,7 +665,7 @@ async fn set_toggle(
     // `AxValueNotApplied` on no change, so an ambiguous outcome is caught by that check
     // rather than needing its own classification.
     if !matches!(
-        try_action(conn, node, TOGGLE_ACTION_NAMES).await,
+        try_action(conn, node, TOGGLE_ACTION_NAMES, Some(dispatch)).await,
         ActionAttempt::Fired { ok: true, .. }
     ) {
         // No toggle action (e.g. a GTK4 GtkCheckButton exposes none) — can't set it
@@ -896,7 +923,7 @@ async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
     // button), which is why only the `toggle` rung consults it.
     let flag = toggle_state_flag(role);
     let was_on = node.get_state().await.map_err(bus_err)?.contains(flag);
-    match try_action(&conn, &node, ACTIVATE_ACTION_NAMES).await {
+    match try_action(&conn, &node, ACTIVATE_ACTION_NAMES, None).await {
         ActionAttempt::Fired { ok: true, action } if action == TOGGLE_ACTION => {
             verify_toggle_flipped(&node, flag, was_on, target.id.0).await
         }
@@ -1044,7 +1071,7 @@ mod tests {
         };
         let thread = A11yThread::new("test a11y bus", Duration::from_secs(1));
 
-        let error = set_value_with_thread(&thread, ctx, |_| {
+        let error = set_value_with_thread(&thread, ctx, 7, |_, _| {
             std::thread::sleep(Duration::from_millis(500));
             Ok(())
         })
@@ -1058,6 +1085,33 @@ mod tests {
         );
         assert!(!error.invoke_fallback_eligible());
         assert!(!error.set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn linux_set_value_timeout_after_native_dispatch_is_unconfirmed() {
+        let ctx = AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(20),
+        };
+        let thread = A11yThread::new("test a11y bus", Duration::from_secs(1));
+
+        let error = set_value_with_thread(&thread, ctx, 7, |_, dispatch| {
+            dispatch.dispatch(|| {
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(())
+            })
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
+            "{error}"
+        );
+        assert!(error.set_value_failed_after_writing(), "{error}");
     }
 
     #[test]

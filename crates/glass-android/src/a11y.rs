@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree};
-use glass_core::{Deadline, Whose};
+use glass_core::{BoundDispatch, Deadline, Whose};
 use glass_core::{
     GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, WindowGeometry,
     read_back_failed, verify_typed_write,
@@ -555,18 +555,61 @@ impl Accessibility for AndroidA11y {
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
-        fn require_time(deadline: Deadline, dispatched: bool) -> Result<()> {
+        fn write_unconfirmed(target: u32, error: GlassError) -> GlassError {
+            if error.set_value_failed_after_writing() {
+                error
+            } else {
+                GlassError::AxWriteUnconfirmed(
+                    target,
+                    format!(
+                        "the Android input value mutation may have run but failed before it could be confirmed ({error})"
+                    ),
+                )
+            }
+        }
+
+        fn require_time(
+            deadline: Deadline,
+            target: u32,
+            external_dispatched: bool,
+            value_dispatched: bool,
+        ) -> Result<()> {
             if !deadline.has_passed() {
                 return Ok(());
             }
-            Err(if dispatched {
+            Err(if value_dispatched {
+                write_unconfirmed(
+                    target,
+                    GlassError::caller_deadline_elapsed("Android accessibility set_value"),
+                )
+            } else if external_dispatched {
                 GlassError::caller_deadline_elapsed("Android accessibility set_value")
             } else {
                 GlassError::deadline_not_started("Android accessibility set_value")
             })
         }
 
-        require_time(ctx.deadline, false)?;
+        fn command_error(
+            target: u32,
+            external_dispatched: bool,
+            value_dispatched: bool,
+            mutates_value: bool,
+            error: GlassError,
+        ) -> GlassError {
+            if value_dispatched
+                || (mutates_value && error.bound_dispatch() != Some(BoundDispatch::NotDispatched))
+            {
+                write_unconfirmed(target, error)
+            } else if external_dispatched
+                && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
+            {
+                error.after_dispatch()
+            } else {
+                error
+            }
+        }
+
+        require_time(ctx.deadline, target.id.0, false, false)?;
         let window = ctx.window.clone();
         let adb = self.ensure_adb_within(ctx.deadline)?;
         // Re-snapshot and number nodes to locate the target by its pre-order id.
@@ -577,7 +620,7 @@ impl Accessibility for AndroidA11y {
                 e
             }
         })?;
-        require_time(ctx.deadline, false)?;
+        require_time(ctx.deadline, target.id.0, false, false)?;
         self.warmed = true;
         // Tap to focus, select-all, delete, type — reusing the P2 input builders.
         let tap = PointerEvent::Click {
@@ -587,35 +630,48 @@ impl Accessibility for AndroidA11y {
             count: 1,
             modifiers: vec![],
         };
-        let mut dispatched = false;
+        let mut external_dispatched = false;
+        let mut value_dispatched = false;
         for argv in pointer_commands(&window, &tap) {
-            require_time(ctx.deadline, dispatched)?;
+            require_time(
+                ctx.deadline,
+                target.id.0,
+                external_dispatched,
+                value_dispatched,
+            )?;
             adb.run_until(argv.iter().map(String::as_str), ctx.deadline)
                 .map_err(|e| {
-                    if ctx.deadline.has_passed() && dispatched {
-                        GlassError::caller_deadline_elapsed("Android accessibility set_value")
-                    } else {
-                        e
-                    }
+                    command_error(target.id.0, external_dispatched, value_dispatched, false, e)
                 })?;
-            dispatched = true;
+            external_dispatched = true;
         }
-        for ev in [
-            KeyEvent::Chord("ctrl+a".into()),
-            KeyEvent::Chord("BackSpace".into()),
-            KeyEvent::Text(text.to_string()),
+        for (ev, mutates_value) in [
+            (KeyEvent::Chord("ctrl+a".into()), false),
+            (KeyEvent::Chord("BackSpace".into()), true),
+            (KeyEvent::Text(text.to_string()), true),
         ] {
-            for argv in key_commands(&ev)? {
-                require_time(ctx.deadline, dispatched)?;
+            let commands = key_commands(&ev).map_err(|e| {
+                command_error(target.id.0, external_dispatched, value_dispatched, false, e)
+            })?;
+            for argv in commands {
+                require_time(
+                    ctx.deadline,
+                    target.id.0,
+                    external_dispatched,
+                    value_dispatched,
+                )?;
                 adb.run_until(argv.iter().map(String::as_str), ctx.deadline)
                     .map_err(|e| {
-                        if ctx.deadline.has_passed() && dispatched {
-                            GlassError::caller_deadline_elapsed("Android accessibility set_value")
-                        } else {
-                            e
-                        }
+                        command_error(
+                            target.id.0,
+                            external_dispatched,
+                            value_dispatched,
+                            mutates_value,
+                            e,
+                        )
                     })?;
-                dispatched = true;
+                external_dispatched = true;
+                value_dispatched |= mutates_value;
             }
         }
 
@@ -631,33 +687,38 @@ impl Accessibility for AndroidA11y {
             .resolve(Instant::now() + Duration::from_millis(VERIFY_PHASE_BUDGET_MS));
         let mut last = None;
         for _ in 0..VERIFY_ATTEMPTS {
-            require_time(ctx.deadline, dispatched)?;
+            require_time(
+                ctx.deadline,
+                target.id.0,
+                external_dispatched,
+                value_dispatched,
+            )?;
             let requested = Duration::from_millis(VERIFY_SETTLE_MS)
                 .min(phase_ends.saturating_duration_since(Instant::now()));
             std::thread::sleep(ctx.deadline.remaining().unwrap_or(requested).min(requested));
-            require_time(ctx.deadline, dispatched)?;
-            let mut after = self.snapshot_within(ctx, VERIFY_BOUND).map_err(|e| {
-                if ctx.deadline.has_passed() || e.bound_owner() == Some(Whose::Caller) {
-                    GlassError::caller_deadline_elapsed(
-                        "Android accessibility set_value verification",
-                    )
-                } else {
-                    read_back_failed(target, &e)
-                }
-            })?;
+            require_time(
+                ctx.deadline,
+                target.id.0,
+                external_dispatched,
+                value_dispatched,
+            )?;
+            let mut after = self
+                .snapshot_within(ctx, VERIFY_BOUND)
+                .map_err(|e| read_back_failed(target, &e))?;
             after.assign_ids();
             match verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED) {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later read: drift and truncation are
                 // structural, and re-dumping for them costs seconds to reach the same answer.
                 Err(e @ GlassError::AxValueNotApplied { .. }) => last = Some(e),
-                Err(e) => return Err(e),
+                Err(e) => return Err(read_back_failed(target, &e)),
             }
             if Instant::now() >= phase_ends {
                 if phase_owner == Whose::Caller {
-                    return Err(GlassError::caller_deadline_elapsed(
+                    let error = GlassError::caller_deadline_elapsed(
                         "Android accessibility set_value verification",
-                    ));
+                    );
+                    return Err(read_back_failed(target, &error));
                 }
                 break;
             }
@@ -2152,6 +2213,57 @@ mod tests {
             "the field must be cleared first: {:?}",
             fake.calls()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_timeout_during_uiautomator_text_input_is_an_unconfirmed_write() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let before = Answer::says(one_field_holding("hello"));
+        let fake = FakeAdb::new(&[
+            ("*input text*", Answer::Lingers),
+            ("*shell cat*", before),
+            ("*", Answer::Silent),
+        ]);
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+        let ctx = AxContext {
+            pids: vec![],
+            window: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 2400,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(300),
+        };
+        let field = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: Some(AxRect {
+                x: 100,
+                y: 200,
+                width: 400,
+                height: 100,
+            }),
+            value: None,
+        };
+
+        let error = reader
+            .set_value(&ctx, &field, "world")
+            .expect_err("the text input process outlives the caller deadline");
+
+        assert!(
+            matches!(error, GlassError::AxWriteUnconfirmed(1, _)),
+            "{error}"
+        );
+        assert!(error.set_value_failed_after_writing(), "{error}");
     }
 
     #[test]

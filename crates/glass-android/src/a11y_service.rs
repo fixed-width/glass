@@ -264,7 +264,7 @@ impl ServiceClient {
         if conn.ensure_usable().is_err() {
             *conn = Conn::open_by(self.port, deadline).map_err(CallFailure::NotSent)?;
             if let Some(pkg) = rearm {
-                rearm_tree(&mut conn, pkg, deadline).map_err(CallFailure::NotSent)?;
+                rearm_or_retire(&mut conn, pkg, deadline).map_err(CallFailure::NotSent)?;
             }
         }
         let first = conn
@@ -282,7 +282,7 @@ impl ServiceClient {
                 if let Some(pkg) = rearm {
                     // `f`'s classification, not the re-arm's own: recovering from `f` says no
                     // more about whether `req` was delivered, whichever step trips.
-                    rearm_tree(&mut conn, pkg, deadline).map_err(|e| f.with_error(e))?;
+                    rearm_or_retire(&mut conn, pkg, deadline).map_err(|e| f.with_error(e))?;
                 }
                 conn.call_within(req, deadline, "Android accessibility service retry")
                     .map_err(|e| f.with_error(e))?
@@ -404,6 +404,16 @@ impl ServiceClient {
         )
         .map(|_| ())
     }
+}
+
+/// Rearm a freshly opened service connection, retiring it if the tree cannot be proven to belong
+/// to the app whose refs the pending request addresses.
+fn rearm_or_retire(conn: &mut Conn, pkg: &str, deadline: Deadline) -> Result<()> {
+    let result = rearm_tree(conn, pkg, deadline);
+    if result.is_err() {
+        conn.poison();
+    }
+    result
 }
 
 /// Re-serve `tree` for `pkg` on a freshly reconnected connection, and confirm the reply still
@@ -788,14 +798,11 @@ impl Accessibility for ServiceA11y {
                 ctx.deadline,
                 "Android accessibility set_value verification",
                 true,
-            )?;
-            let after = self.snapshot_with_refs(ctx).map_err(|e| {
-                if e.bound_owner() == Some(glass_core::Whose::Caller) {
-                    e
-                } else {
-                    read_back_failed(target, &e)
-                }
-            })?;
+            )
+            .map_err(|e| read_back_failed(target, &e))?;
+            let after = self
+                .snapshot_with_refs(ctx)
+                .map_err(|e| read_back_failed(target, &e))?;
             let after_package = after.acting_on(&self.package);
             if after_package != acting_package {
                 return Err(GlassError::AxWriteUnconfirmed(
@@ -820,9 +827,10 @@ impl Accessibility for ServiceA11y {
             }
             if std::time::Instant::now() >= phase_ends {
                 if phase_owner == glass_core::Whose::Caller {
-                    return Err(GlassError::caller_deadline_elapsed(
+                    let error = GlassError::caller_deadline_elapsed(
                         "Android accessibility set_value verification",
-                    ));
+                    );
+                    return Err(read_back_failed(target, &error));
                 }
                 let WriteReading::Pending(observed) = reading else {
                     return Err(GlassError::AxWriteUnconfirmed(
@@ -852,7 +860,8 @@ impl Accessibility for ServiceA11y {
                     .min(phase_ends.saturating_duration_since(std::time::Instant::now())),
                 "Android accessibility set_value verification",
                 true,
-            )?;
+            )
+            .map_err(|e| read_back_failed(target, &e))?;
         }
     }
 
@@ -1445,29 +1454,12 @@ fn disabled_error(target: u32, disabled: AxNodeId) -> GlassError {
     )
 }
 
-/// Map a `set_text` failure onto the `set_value` contract. Only `NotSent` proves nothing was
-/// written — the other two may already have set the field, so they answer in a verdict
-/// `set_value_failed_after_writing` accepts (glass#405).
+/// Map a `set_text` failure onto the `set_value` contract. Only `NotSent` proves this mutation did
+/// not reach the device. The other two are operation-specific evidence that it may have run, even
+/// when the underlying transport error is caller-owned.
 fn write_error(target: u32, f: CallFailure) -> GlassError {
-    let pending_dispatch = match &f {
-        CallFailure::NotSent(_) => glass_core::BoundDispatch::NotDispatched,
-        CallFailure::AnswerLost(_) | CallFailure::Refused(_) => {
-            glass_core::BoundDispatch::MayHaveDispatched
-        }
-    };
-    let caller_owned = match &f {
-        CallFailure::NotSent(e) | CallFailure::AnswerLost(e) | CallFailure::Refused(e) => {
-            e.bound_owner() == Some(glass_core::Whose::Caller)
-        }
-    };
-    if caller_owned {
-        let mut error = f.into_error();
-        if let GlassError::Bounded { dispatch, .. } = &mut error {
-            *dispatch = pending_dispatch;
-        }
-        return error;
-    }
     match f {
+        CallFailure::NotSent(e) if e.bound_owner() == Some(glass_core::Whose::Caller) => e,
         CallFailure::NotSent(e) => GlassError::AccessibilityUnavailable(format!(
             "the write to element {target} could not be sent: {e}"
         )),
@@ -3104,6 +3096,8 @@ mod tests {
     enum OnTree {
         Serve,
         Delayed(std::time::Duration),
+        /// Read the tree request, then drop the connection without answering it.
+        DropWithoutAnswering,
         Refused(&'static str),
         /// Refused "no active window" until the flag is set, then served: a binding that starts
         /// serving only once something off the request path makes the platform rebuild it.
@@ -3267,12 +3261,17 @@ mod tests {
                         "tree" => {
                             let this_tree = on_tree[requested.min(on_tree.len() - 1)];
                             requested += 1;
+                            if matches!(this_tree, OnTree::DropWithoutAnswering) {
+                                log.lock().unwrap().push(format!("conn{conn}:tree-dropped"));
+                                break;
+                            }
                             let refusal = match this_tree {
                                 OnTree::Refused(msg) => Some(msg),
                                 OnTree::Delayed(delay) => {
                                     std::thread::sleep(delay);
                                     None
                                 }
+                                OnTree::DropWithoutAnswering => unreachable!("handled above"),
                                 OnTree::RefusedUntil(gate)
                                     if !gate.load(std::sync::atomic::Ordering::Relaxed) =>
                                 {
@@ -3361,7 +3360,10 @@ mod tests {
         ops.lock().unwrap().clone()
     }
 
-    fn assert_semantic_caller_timeout(error: &GlassError, dispatch: glass_core::BoundDispatch) {
+    fn assert_generic_semantic_caller_timeout(
+        error: &GlassError,
+        dispatch: glass_core::BoundDispatch,
+    ) {
         assert_eq!(
             error.bound_owner(),
             Some(glass_core::Whose::Caller),
@@ -3369,11 +3371,15 @@ mod tests {
         );
         assert_eq!(error.bound_dispatch(), Some(dispatch), "{error}");
         assert!(!error.invoke_fallback_eligible(), "{error}");
-        assert_eq!(
-            error.set_value_failed_after_writing(),
-            dispatch == glass_core::BoundDispatch::MayHaveDispatched,
+        assert!(!error.set_value_failed_after_writing(), "{error}");
+    }
+
+    fn assert_unconfirmed_value_write(error: &GlassError, target: AxNodeId) {
+        assert!(
+            matches!(error, GlassError::AxWriteUnconfirmed(id, _) if *id == target.0),
             "{error}"
         );
+        assert!(error.set_value_failed_after_writing(), "{error}");
     }
 
     #[test]
@@ -3447,6 +3453,45 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_rearm_retires_the_replacement_before_the_next_request() {
+        let tree = editable_field("old");
+        let (port, ops) = fake_service_ex(
+            vec![tree],
+            vec![OnAction::DropWithoutAnswering, OnAction::Ok, OnAction::Ok],
+            vec![
+                TreePackage::Echo,
+                TreePackage::Other("com.other.app".into()),
+                TreePackage::Echo,
+            ],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        client.tree("com.example.app").expect("arm conn1");
+
+        client
+            .click(1, "com.example.app", Deadline::from_millis(1_000))
+            .expect_err("conn1 loses the first click answer");
+        client
+            .click(2, "com.example.app", Deadline::from_millis(1_000))
+            .expect_err("conn2 rearms against a different app");
+        client
+            .click(3, "com.example.app", Deadline::from_millis(1_000))
+            .map_err(CallFailure::into_error)
+            .expect("the next request opens conn3, rearms it, then dispatches");
+
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:click ref=1".to_string(),
+                "conn2:tree".to_string(),
+                "conn3:tree".to_string(),
+                "conn3:click ref=3".to_string(),
+            ],
+            "the failed rearm left conn2 reusable for an unarmed mutation"
+        );
+    }
+
+    #[test]
     fn semantic_caller_deadline_stops_before_service_set_text_request() {
         let tree = editable_field("old");
         let (port, ops) = fake_service(vec![tree.clone()], OnAction::Ok);
@@ -3461,11 +3506,39 @@ mod tests {
             .set_value(&context, &target, "new")
             .expect_err("the caller deadline stops before ACTION_SET_TEXT");
 
-        assert_semantic_caller_timeout(&error, glass_core::BoundDispatch::NotDispatched);
+        assert_generic_semantic_caller_timeout(&error, glass_core::BoundDispatch::NotDispatched);
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string()],
             "set_text started after the caller deadline"
+        );
+    }
+
+    #[test]
+    fn pre_write_tree_answer_lost_does_not_claim_value_mutation_dispatch() {
+        let tree = editable_field("old");
+        let (port, _ops) = fake_service_full(
+            vec![tree.clone()],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+            vec![
+                OnTree::DropWithoutAnswering,
+                OnTree::Delayed(std::time::Duration::from_millis(300)),
+            ],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a11y = ServiceA11y::new(client, "com.example.app".to_string());
+        let target = target_for(&built(&tree), AxNodeId(1));
+        let mut context = ctx();
+        context.deadline = Deadline::from_millis(100);
+
+        let error = a11y
+            .set_value(&context, &target, "new")
+            .expect_err("the guard tree answer arrives after the caller deadline");
+
+        assert_generic_semantic_caller_timeout(
+            &error,
+            glass_core::BoundDispatch::MayHaveDispatched,
         );
     }
 
@@ -3485,7 +3558,7 @@ mod tests {
             .set_value(&context, &target, "new")
             .expect_err("verification cannot sleep past the caller deadline");
 
-        assert_semantic_caller_timeout(&error, glass_core::BoundDispatch::MayHaveDispatched);
+        assert_unconfirmed_value_write(&error, target.id);
         assert!(
             started.elapsed() < std::time::Duration::from_millis(350),
             "verification slept for {:?}",
@@ -3517,7 +3590,7 @@ mod tests {
             .set_value(&context, &target, "new")
             .expect_err("the caller deadline stops before verification reads");
 
-        assert_semantic_caller_timeout(&error, glass_core::BoundDispatch::MayHaveDispatched);
+        assert_unconfirmed_value_write(&error, target.id);
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string(), "conn1:set_text ref=1".to_string(),],
@@ -3540,7 +3613,10 @@ mod tests {
             .invoke(&context, &target)
             .expect_err("checked-state polling cannot outlast the caller deadline");
 
-        assert_semantic_caller_timeout(&error, glass_core::BoundDispatch::MayHaveDispatched);
+        assert_generic_semantic_caller_timeout(
+            &error,
+            glass_core::BoundDispatch::MayHaveDispatched,
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_millis(350),
             "checked-state polling slept for {:?}",
@@ -3579,7 +3655,7 @@ mod tests {
             .set_value(&context, &target, "new")
             .expect_err("the reconnect rearm outlasted the caller");
 
-        assert_semantic_caller_timeout(&error, glass_core::BoundDispatch::MayHaveDispatched);
+        assert_unconfirmed_value_write(&error, target.id);
     }
 
     #[test]
@@ -3599,7 +3675,7 @@ mod tests {
             .set_value(&context, &target, "new")
             .expect_err("the first mutation lost its answer as the deadline expired");
 
-        assert_semantic_caller_timeout(&error, glass_core::BoundDispatch::MayHaveDispatched);
+        assert_unconfirmed_value_write(&error, target.id);
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string(), "conn1:set_text ref=1".to_string(),],

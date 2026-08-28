@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal,
-    GlassError, Result, WalkBudget, normalize_description, normalize_name, read_back_confirms,
-    write_took_no_effect,
+    GlassError, Result, SetValueDispatch, WalkBudget, normalize_description, normalize_name,
+    read_back_confirms, write_took_no_effect,
 };
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
@@ -64,7 +64,9 @@ impl Accessibility for WindowsA11y {
         let ctx = ctx.clone();
         let target = target.clone();
         let text = text.to_string();
-        set_value_with_thread(&UIA, ctx, move |ctx| run_set_value(&ctx, &target, &text))
+        set_value_with_thread(&UIA, ctx, target.id.0, move |ctx, dispatch| {
+            run_set_value(&ctx, &target, &text, dispatch)
+        })
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
@@ -79,9 +81,10 @@ impl Accessibility for WindowsA11y {
 fn set_value_with_thread(
     thread: &A11yThread,
     ctx: AxContext,
-    job: impl FnOnce(AxContext) -> Result<()> + Send + 'static,
+    target: u32,
+    job: impl FnOnce(AxContext, SetValueDispatch) -> Result<()> + Send + 'static,
 ) -> Result<()> {
-    thread.set_value(ctx.deadline, move || job(ctx))
+    thread.set_value(target, ctx.deadline, move |dispatch| job(ctx, dispatch))
 }
 
 fn uia_err(e: impl std::fmt::Display) -> GlassError {
@@ -366,7 +369,12 @@ fn framework_id(el: &UIElement, ct_id: u32) -> Option<String> {
     nonempty(el.get_framework_id().unwrap_or_default())
 }
 
-fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+fn run_set_value(
+    ctx: &AxContext,
+    target: &AxTarget,
+    text: &str,
+    dispatch: SetValueDispatch,
+) -> Result<()> {
     let automation = UIAutomation::new().map_err(|e| {
         GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))
     })?;
@@ -404,8 +412,7 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     // baseline is unknown — the confirmation below then requires an exact match rather than
     // trusting a "differs from before" signal it cannot compute.
     let before = pat.get_value().ok();
-    pat.set_value(text)
-        .map_err(|_| GlassError::AxElementNotEditable(target.id.0))?;
+    dispatch.dispatch(|| pat.set_value(text).map_err(uia_err))?;
     // Verify the write took, error-aware. egui/accesskit read-only editables accept SetValue
     // without error but never apply it (false success). Poll the value back — a real numeric set
     // lands a frame later. `.ok()` maps a failed read to `None`, which never confirms, so neither
@@ -600,7 +607,7 @@ mod tests {
         };
         let thread = A11yThread::new("test UIA", Duration::from_secs(1));
 
-        let error = set_value_with_thread(&thread, ctx, |_| {
+        let error = set_value_with_thread(&thread, ctx, 7, |_, _| {
             std::thread::sleep(Duration::from_millis(500));
             Ok(())
         })
@@ -614,6 +621,33 @@ mod tests {
         );
         assert!(!error.invoke_fallback_eligible());
         assert!(!error.set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn windows_set_value_timeout_after_native_dispatch_is_unconfirmed() {
+        let ctx = AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline: glass_core::Deadline::from_millis(20),
+        };
+        let thread = A11yThread::new("test UIA", Duration::from_secs(1));
+
+        let error = set_value_with_thread(&thread, ctx, 7, |_, dispatch| {
+            dispatch.dispatch(|| {
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(())
+            })
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
+            "{error}"
+        );
+        assert!(error.set_value_failed_after_writing(), "{error}");
     }
 
     /// The failure mode this guards: if an absent child ever stopped arriving as a zero code,

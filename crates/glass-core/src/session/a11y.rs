@@ -3215,6 +3215,12 @@ mod tests {
                 dispatch: crate::BoundDispatch::NotDispatched,
                 message: "the write was refused before dispatch".into(),
             },
+            GlassError::Bounded {
+                kind: crate::BoundKind::TimedOut,
+                whose: crate::Whose::Caller,
+                dispatch: crate::BoundDispatch::MayHaveDispatched,
+                message: "the guard snapshot may have gone out".into(),
+            },
         ] {
             let set_log = Arc::new(Mutex::new(Vec::new()));
             let mut g = glass_ready_for_set_value(Box::new(FirstFailureThenGuarded {
@@ -3248,16 +3254,10 @@ mod tests {
     fn a_post_dispatch_failure_lets_the_retry_through_once_the_field_settles() {
         // The sequence glass#405 is about, end to end: a write that dispatched and could not be
         // confirmed, a field that then settles to the text it sent, and a retry the guard must
-        // accept. Both verdicts and a bounded call that may have dispatched must clear the cache.
+        // accept. Only the operation-specific post-write verdicts may clear the cache.
         for failure in [
             GlassError::AxWriteUnconfirmed(0, "the result was lost".into()),
             GlassError::value_not_applied(0, "x", Some("Alice")),
-            GlassError::Bounded {
-                kind: crate::BoundKind::TimedOut,
-                whose: crate::Whose::Caller,
-                dispatch: crate::BoundDispatch::MayHaveDispatched,
-                message: "the write may have landed".into(),
-            },
         ] {
             let set_log = Arc::new(Mutex::new(Vec::new()));
             let mut g = glass_ready_for_set_value(Box::new(FirstFailureThenGuarded {

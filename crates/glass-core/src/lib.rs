@@ -19,7 +19,7 @@ pub use bounded::{
 };
 
 pub mod a11y_thread;
-pub use a11y_thread::A11yThread;
+pub use a11y_thread::{A11yThread, SetValueDispatch};
 
 pub mod set_value;
 pub use set_value::{

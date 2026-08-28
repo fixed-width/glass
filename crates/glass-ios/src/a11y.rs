@@ -210,15 +210,24 @@ fn dispatch_write(
     send(injector.pointer_events(tap)?)?;
     require_set_value_time(deadline, true)?;
     send(keys).map_err(|e| {
-        if e.bound_owner() == Some(Whose::Caller) {
-            return e;
+        if e.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched) {
+            return e.after_dispatch();
         }
         GlassError::AxWriteUnconfirmed(
             target_id,
             format!("sending the keystrokes failed part-way through ({e}), so the field may have been cleared without receiving the text"),
         )
     })?;
-    require_set_value_time(deadline, true)
+    if deadline.has_passed() {
+        let error = GlassError::caller_deadline_elapsed("iOS accessibility set_value");
+        return Err(GlassError::AxWriteUnconfirmed(
+            target_id,
+            format!(
+                "the keystroke batch was sent but the caller deadline elapsed before its result was confirmed ({error})"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn require_set_value_time(deadline: Deadline, dispatched: bool) -> Result<()> {
@@ -230,6 +239,14 @@ fn require_set_value_time(deadline: Deadline, dispatched: bool) -> Result<()> {
     } else {
         GlassError::deadline_not_started("iOS accessibility set_value")
     })
+}
+
+fn post_write_error(target: &AxTarget, error: GlassError) -> GlassError {
+    if error.set_value_failed_after_writing() {
+        error
+    } else {
+        read_back_failed(target, &error)
+    }
 }
 
 impl Accessibility for IosA11y {
@@ -276,20 +293,23 @@ impl Accessibility for IosA11y {
         let after_dispatch = SemanticPhase::SetValue { dispatched: true };
         let mut last = None;
         for _ in 0..VERIFY_ATTEMPTS {
-            after_dispatch.require(ctx.deadline)?;
+            after_dispatch
+                .require(ctx.deadline)
+                .map_err(|e| post_write_error(target, e))?;
             let sleep = bounded_sleep_at(ctx.deadline, VERIFY_SETTLE, std::time::Instant::now());
             std::thread::sleep(sleep);
-            after_dispatch.require(ctx.deadline)?;
-            let (after, _) = self.describe(ctx, after_dispatch).map_err(|error| {
-                if error.bound_owner() == Some(Whose::Caller) {
-                    error
-                } else {
-                    read_back_failed(target, &error)
-                }
-            })?;
-            match after_dispatch.run(ctx.deadline, || {
-                verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED)
-            }) {
+            after_dispatch
+                .require(ctx.deadline)
+                .map_err(|e| post_write_error(target, e))?;
+            let (after, _) = self
+                .describe(ctx, after_dispatch)
+                .map_err(|e| post_write_error(target, e))?;
+            match after_dispatch
+                .run(ctx.deadline, || {
+                    verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED)
+                })
+                .map_err(|e| post_write_error(target, e))
+            {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later describe: drift and truncation
                 // are structural, so re-describing for them reaches the same answer more slowly.
@@ -299,7 +319,9 @@ impl Accessibility for IosA11y {
         }
         // The const assert on `VERIFY_ATTEMPTS` is what makes `last` always set; the fallback only
         // avoids an unwrap.
-        after_dispatch.require(ctx.deadline)?;
+        after_dispatch
+            .require(ctx.deadline)
+            .map_err(|e| post_write_error(target, e))?;
         Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
     }
 
@@ -607,10 +629,42 @@ mod tests {
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::MayHaveDispatched)
         );
+        assert!(
+            !error.set_value_failed_after_writing(),
+            "the focus tap did not mutate the value: {error}"
+        );
     }
 
     #[test]
-    fn caller_timeout_from_the_keystroke_stream_keeps_its_dispatch_ownership() {
+    fn a_spent_second_hid_keeps_its_bound_but_records_the_focus_dispatch() {
+        let injector = IdbInjector::new(1.0);
+        let mut sends = 0;
+        let mut send = |_events| {
+            sends += 1;
+            if sends == 1 {
+                Ok(())
+            } else {
+                Err(GlassError::deadline_not_started("idb hid"))
+            }
+        };
+
+        let error = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi", Deadline::UNBOUNDED)
+            .expect_err("the second HID was refused after the focus tap landed");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            !error.set_value_failed_after_writing(),
+            "only the focus tap went out, not the value mutation: {error}"
+        );
+    }
+
+    #[test]
+    fn caller_timeout_from_the_keystroke_stream_is_an_unconfirmed_write() {
         let injector = IdbInjector::new(1.0);
         let mut sends = 0;
         let mut send = |_events| {
@@ -623,13 +677,13 @@ mod tests {
         };
 
         let error = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi", Deadline::UNBOUNDED)
-            .expect_err("the caller-owned HID timeout must propagate without AxWriteUnconfirmed");
+            .expect_err("the caller-owned HID timeout may have interrupted the value mutation");
 
-        assert_eq!(error.bound_owner(), Some(Whose::Caller));
-        assert_eq!(
-            error.bound_dispatch(),
-            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        assert!(
+            matches!(error, GlassError::AxWriteUnconfirmed(1, _)),
+            "{error}"
         );
+        assert!(error.set_value_failed_after_writing(), "{error}");
     }
 
     #[test]
