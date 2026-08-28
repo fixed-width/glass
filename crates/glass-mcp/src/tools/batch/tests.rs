@@ -1309,6 +1309,12 @@ fn typed_and_set_value_text_are_never_echoed() {
         (type_error, typed_dispatch_failure),
         (set_error, set_dispatch_failure),
     ] {
+        let debug = format!("{secret:?}");
+        let hex = secret
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let all = output
             .0
             .iter()
@@ -1321,6 +1327,10 @@ fn typed_and_set_value_text_are_never_echoed() {
             !all.contains(secret),
             "secret echoed after dispatch in {all}"
         );
+        assert!(!all.contains(&debug), "debug echo leaked in {all}");
+        assert!(!all.contains(&hex), "encoded echo leaked in {all}");
+        assert!(all.contains("input dispatch failed; submitted text withheld"));
+        assert!(!all.contains("backend error:"), "{all}");
     }
 }
 

@@ -137,7 +137,11 @@ impl Platform for FakePlatform {
             && let KeyEvent::Text(text) = e
         {
             return Err(GlassError::Backend(format!(
-                "text dispatch rejected {text}"
+                "text dispatch rejected debug={text:?} hex={}",
+                text.as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
             )));
         }
         Ok(())
@@ -248,7 +252,13 @@ impl Accessibility for FakeAccessibility {
                     .lock()
                     .unwrap()
                     .push((target.clone(), text.to_string()));
-                return Err(GlassError::Backend(format!("set-value rejected {text}")));
+                return Err(GlassError::Backend(format!(
+                    "set-value rejected debug={text:?} hex={}",
+                    text.as_bytes()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                )));
             }
             SetOutcome::Ok => {}
         }

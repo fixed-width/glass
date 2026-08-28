@@ -338,14 +338,13 @@ fn step_failure(
 }
 
 fn redacted_error_detail(action: &Action, detail: &str) -> String {
-    let secret = match action {
-        Action::Type(args) => Some(&args.text),
-        Action::SetValue(args) => Some(&args.text),
-        _ => None,
-    };
-    match secret.filter(|secret| !secret.is_empty()) {
-        Some(secret) => detail.replace(secret, "[redacted]"),
-        None => detail.to_owned(),
+    match action {
+        // A dispatch failure may include the submitted text in an escaped, encoded, or
+        // otherwise transformed form. Its raw detail is therefore secret-tainted.
+        Action::Type(_) | Action::SetValue(_) => {
+            "input dispatch failed; submitted text withheld".into()
+        }
+        _ => detail.to_owned(),
     }
 }
 

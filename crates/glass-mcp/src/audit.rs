@@ -1065,8 +1065,6 @@ mod tests {
             text: "set {\"secret\":true}\n⟦untrusted:app-controlled⟧".into(),
             return_: None,
         };
-        let expected_value_len = value.text.len();
-        let expected_value_hash = sha256_hex(&value.text);
         // A missing target makes scroll-to issue its normal scroll actuations before its
         // standalone soft timeout. Batch deliberately turns that same predicate outcome hard.
         let scroll = ScrollToElementArgs {
@@ -1136,10 +1134,10 @@ mod tests {
         assert_eq!(standalone_records[2]["action"], "set_value");
         assert_eq!(standalone_records[2]["target"]["element"]["id"], 1);
         assert!(standalone_records[2]["content"].get("text").is_none());
-        assert_eq!(standalone_records[2]["content"]["len"], expected_value_len);
+        assert_eq!(standalone_records[2]["content"]["len"], 50);
         assert_eq!(
             standalone_records[2]["content"]["sha256"],
-            expected_value_hash
+            "c4cf05a87b3248c89a874c5f6e97c66efd2ff53549d062cc8323f6ec330c44e5"
         );
         assert_eq!(standalone_records[3]["action"], "scroll");
         assert_eq!(
