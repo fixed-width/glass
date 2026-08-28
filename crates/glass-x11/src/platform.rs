@@ -2810,20 +2810,62 @@ mod display_tests {
         cmd.spawn().expect("the stand-in app should spawn")
     }
 
-    struct PausedXServer(u32);
+    const X_SERVER_RESCUE_AFTER: Duration = Duration::from_secs(2);
+
+    struct PausedXServer {
+        pid: u32,
+        resumed: bool,
+        rescue_cancel: Option<std::sync::mpsc::Sender<()>>,
+        rescue: Option<std::thread::JoinHandle<bool>>,
+    }
 
     impl PausedXServer {
         fn new(pid: u32) -> Self {
+            let (rescue_cancel, cancelled) = std::sync::mpsc::channel();
+            let rescue = std::thread::spawn(move || {
+                if cancelled.recv_timeout(X_SERVER_RESCUE_AFTER).is_ok() {
+                    return false;
+                }
+                let _ = std::process::Command::new("kill")
+                    .args(["-CONT", &pid.to_string()])
+                    .status();
+                true
+            });
+            let paused = Self {
+                pid,
+                resumed: false,
+                rescue_cancel: Some(rescue_cancel),
+                rescue: Some(rescue),
+            };
             signal_process(pid, "-STOP");
-            Self(pid)
+            paused
+        }
+
+        fn resume(mut self) -> bool {
+            signal_process(self.pid, "-CONT");
+            self.resumed = true;
+            self.join_rescue()
+        }
+
+        fn join_rescue(&mut self) -> bool {
+            if let Some(cancel) = self.rescue_cancel.take() {
+                let _ = cancel.send(());
+            }
+            self.rescue
+                .take()
+                .is_none_or(|rescue| rescue.join().unwrap_or(true))
         }
     }
 
     impl Drop for PausedXServer {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("kill")
-                .args(["-CONT", &self.0.to_string()])
-                .status();
+            if !self.resumed {
+                let _ = std::process::Command::new("kill")
+                    .args(["-CONT", &self.pid.to_string()])
+                    .status();
+                self.resumed = true;
+            }
+            let _ = self.join_rescue();
         }
     }
 
@@ -3275,6 +3317,42 @@ mod display_tests {
 
     #[test]
     #[ignore = "starts a real X server; needs Xvfb"]
+    fn successful_armed_list_watch_is_cancelled_and_the_connection_stays_reusable() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let win = x.window().owned_by(pid).create();
+        plat.window = Some(win);
+
+        for attempt in 1..=8 {
+            let expires = Instant::now() + Duration::from_millis(300);
+            plat.window_process_tree_delay = Duration::from_millis(225);
+            let listed = plat
+                .list_windows_by(Deadline::at(expires))
+                .unwrap_or_else(|error| panic!("near-boundary list {attempt} failed: {error:?}"));
+            plat.window_process_tree_delay = Duration::ZERO;
+            assert!(
+                listed
+                    .iter()
+                    .any(|window| window.id == WindowId(win as u64)),
+                "near-boundary list {attempt} omitted the active window"
+            );
+
+            std::thread::sleep(
+                expires.saturating_duration_since(Instant::now()) + Duration::from_millis(40),
+            );
+            let reuse = plat.list_windows_by(Deadline::from_millis(500));
+            assert!(
+                reuse.is_ok(),
+                "armed watch {attempt} was not cancelled before its deadline: {reuse:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn listing_windows_without_an_active_one_is_an_error_not_an_empty_list() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -3366,9 +3444,13 @@ mod display_tests {
             .list_windows_by(Deadline::from_millis(200))
             .expect_err("the watchdog must interrupt an in-flight X request");
         let elapsed = started.elapsed();
-        drop(paused);
+        let rescue_fired = paused.resume();
         let reuse = plat.list_windows_by(Deadline::from_millis(500));
 
+        assert!(
+            !rescue_fired,
+            "the independent X-server rescue fired before the watchdog answered"
+        );
         assert!(
             elapsed < Duration::from_secs(1),
             "the stalled X request exceeded its bound: {elapsed:?}"
@@ -3385,6 +3467,51 @@ mod display_tests {
         assert!(
             reuse.is_err(),
             "a connection whose request/reply framing was lost must remain fail-closed"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn in_flight_list_watch_uses_the_remaining_absolute_deadline_after_local_work() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let win = x.window().owned_by(pid).create();
+        plat.window = Some(win);
+        plat.window_process_tree_delay = Duration::from_millis(350);
+        let paused = PausedXServer::new(x.server_pid());
+
+        let started = Instant::now();
+        let error = plat
+            .list_windows_by(Deadline::at(started + Duration::from_millis(600)))
+            .expect_err("the remaining caller deadline must interrupt the stopped X server");
+        let elapsed = started.elapsed();
+        plat.window_process_tree_delay = Duration::ZERO;
+        let rescue_fired = paused.resume();
+
+        assert!(
+            !rescue_fired,
+            "the independent X-server rescue fired before the absolute deadline"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "the request did not remain in flight until near its caller deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "arming started a fresh duration after local work instead of using the caller deadline: \
+             {elapsed:?}"
+        );
+        assert_eq!(
+            (error.bound(), error.bound_owner(), error.bound_dispatch()),
+            (
+                Some(BoundKind::TimedOut),
+                Some(Whose::Caller),
+                Some(BoundDispatch::MayHaveDispatched)
+            ),
+            "the X request was in flight when the absolute deadline elapsed: {error:?}"
         );
     }
 
