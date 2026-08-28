@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub mod mcp_http;
+
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdout, Command, Stdio};
 

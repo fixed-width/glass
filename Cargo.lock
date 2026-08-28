@@ -1277,6 +1277,7 @@ dependencies = [
  "glass-wayland",
  "glass-windows",
  "glass-x11",
+ "image",
  "rand",
  "reqwest",
  "rmcp",

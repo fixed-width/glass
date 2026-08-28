@@ -7,29 +7,22 @@
 //!   GLASS_ANDROID_FIXTURE_APK=/path/to/fixture-compose-debug.apk \
 //!     cargo test -p glass-mcp --test android_session_loop -- --ignored --nocapture
 
+mod common;
+
 use std::time::Duration;
 
+use common::mcp_http::{InProcessMcpHarness, await_cleanup, call};
 use glass_android::{A11yServiceRegistry, AgentRegistry, AndroidPlatform, EmulatorRegistry};
 use glass_core::Deadline;
 use glass_core::accessibility::{AxNode, AxTree, ClickMethod};
 use glass_core::{AppSpec, BaselineStore, Glass, PlatformFactory, SandboxLevel};
-use glass_mcp::serve::config::ServeConfig;
-use rmcp::model::CallToolRequestParams;
-use rmcp::service::RunningService;
-use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::{Peer, RoleClient, ServiceExt};
-use serde_json::{Value, json};
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use rmcp::{Peer, RoleClient};
+use serde_json::json;
 
 /// Ceiling on the wait for the fixture's counter to reflect the click — the poll returns as soon
 /// as it changes.
 const AWAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const AWAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
-const MCP_CLIENT_CANCEL_BUDGET: Duration = Duration::from_secs(2);
-// Allow 8s for both 3s server cleanup phases plus scheduling and transport cancellation.
-const MCP_SERVER_JOIN_BUDGET: Duration = Duration::from_secs(8);
 static ANDROID_DEVICE_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Build `glass_mcp::boot`'s session factory with registries owned by the cleanup guard.
@@ -68,59 +61,6 @@ fn session_glass(device: &Companions) -> Glass {
     )
 }
 
-/// An HTTP MCP client whose server task is gracefully shut down even after a proof panic.
-struct McpHarness {
-    client: RunningService<RoleClient, ()>,
-    cancel: CancellationToken,
-    server: JoinHandle<anyhow::Result<()>>,
-}
-
-impl McpHarness {
-    fn peer(&self) -> Peer<RoleClient> {
-        self.client.peer().clone()
-    }
-
-    async fn shutdown(self) -> Result<(), String> {
-        let Self {
-            client,
-            cancel,
-            server,
-        } = self;
-        // Signal first so a stalled DELETE cannot delay bounded server drain and session teardown.
-        cancel.cancel();
-        let client = await_cleanup(
-            "MCP client cancellation",
-            MCP_CLIENT_CANCEL_BUDGET,
-            client.cancel(),
-        )
-        .await
-        .and_then(|result| {
-            result.map_err(|error| format!("MCP client cancellation failed: {error}"))
-        });
-        let server = await_server(server, "MCP server graceful shutdown").await;
-        client.and(server)
-    }
-}
-
-async fn await_cleanup<T>(
-    what: &str,
-    budget: Duration,
-    future: impl std::future::Future<Output = T>,
-) -> Result<T, String> {
-    tokio::time::timeout(budget, future)
-        .await
-        .map_err(|_| format!("{what} exceeded {budget:?}"))
-}
-
-async fn await_server(server: JoinHandle<anyhow::Result<()>>, what: &str) -> Result<(), String> {
-    match await_cleanup(what, MCP_SERVER_JOIN_BUDGET, server).await {
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(error))) => Err(format!("{what} failed: {error}")),
-        Ok(Err(error)) => Err(format!("{what} task panicked or was cancelled: {error}")),
-        Err(error) => Err(error),
-    }
-}
-
 #[tokio::test]
 async fn harness_cleanup_wait_is_bounded() {
     let result: Result<(), String> = await_cleanup(
@@ -131,86 +71,6 @@ async fn harness_cleanup_wait_is_bounded() {
     .await;
     let error = result.unwrap_err();
     assert!(error.contains("persistent test future"));
-}
-
-/// Boot a token-protected Streamable HTTP MCP session for a caller-provided Android session.
-async fn boot_mcp(glass: Glass) -> McpHarness {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind an ephemeral loopback port");
-    let addr = listener.local_addr().expect("read loopback address");
-    let report = glass_mcp::audit::report_from_config(None, |_| None);
-    let cancel = CancellationToken::new();
-    let shutdown = cancel.clone();
-    let server = tokio::spawn(async move {
-        let cfg = ServeConfig {
-            addr,
-            token: Some("android-loop".into()),
-        };
-        glass_mcp::serve::run_on_until(listener, cfg, glass, report, async move {
-            shutdown.cancelled().await;
-        })
-        .await
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut cfg = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/"));
-    cfg = cfg.auth_header("android-loop".to_string());
-    let client = match ().serve(StreamableHttpClientTransport::from_config(cfg)).await {
-        Ok(client) => client,
-        Err(error) => {
-            cancel.cancel();
-            match await_server(server, "MCP server startup cleanup").await {
-                Ok(()) => panic!("initialize Android MCP client: {error}"),
-                Err(cleanup) => panic!(
-                    "initialize Android MCP client: {error}; startup cleanup also failed: {cleanup}"
-                ),
-            }
-        }
-    };
-    McpHarness {
-        client,
-        cancel,
-        server,
-    }
-}
-
-/// Parse only the requested tool's complete trusted success envelope, never app-derived siblings.
-fn successful_envelope_result(text: &str, tool: &str) -> Option<Value> {
-    let envelope = serde_json::from_str::<Value>(text).ok()?;
-    (envelope.get("ok") == Some(&Value::Bool(true))
-        && envelope.get("tool") == Some(&Value::String(tool.to_string())))
-    .then(|| envelope.get("result").cloned())
-    .flatten()
-}
-
-async fn call(client: &Peer<RoleClient>, tool: &str, args: Value) -> (Value, String) {
-    let arguments = args
-        .as_object()
-        .expect("tool args must be a JSON object")
-        .clone();
-    let response = client
-        .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(arguments))
-        .await
-        .unwrap_or_else(|e| panic!("{tool} transport failure: {e}"));
-    let mut result = Value::Null;
-    let mut all_text = String::new();
-    for block in &response.content {
-        if let Some(text) = block.as_text() {
-            all_text.push_str(&text.text);
-            all_text.push('\n');
-            if let Some(envelope_result) = successful_envelope_result(&text.text, tool) {
-                result = envelope_result;
-            }
-        }
-    }
-    assert_ne!(response.is_error, Some(true), "{tool} errored: {all_text}");
-    assert_ne!(
-        result,
-        Value::Null,
-        "{tool} lacked a trusted result: {all_text}"
-    );
-    (result, all_text)
 }
 
 #[derive(Debug)]
@@ -390,7 +250,7 @@ async fn glass_do_android_ime_form_is_confirmed_end_to_end() {
         a11y: A11yServiceRegistry::new(),
         emulators: EmulatorRegistry::new(),
     };
-    let mcp = boot_mcp(session_glass(&device)).await;
+    let mcp = InProcessMcpHarness::boot(session_glass(&device), "android-loop").await;
     let peer = mcp.peer();
     let proof = tokio::spawn(async move { ime_form_proof(peer, fixture).await });
     let proof = proof.await;
