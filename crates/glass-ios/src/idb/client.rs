@@ -6,6 +6,7 @@
 //! See [`IdbClient`] for the threading invariant that `block_on` imposes, and
 //! [`CONNECT_TIMEOUT`]/[`RPC_TIMEOUT`] for the deadlines that keep a wedged
 //! companion from hanging the caller.
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -85,17 +86,19 @@ impl SnapshotRpcGate {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn run_with_clock<T>(
+    pub(crate) async fn run_with_clock<T, F>(
         self,
         mut now: impl FnMut() -> Instant,
-        call: impl FnOnce() -> Result<T>,
-    ) -> SnapshotRpc<T> {
+        call: impl FnOnce() -> F,
+    ) -> SnapshotRpc<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
         let dispatched = match self.dispatch_at(now()) {
             Ok(dispatched) => dispatched,
             Err(error) => return SnapshotRpc::before_dispatch(error),
         };
-        let result = call();
+        let result = call().await;
         dispatched.finish_at(now(), result)
     }
 }
@@ -387,6 +390,67 @@ impl IdbClient {
         }
     }
 
+    fn snapshot_rpc_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(boundary) = self.snapshot_rpc_boundary.as_deref() {
+            return boundary.now();
+        }
+        Instant::now()
+    }
+
+    async fn call_describe_all(
+        &self,
+        mut client: CompanionServiceClient<Channel>,
+        op: &'static str,
+        ends: Instant,
+        timeout: Duration,
+        whose: Whose,
+    ) -> Result<String> {
+        #[cfg(test)]
+        if let Some(boundary) = self.snapshot_rpc_boundary.as_deref() {
+            return boundary.describe_all();
+        }
+        let req = proto::AccessibilityInfoRequest {
+            point: None,
+            format: proto::accessibility_info_request::Format::Nested as i32,
+        };
+        let outcome = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(ends),
+            client.accessibility_info(req),
+        )
+        .await;
+        map_rpc_outcome(op, timeout, whose, ends, outcome).map(|resp| resp.into_inner().json)
+    }
+
+    async fn call_describe(
+        &self,
+        mut client: CompanionServiceClient<Channel>,
+        op: &'static str,
+        ends: Instant,
+        timeout: Duration,
+        whose: Whose,
+    ) -> Result<proto::ScreenDimensions> {
+        #[cfg(test)]
+        if let Some(boundary) = self.snapshot_rpc_boundary.as_deref() {
+            return boundary.describe();
+        }
+        let outcome = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(ends),
+            client.describe(proto::TargetDescriptionRequest {
+                fetch_diagnostics: false,
+            }),
+        )
+        .await;
+        map_rpc_outcome(op, timeout, whose, ends, outcome).and_then(|resp| {
+            resp.into_inner()
+                .target_description
+                .and_then(|target| target.screen_dimensions)
+                .ok_or_else(|| {
+                    GlassError::Backend("idb describe returned no screen dimensions".into())
+                })
+        })
+    }
+
     /// Describe the whole accessibility tree: idb's `accessibility_info` over the entire
     /// screen (no point) in the nested/hierarchical format. Returns the response `json`.
     #[cfg(test)]
@@ -403,37 +467,14 @@ impl IdbClient {
         if let Err(error) = self.ensure_off_runtime(op) {
             return SnapshotRpc::before_dispatch(error);
         }
-        #[cfg(test)]
-        if let Some(boundary) = self.snapshot_rpc_boundary.as_deref() {
-            let dispatched = match gate.dispatch_at(boundary.now()) {
-                Ok(dispatched) => dispatched,
-                Err(error) => return SnapshotRpc::before_dispatch(error),
-            };
-            let result = boundary.describe_all();
-            return dispatched.finish_at(boundary.now(), result);
-        }
         let ends = gate.ends;
         let timeout = gate.timeout;
         let whose = gate.whose;
-        let req = proto::AccessibilityInfoRequest {
-            point: None,
-            format: proto::accessibility_info_request::Format::Nested as i32,
-        };
-        let mut client = self.client.clone();
-        self.rt.block_on(async move {
-            let dispatched = match gate.dispatch_at(Instant::now()) {
-                Ok(dispatched) => dispatched,
-                Err(error) => return SnapshotRpc::before_dispatch(error),
-            };
-            let outcome = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(ends),
-                client.accessibility_info(req),
-            )
-            .await;
-            let result = map_rpc_outcome(op, timeout, whose, ends, outcome)
-                .map(|resp| resp.into_inner().json);
-            dispatched.finish_at(Instant::now(), result)
-        })
+        let client = self.client.clone();
+        self.rt.block_on(gate.run_with_clock(
+            || self.snapshot_rpc_now(),
+            || self.call_describe_all(client, op, ends, timeout, whose),
+        ))
     }
 
     /// Describe the target itself: its screen's pixel size, logical-point size and density.
@@ -459,41 +500,14 @@ impl IdbClient {
         if let Err(error) = self.ensure_off_runtime(op) {
             return SnapshotRpc::before_dispatch(error);
         }
-        #[cfg(test)]
-        if let Some(boundary) = self.snapshot_rpc_boundary.as_deref() {
-            let dispatched = match gate.dispatch_at(boundary.now()) {
-                Ok(dispatched) => dispatched,
-                Err(error) => return SnapshotRpc::before_dispatch(error),
-            };
-            let result = boundary.describe();
-            return dispatched.finish_at(boundary.now(), result);
-        }
         let ends = gate.ends;
         let timeout = gate.timeout;
         let whose = gate.whose;
-        let mut client = self.client.clone();
-        self.rt.block_on(async move {
-            let dispatched = match gate.dispatch_at(Instant::now()) {
-                Ok(dispatched) => dispatched,
-                Err(error) => return SnapshotRpc::before_dispatch(error),
-            };
-            let outcome = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(ends),
-                client.describe(proto::TargetDescriptionRequest {
-                    fetch_diagnostics: false,
-                }),
-            )
-            .await;
-            let result = map_rpc_outcome(op, timeout, whose, ends, outcome).and_then(|resp| {
-                resp.into_inner()
-                    .target_description
-                    .and_then(|target| target.screen_dimensions)
-                    .ok_or_else(|| {
-                        GlassError::Backend("idb describe returned no screen dimensions".into())
-                    })
-            });
-            dispatched.finish_at(Instant::now(), result)
-        })
+        let client = self.client.clone();
+        self.rt.block_on(gate.run_with_clock(
+            || self.snapshot_rpc_now(),
+            || self.call_describe(client, op, ends, timeout, whose),
+        ))
     }
 
     /// Send one HID event stream (client-streaming `hid`). A tap is two events
@@ -549,6 +563,57 @@ impl IdbClient {
 mod tests {
 
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SnapshotRpcEvent {
+        Gate,
+        Describe,
+        AccessibilityInfo,
+        Finish,
+    }
+
+    #[derive(Debug)]
+    struct RecordingSnapshotRpcBoundary {
+        observations: Mutex<VecDeque<(SnapshotRpcEvent, Instant)>>,
+        events: Arc<Mutex<Vec<SnapshotRpcEvent>>>,
+    }
+
+    impl RecordingSnapshotRpcBoundary {
+        fn record(&self, event: SnapshotRpcEvent) {
+            self.events.lock().expect("snapshot event lock").push(event);
+        }
+    }
+
+    impl IdbSnapshotRpcBoundary for RecordingSnapshotRpcBoundary {
+        fn now(&self) -> Instant {
+            let (event, observed_at) = self
+                .observations
+                .lock()
+                .expect("snapshot clock lock")
+                .pop_front()
+                .expect("enough snapshot clock observations");
+            self.record(event);
+            observed_at
+        }
+
+        fn describe(&self) -> Result<proto::ScreenDimensions> {
+            self.record(SnapshotRpcEvent::Describe);
+            Ok(proto::ScreenDimensions {
+                width: 400,
+                height: 800,
+                density: 2.0,
+                width_points: 200,
+                height_points: 400,
+            })
+        }
+
+        fn describe_all(&self) -> Result<String> {
+            self.record(SnapshotRpcEvent::AccessibilityInfo);
+            Ok("[]".into())
+        }
+    }
 
     /// The acceptance leg for glass#117: a pinch built by the injector is accepted and executed
     /// by a real companion. CI cannot run this — it needs a booted Simulator and a companion
@@ -694,6 +759,45 @@ mod tests {
         assert_eq!(
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn snapshot_rpcs_share_gate_call_finish_order_with_the_production_client_path() {
+        let observed_at = Instant::now();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let boundary = RecordingSnapshotRpcBoundary {
+            observations: Mutex::new(
+                vec![
+                    (SnapshotRpcEvent::Gate, observed_at),
+                    (SnapshotRpcEvent::Finish, observed_at),
+                    (SnapshotRpcEvent::Gate, observed_at),
+                    (SnapshotRpcEvent::Finish, observed_at),
+                ]
+                .into(),
+            ),
+            events: Arc::clone(&events),
+        };
+        let client = IdbClient::for_snapshot_test(Box::new(boundary));
+        let deadline = Deadline::at(observed_at + Duration::from_secs(1));
+
+        client
+            .describe_by(deadline)
+            .expect("the scripted describe call succeeds");
+        client
+            .describe_all_by(deadline)
+            .expect("the scripted accessibility_info call succeeds");
+
+        assert_eq!(
+            *events.lock().expect("snapshot event lock"),
+            [
+                SnapshotRpcEvent::Gate,
+                SnapshotRpcEvent::Describe,
+                SnapshotRpcEvent::Finish,
+                SnapshotRpcEvent::Gate,
+                SnapshotRpcEvent::AccessibilityInfo,
+                SnapshotRpcEvent::Finish,
+            ]
         );
     }
 

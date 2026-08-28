@@ -28,7 +28,9 @@ use objc2_core_foundation::CFRetained;
 use crate::ffi::{self, attr};
 use crate::mapping::{self, AxStateFacts};
 use crate::select_diagnostic::{CandidateOutcome, candidate_line};
-use crate::semantic_deadline::{EffectiveDeadline, SemanticDeadline, run_snapshot};
+use crate::semantic_deadline::{
+    EffectiveDeadline, SemanticDeadline, SnapshotBoundary, run_snapshot,
+};
 
 /// Per-axis pixel tolerance when matching an `AXWindow`'s origin against the backend's
 /// reported window origin. Same basis as `axwindow.rs`'s geometry-match fallback. Sized for
@@ -75,15 +77,10 @@ const RESOLVE_WINDOW_POLL_MS: u64 = 40;
 const ACCESSIBILITY_REMEDY: &str =
     "enable glass in System Settings > Privacy & Security > Accessibility";
 
-trait SnapshotAxBoundary: std::fmt::Debug + Send {
-    fn now(&self) -> Instant;
-    fn accessibility_is_trusted(&self) -> bool;
-}
-
 #[derive(Debug)]
 struct NativeSnapshotAxBoundary;
 
-impl SnapshotAxBoundary for NativeSnapshotAxBoundary {
+impl SnapshotBoundary for NativeSnapshotAxBoundary {
     fn now(&self) -> Instant {
         Instant::now()
     }
@@ -96,7 +93,7 @@ impl SnapshotAxBoundary for NativeSnapshotAxBoundary {
 /// The macOS accessibility reader. A fresh AX read is performed per `snapshot`.
 #[derive(Debug)]
 pub struct MacosA11y {
-    snapshot_boundary: Box<dyn SnapshotAxBoundary>,
+    snapshot_boundary: Box<dyn SnapshotBoundary>,
 }
 
 impl Default for MacosA11y {
@@ -113,7 +110,7 @@ impl MacosA11y {
     }
 
     #[cfg(test)]
-    fn with_snapshot_boundary(snapshot_boundary: Box<dyn SnapshotAxBoundary>) -> Self {
+    fn with_snapshot_boundary(snapshot_boundary: Box<dyn SnapshotBoundary>) -> Self {
         Self { snapshot_boundary }
     }
 }
@@ -121,26 +118,21 @@ impl MacosA11y {
 impl Accessibility for MacosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let snapshot_boundary = self.snapshot_boundary.as_ref();
-        run_snapshot(
-            ctx.deadline,
-            || snapshot_boundary.now(),
-            || snapshot_boundary.accessibility_is_trusted(),
-            |trusted, deadline| {
-                require_accessibility_grant(trusted)?;
-                let (window_el, scale) = resolve_window_after_grant(ctx, deadline)?;
+        run_snapshot(ctx.deadline, snapshot_boundary, |trusted, deadline| {
+            require_accessibility_grant(trusted)?;
+            let (window_el, scale) = resolve_window_after_grant(ctx, deadline)?;
 
-                let mut budget = WalkBudget::with_limits(ctx.limits);
-                let root = walk(&window_el, &ctx.window, scale, 0, &mut budget, deadline)?;
-                deadline.run(|| {
-                    let mut tree = AxTree::new(root);
-                    tree.truncated = budget.truncation();
-                    tree.unreadable = budget.unreadable();
-                    // Ids/count are assigned by `glass-core` (`AxTree::assign_ids`) so numbering is
-                    // identical across OS backends.
-                    Ok(tree)
-                })
-            },
-        )
+            let mut budget = WalkBudget::with_limits(ctx.limits);
+            let root = walk(&window_el, &ctx.window, scale, 0, &mut budget, deadline)?;
+            deadline.run(|| {
+                let mut tree = AxTree::new(root);
+                tree.truncated = budget.truncation();
+                tree.unreadable = budget.unreadable();
+                // Ids/count are assigned by `glass-core` (`AxTree::assign_ids`) so numbering is
+                // identical across OS backends.
+                Ok(tree)
+            })
+        })
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -911,26 +903,41 @@ mod tests {
     use super::*;
     use glass_core::{BoundDispatch, BoundKind, Deadline, WalkLimits, Whose};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SnapshotBoundaryEvent {
+        Gate,
+        NativeCall,
+        Finish,
+    }
 
     #[derive(Debug)]
     struct ScriptedSnapshotAxBoundary {
-        observations: Mutex<VecDeque<Instant>>,
-        called: Arc<AtomicBool>,
+        observations: Mutex<VecDeque<(SnapshotBoundaryEvent, Instant)>>,
+        events: Arc<Mutex<Vec<SnapshotBoundaryEvent>>>,
+        native_calls: Arc<AtomicUsize>,
     }
 
-    impl SnapshotAxBoundary for ScriptedSnapshotAxBoundary {
+    impl SnapshotBoundary for ScriptedSnapshotAxBoundary {
         fn now(&self) -> Instant {
-            self.observations
+            let (event, observed_at) = self
+                .observations
                 .lock()
                 .expect("snapshot clock lock")
                 .pop_front()
-                .expect("enough snapshot clock observations")
+                .expect("enough snapshot clock observations");
+            self.events.lock().expect("snapshot event lock").push(event);
+            observed_at
         }
 
         fn accessibility_is_trusted(&self) -> bool {
-            self.called.store(true, Ordering::SeqCst);
+            self.native_calls.fetch_add(1, Ordering::SeqCst);
+            self.events
+                .lock()
+                .expect("snapshot event lock")
+                .push(SnapshotBoundaryEvent::NativeCall);
             true
         }
     }
@@ -1052,11 +1059,25 @@ mod tests {
 
     #[test]
     fn snapshot_with_a_spent_deadline_starts_no_ax_read() {
-        let mut a11y = MacosA11y::new();
+        let expires = Instant::now();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let boundary = ScriptedSnapshotAxBoundary {
+            observations: Mutex::new(vec![(SnapshotBoundaryEvent::Gate, expires)].into()),
+            events: Arc::clone(&events),
+            native_calls: Arc::clone(&native_calls),
+        };
+        let mut a11y = MacosA11y::with_snapshot_boundary(Box::new(boundary));
+
         let error = a11y
-            .snapshot(&context(Deadline::from_millis(0)))
+            .snapshot(&context(Deadline::at(expires)))
             .expect_err("a spent snapshot must stop before checking AX trust");
 
+        assert_eq!(native_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *events.lock().expect("snapshot event lock"),
+            [SnapshotBoundaryEvent::Gate]
+        );
         assert_eq!(error.bound(), Some(BoundKind::NotStarted));
         assert_eq!(error.bound_owner(), Some(Whose::Caller));
         assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
@@ -1066,10 +1087,18 @@ mod tests {
     fn snapshot_uses_the_injected_first_ax_boundary_and_marks_post_call_expiry_dispatched() {
         let before = Instant::now();
         let expires = before + Duration::from_secs(1);
-        let called = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let native_calls = Arc::new(AtomicUsize::new(0));
         let boundary = ScriptedSnapshotAxBoundary {
-            observations: Mutex::new(vec![before, expires].into()),
-            called: Arc::clone(&called),
+            observations: Mutex::new(
+                vec![
+                    (SnapshotBoundaryEvent::Gate, before),
+                    (SnapshotBoundaryEvent::Finish, expires),
+                ]
+                .into(),
+            ),
+            events: Arc::clone(&events),
+            native_calls: Arc::clone(&native_calls),
         };
         let mut a11y = MacosA11y::with_snapshot_boundary(Box::new(boundary));
 
@@ -1077,7 +1106,15 @@ mod tests {
             .snapshot(&context(Deadline::at(expires)))
             .expect_err("expiry after the injected first AX call must stop the snapshot");
 
-        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(native_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *events.lock().expect("snapshot event lock"),
+            [
+                SnapshotBoundaryEvent::Gate,
+                SnapshotBoundaryEvent::NativeCall,
+                SnapshotBoundaryEvent::Finish,
+            ]
+        );
         assert_eq!(error.bound(), Some(BoundKind::TimedOut));
         assert_eq!(error.bound_owner(), Some(Whose::Caller));
         assert_eq!(

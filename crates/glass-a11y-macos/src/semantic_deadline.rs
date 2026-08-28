@@ -153,9 +153,27 @@ impl SemanticDeadline {
     }
 }
 
+pub(crate) trait SnapshotBoundary: std::fmt::Debug + Send {
+    fn now(&self) -> Instant;
+    fn accessibility_is_trusted(&self) -> bool;
+}
+
 /// Run a snapshot from its initially-undispatched phase through the first native call and the
 /// remainder of the reader. The production reader and deterministic tests use this same path.
-pub(crate) fn run_snapshot<T, U>(
+pub(crate) fn run_snapshot<U>(
+    deadline: Deadline,
+    boundary: &dyn SnapshotBoundary,
+    continue_snapshot: impl FnOnce(bool, SemanticDeadline) -> Result<U>,
+) -> Result<U> {
+    run_snapshot_with_clock(
+        deadline,
+        || boundary.now(),
+        || boundary.accessibility_is_trusted(),
+        continue_snapshot,
+    )
+}
+
+fn run_snapshot_with_clock<T, U>(
     deadline: Deadline,
     now: impl FnMut() -> Instant,
     first_native_call: impl FnOnce() -> T,
@@ -235,6 +253,61 @@ mod tests {
     use super::*;
     use glass_core::{BoundDispatch, Whose};
     use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct RecordingSnapshotBoundary {
+        observations: Mutex<VecDeque<Instant>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        native_calls: Arc<AtomicUsize>,
+    }
+
+    impl SnapshotBoundary for RecordingSnapshotBoundary {
+        fn now(&self) -> Instant {
+            self.events
+                .lock()
+                .expect("snapshot event lock")
+                .push("gate");
+            self.observations
+                .lock()
+                .expect("snapshot clock lock")
+                .pop_front()
+                .expect("enough snapshot clock observations")
+        }
+
+        fn accessibility_is_trusted(&self) -> bool {
+            self.native_calls.fetch_add(1, Ordering::SeqCst);
+            self.events
+                .lock()
+                .expect("snapshot event lock")
+                .push("native-call");
+            true
+        }
+    }
+
+    #[test]
+    fn injected_snapshot_boundary_checks_the_gate_before_the_native_call() {
+        let expires = Instant::now();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let boundary = RecordingSnapshotBoundary {
+            observations: Mutex::new(vec![expires].into()),
+            events: Arc::clone(&events),
+            native_calls: Arc::clone(&native_calls),
+        };
+
+        let error = run_snapshot(Deadline::at(expires), &boundary, |_trusted, _deadline| {
+            Ok(())
+        })
+        .expect_err("a spent snapshot must stop before the native call");
+
+        assert_eq!(native_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(*events.lock().expect("snapshot event lock"), ["gate"]);
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
 
     #[test]
     fn snapshot_path_expiry_before_the_first_native_call_is_not_dispatched() {
@@ -243,7 +316,7 @@ mod tests {
         let called = Cell::new(false);
         let continued = Cell::new(false);
 
-        let error = run_snapshot(
+        let error = run_snapshot_with_clock(
             Deadline::at(expires),
             || expires,
             || {
@@ -272,7 +345,7 @@ mod tests {
         let continued = Cell::new(false);
         let mut observations = [before, expires].into_iter();
 
-        let error = run_snapshot(
+        let error = run_snapshot_with_clock(
             Deadline::at(expires),
             || observations.next().expect("two clock observations"),
             || {

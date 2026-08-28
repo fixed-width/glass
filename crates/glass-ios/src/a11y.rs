@@ -490,13 +490,17 @@ mod tests {
                 RpcExpiry::BeforeCall => vec![expires].into_iter(),
                 RpcExpiry::AfterCall => vec![before, expires].into_iter(),
             };
-            gate.run_with_clock(
-                || observations.next().expect("enough clock observations"),
-                || {
-                    called.store(true, Ordering::SeqCst);
-                    result
-                },
-            )
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build a current-thread runtime for the scripted snapshot RPC")
+                .block_on(gate.run_with_clock(
+                    || observations.next().expect("enough clock observations"),
+                    || async move {
+                        called.store(true, Ordering::SeqCst);
+                        result
+                    },
+                ))
         })
     }
 
