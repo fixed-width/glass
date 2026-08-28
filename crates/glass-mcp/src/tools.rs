@@ -4,6 +4,7 @@
 //! turns that into an MCP error result. Never a silent success.
 //!
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use glass_core::{
     AppSpec, AxNodeId, Glass, MarkLabel, MouseButton, WindowGeometry, WindowHint, WindowId,
@@ -156,6 +157,13 @@ impl ContextualError {
     pub fn annotate(mut self, prefix: &str) -> Self {
         self.message = format!("{prefix}: {}", self.message);
         self
+    }
+
+    pub fn sequence_deadline(message: String) -> Self {
+        Self {
+            message,
+            sequence_deadline_exceeded: true,
+        }
     }
 }
 
@@ -473,10 +481,14 @@ fn resolve_return_with(
     match ret {
         None | Some("none") => Ok((None, vec![], None)),
         Some("settle") => {
+            let (_, whose) = context.deadline.budget(
+                Duration::from_millis(settle_params().timeout_ms),
+                Instant::now(),
+            );
             let o = glass
                 .wait_stable_by(&settle_params(), context.deadline)
-                .map_err(|e| ContextualError::from_core(e, context))?;
-            let timed_out_by = (!o.settled).then_some(glass_core::Whose::Callee);
+                .map_err(|e| ContextualError::from_resolved_bound(e, context, whose))?;
+            let timed_out_by = (!o.settled).then_some(whose);
             Ok((
                 Some(serde_json::json!({
                     "settled": o.settled,
@@ -493,7 +505,24 @@ fn resolve_return_with(
             // soft-times-out (`settled:false`, not an error) on a non-settling UI, and a rare
             // real capture failure is swallowed because `a11y_snapshot` reads the accessibility
             // tree (not pixels) and still returns the freshest tree — the caller asked for it.
-            let _ = glass.wait_stable_by(&settle_params(), context.deadline);
+            let (_, whose) = context.deadline.budget(
+                Duration::from_millis(settle_params().timeout_ms),
+                Instant::now(),
+            );
+            match glass.wait_stable_by(&settle_params(), context.deadline) {
+                Ok(o) if !o.settled && whose == glass_core::Whose::Caller => {
+                    return Err(ContextualError::sequence_deadline(
+                        "return snapshot settle reached the caller deadline".into(),
+                    ));
+                }
+                Err(error) => {
+                    let error = ContextualError::from_resolved_bound(error, context, whose);
+                    if error.sequence_deadline_exceeded {
+                        return Err(error);
+                    }
+                }
+                Ok(_) => {}
+            }
             // Reuse the session's current limits so a fold after a raised/unbounded snapshot
             // isn't silently re-truncated to the default cap.
             let tree = glass

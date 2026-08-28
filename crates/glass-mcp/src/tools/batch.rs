@@ -21,6 +21,10 @@ const MAX_ARGUMENT_BYTES: usize = 65_536;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 120_000;
 
+fn checked_sequence_deadline(started: Instant, timeout: Duration) -> Option<Deadline> {
+    started.checked_add(timeout).map(Deadline::at)
+}
+
 /// Split a sub-tool's enveloped output into (its `result` payload, its non-envelope
 /// sibling blocks — images and the IMAGE_NOTE). The envelope text block itself is consumed.
 ///
@@ -92,9 +96,13 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
         )));
     }
     let started = Instant::now();
-    let context = ToolContext {
-        deadline: Deadline::at(started + Duration::from_millis(timeout_ms)),
+    let Some(deadline) = checked_sequence_deadline(started, Duration::from_millis(timeout_ms))
+    else {
+        return Err(validation_error(
+            "`timeout_ms` is outside this platform's monotonic clock range",
+        ));
     };
+    let context = ToolContext { deadline };
     let n = a.actions.len();
     let mut steps = Vec::with_capacity(n);
     let mut siblings = Vec::new();
@@ -137,6 +145,20 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 let start = siblings.len() + 1;
                 let content_blocks = (start..start + extra.len()).collect();
                 siblings.append(&mut extra);
+                if timed_out_by == Some(Whose::Caller) {
+                    return Err(predicate_failure(
+                        &a.actions,
+                        i,
+                        kind,
+                        action.is_mutating(),
+                        true,
+                        result,
+                        content_blocks,
+                        steps,
+                        siblings,
+                        started.elapsed().as_millis(),
+                    ));
+                }
                 let predicate_failed =
                     matches!(
                         action,
@@ -148,7 +170,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                         i,
                         kind,
                         action.is_mutating(),
-                        timed_out_by == Some(Whose::Caller),
+                        false,
                         result,
                         content_blocks,
                         steps,

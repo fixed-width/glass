@@ -99,7 +99,7 @@ pub(crate) fn wait_stable_with(
         });
         return Ok(ContextualOutput::with_timeout(
             ToolOutput::result("glass_wait_stable", meta),
-            (!settled).then_some(glass_core::Whose::Callee),
+            (!settled).then_some(whose),
         ));
     }
 
@@ -113,7 +113,7 @@ pub(crate) fn wait_stable_with(
     }
     Ok(ContextualOutput::with_timeout(
         ToolOutput::image_result("glass_wait_stable", Some(img), meta, vec![]),
-        (!settled).then_some(glass_core::Whose::Callee),
+        (!settled).then_some(whose),
     ))
 }
 

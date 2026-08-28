@@ -3,19 +3,19 @@ use crate::tools::start as start_tool;
 use crate::tools::testutil::*;
 use crate::tools::{OutContent, baseline_save};
 use glass_core::{
-    AppSpec, Backend, BaselineStore, Deadline, Frame, GlassError, KeyEvent, Platform,
-    PlatformFactory, PointerEvent, Region, Result as GlassResult, Stream, WindowGeometry, WindowId,
-    WindowInfo, WindowOp,
+    Accessibility, AppSpec, AxContext, AxTree, Backend, BaselineStore, Deadline, Frame, GlassError,
+    KeyEvent, Platform, PlatformFactory, PointerEvent, Region, Result as GlassResult, Stream,
+    WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 enum DeadlineBehavior {
     Normal,
     CompleteLate,
     FailLate,
-    FailCaptureLate,
+    CaptureCompletesLate,
 }
 
 struct DeadlinePlatform {
@@ -25,6 +25,19 @@ struct DeadlinePlatform {
 }
 
 type DeadlineFixture = (Glass, Arc<Mutex<Vec<Deadline>>>, Arc<Mutex<Vec<String>>>);
+type A11yDeadlineFixture = (Glass, Arc<Mutex<Vec<Deadline>>>, Arc<Mutex<Vec<Deadline>>>);
+
+struct DeadlineAccessibility {
+    tree: AxTree,
+    deadlines: Arc<Mutex<Vec<Deadline>>>,
+}
+
+impl Accessibility for DeadlineAccessibility {
+    fn snapshot(&mut self, context: &AxContext) -> GlassResult<AxTree> {
+        self.deadlines.lock().unwrap().push(context.deadline);
+        Ok(self.tree.clone())
+    }
+}
 
 impl Platform for DeadlinePlatform {
     fn start_app(&mut self, spec: &AppSpec) -> GlassResult<WindowGeometry> {
@@ -42,9 +55,9 @@ impl Platform for DeadlinePlatform {
         deadline: Deadline,
     ) -> GlassResult<Frame> {
         self.deadlines.lock().unwrap().push(deadline);
-        if matches!(self.behavior, DeadlineBehavior::FailCaptureLate) {
-            std::thread::sleep(Duration::from_millis(3));
-            return Err(GlassError::caller_deadline_elapsed("controlled capture"));
+        if matches!(self.behavior, DeadlineBehavior::CaptureCompletesLate) {
+            std::thread::sleep(Duration::from_millis(160));
+            return self.inner.capture_frame(region);
         }
         self.inner.capture_frame(region)
     }
@@ -64,7 +77,7 @@ impl Platform for DeadlinePlatform {
                 std::thread::sleep(Duration::from_millis(3));
                 Err(GlassError::caller_deadline_elapsed("controlled pointer"))
             }
-            DeadlineBehavior::FailCaptureLate => self.inner.send_pointer(event),
+            DeadlineBehavior::CaptureCompletesLate => self.inner.send_pointer(event),
         }
     }
     fn send_key(&mut self, event: &KeyEvent) -> GlassResult<()> {
@@ -127,6 +140,50 @@ fn deadline_glass(behavior: DeadlineBehavior, frames: Vec<Frame>) -> DeadlineFix
     (glass, deadlines, events)
 }
 
+fn deadline_a11y_glass(frames: Vec<Frame>) -> A11yDeadlineFixture {
+    let platform_deadlines = Arc::new(Mutex::new(Vec::new()));
+    let accessibility_deadlines = Arc::new(Mutex::new(Vec::new()));
+    let platform = DeadlinePlatform {
+        inner: FakePlatform::new(100, 100).with_frames(frames),
+        deadlines: platform_deadlines.clone(),
+        behavior: DeadlineBehavior::Normal,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    let mut held = Some(Backend {
+        platform: Box::new(platform),
+        accessibility: Some(Box::new(DeadlineAccessibility {
+            tree: fake_tree(),
+            deadlines: accessibility_deadlines.clone(),
+        })),
+    });
+    let factory: PlatformFactory = Box::new(move |_| {
+        held.take()
+            .ok_or_else(|| GlassError::Backend("factory called twice".into()))
+    });
+    let mut glass = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+    start_tool(
+        &mut glass,
+        &StartArgs {
+            build: None,
+            run: vec!["app".into()],
+            backend: None,
+            sandbox: None,
+            cwd: None,
+            env: Default::default(),
+            window_hint: None,
+            timeout_ms: None,
+            a11y: None,
+        },
+    )
+    .unwrap();
+    crate::tools::a11y_snapshot(&mut glass, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+    platform_deadlines.lock().unwrap().clear();
+    accessibility_deadlines.lock().unwrap().clear();
+    (glass, platform_deadlines, accessibility_deadlines)
+}
+
 fn do_args(actions: Vec<Action>, timeout_ms: u64) -> DoArgs {
     DoArgs {
         actions,
@@ -139,7 +196,7 @@ fn do_args(actions: Vec<Action>, timeout_ms: u64) -> DoArgs {
 #[test]
 fn standalone_handlers_use_unbounded_context_and_keep_wire_shape() {
     let (mut g, deadlines, _) = deadline_glass(
-        DeadlineBehavior::Normal,
+        DeadlineBehavior::CaptureCompletesLate,
         vec![Frame::solid(100, 100, [0, 0, 0, 255])],
     );
     let args = ClickArgs {
@@ -181,6 +238,110 @@ fn standalone_handlers_use_unbounded_context_and_keep_wire_shape() {
         crate::tools::click_with(&mut g, &bad, crate::tools::ToolContext::UNBOUNDED)
             .unwrap_err()
             .message
+    );
+}
+
+#[test]
+fn sequence_deadline_construction_is_checked() {
+    let started = Instant::now();
+    assert_eq!(
+        checked_sequence_deadline(started, Duration::from_secs(1)),
+        Some(Deadline::at(started + Duration::from_secs(1)))
+    );
+    assert!(checked_sequence_deadline(started, Duration::MAX).is_none());
+}
+
+#[test]
+fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
+    let frame = Frame::solid(100, 100, [7, 8, 9, 255]);
+    let settle_args = TypeArgs {
+        text: "private".into(),
+        return_: Some("settle".into()),
+    };
+    let (mut standalone, standalone_deadlines, _) = deadline_glass(
+        DeadlineBehavior::Normal,
+        vec![frame.clone(), frame.clone(), frame.clone()],
+    );
+    let (mut contextual, contextual_deadlines, _) = deadline_glass(
+        DeadlineBehavior::Normal,
+        vec![frame.clone(), frame.clone(), frame.clone()],
+    );
+    let standalone_out = crate::tools::type_text(&mut standalone, &settle_args).unwrap();
+    let contextual_out = crate::tools::type_text_with(
+        &mut contextual,
+        &settle_args,
+        crate::tools::ToolContext::UNBOUNDED,
+    )
+    .unwrap()
+    .output;
+    let OutContent::Text(standalone_envelope) = &standalone_out.0[0] else {
+        panic!("standalone type settle envelope must lead")
+    };
+    let OutContent::Text(contextual_envelope) = &contextual_out.0[0] else {
+        panic!("contextual type settle envelope must lead")
+    };
+    let mut standalone_value: serde_json::Value =
+        serde_json::from_str(standalone_envelope).unwrap();
+    let mut contextual_value: serde_json::Value =
+        serde_json::from_str(contextual_envelope).unwrap();
+    standalone_value["result"]["observed"]["observed_ms"] = json!(0);
+    contextual_value["result"]["observed"]["observed_ms"] = json!(0);
+    assert_eq!(standalone_value, contextual_value);
+    assert_eq!(standalone_deadlines.lock().unwrap()[0], Deadline::UNBOUNDED);
+    assert_eq!(contextual_deadlines.lock().unwrap()[0], Deadline::UNBOUNDED);
+
+    let snapshot_args = TypeArgs {
+        text: "private".into(),
+        return_: Some("snapshot".into()),
+    };
+    let (mut standalone, standalone_platform, standalone_ax) =
+        deadline_a11y_glass(vec![frame.clone(), frame.clone(), frame.clone()]);
+    let (mut contextual, contextual_platform, contextual_ax) =
+        deadline_a11y_glass(vec![frame.clone(), frame.clone(), frame]);
+    let standalone_out = crate::tools::type_text(&mut standalone, &snapshot_args).unwrap();
+    let contextual_out = crate::tools::type_text_with(
+        &mut contextual,
+        &snapshot_args,
+        crate::tools::ToolContext::UNBOUNDED,
+    )
+    .unwrap()
+    .output;
+    let OutContent::Text(standalone_envelope) = &standalone_out.0[0] else {
+        panic!("standalone type snapshot envelope must lead")
+    };
+    let OutContent::Text(contextual_envelope) = &contextual_out.0[0] else {
+        panic!("contextual type snapshot envelope must lead")
+    };
+    assert_eq!(standalone_envelope, contextual_envelope);
+    assert_eq!(standalone_out.0.len(), contextual_out.0.len());
+    assert!(format!("{:?}", standalone_out.0[1]).contains("Save"));
+    assert!(format!("{:?}", contextual_out.0[1]).contains("Save"));
+    for log in [standalone_platform, contextual_platform] {
+        let deadlines = log.lock().unwrap();
+        assert!(!deadlines.is_empty());
+        assert_eq!(deadlines[0], Deadline::UNBOUNDED);
+    }
+    for log in [standalone_ax, contextual_ax] {
+        let deadlines = log.lock().unwrap();
+        assert!(!deadlines.is_empty());
+        assert!(deadlines.iter().all(|d| *d == Deadline::UNBOUNDED));
+    }
+
+    let invalid = TypeArgs {
+        text: "private".into(),
+        return_: Some("later".into()),
+    };
+    let mut standalone = started(FakePlatform::new(100, 100));
+    let mut contextual = started(FakePlatform::new(100, 100));
+    assert_eq!(
+        crate::tools::type_text(&mut standalone, &invalid).unwrap_err(),
+        crate::tools::type_text_with(
+            &mut contextual,
+            &invalid,
+            crate::tools::ToolContext::UNBOUNDED,
+        )
+        .unwrap_err()
+        .message
     );
 }
 
@@ -236,7 +397,8 @@ fn deadline_spent_before_step_marks_it_failed_unattempted() {
         ),
     )
     .unwrap_err();
-    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    let error = error_text(err);
+    let envelope: serde_json::Value = serde_json::from_str(&error).unwrap();
     assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
     assert_eq!(envelope["outcome"]["steps"][1]["attempted"], false);
     assert_eq!(
@@ -289,17 +451,110 @@ fn settle_own_timeout_is_completed_but_sequence_timeout_fails() {
         false
     );
     let caller_settle = Action::Settle(SettleArgs {
-        interval_ms: Some(10),
-        settle_frames: Some(3),
+        interval_ms: Some(0),
+        settle_frames: Some(u32::MAX),
         tolerance: None,
         timeout_ms: Some(1000),
         stability_region: None,
         ignore: None,
     });
-    let (mut caller, _, _) = deadline_glass(DeadlineBehavior::FailCaptureLate, vec![black, white]);
-    let err = do_actions(&mut caller, &do_args(vec![caller_settle], 1)).unwrap_err();
+    let (mut caller, _, events) = deadline_glass(
+        DeadlineBehavior::Normal,
+        vec![black.clone(), white.clone(), black, white],
+    );
+    let err = do_actions(
+        &mut caller,
+        &do_args(
+            vec![
+                click(1, 1),
+                caller_settle,
+                Action::Key(KeyArgs {
+                    chord: "Tab".into(),
+                }),
+            ],
+            1,
+        ),
+    )
+    .unwrap_err();
     let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
     assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(envelope["error"]["step"], 1);
+    assert_eq!(envelope["outcome"]["executed"], 1);
+    assert_eq!(envelope["outcome"]["steps"][0]["status"], "completed");
+    let step = &envelope["outcome"]["steps"][1];
+    assert_eq!(step["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], false);
+    assert_eq!(step["result"]["settled"], false);
+    assert_eq!(envelope["outcome"]["steps"][2]["status"], "unexecuted");
+    assert_eq!(*events.lock().unwrap(), vec!["click(1,1)"]);
+}
+
+#[test]
+fn caller_soft_return_settle_fails_the_mutating_action() {
+    let black = Frame::solid(100, 100, [0, 0, 0, 255]);
+    let white = Frame::solid(100, 100, [255, 255, 255, 255]);
+    let (mut g, _, events) = deadline_glass(
+        DeadlineBehavior::CaptureCompletesLate,
+        vec![black.clone(), white.clone(), black, white],
+    );
+    let err = do_actions(
+        &mut g,
+        &do_args(
+            vec![
+                click(1, 1),
+                Action::Type(TypeArgs {
+                    text: "secret".into(),
+                    return_: Some("settle".into()),
+                }),
+                Action::Key(KeyArgs {
+                    chord: "Tab".into(),
+                }),
+            ],
+            150,
+        ),
+    )
+    .unwrap_err();
+    let error = error_text(err);
+    let envelope: serde_json::Value = serde_json::from_str(&error).unwrap();
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(envelope["error"]["step"], 1);
+    assert_eq!(envelope["outcome"]["executed"], 1);
+    let step = &envelope["outcome"]["steps"][1];
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], true);
+    assert_eq!(step["result"]["observed"]["settled"], false);
+    assert_eq!(envelope["outcome"]["steps"][2]["status"], "unexecuted");
+    assert_eq!(*events.lock().unwrap(), vec!["click(1,1)", "type(secret)"]);
+    assert!(!error.contains("secret"));
+}
+
+#[test]
+fn caller_soft_return_snapshot_stops_before_accessibility_work() {
+    let frame = Frame::solid(100, 100, [0, 0, 0, 255]);
+    let (mut g, _, events) = deadline_glass(
+        DeadlineBehavior::CaptureCompletesLate,
+        vec![frame.clone(), frame],
+    );
+    let err = do_actions(
+        &mut g,
+        &do_args(
+            vec![Action::Type(TypeArgs {
+                text: "secret".into(),
+                return_: Some("snapshot".into()),
+            })],
+            150,
+        ),
+    )
+    .unwrap_err();
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(envelope["outcome"]["steps"][0]["attempted"], true);
+    assert_eq!(
+        envelope["outcome"]["steps"][0]["side_effects_may_have_occurred"],
+        true
+    );
+    assert_eq!(*events.lock().unwrap(), vec!["type(secret)"]);
 }
 
 #[test]
