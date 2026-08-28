@@ -1,5 +1,5 @@
-use std::cell::Cell;
-use std::os::fd::AsFd;
+use std::cell::{Cell, RefCell};
+use std::os::fd::{AsFd, OwnedFd};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -46,15 +46,34 @@ const XT_KEY_PRESS: u8 = 2; // KeyPress
 const XT_KEY_RELEASE: u8 = 3; // KeyRelease
 
 #[derive(Default)]
-struct X11Dispatch(Cell<bool>);
+struct X11Dispatch {
+    sent: Cell<bool>,
+    deadline_watch: RefCell<Option<X11DeadlineWatch>>,
+}
 
 impl X11Dispatch {
+    fn for_window(conn: &RustConnection, deadline: Deadline) -> Result<Self> {
+        Ok(Self {
+            sent: Cell::new(false),
+            deadline_watch: RefCell::new(X11DeadlineWatch::prepare(conn, deadline)?),
+        })
+    }
+
     fn mark(&self) {
-        self.0.set(true);
+        if self.sent.replace(true) {
+            return;
+        }
+        if let Some(watch) = self.deadline_watch.borrow_mut().as_mut() {
+            watch.arm();
+        }
+    }
+
+    fn stop_watch(&self) {
+        self.deadline_watch.borrow_mut().take();
     }
 
     fn deadline_error(&self, op: &str) -> GlassError {
-        if self.0.get() {
+        if self.sent.get() {
             GlassError::caller_deadline_elapsed(op)
         } else {
             GlassError::deadline_not_started(op)
@@ -74,7 +93,7 @@ impl X11Dispatch {
                 *cleanup,
             );
         }
-        if self.0.get()
+        if self.sent.get()
             && error.bound_owner() == Some(Whose::Caller)
             && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
         {
@@ -121,35 +140,49 @@ fn run_x11_call_by<T>(
 }
 
 /// Cancels a blocking x11rb socket poll when a bounded window operation reaches its caller
-/// deadline. Shutting down the connection is intentionally fail-closed: after a server stalls long
+/// deadline. The socket is duplicated when the call begins, but shutdown is armed only by the
+/// first dispatch mark. Shutting down is intentionally fail-closed: after a server stalls long
 /// enough to lose request/reply framing, reusing that session would risk acting on a stale reply.
 struct X11DeadlineWatch {
-    cancel: std::sync::mpsc::Sender<()>,
+    deadline: Deadline,
+    socket: Option<OwnedFd>,
+    cancel: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl X11DeadlineWatch {
-    fn start(conn: &RustConnection, deadline: Deadline) -> Result<Option<Self>> {
-        let Some(remaining) = deadline.remaining() else {
+    fn prepare(conn: &RustConnection, deadline: Deadline) -> Result<Option<Self>> {
+        if deadline.remaining().is_none() {
             return Ok(None);
-        };
-        if remaining.is_zero() {
-            return Err(GlassError::deadline_not_started("X11 window operation"));
         }
         let socket = rustix::io::dup(conn.stream().as_fd())
             .map_err(|error| GlassError::Backend(format!("duplicate X11 socket: {error}")))?;
+        Ok(Some(Self {
+            deadline,
+            socket: Some(socket),
+            cancel: None,
+        }))
+    }
+
+    fn arm(&mut self) {
+        let Some(socket) = self.socket.take() else {
+            return;
+        };
+        let remaining = self.deadline.remaining().unwrap_or(Duration::ZERO);
         let (cancel, cancelled) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             if cancelled.recv_timeout(remaining).is_err() {
                 let _ = rustix::net::shutdown(socket, rustix::net::Shutdown::Both);
             }
         });
-        Ok(Some(Self { cancel }))
+        self.cancel = Some(cancel);
     }
 }
 
 impl Drop for X11DeadlineWatch {
     fn drop(&mut self) {
-        let _ = self.cancel.send(());
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
     }
 }
 
@@ -244,6 +277,8 @@ pub struct X11Platform {
     dbus: Option<glass_dbus_linux::PrivateBus>,
     // Background thread that owns the CLIPBOARD selection and serves pastes.
     clipboard_owner: Option<crate::clipboard::ClipboardOwner>,
+    #[cfg(test)]
+    window_process_tree_delay: Duration,
 }
 
 /// What display the X11 backend should use, derived from `GLASS_DISPLAY`.
@@ -362,6 +397,8 @@ impl X11Platform {
             xvfb: None,
             dbus: None,
             clipboard_owner: None,
+            #[cfg(test)]
+            window_process_tree_delay: Duration::ZERO,
         })
     }
 
@@ -374,14 +411,13 @@ impl X11Platform {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started(operation));
         }
-        let watch = X11DeadlineWatch::start(&self.conn, deadline)?;
-        let dispatch = X11Dispatch::default();
+        let dispatch = X11Dispatch::for_window(&self.conn, deadline)?;
         let answer = match call(self, &dispatch) {
             Ok(answer) => answer,
             Err(_) if deadline.has_passed() => return Err(dispatch.deadline_error(operation)),
             Err(error) => return Err(dispatch.classify(operation, error)),
         };
-        drop(watch);
+        dispatch.stop_watch();
         if deadline.has_passed() {
             Err(dispatch.deadline_error(operation))
         } else {
@@ -1617,6 +1653,11 @@ impl Platform for X11Platform {
                 .as_ref()
                 .map(|c| proc_tree_pids(c.id()))
                 .unwrap_or_default();
+            #[cfg(test)]
+            std::thread::sleep(platform.window_process_tree_delay);
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("X11 window list"));
+            }
             let active = platform.window;
             dispatch.mark();
             let mut out = Vec::new();
@@ -1640,6 +1681,11 @@ impl Platform for X11Platform {
                 .as_ref()
                 .map(|c| proc_tree_pids(c.id()))
                 .unwrap_or_default();
+            #[cfg(test)]
+            std::thread::sleep(platform.window_process_tree_delay);
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("X11 window selection"));
+            }
             let target = id.0 as Window;
             dispatch.mark();
             if !platform.scan_all_windows(&pids)?.contains(&target) {
@@ -2764,6 +2810,31 @@ mod display_tests {
         cmd.spawn().expect("the stand-in app should spawn")
     }
 
+    struct PausedXServer(u32);
+
+    impl PausedXServer {
+        fn new(pid: u32) -> Self {
+            signal_process(pid, "-STOP");
+            Self(pid)
+        }
+    }
+
+    impl Drop for PausedXServer {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("kill")
+                .args(["-CONT", &self.0.to_string()])
+                .status();
+        }
+    }
+
+    fn signal_process(pid: u32, signal: &str) {
+        let status = std::process::Command::new("kill")
+            .args([signal, &pid.to_string()])
+            .status()
+            .expect("signal the X server");
+        assert!(status.success(), "kill {signal} {pid} failed: {status}");
+    }
+
     /// The buttons and their positions a watching window saw, as `(detail, x, y)`.
     fn clicks_seen(x: &TestX) -> Vec<(u8, i16, i16)> {
         x.drain_events(Duration::from_millis(80))
@@ -3171,6 +3242,39 @@ mod display_tests {
 
     #[test]
     #[ignore = "starts a real X server; needs Xvfb"]
+    fn list_expiry_before_x_dispatch_does_not_close_the_connection() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let win = x.window().owned_by(pid).create();
+        plat.window = Some(win);
+        plat.window_process_tree_delay = Duration::from_millis(40);
+
+        let error = plat
+            .list_windows_by(Deadline::from_millis(5))
+            .expect_err("the deadline must expire during local process discovery");
+        plat.window_process_tree_delay = Duration::ZERO;
+        let retry = plat.list_windows_by(Deadline::from_millis(500));
+
+        assert_eq!(
+            (error.bound(), error.bound_owner(), error.bound_dispatch()),
+            (
+                Some(BoundKind::NotStarted),
+                Some(Whose::Caller),
+                Some(BoundDispatch::NotDispatched)
+            ),
+            "no X request was sent before the deadline elapsed: {error:?}"
+        );
+        assert!(
+            retry.is_ok(),
+            "pre-dispatch expiry must leave the X connection reusable: {retry:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn listing_windows_without_an_active_one_is_an_error_not_an_empty_list() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -3209,6 +3313,78 @@ mod display_tests {
             plat.window,
             Some(mine),
             "a refused selection must leave the active window where it was"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn select_expiry_before_x_dispatch_does_not_close_the_connection() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let win = x.window().owned_by(pid).create();
+        plat.window = Some(win);
+        plat.window_process_tree_delay = Duration::from_millis(40);
+
+        let error = plat
+            .select_window_by(WindowId(win as u64), Deadline::from_millis(5))
+            .expect_err("the deadline must expire during local process discovery");
+        plat.window_process_tree_delay = Duration::ZERO;
+        let retry = plat.select_window_by(WindowId(win as u64), Deadline::from_millis(500));
+
+        assert_eq!(
+            (error.bound(), error.bound_owner(), error.bound_dispatch()),
+            (
+                Some(BoundKind::NotStarted),
+                Some(Whose::Caller),
+                Some(BoundDispatch::NotDispatched)
+            ),
+            "no X request was sent before the deadline elapsed: {error:?}"
+        );
+        assert!(
+            retry.is_ok(),
+            "pre-dispatch expiry must leave the X connection reusable: {retry:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn in_flight_list_request_is_bounded_and_leaves_the_connection_fail_closed() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let win = x.window().owned_by(pid).create();
+        plat.window = Some(win);
+        let paused = PausedXServer::new(x.server_pid());
+
+        let started = Instant::now();
+        let error = plat
+            .list_windows_by(Deadline::from_millis(200))
+            .expect_err("the watchdog must interrupt an in-flight X request");
+        let elapsed = started.elapsed();
+        drop(paused);
+        let reuse = plat.list_windows_by(Deadline::from_millis(500));
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the stalled X request exceeded its bound: {elapsed:?}"
+        );
+        assert_eq!(
+            (error.bound(), error.bound_owner(), error.bound_dispatch()),
+            (
+                Some(BoundKind::TimedOut),
+                Some(Whose::Caller),
+                Some(BoundDispatch::MayHaveDispatched)
+            ),
+            "the X request was in flight when the deadline elapsed: {error:?}"
+        );
+        assert!(
+            reuse.is_err(),
+            "a connection whose request/reply framing was lost must remain fail-closed"
         );
     }
 
