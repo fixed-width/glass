@@ -106,6 +106,22 @@ impl SetValueDispatch {
     }
 }
 
+struct SetValueCompletion(SetValueDispatch);
+
+impl Drop for SetValueCompletion {
+    fn drop(&mut self) {
+        self.0.cancel_or_dispatched();
+    }
+}
+
+fn run_set_value_job(
+    dispatch: SetValueDispatch,
+    job: impl FnOnce(SetValueDispatch) -> Result<()>,
+) -> Result<()> {
+    let _completion = SetValueCompletion(dispatch.clone());
+    job(dispatch)
+}
+
 /// A bounded call, for the message its failure carries.
 #[derive(Clone, Copy)]
 enum Op {
@@ -204,7 +220,7 @@ impl A11yThread {
         let result = self.detached(
             Op::SetValue,
             wait,
-            move || job(worker_dispatch),
+            move || run_set_value_job(worker_dispatch, job),
             || self.set_value_no_answer(target, ended_by, &timeout_dispatch),
             || self.set_value_panicked(target, &panic_dispatch),
         );
@@ -820,6 +836,53 @@ mod tests {
         assert!(
             late_result.is_err(),
             "the late first claim must be rejected"
+        );
+    }
+
+    #[test]
+    fn worker_completion_seals_a_pending_noop_before_returning_its_result() {
+        let dispatch = SetValueDispatch::new();
+        let escaped = dispatch.clone();
+
+        let result = run_set_value_job(dispatch, |_| Ok(()));
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            escaped.dispatch(|| Ok(())).is_err(),
+            "completion must be sealed before the worker result becomes observable"
+        );
+    }
+
+    #[test]
+    fn worker_completion_seals_a_pending_pre_write_error_before_returning_it() {
+        let dispatch = SetValueDispatch::new();
+        let escaped = dispatch.clone();
+
+        let result = run_set_value_job(dispatch, |_| Err(GlassError::AxUnsupported));
+
+        assert!(
+            matches!(result, Err(GlassError::AxUnsupported)),
+            "{result:?}"
+        );
+        assert!(
+            escaped.dispatch(|| Ok(())).is_err(),
+            "an error result must not leave an escaped first claim alive"
+        );
+    }
+
+    #[test]
+    fn worker_completion_seals_a_pending_token_before_unwinding() {
+        let dispatch = SetValueDispatch::new();
+        let escaped = dispatch.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = run_set_value_job(dispatch, |_| panic!("scripted worker panic"));
+        }));
+
+        assert!(result.is_err(), "the scripted worker must unwind");
+        assert!(
+            escaped.dispatch(|| Ok(())).is_err(),
+            "unwinding must seal the mutation before sender disconnect is observable"
         );
     }
 

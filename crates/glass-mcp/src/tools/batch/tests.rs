@@ -17,6 +17,7 @@ enum DeadlineBehavior {
     FailLate,
     OrdinaryFailLate,
     NotDispatched,
+    NestedPriorDispatch,
     ReturnNotDispatched,
     CaptureCompletesLate,
     CaptureFailsLate,
@@ -295,6 +296,11 @@ impl Platform for DeadlinePlatform {
             DeadlineBehavior::NotDispatched => {
                 Err(GlassError::deadline_not_started("controlled pointer"))
             }
+            DeadlineBehavior::NestedPriorDispatch => Err(GlassError::BeforeDispatch(Box::new(
+                GlassError::AfterDispatch(Box::new(GlassError::Backend(
+                    "later compound failure".into(),
+                ))),
+            ))),
             DeadlineBehavior::NoActiveSession => Err(GlassError::NoActiveSession),
             DeadlineBehavior::MissingElement => Err(GlassError::AxElementNotFound(7)),
             DeadlineBehavior::StaleElement => Err(GlassError::AxElementChanged(7)),
@@ -1400,6 +1406,18 @@ fn proven_not_dispatched_mutation_is_reported_unattempted() {
     assert_eq!(step["attempted"], false);
     assert_eq!(step["side_effects_may_have_occurred"], false);
     assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn nested_prior_dispatch_remains_attempted_and_warns_about_side_effects() {
+    let (mut g, _, _) = deadline_glass(DeadlineBehavior::NestedPriorDispatch, vec![]);
+    let err = do_actions(&mut g, &do_args(vec![click(1, 1)], 100)).unwrap_err();
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(envelope["error"]["code"], "action_failed");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], true);
 }
 
 #[test]

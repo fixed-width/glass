@@ -522,7 +522,13 @@ impl GlassError {
     pub fn bound_dispatch(&self) -> Option<BoundDispatch> {
         match self {
             GlassError::Bounded { dispatch, .. } => Some(*dispatch),
-            GlassError::BeforeDispatch(_) => Some(BoundDispatch::NotDispatched),
+            GlassError::BeforeDispatch(error) => {
+                if error.bound_dispatch() == Some(BoundDispatch::MayHaveDispatched) {
+                    Some(BoundDispatch::MayHaveDispatched)
+                } else {
+                    Some(BoundDispatch::NotDispatched)
+                }
+            }
             GlassError::AfterDispatch(_)
             | GlassError::AxWriteUnconfirmed(..)
             | GlassError::AxWriteUnconfirmedCaused { .. } => Some(BoundDispatch::MayHaveDispatched),
@@ -647,7 +653,11 @@ mod tests {
         ))));
         assert_eq!(bounded.bound(), Some(BoundKind::TimedOut));
         assert_eq!(bounded.bound_owner(), Some(Whose::Callee));
-        assert_eq!(bounded.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert_eq!(
+            bounded.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "an inner dispatched bound must outrank outer preflight annotations"
+        );
         assert!(matches!(bounded.cause(), GlassError::Bounded { .. }));
 
         let tool = GlassError::BeforeDispatch(Box::new(GlassError::BeforeDispatch(Box::new(
@@ -1170,6 +1180,19 @@ mod tests {
         assert_eq!(
             GlassError::AxWriteUnconfirmed(7, "x".into()).bound_dispatch(),
             Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn nested_prior_dispatch_cannot_be_downgraded_by_an_outer_preflight_annotation() {
+        let error = GlassError::BeforeDispatch(Box::new(GlassError::AfterDispatch(Box::new(
+            GlassError::Backend("later failure".into()),
+        ))));
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "an inner dispatch must dominate an outer not-dispatched annotation"
         );
     }
 
