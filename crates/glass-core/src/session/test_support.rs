@@ -275,8 +275,27 @@ impl Platform for FakePlatform {
         region: Option<&Region>,
         deadline: Deadline,
     ) -> Result<Frame> {
+        if let Some(log) = &self.capture_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("window capture"));
+        }
+        if let Some(delay) = self.capture_delay {
+            std::thread::sleep(delay);
+        }
+        if let Some(whose) = self.capture_deadline_error_owner
+            && deadline.has_passed()
+        {
+            return Err(match whose {
+                crate::Whose::Caller => GlassError::caller_deadline_elapsed("window capture"),
+                crate::Whose::Callee => GlassError::Bounded {
+                    kind: crate::BoundKind::TimedOut,
+                    whose,
+                    dispatch: crate::BoundDispatch::MayHaveDispatched,
+                    message: "window capture: the backend capture budget elapsed".into(),
+                },
+            });
         }
         self.capture_window_log
             .lock()

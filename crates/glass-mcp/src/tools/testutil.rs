@@ -22,6 +22,7 @@ pub struct FakePlatform {
     pub started: bool,
     pub events: Arc<Mutex<Vec<String>>>,
     pub clipboard: String,
+    pub window_frame: Option<(WindowId, Frame)>,
     /// Count of `capture_frame` calls — lets a test assert a settle actually captured
     /// frames (e.g. `return:"snapshot"` settling before it folds the tree).
     pub captures: Arc<Mutex<usize>>,
@@ -45,6 +46,10 @@ impl FakePlatform {
     }
     pub fn with_frames(mut self, frames: Vec<Frame>) -> Self {
         self.frames = frames.into();
+        self
+    }
+    pub fn with_window_frame(mut self, id: WindowId, frame: Frame) -> Self {
+        self.window_frame = Some((id, frame));
         self
     }
     pub fn with_logs(mut self, logs: Vec<(Stream, &str)>) -> Self {
@@ -114,16 +119,23 @@ impl Platform for FakePlatform {
 
     fn capture_window_by(
         &mut self,
-        _id: WindowId,
-        _region: Option<&Region>,
+        id: WindowId,
+        region: Option<&Region>,
         deadline: Deadline,
     ) -> Result<Frame> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("window capture"));
         }
-        Err(GlassError::Unsupported(
-            "capture_window is not supported by this backend".into(),
-        ))
+        let frame = self
+            .window_frame
+            .as_ref()
+            .filter(|(scripted_id, _)| *scripted_id == id)
+            .map(|(_, frame)| frame.clone())
+            .ok_or(GlassError::WindowNotFound)?;
+        match region {
+            Some(region) => frame.crop(region),
+            None => Ok(frame),
+        }
     }
 
     fn send_pointer_by(&mut self, e: &PointerEvent, deadline: Deadline) -> Result<()> {

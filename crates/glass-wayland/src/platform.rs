@@ -149,6 +149,7 @@ struct ActiveSession {
     active_rect: WindowGeometry,         // active window's output rect (capture/input origin)
     geometry: WindowGeometry,            // active window geometry (session contract)
     time: u32,
+    input_poison: Option<String>,
 }
 
 /// Linux/Wayland backend (wlroots protocols, per-session headless `sway` compositor).
@@ -1543,6 +1544,7 @@ fn bring_up_session(
         active_rect,
         geometry: geometry.clone(),
         time: 0,
+        input_poison: None,
     };
     Ok((session, geometry))
 }
@@ -1563,11 +1565,11 @@ struct Held {
 }
 
 impl Held {
-    /// Put the seat back, best effort — what failed is the compositor answering, so there is
-    /// nothing to wait for.
-    fn release(&mut self, s: &mut ActiveSession) {
+    /// Put the seat back without waiting for the compositor, but require the release requests to
+    /// reach the Wayland transport.
+    fn release(&mut self, s: &mut ActiveSession) -> Result<()> {
         if self.button.is_none() && self.key.is_none() && !self.modifiers {
-            return;
+            return Ok(());
         }
         s.time = s.time.wrapping_add(1);
         let t = s.time;
@@ -1581,7 +1583,54 @@ impl Held {
         if std::mem::take(&mut self.modifiers) {
             s.keyboard.modifiers(0, 0, 0, 0);
         }
-        let _ = s.conn.flush();
+        s.conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("input cleanup flush: {e}")))
+    }
+}
+
+fn attach_cleanup_failure(mut primary: GlassError, cleanup: GlassError) -> GlassError {
+    let note = format!("; input cleanup failed: {cleanup}");
+    match &mut primary {
+        GlassError::Backend(message) | GlassError::Bounded { message, .. } => {
+            message.push_str(&note);
+        }
+        _ => eprintln!("glass-wayland: {primary}{note}"),
+    }
+    primary
+}
+
+fn finish_input_cleanup<T>(
+    poison: &mut Option<String>,
+    primary: Result<T>,
+    cleanup: Result<()>,
+) -> Result<T> {
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => {
+            poison.get_or_insert_with(|| cleanup.to_string());
+            Err(attach_cleanup_failure(primary, cleanup))
+        }
+        (Ok(_), Err(cleanup)) => {
+            poison.get_or_insert_with(|| cleanup.to_string());
+            Err(cleanup)
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+fn record_release_failure(poison: &mut Option<String>, result: &Result<()>) {
+    if let Err(error) = result {
+        poison.get_or_insert_with(|| error.to_string());
+    }
+}
+
+fn require_healthy_input(s: &ActiveSession) -> Result<()> {
+    match &s.input_poison {
+        Some(cause) => Err(GlassError::Backend(format!(
+            "input state is uncertain after a release cleanup failure ({cause}); restart the session"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -1634,20 +1683,24 @@ fn tap_by(
     let mut held = Held::default();
     for state in [1u32, 0] {
         if deadline.has_passed() {
-            held.release(s);
-            return Err(GlassError::deadline_not_started("key tap"));
+            let cleanup = held.release(s);
+            return finish_input_cleanup(
+                &mut s.input_poison,
+                Err(GlassError::deadline_not_started("key tap")),
+                cleanup,
+            );
         }
         s.time = s.time.wrapping_add(1);
         kb.key(s.time, kc, state);
         dispatch.mark();
         held.key = (state == 1).then_some(kc);
         if let Err(e) = sync_session_by(s, "key tap", deadline) {
-            held.release(s);
-            return Err(e);
+            let cleanup = held.release(s);
+            return finish_input_cleanup(&mut s.input_poison, Err(e), cleanup);
         }
         if let Err(error) = input_settle_by(deadline) {
-            held.release(s);
-            return Err(error);
+            let cleanup = held.release(s);
+            return finish_input_cleanup(&mut s.input_poison, Err(error), cleanup);
         }
     }
     Ok(())
@@ -1731,7 +1784,10 @@ struct WaylandDragSink<'a> {
 /// otherwise leaves the button down.
 impl Drop for WaylandDragSink<'_> {
     fn drop(&mut self) {
-        self.held.release(self.s);
+        let cleanup = self.held.release(self.s);
+        if let Err(error) = finish_input_cleanup(&mut self.s.input_poison, Ok(()), cleanup) {
+            eprintln!("glass-wayland: drag cleanup failed: {error}");
+        }
     }
 }
 
@@ -1791,7 +1847,11 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         vp.frame();
         self.dispatch.mark();
         self.held.button = down.then_some(self.b);
-        self.settle()
+        let result = self.settle();
+        if !down {
+            record_release_failure(&mut self.s.input_poison, &result);
+        }
+        result
     }
     fn modifiers(&mut self, down: bool) -> Result<()> {
         if self.mask == 0 {
@@ -1815,7 +1875,11 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         self.held.modifiers = down;
         // Self-commit so the modifier change reaches the compositor before the
         // press/release that follows it (matches the X11 sink's flush-per-call).
-        self.settle()
+        let result = self.settle();
+        if !down {
+            record_release_failure(&mut self.s.input_poison, &result);
+        }
+        result
     }
 }
 
@@ -1834,7 +1898,10 @@ struct WaylandChordSink<'a> {
 /// A chord that ends early otherwise leaves its key or its modifier down.
 impl Drop for WaylandChordSink<'_> {
     fn drop(&mut self) {
-        self.held.release(self.s);
+        let cleanup = self.held.release(self.s);
+        if let Err(error) = finish_input_cleanup(&mut self.s.input_poison, Ok(()), cleanup) {
+            eprintln!("glass-wayland: chord cleanup failed: {error}");
+        }
     }
 }
 
@@ -1866,7 +1933,11 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
             self.dispatch.mark();
         }
         self.held.modifiers = down && self.mask != 0;
-        self.settle()
+        let result = self.settle();
+        if !down {
+            record_release_failure(&mut self.s.input_poison, &result);
+        }
+        result
     }
     fn key(&mut self, down: bool) -> Result<()> {
         let kb = self.s.keyboard.clone();
@@ -1875,7 +1946,11 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
         kb.key(t, 1, u32::from(down)); // keycode 1 = the chord's key; 1=pressed, 0=released
         self.dispatch.mark();
         self.held.key = down.then_some(1);
-        self.settle()
+        let result = self.settle();
+        if !down {
+            record_release_failure(&mut self.s.input_poison, &result);
+        }
+        result
     }
 }
 
@@ -1904,7 +1979,10 @@ struct WaylandScrollSink<'a> {
 /// otherwise leaves that modifier down.
 impl Drop for WaylandScrollSink<'_> {
     fn drop(&mut self) {
-        self.held.release(self.s);
+        let cleanup = self.held.release(self.s);
+        if let Err(error) = finish_input_cleanup(&mut self.s.input_poison, Ok(()), cleanup) {
+            eprintln!("glass-wayland: scroll cleanup failed: {error}");
+        }
     }
 }
 
@@ -1945,7 +2023,11 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
             self.dispatch.mark();
         }
         self.held.modifiers = down;
-        self.settle()
+        let result = self.settle();
+        if !down {
+            record_release_failure(&mut self.s.input_poison, &result);
+        }
+        result
     }
     fn wheel(&mut self) -> Result<()> {
         let vp = self.s.pointer.clone();
@@ -2172,6 +2254,7 @@ impl Platform for WaylandPlatform {
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
         run_wayland_call_by(deadline, "pointer input", |dispatch| {
             let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            require_healthy_input(session)?;
             session.time = session.time.wrapping_add(1);
             let t = session.time;
             // Pointer motion is absolute over the OUTPUT; map window-relative coords
@@ -2263,8 +2346,8 @@ impl Platform for WaylandPlatform {
                     let outcome = clicks(session, &mut held);
                     // The same release on both paths: what ends the modifier on a click that worked is
                     // what has to end it on one that did not.
-                    held.release(session);
-                    outcome?;
+                    let cleanup = held.release(session);
+                    finish_input_cleanup(&mut session.input_poison, outcome, cleanup)?;
                 }
                 PointerEvent::Drag {
                     from_x,
@@ -2332,6 +2415,7 @@ impl Platform for WaylandPlatform {
         run_wayland_call_by(deadline, "key input", |dispatch| {
             use glass_core::keys::parse_chord;
             let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            require_healthy_input(session)?;
             let kb = session.keyboard.clone();
             match event {
                 KeyEvent::Text(text) => {
@@ -2559,6 +2643,27 @@ mod pure_tests {
         .expect_err("the keymap did not reach the compositor");
 
         assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn failed_cleanup_flush_preserves_primary_provenance_and_poisons_input() {
+        let mut poison = None;
+        let primary = Err::<(), _>(GlassError::caller_deadline_elapsed("pointer input"));
+        let cleanup = Err(GlassError::Backend("cleanup flush failed".into()));
+
+        let error = finish_input_cleanup(&mut poison, primary, cleanup).unwrap_err();
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("cleanup flush failed"));
+        assert_eq!(
+            poison.as_deref(),
+            Some("backend error: cleanup flush failed")
+        );
     }
 
     #[test]

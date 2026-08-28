@@ -924,6 +924,24 @@ mod tests {
     }
 
     #[test]
+    fn do_args_accepts_every_documented_type_return_mode() {
+        for return_mode in ["none", "settle", "snapshot"] {
+            let raw = serde_json::json!({
+                "actions": [{
+                    "action": "type",
+                    "text": "hé🙂",
+                    "return": return_mode
+                }]
+            });
+            let args: DoArgs = serde_json::from_value(raw).unwrap();
+            let Action::Type(type_args) = &args.actions[0] else {
+                panic!("the action must remain a type action");
+            };
+            assert_eq!(type_args.return_.as_deref(), Some(return_mode));
+        }
+    }
+
+    #[test]
     fn do_args_rejects_unknown_action() {
         let r: Result<DoArgs, _> =
             serde_json::from_str(r#"{"actions":[{"action":"teleport","x":1}]}"#);
@@ -972,6 +990,33 @@ mod tests {
             a.encoded_argument_bytes,
             serde_json::to_vec(&value).unwrap().len()
         );
+    }
+
+    fn mixed_utf8_do_args_with_compact_len(target: usize) -> Vec<u8> {
+        let mut value = serde_json::json!({
+            "actions": [{
+                "action": "key",
+                "chord": "é",
+                "ignored_action_bytes": "🙂"
+            }],
+            "ignored_top_level_bytes": "漢"
+        });
+        let base = serde_json::to_vec(&value).unwrap().len();
+        assert!(base <= target);
+        value["ignored_top_level_bytes"] =
+            serde_json::Value::String(format!("漢{}", "x".repeat(target - base)));
+        let compact = serde_json::to_vec(&value).unwrap();
+        assert_eq!(compact.len(), target);
+        compact
+    }
+
+    #[test]
+    fn do_args_measure_exact_mixed_utf8_boundaries_before_ignoring_unknown_fields() {
+        for target in [65_536, 65_537] {
+            let compact = mixed_utf8_do_args_with_compact_len(target);
+            let args: DoArgs = serde_json::from_slice(&compact).unwrap();
+            assert_eq!(args.encoded_argument_bytes, target);
+        }
     }
 
     #[test]

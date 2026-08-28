@@ -98,6 +98,17 @@ fn run_x11_type_by<S: glass_core::TypeSink>(
     glass_core::run_type_by(sink, text, dwell, deadline)
 }
 
+fn attach_cleanup_failure(mut primary: GlassError, cleanup: GlassError) -> GlassError {
+    let note = format!("; cleanup failed after pointer input: {cleanup}");
+    match &mut primary {
+        GlassError::Backend(message) | GlassError::Bounded { message, .. } => {
+            message.push_str(&note);
+        }
+        _ => eprintln!("glass-x11: {primary}{note}"),
+    }
+    primary
+}
+
 fn run_clicks_by(
     count: u32,
     mut deadline_passed: impl FnMut() -> bool,
@@ -113,15 +124,20 @@ fn run_clicks_by(
             button(true)?;
             button_down = true;
             if deadline_passed() {
-                return Err(GlassError::deadline_not_started("pointer input"));
+                return Err(GlassError::caller_deadline_elapsed("pointer input"));
             }
             button(false)?;
             button_down = false;
         }
         Ok(())
     })();
-    cleanup(button_down, outcome.is_err())?;
-    outcome
+    let cleanup = cleanup(button_down, outcome.is_err());
+    match (outcome, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(attach_cleanup_failure(primary, cleanup)),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 fn run_scroll_buttons_by(
@@ -1666,7 +1682,9 @@ mod tests {
     use super::{
         hint_matches, run_clicks_by, run_scroll_buttons_by, run_x11_call_by, run_x11_type_by,
     };
-    use glass_core::{BoundDispatch, Deadline, GlassError, Result, TypeSink, Whose, WindowHint};
+    use glass_core::{
+        BoundDispatch, BoundKind, Deadline, GlassError, Result, TypeSink, Whose, WindowHint,
+    };
     use std::cell::{Cell, RefCell};
     use std::time::{Duration, Instant};
 
@@ -1713,31 +1731,41 @@ mod tests {
         let events = RefCell::new(Vec::new());
         let checks = Cell::new(0);
 
-        run_clicks_by(
-            1,
-            || {
-                checks.set(checks.get() + 1);
-                checks.get() == 2
-            },
-            |down| {
-                events
-                    .borrow_mut()
-                    .push(if down { "press" } else { "release" });
-                Ok(())
-            },
-            |button_down, failed| {
-                if button_down {
-                    events.borrow_mut().push("release");
-                }
-                if failed {
-                    events.borrow_mut().push("sync");
-                }
-                Ok(())
-            },
-        )
+        let error = run_x11_call_by(Deadline::UNBOUNDED, "pointer input", |dispatch| {
+            run_clicks_by(
+                1,
+                || {
+                    checks.set(checks.get() + 1);
+                    checks.get() == 2
+                },
+                |down| {
+                    events
+                        .borrow_mut()
+                        .push(if down { "press" } else { "release" });
+                    dispatch.mark();
+                    Ok(())
+                },
+                |button_down, failed| {
+                    if button_down {
+                        events.borrow_mut().push("release");
+                    }
+                    if failed {
+                        events.borrow_mut().push("sync");
+                    }
+                    Err(GlassError::Backend("cleanup sync failed".into()))
+                },
+            )
+        })
         .expect_err("the deadline expires after the press");
 
         assert_eq!(*events.borrow(), ["press", "release", "sync"]);
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("cleanup sync failed"));
     }
 
     #[test]

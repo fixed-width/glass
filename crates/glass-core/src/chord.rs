@@ -48,14 +48,53 @@ fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
     require_time(deadline, true)
 }
 
-fn cleanup_chord<S: ChordSink>(sink: &mut S, key_down: bool, modifiers_down: bool) {
+fn attach_cleanup_failure(
+    mut primary: GlassError,
+    cleanup: GlassError,
+    release: &str,
+) -> GlassError {
+    let note = format!("; cleanup failed while releasing {release}: {cleanup}");
+    match &mut primary {
+        GlassError::Backend(message) | GlassError::Bounded { message, .. } => {
+            message.push_str(&note);
+        }
+        _ => eprintln!("glass-core: {primary}{note}"),
+    }
+    primary
+}
+
+fn combine_cleanup(
+    primary: crate::Result<()>,
+    cleanup: crate::Result<()>,
+    release: &str,
+) -> crate::Result<()> {
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(attach_cleanup_failure(primary, cleanup, release)),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn preserve_primary_after_cleanup(primary: GlassError, cleanup: crate::Result<()>) -> GlassError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => attach_cleanup_failure(primary, cleanup, "the chord"),
+    }
+}
+
+fn cleanup_chord<S: ChordSink>(
+    sink: &mut S,
+    key_down: bool,
+    modifiers_down: bool,
+) -> crate::Result<()> {
     // Releases remain mandatory after expiry and run in dependency order so a
     // failed key release never prevents the modifier release attempt.
-    if key_down {
-        let _ = sink.key(false);
-    }
+    let key = if key_down { sink.key(false) } else { Ok(()) };
     if modifiers_down {
-        let _ = sink.modifiers(false);
+        combine_cleanup(key, sink.modifiers(false), "the chord modifiers")
+    } else {
+        key
     }
 }
 
@@ -71,51 +110,51 @@ pub fn run_chord_by<S: ChordSink>(sink: &mut S, deadline: Deadline) -> crate::Re
 
     let modifiers_down = true;
     if let Err(error) = sink.modifiers(true) {
-        cleanup_chord(sink, false, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_chord(sink, false, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = require_time(deadline, true) {
-        cleanup_chord(sink, false, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_chord(sink, false, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
 
     if let Err(error) = sleep_by(deadline, CHORD_DWELL) {
-        cleanup_chord(sink, false, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_chord(sink, false, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
 
     let key_down = true;
     if let Err(error) = sink.key(true) {
-        cleanup_chord(sink, key_down, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_chord(sink, key_down, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = require_time(deadline, true) {
-        cleanup_chord(sink, key_down, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_chord(sink, key_down, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
 
     if let Err(error) = require_time(deadline, true) {
-        cleanup_chord(sink, key_down, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_chord(sink, key_down, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     let key_result = sink.key(false);
     let key_deadline = require_time(deadline, true);
     if let Err(error) = key_result {
-        cleanup_chord(sink, false, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_chord(sink, false, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = key_deadline {
-        cleanup_chord(sink, false, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_chord(sink, false, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
 
     if let Err(error) = sleep_by(deadline, CHORD_DWELL) {
-        cleanup_chord(sink, false, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_chord(sink, false, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = require_time(deadline, true) {
-        cleanup_chord(sink, false, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_chord(sink, false, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     sink.modifiers(false)?;
     require_time(deadline, true)
@@ -234,8 +273,10 @@ mod tests {
                 self.0.modifiers(down)?;
                 if down {
                     std::thread::sleep(Duration::from_millis(20));
+                    Ok(())
+                } else {
+                    Err(GlassError::Backend("modifier cleanup failed".into()))
                 }
-                Ok(())
             }
 
             fn key(&mut self, down: bool) -> Result<()> {
@@ -248,10 +289,12 @@ mod tests {
 
         assert_eq!(sink.0.calls, vec![Call::Mods(true), Call::Mods(false)]);
         assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
         assert_eq!(
             error.bound_dispatch(),
             Some(BoundDispatch::MayHaveDispatched)
         );
+        assert!(error.to_string().contains("modifier cleanup failed"));
     }
 
     #[test]
@@ -260,7 +303,12 @@ mod tests {
 
         impl ChordSink for FailingKeyReleaseSink {
             fn modifiers(&mut self, down: bool) -> Result<()> {
-                self.0.modifiers(down)
+                self.0.modifiers(down)?;
+                if down {
+                    Ok(())
+                } else {
+                    Err(GlassError::Backend("modifier cleanup failed".into()))
+                }
             }
 
             fn key(&mut self, down: bool) -> Result<()> {
@@ -277,6 +325,7 @@ mod tests {
         let error = run_chord_by(&mut sink, Deadline::UNBOUNDED).unwrap_err();
 
         assert!(error.to_string().contains("key release failed"));
+        assert!(error.to_string().contains("modifier cleanup failed"));
         assert_eq!(sink.0.calls.last(), Some(&Call::Mods(false)));
     }
 }

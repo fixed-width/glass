@@ -126,14 +126,57 @@ fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
     require_time(deadline, true)
 }
 
-fn cleanup_drag<S: DragSink>(sink: &mut S, button_down: bool, modifiers_down: bool) {
+fn attach_cleanup_failure(
+    mut primary: GlassError,
+    cleanup: GlassError,
+    release: &str,
+) -> GlassError {
+    let note = format!("; cleanup failed while releasing {release}: {cleanup}");
+    match &mut primary {
+        GlassError::Backend(message) | GlassError::Bounded { message, .. } => {
+            message.push_str(&note);
+        }
+        _ => eprintln!("glass-core: {primary}{note}"),
+    }
+    primary
+}
+
+fn combine_cleanup(
+    primary: crate::Result<()>,
+    cleanup: crate::Result<()>,
+    release: &str,
+) -> crate::Result<()> {
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(attach_cleanup_failure(primary, cleanup, release)),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn preserve_primary_after_cleanup(primary: GlassError, cleanup: crate::Result<()>) -> GlassError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => attach_cleanup_failure(primary, cleanup, "the drag"),
+    }
+}
+
+fn cleanup_drag<S: DragSink>(
+    sink: &mut S,
+    button_down: bool,
+    modifiers_down: bool,
+) -> crate::Result<()> {
     // Releases are safety cleanup, not continued gesture dispatch. Once a press may
     // have landed they must still be attempted after expiry, in dependency order.
-    if button_down {
-        let _ = sink.button(false);
-    }
+    let button = if button_down {
+        sink.button(false)
+    } else {
+        Ok(())
+    };
     if modifiers_down {
-        let _ = sink.modifiers(false);
+        combine_cleanup(button, sink.modifiers(false), "the drag modifiers")
+    } else {
+        button
     }
 }
 
@@ -162,56 +205,56 @@ pub fn run_drag_by<S: DragSink>(
     require_time(deadline, true)?;
     let modifiers_down = true;
     if let Err(error) = sink.modifiers(true) {
-        cleanup_drag(sink, false, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_drag(sink, false, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = require_time(deadline, true) {
-        cleanup_drag(sink, false, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_drag(sink, false, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
 
     require_time(deadline, true)?;
     let button_down = true;
     if let Err(error) = sink.button(true) {
-        cleanup_drag(sink, button_down, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_drag(sink, button_down, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = require_time(deadline, true) {
-        cleanup_drag(sink, button_down, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_drag(sink, button_down, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
 
     for &(px, py) in rest {
         if let Err(error) = sleep_by(deadline, gesture.step) {
-            cleanup_drag(sink, button_down, modifiers_down);
-            return Err(error);
+            let cleanup = cleanup_drag(sink, button_down, modifiers_down);
+            return Err(preserve_primary_after_cleanup(error, cleanup));
         }
         if let Err(error) = sink.move_to(px, py) {
-            cleanup_drag(sink, button_down, modifiers_down);
-            return Err(error);
+            let cleanup = cleanup_drag(sink, button_down, modifiers_down);
+            return Err(preserve_primary_after_cleanup(error, cleanup));
         }
         if let Err(error) = require_time(deadline, true) {
-            cleanup_drag(sink, button_down, modifiers_down);
-            return Err(error);
+            let cleanup = cleanup_drag(sink, button_down, modifiers_down);
+            return Err(preserve_primary_after_cleanup(error, cleanup));
         }
     }
 
     if let Err(error) = sleep_by(deadline, gesture.dwell) {
-        cleanup_drag(sink, button_down, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_drag(sink, button_down, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = sink.move_to(end.0, end.1) {
-        cleanup_drag(sink, button_down, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_drag(sink, button_down, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = require_time(deadline, true) {
-        cleanup_drag(sink, button_down, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_drag(sink, button_down, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
 
     if let Err(error) = require_time(deadline, true) {
-        cleanup_drag(sink, button_down, modifiers_down);
-        return Err(error);
+        let cleanup = cleanup_drag(sink, button_down, modifiers_down);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     let button_result = sink.button(false);
     let button_deadline = require_time(deadline, true);
@@ -222,11 +265,15 @@ pub fn run_drag_by<S: DragSink>(
     let modifier_result = sink.modifiers(false);
     let modifier_deadline = require_time(deadline, true);
 
-    button_result?;
-    button_deadline?;
-    modifier_pre_deadline?;
-    modifier_result?;
-    modifier_deadline
+    let before_modifier_cleanup = button_result
+        .and(button_deadline)
+        .and(modifier_pre_deadline);
+    combine_cleanup(
+        before_modifier_cleanup,
+        modifier_result,
+        "the drag modifiers",
+    )
+    .and(modifier_deadline)
 }
 
 #[cfg(test)]
@@ -572,7 +619,12 @@ mod run_drag_tests {
             }
 
             fn modifiers(&mut self, down: bool) -> Result<()> {
-                self.0.modifiers(down)
+                self.0.modifiers(down)?;
+                if down {
+                    Ok(())
+                } else {
+                    Err(GlassError::Backend("modifier cleanup failed".into()))
+                }
             }
         }
 
@@ -585,6 +637,52 @@ mod run_drag_tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("button release failed"));
+        assert!(error.to_string().contains("modifier cleanup failed"));
         assert_eq!(sink.0.calls.last(), Some(&Call::Mods(false)));
+    }
+
+    #[test]
+    fn run_drag_by_preserves_deadline_provenance_when_cleanup_fails() {
+        struct SlowModifierCleanupSink(RecordingSink);
+
+        impl DragSink for SlowModifierCleanupSink {
+            fn place(&mut self, x: i32, y: i32) -> Result<()> {
+                self.0.place(x, y)
+            }
+
+            fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
+                self.0.move_to(x, y)
+            }
+
+            fn button(&mut self, down: bool) -> Result<()> {
+                self.0.button(down)
+            }
+
+            fn modifiers(&mut self, down: bool) -> Result<()> {
+                self.0.modifiers(down)?;
+                if down {
+                    std::thread::sleep(Duration::from_millis(20));
+                    Ok(())
+                } else {
+                    Err(GlassError::Backend("modifier cleanup failed".into()))
+                }
+            }
+        }
+
+        let mut sink = SlowModifierCleanupSink(RecordingSink::default());
+        let error = run_drag_by(
+            &mut sink,
+            &gesture(vec![(0, 0), (10, 0)]),
+            Deadline::from_millis(5),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("modifier cleanup failed"));
     }
 }

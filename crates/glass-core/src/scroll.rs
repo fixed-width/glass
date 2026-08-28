@@ -48,10 +48,28 @@ fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
     require_time(deadline, true)
 }
 
-fn cleanup_modifiers<S: ScrollSink>(sink: &mut S) {
+fn attach_cleanup_failure(mut primary: GlassError, cleanup: GlassError) -> GlassError {
+    let note = format!("; cleanup failed while releasing the scroll modifiers: {cleanup}");
+    match &mut primary {
+        GlassError::Backend(message) | GlassError::Bounded { message, .. } => {
+            message.push_str(&note);
+        }
+        _ => eprintln!("glass-core: {primary}{note}"),
+    }
+    primary
+}
+
+fn preserve_primary_after_cleanup(primary: GlassError, cleanup: crate::Result<()>) -> GlassError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => attach_cleanup_failure(primary, cleanup),
+    }
+}
+
+fn cleanup_modifiers<S: ScrollSink>(sink: &mut S) -> crate::Result<()> {
     // A release is mandatory safety cleanup once modifier-down may have landed,
     // even when the deadline has elapsed or the wheel dispatch failed.
-    let _ = sink.modifiers(false);
+    sink.modifiers(false)
 }
 
 /// Drive a scroll against a backend `sink`, stopping at `deadline`.
@@ -72,34 +90,34 @@ pub fn run_scroll_by<S: ScrollSink>(
 
     let modifiers_down = true;
     if let Err(error) = sink.modifiers(true) {
-        cleanup_modifiers(sink);
-        return Err(error);
+        let cleanup = cleanup_modifiers(sink);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = require_time(deadline, true) {
-        cleanup_modifiers(sink);
-        return Err(error);
+        let cleanup = cleanup_modifiers(sink);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
 
     if let Err(error) = sleep_by(deadline, SCROLL_DWELL) {
-        cleanup_modifiers(sink);
-        return Err(error);
+        let cleanup = cleanup_modifiers(sink);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = sink.wheel() {
-        cleanup_modifiers(sink);
-        return Err(error);
+        let cleanup = cleanup_modifiers(sink);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = require_time(deadline, true) {
-        cleanup_modifiers(sink);
-        return Err(error);
+        let cleanup = cleanup_modifiers(sink);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
 
     if let Err(error) = sleep_by(deadline, SCROLL_DWELL) {
-        cleanup_modifiers(sink);
-        return Err(error);
+        let cleanup = cleanup_modifiers(sink);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     if let Err(error) = require_time(deadline, modifiers_down) {
-        cleanup_modifiers(sink);
-        return Err(error);
+        let cleanup = cleanup_modifiers(sink);
+        return Err(preserve_primary_after_cleanup(error, cleanup));
     }
     sink.modifiers(false)?;
     require_time(deadline, true)
@@ -246,7 +264,12 @@ mod tests {
 
         impl ScrollSink for FailingWheelSink {
             fn modifiers(&mut self, down: bool) -> Result<()> {
-                self.0.modifiers(down)
+                self.0.modifiers(down)?;
+                if down {
+                    Ok(())
+                } else {
+                    Err(GlassError::Backend("modifier cleanup failed".into()))
+                }
             }
 
             fn wheel(&mut self) -> Result<()> {
@@ -259,6 +282,39 @@ mod tests {
         let error = run_scroll_by(&mut sink, true, Deadline::UNBOUNDED).unwrap_err();
 
         assert!(error.to_string().contains("wheel failed"));
+        assert!(error.to_string().contains("modifier cleanup failed"));
         assert_eq!(sink.0.calls.last(), Some(&Call::Mods(false)));
+    }
+
+    #[test]
+    fn run_scroll_by_preserves_deadline_provenance_when_cleanup_fails() {
+        struct SlowModifierCleanupSink(RecordingSink);
+
+        impl ScrollSink for SlowModifierCleanupSink {
+            fn modifiers(&mut self, down: bool) -> Result<()> {
+                self.0.modifiers(down)?;
+                if down {
+                    std::thread::sleep(Duration::from_millis(20));
+                    Ok(())
+                } else {
+                    Err(GlassError::Backend("modifier cleanup failed".into()))
+                }
+            }
+
+            fn wheel(&mut self) -> Result<()> {
+                self.0.wheel()
+            }
+        }
+
+        let mut sink = SlowModifierCleanupSink(RecordingSink::default());
+        let error = run_scroll_by(&mut sink, true, Deadline::from_millis(5)).unwrap_err();
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("modifier cleanup failed"));
     }
 }

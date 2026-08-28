@@ -90,6 +90,44 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_by_window_passes_the_exact_callers_deadline_to_the_platform() {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let deadline = Deadline::from_millis(1_000);
+        let id = WindowId(7);
+        let platform = FakePlatform::new(4, 4)
+            .with_window_frame(id, Frame::solid(4, 4, [7, 7, 7, 255]))
+            .with_capture_deadline_log(deadlines.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        g.screenshot_by(None, Some(id), deadline).unwrap();
+
+        assert_eq!(*deadlines.lock().unwrap(), vec![deadline]);
+    }
+
+    #[test]
+    fn screenshot_by_window_rejects_a_backend_success_after_the_deadline() {
+        let id = WindowId(7);
+        let platform = FakePlatform::new(4, 4)
+            .with_window_frame(id, Frame::solid(4, 4, [7, 7, 7, 255]))
+            .with_capture_delay(Duration::from_millis(20))
+            .honoring_capture_deadline();
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .screenshot_by(None, Some(id), Deadline::from_millis(5))
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
     fn screenshot_by_spent_deadline_does_not_capture() {
         let captures = Arc::new(Mutex::new(Vec::new()));
         let platform = FakePlatform::new(4, 4)
