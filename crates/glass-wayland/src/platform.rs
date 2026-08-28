@@ -2566,7 +2566,7 @@ impl Platform for WaylandPlatform {
             // it — otherwise the caller is told the app has fewer windows than it does.
             if session
                 .recovery
-                .recover_if_due(Instant::now(), &x11_ids(&wins))
+                .recover_if_due_by(Instant::now(), &x11_ids(&wins), deadline)?
                 > 0
             {
                 let settle = deadline
@@ -3889,8 +3889,381 @@ mod session_tests {
     //! The backend against a real compositor. Every method below talks to sway or to the wayland
     //! connection, so there is nothing underneath them to fake; [`crate::testw`] launches a
     //! private session and observes it over a connection the backend does not own.
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixStream;
+
     use super::*;
     use crate::testw::{Launch, READY_LINE};
+    use x11rb::protocol::xproto::{
+        GetInputFocusReply, GetWindowAttributesReply, MapState, QueryTreeReply, Setup, WindowClass,
+    };
+    use x11rb::x11_utils::Serialize as _;
+
+    const SCRIPTED_X_ROOT: u32 = 0x100;
+    const SCRIPTED_X_WINDOW: u32 = 0x200;
+    const STALLED_X_REPLY: Duration = Duration::from_secs(1);
+    const X_REPLY_DEADLINE: Duration = Duration::from_millis(50);
+
+    fn scripted_x_recovery(
+        missing_before: &[u32],
+        script: impl FnOnce(UnixStream) + Send + 'static,
+    ) -> (crate::xwayland::Recovery, std::thread::JoinHandle<()>) {
+        let (client, server) = UnixStream::pair().expect("scripted X11 socketpair");
+        let setup = Setup {
+            resource_id_base: 0x0100_0000,
+            resource_id_mask: 0x00ff_ffff,
+            maximum_request_length: u16::MAX,
+            ..Setup::default()
+        };
+        let recovery = crate::xwayland::Recovery::with_test_connection(
+            Path::new("/nonexistent/scripted-xwayland"),
+            client,
+            setup,
+            SCRIPTED_X_ROOT,
+            missing_before,
+        );
+        (recovery, std::thread::spawn(move || script(server)))
+    }
+
+    fn expect_x_request(peer: &mut UnixStream, sequence: &mut u16, opcode: u8) {
+        let mut header = [0u8; 4];
+        peer.read_exact(&mut header).expect("X11 request header");
+        let words = u16::from_ne_bytes([header[2], header[3]]) as usize;
+        assert!(words > 0, "the fixture does not accept BigRequests");
+        let mut body = vec![0u8; words * 4 - header.len()];
+        peer.read_exact(&mut body).expect("X11 request body");
+        *sequence += 1;
+        assert_eq!(
+            header[0], opcode,
+            "unexpected X11 request at sequence {sequence}"
+        );
+    }
+
+    fn answer_query_tree(peer: &mut UnixStream, sequence: u16, children: Vec<u32>) {
+        let reply = QueryTreeReply {
+            sequence,
+            length: children.len() as u32,
+            root: SCRIPTED_X_ROOT,
+            parent: 0,
+            children,
+        };
+        peer.write_all(&reply.serialize())
+            .expect("query-tree reply");
+    }
+
+    fn answer_viewable_attributes(peer: &mut UnixStream, sequence: u16) {
+        let reply = GetWindowAttributesReply {
+            sequence,
+            length: 3,
+            class: WindowClass::INPUT_OUTPUT,
+            map_state: MapState::VIEWABLE,
+            override_redirect: false,
+            ..GetWindowAttributesReply::default()
+        };
+        peer.write_all(&reply.serialize())
+            .expect("attributes reply");
+    }
+
+    fn answer_sync(peer: &mut UnixStream, sequence: u16) {
+        let reply = GetInputFocusReply {
+            sequence,
+            ..GetInputFocusReply::default()
+        };
+        let mut bytes = reply.serialize().to_vec();
+        bytes.resize(32, 0);
+        peer.write_all(&bytes).expect("sync reply");
+    }
+
+    fn hold_scripted_peer_open() {
+        // x11rb drains every packet currently readable before returning one reply. A live peer
+        // makes the next non-blocking read report WouldBlock rather than EOF.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    fn install_recovery(session: &mut crate::testw::Session, recovery: crate::xwayland::Recovery) {
+        session
+            .platform()
+            .active
+            .as_mut()
+            .expect("a started session")
+            .recovery = recovery;
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn spent_window_list_deadline_sends_no_x_request_and_the_session_remains_usable() {
+        let mut session = Launch::new().start_mapped();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (recovery, server) = scripted_x_recovery(&[], move |mut peer| {
+            peer.set_read_timeout(Some(Duration::from_millis(150)))
+                .expect("read timeout");
+            let mut first = [0u8; 1];
+            let no_request = peer.read(&mut first).is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            });
+            observed_tx.send(no_request).expect("observation receiver");
+            peer.set_read_timeout(None).expect("clear read timeout");
+
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            answer_query_tree(&mut peer, sequence, Vec::new());
+            hold_scripted_peer_open();
+        });
+        install_recovery(&mut session, recovery);
+
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(Instant::now() - Duration::from_millis(1)))
+            .expect_err("an already-spent window-list deadline must reject before dispatch");
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(
+            observed_rx.recv().expect("X11 observation"),
+            "the rejected call sent an X11 request"
+        );
+        let windows = session
+            .platform()
+            .list_windows_by(Deadline::from_millis(1_000))
+            .expect("the next window list should still use the session");
+        assert!(!windows.is_empty());
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_late_xwayland_tree_reply_cannot_become_window_list_success() {
+        let mut session = Launch::new().start_mapped();
+        let (recovery, server) = scripted_x_recovery(&[], |mut peer| {
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            std::thread::sleep(STALLED_X_REPLY);
+            answer_query_tree(&mut peer, sequence, Vec::new());
+            hold_scripted_peer_open();
+        });
+        install_recovery(&mut session, recovery);
+
+        let started = Instant::now();
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(started + X_REPLY_DEADLINE))
+            .expect_err("a query reply after the caller deadline is not success");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < STALLED_X_REPLY * 3 / 4,
+            "the Xwayland query outlived its deadline: {elapsed:?}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("Xwayland tree"), "{error}");
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_stalled_xwayland_attribute_reply_obeys_the_window_list_deadline() {
+        let mut session = Launch::new().start_mapped();
+        let (recovery, server) = scripted_x_recovery(&[], |mut peer| {
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            answer_query_tree(&mut peer, sequence, vec![SCRIPTED_X_WINDOW]);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_WINDOW_ATTRIBUTES_REQUEST,
+            );
+            std::thread::sleep(STALLED_X_REPLY);
+            answer_viewable_attributes(&mut peer, sequence);
+            hold_scripted_peer_open();
+        });
+        install_recovery(&mut session, recovery);
+
+        let started = Instant::now();
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(started + X_REPLY_DEADLINE))
+            .expect_err("a stalled attribute reply must not hold the window list");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < STALLED_X_REPLY * 3 / 4,
+            "the Xwayland attribute read outlived its deadline: {elapsed:?}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            error.to_string().contains("Xwayland window attributes"),
+            "{error}"
+        );
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn an_unmap_confirmation_stall_reports_the_possible_hidden_window_and_sends_no_map() {
+        let mut session = Launch::new().start_mapped();
+        let (mapped_tx, mapped_rx) = std::sync::mpsc::channel();
+        let (recovery, server) = scripted_x_recovery(&[SCRIPTED_X_WINDOW], move |mut peer| {
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            answer_query_tree(&mut peer, sequence, vec![SCRIPTED_X_WINDOW]);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_WINDOW_ATTRIBUTES_REQUEST,
+            );
+            answer_viewable_attributes(&mut peer, sequence);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::UNMAP_WINDOW_REQUEST,
+            );
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+            );
+            std::thread::sleep(STALLED_X_REPLY);
+            answer_sync(&mut peer, sequence);
+            peer.set_read_timeout(Some(Duration::from_millis(150)))
+                .expect("read timeout");
+            let mut next = [0u8; 4];
+            let no_map = peer.read_exact(&mut next).is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            });
+            mapped_tx.send(no_map).expect("map observation receiver");
+        });
+        install_recovery(&mut session, recovery);
+
+        let started = Instant::now();
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(started + X_REPLY_DEADLINE))
+            .expect_err("an unconfirmed unmap must be surfaced");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < STALLED_X_REPLY * 3 / 4, "{elapsed:?}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("may now be hidden"), "{error}");
+        assert!(
+            mapped_rx.recv().expect("map observation"),
+            "recovery dispatched a map after its shared deadline"
+        );
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_remap_confirmation_stall_preserves_partial_side_effect_provenance() {
+        let mut session = Launch::new().start_mapped();
+        let (retried_tx, retried_rx) = std::sync::mpsc::channel();
+        let (recovery, server) = scripted_x_recovery(&[SCRIPTED_X_WINDOW], move |mut peer| {
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            answer_query_tree(&mut peer, sequence, vec![SCRIPTED_X_WINDOW]);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_WINDOW_ATTRIBUTES_REQUEST,
+            );
+            answer_viewable_attributes(&mut peer, sequence);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::UNMAP_WINDOW_REQUEST,
+            );
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+            );
+            answer_sync(&mut peer, sequence);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::MAP_WINDOW_REQUEST,
+            );
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+            );
+            std::thread::sleep(STALLED_X_REPLY);
+            answer_sync(&mut peer, sequence);
+            peer.set_read_timeout(Some(Duration::from_millis(150)))
+                .expect("read timeout");
+            let mut next = [0u8; 4];
+            let no_retry = peer.read_exact(&mut next).is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            });
+            retried_tx
+                .send(no_retry)
+                .expect("retry observation receiver");
+        });
+        install_recovery(&mut session, recovery);
+
+        let started = Instant::now();
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(started + X_REPLY_DEADLINE))
+            .expect_err("an unconfirmed re-map must be surfaced");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < STALLED_X_REPLY * 3 / 4, "{elapsed:?}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            error.to_string().contains("window visibility is uncertain"),
+            "{error}"
+        );
+        assert!(
+            retried_rx.recv().expect("retry observation"),
+            "recovery retried the map after its shared deadline"
+        );
+        server.join().expect("scripted X11 server");
+    }
 
     #[test]
     #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
