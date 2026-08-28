@@ -424,8 +424,8 @@ impl Glass {
         // A combo has no committing accessibility write: its `Selection` interface moves only
         // the popup's *preview* selection, and the model commits on row activation (Enter/click).
         //
-        // Its compound input path invalidates the cached tree as soon as each mutation dispatches;
-        // a successful verification snapshot replaces it wholesale.
+        // Its compound input path invalidates the cached tree whenever a mutation dispatches or
+        // cannot be proven not to have dispatched; a successful snapshot replaces it wholesale.
         if target.role == AxRole::ComboBox {
             return self.set_combo_value(id, &target, text, deadline);
         }
@@ -459,10 +459,10 @@ impl Glass {
             if st.checked == want {
                 return Ok(()); // truthful no-op, no actuation
             }
-            self.click_element_inner(id, deadline)?; // the toggle actuation (a swipe for a row-shaped control)
+            let actuation = self.click_element_inner(id, deadline);
             // The actuation may already have landed. Do not let a failed verification read leave
             // the pre-toggle state available to a retry, which could toggle the control back.
-            self.invalidate_ax_cache()?;
+            self.invalidate_ax_cache_after_possible_dispatch(actuation)?;
             // iOS has no event stream, so polling uses the nearer caller/verification deadline
             // and never accepts state read after expiry.
             let now = std::time::Instant::now();
@@ -562,13 +562,13 @@ impl Glass {
         // A real pointer click, deliberately NOT the native action: a programmatic expand
         // (UIA's `ExpandCollapsePattern`) opens the popup without moving keyboard focus, so the
         // Down/Up/Return below would go to whatever held focus instead.
-        self.audited_click(id, |g, id| {
+        let open = self.audited_click(id, |g, id| {
             g.click_element_pointer_only(id, deadline)
                 .map(|()| ClickMethod::Pointer {
                     native_fallback: COMBO_OPEN_POINTER_REASON.into(),
                 })
-        })?;
-        self.invalidate_ax_cache()?;
+        });
+        self.invalidate_ax_cache_after_possible_dispatch(open)?;
         self.settle_for_popup(deadline)
             .map_err(GlassError::after_dispatch)?;
         // Ids don't survive a re-snapshot, so match the open (`expanded`) combo, else the one
@@ -588,12 +588,9 @@ impl Glass {
             .position(|(label, _)| label.eq_ignore_ascii_case(want));
         let Some(target_idx) = target_idx else {
             // Unknown option — dismiss the popup so the UI is left neutral, then report.
-            if !deadline.has_passed()
-                && self
-                    .semantic_key_by(&KeyEvent::Chord("Escape".to_string()), deadline)
-                    .is_ok()
-            {
-                self.invalidate_ax_cache()?;
+            if !deadline.has_passed() {
+                let escape = self.semantic_key_by(&KeyEvent::Chord("Escape".to_string()), deadline);
+                let _ = self.invalidate_ax_cache_after_possible_dispatch(escape);
             }
             let choices = options
                 .iter()
@@ -613,13 +610,13 @@ impl Glass {
         // the chord is never sent — not observable either way.
         let chord = if delta.is_negative() { "Up" } else { "Down" };
         for _ in 0..delta.unsigned_abs() {
-            self.semantic_key_by(&KeyEvent::Chord(chord.to_string()), deadline)
+            let selection = self.semantic_key_by(&KeyEvent::Chord(chord.to_string()), deadline);
+            self.invalidate_ax_cache_after_possible_dispatch(selection)
                 .map_err(GlassError::after_dispatch)?;
-            self.invalidate_ax_cache()?;
         }
-        self.semantic_key_by(&KeyEvent::Chord("Return".to_string()), deadline)
+        let commit = self.semantic_key_by(&KeyEvent::Chord("Return".to_string()), deadline);
+        self.invalidate_ax_cache_after_possible_dispatch(commit)
             .map_err(GlassError::after_dispatch)?;
-        self.invalidate_ax_cache()?;
         self.settle_for_popup(deadline)
             .map_err(GlassError::after_dispatch)?;
         // Verify the model actually committed — the *target* combo (matched by bounds,
@@ -647,9 +644,16 @@ impl Glass {
         }
     }
 
-    fn invalidate_ax_cache(&mut self) -> Result<()> {
-        self.active_mut()?.last_ax = None;
-        Ok(())
+    fn invalidate_ax_cache_after_possible_dispatch<T>(&mut self, result: Result<T>) -> Result<T> {
+        // Only an explicit pre-dispatch verdict proves the cached pre-mutation tree is still true.
+        let may_have_dispatched = match &result {
+            Ok(_) => true,
+            Err(error) => error.bound_dispatch() != Some(crate::BoundDispatch::NotDispatched),
+        };
+        if may_have_dispatched && let Some(active) = self.active.as_mut() {
+            active.last_ax = None;
+        }
+        result
     }
 
     /// Let a just-opened/closed popup realize in the a11y tree before re-reading.
@@ -2553,6 +2557,115 @@ mod tests {
         replies: VecDeque<SnapshotReply>,
     }
 
+    fn scripted_dispatch_error(
+        operation: &'static str,
+        dispatch: crate::BoundDispatch,
+    ) -> GlassError {
+        match dispatch {
+            crate::BoundDispatch::NotDispatched => GlassError::deadline_not_started(operation),
+            crate::BoundDispatch::MayHaveDispatched => {
+                GlassError::caller_deadline_elapsed(operation)
+            }
+        }
+    }
+
+    struct InvokeErrorAccessibility {
+        trees: VecDeque<AxTree>,
+        invokes: Arc<AtomicUsize>,
+        dispatch: crate::BoundDispatch,
+    }
+
+    impl Accessibility for InvokeErrorAccessibility {
+        fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+            self.trees
+                .pop_front()
+                .ok_or_else(|| GlassError::Backend("scripted invoke snapshot exhausted".into()))
+        }
+
+        fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
+            self.invokes.fetch_add(1, Ordering::SeqCst);
+            Err(scripted_dispatch_error(
+                "scripted toggle actuation",
+                self.dispatch,
+            ))
+        }
+    }
+
+    struct ScriptedKeyPlatform {
+        inner: FakePlatform,
+        replies: VecDeque<Result<()>>,
+    }
+
+    impl Platform for ScriptedKeyPlatform {
+        fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
+            self.inner.start_app(spec)
+        }
+
+        fn stop_app_by(&mut self, deadline: Deadline) -> Result<()> {
+            self.inner.stop_app_by(deadline)
+        }
+
+        fn capture_frame_by(
+            &mut self,
+            region: Option<&Region>,
+            deadline: Deadline,
+        ) -> Result<Frame> {
+            self.inner.capture_frame_by(region, deadline)
+        }
+
+        fn capture_window_by(
+            &mut self,
+            id: WindowId,
+            region: Option<&Region>,
+            deadline: Deadline,
+        ) -> Result<Frame> {
+            self.inner.capture_window_by(id, region, deadline)
+        }
+
+        fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+            self.inner.send_pointer_by(event, deadline)
+        }
+
+        fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+            match self.replies.pop_front() {
+                Some(Err(error))
+                    if error.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched) =>
+                {
+                    Err(error)
+                }
+                Some(Err(error)) => {
+                    self.inner.send_key_by(event, deadline)?;
+                    Err(error)
+                }
+                Some(Ok(())) | None => self.inner.send_key_by(event, deadline),
+            }
+        }
+
+        fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+            self.inner.window(op)
+        }
+
+        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+            self.inner.list_windows()
+        }
+
+        fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+            self.inner.select_window(id)
+        }
+
+        fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+            self.inner.drain_logs()
+        }
+
+        fn app_pid(&self) -> Option<u32> {
+            self.inner.app_pid()
+        }
+
+        fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
+            self.inner.a11y_toggle_control_at_trailing_edge()
+        }
+    }
+
     impl Accessibility for ScriptedSnapshots {
         fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
             match self
@@ -2583,6 +2696,26 @@ mod tests {
                 replies: replies.into(),
             }),
         )
+    }
+
+    fn glass_with_scripted_key_snapshots(
+        platform: ScriptedKeyPlatform,
+        replies: Vec<SnapshotReply>,
+    ) -> Glass {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("baselines");
+        std::mem::forget(dir);
+        let mut held = Some(Backend {
+            platform: Box::new(platform),
+            accessibility: Some(Box::new(ScriptedSnapshots {
+                replies: replies.into(),
+            })),
+        });
+        let factory: PlatformFactory = Box::new(move |_backend| {
+            held.take()
+                .ok_or_else(|| GlassError::Backend("test factory called twice".into()))
+        });
+        Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
     }
 
     fn assert_not_started_was_upgraded_after_dispatch(error: &GlassError) {
@@ -2658,6 +2791,11 @@ mod tests {
         assert_not_started_was_upgraded_after_dispatch(&error);
         assert_eq!(clicks.lock().unwrap().len(), 1, "the combo was opened");
         assert!(keys.lock().unwrap().is_empty(), "the late key was not sent");
+
+        g.set_value_by(AxNodeId(1), "Beta", Deadline::from_millis(2_000))
+            .expect("a proven pre-dispatch key refusal keeps the open-popup snapshot usable");
+        assert_eq!(clicks.lock().unwrap().len(), 1);
+        assert!(keys.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2711,6 +2849,65 @@ mod tests {
             .unwrap();
         assert_eq!(clicks.lock().unwrap().len(), 1);
         assert_eq!(keys.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn combo_key_error_that_may_have_dispatched_requires_a_fresh_snapshot() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = ScriptedKeyPlatform {
+            inner: FakePlatform::new(340, 300)
+                .with_click_log(clicks.clone())
+                .with_key_log(keys.clone()),
+            replies: vec![
+                Err(scripted_dispatch_error(
+                    "scripted combo key",
+                    crate::BoundDispatch::MayHaveDispatched,
+                )),
+                Err(scripted_dispatch_error(
+                    "scripted combo key retry",
+                    crate::BoundDispatch::MayHaveDispatched,
+                )),
+            ]
+            .into(),
+        };
+        let mut g = glass_with_scripted_key_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(combo("Beta", &[])),
+                SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
+                SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect_err("the first selection key reports an ambiguous timeout");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(clicks.lock().unwrap().len(), 1);
+        assert_eq!(keys.lock().unwrap().len(), 1);
+
+        let retry = g
+            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect_err("an ambiguous key dispatch requires a fresh snapshot before retry");
+        assert!(matches!(retry, GlassError::NoAxSnapshot), "{retry}");
+        assert_eq!(clicks.lock().unwrap().len(), 1);
+        assert_eq!(
+            keys.lock().unwrap().len(),
+            1,
+            "the stale open-popup snapshot must not send a second selection key"
+        );
+
+        g.a11y_resnapshot(Deadline::from_millis(2_000)).unwrap();
+        g.set_value_by(AxNodeId(1), "Beta", Deadline::from_millis(2_000))
+            .unwrap();
+        assert_eq!(clicks.lock().unwrap().len(), 1);
+        assert_eq!(keys.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -3581,6 +3778,46 @@ mod tests {
             1,
             "the fresh post-toggle state makes the retry a truthful no-op"
         );
+    }
+
+    #[test]
+    fn toggle_actuation_error_that_may_have_dispatched_requires_a_fresh_snapshot() {
+        let invokes = Arc::new(AtomicUsize::new(0));
+        let platform = FakePlatform::new(400, 400).with_trailing_toggle_backend();
+        let mut g = glass_with_backend(
+            platform,
+            Box::new(InvokeErrorAccessibility {
+                trees: vec![sw(false), sw(true)].into(),
+                invokes: invokes.clone(),
+                dispatch: crate::BoundDispatch::MayHaveDispatched,
+            }),
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .set_value_by(AxNodeId(1), "true", Deadline::from_millis(2_000))
+            .expect_err("the scripted native actuation reports an ambiguous timeout");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(invokes.load(Ordering::SeqCst), 1);
+
+        let retry = g
+            .set_value_by(AxNodeId(1), "true", Deadline::from_millis(2_000))
+            .expect_err("an ambiguous actuation requires a fresh snapshot before retry");
+        assert!(matches!(retry, GlassError::NoAxSnapshot), "{retry}");
+        assert_eq!(
+            invokes.load(Ordering::SeqCst),
+            1,
+            "the stale pre-toggle state must not dispatch a second native action"
+        );
+
+        g.a11y_resnapshot(Deadline::from_millis(2_000)).unwrap();
+        g.set_value_by(AxNodeId(1), "true", Deadline::from_millis(2_000))
+            .unwrap();
+        assert_eq!(invokes.load(Ordering::SeqCst), 1);
     }
 
     #[test]
