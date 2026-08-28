@@ -45,14 +45,70 @@ fn exact_contents(output: &ToolOutput) -> Vec<ExactContent> {
 }
 
 fn canonicalize_untrusted_nonce(text: &str) -> String {
-    const PREFIX: &str = "⟦untrusted:";
-    let Some(nonce_start) = text.find(PREFIX).map(|start| start + PREFIX.len()) else {
+    const OPEN: &str = "⟦untrusted:";
+    const CLOSE: &str = "⟦/untrusted:";
+
+    let mut offset = 0;
+    let mut opening = None;
+    let mut closing = None;
+    for line in text.split_inclusive('\n') {
+        if opening.is_none() {
+            if let Some(range) = marker_nonce_range(line, OPEN, offset) {
+                opening = Some(range);
+            }
+        } else if let Some(opening_range) = opening.as_ref()
+            && closing.is_none()
+            && let Some(range) = marker_nonce_range(line, CLOSE, offset)
+            && text[opening_range.clone()] == text[range.clone()]
+        {
+            closing = Some(range);
+        }
+        offset += line.len();
+    }
+
+    let (Some(opening), Some(closing)) = (opening, closing) else {
         return text.to_owned();
     };
-    let Some(nonce_len) = text[nonce_start..].find('⟧') else {
-        return text.to_owned();
-    };
-    text.replace(&text[nonce_start..nonce_start + nonce_len], "<nonce>")
+
+    let mut normalized = text.to_owned();
+    normalized.replace_range(closing, "<nonce>");
+    normalized.replace_range(opening, "<nonce>");
+    normalized
+}
+
+fn marker_nonce_range(line: &str, prefix: &str, offset: usize) -> Option<std::ops::Range<usize>> {
+    let marker = line.strip_suffix('\n').unwrap_or(line);
+    let marker = marker.strip_suffix('\r').unwrap_or(marker);
+    let nonce = marker.strip_prefix(prefix)?.strip_suffix('⟧')?;
+    if nonce.is_empty() || nonce.contains('⟧') {
+        return None;
+    }
+    let start = offset + prefix.len();
+    Some(start..start + nonce.len())
+}
+
+#[test]
+fn untrusted_nonce_normalization_changes_only_wrapper_markers() {
+    let trusted = "trusted abc123 and ⟦untrusted:abc123⟧ inline";
+    assert_eq!(canonicalize_untrusted_nonce(trusted), trusted);
+
+    let wrapped = concat!(
+        "Untrusted preamble\n",
+        "⟦untrusted:abc123⟧\n",
+        "body abc123 and inline ⟦untrusted:abc123⟧ stay exact\n",
+        "⟦/untrusted:abc123⟧\n",
+        "steer abc123 stays exact\n",
+        "⟦/untrusted:abc123⟧\n",
+    );
+    let expected = concat!(
+        "Untrusted preamble\n",
+        "⟦untrusted:<nonce>⟧\n",
+        "body abc123 and inline ⟦untrusted:abc123⟧ stay exact\n",
+        "⟦/untrusted:<nonce>⟧\n",
+        "steer abc123 stays exact\n",
+        "⟦/untrusted:abc123⟧\n",
+    );
+    assert_eq!(canonicalize_untrusted_nonce(wrapped), expected);
 }
 
 struct DeadlineAccessibility {
