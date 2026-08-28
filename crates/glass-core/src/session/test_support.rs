@@ -65,6 +65,9 @@ pub(crate) struct FakePlatform {
     select_delay: Option<Duration>,
     /// A selected id whose lookup/focus fails, for proving restoration failures stay visible.
     fail_select_window: Option<WindowId>,
+    /// A selected id rejected before any focus request is dispatched, for proving the caller does
+    /// not claim focus mutation or attempt restoration when the seam says nothing ran.
+    reject_select_window_before_dispatch: Option<WindowId>,
     /// When set, `list_windows` errors instead of returning its scripted list — for
     /// proving a failed popover-probe enumeration degrades to the normal click path
     /// instead of propagating.
@@ -161,6 +164,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_failing_select_window(mut self, id: WindowId) -> Self {
         self.fail_select_window = Some(id);
+        self
+    }
+    pub(crate) fn rejecting_select_window_before_dispatch(mut self, id: WindowId) -> Self {
+        self.reject_select_window_before_dispatch = Some(id);
         self
     }
     pub(crate) fn counting_stops(mut self, c: Arc<Mutex<u32>>) -> Self {
@@ -422,6 +429,13 @@ impl Platform for FakePlatform {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("window selection"));
         }
+        if self.reject_select_window_before_dispatch == Some(id) {
+            return Err(GlassError::Backend(format!(
+                "scripted pre-dispatch rejection for {}",
+                id.0
+            ))
+            .before_dispatch());
+        }
         self.select_log.lock().unwrap().push(id);
         if let Some(delay) = self.select_delay {
             std::thread::sleep(delay);
@@ -432,20 +446,25 @@ impl Platform for FakePlatform {
                 id.0
             )));
         }
-        if self.windows.is_empty() {
-            return if id == WindowId(0) {
-                Ok(self.geometry.clone())
-            } else {
-                Err(GlassError::WindowNotFound)
-            };
+        let geometry = if self.windows.is_empty() {
+            if id != WindowId(0) {
+                return Err(GlassError::WindowNotFound);
+            }
+            self.geometry.clone()
+        } else {
+            let w = self
+                .windows
+                .iter()
+                .find(|w| w.id == id)
+                .ok_or(GlassError::WindowNotFound)?;
+            self.geometry = w.geometry.clone();
+            self.geometry.clone()
+        };
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("window selection"))
+        } else {
+            Ok(geometry)
         }
-        let w = self
-            .windows
-            .iter()
-            .find(|w| w.id == id)
-            .ok_or(GlassError::WindowNotFound)?;
-        self.geometry = w.geometry.clone();
-        Ok(self.geometry.clone())
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
         if let Some(batch) = self.log_batches.pop_front() {

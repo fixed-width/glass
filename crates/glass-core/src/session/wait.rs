@@ -575,7 +575,7 @@ impl Glass {
                     whose
                 };
                 looked = true;
-                let tree = match self.a11y_resnapshot(bound) {
+                let tree = match self.a11y_resnapshot_for_wait(bound) {
                     Ok(t) => {
                         saw_a_tree = true;
                         t

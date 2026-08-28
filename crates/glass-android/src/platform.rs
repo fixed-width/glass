@@ -43,9 +43,17 @@ pub struct AndroidPlatform {
     agent: Option<Arc<AgentClient>>,
     logs: LogSink,
     app: Option<RunningApp>,
+    #[cfg(test)]
+    window_list_parse_delay: Option<Duration>,
 }
 
 impl AndroidPlatform {
+    #[cfg(test)]
+    fn with_window_list_parse_delay(mut self, delay: Duration) -> Self {
+        self.window_list_parse_delay = Some(delay);
+        self
+    }
+
     /// Stop the app, under `deadline` when the caller has one to share.
     ///
     /// The logcat reap comes first and is unbounded, measured at 0-1ms — a kill and reap of a
@@ -100,6 +108,8 @@ impl AndroidPlatform {
             agent,
             logs: Arc::new(Mutex::new(Vec::new())),
             app: None,
+            #[cfg(test)]
+            window_list_parse_delay: None,
         })
     }
 
@@ -440,8 +450,12 @@ impl Platform for AndroidPlatform {
             .adb()
             .run_until(["shell", "dumpsys", "window", "windows"], deadline)?;
         let parsed = parse_app_windows(&dump, &package);
+        #[cfg(test)]
+        if let Some(delay) = self.window_list_parse_delay {
+            std::thread::sleep(delay);
+        }
         let any_match = parsed.iter().any(|w| WindowId(w.id) == active_id);
-        Ok(parsed
+        let windows = parsed
             .into_iter()
             .enumerate()
             .map(|(i, w)| WindowInfo {
@@ -455,7 +469,12 @@ impl Platform for AndroidPlatform {
                     i == 0
                 },
             })
-            .collect())
+            .collect();
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("Android window list"))
+        } else {
+            Ok(windows)
+        }
     }
 
     fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
@@ -610,6 +629,7 @@ mod platform_tests {
             agent: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app: None,
+            window_list_parse_delay: None,
         }
     }
 
@@ -1064,6 +1084,37 @@ mod platform_tests {
         assert!(windows[0].active, "the session drives the topmost window");
         assert!(!windows[1].active);
         assert_eq!(windows[0].class.as_deref(), Some("com.example.app"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn large_window_list_parse_finishing_after_deadline_is_not_late_success() {
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let initial_windows = Answer::says(WINDOWS);
+        let large_windows = Answer::says(WINDOWS.repeat(512));
+        let pid = Answer::says("4321\n");
+        let silent = Answer::Silent;
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&launch_reply]),
+            (
+                "shell dumpsys window windows",
+                vec![&initial_windows, &large_windows],
+            ),
+            ("shell pidof *", vec![&pid]),
+            ("*", vec![&silent]),
+        ]);
+        let mut platform = started(&fake).with_window_list_parse_delay(Duration::from_millis(30));
+
+        let error = platform
+            .list_windows_by(Deadline::from_millis(10))
+            .expect_err("a completed parse must not return success after its caller deadline");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
     }
 
     #[test]

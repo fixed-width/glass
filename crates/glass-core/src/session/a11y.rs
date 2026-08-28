@@ -78,10 +78,26 @@ impl Glass {
         self.snapshot_at_current_limits(deadline)
     }
 
+    /// A wait deliberately takes one final look at its already-spent deadline when a quiet change
+    /// signal may have missed an update. Let that reader see the deadline using cached geometry only
+    /// when the geometry seam proves it dispatched nothing; every started/timed-out geometry query
+    /// remains a hard error.
+    pub(crate) fn a11y_resnapshot_for_wait(&mut self, deadline: Deadline) -> Result<AxTree> {
+        self.snapshot_at_current_limits_with_wait_fallback(deadline, true)
+    }
+
     /// The snapshot worker: walks the active window's tree bounded by the session's current
     /// `a11y_limits` and caches it. Callers set `a11y_limits` first (or reuse it) — see
     /// [`Glass::a11y_snapshot`] / [`Glass::a11y_resnapshot`].
     fn snapshot_at_current_limits(&mut self, deadline: Deadline) -> Result<AxTree> {
+        self.snapshot_at_current_limits_with_wait_fallback(deadline, false)
+    }
+
+    fn snapshot_at_current_limits_with_wait_fallback(
+        &mut self,
+        deadline: Deadline,
+        allow_spent_geometry: bool,
+    ) -> Result<AxTree> {
         let s = self.active_mut()?;
         let limits = s.a11y_limits;
         // Reader-presence check up front (mirrors set_value_inner) so `AxUnsupported` keeps
@@ -94,7 +110,18 @@ impl Glass {
         // macOS resolves this window via ScreenCaptureKit, so a momentarily off-screen window
         // fails here. Android reports a cached fullscreen window, so a freeform self-resize
         // would not refresh.
-        let window = s.platform.window(&WindowOp::Geometry)?;
+        let window = match s.platform.window_by(&WindowOp::Geometry, deadline) {
+            Ok(window) => window,
+            Err(error)
+                if allow_spent_geometry
+                    && error.bound() == Some(crate::BoundKind::NotStarted)
+                    && error.bound_owner() == Some(crate::Whose::Caller)
+                    && error.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched) =>
+            {
+                s.geometry.clone()
+            }
+            Err(error) => return Err(error),
+        };
         s.geometry = window.clone();
         let pids = s.platform.app_pids();
         let window_handle = s.platform.active_window_handle();
@@ -230,7 +257,22 @@ impl Glass {
             }
             .ok_or(GlassError::AxElementInUnmappedPopover(id.0))?;
             let prev = windows.iter().find(|w| w.active).map(|w| w.id);
-            self.select_window_by(popover_id, deadline)?;
+            if let Err(primary) = self.select_window_by(popover_id, deadline) {
+                if primary.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched) {
+                    return Err(primary);
+                }
+                let restore = prev
+                    .map(|id| self.select_window_by(id, Deadline::UNBOUNDED))
+                    .transpose();
+                return Err(match restore {
+                    Ok(_) => primary.after_dispatch(),
+                    Err(restore) => GlassError::WindowRestoreFailed {
+                        primary: Box::new(primary),
+                        restore: Box::new(restore),
+                    }
+                    .after_dispatch(),
+                });
+            }
             let primary = self.pointer_inner_by(
                 &PointerEvent::Click {
                     x: bounds.x - container.x,
@@ -1626,6 +1668,27 @@ mod tests {
     }
 
     #[test]
+    fn a11y_resnapshot_rejects_geometry_success_after_the_caller_deadline() {
+        let mut g = glass_with_a11y(
+            FakePlatform::new(100, 100).with_geometry_delay(Duration::from_millis(20)),
+            fake_tree(),
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .a11y_resnapshot(Deadline::from_millis(5))
+            .expect_err("the geometry seam must not return late success");
+
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
     fn snapshot_unsupported_without_reader() {
         let mut g = glass_with(FakePlatform::new(40, 30));
         g.start(&spec()).unwrap();
@@ -2376,7 +2439,7 @@ mod tests {
     }
 
     #[test]
-    fn popover_focus_followed_by_pointer_not_started_is_after_dispatch() {
+    fn popover_selection_timeout_restores_active_window_and_preserves_dispatch() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let select_log = Arc::new(Mutex::new(Vec::new()));
         let platform = popover_platform(clicks.clone(), select_log.clone())
@@ -2390,18 +2453,18 @@ mod tests {
             .click_element_by(globex_id, Deadline::from_millis(5))
             .unwrap_err();
 
-        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut));
         assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
         assert_eq!(
             error.bound_dispatch(),
             Some(crate::BoundDispatch::MayHaveDispatched),
-            "successful temporary focus makes the compound click attempted"
+            "the focus request may have changed OS focus before its confirmation timed out"
         );
         assert!(matches!(
             error.cause(),
             GlassError::Bounded {
-                kind: crate::BoundKind::NotStarted,
-                dispatch: crate::BoundDispatch::NotDispatched,
+                kind: crate::BoundKind::TimedOut,
+                dispatch: crate::BoundDispatch::MayHaveDispatched,
                 ..
             }
         ));
@@ -2409,12 +2472,12 @@ mod tests {
         assert_eq!(
             *select_log.lock().unwrap(),
             vec![WindowId(2), WindowId(1)],
-            "focus moved before the pointer refusal and restoration was attempted"
+            "a possibly-dispatched focus request still requires restoration"
         );
     }
 
     #[test]
-    fn popover_restoration_failure_preserves_primary_and_cleanup_errors() {
+    fn popover_selection_timeout_and_restoration_failure_preserve_both_errors() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let select_log = Arc::new(Mutex::new(Vec::new()));
         let platform = popover_platform(clicks.clone(), select_log.clone())
@@ -2429,7 +2492,7 @@ mod tests {
             .click_element_by(globex_id, Deadline::from_millis(5))
             .unwrap_err();
 
-        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut));
         assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
         assert_eq!(
             error.bound_dispatch(),
@@ -2453,6 +2516,34 @@ mod tests {
             *select_log.lock().unwrap(),
             vec![WindowId(2), WindowId(1)],
             "the prior target restoration was attempted rather than silently skipped"
+        );
+    }
+
+    #[test]
+    fn popover_selection_not_dispatched_does_not_restore_or_claim_focus_mutation() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = popover_platform(clicks.clone(), select_log.clone())
+            .rejecting_select_window_before_dispatch(WindowId(2));
+        let mut g = glass_with_a11y(platform, fake_tree_with_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        let error = g.click_element(globex_id).unwrap_err();
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::NotDispatched)
+        );
+        assert!(matches!(
+            error.cause(),
+            GlassError::Backend(message) if message == "scripted pre-dispatch rejection for 2"
+        ));
+        assert!(clicks.lock().unwrap().is_empty());
+        assert!(
+            select_log.lock().unwrap().is_empty(),
+            "neither temporary focus nor restoration should be requested"
         );
     }
 
