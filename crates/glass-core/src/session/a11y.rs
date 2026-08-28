@@ -23,6 +23,23 @@ const TOGGLE_VERIFY_INTERVAL_MS: u64 = 50;
 /// under load without turning a real actuation failure into an indefinite hang.
 const TOGGLE_VERIFY_TIMEOUT_MS: u64 = 2000;
 
+impl ActiveSession {
+    fn accessibility_context(
+        &self,
+        window: WindowGeometry,
+        deadline: Deadline,
+    ) -> Result<AxContext> {
+        Ok(AxContext {
+            pids: self.platform.app_pids_by(deadline)?,
+            window,
+            window_handle: self.platform.active_window_handle(),
+            a11y_bus_addr: self.platform.a11y_bus_addr(),
+            limits: self.a11y_limits,
+            deadline,
+        })
+    }
+}
+
 impl Glass {
     /// Snapshot the active window's accessibility tree (normalized, window-
     /// relative, ids assigned by the core). Caches it for `click_element`.
@@ -56,14 +73,7 @@ impl Glass {
         s.accessibility.as_ref()?;
         // Cached geometry deliberately: a failed window round-trip must degrade to polling,
         // not to an error.
-        let ctx = AxContext {
-            pids: s.platform.app_pids(),
-            window: s.geometry.clone(),
-            window_handle: s.platform.active_window_handle(),
-            a11y_bus_addr: s.platform.a11y_bus_addr(),
-            limits: s.a11y_limits,
-            deadline,
-        };
+        let ctx = s.accessibility_context(s.geometry.clone(), deadline).ok()?;
         s.accessibility.as_mut()?.subscribe_changes(&ctx)
     }
 
@@ -99,7 +109,6 @@ impl Glass {
         allow_spent_geometry: bool,
     ) -> Result<AxTree> {
         let s = self.active_mut()?;
-        let limits = s.a11y_limits;
         // Reader-presence check up front (mirrors set_value_inner) so `AxUnsupported` keeps
         // precedence over — and a reader-less backend skips — the geometry round-trip below.
         if s.accessibility.is_none() {
@@ -123,21 +132,23 @@ impl Glass {
             Err(error) => return Err(error),
         };
         s.geometry = window.clone();
-        let pids = s.platform.app_pids();
-        let window_handle = s.platform.active_window_handle();
-        let a11y_bus_addr = s.platform.a11y_bus_addr();
+        let ctx = s.accessibility_context(window, deadline)?;
         let acc = s.accessibility.as_mut().ok_or(GlassError::AxUnsupported)?;
-        let mut tree = acc.snapshot(&AxContext {
-            pids,
-            window,
-            window_handle,
-            a11y_bus_addr,
-            limits,
-            deadline,
-        })?;
+        let mut tree = acc.snapshot(&ctx)?;
         tree.assign_ids();
-        s.last_ax = Some(tree.clone());
+        if deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed(
+                "accessibility snapshot",
+            ));
+        }
+        let cached = tree.clone();
         s.pump();
+        if deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed(
+                "accessibility snapshot",
+            ));
+        }
+        s.last_ax = Some(cached);
         Ok(tree)
     }
 
@@ -256,14 +267,12 @@ impl Glass {
                 menu_container_bounds(tree, id, &popover_geo)
             }
             .ok_or(GlassError::AxElementInUnmappedPopover(id.0))?;
-            let prev = windows.iter().find(|w| w.active).map(|w| w.id);
+            let prev = restorable_window(&windows, &active_geo)?;
             if let Err(primary) = self.select_window_by(popover_id, deadline) {
                 if primary.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched) {
                     return Err(primary);
                 }
-                let restore = prev
-                    .map(|id| self.select_window_by(id, Deadline::UNBOUNDED))
-                    .transpose();
+                let restore = self.select_window_by(prev, Deadline::UNBOUNDED);
                 return Err(match restore {
                     Ok(_) => primary.after_dispatch(),
                     Err(restore) => GlassError::WindowRestoreFailed {
@@ -286,9 +295,7 @@ impl Glass {
             // Cleanup is deliberately unbounded: once focus has moved, restoration must still be
             // attempted after the caller stops waiting. The returned failure remains after-dispatch
             // because the temporary selection already changed the compound action's state.
-            let restore = prev
-                .map(|id| self.select_window_by(id, Deadline::UNBOUNDED))
-                .transpose();
+            let restore = self.select_window_by(prev, Deadline::UNBOUNDED);
             return match (primary, restore) {
                 (Ok(()), Ok(_)) => Ok(()),
                 (Err(primary), Ok(_)) => Err(primary.after_dispatch()),
@@ -388,14 +395,7 @@ impl Glass {
                 bounds: node.bounds,
                 value: node.value.clone(),
             };
-            let ctx = AxContext {
-                pids: s.platform.app_pids(),
-                window: s.geometry.clone(),
-                window_handle: s.platform.active_window_handle(),
-                a11y_bus_addr: s.platform.a11y_bus_addr(),
-                limits: s.a11y_limits,
-                deadline,
-            };
+            let ctx = s.accessibility_context(s.geometry.clone(), deadline)?;
             (target, ctx)
         };
         let s = self.active_mut()?;
@@ -470,14 +470,7 @@ impl Glass {
                 bounds: node.bounds,
                 value: node.value.clone(),
             };
-            let ctx = AxContext {
-                pids: s.platform.app_pids(),
-                window: s.geometry.clone(),
-                window_handle: s.platform.active_window_handle(),
-                a11y_bus_addr: s.platform.a11y_bus_addr(),
-                limits: s.a11y_limits,
-                deadline,
-            };
+            let ctx = s.accessibility_context(s.geometry.clone(), deadline)?;
             (target, ctx)
         };
         // A combo has no committing accessibility write: its `Selection` interface moves only
@@ -540,6 +533,11 @@ impl Glass {
                     Err(error) => {
                         if let Some(active) = self.active.as_mut() {
                             active.last_ax = None;
+                        }
+                        if whose == crate::deadline::Whose::Callee
+                            && error.bound_owner() == Some(crate::Whose::Caller)
+                        {
+                            break;
                         }
                         return Err(GlassError::after_dispatch(error));
                     }
@@ -957,6 +955,32 @@ fn owning_popover(
         })
         .min_by_key(|w| w.geometry.width as u64 * w.geometry.height as u64)
         .map(|w| w.id)
+}
+
+fn restorable_window(
+    windows: &[WindowInfo],
+    selected_geometry: &WindowGeometry,
+) -> Result<WindowId> {
+    fn unique_id<'a>(mut matches: impl Iterator<Item = &'a WindowInfo>) -> Option<WindowId> {
+        let id = matches.next()?.id;
+        matches.next().is_none().then_some(id)
+    }
+
+    unique_id(windows.iter().filter(|window| window.active))
+        .or_else(|| {
+            unique_id(
+                windows
+                    .iter()
+                    .filter(|window| &window.geometry == selected_geometry),
+            )
+        })
+        .ok_or_else(|| {
+            GlassError::Backend(
+                "cannot guarantee restoration of the previously selected window; the window list has no unique active or geometry-matching target"
+                    .into(),
+            )
+            .before_dispatch()
+        })
 }
 
 /// The bounds of the ancestor of `target` whose size most closely matches `popover`'s
@@ -1698,6 +1722,102 @@ mod tests {
     }
 
     #[test]
+    fn a11y_resnapshot_shares_one_absolute_deadline_with_pid_discovery_and_reader() {
+        let pid_deadlines = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_pid_deadline_log(pid_deadlines.clone());
+        let (mut g, ctx_log) = glass_with_a11y_ctx(platform, fake_tree());
+        g.start(&spec()).unwrap();
+        let deadline = Deadline::from_millis(500);
+
+        g.a11y_resnapshot(deadline).unwrap();
+
+        assert_eq!(*pid_deadlines.lock().unwrap(), vec![deadline]);
+        assert_eq!(
+            ctx_log
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("the accessibility reader ran")
+                .deadline,
+            deadline
+        );
+    }
+
+    #[test]
+    fn a11y_subscription_shares_one_absolute_deadline_with_pid_discovery_and_reader() {
+        let pid_deadlines = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_pid_deadline_log(pid_deadlines.clone());
+        let (mut g, ctx_log) = glass_with_a11y_ctx(platform, fake_tree());
+        g.start(&spec()).unwrap();
+        let deadline = Deadline::from_millis(500);
+
+        assert!(g.subscribe_a11y_changes(deadline).is_none());
+
+        assert_eq!(*pid_deadlines.lock().unwrap(), vec![deadline]);
+        assert_eq!(
+            ctx_log
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("the accessibility subscriber ran")
+                .deadline,
+            deadline
+        );
+    }
+
+    #[test]
+    fn native_invoke_shares_one_absolute_deadline_with_pid_discovery_and_reader() {
+        let pid_deadlines = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_pid_deadline_log(pid_deadlines.clone());
+        let (mut g, _, ctx_log) =
+            glass_with_a11y_invoke_ctx(platform, fake_tree(), InvokeBehavior::Succeed);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        pid_deadlines.lock().unwrap().clear();
+        let deadline = Deadline::from_millis(500);
+
+        assert_eq!(
+            g.click_element_by(AxNodeId(1), deadline).unwrap(),
+            ClickMethod::NativeAction { actuated: None }
+        );
+
+        assert_eq!(*pid_deadlines.lock().unwrap(), vec![deadline]);
+        assert_eq!(
+            ctx_log
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("the accessibility invoker ran")
+                .deadline,
+            deadline
+        );
+    }
+
+    #[test]
+    fn set_value_shares_one_absolute_deadline_with_pid_discovery_and_reader() {
+        let pid_deadlines = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_pid_deadline_log(pid_deadlines.clone());
+        let (mut g, ctx_log) = glass_with_a11y_ctx(platform, fake_tree());
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        pid_deadlines.lock().unwrap().clear();
+        let deadline = Deadline::from_millis(500);
+
+        g.set_value_by(AxNodeId(1), "renamed", deadline).unwrap();
+
+        assert_eq!(*pid_deadlines.lock().unwrap(), vec![deadline]);
+        assert_eq!(
+            ctx_log
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("the accessibility writer ran")
+                .deadline,
+            deadline
+        );
+    }
+
+    #[test]
     fn snapshot_unsupported_without_reader() {
         let mut g = glass_with(FakePlatform::new(40, 30));
         g.start(&spec()).unwrap();
@@ -2426,6 +2546,30 @@ mod tests {
     }
 
     #[test]
+    fn popover_success_restores_the_derived_selected_window_when_all_report_inactive() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = popover_platform_with_active(clicks.clone(), select_log.clone(), false);
+        let mut g = glass_with_a11y(platform, fake_tree_with_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        assert!(matches!(
+            g.click_element(globex_id).unwrap(),
+            ClickMethod::Pointer { .. }
+        ));
+
+        assert_eq!(clicks.lock().unwrap().last().copied(), Some((20, 54)));
+        assert_eq!(
+            *select_log.lock().unwrap(),
+            vec![WindowId(2), WindowId(1)],
+            "the cached selected geometry identifies the main window even without a global active flag"
+        );
+        assert_eq!(g.geometry().unwrap().width, 340);
+    }
+
+    #[test]
     fn window_geometry_query_consuming_the_click_deadline_reports_started_work() {
         let mut g = glass_with_a11y(
             FakePlatform::new(100, 100).with_geometry_delay(Duration::from_millis(20)),
@@ -2482,6 +2626,112 @@ mod tests {
             *select_log.lock().unwrap(),
             vec![WindowId(2), WindowId(1)],
             "a possibly-dispatched focus request still requires restoration"
+        );
+    }
+
+    #[test]
+    fn popover_selection_timeout_restores_derived_window_when_all_report_inactive() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = popover_platform_with_active(clicks.clone(), select_log.clone(), false)
+            .with_select_delay(Duration::from_millis(20));
+        let mut g = glass_with_a11y(platform, fake_tree_with_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        let error = g
+            .click_element_by(globex_id, Deadline::from_millis(5))
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(clicks.lock().unwrap().is_empty());
+        assert_eq!(
+            *select_log.lock().unwrap(),
+            vec![WindowId(2), WindowId(1)],
+            "a possibly-dispatched selection still restores the derived prior target"
+        );
+    }
+
+    #[test]
+    fn popover_pointer_failure_restores_derived_window_when_all_report_inactive() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = popover_platform_with_active(clicks.clone(), select_log.clone(), false)
+            .with_failing_pointer();
+        let mut g = glass_with_a11y(platform, fake_tree_with_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        let error = g.click_element(globex_id).unwrap_err();
+
+        assert!(matches!(
+            error.cause(),
+            GlassError::Backend(message) if message == "scripted pointer failure"
+        ));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(
+            *select_log.lock().unwrap(),
+            vec![WindowId(2), WindowId(1)],
+            "pointer failure must not strand the session on the popover"
+        );
+        assert_eq!(g.geometry().unwrap().width, 340);
+    }
+
+    #[test]
+    fn popover_selection_is_refused_when_all_report_inactive_and_geometry_is_ambiguous() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let main_geometry = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 340,
+            height: 300,
+        };
+        let popover_geometry = WindowGeometry {
+            x: -3,
+            y: 220,
+            width: 326,
+            height: 135,
+        };
+        let platform = FakePlatform::new(340, 300)
+            .with_windows(vec![
+                window_info(1, main_geometry.clone(), false),
+                window_info(3, main_geometry, false),
+                window_info(2, popover_geometry, false),
+            ])
+            .with_click_log(clicks.clone())
+            .with_select_log(select_log.clone());
+        let mut g = glass_with_a11y(platform, fake_tree_with_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        let error = g.click_element(globex_id).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot guarantee restoration of the previously selected window"),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::NotDispatched)
+        );
+        assert!(clicks.lock().unwrap().is_empty());
+        assert!(
+            select_log.lock().unwrap().is_empty(),
+            "no focus request is safe when the prior selected window is ambiguous"
         );
     }
 
@@ -2562,6 +2812,14 @@ mod tests {
         clicks: Arc<Mutex<Vec<(i32, i32)>>>,
         select_log: Arc<Mutex<Vec<WindowId>>>,
     ) -> FakePlatform {
+        popover_platform_with_active(clicks, select_log, true)
+    }
+
+    fn popover_platform_with_active(
+        clicks: Arc<Mutex<Vec<(i32, i32)>>>,
+        select_log: Arc<Mutex<Vec<WindowId>>>,
+        active: bool,
+    ) -> FakePlatform {
         let active = window_info(
             1,
             WindowGeometry {
@@ -2570,7 +2828,7 @@ mod tests {
                 width: 340,
                 height: 300,
             },
-            true,
+            active,
         );
         let popover = window_info(
             2,
@@ -2995,6 +3253,67 @@ mod tests {
             "{error}"
         );
         assert_eq!(error.bound_dispatch(), Some(expected), "{error}");
+    }
+
+    #[test]
+    fn a11y_resnapshot_rejects_reader_late_success_without_replacing_the_cache() {
+        let mut original = fake_tree();
+        original.root.name = Some("original".into());
+        let mut late = fake_tree();
+        late.root.name = Some("late".into());
+        let mut g = glass_with_scripted_snapshots(
+            FakePlatform::new(100, 100),
+            vec![
+                SnapshotReply::Tree(original),
+                SnapshotReply::SleepPastDeadline(late),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .a11y_resnapshot(Deadline::from_millis(5))
+            .expect_err("a reader result returned after the caller deadline is not success");
+
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(
+            g.active
+                .as_ref()
+                .and_then(|session| session.last_ax.as_ref())
+                .and_then(|tree| tree.root.name.as_deref()),
+            Some("original"),
+            "a late tree must not replace the last on-time snapshot"
+        );
+    }
+
+    #[test]
+    fn a11y_resnapshot_rejects_success_when_core_post_processing_spends_the_deadline() {
+        let platform = FakePlatform::new(100, 100).with_drain_logs_delay(Duration::from_millis(20));
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .a11y_resnapshot(Deadline::from_millis(5))
+            .expect_err("post-processing that crosses the caller deadline is not success");
+
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            g.active
+                .as_ref()
+                .and_then(|session| session.last_ax.as_ref())
+                .is_none(),
+            "a tree whose core post-processing finished late must not be cached"
+        );
     }
 
     #[test]
@@ -3439,7 +3758,7 @@ mod tests {
                     "Beta",
                     &["Alpha", "Beta", "Gamma", "Delta"],
                 )),
-                SnapshotReply::Tree(combo("Beta", &[])),
+                SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
             ],
         );
         g.start(&spec()).unwrap();
@@ -3448,10 +3767,24 @@ mod tests {
         let first = g
             .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(400))
             .expect_err("the deadline expires before unknown-option cleanup");
-        assert_option_not_found_dispatch(&first, crate::BoundDispatch::MayHaveDispatched);
+        assert_eq!(first.bound(), Some(crate::BoundKind::TimedOut));
+        assert_eq!(first.bound_owner(), Some(crate::Whose::Caller));
+        assert_eq!(
+            first.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
         assert_eq!(clicks.lock().unwrap().len(), 1);
         assert!(keys.lock().unwrap().is_empty(), "late Escape is skipped");
 
+        let stale_retry = g
+            .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
+            .expect_err("a rejected late tree cannot support a retry");
+        assert!(matches!(stale_retry, GlassError::NoAxSnapshot));
+        assert_eq!(clicks.lock().unwrap().len(), 1);
+        assert!(keys.lock().unwrap().is_empty());
+
+        g.a11y_resnapshot(Deadline::from_millis(2_000))
+            .expect("an on-time snapshot safely recovers the retained popup state");
         let retry = g
             .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
             .expect_err("the same unknown option remains invalid");

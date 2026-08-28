@@ -26,6 +26,7 @@ pub(crate) type InputDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
 pub(crate) type CtxLog = Arc<Mutex<Option<AxContext>>>;
 pub(crate) type AxDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
 pub(crate) type AxReadStartLog = Arc<Mutex<Vec<(Deadline, bool)>>>;
+pub(crate) type PidDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
 
 /// Scriptable in-memory backend for testing the session manager.
 #[derive(Default)]
@@ -33,13 +34,16 @@ pub(crate) struct FakePlatform {
     geometry: WindowGeometry,
     frames: VecDeque<Frame>,
     pending_logs: Vec<(Stream, String)>,
+    drain_logs_delay: Option<Duration>,
     pointer_events: Vec<PointerEvent>,
+    fail_pointer: bool,
     key_events: Vec<KeyEvent>,
     started: bool,
     capture_log: Arc<Mutex<Vec<Option<Region>>>>,
     capture_deadline_log: Option<CaptureDeadlineLog>,
     pointer_deadline_log: Option<InputDeadlineLog>,
     key_deadline_log: Option<InputDeadlineLog>,
+    pid_deadline_log: Option<PidDeadlineLog>,
     capture_delay: Option<Duration>,
     capture_deadline_error_owner: Option<crate::Whose>,
     geometry_delay: Option<Duration>,
@@ -116,8 +120,16 @@ impl FakePlatform {
         self.pointer_deadline_log = Some(log);
         self
     }
+    pub(crate) fn with_failing_pointer(mut self) -> Self {
+        self.fail_pointer = true;
+        self
+    }
     pub(crate) fn with_key_deadline_log(mut self, log: InputDeadlineLog) -> Self {
         self.key_deadline_log = Some(log);
+        self
+    }
+    pub(crate) fn with_pid_deadline_log(mut self, log: PidDeadlineLog) -> Self {
+        self.pid_deadline_log = Some(log);
         self
     }
     pub(crate) fn with_capture_delay(mut self, delay: Duration) -> Self {
@@ -190,6 +202,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_logs(mut self, logs: Vec<(Stream, &str)>) -> Self {
         self.pending_logs = logs.into_iter().map(|(s, t)| (s, t.to_string())).collect();
+        self
+    }
+    pub(crate) fn with_drain_logs_delay(mut self, delay: Duration) -> Self {
+        self.drain_logs_delay = Some(delay);
         self
     }
     /// One batch per drain, in order, so a line can be made to arrive on a chosen pump rather
@@ -348,10 +364,26 @@ impl Platform for FakePlatform {
             self.drag_log.lock().unwrap().push(event.clone());
         }
         self.pointer_events.push(event.clone());
-        Ok(())
+        if self.fail_pointer {
+            Err(GlassError::Backend("scripted pointer failure".into()))
+        } else {
+            Ok(())
+        }
     }
     fn app_pid(&self) -> Option<u32> {
         Some(4242)
+    }
+    fn app_pids_by(&self, deadline: Deadline) -> Result<Vec<u32>> {
+        if let Some(log) = &self.pid_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
+        if deadline.has_passed() {
+            Err(GlassError::deadline_not_started(
+                "accessibility process discovery",
+            ))
+        } else {
+            Ok(vec![4242])
+        }
     }
     fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
         self.a11y_trailing_toggle
@@ -467,6 +499,9 @@ impl Platform for FakePlatform {
         }
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+        if let Some(delay) = self.drain_logs_delay {
+            std::thread::sleep(delay);
+        }
         if let Some(batch) = self.log_batches.pop_front() {
             return batch;
         }

@@ -529,10 +529,21 @@ impl Glass {
             action_deadline
         };
         let mut looked = false;
+        let final_read_scheduled = std::cell::Cell::new(false);
         let outcome = crate::poll::poll_until_with_pause(
             params.interval_ms,
             remaining,
             |d| {
+                // `poll_until_with_pause` performs its skipped-tick safety read after the timeout.
+                // Accessibility snapshots cannot return late success, so when this pause would
+                // reach the absolute deadline, spend it on one final on-time read instead. A wide
+                // interval may make that read early, but never late.
+                if !final_read_scheduled.get()
+                    && action_deadline.remaining().is_some_and(|left| left <= d)
+                {
+                    final_read_scheduled.set(true);
+                    return true;
+                }
                 let paused_at = std::time::Instant::now();
                 let pause_budget = action_deadline.remaining().unwrap_or(d).min(d);
                 let read_now = match signal.as_mut() {
@@ -574,6 +585,12 @@ impl Glass {
                 } else {
                     whose
                 };
+                // The generic poller asks once more after a skipped pause reaches its timeout.
+                // The branch above already scheduled that safety read while time remained, so do
+                // not turn the poller's bookkeeping tick into a semantic snapshot started late.
+                if !first_read && bound.has_passed() {
+                    return Ok(None);
+                }
                 looked = true;
                 let tree = match self.a11y_resnapshot_for_wait(bound) {
                     Ok(t) => {

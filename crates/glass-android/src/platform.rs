@@ -536,18 +536,44 @@ impl Platform for AndroidPlatform {
     }
 
     fn app_pids(&self) -> Vec<u32> {
+        self.app_pids_by(Deadline::UNBOUNDED)
+            .unwrap_or_else(|_| self.app_pid().into_iter().collect())
+    }
+
+    fn app_pids_by(&self, deadline: Deadline) -> Result<Vec<u32>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "Android accessibility process discovery",
+            ));
+        }
         // Best-effort live re-scan; falls back to the single known pid.
         if let Some(app) = &self.app {
-            let out = self
+            match self
                 .adb()
-                .run(["shell", "pidof", &app.package])
-                .unwrap_or_default();
-            let pids = parse_pids(&out);
-            if !pids.is_empty() {
-                return pids;
+                .run_until(["shell", "pidof", &app.package], deadline)
+            {
+                Ok(out) => {
+                    let pids = parse_pids(&out);
+                    if deadline.has_passed() {
+                        return Err(GlassError::caller_deadline_elapsed(
+                            "Android accessibility process discovery",
+                        ));
+                    }
+                    if !pids.is_empty() {
+                        return Ok(pids);
+                    }
+                }
+                Err(error) if error.bound().is_some() => return Err(error),
+                Err(_) => {}
             }
         }
-        self.app_pid().into_iter().collect()
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed(
+                "Android accessibility process discovery",
+            ))
+        } else {
+            Ok(self.app_pid().into_iter().collect())
+        }
     }
 }
 
@@ -1207,6 +1233,45 @@ mod platform_tests {
             .set_clipboard("x")
             .expect_err("no agent, no clipboard");
         assert!(matches!(written, GlassError::Unsupported(_)), "{written}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn accessibility_pid_discovery_kills_a_wedged_pidof_at_the_shared_deadline() {
+        let started_ok = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let windows = Answer::says(WINDOWS);
+        let pid = Answer::says("4321\n");
+        let wedged = Answer::Lingers;
+        let silent = Answer::Silent;
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&started_ok]),
+            ("shell dumpsys window windows", vec![&windows]),
+            ("shell pidof *", vec![&pid, &wedged]),
+            ("*", vec![&silent]),
+        ]);
+        let platform = started(&fake);
+        let deadline = Deadline::from_millis(25);
+
+        let began = std::time::Instant::now();
+        let error = platform
+            .app_pids_by(deadline)
+            .expect_err("a wedged live pid scan must stop at the semantic caller deadline");
+
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "pidof waited {:?}, which is closer to adb's 10s shell budget than the caller deadline",
+            began.elapsed()
+        );
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            fake.deadlines().contains(&deadline),
+            "the exact semantic deadline must reach the adb process runner"
+        );
     }
 
     #[test]

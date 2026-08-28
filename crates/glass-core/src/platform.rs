@@ -428,6 +428,26 @@ pub trait Platform {
         self.app_pid().into_iter().collect()
     }
 
+    /// Resolve [`Platform::app_pids`] under the absolute deadline shared by a semantic
+    /// accessibility operation. The default covers backends whose PID set is already in memory;
+    /// any backend that performs blocking discovery must override this method and bound that work
+    /// itself.
+    fn app_pids_by(&self, deadline: crate::Deadline) -> Result<Vec<u32>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "accessibility process discovery",
+            ));
+        }
+        let pids = self.app_pids();
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed(
+                "accessibility process discovery",
+            ))
+        } else {
+            Ok(pids)
+        }
+    }
+
     /// The session's private AT-SPI bus address, if this backend spawned one.
     /// Default `None` (no private bus / non-Linux backends).
     fn a11y_bus_addr(&self) -> Option<String> {
