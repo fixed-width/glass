@@ -501,6 +501,11 @@ impl Glass {
                     left.min(std::time::Duration::from_millis(TOGGLE_VERIFY_INTERVAL_MS)),
                 );
             }
+            // Every verification snapshot refreshed `last_ax`, but none proved the requested
+            // post-toggle state. Keep retries fail-safe after either terminal deadline.
+            if let Some(active) = self.active.as_mut() {
+                active.last_ax = None;
+            }
             if whose == crate::deadline::Whose::Caller {
                 return Err(GlassError::caller_deadline_elapsed("toggle verification"));
             }
@@ -4126,19 +4131,49 @@ mod tests {
 
     #[test]
     fn set_value_errors_when_the_toggle_does_not_apply() {
+        let drags = Arc::new(Mutex::new(Vec::new()));
         let platform = FakePlatform::new(400, 400)
-            .with_drag_log(Arc::new(Mutex::new(Vec::new())))
+            .with_drag_log(drags.clone())
             .with_trailing_toggle_backend();
-        // Both reads unchecked: the swipe "did not take" -> honest error, not false ok.
-        let mut g = glass_with_a11y_seq(platform, vec![sw(false), sw(false)]);
+        let mut g = glass_with_scripted_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(sw(false)),
+                SnapshotReply::Tree(sw(false)),
+                SnapshotReply::SleepPastDeadline(sw(false)),
+                SnapshotReply::Tree(sw(true)),
+            ],
+        );
         g.start(&spec()).unwrap();
         g.a11y_snapshot(None).unwrap();
 
-        let err = g.set_value(AxNodeId(1), "true").unwrap_err();
+        let err = g
+            .set_value_by(AxNodeId(1), "true", Deadline::from_millis(10_000))
+            .unwrap_err();
         assert!(
             matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed, .. }
                 if requested == "true" && observed.as_deref() == Some("off")),
             "{err}"
+        );
+        assert_eq!(drags.lock().unwrap().len(), 1, "the toggle was actuated");
+
+        let retry = g
+            .set_value_by(AxNodeId(1), "true", Deadline::from_millis(2_000))
+            .expect_err("a verification ceiling requires a fresh snapshot before retry");
+        assert!(matches!(retry, GlassError::NoAxSnapshot), "{retry}");
+        assert_eq!(
+            drags.lock().unwrap().len(),
+            1,
+            "the stale unchecked poll must not dispatch a second toggle"
+        );
+
+        g.a11y_resnapshot(Deadline::from_millis(2_000)).unwrap();
+        g.set_value_by(AxNodeId(1), "true", Deadline::from_millis(2_000))
+            .unwrap();
+        assert_eq!(
+            drags.lock().unwrap().len(),
+            1,
+            "the fresh checked state makes the retry a truthful no-op"
         );
     }
 
@@ -4555,6 +4590,59 @@ mod tests {
                 .iter()
                 .all(|(seen, started_live)| *seen == deadline && *started_live),
             "no verification read may start after the effective caller deadline: {starts:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_caller_deadline_requires_a_fresh_snapshot_before_retrying_actuation() {
+        let drags = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_scripted_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(sw(false)),
+                SnapshotReply::Tree(sw(false)),
+                SnapshotReply::SleepPastDeadline(sw(false)),
+                SnapshotReply::Tree(sw(true)),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let err = g
+            .set_value_by(AxNodeId(1), "true", Deadline::from_millis(350))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GlassError::Bounded {
+                    kind: crate::error::BoundKind::TimedOut,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(drags.lock().unwrap().len(), 1, "the toggle was actuated");
+
+        let retry = g
+            .set_value_by(AxNodeId(1), "true", Deadline::from_millis(2_000))
+            .expect_err("a caller-deadline exit requires a fresh snapshot before retry");
+        assert!(matches!(retry, GlassError::NoAxSnapshot), "{retry}");
+        assert_eq!(
+            drags.lock().unwrap().len(),
+            1,
+            "the stale unchecked poll must not dispatch a second toggle"
+        );
+
+        g.a11y_resnapshot(Deadline::from_millis(2_000)).unwrap();
+        g.set_value_by(AxNodeId(1), "true", Deadline::from_millis(2_000))
+            .unwrap();
+        assert_eq!(
+            drags.lock().unwrap().len(),
+            1,
+            "the fresh checked state makes the retry a truthful no-op"
         );
     }
 
