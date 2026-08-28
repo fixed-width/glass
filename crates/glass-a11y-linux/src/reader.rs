@@ -11,8 +11,8 @@ use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
     A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, Deadline,
-    GlassError, Result, WalkBudget, normalize_description, normalize_name, read_back_confirms,
-    write_took_no_effect,
+    GlassError, Result, WalkBudget, Whose, normalize_description, normalize_name,
+    read_back_confirms, write_took_no_effect,
 };
 
 use crate::mapping::{map_role, map_states};
@@ -684,12 +684,139 @@ const TOGGLE_ACTION: &str = "toggle";
 const ACTIVATE_ACTION_NAMES: &[&str] =
     &["click", "activate", "press", "push", "jump", TOGGLE_ACTION];
 
-/// Plain text editors need a pointer click to establish toolkit text-input focus.
-fn requires_pointer_focus(role: glass_core::AxRole) -> bool {
-    matches!(
-        role,
-        glass_core::AxRole::TextField | glass_core::AxRole::TextArea
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeInvokeKind {
+    Focus,
+    Activate,
+}
+
+fn native_invoke_kind(role: glass_core::AxRole) -> NativeInvokeKind {
+    match role {
+        glass_core::AxRole::TextField | glass_core::AxRole::TextArea => NativeInvokeKind::Focus,
+        _ => NativeInvokeKind::Activate,
+    }
+}
+
+const FOCUS_CONFIRM_POLL: Duration = Duration::from_millis(10);
+const FOCUS_CONFIRM_CEILING: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusConfirmationStep {
+    Confirmed,
+    Sleep(Duration),
+    Expired(Whose),
+}
+
+fn focus_confirmation_step(
+    caller: Deadline,
+    backend_end: std::time::Instant,
+    now: std::time::Instant,
+    focused: bool,
+) -> FocusConfirmationStep {
+    if focused {
+        return FocusConfirmationStep::Confirmed;
+    }
+    let (end, whose) = caller.resolve(backend_end);
+    let remaining = end.saturating_duration_since(now);
+    if remaining.is_zero() {
+        FocusConfirmationStep::Expired(whose)
+    } else {
+        FocusConfirmationStep::Sleep(FOCUS_CONFIRM_POLL.min(remaining))
+    }
+}
+
+async fn focus_text_editor(
+    ctx: &AxContext,
+    conn: &zbus::Connection,
+    node: &AccessibleProxy<'_>,
+    id: u32,
+) -> Result<()> {
+    const OP: &str = "native accessibility focus";
+    if ctx.deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(OP));
+    }
+    let dest = node.inner().destination().to_owned();
+    let path = node.inner().path().to_owned();
+    let builder = ComponentProxy::builder(conn)
+        .destination(dest)
+        .map_err(|_| GlassError::AxActionUnavailable(id))?
+        .path(path)
+        .map_err(|_| GlassError::AxActionUnavailable(id))?;
+    let component = builder.build().await.map_err(|e| {
+        GlassError::AccessibilityUnavailable(format!("AT-SPI focus proxy failed: {e}"))
+    })?;
+    if ctx.deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(OP));
+    }
+    match component.grab_focus().await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(GlassError::AxActionFailed(
+                id,
+                "the toolkit reported focus did not run".into(),
+            ));
+        }
+        Err(e) => {
+            return Err(GlassError::AccessibilityUnavailable(format!(
+                "AT-SPI focus call failed: {e}"
+            )));
+        }
+    }
+
+    let backend_end = std::time::Instant::now() + FOCUS_CONFIRM_CEILING;
+    let mut first_read = true;
+    loop {
+        if ctx.deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed(OP));
+        }
+        if !first_read {
+            match focus_confirmation_step(
+                ctx.deadline,
+                backend_end,
+                std::time::Instant::now(),
+                false,
+            ) {
+                FocusConfirmationStep::Expired(Whose::Caller) => {
+                    return Err(GlassError::caller_deadline_elapsed(OP));
+                }
+                FocusConfirmationStep::Expired(Whose::Callee) => {
+                    return Err(GlassError::AxActionFailed(
+                        id,
+                        "focus was requested but the element did not become focused within the confirmation window"
+                            .into(),
+                    ));
+                }
+                FocusConfirmationStep::Confirmed | FocusConfirmationStep::Sleep(_) => {}
+            }
+        }
+        first_read = false;
+        let focused = node
+            .get_state()
+            .await
+            .map_err(|e| {
+                GlassError::AccessibilityUnavailable(format!("AT-SPI focus state read failed: {e}"))
+            })?
+            .contains(atspi_common::State::Focused);
+        match focus_confirmation_step(
+            ctx.deadline,
+            backend_end,
+            std::time::Instant::now(),
+            focused,
+        ) {
+            FocusConfirmationStep::Confirmed => return Ok(()),
+            FocusConfirmationStep::Sleep(duration) => tokio::time::sleep(duration).await,
+            FocusConfirmationStep::Expired(Whose::Caller) => {
+                return Err(GlassError::caller_deadline_elapsed(OP));
+            }
+            FocusConfirmationStep::Expired(Whose::Callee) => {
+                return Err(GlassError::AxActionFailed(
+                    id,
+                    "focus was requested but the element did not become focused within the confirmation window"
+                        .into(),
+                ));
+            }
+        }
+    }
 }
 
 /// Confirm a fired `toggle` action actually moved the control: poll its boolean state until
@@ -716,10 +843,10 @@ async fn verify_toggle_flipped(
     ))
 }
 
-/// Actuate the element identified by `target` via its native AT-SPI Action — the
+/// Actuate the element identified by `target` via its role-appropriate native AT-SPI operation — the
 /// backend for `Accessibility::invoke`. Re-walks pre-order to `target.id`, verifies
 /// the fingerprint (same gate as `set_value_async`, guarding a stale id / mirror
-/// drift), then fires the first action in [`ACTIVATE_ACTION_NAMES`].
+/// drift), then focuses a text editor or fires the first action in [`ACTIVATE_ACTION_NAMES`].
 ///
 /// When the action that fired is [`TOGGLE_ACTION`], the ack alone is not accepted as
 /// success: the control's boolean state must be observed to change (see
@@ -739,8 +866,8 @@ async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
     if !target.matches(role, name.as_deref()) {
         return Err(GlassError::AxElementChanged(target.id.0));
     }
-    if requires_pointer_focus(role) {
-        return Err(GlassError::AxActionUnavailable(target.id.0));
+    if native_invoke_kind(role) == NativeInvokeKind::Focus {
+        return focus_text_editor(ctx, &conn, &node, target.id.0).await;
     }
     // Read the control's boolean state BEFORE firing, so a `toggle` action can be verified by
     // an actual flip below — afterwards there is nothing left to compare against. Costs one
@@ -886,11 +1013,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_roles_require_pointer_focus() {
+    fn text_roles_use_native_focus_and_other_controls_activate() {
         use glass_core::AxRole::*;
 
         for role in [TextField, TextArea] {
-            assert!(requires_pointer_focus(role), "{role:?}");
+            assert_eq!(
+                native_invoke_kind(role),
+                NativeInvokeKind::Focus,
+                "{role:?}"
+            );
         }
         for role in [
             Button,
@@ -902,7 +1033,76 @@ mod tests {
             Link,
             MenuItem,
         ] {
-            assert!(!requires_pointer_focus(role), "{role:?}");
+            assert_eq!(
+                native_invoke_kind(role),
+                NativeInvokeKind::Activate,
+                "{role:?}"
+            );
+        }
+        assert_eq!(
+            glass_core::AxRole::ALL
+                .into_iter()
+                .filter(|&role| native_invoke_kind(role) == NativeInvokeKind::Focus)
+                .collect::<Vec<_>>(),
+            vec![TextField, TextArea]
+        );
+    }
+
+    #[test]
+    fn focus_confirmation_succeeds_immediately_without_sleep() {
+        let now = std::time::Instant::now();
+        assert_eq!(
+            focus_confirmation_step(
+                Deadline::at(now + Duration::from_millis(20)),
+                now + Duration::from_millis(40),
+                now,
+                true,
+            ),
+            FocusConfirmationStep::Confirmed
+        );
+    }
+
+    #[test]
+    fn focus_confirmation_attributes_the_earlier_bound() {
+        use glass_core::Whose;
+
+        let now = std::time::Instant::now();
+        let caller_end = now + Duration::from_millis(20);
+        let backend_end = now + Duration::from_millis(40);
+        assert_eq!(
+            focus_confirmation_step(Deadline::at(caller_end), backend_end, caller_end, false),
+            FocusConfirmationStep::Expired(Whose::Caller)
+        );
+
+        let backend_end = now + Duration::from_millis(20);
+        for deadline in [
+            Deadline::UNBOUNDED,
+            Deadline::at(now + Duration::from_millis(40)),
+        ] {
+            assert_eq!(
+                focus_confirmation_step(deadline, backend_end, backend_end, false),
+                FocusConfirmationStep::Expired(Whose::Callee)
+            );
+        }
+    }
+
+    #[test]
+    fn focus_confirmation_sleep_is_capped_by_every_bound() {
+        let now = std::time::Instant::now();
+        for (caller, backend, expected) in [
+            (50, 50, FOCUS_CONFIRM_POLL),
+            (3, 50, Duration::from_millis(3)),
+            (50, 4, Duration::from_millis(4)),
+        ] {
+            assert_eq!(
+                focus_confirmation_step(
+                    Deadline::at(now + Duration::from_millis(caller)),
+                    now + Duration::from_millis(backend),
+                    now,
+                    false,
+                ),
+                FocusConfirmationStep::Sleep(expected)
+            );
         }
     }
 

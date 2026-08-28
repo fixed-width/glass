@@ -1243,11 +1243,12 @@ pub trait Accessibility {
         Err(crate::error::GlassError::AxUnsupported)
     }
 
-    /// Actuate the element identified by `target` via the platform's native
-    /// accessibility action (the OS-level "press this control" verb). The
-    /// backend re-walks pre-order to `target.id`, verifies the fingerprint
-    /// (role+name, and bounds where its `set_value` does), then fires the
-    /// action.
+    /// Actuate the element identified by `target` through the platform's native
+    /// accessibility operation appropriate to the element. This is usually
+    /// press/activate for command controls and may be focus for editable text
+    /// controls. The backend re-walks pre-order to `target.id`, verifies the
+    /// fingerprint (role+name, and bounds where its `set_value` does), then
+    /// confirms the operation's required semantic effect.
     ///
     /// Returns the element the action actually fired on, when that is **not**
     /// `target.id` — a backend whose toolkit carries a control's activation on an
@@ -1276,8 +1277,9 @@ pub trait Accessibility {
 /// How `click_element` actuated the target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClickMethod {
-    /// The platform's native accessibility action fired; no pointer was synthesized.
-    /// `actuated` names the element the action fired on when it is not the one the
+    /// A native accessibility operation actuated the target; no pointer was synthesized.
+    /// The operation may be press/activate or another role-appropriate effect such as focusing
+    /// an editable text control. `actuated` names the element acted on when it is not the one the
     /// caller asked for, and is `None` when they are the same element.
     NativeAction { actuated: Option<AxNodeId> },
     /// The synthetic pointer path ran; `native_fallback` says why the native
