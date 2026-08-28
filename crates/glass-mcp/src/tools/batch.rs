@@ -191,7 +191,8 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
             }
             Err(error) => {
                 let detail = redacted_error_detail(action, &error.message);
-                let attempted = !error.not_dispatched;
+                let attempted =
+                    error.bound_dispatch != Some(glass_core::BoundDispatch::NotDispatched);
                 return Err(step_failure(
                     &a.actions,
                     i,

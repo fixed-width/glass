@@ -16,6 +16,7 @@ enum DeadlineBehavior {
     CompleteLate,
     FailLate,
     NotDispatched,
+    ReturnNotDispatched,
     CaptureCompletesLate,
 }
 
@@ -27,6 +28,12 @@ struct DeadlinePlatform {
 
 type DeadlineFixture = (Glass, Arc<Mutex<Vec<Deadline>>>, Arc<Mutex<Vec<String>>>);
 type A11yDeadlineFixture = (Glass, Arc<Mutex<Vec<Deadline>>>, Arc<Mutex<Vec<Deadline>>>);
+type A11yReturnDeadlineFixture = (
+    Glass,
+    Arc<Mutex<Vec<Deadline>>>,
+    Arc<Mutex<Vec<Deadline>>>,
+    Arc<Mutex<Vec<String>>>,
+);
 
 #[derive(Debug, PartialEq, Eq)]
 enum ExactContent {
@@ -118,12 +125,35 @@ fn untrusted_nonce_normalization_changes_only_wrapper_markers() {
 struct DeadlineAccessibility {
     tree: AxTree,
     deadlines: Arc<Mutex<Vec<Deadline>>>,
+    events: Arc<Mutex<Vec<String>>>,
 }
 
 impl Accessibility for DeadlineAccessibility {
     fn snapshot(&mut self, context: &AxContext) -> GlassResult<AxTree> {
         self.deadlines.lock().unwrap().push(context.deadline);
         Ok(self.tree.clone())
+    }
+
+    fn set_value(
+        &mut self,
+        _context: &AxContext,
+        _target: &glass_core::AxTarget,
+        text: &str,
+    ) -> GlassResult<()> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("set_value({text})"));
+        Ok(())
+    }
+
+    fn invoke(
+        &mut self,
+        _context: &AxContext,
+        _target: &glass_core::AxTarget,
+    ) -> GlassResult<Option<glass_core::AxNodeId>> {
+        self.events.lock().unwrap().push("click_element".into());
+        Ok(None)
     }
 }
 
@@ -147,6 +177,11 @@ impl Platform for DeadlinePlatform {
             sleep_past(deadline);
             return self.inner.capture_frame(region);
         }
+        if matches!(self.behavior, DeadlineBehavior::ReturnNotDispatched) {
+            return Err(GlassError::deadline_not_started(
+                "controlled return observation",
+            ));
+        }
         self.inner.capture_frame(region)
     }
     fn send_pointer(&mut self, event: &PointerEvent) -> GlassResult<()> {
@@ -168,7 +203,9 @@ impl Platform for DeadlinePlatform {
             DeadlineBehavior::NotDispatched => {
                 Err(GlassError::deadline_not_started("controlled pointer"))
             }
-            DeadlineBehavior::CaptureCompletesLate => self.inner.send_pointer(event),
+            DeadlineBehavior::ReturnNotDispatched | DeadlineBehavior::CaptureCompletesLate => {
+                self.inner.send_pointer(event)
+            }
         }
     }
     fn send_key(&mut self, event: &KeyEvent) -> GlassResult<()> {
@@ -232,12 +269,24 @@ fn deadline_glass(behavior: DeadlineBehavior, frames: Vec<Frame>) -> DeadlineFix
 }
 
 fn deadline_a11y_glass(frames: Vec<Frame>) -> A11yDeadlineFixture {
+    let (glass, platform_deadlines, accessibility_deadlines, _) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::Normal, frames);
+    (glass, platform_deadlines, accessibility_deadlines)
+}
+
+fn deadline_a11y_glass_with_behavior(
+    behavior: DeadlineBehavior,
+    frames: Vec<Frame>,
+) -> A11yReturnDeadlineFixture {
     let platform_deadlines = Arc::new(Mutex::new(Vec::new()));
     let accessibility_deadlines = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
     let platform = DeadlinePlatform {
-        inner: FakePlatform::new(100, 100).with_frames(frames),
+        inner: FakePlatform::new(100, 100)
+            .with_frames(frames)
+            .with_event_log(events.clone()),
         deadlines: platform_deadlines.clone(),
-        behavior: DeadlineBehavior::Normal,
+        behavior,
     };
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("baselines");
@@ -247,6 +296,7 @@ fn deadline_a11y_glass(frames: Vec<Frame>) -> A11yDeadlineFixture {
         accessibility: Some(Box::new(DeadlineAccessibility {
             tree: fake_tree(),
             deadlines: accessibility_deadlines.clone(),
+            events: events.clone(),
         })),
     });
     let factory: PlatformFactory = Box::new(move |_| {
@@ -272,7 +322,8 @@ fn deadline_a11y_glass(frames: Vec<Frame>) -> A11yDeadlineFixture {
     crate::tools::a11y_snapshot(&mut glass, &A11ySnapshotArgs { max_nodes: None }).unwrap();
     platform_deadlines.lock().unwrap().clear();
     accessibility_deadlines.lock().unwrap().clear();
-    (glass, platform_deadlines, accessibility_deadlines)
+    events.lock().unwrap().clear();
+    (glass, platform_deadlines, accessibility_deadlines, events)
 }
 
 fn do_args(actions: Vec<Action>, timeout_ms: u64) -> DoArgs {
@@ -712,6 +763,74 @@ fn caller_soft_return_snapshot_stops_before_accessibility_work() {
         true
     );
     assert_eq!(*events.lock().unwrap(), vec!["type(secret)"]);
+}
+
+fn assert_composed_mutation_was_attempted(err: ToolOutput) {
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    let step = &envelope["outcome"]["steps"][0];
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], true);
+}
+
+#[test]
+fn type_return_not_dispatched_after_actuation_remains_attempted() {
+    let (mut g, _, events) = deadline_glass(DeadlineBehavior::ReturnNotDispatched, vec![]);
+    let err = do_actions(
+        &mut g,
+        &do_args(
+            vec![Action::Type(TypeArgs {
+                text: "secret".into(),
+                return_: Some("settle".into()),
+            })],
+            100,
+        ),
+    )
+    .unwrap_err();
+
+    assert_composed_mutation_was_attempted(err);
+    assert_eq!(*events.lock().unwrap(), vec!["type(secret)"]);
+}
+
+#[test]
+fn click_element_return_not_dispatched_after_actuation_remains_attempted() {
+    let (mut g, _, _, events) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::ReturnNotDispatched, vec![]);
+    let err = do_actions(
+        &mut g,
+        &do_args(
+            vec![Action::ClickElement(ClickElementArgs {
+                id: 1,
+                return_: Some("settle".into()),
+            })],
+            100,
+        ),
+    )
+    .unwrap_err();
+
+    assert_composed_mutation_was_attempted(err);
+    assert_eq!(*events.lock().unwrap(), vec!["click_element"]);
+}
+
+#[test]
+fn set_value_return_not_dispatched_after_actuation_remains_attempted() {
+    let (mut g, _, _, events) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::ReturnNotDispatched, vec![]);
+    let err = do_actions(
+        &mut g,
+        &do_args(
+            vec![Action::SetValue(SetValueArgs {
+                id: 1,
+                text: "secret".into(),
+                return_: Some("settle".into()),
+            })],
+            100,
+        ),
+    )
+    .unwrap_err();
+
+    assert_composed_mutation_was_attempted(err);
+    assert_eq!(*events.lock().unwrap(), vec!["set_value(secret)"]);
 }
 
 #[test]

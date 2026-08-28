@@ -175,8 +175,10 @@ pub(crate) fn type_text_with(
     // Past this point the keystrokes have landed: a failing observe (e.g. `snapshot`
     // with no a11y reader) must say so, or an agent retries and types the text twice.
     let (observed, extra, timed_out_by) =
-        crate::tools::resolve_return_with(glass, a.return_.as_deref(), context)
-            .map_err(|e| e.annotate("text was typed; return observe failed"))?;
+        crate::tools::resolve_return_with(glass, a.return_.as_deref(), context).map_err(|e| {
+            e.after_dispatch()
+                .annotate("text was typed; return observe failed")
+        })?;
     let mut result = serde_json::json!({});
     if let Some(o) = observed {
         result["observed"] = o;

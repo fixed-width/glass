@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, AxNodeId, Glass, MarkLabel, MouseButton, WindowGeometry, WindowHint, WindowId,
-    WindowOp, frame_to_webp,
+    AppSpec, AxNodeId, BoundDispatch, Glass, MarkLabel, MouseButton, WindowGeometry, WindowHint,
+    WindowId, WindowOp, frame_to_webp,
 };
 use serde_json::json;
 
@@ -109,7 +109,7 @@ impl ContextualOutput {
 pub(crate) struct ContextualError {
     pub message: String,
     pub sequence_deadline_exceeded: bool,
-    pub not_dispatched: bool,
+    pub bound_dispatch: Option<BoundDispatch>,
 }
 
 impl ContextualError {
@@ -117,13 +117,12 @@ impl ContextualError {
         Self {
             message,
             sequence_deadline_exceeded: false,
-            not_dispatched: false,
+            bound_dispatch: None,
         }
     }
 
     pub fn from_core(error: glass_core::GlassError, context: ToolContext) -> Self {
-        let not_dispatched =
-            error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched);
+        let bound_dispatch = error.bound_dispatch();
         let sequence_deadline_exceeded = match error.bound() {
             Some(glass_core::BoundKind::NotStarted) => context.deadline.has_passed(),
             Some(glass_core::BoundKind::TimedOut) => context.deadline.has_passed(),
@@ -132,19 +131,18 @@ impl ContextualError {
         Self {
             message: error.to_string(),
             sequence_deadline_exceeded,
-            not_dispatched,
+            bound_dispatch,
         }
     }
 
     pub fn from_caller_bound(error: glass_core::GlassError, context: ToolContext) -> Self {
-        let not_dispatched =
-            error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched);
+        let bound_dispatch = error.bound_dispatch();
         let sequence_deadline_exceeded =
             error.bound().is_some() && context.deadline.remaining().is_some();
         Self {
             message: error.to_string(),
             sequence_deadline_exceeded,
-            not_dispatched,
+            bound_dispatch,
         }
     }
 
@@ -153,16 +151,20 @@ impl ContextualError {
         context: ToolContext,
         whose: glass_core::Whose,
     ) -> Self {
-        let not_dispatched =
-            error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched);
+        let bound_dispatch = error.bound_dispatch();
         let sequence_deadline_exceeded = error.bound().is_some()
             && whose == glass_core::Whose::Caller
             && context.deadline.remaining().is_some();
         Self {
             message: error.to_string(),
             sequence_deadline_exceeded,
-            not_dispatched,
+            bound_dispatch,
         }
+    }
+
+    pub fn after_dispatch(mut self) -> Self {
+        self.bound_dispatch = Some(BoundDispatch::MayHaveDispatched);
+        self
     }
 
     pub fn annotate(mut self, prefix: &str) -> Self {
@@ -174,7 +176,7 @@ impl ContextualError {
         Self {
             message,
             sequence_deadline_exceeded: true,
-            not_dispatched: false,
+            bound_dispatch: None,
         }
     }
 }
@@ -571,8 +573,8 @@ pub(crate) fn click_element_with(
     let method = glass
         .click_element_by(AxNodeId(a.id), context.deadline)
         .map_err(|e| ContextualError::from_caller_bound(e, context))?;
-    let (observed, extra, timed_out_by) =
-        resolve_return_with(glass, a.return_.as_deref(), context)?;
+    let (observed, extra, timed_out_by) = resolve_return_with(glass, a.return_.as_deref(), context)
+        .map_err(ContextualError::after_dispatch)?;
     let mut result = serde_json::json!({ "id": a.id, "method": method.label() });
     if let Some(reason) = method.native_fallback() {
         result["native_fallback"] = serde_json::json!(reason);
@@ -603,8 +605,8 @@ pub(crate) fn set_value_with(
     glass
         .set_value_by(AxNodeId(a.id), &a.text, context.deadline)
         .map_err(|e| ContextualError::from_caller_bound(e, context))?;
-    let (observed, extra, timed_out_by) =
-        resolve_return_with(glass, a.return_.as_deref(), context)?;
+    let (observed, extra, timed_out_by) = resolve_return_with(glass, a.return_.as_deref(), context)
+        .map_err(ContextualError::after_dispatch)?;
     let mut result = serde_json::json!({ "id": a.id });
     if let Some(o) = observed {
         result["observed"] = o;
