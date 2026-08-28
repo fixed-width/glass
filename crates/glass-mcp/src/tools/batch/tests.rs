@@ -212,12 +212,12 @@ impl Accessibility for DeadlineAccessibility {
                     })
                 })
             }),
-            DeadlineBehavior::SetValueWorkerSpawnFailure => Err(
-                GlassError::AccessibilityUnavailable(
+            DeadlineBehavior::SetValueWorkerSpawnFailure => {
+                Err(GlassError::AccessibilityUnavailable(
                     "could not start the scripted accessibility worker".into(),
                 )
-                .before_dispatch(),
-            ),
+                .before_dispatch())
+            }
             _ => Ok(()),
         }
     }
@@ -1393,10 +1393,8 @@ fn set_value_transport_failure_keeps_post_write_retry_guidance() {
 
 #[test]
 fn set_value_worker_spawn_failure_is_unattempted_and_safe_to_retry() {
-    let (mut g, _, _, events) = deadline_a11y_glass_with_behavior(
-        DeadlineBehavior::SetValueWorkerSpawnFailure,
-        vec![],
-    );
+    let (mut g, _, _, events) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::SetValueWorkerSpawnFailure, vec![]);
     let error = do_actions(
         &mut g,
         &do_args(
