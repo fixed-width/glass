@@ -751,9 +751,18 @@ fn success_retains_existing_fields_and_adds_every_step_result() {
         vec!["click(10,20)", "type(alice)", "key(Tab)"]
     );
     let result = assert_envelope(&out, "glass_do");
+    assert_eq!(result["status"], "completed");
     assert_eq!(result["executed"], json!(3));
+    assert!(result["elapsed_ms"].is_u64());
     assert_eq!(result["steps"].as_array().unwrap().len(), 3);
-    assert_eq!(result["steps"][0]["status"], "completed");
+    assert_eq!(
+        result["steps"],
+        json!([
+            {"status":"completed","index":0,"action":"click","result":{},"content_blocks":[]},
+            {"status":"completed","index":1,"action":"type","result":{},"content_blocks":[]},
+            {"status":"completed","index":2,"action":"key","result":{},"content_blocks":[]},
+        ])
+    );
 }
 
 #[test]
@@ -1411,7 +1420,15 @@ fn then_settle_is_text_only() {
         "settle folded into the envelope, no separate/image block"
     );
     let result = assert_envelope(&out, "glass_do");
+    assert_eq!(result["status"], "completed");
+    assert!(result["elapsed_ms"].is_u64());
     assert_eq!(result["then"]["settle"]["settled"], json!(true));
+    assert!(
+        result["elapsed_ms"].as_u64().unwrap()
+            >= result["then"]["settle"]["observed_ms"].as_u64().unwrap(),
+        "top-level elapsed time must include terminal settle work: {result}"
+    );
+    assert!(result.get("terminal_steps").is_some());
 }
 
 #[test]

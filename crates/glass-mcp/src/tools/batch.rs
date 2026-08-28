@@ -203,7 +203,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
         }
     }
 
-    let mut result = json!({ "executed": n, "steps": steps });
+    let mut result = json!({ "status": "completed", "executed": n, "steps": steps });
     if let Some(then) = &a.then {
         match run_then(glass, then, context, siblings.len() + 1) {
             Ok(mut terminal) => {
@@ -228,6 +228,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
             }
         }
     }
+    result["elapsed_ms"] = json!(started.elapsed().as_millis());
     Ok(ToolOutput::result_with("glass_do", result, siblings))
 }
 
