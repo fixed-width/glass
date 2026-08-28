@@ -472,7 +472,7 @@ Example, using element ids obtained before the call:
 {
   "actions": [
     {"action":"set_value","id":12,"text":"Alice"},
-    {"action":"wait_for_element","description":"Name","role":"Text","value":"Alice","timeout_ms":3000},
+    {"action":"wait_for_element","description":"Name","role":"TextField","value":"Alice","timeout_ms":3000},
     {"action":"click_element","id":16,"return":"snapshot"},
     {"action":"wait_for_element","name":"Clicked 1","description":"Counter","timeout_ms":3000}
   ],
