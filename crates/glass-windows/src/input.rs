@@ -113,28 +113,46 @@ fn key_vk(vk: VIRTUAL_KEY, up: bool) -> INPUT {
     }
 }
 
-fn send_by(inputs: &[INPUT], inject: &mut impl FnMut(&[INPUT]) -> usize) -> Result<()> {
+struct SendFailure<'a> {
+    error: GlassError,
+    inserted: &'a [INPUT],
+}
+
+fn send_prefix_by<'a>(
+    inputs: &'a [INPUT],
+    inject: &mut impl FnMut(&[INPUT]) -> usize,
+) -> std::result::Result<(), SendFailure<'a>> {
     if inputs.is_empty() {
         return Ok(());
     }
     let n = inject(inputs);
     if n == 0 {
-        return Err(GlassError::Backend(format!(
-            "SendInput injected 0/{} events — input blocked (UIPI / foreground lock / \
-                 locked input desktop); try running elevated",
-            inputs.len()
-        ))
-        .before_dispatch());
+        return Err(SendFailure {
+            error: GlassError::Backend(format!(
+                "SendInput injected 0/{} events — input blocked (UIPI / foreground lock / \
+                     locked input desktop); try running elevated",
+                inputs.len()
+            ))
+            .before_dispatch(),
+            inserted: &inputs[..0],
+        });
     }
     if n != inputs.len() {
-        return Err(GlassError::Backend(format!(
-            "SendInput injected {n}/{} events; input state is uncertain (UIPI / foreground lock); \
-             try running elevated",
-            inputs.len()
-        ))
-        .after_dispatch());
+        return Err(SendFailure {
+            error: GlassError::Backend(format!(
+                "SendInput injected {n}/{} events; input state is uncertain (UIPI / foreground lock); \
+                 try running elevated",
+                inputs.len()
+            ))
+            .after_dispatch(),
+            inserted: &inputs[..n],
+        });
     }
     Ok(())
+}
+
+fn send_by(inputs: &[INPUT], inject: &mut impl FnMut(&[INPUT]) -> usize) -> Result<()> {
+    send_prefix_by(inputs, inject).map_err(|failure| failure.error)
 }
 
 /// Submit a batch of `INPUT`s. Any nonzero short delivery is an after-dispatch error.
@@ -146,77 +164,207 @@ fn send(inputs: &[INPUT]) -> Result<()> {
     send_by(inputs, &mut inject)
 }
 
-fn send_with_cleanup_by(
-    inputs: &[INPUT],
-    cleanup_inputs: &[INPUT],
-    operation: &'static str,
-    inject: &mut impl FnMut(&[INPUT]) -> usize,
-) -> Result<()> {
-    let primary = match send_by(inputs, inject) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InjectedInputIdentity {
+    Keyboard { vk: u16, scan: u16, flags: u32 },
+    MouseButton(u32),
+}
+
+struct InjectedDown {
+    identity: InjectedInputIdentity,
+    release: INPUT,
+}
+
+enum InjectedInputTransition {
+    Down(InjectedDown),
+    Up(InjectedInputIdentity),
+}
+
+fn keyboard_transition(input: &INPUT) -> InjectedInputTransition {
+    // SAFETY: the INPUT type tag identifies the active union field.
+    let mut key = unsafe { input.Anonymous.ki };
+    let identity = InjectedInputIdentity::Keyboard {
+        vk: key.wVk.0,
+        scan: key.wScan,
+        flags: key.dwFlags.0 & !KEYEVENTF_KEYUP.0,
     };
-    if primary.bound_dispatch() != Some(glass_core::BoundDispatch::MayHaveDispatched)
-        || cleanup_inputs.is_empty()
-    {
-        return Err(primary);
-    }
-    match send_by(cleanup_inputs, inject) {
-        Ok(()) => Err(primary),
-        Err(cleanup) => Err(GlassError::input_cleanup_failed(
-            operation, primary, cleanup,
-        )),
+    if key.dwFlags.contains(KEYEVENTF_KEYUP) {
+        InjectedInputTransition::Up(identity)
+    } else {
+        key.dwFlags |= KEYEVENTF_KEYUP;
+        InjectedInputTransition::Down(InjectedDown {
+            identity,
+            release: INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 { ki: key },
+            },
+        })
     }
 }
 
-fn send_with_cleanup(
+fn mouse_transition(input: &INPUT) -> Option<InjectedInputTransition> {
+    // SAFETY: the INPUT type tag identifies the active union field.
+    let mouse = unsafe { input.Anonymous.mi };
+    let pairs = [
+        (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+        (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+    ];
+    for (down, up) in pairs {
+        let identity = InjectedInputIdentity::MouseButton(down.0);
+        if mouse.dwFlags.contains(up) {
+            return Some(InjectedInputTransition::Up(identity));
+        }
+        if mouse.dwFlags.contains(down) {
+            let mut release = mouse;
+            release.dwFlags = MOUSE_EVENT_FLAGS((release.dwFlags.0 & !down.0) | up.0);
+            return Some(InjectedInputTransition::Down(InjectedDown {
+                identity,
+                release: INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 { mi: release },
+                },
+            }));
+        }
+    }
+    None
+}
+
+fn input_transition(input: &INPUT) -> Option<InjectedInputTransition> {
+    if input.r#type == INPUT_KEYBOARD {
+        Some(keyboard_transition(input))
+    } else if input.r#type == INPUT_MOUSE {
+        mouse_transition(input)
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+struct InjectedInputState {
+    downs: Vec<InjectedDown>,
+}
+
+impl InjectedInputState {
+    fn observe(&mut self, inserted: &[INPUT]) {
+        for input in inserted {
+            match input_transition(input) {
+                Some(InjectedInputTransition::Down(down)) => self.downs.push(down),
+                Some(InjectedInputTransition::Up(identity)) => {
+                    if let Some(index) = self
+                        .downs
+                        .iter()
+                        .rposition(|down| down.identity == identity)
+                    {
+                        self.downs.remove(index);
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn releases(&self) -> Vec<INPUT> {
+        self.downs.iter().rev().map(|down| down.release).collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.downs.is_empty()
+    }
+}
+
+fn send_tracked_by(
     inputs: &[INPUT],
-    cleanup_inputs: &[INPUT],
+    state: &mut InjectedInputState,
+    earlier_dispatch: bool,
     operation: &'static str,
+    inject: &mut impl FnMut(&[INPUT]) -> usize,
 ) -> Result<()> {
+    let failure = match send_prefix_by(inputs, inject) {
+        Ok(()) => {
+            state.observe(inputs);
+            return Ok(());
+        }
+        Err(failure) => failure,
+    };
+    state.observe(failure.inserted);
+    let primary = if earlier_dispatch {
+        failure.error.after_dispatch()
+    } else {
+        failure.error
+    };
+    let cleanup_inputs = state.releases();
+    if cleanup_inputs.is_empty() {
+        return Err(primary);
+    }
+    match send_prefix_by(&cleanup_inputs, inject) {
+        Ok(()) => {
+            state.observe(&cleanup_inputs);
+            Err(primary)
+        }
+        Err(cleanup) => {
+            state.observe(cleanup.inserted);
+            Err(GlassError::input_cleanup_failed(
+                operation,
+                primary,
+                cleanup.error,
+            ))
+        }
+    }
+}
+
+fn send_balanced_by(
+    inputs: &[INPUT],
+    operation: &'static str,
+    inject: &mut impl FnMut(&[INPUT]) -> usize,
+) -> Result<()> {
+    let mut state = InjectedInputState::default();
+    send_tracked_by(inputs, &mut state, false, operation, inject)
+}
+
+fn send_balanced(inputs: &[INPUT], operation: &'static str) -> Result<()> {
     let mut inject = |inputs: &[INPUT]| {
         // SAFETY: `inputs` is a valid slice and the stride is the real `INPUT` size.
         (unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) }) as usize
     };
-    send_with_cleanup_by(inputs, cleanup_inputs, operation, &mut inject)
+    send_balanced_by(inputs, operation, &mut inject)
 }
 
 fn send_modifiers_by(
     modifiers: &[VIRTUAL_KEY],
     down: bool,
+    state: &mut InjectedInputState,
     inject: &mut impl FnMut(&[INPUT]) -> usize,
 ) -> Result<()> {
     let inputs: Vec<_> = if down {
+        debug_assert!(state.is_empty());
         modifiers
             .iter()
             .map(|&modifier| key_vk(modifier, false))
             .collect()
     } else {
-        modifiers
-            .iter()
-            .rev()
-            .map(|&modifier| key_vk(modifier, true))
-            .collect()
+        state.releases()
     };
-    let cleanup: Vec<_> = modifiers
-        .iter()
-        .rev()
-        .map(|&modifier| key_vk(modifier, true))
-        .collect();
-    send_with_cleanup_by(
+    let earlier_dispatch = !down && !state.is_empty();
+    send_tracked_by(
         &inputs,
-        &cleanup,
+        state,
+        earlier_dispatch,
         "releasing Windows modifier input",
         inject,
     )
 }
 
-fn send_modifiers(modifiers: &[VIRTUAL_KEY], down: bool) -> Result<()> {
+fn send_modifiers(
+    modifiers: &[VIRTUAL_KEY],
+    down: bool,
+    state: &mut InjectedInputState,
+) -> Result<()> {
     let mut inject = |inputs: &[INPUT]| {
         // SAFETY: `inputs` is a valid slice and the stride is the real `INPUT` size.
         (unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) }) as usize
     };
-    send_modifiers_by(modifiers, down, &mut inject)
+    send_modifiers_by(modifiers, down, state, &mut inject)
 }
 
 /// The `MOUSEEVENTF_*DOWN`/`*UP` flag pair for a button.
@@ -241,6 +389,7 @@ struct WindowsDragSink<'a> {
     down: MOUSE_EVENT_FLAGS,
     up: MOUSE_EVENT_FLAGS,
     mods: &'a [Modifier],
+    modifier_state: InjectedInputState,
     /// Last normalized position emitted by `place`/`move_to`. `button` fires there,
     /// because with `MOUSEEVENTF_ABSOLUTE` the up/down event's own coords are
     /// authoritative — releasing without this would snap the cursor to (0,0) and drop
@@ -271,7 +420,7 @@ impl glass_core::DragSink for WindowsDragSink<'_> {
     }
     fn modifiers(&mut self, down: bool) -> Result<()> {
         let modifiers: Vec<_> = self.mods.iter().copied().map(modifier_vk).collect();
-        send_modifiers(&modifiers, down)
+        send_modifiers(&modifiers, down, &mut self.modifier_state)
     }
 }
 
@@ -280,11 +429,12 @@ impl glass_core::DragSink for WindowsDragSink<'_> {
 struct WindowsChordSink {
     mod_vks: Vec<VIRTUAL_KEY>,
     vk: VIRTUAL_KEY,
+    modifier_state: InjectedInputState,
 }
 
 impl glass_core::ChordSink for WindowsChordSink {
     fn modifiers(&mut self, down: bool) -> Result<()> {
-        send_modifiers(&self.mod_vks, down)
+        send_modifiers(&self.mod_vks, down, &mut self.modifier_state)
     }
     fn key(&mut self, down: bool) -> Result<()> {
         send(&[key_vk(self.vk, !down)])
@@ -301,11 +451,12 @@ struct WindowsScrollSink {
     dx: i32,
     dy: i32,
     mod_vks: Vec<VIRTUAL_KEY>,
+    modifier_state: InjectedInputState,
 }
 
 impl glass_core::ScrollSink for WindowsScrollSink {
     fn modifiers(&mut self, down: bool) -> Result<()> {
-        send_modifiers(&self.mod_vks, down)
+        send_modifiers(&self.mod_vks, down, &mut self.modifier_state)
     }
     fn wheel(&mut self) -> Result<()> {
         // Scroll sign matches x11 (`scroll_button(5=down,4=up, dy)`): there positive `dy` clicks
@@ -354,13 +505,11 @@ impl glass_core::TypeSink for WindowsTypeSink {
         let mut buf = [0u16; 2];
         let units = c.encode_utf16(&mut buf);
         let mut inputs = Vec::with_capacity(units.len() * 2);
-        let mut cleanup = Vec::with_capacity(units.len());
         for unit in units.iter().copied() {
             inputs.push(key_unicode(unit, false));
             inputs.push(key_unicode(unit, true));
-            cleanup.push(key_unicode(unit, true));
         }
-        send_with_cleanup(&inputs, &cleanup, "releasing Windows text input")
+        send_balanced(&inputs, "releasing Windows text input")
     }
 }
 
@@ -457,19 +606,10 @@ pub(crate) fn send_pointer_by(
                 for m in modifiers.iter().rev() {
                     inputs.push(key_vk(modifier_vk(*m), true));
                 }
-                let cleanup_capacity = modifiers.len().checked_add(1).ok_or_else(|| {
-                    GlassError::InvalidPointerInput("click cleanup event count overflowed")
-                        .before_dispatch()
-                })?;
-                let mut cleanup = Vec::with_capacity(cleanup_capacity);
-                cleanup.push(mouse(nx, ny, up | ABS));
-                for m in modifiers.iter().rev() {
-                    cleanup.push(key_vk(modifier_vk(*m), true));
-                }
                 if deadline.has_passed() {
                     return Err(GlassError::caller_deadline_elapsed("pointer input"));
                 }
-                send_with_cleanup(&inputs, &cleanup, "releasing Windows click input")?;
+                send_balanced(&inputs, "releasing Windows click input")?;
             }
             PointerEvent::Drag {
                 from_x,
@@ -490,6 +630,7 @@ pub(crate) fn send_pointer_by(
                     down,
                     up,
                     mods: modifiers,
+                    modifier_state: InjectedInputState::default(),
                     last: (0, 0),
                 };
                 glass_core::run_drag_by(&mut sink, &gesture, deadline)?;
@@ -511,6 +652,7 @@ pub(crate) fn send_pointer_by(
                     dx,
                     dy,
                     mod_vks,
+                    modifier_state: InjectedInputState::default(),
                 };
                 glass_core::run_scroll_by(&mut sink, !modifiers.is_empty(), deadline)?;
             }
@@ -548,7 +690,11 @@ pub(crate) fn send_key_by(active_hwnd: isize, event: &KeyEvent, deadline: Deadli
                 let mod_vks: Vec<VIRTUAL_KEY> = mods.iter().map(|&m| modifier_vk(m)).collect();
                 // Shared, frame-aware sequencing: hold the modifier across the key's frame instead of
                 // bursting the whole chord into one — see glass_core::run_chord.
-                let mut sink = WindowsChordSink { mod_vks, vk };
+                let mut sink = WindowsChordSink {
+                    mod_vks,
+                    vk,
+                    modifier_state: InjectedInputState::default(),
+                };
                 glass_core::run_chord_by(&mut sink, deadline)?;
             }
         }
@@ -593,6 +739,48 @@ fn keysym_to_vk(keysym: u32) -> Option<VIRTUAL_KEY> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum InputIdentity {
+        Key {
+            vk: u16,
+            scan: u16,
+            unicode: bool,
+            up: bool,
+        },
+        Mouse {
+            x: i32,
+            y: i32,
+            flags: u32,
+        },
+    }
+
+    fn input_identities(inputs: &[INPUT]) -> Vec<InputIdentity> {
+        inputs
+            .iter()
+            .map(|input| {
+                if input.r#type == INPUT_KEYBOARD {
+                    // SAFETY: the INPUT type tag identifies the active union field.
+                    let key = unsafe { input.Anonymous.ki };
+                    InputIdentity::Key {
+                        vk: key.wVk.0,
+                        scan: key.wScan,
+                        unicode: key.dwFlags.contains(KEYEVENTF_UNICODE),
+                        up: key.dwFlags.contains(KEYEVENTF_KEYUP),
+                    }
+                } else {
+                    assert_eq!(input.r#type, INPUT_MOUSE);
+                    // SAFETY: the INPUT type tag identifies the active union field.
+                    let mouse = unsafe { input.Anonymous.mi };
+                    InputIdentity::Mouse {
+                        x: mouse.dx,
+                        y: mouse.dy,
+                        flags: mouse.dwFlags.0,
+                    }
+                }
+            })
+            .collect()
+    }
 
     // A gesture must fail fast with the clean `Unsupported` before any window lookup: a dummy
     // hwnd (no frame bounds) still yields the backend-named message, not a `Backend` error —
@@ -675,10 +863,15 @@ mod tests {
     #[test]
     fn zero_sendinput_is_a_not_dispatched_error() {
         let inputs = [key_vk(VK_SHIFT, false), key_vk(VK_SHIFT, true)];
-        let mut inject = |_: &[INPUT]| 0;
+        let mut calls = Vec::new();
+        let mut inject = |submitted: &[INPUT]| {
+            calls.push(input_identities(submitted));
+            0
+        };
 
         let error = send_by(&inputs, &mut inject).expect_err("zero delivery must be explicit");
 
+        assert_eq!(calls, [input_identities(&inputs)]);
         assert_eq!(
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::NotDispatched)
@@ -686,42 +879,96 @@ mod tests {
     }
 
     #[test]
-    fn partial_sendinput_attempts_known_cleanup_before_returning() {
-        let inputs = [key_vk(VK_SHIFT, false), key_vk(VK_SHIFT, true)];
-        let cleanup = [key_vk(VK_SHIFT, true)];
-        let mut deliveries = VecDeque::from([1, cleanup.len()]);
+    fn pointer_move_only_prefix_does_not_release_an_uninjected_button() {
+        let inputs = [
+            mouse(11, 22, MOUSEEVENTF_MOVE | ABS),
+            mouse(11, 22, MOUSEEVENTF_LEFTDOWN | ABS),
+            mouse(11, 22, MOUSEEVENTF_LEFTUP | ABS),
+        ];
+        let mut deliveries = VecDeque::from([1]);
         let mut calls = Vec::new();
         let mut inject = |submitted: &[INPUT]| {
-            calls.push(submitted.len());
+            calls.push(input_identities(submitted));
             deliveries.pop_front().unwrap()
         };
 
-        let error = send_with_cleanup_by(
-            &inputs,
-            &cleanup,
-            "releasing Windows test input",
-            &mut inject,
-        )
-        .expect_err("partial primary delivery remains an error after cleanup");
+        let error = send_balanced_by(&inputs, "releasing Windows click input", &mut inject)
+            .expect_err("partial primary delivery remains an error after cleanup");
 
-        assert_eq!(calls, [inputs.len(), cleanup.len()]);
+        assert_eq!(calls, [input_identities(&inputs)]);
         assert!(matches!(error, GlassError::AfterDispatch(_)));
+    }
+
+    #[test]
+    fn partial_click_releases_the_injected_button_down_in_order() {
+        let inputs = [
+            mouse(11, 22, MOUSEEVENTF_MOVE | ABS),
+            mouse(11, 22, MOUSEEVENTF_LEFTDOWN | ABS),
+            mouse(11, 22, MOUSEEVENTF_LEFTUP | ABS),
+        ];
+        let cleanup = [mouse(11, 22, MOUSEEVENTF_LEFTUP | ABS)];
+        let mut deliveries = VecDeque::from([2, cleanup.len()]);
+        let mut calls = Vec::new();
+        let mut inject = |submitted: &[INPUT]| {
+            calls.push(input_identities(submitted));
+            deliveries.pop_front().unwrap()
+        };
+
+        let error = send_balanced_by(&inputs, "releasing Windows click input", &mut inject)
+            .expect_err("partial primary delivery remains an error after cleanup");
+
+        assert_eq!(
+            calls,
+            [input_identities(&inputs), input_identities(&cleanup)]
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn partial_text_releases_only_the_unmatched_unicode_down() {
+        let high = 0xd83d;
+        let low = 0xde00;
+        let inputs = [
+            key_unicode(high, false),
+            key_unicode(high, true),
+            key_unicode(low, false),
+            key_unicode(low, true),
+        ];
+        let expected_cleanup = [key_unicode(low, true)];
+        let mut deliveries = VecDeque::from([3, expected_cleanup.len()]);
+        let mut calls = Vec::new();
+        let mut inject = |submitted: &[INPUT]| {
+            calls.push(input_identities(submitted));
+            deliveries.pop_front().unwrap()
+        };
+
+        let error = send_balanced_by(&inputs, "releasing Windows text input", &mut inject)
+            .expect_err("partial text delivery remains an error after cleanup");
+
+        assert_eq!(
+            calls,
+            [
+                input_identities(&inputs),
+                input_identities(&expected_cleanup),
+            ]
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
     }
 
     #[test]
     fn partial_sendinput_cleanup_failure_preserves_both_errors() {
         let inputs = [key_vk(VK_SHIFT, false), key_vk(VK_SHIFT, true)];
-        let cleanup = [key_vk(VK_SHIFT, true)];
         let mut deliveries = VecDeque::from([1, 0]);
         let mut inject = |_: &[INPUT]| deliveries.pop_front().unwrap();
 
-        let error = send_with_cleanup_by(
-            &inputs,
-            &cleanup,
-            "releasing Windows test input",
-            &mut inject,
-        )
-        .expect_err("cleanup failure must stay structured");
+        let error = send_balanced_by(&inputs, "releasing Windows test input", &mut inject)
+            .expect_err("cleanup failure must stay structured");
 
         let GlassError::InputCleanupFailed {
             operation,
@@ -743,19 +990,115 @@ mod tests {
     }
 
     #[test]
-    fn partial_modifier_delivery_attempts_all_known_key_ups() {
+    fn partial_modifier_down_releases_only_the_injected_prefix_in_reverse_order() {
         let modifiers = [VK_CONTROL, VK_SHIFT, VK_MENU];
-        let mut deliveries = VecDeque::from([1, modifiers.len()]);
+        let expected_cleanup = [key_vk(VK_CONTROL, true)];
+        let mut deliveries = VecDeque::from([1, expected_cleanup.len()]);
         let mut calls = Vec::new();
+        let mut state = InjectedInputState::default();
         let mut inject = |submitted: &[INPUT]| {
-            calls.push(submitted.len());
+            calls.push(input_identities(submitted));
             deliveries.pop_front().unwrap()
         };
 
-        let error = send_modifiers_by(&modifiers, true, &mut inject)
+        let error = send_modifiers_by(&modifiers, true, &mut state, &mut inject)
             .expect_err("partial modifier delivery remains an error after cleanup");
+        send_modifiers_by(&modifiers, false, &mut state, &mut inject)
+            .expect("the core cleanup callback must not release unproven modifiers");
 
-        assert_eq!(calls, [modifiers.len(), modifiers.len()]);
+        let modifier_downs = [
+            key_vk(VK_CONTROL, false),
+            key_vk(VK_SHIFT, false),
+            key_vk(VK_MENU, false),
+        ];
+        assert_eq!(
+            calls,
+            [
+                input_identities(&modifier_downs),
+                input_identities(&expected_cleanup),
+            ]
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn partial_modifier_release_retries_only_the_unmatched_suffix_in_order() {
+        let modifiers = [VK_CONTROL, VK_SHIFT, VK_MENU];
+        let modifier_downs = [
+            key_vk(VK_CONTROL, false),
+            key_vk(VK_SHIFT, false),
+            key_vk(VK_MENU, false),
+        ];
+        let modifier_ups = [
+            key_vk(VK_MENU, true),
+            key_vk(VK_SHIFT, true),
+            key_vk(VK_CONTROL, true),
+        ];
+        let remaining_ups = [key_vk(VK_SHIFT, true), key_vk(VK_CONTROL, true)];
+        let mut deliveries = VecDeque::from([modifiers.len(), 1, remaining_ups.len()]);
+        let mut calls = Vec::new();
+        let mut state = InjectedInputState::default();
+        let mut inject = |submitted: &[INPUT]| {
+            calls.push(input_identities(submitted));
+            deliveries.pop_front().unwrap()
+        };
+
+        send_modifiers_by(&modifiers, true, &mut state, &mut inject)
+            .expect("modifier downs establish the state released by the next batch");
+        let error = send_modifiers_by(&modifiers, false, &mut state, &mut inject)
+            .expect_err("partial modifier release remains an error after cleanup");
+
+        assert_eq!(
+            calls,
+            [
+                input_identities(&modifier_downs),
+                input_identities(&modifier_ups),
+                input_identities(&remaining_ups),
+            ]
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn zero_modifier_release_retries_all_proven_downs_and_stays_after_dispatch() {
+        let modifiers = [VK_CONTROL, VK_SHIFT, VK_MENU];
+        let modifier_downs = [
+            key_vk(VK_CONTROL, false),
+            key_vk(VK_SHIFT, false),
+            key_vk(VK_MENU, false),
+        ];
+        let modifier_ups = [
+            key_vk(VK_MENU, true),
+            key_vk(VK_SHIFT, true),
+            key_vk(VK_CONTROL, true),
+        ];
+        let mut deliveries = VecDeque::from([modifiers.len(), 0, modifiers.len()]);
+        let mut calls = Vec::new();
+        let mut state = InjectedInputState::default();
+        let mut inject = |submitted: &[INPUT]| {
+            calls.push(input_identities(submitted));
+            deliveries.pop_front().unwrap()
+        };
+
+        send_modifiers_by(&modifiers, true, &mut state, &mut inject)
+            .expect("modifier downs establish the state released by the next batch");
+        let error = send_modifiers_by(&modifiers, false, &mut state, &mut inject)
+            .expect_err("zero modifier release remains an error after retry cleanup");
+
+        assert_eq!(
+            calls,
+            [
+                input_identities(&modifier_downs),
+                input_identities(&modifier_ups),
+                input_identities(&modifier_ups),
+            ]
+        );
         assert_eq!(
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::MayHaveDispatched)
