@@ -461,7 +461,7 @@ zero-based references into the MCP content blocks.
 
 Failed execution remains an MCP error with `is_error:true`. `executed` counts only successfully
 completed actions. The failed step records `attempted`, `side_effects_may_have_occurred`,
-optional `result` evidence produced before the failure, `error.{code,summary,category?}`, and
+optional `result?` evidence produced before the failure, `error.{code,summary,category?}`, and
 `content_blocks`; later steps use `status:"unexecuted"`. `effects_rolled_back:false` means Glass
 performed no rollback, so landed effects may persist. App-derived names,
 descriptions, values, outlines, and images remain untrusted sibling blocks. Non-secret raw error
