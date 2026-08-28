@@ -14,6 +14,8 @@
 use glass_core::capability::{CapabilityMap, CapabilityStatus};
 
 pub mod adoption_log; // pure window-adoption diagnostic rendering — cross-platform, host-tested
+#[cfg(any(target_os = "macos", test))]
+mod ax_timeout; // pure AX messaging-timeout orchestration — cross-platform, host-tested
 pub mod bundle; // pure .app-bundle logic — cross-platform, host-tested
 pub mod clipboard_route; // pure clipboard-routing policy — cross-platform, host-tested
 pub mod coords; // pure window-relative <-> global math — cross-platform, host-tested

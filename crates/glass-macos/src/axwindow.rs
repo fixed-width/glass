@@ -92,41 +92,38 @@ const FALLBACK_TOLERANCE_PX: i32 = 8;
 /// module; not a supported way to configure glass in normal use.
 const FORCE_AX_GEOMETRY_FALLBACK_ENV: &str = "GLASS_MACOS_FORCE_AX_GEOMETRY_FALLBACK";
 
-/// Scope synchronous AX IPC to the caller's remaining deadline, restoring the process default on
-/// drop. `None` for an unbounded caller leaves the system default untouched.
-pub(crate) struct MessagingTimeout {
-    app: CFRetained<AXUIElement>,
-}
+struct SystemWideAxMessaging;
 
-impl MessagingTimeout {
-    pub(crate) fn for_pid_by(pid: i32, deadline: Deadline) -> Result<Option<Self>> {
-        let Some(remaining) = deadline.remaining() else {
-            return Ok(None);
-        };
-        if remaining.is_zero() {
-            return Err(GlassError::deadline_not_started(
-                "macOS AX window operation",
-            ));
-        }
-        // SAFETY: the binding guarantees a live application element for a plain process id.
-        let app = unsafe { AXUIElement::new_application(pid) };
-        // SAFETY: `app` is live and the timeout is a finite scalar. A 1ms floor avoids passing
-        // zero, which means "restore the default" rather than "do not wait" in AX.
-        let error = unsafe { app.set_messaging_timeout(remaining.as_secs_f32().max(0.001)) };
-        if error != AXError::Success {
-            return Err(GlassError::Backend(format!(
+impl crate::ax_timeout::AxMessaging for SystemWideAxMessaging {
+    type Element = CFRetained<AXUIElement>;
+
+    fn system_wide_element(&self) -> Self::Element {
+        // SAFETY: the binding guarantees a live process-global accessibility element.
+        unsafe { AXUIElement::new_system_wide() }
+    }
+
+    fn set_messaging_timeout(&self, element: &Self::Element, seconds: f32) -> Result<()> {
+        // SAFETY: `element` is live and `seconds` is finite. Apple documents a timeout set on the
+        // system-wide element as the global value inherited by all exact per-app/window objects;
+        // zero restores the documented default.
+        let error = unsafe { element.set_messaging_timeout(seconds) };
+        if error == AXError::Success {
+            Ok(())
+        } else {
+            Err(GlassError::Backend(format!(
                 "AXUIElementSetMessagingTimeout failed: {error:?}"
-            )));
+            )))
         }
-        Ok(Some(Self { app }))
     }
 }
 
-impl Drop for MessagingTimeout {
-    fn drop(&mut self) {
-        // SAFETY: `self.app` remains live through drop; zero restores AX's documented default.
-        let _ = unsafe { self.app.set_messaging_timeout(0.0) };
-    }
+/// Run all exact AX object creation and work under one serialized process-global timeout scope.
+/// Unbounded callers are serialized with bounded scopes but leave AX's default timeout untouched.
+pub(crate) fn with_messaging_timeout_by<T>(
+    deadline: Deadline,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    crate::ax_timeout::with_messaging_timeout_by(&SystemWideAxMessaging, deadline, operation)
 }
 
 /// Resolve the `AXUIElement` window for `pid` whose `CGWindowID` is `window_id`.

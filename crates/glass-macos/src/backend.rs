@@ -871,61 +871,57 @@ impl Platform for MacosPlatform {
                 error
             }
         })?;
-        let _messaging_timeout = axwindow::MessagingTimeout::for_pid_by(pid as i32, deadline)?;
-        let el = axwindow::ax_window_for_cgwindowid(pid as i32, id, m.geometry.clone(), m.scale)?;
-
         let mut mutation_dispatched = false;
-        let result = (|| match *op {
-            WindowOp::Focus => {
-                mutation_dispatched = true;
-                crate::input::focus(pid as i32)?;
-                axwindow::ax_raise(&el)?;
-                axwindow::ax_set_main(&el)?;
-                read_ax_geometry(&el, m.scale)
-            }
-            WindowOp::Move { x, y } => {
-                let target_pt = coords::global_pixel_to_point((x, y), m.scale);
-                mutation_dispatched = true;
-                axwindow::ax_set_position(&el, target_pt)?;
-                let geom = read_ax_geometry(&el, m.scale)?;
-                if !move_took_effect(&m.geometry, &geom, x, y) {
-                    return Err(GlassError::Backend(format!(
-                        "window move to ({x},{y}) px did not take; window is at ({},{})",
-                        geom.x, geom.y
-                    )));
+        let result = axwindow::with_messaging_timeout_by(deadline, || {
+            let el =
+                axwindow::ax_window_for_cgwindowid(pid as i32, id, m.geometry.clone(), m.scale)?;
+
+            match *op {
+                WindowOp::Focus => {
+                    mutation_dispatched = true;
+                    crate::input::focus(pid as i32)?;
+                    axwindow::ax_raise(&el)?;
+                    axwindow::ax_set_main(&el)?;
+                    read_ax_geometry(&el, m.scale)
                 }
-                Ok(geom)
-            }
-            WindowOp::Resize { width, height } => {
-                let target_size_pt = (width as f64 / m.scale, height as f64 / m.scale);
-                mutation_dispatched = true;
-                axwindow::ax_set_size(&el, target_size_pt)?;
-                let pos = axwindow::ax_position(&el)?;
-                axwindow::ax_set_position(&el, pos)?;
-                axwindow::ax_set_size(&el, target_size_pt)?;
-                let geom = read_ax_geometry(&el, m.scale)?;
-                if resize_was_refused(&m.geometry, &geom, width, height) {
-                    return Err(GlassError::Backend(format!(
-                        "window resize to {width}x{height} px was refused; window remains {}x{}",
-                        geom.width, geom.height
-                    )));
+                WindowOp::Move { x, y } => {
+                    let target_pt = coords::global_pixel_to_point((x, y), m.scale);
+                    mutation_dispatched = true;
+                    axwindow::ax_set_position(&el, target_pt)?;
+                    let geom = read_ax_geometry(&el, m.scale)?;
+                    if !move_took_effect(&m.geometry, &geom, x, y) {
+                        return Err(GlassError::Backend(format!(
+                            "window move to ({x},{y}) px did not take; window is at ({},{})",
+                            geom.x, geom.y
+                        )));
+                    }
+                    Ok(geom)
                 }
-                Ok(geom)
+                WindowOp::Resize { width, height } => {
+                    let target_size_pt = (width as f64 / m.scale, height as f64 / m.scale);
+                    mutation_dispatched = true;
+                    axwindow::ax_set_size(&el, target_size_pt)?;
+                    let pos = axwindow::ax_position(&el)?;
+                    axwindow::ax_set_position(&el, pos)?;
+                    axwindow::ax_set_size(&el, target_size_pt)?;
+                    let geom = read_ax_geometry(&el, m.scale)?;
+                    if resize_was_refused(&m.geometry, &geom, width, height) {
+                        return Err(GlassError::Backend(format!(
+                            "window resize to {width}x{height} px was refused; window remains {}x{}",
+                            geom.width, geom.height
+                        )));
+                    }
+                    Ok(geom)
+                }
+                WindowOp::Geometry => read_ax_geometry(&el, m.scale),
             }
-            WindowOp::Geometry => read_ax_geometry(&el, m.scale),
-        })();
+        });
         let result = if mutation_dispatched {
             result.map_err(GlassError::after_dispatch)
         } else {
             result
         };
-        if deadline.has_passed() {
-            Err(GlassError::caller_deadline_elapsed(
-                "macOS window operation",
-            ))
-        } else {
-            result
-        }
+        crate::ax_timeout::finish_window_operation_by(deadline, result)
     }
     /// Enumerate every on-screen window owned by the launched app's pid via
     /// `scwindow::list_app_windows` (one `SCShareableContent` query, all matches), mapping each
