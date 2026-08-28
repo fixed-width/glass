@@ -27,6 +27,10 @@ use tokio_util::sync::CancellationToken;
 /// as it changes.
 const AWAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const AWAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+const MCP_CLIENT_CANCEL_BUDGET: Duration = Duration::from_secs(2);
+// The server has a 3s HTTP drain and a 3s bounded session teardown. Leave 2s for scheduling and
+// transport cancellation without turning a real cleanup stall into an indefinite test hang.
+const MCP_SERVER_JOIN_BUDGET: Duration = Duration::from_secs(8);
 
 /// Build the same session factory that `glass_mcp::boot` uses, with registries owned by the
 /// caller's cleanup guard.
@@ -79,12 +83,58 @@ impl McpHarness {
         self.client.peer().clone()
     }
 
-    async fn shutdown(self) {
-        self.client.cancel().await.ok();
-        self.cancel.cancel();
-        let result = self.server.await.expect("MCP server task must not panic");
-        result.expect("MCP server graceful shutdown must succeed");
+    async fn shutdown(self) -> Result<(), String> {
+        let Self {
+            client,
+            cancel,
+            server,
+        } = self;
+        // Signal the server before waiting on the client transport: a stalled DELETE must not
+        // delay the server's own bounded drain and session teardown.
+        cancel.cancel();
+        let client = await_cleanup(
+            "MCP client cancellation",
+            MCP_CLIENT_CANCEL_BUDGET,
+            client.cancel(),
+        )
+        .await
+        .and_then(|result| {
+            result.map_err(|error| format!("MCP client cancellation failed: {error}"))
+        });
+        let server = await_server(server, "MCP server graceful shutdown").await;
+        client.and(server)
     }
+}
+
+async fn await_cleanup<T>(
+    what: &str,
+    budget: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout(budget, future)
+        .await
+        .map_err(|_| format!("{what} exceeded {budget:?}"))
+}
+
+async fn await_server(server: JoinHandle<anyhow::Result<()>>, what: &str) -> Result<(), String> {
+    match await_cleanup(what, MCP_SERVER_JOIN_BUDGET, server).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(format!("{what} failed: {error}")),
+        Ok(Err(error)) => Err(format!("{what} task panicked or was cancelled: {error}")),
+        Err(error) => Err(error),
+    }
+}
+
+#[tokio::test]
+async fn harness_cleanup_wait_is_bounded() {
+    let result: Result<(), String> = await_cleanup(
+        "persistent test future",
+        Duration::ZERO,
+        std::future::pending(),
+    )
+    .await;
+    let error = result.unwrap_err();
+    assert!(error.contains("persistent test future"));
 }
 
 /// Boot a token-protected Streamable HTTP MCP session for a caller-provided Android session.
@@ -114,8 +164,12 @@ async fn boot_mcp(glass: Glass) -> McpHarness {
         Ok(client) => client,
         Err(error) => {
             cancel.cancel();
-            let _ = server.await;
-            panic!("initialize Android MCP client: {error}");
+            match await_server(server, "MCP server startup cleanup").await {
+                Ok(()) => panic!("initialize Android MCP client: {error}"),
+                Err(cleanup) => panic!(
+                    "initialize Android MCP client: {error}; startup cleanup also failed: {cleanup}"
+                ),
+            }
         }
     };
     McpHarness {
@@ -345,8 +399,16 @@ async fn glass_do_android_ime_form_is_confirmed_end_to_end() {
     let peer = mcp.peer();
     let proof = tokio::spawn(async move { ime_form_proof(peer, fixture).await });
     let proof = proof.await;
-    mcp.shutdown().await;
-    proof.expect("Android semantic IME proof panicked");
+    let cleanup = mcp.shutdown().await;
+    match proof {
+        Ok(()) => cleanup.expect("Android MCP cleanup failed"),
+        Err(proof) => {
+            if let Err(cleanup) = cleanup {
+                eprintln!("Android MCP cleanup failed after proof panic: {cleanup}");
+            }
+            std::panic::resume_unwind(proof.into_panic());
+        }
+    }
 }
 
 async fn ime_form_proof(client: Peer<RoleClient>, fixture: String) {
