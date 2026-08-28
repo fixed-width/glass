@@ -163,6 +163,9 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
 pub(crate) struct RefTree {
     pub(crate) tree: AxTree,
     refs: Vec<u32>,
+    /// The package explicitly named by the companion. `AxTree::subject` intentionally cannot
+    /// distinguish an explicit match from an omitted package, but retry authorization must.
+    explicit_package: Option<String>,
 }
 
 impl RefTree {
@@ -179,6 +182,10 @@ impl RefTree {
     /// that app and the tree that supplied it.
     fn acting_on<'a>(&'a self, asked: &'a str) -> &'a str {
         self.tree.subject.as_ref().map_or(asked, |s| &s.actual)
+    }
+
+    fn explicit_acting_package(&self) -> Option<&str> {
+        self.explicit_package.as_deref()
     }
 }
 
@@ -212,6 +219,7 @@ pub(crate) fn tree_from_json(
     Ok(RefTree {
         tree,
         refs: walk.refs,
+        explicit_package: None,
     })
 }
 
@@ -487,11 +495,22 @@ impl ServiceA11y {
     fn refreshed_action_tree(
         &mut self,
         ctx: &AxContext,
-        acting_package: &str,
+        acting_package: Option<&str>,
         action: &str,
     ) -> std::result::Result<RefTree, CallFailure> {
         let fresh = self.snapshot_with_refs(ctx).map_err(CallFailure::NotSent)?;
-        let fresh_package = fresh.acting_on(&self.package);
+        let Some(acting_package) = acting_package else {
+            return Err(CallFailure::NotSent(GlassError::Backend(format!(
+                "the original acting package was not explicitly identified while recovering a \
+                 provably unsent {action}; the action was not sent"
+            ))));
+        };
+        let Some(fresh_package) = fresh.explicit_acting_package() else {
+            return Err(CallFailure::NotSent(GlassError::Backend(format!(
+                "the refreshed acting package was not explicitly identified while recovering a \
+                 provably unsent {action}; the action was not sent"
+            ))));
+        };
         if fresh_package != acting_package {
             return Err(CallFailure::NotSent(GlassError::Backend(format!(
                 "the active app moved from {acting_package} to {fresh_package} while recovering a \
@@ -553,7 +572,7 @@ impl ServiceA11y {
         rt: &RefTree,
     ) -> Result<Option<AxNodeId>> {
         let device_ref = rt.device_ref(plan.actuated.id)?;
-        let acting_package = rt.acting_on(&self.package).to_owned();
+        let explicit_acting_package = rt.explicit_acting_package();
         require_semantic_time(ctx.deadline, "Android accessibility click", false)?;
         let mut retried_plan = None;
         match self
@@ -563,7 +582,7 @@ impl ServiceA11y {
             Ok(()) => {}
             Err(CallFailure::NotSent(_)) => {
                 let fresh = self
-                    .refreshed_action_tree(ctx, &acting_package, "click")
+                    .refreshed_action_tree(ctx, explicit_acting_package, "click")
                     .map_err(|failure| action_error(target.id.0, failure))?;
                 let fresh_target = relocated_target(&fresh.tree, target)?;
                 let fresh_plan = invoke_plan(&fresh.tree, &fresh_target)?;
@@ -596,6 +615,7 @@ impl ServiceA11y {
         let reply = self.client.tree_within(&self.package, ctx.deadline)?;
         let mut rt = tree_from_json(&reply.tree, &ctx.window, ctx.limits)?;
         rt.tree.subject = subject_of(&self.package, reply.package.as_deref());
+        rt.explicit_package = reply.package;
         Ok(rt)
     }
 }
@@ -744,6 +764,7 @@ impl Accessibility for ServiceA11y {
         // acting — `invoke`'s guard plus the editable check.
         let rt = self.snapshot_with_refs(ctx)?;
         let acting_package = rt.acting_on(&self.package).to_owned();
+        let explicit_acting_package = rt.explicit_acting_package();
         // Addressed by the node the guard approved, not by the id the caller named, so a guard
         // that ever relaxes into a search cannot dispatch to a node it never approved.
         let device_ref = rt.device_ref(resolved_editable_target(&rt.tree, target)?.id)?;
@@ -757,7 +778,7 @@ impl Accessibility for ServiceA11y {
             Ok(()) => {}
             Err(CallFailure::NotSent(_)) => {
                 let fresh = self
-                    .refreshed_action_tree(ctx, &acting_package, "set_text")
+                    .refreshed_action_tree(ctx, explicit_acting_package, "set_text")
                     .map_err(|failure| write_error(target.id.0, failure))?;
                 let fresh_target = relocated_target(&fresh.tree, target)?;
                 let fresh_ref =
@@ -3098,6 +3119,8 @@ mod tests {
         Echo,
         /// A different package than asked — the foreground changed since the last `tree`.
         Other(String),
+        /// No `package` field — the companion cannot identify the active window.
+        Omitted,
     }
 
     /// Whether a fake `tree` request is served normally (per `packages`) or refused outright —
@@ -3307,6 +3330,7 @@ mod tests {
                                             reply["package"] = req["package"].clone();
                                         }
                                         TreePackage::Other(p) => reply["package"] = json!(p),
+                                        TreePackage::Omitted => {}
                                     }
                                     reply
                                 }
@@ -5034,6 +5058,67 @@ mod tests {
             vec!["conn1:tree".to_string(), "conn2:tree".to_string(),],
             "no set_text may use refs from either stale or mismatched trees"
         );
+    }
+
+    #[test]
+    fn not_sent_recovery_refuses_an_omitted_original_acting_package() {
+        // The original tree supplied the ref but made no package claim. Falling back to the
+        // requested package would let an explicitly named fresh tree authorise that unknown ref.
+        let (port, ops) = fake_service_ex(
+            vec![
+                editable_field("old"),
+                editable_field("old"),
+                editable_field("new"),
+            ],
+            vec![OnAction::Ok],
+            vec![TreePackage::Omitted, TreePackage::Echo],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let t = built(&editable_field("old"));
+        let target = target_for(&t, AxNodeId(1));
+        let breaker = break_set_text_write_after_guard(&mut a, &ops);
+
+        let result = a.set_value(&ctx(), &target, "new");
+        breaker.join().expect("connection breaker");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn2:tree".to_string()],
+            "the fresh ref must not be used when the original package identity was omitted"
+        );
+        let e = result.expect_err("an unknown original acting package cannot authorise a retry");
+        assert!(e.to_string().contains("package"), "{e}");
+    }
+
+    #[test]
+    fn not_sent_recovery_refuses_an_omitted_refreshed_acting_package() {
+        // The first tree explicitly names the requested app. After the foreground changes, the
+        // fresh tree has a same-fingerprint field but cannot name its package; treating omission
+        // as the requested package would send set_text into that newly foreground app.
+        let (port, ops) = fake_service_ex(
+            vec![
+                editable_field("old"),
+                editable_field("old"),
+                editable_field("new"),
+            ],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo, TreePackage::Omitted],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let t = built(&editable_field("old"));
+        let target = target_for(&t, AxNodeId(1));
+        let breaker = break_set_text_write_after_guard(&mut a, &ops);
+
+        let result = a.set_value(&ctx(), &target, "new");
+        breaker.join().expect("connection breaker");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn2:tree".to_string()],
+            "the fresh ref must not be used when the refreshed package identity was omitted"
+        );
+        let e = result.expect_err("an unknown refreshed acting package cannot authorise a retry");
+        assert!(e.to_string().contains("package"), "{e}");
     }
 
     #[test]
