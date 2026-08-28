@@ -21,6 +21,92 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Budget for a single RPC. 30s mirrors glass-android's socket timeout.
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Result of a snapshot RPC together with proof of whether the gRPC method was invoked.
+pub(crate) enum SnapshotRpc<T> {
+    BeforeDispatch(GlassError),
+    Dispatched(Result<T>),
+}
+
+impl<T> SnapshotRpc<T> {
+    pub(crate) fn before_dispatch(error: GlassError) -> Self {
+        Self::BeforeDispatch(error.before_dispatch())
+    }
+
+    pub(crate) fn dispatched(result: Result<T>) -> Self {
+        Self::Dispatched(result)
+    }
+
+    fn into_result(self) -> Result<T> {
+        match self {
+            Self::BeforeDispatch(error) => Err(error),
+            Self::Dispatched(result) => result,
+        }
+    }
+}
+
+/// Type-state gate kept immediately beside the actual snapshot gRPC invocation.
+pub(crate) struct SnapshotRpcGate {
+    op: &'static str,
+    ends: Instant,
+    timeout: Duration,
+    whose: Whose,
+}
+
+struct DispatchedSnapshotRpcGate(SnapshotRpcGate);
+
+impl SnapshotRpcGate {
+    pub(crate) fn new(deadline: Deadline, own_timeout: Duration, op: &'static str) -> Result<Self> {
+        let (ends, timeout, whose) = rpc_bound(deadline, own_timeout, op)?;
+        Ok(Self {
+            op,
+            ends,
+            timeout,
+            whose,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ends(&self) -> Instant {
+        self.ends
+    }
+
+    fn dispatch_at(self, now: Instant) -> Result<DispatchedSnapshotRpcGate> {
+        if now >= self.ends {
+            Err(rpc_not_started_error(self.op, self.timeout, self.whose))
+        } else {
+            Ok(DispatchedSnapshotRpcGate(self))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_with_clock<T>(
+        self,
+        mut now: impl FnMut() -> Instant,
+        call: impl FnOnce() -> Result<T>,
+    ) -> SnapshotRpc<T> {
+        let dispatched = match self.dispatch_at(now()) {
+            Ok(dispatched) => dispatched,
+            Err(error) => return SnapshotRpc::before_dispatch(error),
+        };
+        let result = call();
+        dispatched.finish_at(now(), result)
+    }
+}
+
+impl DispatchedSnapshotRpcGate {
+    fn finish_at<T>(self, observed_at: Instant, result: Result<T>) -> SnapshotRpc<T> {
+        let gate = self.0;
+        SnapshotRpc::dispatched(finish_rpc_result_at(
+            gate.op,
+            gate.timeout,
+            gate.whose,
+            gate.ends,
+            observed_at,
+            result,
+        ))
+    }
+}
+
 /// Blocking handle to `idb_companion`'s gRPC service.
 ///
 /// **Threading invariant:** must be driven from a thread with *no* ambient tokio
@@ -156,16 +242,6 @@ fn finish_rpc_result_at<T>(
     }
 }
 
-fn finish_rpc_result<T>(
-    op: &str,
-    timeout: Duration,
-    whose: Whose,
-    ends: Instant,
-    result: Result<T>,
-) -> Result<T> {
-    finish_rpc_result_at(op, timeout, whose, ends, Instant::now(), result)
-}
-
 /// Fold one `hid` outcome into a `Result`. An event this build does not implement is reported
 /// as that; everything else keeps the generic folding every other RPC gets.
 ///
@@ -291,30 +367,42 @@ impl IdbClient {
 
     /// Describe the whole accessibility tree: idb's `accessibility_info` over the entire
     /// screen (no point) in the nested/hierarchical format. Returns the response `json`.
+    #[cfg(test)]
     pub fn describe_all_by(&self, deadline: Deadline) -> Result<String> {
+        self.describe_all_rpc_by(deadline).into_result()
+    }
+
+    pub(crate) fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String> {
         let op = "idb accessibility_info";
-        let (ends, timeout, whose) = rpc_bound(deadline, RPC_TIMEOUT, op)?;
-        self.ensure_off_runtime("idb accessibility_info")?;
+        let gate = match SnapshotRpcGate::new(deadline, RPC_TIMEOUT, op) {
+            Ok(gate) => gate,
+            Err(error) => return SnapshotRpc::before_dispatch(error),
+        };
+        if let Err(error) = self.ensure_off_runtime(op) {
+            return SnapshotRpc::before_dispatch(error);
+        }
+        let ends = gate.ends;
+        let timeout = gate.timeout;
+        let whose = gate.whose;
         let req = proto::AccessibilityInfoRequest {
             point: None,
             format: proto::accessibility_info_request::Format::Nested as i32,
         };
         let mut client = self.client.clone();
-        let outcome = self.rt.block_on(async move {
-            if Instant::now() >= ends {
-                return None;
-            }
-            Some(
-                tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(ends),
-                    client.accessibility_info(req),
-                )
-                .await,
+        self.rt.block_on(async move {
+            let dispatched = match gate.dispatch_at(Instant::now()) {
+                Ok(dispatched) => dispatched,
+                Err(error) => return SnapshotRpc::before_dispatch(error),
+            };
+            let outcome = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(ends),
+                client.accessibility_info(req),
             )
-        });
-        let outcome = outcome.ok_or_else(|| rpc_not_started_error(op, timeout, whose))?;
-        let resp = map_rpc_outcome(op, timeout, whose, ends, outcome)?;
-        finish_rpc_result(op, timeout, whose, ends, Ok(resp.into_inner().json))
+            .await;
+            let result = map_rpc_outcome(op, timeout, whose, ends, outcome)
+                .map(|resp| resp.into_inner().json);
+            dispatched.finish_at(Instant::now(), result)
+        })
     }
 
     /// Describe the target itself: its screen's pixel size, logical-point size and density.
@@ -325,34 +413,47 @@ impl IdbClient {
     }
 
     pub fn describe_by(&self, deadline: Deadline) -> Result<proto::ScreenDimensions> {
+        self.describe_rpc_by(deadline).into_result()
+    }
+
+    pub(crate) fn describe_rpc_by(
+        &self,
+        deadline: Deadline,
+    ) -> SnapshotRpc<proto::ScreenDimensions> {
         let op = "idb describe";
-        let (ends, timeout, whose) = rpc_bound(deadline, RPC_TIMEOUT, op)?;
-        self.ensure_off_runtime(op)?;
+        let gate = match SnapshotRpcGate::new(deadline, RPC_TIMEOUT, op) {
+            Ok(gate) => gate,
+            Err(error) => return SnapshotRpc::before_dispatch(error),
+        };
+        if let Err(error) = self.ensure_off_runtime(op) {
+            return SnapshotRpc::before_dispatch(error);
+        }
+        let ends = gate.ends;
+        let timeout = gate.timeout;
+        let whose = gate.whose;
         let mut client = self.client.clone();
-        let outcome = self.rt.block_on(async move {
-            if Instant::now() >= ends {
-                return None;
-            }
-            Some(
-                tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(ends),
-                    client.describe(proto::TargetDescriptionRequest {
-                        fetch_diagnostics: false,
-                    }),
-                )
-                .await,
+        self.rt.block_on(async move {
+            let dispatched = match gate.dispatch_at(Instant::now()) {
+                Ok(dispatched) => dispatched,
+                Err(error) => return SnapshotRpc::before_dispatch(error),
+            };
+            let outcome = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(ends),
+                client.describe(proto::TargetDescriptionRequest {
+                    fetch_diagnostics: false,
+                }),
             )
-        });
-        let outcome = outcome.ok_or_else(|| rpc_not_started_error(op, timeout, whose))?;
-        let resp = map_rpc_outcome(op, timeout, whose, ends, outcome)?;
-        let dimensions = resp
-            .into_inner()
-            .target_description
-            .and_then(|t| t.screen_dimensions)
-            .ok_or_else(|| {
-                GlassError::Backend("idb describe returned no screen dimensions".into())
+            .await;
+            let result = map_rpc_outcome(op, timeout, whose, ends, outcome).and_then(|resp| {
+                resp.into_inner()
+                    .target_description
+                    .and_then(|target| target.screen_dimensions)
+                    .ok_or_else(|| {
+                        GlassError::Backend("idb describe returned no screen dimensions".into())
+                    })
             });
-        finish_rpc_result(op, timeout, whose, ends, dimensions)
+            dispatched.finish_at(Instant::now(), result)
+        })
     }
 
     /// Send one HID event stream (client-streaming `hid`). A tap is two events
@@ -583,6 +684,29 @@ mod tests {
         assert_eq!(
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn ambient_runtime_rejection_is_explicitly_before_dispatch() {
+        let client = IdbClient::for_test();
+        let ambient = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build an ambient runtime");
+
+        let error = ambient
+            .block_on(async { client.describe_by(Deadline::UNBOUNDED) })
+            .expect_err("the synchronous idb client must reject an ambient runtime");
+
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message.contains("within an async runtime")),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
         );
     }
 

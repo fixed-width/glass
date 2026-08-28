@@ -14,14 +14,34 @@ use glass_core::{
 };
 
 use crate::axmap;
-use crate::idb::client::IdbClient;
+use crate::idb::client::{IdbClient, SnapshotRpc};
 use crate::idb::proto;
 use crate::injector::IdbInjector;
+
+trait IosA11yClient: Send {
+    fn describe_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<proto::ScreenDimensions>;
+    fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String>;
+    fn hid_by(&self, events: Vec<proto::HidEvent>, deadline: Deadline) -> Result<()>;
+}
+
+impl IosA11yClient for IdbClient {
+    fn describe_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<proto::ScreenDimensions> {
+        IdbClient::describe_rpc_by(self, deadline)
+    }
+
+    fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String> {
+        IdbClient::describe_all_rpc_by(self, deadline)
+    }
+
+    fn hid_by(&self, events: Vec<proto::HidEvent>, deadline: Deadline) -> Result<()> {
+        IdbClient::hid_by(self, events, deadline)
+    }
+}
 
 /// Reads and writes the accessibility tree of the app under test in the
 /// Simulator, over idb's `accessibility_info` and HID RPCs.
 pub struct IosA11y {
-    client: IdbClient,
+    client: Box<dyn IosA11yClient>,
     /// The target's scale, fetched on first need and kept: a property of the device, so it
     /// does not change between snapshots.
     scale: Option<f64>,
@@ -72,18 +92,6 @@ impl SemanticPhase {
     }
 
     fn finish<T>(self, deadline: Deadline, result: Result<T>) -> Result<T> {
-        // The RPC layer's no-start gate is more precise than a phase set by its caller. Preserve
-        // that proof before re-reading a deadline that may now have elapsed.
-        if matches!(self, Self::Snapshot { .. })
-            && matches!(
-                &result,
-                Err(error)
-                    if error.bound_dispatch()
-                        == Some(glass_core::BoundDispatch::NotDispatched)
-            )
-        {
-            return result;
-        }
         self.require(deadline)?;
         match result {
             Ok(value) => Ok(value),
@@ -97,27 +105,22 @@ impl SemanticPhase {
         self.finish(deadline, work())
     }
 
-    fn finish_snapshot_rpc<T>(self, deadline: Deadline, result: Result<T>) -> Result<(T, Self)> {
-        // Only a result other than the RPC layer's explicit no-start refusal proves that this
-        // snapshot crossed the external dispatch boundary.
-        let phase = if matches!(
-            &result,
-            Err(error)
-                if error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched)
-        ) {
-            self
-        } else {
-            self.after_snapshot_dispatch()
-        };
-        let value = phase.finish(deadline, result)?;
-        Ok((value, phase))
+    fn finish_snapshot_rpc<T>(self, deadline: Deadline, rpc: SnapshotRpc<T>) -> Result<(T, Self)> {
+        match rpc {
+            SnapshotRpc::BeforeDispatch(error) => Err(error.before_dispatch()),
+            SnapshotRpc::Dispatched(result) => {
+                let phase = self.after_snapshot_dispatch();
+                let value = phase.finish(deadline, result)?;
+                Ok((value, phase))
+            }
+        }
     }
 }
 
 impl IosA11y {
     pub(crate) fn new(client: IdbClient) -> Self {
         IosA11y {
-            client,
+            client: Box::new(client),
             scale: None,
         }
     }
@@ -136,7 +139,7 @@ impl IosA11y {
             return Ok((scale, phase));
         }
         let (dimensions, phase) =
-            phase.finish_snapshot_rpc(deadline, self.client.describe_by(deadline))?;
+            phase.finish_snapshot_rpc(deadline, self.client.describe_rpc_by(deadline))?;
         let scale = phase.run(deadline, || {
             crate::platform::checked_scale(dimensions.density)
         })?;
@@ -151,8 +154,8 @@ impl IosA11y {
     fn describe(&mut self, ctx: &AxContext, phase: SemanticPhase) -> Result<(AxTree, f64)> {
         phase.require(ctx.deadline)?;
         let (scale, phase) = self.scale(ctx.deadline, phase)?;
-        let (json, phase) =
-            phase.finish_snapshot_rpc(ctx.deadline, self.client.describe_all_by(ctx.deadline))?;
+        let (json, phase) = phase
+            .finish_snapshot_rpc(ctx.deadline, self.client.describe_all_rpc_by(ctx.deadline))?;
         let tree = phase.run(ctx.deadline, || {
             let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
             tree.assign_ids();
@@ -374,7 +377,105 @@ impl Accessibility for IosA11y {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::idb::client::{SnapshotRpc, SnapshotRpcGate};
     use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    type ScaleRpc =
+        Box<dyn FnOnce(Deadline) -> SnapshotRpc<proto::ScreenDimensions> + Send + 'static>;
+    type TreeRpc = Box<dyn FnOnce(Deadline) -> SnapshotRpc<String> + Send + 'static>;
+
+    struct ScriptedClient {
+        scale: Mutex<VecDeque<ScaleRpc>>,
+        tree: Mutex<VecDeque<TreeRpc>>,
+    }
+
+    impl ScriptedClient {
+        fn new(scale: Vec<ScaleRpc>, tree: Vec<TreeRpc>) -> Self {
+            Self {
+                scale: Mutex::new(scale.into()),
+                tree: Mutex::new(tree.into()),
+            }
+        }
+    }
+
+    impl IosA11yClient for ScriptedClient {
+        fn describe_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<proto::ScreenDimensions> {
+            self.scale
+                .lock()
+                .expect("scale script lock")
+                .pop_front()
+                .expect("one scripted scale RPC")(deadline)
+        }
+
+        fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String> {
+            self.tree
+                .lock()
+                .expect("tree script lock")
+                .pop_front()
+                .expect("one scripted tree RPC")(deadline)
+        }
+
+        fn hid_by(&self, _events: Vec<proto::HidEvent>, _deadline: Deadline) -> Result<()> {
+            panic!("snapshot deadline tests never send HID")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RpcExpiry {
+        BeforeCall,
+        AfterCall,
+    }
+
+    fn expiring_rpc<T: Send + 'static>(
+        op: &'static str,
+        expiry: RpcExpiry,
+        called: Arc<AtomicBool>,
+        result: Result<T>,
+    ) -> Box<dyn FnOnce(Deadline) -> SnapshotRpc<T> + Send> {
+        Box::new(move |deadline| {
+            let gate = SnapshotRpcGate::new(deadline, Duration::from_secs(30), op)
+                .expect("the outer snapshot deadline starts live");
+            let expires = gate.ends();
+            let before = expires
+                .checked_sub(Duration::from_millis(1))
+                .expect("the RPC bound is longer than one millisecond");
+            let mut observations = match expiry {
+                RpcExpiry::BeforeCall => vec![expires].into_iter(),
+                RpcExpiry::AfterCall => vec![before, expires].into_iter(),
+            };
+            gate.run_with_clock(
+                || observations.next().expect("enough clock observations"),
+                || {
+                    called.store(true, Ordering::SeqCst);
+                    result
+                },
+            )
+        })
+    }
+
+    fn dimensions() -> proto::ScreenDimensions {
+        proto::ScreenDimensions {
+            width: 400,
+            height: 800,
+            density: 2.0,
+            width_points: 200,
+            height_points: 400,
+        }
+    }
+
+    fn scripted_a11y(
+        scale: Vec<ScaleRpc>,
+        tree: Vec<TreeRpc>,
+        cached_scale: Option<f64>,
+    ) -> IosA11y {
+        IosA11y {
+            client: Box::new(ScriptedClient::new(scale, tree)),
+            scale: cached_scale,
+        }
+    }
 
     fn ctx(deadline: glass_core::Deadline) -> AxContext {
         AxContext {
@@ -414,16 +515,54 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_expiry_after_describe_dispatch_is_a_caller_timeout() {
-        let error = SemanticPhase::Snapshot { dispatched: true }
-            .finish::<()>(
-                glass_core::Deadline::from_millis(0),
-                Err(GlassError::caller_deadline_elapsed(
-                    "idb accessibility describe",
-                )),
-            )
-            .expect_err("an in-flight describe ended at the caller deadline");
+    fn scale_rpc_expiry_before_the_injected_call_is_not_dispatched() {
+        let called = Arc::new(AtomicBool::new(false));
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(5));
+        let mut a11y = scripted_a11y(
+            vec![expiring_rpc(
+                "idb describe",
+                RpcExpiry::BeforeCall,
+                Arc::clone(&called),
+                Ok(dimensions()),
+            )],
+            vec![],
+            None,
+        );
 
+        let error = a11y
+            .snapshot(&ctx(deadline))
+            .expect_err("expiry at the scale RPC gate must stop before the call");
+
+        assert!(!called.load(Ordering::SeqCst), "scale RPC must not begin");
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn scale_rpc_expiry_after_the_injected_call_is_a_caller_timeout() {
+        let called = Arc::new(AtomicBool::new(false));
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(5));
+        let mut a11y = scripted_a11y(
+            vec![expiring_rpc(
+                "idb describe",
+                RpcExpiry::AfterCall,
+                Arc::clone(&called),
+                Ok(dimensions()),
+            )],
+            vec![],
+            None,
+        );
+
+        let error = a11y
+            .snapshot(&ctx(deadline))
+            .expect_err("expiry after the scale RPC begins must be a caller timeout");
+
+        assert!(called.load(Ordering::SeqCst), "scale RPC must begin");
         assert_eq!(
             error.bound(),
             Some(glass_core::BoundKind::TimedOut),
@@ -438,14 +577,25 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_scale_rpc_refusal_at_its_dispatch_gate_stays_not_dispatched() {
-        let error = SemanticPhase::Snapshot { dispatched: true }
-            .finish::<()>(
-                glass_core::Deadline::from_millis(0),
-                Err(GlassError::deadline_not_started("idb describe")),
-            )
-            .expect_err("the lower RPC gate proved that describe did not start");
+    fn tree_rpc_expiry_before_the_injected_call_is_not_dispatched() {
+        let called = Arc::new(AtomicBool::new(false));
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(5));
+        let mut a11y = scripted_a11y(
+            vec![],
+            vec![expiring_rpc(
+                "idb accessibility_info",
+                RpcExpiry::BeforeCall,
+                Arc::clone(&called),
+                Ok("[]".into()),
+            )],
+            Some(2.0),
+        );
 
+        let error = a11y
+            .snapshot(&ctx(deadline))
+            .expect_err("expiry at the tree RPC gate must stop before the call");
+
+        assert!(!called.load(Ordering::SeqCst), "tree RPC must not begin");
         assert_eq!(
             error.bound(),
             Some(glass_core::BoundKind::NotStarted),
@@ -460,20 +610,59 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_tree_rpc_refusal_at_its_dispatch_gate_stays_not_dispatched() {
-        let error = SemanticPhase::Snapshot { dispatched: true }
-            .finish::<()>(
-                glass_core::Deadline::from_millis(0),
-                Err(GlassError::deadline_not_started("idb accessibility_info")),
-            )
-            .expect_err("the lower RPC gate proved that accessibility_info did not start");
+    fn tree_rpc_expiry_after_the_injected_call_is_a_caller_timeout() {
+        let called = Arc::new(AtomicBool::new(false));
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(5));
+        let mut a11y = scripted_a11y(
+            vec![],
+            vec![expiring_rpc(
+                "idb accessibility_info",
+                RpcExpiry::AfterCall,
+                Arc::clone(&called),
+                Ok("[]".into()),
+            )],
+            Some(2.0),
+        );
 
+        let error = a11y
+            .snapshot(&ctx(deadline))
+            .expect_err("expiry after the tree RPC begins must be a caller timeout");
+
+        assert!(called.load(Ordering::SeqCst), "tree RPC must begin");
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
         assert_eq!(
-            error.bound(),
-            Some(glass_core::BoundKind::NotStarted),
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
             "{error}"
         );
-        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+    }
+
+    #[test]
+    fn pre_rpc_backend_failure_survives_deadline_expiry_before_snapshot_returns() {
+        let mut a11y = scripted_a11y(
+            vec![Box::new(move |deadline| {
+                while !deadline.has_passed() {
+                    std::thread::yield_now();
+                }
+                SnapshotRpc::BeforeDispatch(GlassError::Backend(
+                    "idb describe preflight failed".into(),
+                ))
+            })],
+            vec![],
+            None,
+        );
+
+        let error = a11y
+            .snapshot(&ctx(Deadline::at(
+                std::time::Instant::now() + Duration::from_millis(10),
+            )))
+            .expect_err("the real pre-RPC failure must survive the outer deadline recheck");
+
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "idb describe preflight failed"),
+            "{error}"
+        );
         assert_eq!(
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::NotDispatched),
@@ -482,16 +671,25 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_no_tree_result_stays_accessibility_not_ready() {
-        let error = SemanticPhase::Snapshot { dispatched: true }
-            .finish::<()>(
-                glass_core::Deadline::UNBOUNDED,
-                Err(GlassError::AccessibilityNotReady(
+    fn live_tree_rpc_accessibility_not_ready_is_preserved() {
+        let called = Arc::new(AtomicBool::new(false));
+        let saw_call = Arc::clone(&called);
+        let mut a11y = scripted_a11y(
+            vec![],
+            vec![Box::new(move |_deadline| {
+                saw_call.store(true, Ordering::SeqCst);
+                SnapshotRpc::dispatched(Err(GlassError::AccessibilityNotReady(
                     "the app has not published a tree yet".into(),
-                )),
-            )
+                )))
+            })],
+            Some(2.0),
+        );
+
+        let error = a11y
+            .snapshot(&ctx(Deadline::UNBOUNDED))
             .expect_err("a live no-tree result must remain retryable");
 
+        assert!(called.load(Ordering::SeqCst), "tree RPC must begin");
         assert!(
             matches!(error, GlassError::AccessibilityNotReady(_)),
             "{error}"

@@ -28,7 +28,7 @@ use objc2_core_foundation::CFRetained;
 use crate::ffi::{self, attr};
 use crate::mapping::{self, AxStateFacts};
 use crate::select_diagnostic::{CandidateOutcome, candidate_line};
-use crate::semantic_deadline::{EffectiveDeadline, SemanticDeadline};
+use crate::semantic_deadline::{EffectiveDeadline, SemanticDeadline, run_snapshot};
 
 /// Per-axis pixel tolerance when matching an `AXWindow`'s origin against the backend's
 /// reported window origin. Same basis as `axwindow.rs`'s geometry-match fallback. Sized for
@@ -87,22 +87,26 @@ impl MacosA11y {
 
 impl Accessibility for MacosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        let deadline = SemanticDeadline::snapshot(ctx.deadline);
-        deadline.require()?;
-        let (trusted, deadline) = deadline.dispatch_snapshot(ffi::accessibility_is_trusted)?;
-        require_accessibility_grant(trusted)?;
-        let (window_el, scale) = resolve_window_after_grant(ctx, deadline)?;
+        run_snapshot(
+            ctx.deadline,
+            Instant::now,
+            ffi::accessibility_is_trusted,
+            |trusted, deadline| {
+                require_accessibility_grant(trusted)?;
+                let (window_el, scale) = resolve_window_after_grant(ctx, deadline)?;
 
-        let mut budget = WalkBudget::with_limits(ctx.limits);
-        let root = walk(&window_el, &ctx.window, scale, 0, &mut budget, deadline)?;
-        deadline.run(|| {
-            let mut tree = AxTree::new(root);
-            tree.truncated = budget.truncation();
-            tree.unreadable = budget.unreadable();
-            // Ids/count are assigned by `glass-core` (`AxTree::assign_ids`) so numbering is
-            // identical across OS backends.
-            Ok(tree)
-        })
+                let mut budget = WalkBudget::with_limits(ctx.limits);
+                let root = walk(&window_el, &ctx.window, scale, 0, &mut budget, deadline)?;
+                deadline.run(|| {
+                    let mut tree = AxTree::new(root);
+                    tree.truncated = budget.truncation();
+                    tree.unreadable = budget.unreadable();
+                    // Ids/count are assigned by `glass-core` (`AxTree::assign_ids`) so numbering is
+                    // identical across OS backends.
+                    Ok(tree)
+                })
+            },
+        )
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {

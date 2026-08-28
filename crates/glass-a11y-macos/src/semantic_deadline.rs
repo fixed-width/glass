@@ -131,13 +131,6 @@ impl SemanticDeadline {
         self.after_dispatch().finish(work())
     }
 
-    pub(crate) fn dispatch_snapshot<T>(
-        self,
-        work: impl FnOnce() -> T,
-    ) -> Result<(T, SemanticDeadline)> {
-        self.dispatch_snapshot_with_clock(Instant::now, work)
-    }
-
     fn dispatch_snapshot_with_clock<T>(
         self,
         mut now: impl FnMut() -> Instant,
@@ -158,6 +151,19 @@ impl SemanticDeadline {
         let (ends, owner) = self.deadline.resolve(own);
         EffectiveDeadline { ends, owner }
     }
+}
+
+/// Run a snapshot from its initially-undispatched phase through the first native call and the
+/// remainder of the reader. The production reader and deterministic tests use this same path.
+pub(crate) fn run_snapshot<T, U>(
+    deadline: Deadline,
+    now: impl FnMut() -> Instant,
+    first_native_call: impl FnOnce() -> T,
+    continue_snapshot: impl FnOnce(T, SemanticDeadline) -> Result<U>,
+) -> Result<U> {
+    let (value, dispatched) = SemanticDeadline::snapshot(deadline)
+        .dispatch_snapshot_with_clock(now, first_native_call)?;
+    continue_snapshot(value, dispatched)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,51 +237,60 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
-    fn a_spent_snapshot_deadline_is_not_started() {
-        let now = Instant::now();
-        let error = SemanticDeadline::snapshot(Deadline::at(now))
-            .require_at(now)
-            .unwrap_err();
-
-        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
-        assert_eq!(error.bound_owner(), Some(Whose::Caller));
-        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
-    }
-
-    #[test]
-    fn snapshot_expiry_at_the_first_native_gate_is_not_dispatched() {
+    fn snapshot_path_expiry_before_the_first_native_call_is_not_dispatched() {
         let before = Instant::now();
         let expires = before + Duration::from_secs(1);
-        let deadline = SemanticDeadline::snapshot(Deadline::at(expires));
-        deadline
-            .require_at(before)
-            .expect("the outer snapshot check is still live");
         let called = Cell::new(false);
+        let continued = Cell::new(false);
 
-        let error = deadline
-            .dispatch_snapshot_with_clock(
-                || expires,
-                || {
-                    called.set(true);
-                    true
-                },
-            )
-            .expect_err("expiry at the native gate must prevent the first AX call");
+        let error = run_snapshot(
+            Deadline::at(expires),
+            || expires,
+            || {
+                called.set(true);
+                true
+            },
+            |_trusted, _deadline| {
+                continued.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("expiry at the native gate must prevent the first AX call");
 
         assert!(!called.get(), "the first AX call must not begin");
+        assert!(!continued.get(), "snapshot body must not run");
         assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
         assert_eq!(error.bound_owner(), Some(Whose::Caller));
         assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
     }
 
     #[test]
-    fn a_snapshot_deadline_expiring_after_dispatch_is_a_caller_timeout() {
-        let now = Instant::now();
-        let error = SemanticDeadline::snapshot(Deadline::at(now))
-            .after_dispatch()
-            .require_at(now)
-            .unwrap_err();
+    fn snapshot_path_expiry_after_the_first_native_call_is_a_caller_timeout() {
+        let before = Instant::now();
+        let expires = before + Duration::from_secs(1);
+        let called = Cell::new(false);
+        let continued = Cell::new(false);
+        let mut observations = [before, expires].into_iter();
 
+        let error = run_snapshot(
+            Deadline::at(expires),
+            || observations.next().expect("two clock observations"),
+            || {
+                called.set(true);
+                true
+            },
+            |_trusted, _deadline| {
+                continued.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("expiry after the first AX call begins must be a caller timeout");
+
+        assert!(called.get(), "the first AX call must begin");
+        assert!(
+            !continued.get(),
+            "snapshot body must not continue after expiry"
+        );
         assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
         assert_eq!(error.bound_owner(), Some(Whose::Caller));
         assert_eq!(
