@@ -18,6 +18,19 @@ fn standalone(result: ContextualToolResult) -> ToolResult {
     result.map(|o| o.output).map_err(|e| e.message)
 }
 
+fn standalone_scroll_to_element(result: ContextualToolResult) -> ToolResult {
+    result.map(|o| o.output).map_err(|e| {
+        if e.bound_dispatch == Some(glass_core::BoundDispatch::MayHaveDispatched) {
+            format!(
+                "{}\nRetry safety: one or more earlier steps may already have changed the app. The caller should re-observe before retrying.",
+                e.message
+            )
+        } else {
+            e.message
+        }
+    })
+}
+
 pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult {
     standalone(wait_for_element_with(glass, a, ToolContext::UNBOUNDED))
 }
@@ -97,7 +110,7 @@ fn element_sibling(element: Option<glass_core::ElementInfo>) -> Vec<OutContent> 
 }
 
 pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResult {
-    standalone(scroll_to_element_with(glass, a, ToolContext::UNBOUNDED))
+    standalone_scroll_to_element(scroll_to_element_with(glass, a, ToolContext::UNBOUNDED))
 }
 
 pub(crate) fn scroll_to_element_with(
@@ -264,7 +277,111 @@ pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
 mod tests {
     use super::*;
     use crate::tools::testutil::*;
-    use glass_core::{AppSpec, AxNode, AxNodeId, AxRect, AxStates, AxTree};
+    use glass_core::{
+        Accessibility, AppSpec, AxContext, AxNode, AxNodeId, AxRect, AxStates, AxTree, Backend,
+        BaselineStore, Deadline, Frame, GlassError, KeyEvent, Platform, PlatformFactory,
+        PointerEvent, Region, Result as GlassResult, Stream, WindowGeometry, WindowId, WindowInfo,
+        WindowOp,
+    };
+    use std::sync::{Arc, Mutex};
+
+    struct StaticAccessibility {
+        tree: AxTree,
+    }
+
+    impl Accessibility for StaticAccessibility {
+        fn snapshot(&mut self, _context: &AxContext) -> GlassResult<AxTree> {
+            Ok(self.tree.clone())
+        }
+    }
+
+    struct ResizeAfterFirstScrollPlatform {
+        inner: FakePlatform,
+    }
+
+    impl Platform for ResizeAfterFirstScrollPlatform {
+        fn start_app(&mut self, spec: &AppSpec) -> GlassResult<WindowGeometry> {
+            self.inner.start_app(spec)
+        }
+
+        fn stop_app_by(&mut self, deadline: Deadline) -> GlassResult<()> {
+            self.inner.stop_app_by(deadline)
+        }
+
+        fn capture_frame_by(
+            &mut self,
+            region: Option<&Region>,
+            deadline: Deadline,
+        ) -> GlassResult<Frame> {
+            self.inner.capture_frame_by(region, deadline)
+        }
+
+        fn capture_window_by(
+            &mut self,
+            id: WindowId,
+            region: Option<&Region>,
+            deadline: Deadline,
+        ) -> GlassResult<Frame> {
+            self.inner.capture_window_by(id, region, deadline)
+        }
+
+        fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> GlassResult<()> {
+            self.inner.send_pointer_by(event, deadline)?;
+            if matches!(event, PointerEvent::Scroll { .. }) {
+                self.inner.geometry.width = 50;
+                self.inner.geometry.height = 50;
+            }
+            Ok(())
+        }
+
+        fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> GlassResult<()> {
+            self.inner.send_key_by(event, deadline)
+        }
+
+        fn window(&mut self, op: &WindowOp) -> GlassResult<WindowGeometry> {
+            self.inner.window(op)
+        }
+
+        fn list_windows(&mut self) -> GlassResult<Vec<WindowInfo>> {
+            self.inner.list_windows()
+        }
+
+        fn select_window(&mut self, id: WindowId) -> GlassResult<WindowGeometry> {
+            self.inner.select_window(id)
+        }
+
+        fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+            self.inner.drain_logs()
+        }
+    }
+
+    fn started_a11y_on(platform: Box<dyn Platform + Send>, tree: AxTree) -> Glass {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("baselines");
+        std::mem::forget(dir);
+        let mut held = Some(Backend {
+            platform,
+            accessibility: Some(Box::new(StaticAccessibility { tree })),
+        });
+        let factory: PlatformFactory = Box::new(move |_| {
+            held.take()
+                .ok_or_else(|| GlassError::Backend("factory called twice".into()))
+        });
+        let mut glass = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+        glass
+            .start(&AppSpec {
+                build: None,
+                run: vec!["x".into()],
+                cwd: None,
+                env: vec![],
+                window_hint: None,
+                timeout_ms: 1,
+                sandbox: glass_core::SandboxLevel::Off,
+                a11y: false,
+            })
+            .unwrap();
+        glass
+    }
 
     #[test]
     fn scroll_to_element_requires_a_selector() {
@@ -314,6 +431,62 @@ mod tests {
         a.direction = Some("sideways".into());
         let err = scroll_to_element(&mut g, &a).unwrap_err();
         assert!(err.contains("up/down/left/right"), "got: {err}");
+    }
+
+    #[test]
+    fn standalone_scroll_to_element_resize_after_first_scroll_preserves_cause_and_warns() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let platform = ResizeAfterFirstScrollPlatform {
+            inner: FakePlatform::new(100, 100).with_event_log(events.clone()),
+        };
+        let mut g = started_a11y_on(Box::new(platform), fake_tree());
+        let mut a = scroll_args();
+        a.name = Some("missing".into());
+        a.direction = Some("down".into());
+        a.timeout_ms = Some(1_000);
+
+        let err = scroll_to_element(&mut g, &a).unwrap_err();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["scroll(50,50,0,3)"],
+            "the first scroll must land before the later coordinate failure"
+        );
+        assert!(
+            err.contains("coordinate (50,50) out of bounds for 50x50 window"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("one or more earlier steps may already have changed the app")
+                && err.contains("re-observe before retrying"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn standalone_scroll_to_element_preflight_coordinate_failure_does_not_warn() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(50, 50).with_event_log(events.clone());
+        let mut g = started_a11y_on(Box::new(platform), fake_tree());
+        let mut a = scroll_args();
+        a.name = Some("missing".into());
+        a.direction = Some("down".into());
+        a.x = Some(50);
+        a.y = Some(50);
+        a.timeout_ms = Some(1_000);
+
+        let err = scroll_to_element(&mut g, &a).unwrap_err();
+
+        assert!(
+            err.contains("coordinate (50,50) out of bounds for 50x50 window"),
+            "got: {err}"
+        );
+        assert!(events.lock().unwrap().is_empty(), "no scroll may dispatch");
+        assert!(
+            !err.contains("may already have changed the app")
+                && !err.contains("re-observe before retrying"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -650,8 +823,6 @@ mod tests {
             _ => panic!("expected text"),
         }
     }
-
-    use glass_core::Frame;
 
     fn started_frames(frames: Vec<Frame>) -> Glass {
         let mut g = glass_with(FakePlatform::new(2, 2).with_frames(frames));
