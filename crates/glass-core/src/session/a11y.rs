@@ -3915,6 +3915,8 @@ mod tests {
             fake_tree(),
             InvokeBehavior::Succeed,
         );
+        let delayed_click_audit = RecordingSink::default();
+        delayed_click.set_audit_sink(Box::new(delayed_click_audit.clone()));
         delayed_click.start(&spec()).unwrap();
         delayed_click.a11y_snapshot(None).unwrap();
         assert!(
@@ -3923,12 +3925,15 @@ mod tests {
                 .is_err()
         );
         assert!(invoke_log.lock().unwrap().is_empty());
+        assert_one_failed(&delayed_click_audit, "click_element");
 
         let delayed_writes = Arc::new(Mutex::new(Vec::new()));
         let mut delayed_set = glass_with_backend(
             FakePlatform::new(100, 100).with_geometry_delay(Duration::from_millis(20)),
             Box::new(logging_a11y(fake_tree(), delayed_writes.clone())),
         );
+        let delayed_set_audit = RecordingSink::default();
+        delayed_set.set_audit_sink(Box::new(delayed_set_audit.clone()));
         delayed_set.start(&spec()).unwrap();
         delayed_set.a11y_snapshot(None).unwrap();
         assert!(
@@ -3937,5 +3942,6 @@ mod tests {
                 .is_err()
         );
         assert!(delayed_writes.lock().unwrap().is_empty());
+        assert_one_failed(&delayed_set_audit, "set_value");
     }
 }
