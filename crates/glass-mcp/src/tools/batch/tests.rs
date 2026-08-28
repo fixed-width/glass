@@ -3,10 +3,12 @@ use crate::tools::start as start_tool;
 use crate::tools::testutil::*;
 use crate::tools::{OutContent, baseline_save};
 use glass_core::{
-    A11yThread, Accessibility, AppSpec, AxContext, AxRole, AxTree, Backend, BaselineStore,
-    Deadline, Frame, GlassError, KeyEvent, Platform, PlatformFactory, PointerEvent, Region,
-    Result as GlassResult, Stream, WindowGeometry, WindowId, WindowInfo, WindowOp,
+    A11yThread, Accessibility, AppSpec, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates,
+    AxTree, Backend, BaselineStore, Deadline, Frame, GlassError, KeyEvent, Platform,
+    PlatformFactory, PointerEvent, Region, Result as GlassResult, Stream, WindowGeometry, WindowId,
+    WindowInfo, WindowOp,
 };
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +40,7 @@ enum DeadlineBehavior {
     TransportFailure,
     InvalidBoolean,
     OptionNotFound,
+    ComboEscapeFailure,
     OtherFailure,
     ResizeAfterOneScroll,
 }
@@ -362,12 +365,19 @@ impl Platform for DeadlinePlatform {
             | DeadlineBehavior::SetValueTransportFailure
             | DeadlineBehavior::SetValueWorkerSpawnFailure
             | DeadlineBehavior::InvalidBoolean
-            | DeadlineBehavior::OptionNotFound => self.inner.send_pointer(event),
+            | DeadlineBehavior::OptionNotFound
+            | DeadlineBehavior::ComboEscapeFailure => self.inner.send_pointer(event),
         }
     }
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> GlassResult<()> {
         self.deadlines.lock().unwrap().push(deadline);
-        self.inner.send_key(event)
+        self.inner.send_key(event)?;
+        if matches!(self.behavior, DeadlineBehavior::ComboEscapeFailure) {
+            return Err(GlassError::Backend(
+                "combo cleanup transport result was lost".into(),
+            ));
+        }
+        Ok(())
     }
     fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> GlassResult<WindowGeometry> {
         self.deadlines.lock().unwrap().push(deadline);
@@ -626,6 +636,7 @@ fn assert_safe_set_value_category(
     secret: &str,
     expected_category: &str,
     expected_summary: &str,
+    expected_attempted: bool,
 ) {
     let (mut glass, _, _, _) =
         deadline_a11y_glass_with_behavior(behavior, vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
@@ -653,11 +664,106 @@ fn assert_safe_set_value_category(
         trusted["outcome"]["steps"][0]["error"]["summary"],
         expected_summary
     );
+    assert_eq!(
+        trusted["outcome"]["steps"][0]["attempted"],
+        expected_attempted
+    );
+    assert_eq!(
+        trusted["outcome"]["steps"][0]["side_effects_may_have_occurred"],
+        expected_attempted
+    );
     assert_secret_absent(&error, secret);
     assert!(
         !output_text(&error).contains("app-derived option list"),
         "app-derived option details must stay out of trusted set_value diagnostics"
     );
+}
+
+struct ScriptedComboAccessibility {
+    trees: VecDeque<AxTree>,
+}
+
+impl Accessibility for ScriptedComboAccessibility {
+    fn snapshot(&mut self, _context: &AxContext) -> GlassResult<AxTree> {
+        self.trees
+            .pop_front()
+            .ok_or_else(|| GlassError::Backend("scripted combo snapshots exhausted".into()))
+    }
+}
+
+fn combo_tree(name: &str, options: &[&str]) -> AxTree {
+    let mut tree = fake_tree();
+    let combo = &mut tree.root.children[0];
+    combo.role = AxRole::ComboBox;
+    combo.raw_role = "combo box".into();
+    combo.name = Some(name.into());
+    combo.states = AxStates {
+        expanded: !options.is_empty(),
+        focusable: true,
+        enabled: true,
+        ..Default::default()
+    };
+    combo.children = (!options.is_empty())
+        .then(|| AxNode {
+            id: AxNodeId(0),
+            role: AxRole::List,
+            raw_role: "list".into(),
+            name: None,
+            description: None,
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 10,
+                y: 30,
+                width: 80,
+                height: 60,
+            }),
+            children: options
+                .iter()
+                .map(|option| AxNode {
+                    id: AxNodeId(0),
+                    role: AxRole::ListItem,
+                    raw_role: "list item".into(),
+                    name: Some((*option).into()),
+                    description: None,
+                    value: None,
+                    states: AxStates {
+                        selected: *option == name,
+                        ..Default::default()
+                    },
+                    bounds: None,
+                    children: vec![],
+                })
+                .collect(),
+        })
+        .into_iter()
+        .collect();
+    tree.assign_ids();
+    tree
+}
+
+fn started_scripted_combo(trees: Vec<AxTree>) -> (Glass, Arc<Mutex<Vec<String>>>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let platform = DeadlinePlatform {
+        inner: FakePlatform::new(100, 100).with_event_log(events.clone()),
+        deadlines: Arc::new(Mutex::new(Vec::new())),
+        behavior: DeadlineBehavior::ComboEscapeFailure,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    let mut held = Some(Backend {
+        platform: Box::new(platform),
+        accessibility: Some(Box::new(ScriptedComboAccessibility {
+            trees: trees.into(),
+        })),
+    });
+    let factory: PlatformFactory = Box::new(move |_| {
+        held.take()
+            .ok_or_else(|| GlassError::Backend("factory called twice".into()))
+    });
+    let glass = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+    (started_a11y_session(glass), events)
 }
 
 #[test]
@@ -667,6 +773,7 @@ fn set_value_invalid_boolean_keeps_a_fixed_actionable_category_without_echoing_i
         "boolean-secret-value",
         "invalid_value",
         "element expects a boolean value",
+        false,
     );
 }
 
@@ -677,6 +784,49 @@ fn set_value_missing_option_keeps_a_fixed_actionable_category_without_echoing_in
         "option-secret-value",
         "option_not_found",
         "requested option was not found",
+        true,
+    );
+}
+
+#[test]
+fn real_combo_missing_option_after_open_and_failed_escape_is_attempted_and_secret_safe() {
+    let submitted_secret = "submitted-secret-option";
+    let app_option_secret = "app-derived-secret-option";
+    let (mut glass, events) = started_scripted_combo(vec![
+        combo_tree("Beta", &[]),
+        combo_tree("Beta", &["Alpha", "Beta", app_option_secret]),
+    ]);
+
+    let error = do_actions(
+        &mut glass,
+        &DoArgs {
+            actions: vec![Action::SetValue(SetValueArgs {
+                id: 1,
+                text: submitted_secret.into(),
+                return_: None,
+            })],
+            then: None,
+            timeout_ms: Some(2_000),
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+
+    let trusted = envelope(&error);
+    let step = &trusted["outcome"]["steps"][0];
+    assert_eq!(step["error"]["category"], "option_not_found");
+    assert_eq!(step["error"]["summary"], "requested option was not found");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], true);
+    assert_secret_absent(&error, submitted_secret);
+    assert!(
+        !output_text(&error).contains(app_option_secret),
+        "app-derived option details must stay out of trusted set_value diagnostics"
+    );
+    assert_eq!(
+        &*events.lock().unwrap(),
+        &["click(20,20)".to_string(), "key(Escape)".to_string()],
+        "the regression must route through the real combo open and cleanup path"
     );
 }
 

@@ -217,7 +217,6 @@ impl ContextualError {
                 &error,
                 glass_core::GlassError::CoordOutOfBounds { .. }
                     | glass_core::GlassError::AxValueNotBoolean(..)
-                    | glass_core::GlassError::AxOptionNotFound(..)
             )
             .then_some(BoundDispatch::NotDispatched)
         });

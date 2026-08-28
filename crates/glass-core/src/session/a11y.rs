@@ -621,6 +621,7 @@ impl Glass {
         deadline: Deadline,
     ) -> Result<()> {
         let want = text.trim();
+        let mut mutation_may_have_dispatched = false;
         let expanded_options = {
             let s = self.require_active()?;
             s.last_ax
@@ -653,6 +654,7 @@ impl Glass {
                             })
                     });
                     self.invalidate_ax_cache_after_possible_dispatch(open)?;
+                    mutation_may_have_dispatched = true;
                 }
                 self.settle_for_popup(deadline)
                     .map_err(GlassError::after_dispatch)?;
@@ -677,6 +679,12 @@ impl Glass {
             // Unknown option — dismiss the popup so the UI is left neutral, then report.
             if !deadline.has_passed() {
                 let escape = self.semantic_key_by(&KeyEvent::Chord("Escape".to_string()), deadline);
+                mutation_may_have_dispatched |= match &escape {
+                    Ok(()) => true,
+                    Err(error) => {
+                        error.bound_dispatch() != Some(crate::BoundDispatch::NotDispatched)
+                    }
+                };
                 let _ = self.invalidate_ax_cache_after_possible_dispatch(escape);
             }
             let choices = options
@@ -684,11 +692,12 @@ impl Glass {
                 .map(|(l, _)| l.clone())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(GlassError::AxOptionNotFound(
-                id.0,
-                text.to_string(),
-                choices,
-            ));
+            let error = GlassError::AxOptionNotFound(id.0, text.to_string(), choices);
+            return Err(if mutation_may_have_dispatched {
+                error.after_dispatch()
+            } else {
+                error.before_dispatch()
+            });
         };
         // Opening focuses the current selection; step from it to the target, then Enter.
         let current_idx = options.iter().position(|(_, sel)| *sel).unwrap_or(0);
@@ -2980,6 +2989,14 @@ mod tests {
         );
     }
 
+    fn assert_option_not_found_dispatch(error: &GlassError, expected: crate::BoundDispatch) {
+        assert!(
+            matches!(error.cause(), GlassError::AxOptionNotFound(1, _, _)),
+            "{error}"
+        );
+        assert_eq!(error.bound_dispatch(), Some(expected), "{error}");
+    }
+
     #[test]
     fn combo_open_read_failure_requires_a_fresh_snapshot_before_retrying_actuation() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
@@ -3320,19 +3337,87 @@ mod tests {
         let first = g
             .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
             .expect_err("Omega is not an option and Escape is refused");
-        assert!(matches!(first, GlassError::AxOptionNotFound(1, _, _)));
+        assert_option_not_found_dispatch(&first, crate::BoundDispatch::MayHaveDispatched);
         assert_eq!(clicks.lock().unwrap().len(), 1);
         assert!(keys.lock().unwrap().is_empty());
 
         let retry = g
             .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
             .expect_err("the same unknown option remains invalid");
-        assert!(matches!(retry, GlassError::AxOptionNotFound(1, _, _)));
+        assert_option_not_found_dispatch(&retry, crate::BoundDispatch::MayHaveDispatched);
         assert_eq!(
             clicks.lock().unwrap().len(),
             1,
             "retrying cleanup must not close the popup with a pointer click"
         );
+        assert_eq!(
+            &*keys.lock().unwrap(),
+            &[KeyEvent::Chord("Escape".to_string())]
+        );
+    }
+
+    #[test]
+    fn combo_already_open_escape_refusal_proves_unknown_option_not_dispatched() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = ScriptedKeyPlatform {
+            inner: FakePlatform::new(340, 300)
+                .with_click_log(clicks.clone())
+                .with_key_log(keys.clone()),
+            replies: vec![Err(scripted_dispatch_error(
+                "scripted combo escape",
+                crate::BoundDispatch::NotDispatched,
+            ))]
+            .into(),
+        };
+        let mut g = glass_with_scripted_key_snapshots(
+            platform,
+            vec![SnapshotReply::Tree(combo(
+                "Beta",
+                &["Alpha", "Beta", "Gamma", "Delta"],
+            ))],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
+            .expect_err("the open combo has no matching option and Escape is refused");
+
+        assert_option_not_found_dispatch(&error, crate::BoundDispatch::NotDispatched);
+        assert!(clicks.lock().unwrap().is_empty());
+        assert!(keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn combo_already_open_ambiguous_escape_failure_marks_unknown_option_after_dispatch() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = ScriptedKeyPlatform {
+            inner: FakePlatform::new(340, 300)
+                .with_click_log(clicks.clone())
+                .with_key_log(keys.clone()),
+            replies: vec![Err(GlassError::Backend(
+                "scripted combo cleanup transport failure".into(),
+            ))]
+            .into(),
+        };
+        let mut g = glass_with_scripted_key_snapshots(
+            platform,
+            vec![SnapshotReply::Tree(combo(
+                "Beta",
+                &["Alpha", "Beta", "Gamma", "Delta"],
+            ))],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
+            .expect_err("the missing option remains primary after ambiguous cleanup failure");
+
+        assert_option_not_found_dispatch(&error, crate::BoundDispatch::MayHaveDispatched);
+        assert!(clicks.lock().unwrap().is_empty());
         assert_eq!(
             &*keys.lock().unwrap(),
             &[KeyEvent::Chord("Escape".to_string())]
@@ -3363,14 +3448,14 @@ mod tests {
         let first = g
             .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(400))
             .expect_err("the deadline expires before unknown-option cleanup");
-        assert!(matches!(first, GlassError::AxOptionNotFound(1, _, _)));
+        assert_option_not_found_dispatch(&first, crate::BoundDispatch::MayHaveDispatched);
         assert_eq!(clicks.lock().unwrap().len(), 1);
         assert!(keys.lock().unwrap().is_empty(), "late Escape is skipped");
 
         let retry = g
             .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
             .expect_err("the same unknown option remains invalid");
-        assert!(matches!(retry, GlassError::AxOptionNotFound(1, _, _)));
+        assert_option_not_found_dispatch(&retry, crate::BoundDispatch::MayHaveDispatched);
         assert_eq!(
             clicks.lock().unwrap().len(),
             1,
@@ -3403,7 +3488,7 @@ mod tests {
         let error = g
             .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
             .expect_err("Omega is not an option");
-        assert!(matches!(error, GlassError::AxOptionNotFound(1, _, _)));
+        assert_option_not_found_dispatch(&error, crate::BoundDispatch::MayHaveDispatched);
         assert_eq!(clicks.lock().unwrap().len(), 1, "the combo was opened once");
         assert_eq!(
             &*keys.lock().unwrap(),
