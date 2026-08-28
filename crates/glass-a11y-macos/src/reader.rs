@@ -155,48 +155,31 @@ impl Accessibility for MacosA11y {
         // Read-back poll: some editables accept the AX write without an `AXError` but never
         // actually change `AXValue` (a misleading success) — require the read-back to show the
         // change before reporting success, never a silent false-success. Both reads are
-        // *error-aware*: a failed or absent post-read maps to `None`, which is inconclusive and
-        // never confirms, so we keep polling to the deadline rather than mistaking a failed read
-        // for a change.
+        // *error-aware*: a failed or absent post-read is inconclusive and never confirms, so we
+        // keep polling to the deadline rather than mistaking a failed read for a change. Keep the
+        // complete latest result: a later read supersedes a transient failure, while a terminal
+        // failure remains the structured cause of the unconfirmed-write verdict.
         let verification =
             dispatched.phase(Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS));
+        let mut read_back = WriteVerification::new(target.id.0, text, before.as_deref());
         loop {
             let Some(after) = verification.observe(dispatched, || {
                 ffi::attribute_string_checked(&el, attr::VALUE)
             })?
             else {
-                return Err(write_verdict(target.id.0, text, before.as_deref(), None));
+                return Err(read_back.verdict());
             };
-            let after = after.ok().flatten();
+            let confirmed = read_back.observe(after);
             if verification.callee_expired(dispatched)? {
-                return Err(write_verdict(
-                    target.id.0,
-                    text,
-                    before.as_deref(),
-                    after.as_deref(),
-                ));
+                return Err(read_back.verdict());
             }
-            match verification.observe(dispatched, || {
-                read_back_confirms(after.as_deref(), before.as_deref(), text)
-            })? {
+            match verification.observe(dispatched, || confirmed)? {
                 Some(true) => return Ok(()),
                 Some(false) => {}
-                None => {
-                    return Err(write_verdict(
-                        target.id.0,
-                        text,
-                        before.as_deref(),
-                        after.as_deref(),
-                    ));
-                }
+                None => return Err(read_back.verdict()),
             }
             if !verification.sleep(dispatched, Duration::from_millis(SET_VALUE_POLL_MS))? {
-                return Err(write_verdict(
-                    target.id.0,
-                    text,
-                    before.as_deref(),
-                    after.as_deref(),
-                ));
+                return Err(read_back.verdict());
             }
         }
     }
@@ -252,27 +235,71 @@ impl Accessibility for MacosA11y {
     }
 }
 
+struct WriteVerification<'a> {
+    id: u32,
+    requested: &'a str,
+    before: Option<&'a str>,
+    latest: Option<Result<Option<String>>>,
+}
+
+impl<'a> WriteVerification<'a> {
+    fn new(id: u32, requested: &'a str, before: Option<&'a str>) -> Self {
+        Self {
+            id,
+            requested,
+            before,
+            latest: None,
+        }
+    }
+
+    fn observe(&mut self, result: Result<Option<String>>) -> bool {
+        self.latest = Some(result);
+        read_back_confirms(
+            self.latest
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(Option::as_deref),
+            self.before,
+            self.requested,
+        )
+    }
+
+    fn verdict(self) -> GlassError {
+        write_verdict(
+            self.id,
+            self.requested,
+            self.before,
+            self.latest.unwrap_or(Ok(None)),
+        )
+    }
+}
+
 fn write_verdict(
     id: u32,
     requested: &str,
     before: Option<&str>,
-    after: Option<&str>,
+    after: Result<Option<String>>,
 ) -> GlassError {
     // A read that failed, or one showing a value the element reformatted, is not evidence of a
     // projection that accepted the write and kept its value.
     match after {
-        None => GlassError::AxWriteUnconfirmed(
+        Err(source) => GlassError::write_unconfirmed_because(
+            id,
+            "the element exposes a writable value but no readable value was available after the write",
+            source,
+        ),
+        Ok(None) => GlassError::AxWriteUnconfirmed(
             id,
             "the element exposes a writable value but no readable value was available after the write"
                 .into(),
         ),
-        Some(seen) if write_took_no_effect(seen, before) => GlassError::value_not_applied_because(
+        Ok(Some(seen)) if write_took_no_effect(&seen, before) => GlassError::value_not_applied_because(
             id,
             requested,
-            Some(seen),
+            Some(&seen),
             READ_ONLY_PROJECTION,
         ),
-        Some(seen) => GlassError::value_not_applied(id, requested, Some(seen)),
+        Ok(Some(seen)) => GlassError::value_not_applied(id, requested, Some(&seen)),
     }
 }
 
@@ -829,7 +856,7 @@ fn gather_states(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::{BoundDispatch, BoundKind, Deadline, WalkLimits};
+    use glass_core::{BoundDispatch, BoundKind, Deadline, WalkLimits, Whose};
 
     fn context(deadline: Deadline) -> AxContext {
         AxContext {
@@ -855,6 +882,95 @@ mod tests {
             bounds: None,
             value: None,
         }
+    }
+
+    #[test]
+    fn a_final_backend_read_failure_remains_the_unconfirmed_write_cause() {
+        let error = write_verdict(
+            1,
+            "new",
+            Some("old"),
+            Err(GlassError::Backend("AXValue read failed".into())),
+        );
+
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "AXValue read failed"),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_final_tool_read_failure_remains_the_unconfirmed_write_cause() {
+        let error = write_verdict(
+            1,
+            "new",
+            Some("old"),
+            Err(GlassError::ToolFailed {
+                call: "AXValue read".into(),
+                said: " transport unavailable \n".into(),
+            }),
+        );
+
+        assert!(
+            matches!(error.cause(), GlassError::ToolFailed { .. }),
+            "{error}"
+        );
+        assert_eq!(error.tool_said(), Some("transport unavailable"), "{error}");
+    }
+
+    #[test]
+    fn a_final_bounded_read_failure_remains_the_unconfirmed_write_cause() {
+        let error = write_verdict(
+            1,
+            "new",
+            Some("old"),
+            Err(GlassError::caller_deadline_elapsed("AXValue read")),
+        );
+
+        assert!(
+            matches!(error.cause(), GlassError::Bounded { .. }),
+            "{error}"
+        );
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+    }
+
+    #[test]
+    fn a_transient_read_failure_can_be_superseded_by_a_successful_read() {
+        let mut verification = WriteVerification::new(1, "new", Some("old"));
+
+        assert!(!verification.observe(Err(GlassError::Backend(
+            "transient AXValue read failure".into()
+        ))));
+        assert!(verification.observe(Ok(Some("new".into()))));
+    }
+
+    #[test]
+    fn readable_none_without_a_source_stays_source_less() {
+        let mut verification = WriteVerification::new(1, "new", Some("old"));
+        assert!(!verification.observe(Ok(None)));
+
+        let error = verification.verdict();
+
+        assert!(
+            matches!(error, GlassError::AxWriteUnconfirmed(1, _)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn no_completed_read_stays_source_less() {
+        let error = WriteVerification::new(1, "new", Some("old")).verdict();
+
+        assert!(
+            matches!(error, GlassError::AxWriteUnconfirmed(1, _)),
+            "{error}"
+        );
     }
 
     #[test]
