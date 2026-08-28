@@ -380,14 +380,17 @@ impl Glass {
             },
             || {
                 // Poll only the watched region (cheap) when one is set; else the full window.
-                let capture_deadline =
-                    if (!looked && params.timeout_ms == 0) || whose == crate::Whose::Caller {
-                        caller
-                    } else {
-                        deadline
-                    };
+                let compatibility_capture = !looked && params.timeout_ms == 0;
+                let capture_deadline = if compatibility_capture || whose == crate::Whose::Caller {
+                    caller
+                } else {
+                    deadline
+                };
                 looked = true;
                 let frame = self.capture_by(window, region.as_ref(), capture_deadline)?;
+                if compatibility_capture && caller != Deadline::UNBOUNDED && caller.has_passed() {
+                    return Err(GlassError::caller_deadline_elapsed("wait for stable"));
+                }
                 let t = match tracker {
                     Some(ref mut t) => t,
                     None => {
@@ -885,6 +888,7 @@ impl Glass {
 #[cfg(test)]
 mod tests {
     use super::{offscreen_direction, scroll_anchor};
+    use crate::BoundKind;
     use crate::session::test_support::*;
 
     #[test]
@@ -935,6 +939,129 @@ mod tests {
             })
             .unwrap();
         assert!(!outcome.settled);
+    }
+
+    #[test]
+    fn bounded_zero_timeout_takes_one_compatibility_capture_with_the_caller_deadline() {
+        let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let caller = Deadline::from_millis(1_000);
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![frame.clone()])
+            .with_capture_log(captures.clone())
+            .with_capture_deadline_log(deadlines.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let outcome = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 0,
+                    stability_region: None,
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                caller,
+            )
+            .unwrap();
+
+        assert!(!outcome.settled);
+        assert!(!outcome.saw_motion);
+        assert_eq!(outcome.frame, frame);
+        assert_eq!(outcome.ignored_pixels, 0);
+        assert_eq!(captures.lock().unwrap().len(), 1);
+        assert_eq!(*deadlines.lock().unwrap(), vec![caller]);
+    }
+
+    #[test]
+    fn bounded_zero_timeout_propagates_a_genuine_capture_failure() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let caller = Deadline::from_millis(1_000);
+        let platform = FakePlatform::new(2, 2).with_capture_log(captures.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 0,
+                    stability_region: None,
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                caller,
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, GlassError::CaptureFailed(ref message) if message == "no scripted frames")
+        );
+        assert_eq!(captures.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn spent_bounded_zero_timeout_starts_no_capture() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![Frame::solid(2, 2, [1, 2, 3, 255])])
+            .with_capture_log(captures.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 0,
+                    stability_region: None,
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                Deadline::from_millis(0),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(BoundKind::NotStarted));
+        assert!(captures.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bounded_zero_timeout_capture_completing_after_caller_expiry_is_a_caller_error() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let caller = Deadline::from_millis(10);
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![Frame::solid(2, 2, [1, 2, 3, 255])])
+            .with_capture_log(captures.clone())
+            .with_capture_delay(Duration::from_millis(20));
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 0,
+                    stability_region: None,
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                caller,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(captures.lock().unwrap().len(), 1);
     }
 
     #[test]

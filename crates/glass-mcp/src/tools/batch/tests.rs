@@ -34,8 +34,11 @@ enum ExactContent {
 }
 
 fn exact_contents(output: &ToolOutput) -> Vec<ExactContent> {
-    output
-        .0
+    exact_content_slice(&output.0)
+}
+
+fn exact_content_slice(contents: &[OutContent]) -> Vec<ExactContent> {
+    contents
         .iter()
         .map(|content| match content {
             OutContent::Text(text) => ExactContent::Text(canonicalize_untrusted_nonce(text)),
@@ -1539,7 +1542,7 @@ fn terminal_sequence_deadline_keeps_all_action_steps_completed() {
                     interval_ms: Some(0),
                     settle_frames: Some(u32::MAX),
                     tolerance: None,
-                    timeout_ms: Some(1_000),
+                    timeout_ms: Some(0),
                     stability_region: None,
                     ignore: None,
                 }),
@@ -1586,7 +1589,15 @@ fn terminal_sequence_deadline_keeps_all_action_steps_completed() {
 #[test]
 fn then_shape_remains_backward_compatible() {
     let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
-    let mut g = started(FakePlatform::new(2, 2).with_frames(vec![frame; 3]));
+    let screenshot_args = ScreenshotArgs {
+        region: None,
+        window_id: None,
+    };
+    let mut legacy = started(FakePlatform::new(2, 2).with_frames(vec![frame.clone()]));
+    let legacy_out = crate::tools::screenshot(&mut legacy, &screenshot_args).unwrap();
+    let (legacy_result, legacy_siblings) = split_sub(legacy_out);
+
+    let mut g = started(FakePlatform::new(2, 2).with_frames(vec![frame]));
     let out = do_actions(
         &mut g,
         &DoArgs {
@@ -1594,10 +1605,7 @@ fn then_shape_remains_backward_compatible() {
             then: Some(ThenArgs {
                 settle: None,
                 diff: None,
-                screenshot: Some(ScreenshotArgs {
-                    region: None,
-                    window_id: None,
-                }),
+                screenshot: Some(screenshot_args),
             }),
             timeout_ms: None,
             encoded_argument_bytes: 0,
@@ -1605,16 +1613,21 @@ fn then_shape_remains_backward_compatible() {
     )
     .unwrap();
     let result = assert_envelope(&out, "glass_do");
+    assert_eq!(result["then"], json!({ "screenshot": legacy_result }));
     assert_eq!(
-        result["then"],
-        json!({ "screenshot": { "width": 2, "height": 2 } })
+        exact_content_slice(&out.0[1..]),
+        exact_content_slice(&legacy_siblings),
+        "batch must preserve every legacy screenshot sibling variant, byte, and position"
     );
     assert_eq!(
-        result["terminal_steps"][0]["result"],
-        result["then"]["screenshot"]
+        result["terminal_steps"],
+        json!([{
+            "status": "completed",
+            "operation": "screenshot",
+            "result": result["then"]["screenshot"].clone(),
+            "content_blocks": [1, 2]
+        }])
     );
-    assert!(matches!(out.0[1], OutContent::Image(_)));
-    assert!(matches!(&out.0[2], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
 }
 
 #[test]

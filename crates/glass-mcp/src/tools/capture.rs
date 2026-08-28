@@ -75,7 +75,20 @@ pub(crate) fn wait_stable_with(
         .budget(Duration::from_millis(params.timeout_ms), Instant::now());
     let outcome = glass
         .wait_stable_by(&params, context.deadline)
-        .map_err(|e| ContextualError::from_resolved_bound(e, context, whose))?;
+        .map_err(|e| {
+            // A zero-timeout wait still performs its compatibility capture. Core marks a
+            // successful capture that answered after a bounded caller left as `TimedOut`.
+            // Use that typed provenance only when the actual shared deadline is now spent;
+            // ordinary capture/region/backend errors have no bound and stay action failures.
+            if params.timeout_ms == 0
+                && e.bound() == Some(glass_core::BoundKind::TimedOut)
+                && context.deadline.has_passed()
+            {
+                ContextualError::from_core(e, context)
+            } else {
+                ContextualError::from_resolved_bound(e, context, whose)
+            }
+        })?;
     let settled = outcome.settled;
     // `saw_motion`/`observed_ms` make `settled` non-opaque: settled with saw_motion:false
     // over a short observed_ms is only a brief quiet window (a slow animation can hide).
