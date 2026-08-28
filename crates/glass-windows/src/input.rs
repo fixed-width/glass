@@ -367,6 +367,23 @@ fn send_modifiers(
     send_modifiers_by(modifiers, down, state, &mut inject)
 }
 
+fn send_held_input_by(
+    press: INPUT,
+    down: bool,
+    state: &mut InjectedInputState,
+    operation: &'static str,
+    inject: &mut impl FnMut(&[INPUT]) -> usize,
+) -> Result<()> {
+    let inputs = if down {
+        debug_assert!(state.is_empty());
+        vec![press]
+    } else {
+        state.releases()
+    };
+    let earlier_dispatch = !state.is_empty();
+    send_tracked_by(&inputs, state, earlier_dispatch, operation, inject)
+}
+
 /// The `MOUSEEVENTF_*DOWN`/`*UP` flag pair for a button.
 fn button_flags(button: MouseButton) -> (MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS) {
     match button {
@@ -390,12 +407,14 @@ struct WindowsDragSink<'a> {
     up: MOUSE_EVENT_FLAGS,
     mods: &'a [Modifier],
     modifier_state: InjectedInputState,
+    button_state: InjectedInputState,
     /// Last normalized position emitted by `place`/`move_to`. `button` fires there,
     /// because with `MOUSEEVENTF_ABSOLUTE` the up/down event's own coords are
     /// authoritative — releasing without this would snap the cursor to (0,0) and drop
     /// the drag at the desktop origin. `run_drag` always calls `place` before any
     /// `button`, so the `(0, 0)` seed is overwritten before it is ever read.
     last: (i32, i32),
+    inject: &'a mut dyn FnMut(&[INPUT]) -> usize,
 }
 
 impl WindowsDragSink<'_> {
@@ -411,33 +430,52 @@ impl glass_core::DragSink for WindowsDragSink<'_> {
     fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
         let (nx, ny) = self.norm(x, y);
         self.last = (nx, ny);
-        send(&[mouse(nx, ny, MOUSEEVENTF_MOVE | ABS)])
+        send_by(&[mouse(nx, ny, MOUSEEVENTF_MOVE | ABS)], &mut self.inject)
     }
     fn button(&mut self, down: bool) -> Result<()> {
         let (nx, ny) = self.last;
         let flag = if down { self.down } else { self.up };
-        send(&[mouse(nx, ny, flag | ABS)])
+        send_held_input_by(
+            mouse(nx, ny, flag | ABS),
+            down,
+            &mut self.button_state,
+            "releasing Windows drag button input",
+            &mut self.inject,
+        )
     }
     fn modifiers(&mut self, down: bool) -> Result<()> {
         let modifiers: Vec<_> = self.mods.iter().copied().map(modifier_vk).collect();
-        send_modifiers(&modifiers, down, &mut self.modifier_state)
+        send_modifiers_by(&modifiers, down, &mut self.modifier_state, &mut self.inject)
     }
 }
 
 /// `ChordSink` for Windows: one `SendInput` per call (its own commit), so `run_chord`'s dwell lands
 /// between phases the app actually processes as separate frames. `key_vk(_, true)` is the release.
-struct WindowsChordSink {
+struct WindowsChordSink<'a> {
     mod_vks: Vec<VIRTUAL_KEY>,
     vk: VIRTUAL_KEY,
     modifier_state: InjectedInputState,
+    key_state: InjectedInputState,
+    inject: &'a mut dyn FnMut(&[INPUT]) -> usize,
 }
 
-impl glass_core::ChordSink for WindowsChordSink {
+impl glass_core::ChordSink for WindowsChordSink<'_> {
     fn modifiers(&mut self, down: bool) -> Result<()> {
-        send_modifiers(&self.mod_vks, down, &mut self.modifier_state)
+        send_modifiers_by(
+            &self.mod_vks,
+            down,
+            &mut self.modifier_state,
+            &mut self.inject,
+        )
     }
     fn key(&mut self, down: bool) -> Result<()> {
-        send(&[key_vk(self.vk, !down)])
+        send_held_input_by(
+            key_vk(self.vk, false),
+            down,
+            &mut self.key_state,
+            "releasing Windows chord key input",
+            &mut self.inject,
+        )
     }
 }
 
@@ -623,6 +661,10 @@ pub(crate) fn send_pointer_by(
                 let gesture =
                     glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
                 let (down, up) = button_flags(button);
+                let mut inject = |inputs: &[INPUT]| {
+                    // SAFETY: `inputs` is a valid slice and the stride is the real `INPUT` size.
+                    (unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) }) as usize
+                };
                 let mut sink = WindowsDragSink {
                     origin,
                     v0,
@@ -631,7 +673,9 @@ pub(crate) fn send_pointer_by(
                     up,
                     mods: modifiers,
                     modifier_state: InjectedInputState::default(),
+                    button_state: InjectedInputState::default(),
                     last: (0, 0),
+                    inject: &mut inject,
                 };
                 glass_core::run_drag_by(&mut sink, &gesture, deadline)?;
             }
@@ -690,10 +734,16 @@ pub(crate) fn send_key_by(active_hwnd: isize, event: &KeyEvent, deadline: Deadli
                 let mod_vks: Vec<VIRTUAL_KEY> = mods.iter().map(|&m| modifier_vk(m)).collect();
                 // Shared, frame-aware sequencing: hold the modifier across the key's frame instead of
                 // bursting the whole chord into one — see glass_core::run_chord.
+                let mut inject = |inputs: &[INPUT]| {
+                    // SAFETY: `inputs` is a valid slice and the stride is the real `INPUT` size.
+                    (unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) }) as usize
+                };
                 let mut sink = WindowsChordSink {
                     mod_vks,
                     vk,
                     modifier_state: InjectedInputState::default(),
+                    key_state: InjectedInputState::default(),
+                    inject: &mut inject,
                 };
                 glass_core::run_chord_by(&mut sink, deadline)?;
             }
@@ -1102,6 +1152,283 @@ mod tests {
         assert_eq!(
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn zero_drag_button_down_cleanup_is_a_noop_and_stays_not_dispatched() {
+        let last = (31, 47);
+        let button_down = [mouse(last.0, last.1, MOUSEEVENTF_LEFTDOWN | ABS)];
+        let mut deliveries = VecDeque::from([0]);
+        let mut calls = Vec::new();
+        let mut inject = |submitted: &[INPUT]| {
+            calls.push(input_identities(submitted));
+            deliveries.pop_front().unwrap()
+        };
+        let mut sink = WindowsDragSink {
+            origin: (0, 0),
+            v0: (0, 0),
+            vs: (1, 1),
+            down: MOUSEEVENTF_LEFTDOWN,
+            up: MOUSEEVENTF_LEFTUP,
+            mods: &[],
+            modifier_state: InjectedInputState::default(),
+            button_state: InjectedInputState::default(),
+            last,
+            inject: &mut inject,
+        };
+
+        let error = glass_core::DragSink::button(&mut sink, true)
+            .expect_err("zero button-down delivery must remain explicit");
+        glass_core::DragSink::button(&mut sink, false)
+            .expect("the core cleanup callback must not emit an unmatched button-up");
+
+        drop(sink);
+        assert!(deliveries.is_empty());
+        assert_eq!(calls, [input_identities(&button_down)]);
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn zero_drag_button_up_retries_only_the_button_and_resets_for_the_next_drag() {
+        let last = (31, 47);
+        let button_down = [mouse(last.0, last.1, MOUSEEVENTF_LEFTDOWN | ABS)];
+        let button_up = [mouse(last.0, last.1, MOUSEEVENTF_LEFTUP | ABS)];
+        let mut deliveries = VecDeque::from([1, 0, 1, 1, 1]);
+        let mut calls = Vec::new();
+        let mut inject = |submitted: &[INPUT]| {
+            calls.push(input_identities(submitted));
+            deliveries.pop_front().unwrap()
+        };
+        let mut sink = WindowsDragSink {
+            origin: (0, 0),
+            v0: (0, 0),
+            vs: (1, 1),
+            down: MOUSEEVENTF_LEFTDOWN,
+            up: MOUSEEVENTF_LEFTUP,
+            mods: &[],
+            modifier_state: InjectedInputState::default(),
+            button_state: InjectedInputState::default(),
+            last,
+            inject: &mut inject,
+        };
+
+        glass_core::DragSink::button(&mut sink, true)
+            .expect("the first button-down establishes delivered state");
+        let error = glass_core::DragSink::button(&mut sink, false)
+            .expect_err("zero button-up delivery remains an error after retry cleanup");
+        glass_core::DragSink::button(&mut sink, true)
+            .expect("successful retry cleanup must reset state for the next drag");
+        glass_core::DragSink::button(&mut sink, false)
+            .expect("the next drag releases exactly its own button-down");
+
+        drop(sink);
+        assert!(deliveries.is_empty());
+        assert_eq!(
+            calls,
+            [
+                input_identities(&button_down),
+                input_identities(&button_up),
+                input_identities(&button_up),
+                input_identities(&button_down),
+                input_identities(&button_up),
+            ]
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn failed_drag_button_up_retry_preserves_primary_and_cleanup_errors() {
+        let last = (31, 47);
+        let button_down = [mouse(last.0, last.1, MOUSEEVENTF_LEFTDOWN | ABS)];
+        let button_up = [mouse(last.0, last.1, MOUSEEVENTF_LEFTUP | ABS)];
+        let mut deliveries = VecDeque::from([1, 0, 0]);
+        let mut calls = Vec::new();
+        let mut inject = |submitted: &[INPUT]| {
+            calls.push(input_identities(submitted));
+            deliveries.pop_front().unwrap()
+        };
+        let mut sink = WindowsDragSink {
+            origin: (0, 0),
+            v0: (0, 0),
+            vs: (1, 1),
+            down: MOUSEEVENTF_LEFTDOWN,
+            up: MOUSEEVENTF_LEFTUP,
+            mods: &[],
+            modifier_state: InjectedInputState::default(),
+            button_state: InjectedInputState::default(),
+            last,
+            inject: &mut inject,
+        };
+
+        glass_core::DragSink::button(&mut sink, true)
+            .expect("button-down establishes the state that both releases fail to clear");
+        let error = glass_core::DragSink::button(&mut sink, false)
+            .expect_err("failed retry cleanup must stay structured");
+
+        drop(sink);
+        assert!(deliveries.is_empty());
+        assert_eq!(
+            calls,
+            [
+                input_identities(&button_down),
+                input_identities(&button_up),
+                input_identities(&button_up),
+            ]
+        );
+        let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("both drag-button SendInput failures must remain inspectable");
+        };
+        assert_eq!(operation, "releasing Windows drag button input");
+        assert_eq!(
+            primary.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(
+            cleanup.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn zero_chord_key_down_cleanup_is_a_noop_and_stays_not_dispatched() {
+        let vk = VIRTUAL_KEY(0x1b);
+        let key_down = [key_vk(vk, false)];
+        let mut deliveries = VecDeque::from([0]);
+        let mut calls = Vec::new();
+        let mut inject = |submitted: &[INPUT]| {
+            calls.push(input_identities(submitted));
+            deliveries.pop_front().unwrap()
+        };
+        let mut sink = WindowsChordSink {
+            mod_vks: vec![],
+            vk,
+            modifier_state: InjectedInputState::default(),
+            key_state: InjectedInputState::default(),
+            inject: &mut inject,
+        };
+
+        let error = glass_core::ChordSink::key(&mut sink, true)
+            .expect_err("zero key-down delivery must remain explicit");
+        glass_core::ChordSink::key(&mut sink, false)
+            .expect("the core cleanup callback must not emit an unmatched key-up");
+
+        drop(sink);
+        assert!(deliveries.is_empty());
+        assert_eq!(calls, [input_identities(&key_down)]);
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn zero_chord_key_up_retries_only_the_key_and_resets_for_the_next_chord() {
+        let vk = VIRTUAL_KEY(0x1b);
+        let key_down = [key_vk(vk, false)];
+        let key_up = [key_vk(vk, true)];
+        let mut deliveries = VecDeque::from([1, 0, 1, 1, 1]);
+        let mut calls = Vec::new();
+        let mut inject = |submitted: &[INPUT]| {
+            calls.push(input_identities(submitted));
+            deliveries.pop_front().unwrap()
+        };
+        let mut sink = WindowsChordSink {
+            mod_vks: vec![],
+            vk,
+            modifier_state: InjectedInputState::default(),
+            key_state: InjectedInputState::default(),
+            inject: &mut inject,
+        };
+
+        glass_core::ChordSink::key(&mut sink, true)
+            .expect("the first key-down establishes delivered state");
+        let error = glass_core::ChordSink::key(&mut sink, false)
+            .expect_err("zero key-up delivery remains an error after retry cleanup");
+        glass_core::ChordSink::key(&mut sink, true)
+            .expect("successful retry cleanup must reset state for the next chord");
+        glass_core::ChordSink::key(&mut sink, false)
+            .expect("the next chord releases exactly its own key-down");
+
+        drop(sink);
+        assert!(deliveries.is_empty());
+        assert_eq!(
+            calls,
+            [
+                input_identities(&key_down),
+                input_identities(&key_up),
+                input_identities(&key_up),
+                input_identities(&key_down),
+                input_identities(&key_up),
+            ]
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn failed_chord_key_up_retry_preserves_primary_and_cleanup_errors() {
+        let vk = VIRTUAL_KEY(0x1b);
+        let key_down = [key_vk(vk, false)];
+        let key_up = [key_vk(vk, true)];
+        let mut deliveries = VecDeque::from([1, 0, 0]);
+        let mut calls = Vec::new();
+        let mut inject = |submitted: &[INPUT]| {
+            calls.push(input_identities(submitted));
+            deliveries.pop_front().unwrap()
+        };
+        let mut sink = WindowsChordSink {
+            mod_vks: vec![],
+            vk,
+            modifier_state: InjectedInputState::default(),
+            key_state: InjectedInputState::default(),
+            inject: &mut inject,
+        };
+
+        glass_core::ChordSink::key(&mut sink, true)
+            .expect("key-down establishes the state that both releases fail to clear");
+        let error = glass_core::ChordSink::key(&mut sink, false)
+            .expect_err("failed retry cleanup must stay structured");
+
+        drop(sink);
+        assert!(deliveries.is_empty());
+        assert_eq!(
+            calls,
+            [
+                input_identities(&key_down),
+                input_identities(&key_up),
+                input_identities(&key_up),
+            ]
+        );
+        let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("both chord-key SendInput failures must remain inspectable");
+        };
+        assert_eq!(operation, "releasing Windows chord key input");
+        assert_eq!(
+            primary.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(
+            cleanup.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
         );
     }
 }
