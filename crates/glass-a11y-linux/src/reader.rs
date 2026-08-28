@@ -54,7 +54,8 @@ impl Accessibility for LinuxA11y {
         let ctx = ctx.clone();
         let target = target.clone();
         // This reader actuates the element it resolved, so it never substitutes another.
-        BUS.invoke(move || run_invoke(&ctx, &target)).map(|()| None)
+        BUS.invoke(ctx.deadline, move || run_invoke(&ctx, &target))
+            .map(|()| None)
     }
 }
 
@@ -713,15 +714,37 @@ fn focus_confirmation_step(
     now: std::time::Instant,
     focused: bool,
 ) -> FocusConfirmationStep {
-    if focused {
-        return FocusConfirmationStep::Confirmed;
-    }
     let (end, whose) = caller.resolve(backend_end);
     let remaining = end.saturating_duration_since(now);
     if remaining.is_zero() {
         FocusConfirmationStep::Expired(whose)
+    } else if focused {
+        FocusConfirmationStep::Confirmed
     } else {
         FocusConfirmationStep::Sleep(FOCUS_CONFIRM_POLL.min(remaining))
+    }
+}
+
+async fn await_caller_deadline<F: std::future::Future>(
+    deadline: Deadline,
+    future: F,
+) -> std::result::Result<F::Output, ()> {
+    match deadline.instant() {
+        Some(end) => tokio::time::timeout_at(tokio::time::Instant::from_std(end), future)
+            .await
+            .map_err(|_| ()),
+        None => Ok(future.await),
+    }
+}
+
+fn focus_confirmation_expired(id: u32, whose: Whose) -> GlassError {
+    match whose {
+        Whose::Caller => GlassError::caller_deadline_elapsed("native accessibility focus"),
+        Whose::Callee => GlassError::AxActionFailed(
+            id,
+            "focus was requested but the element did not become focused within the confirmation window"
+                .into(),
+        ),
     }
 }
 
@@ -742,13 +765,25 @@ async fn focus_text_editor(
         .map_err(|_| GlassError::AxActionUnavailable(id))?
         .path(path)
         .map_err(|_| GlassError::AxActionUnavailable(id))?;
-    let component = builder.build().await.map_err(|e| {
+    let built = await_caller_deadline(ctx.deadline, builder.build())
+        .await
+        .map_err(|()| GlassError::deadline_not_started(OP))?;
+    if ctx.deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(OP));
+    }
+    let component = built.map_err(|e| {
         GlassError::AccessibilityUnavailable(format!("AT-SPI focus proxy failed: {e}"))
     })?;
     if ctx.deadline.has_passed() {
         return Err(GlassError::deadline_not_started(OP));
     }
-    match component.grab_focus().await {
+    let focus_reply = await_caller_deadline(ctx.deadline, component.grab_focus())
+        .await
+        .map_err(|()| GlassError::caller_deadline_elapsed(OP))?;
+    if ctx.deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed(OP));
+    }
+    match focus_reply {
         Ok(true) => {}
         Ok(false) => {
             return Err(GlassError::AxActionFailed(
@@ -764,56 +799,36 @@ async fn focus_text_editor(
     }
 
     let backend_end = std::time::Instant::now() + FOCUS_CONFIRM_CEILING;
-    let mut first_read = true;
     loop {
-        if ctx.deadline.has_passed() {
-            return Err(GlassError::caller_deadline_elapsed(OP));
+        let (effective_end, whose) = ctx.deadline.resolve(backend_end);
+        if effective_end
+            .saturating_duration_since(std::time::Instant::now())
+            .is_zero()
+        {
+            return Err(focus_confirmation_expired(id, whose));
         }
-        if !first_read {
-            match focus_confirmation_step(
-                ctx.deadline,
-                backend_end,
-                std::time::Instant::now(),
-                false,
-            ) {
-                FocusConfirmationStep::Expired(Whose::Caller) => {
-                    return Err(GlassError::caller_deadline_elapsed(OP));
-                }
-                FocusConfirmationStep::Expired(Whose::Callee) => {
-                    return Err(GlassError::AxActionFailed(
-                        id,
-                        "focus was requested but the element did not become focused within the confirmation window"
-                            .into(),
-                    ));
-                }
-                FocusConfirmationStep::Confirmed | FocusConfirmationStep::Sleep(_) => {}
-            }
+        let state_reply = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(effective_end),
+            node.get_state(),
+        )
+        .await
+        .map_err(|_| focus_confirmation_expired(id, whose))?;
+        let observed_at = std::time::Instant::now();
+        if let FocusConfirmationStep::Expired(expired_by) =
+            focus_confirmation_step(ctx.deadline, backend_end, observed_at, false)
+        {
+            return Err(focus_confirmation_expired(id, expired_by));
         }
-        first_read = false;
-        let focused = node
-            .get_state()
-            .await
+        let focused = state_reply
             .map_err(|e| {
                 GlassError::AccessibilityUnavailable(format!("AT-SPI focus state read failed: {e}"))
             })?
             .contains(atspi_common::State::Focused);
-        match focus_confirmation_step(
-            ctx.deadline,
-            backend_end,
-            std::time::Instant::now(),
-            focused,
-        ) {
+        match focus_confirmation_step(ctx.deadline, backend_end, observed_at, focused) {
             FocusConfirmationStep::Confirmed => return Ok(()),
             FocusConfirmationStep::Sleep(duration) => tokio::time::sleep(duration).await,
-            FocusConfirmationStep::Expired(Whose::Caller) => {
-                return Err(GlassError::caller_deadline_elapsed(OP));
-            }
-            FocusConfirmationStep::Expired(Whose::Callee) => {
-                return Err(GlassError::AxActionFailed(
-                    id,
-                    "focus was requested but the element did not become focused within the confirmation window"
-                        .into(),
-                ));
+            FocusConfirmationStep::Expired(expired_by) => {
+                return Err(focus_confirmation_expired(id, expired_by));
             }
         }
     }
@@ -1060,6 +1075,49 @@ mod tests {
             ),
             FocusConfirmationStep::Confirmed
         );
+    }
+
+    #[test]
+    fn focused_observation_cannot_override_an_expired_bound() {
+        use glass_core::Whose;
+
+        let now = std::time::Instant::now();
+        let caller_end = now + Duration::from_millis(20);
+        let backend_end = now + Duration::from_millis(40);
+        for observed in [caller_end, caller_end + Duration::from_millis(1)] {
+            assert_eq!(
+                focus_confirmation_step(Deadline::at(caller_end), backend_end, observed, true,),
+                FocusConfirmationStep::Expired(Whose::Caller)
+            );
+        }
+
+        let backend_end = now + Duration::from_millis(20);
+        for deadline in [
+            Deadline::UNBOUNDED,
+            Deadline::at(now + Duration::from_millis(40)),
+        ] {
+            for observed in [backend_end, backend_end + Duration::from_millis(1)] {
+                assert_eq!(
+                    focus_confirmation_step(deadline, backend_end, observed, true),
+                    FocusConfirmationStep::Expired(Whose::Callee)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_deadline_caps_pending_focus_phase() {
+        let started = std::time::Instant::now();
+        let result =
+            await_caller_deadline(Deadline::from_millis(10), std::future::pending::<()>()).await;
+        assert_eq!(result, Err(()));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn unbounded_focus_phase_waits_for_its_reply() {
+        let result = await_caller_deadline(Deadline::UNBOUNDED, async { 7 }).await;
+        assert_eq!(result, Ok(7));
     }
 
     #[test]

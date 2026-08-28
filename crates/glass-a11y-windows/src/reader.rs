@@ -71,7 +71,8 @@ impl Accessibility for WindowsA11y {
         let ctx = ctx.clone();
         let target = target.clone();
         // This reader actuates the element it resolved, so it never substitutes another.
-        UIA.invoke(move || run_invoke(&ctx, &target)).map(|()| None)
+        UIA.invoke(ctx.deadline, move || run_invoke(&ctx, &target))
+            .map(|()| None)
     }
 }
 

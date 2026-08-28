@@ -36,6 +36,11 @@ impl Deadline {
         Self(Some(instant))
     }
 
+    /// The caller's absolute stopping instant, or `None` when it named no bound.
+    pub const fn instant(self) -> Option<std::time::Instant> {
+        self.0
+    }
+
     /// The instant a step is bounded by — the nearer of this deadline and `own`, the callee's own
     /// bound — and whose bound that is.
     ///

@@ -100,21 +100,37 @@ impl A11yThread {
 
     /// Write a value, bounded by the ceiling alone.
     ///
-    /// No deadline: the seam places the capping obligation on `snapshot`, and the session builds
-    /// both this context and `invoke`'s with [`Deadline::UNBOUNDED`], so there is none to honour.
+    /// No deadline: the value-write seam does not currently carry one to this wrapper.
     pub fn set_value(&self, job: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
         self.detached(Op::SetValue, self.ceiling, job, || {
             self.timed_out(Op::SetValue)
         })
     }
 
-    /// Actuate the element, bounded by the ceiling alone.
+    /// Actuate the element, bounded by whichever of the caller's deadline and the ceiling falls
+    /// first. A timeout always fails closed because the detached action may still land.
     ///
     /// Its failures stay [`GlassError::AccessibilityUnavailable`], which
     /// [`GlassError::invoke_fallback_eligible`] excludes — so no pointer click is layered on top of
     /// an action that may be about to fire.
-    pub fn invoke(&self, job: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
-        self.detached(Op::Invoke, self.ceiling, job, || self.timed_out(Op::Invoke))
+    pub fn invoke(
+        &self,
+        deadline: Deadline,
+        job: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility invoke",
+            ));
+        }
+        let (wait, ended_by) = self.bounded_wait(deadline);
+        self.detached(Op::Invoke, wait, job, || match ended_by {
+            Whose::Caller => GlassError::AccessibilityUnavailable(
+                "accessibility invoke timed out at the caller deadline; the action may still land — re-snapshot before retrying"
+                    .into(),
+            ),
+            Whose::Callee => self.timed_out(Op::Invoke),
+        })
     }
 
     /// The verdict for a read that never answered. The caller's own deadline ending it is
@@ -293,7 +309,9 @@ mod tests {
         let e = impatient().set_value(hangs()).unwrap_err();
         assert!(e.to_string().contains("set_value timed out"), "{e}");
 
-        let e = impatient().invoke(hangs()).unwrap_err();
+        let e = impatient()
+            .invoke(Deadline::UNBOUNDED, hangs())
+            .unwrap_err();
         assert!(e.to_string().contains("invoke timed out"), "{e}");
         // The variant, not the prose, is what withholds the pointer-click fallback from an action
         // that may be about to fire.
@@ -306,7 +324,9 @@ mod tests {
     fn a_write_or_an_action_that_timed_out_says_it_may_still_land() {
         for e in [
             impatient().set_value(hangs()).unwrap_err(),
-            impatient().invoke(hangs()).unwrap_err(),
+            impatient()
+                .invoke(Deadline::UNBOUNDED, hangs())
+                .unwrap_err(),
         ] {
             assert!(e.to_string().contains("may still land"), "{e}");
         }
@@ -386,8 +406,46 @@ mod tests {
     #[test]
     fn a_panicking_action_still_says_it_may_have_landed() {
         let e = reader()
-            .invoke(|| panic!("unwound after dispatch"))
+            .invoke(Deadline::UNBOUNDED, || panic!("unwound after dispatch"))
             .unwrap_err();
+        assert!(e.to_string().contains("may still land"), "{e}");
+    }
+
+    #[test]
+    fn a_spent_invoke_deadline_starts_no_worker() {
+        let (started, ran) = mpsc::channel();
+        let r = reader().invoke(Deadline::from_millis(0), move || {
+            let _ = started.send(());
+            Ok(())
+        });
+        assert!(r.is_err(), "{r:?}");
+        assert!(!r.unwrap_err().invoke_fallback_eligible());
+        assert!(matches!(
+            ran.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn a_hanging_invoke_returns_at_the_earlier_caller_bound() {
+        let started = Instant::now();
+        let e = reader()
+            .invoke(Deadline::from_millis(20), hangs())
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        assert!(e.to_string().contains("may still land"), "{e}");
+    }
+
+    #[test]
+    fn an_unbounded_invoke_retains_the_backend_ceiling() {
+        let started = Instant::now();
+        let e = impatient()
+            .invoke(Deadline::UNBOUNDED, hangs())
+            .unwrap_err();
+        assert!(started.elapsed() >= IMPATIENT, "{:?}", started.elapsed());
+        assert!(e.to_string().contains("invoke timed out"), "{e}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
         assert!(e.to_string().contains("may still land"), "{e}");
     }
 }
