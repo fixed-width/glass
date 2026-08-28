@@ -30,7 +30,7 @@ enum DeadlineBehavior {
     PermissionDenied,
     TransportFailure,
     OtherFailure,
-    CoordOutOfBoundsAfterOneScroll,
+    ResizeAfterOneScroll,
 }
 
 struct DeadlinePlatform {
@@ -272,17 +272,11 @@ impl Platform for DeadlinePlatform {
                 Err(GlassError::Backend("transport disconnected".into()))
             }
             DeadlineBehavior::OtherFailure => Err(GlassError::InvalidKey("bad".into())),
-            DeadlineBehavior::CoordOutOfBoundsAfterOneScroll => {
-                if self.inner.pointer_events.is_empty() {
-                    self.inner.send_pointer(event)
-                } else {
-                    Err(GlassError::CoordOutOfBounds {
-                        x: 50,
-                        y: 50,
-                        width: 50,
-                        height: 50,
-                    })
-                }
+            DeadlineBehavior::ResizeAfterOneScroll => {
+                self.inner.send_pointer(event)?;
+                self.inner.geometry.width = 50;
+                self.inner.geometry.height = 50;
+                Ok(())
             }
             DeadlineBehavior::ReturnNotDispatched
             | DeadlineBehavior::CaptureCompletesLate
@@ -1867,7 +1861,7 @@ fn scroll_to_element_unmatched_warns_that_side_effects_may_have_occurred() {
 #[test]
 fn scroll_to_element_later_coord_failure_reports_that_an_earlier_scroll_dispatched() {
     let (mut g, _, _, events) =
-        deadline_a11y_glass_with_behavior(DeadlineBehavior::CoordOutOfBoundsAfterOneScroll, vec![]);
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::ResizeAfterOneScroll, vec![]);
     let error = do_actions(
         &mut g,
         &do_args(
@@ -1896,6 +1890,17 @@ fn scroll_to_element_later_coord_failure_reports_that_an_earlier_scroll_dispatch
     );
     assert_eq!(step["attempted"], true, "{envelope}");
     assert_eq!(step["side_effects_may_have_occurred"], true, "{envelope}");
+    assert_eq!(step["error"]["category"], "other", "{envelope}");
+    let detail = output_text(&error);
+    assert!(
+        detail.contains("coordinate (50,50) out of bounds for 50x50 window"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("backend transport failed")
+            && !detail.contains("scroll to element failed after an earlier scroll step dispatched"),
+        "{detail}"
+    );
 }
 
 #[test]

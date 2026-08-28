@@ -134,7 +134,7 @@ impl SafeErrorCategory {
             return Self::SequenceDeadlineExceeded;
         }
 
-        match error {
+        match error.cause() {
             glass_core::GlassError::NoActiveSession => Self::NoActiveSession,
             glass_core::GlassError::NoAxSnapshot
             | glass_core::GlassError::AxElementNotFound(_)

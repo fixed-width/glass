@@ -277,6 +277,12 @@ pub enum GlassError {
         message: String,
     },
 
+    /// An unchanged failure from a later step of a compound operation after an earlier step
+    /// dispatched. The wrapped cause and its message remain authoritative; only the independent
+    /// compound-operation dispatch provenance changes.
+    #[error(transparent)]
+    AfterDispatch(Box<GlassError>),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -334,6 +340,19 @@ impl GlassError {
         )
     }
 
+    /// The original structured failure, without compound-operation dispatch annotations.
+    ///
+    /// An annotation changes whether an earlier step may have affected the app, not what the
+    /// later step reported. Classification should inspect this cause while dispatch decisions use
+    /// [`Self::bound_dispatch`]. Recursive unwrapping also makes this accessor robust to errors
+    /// received from code that constructed nested annotations directly.
+    pub fn cause(&self) -> &Self {
+        match self {
+            GlassError::AfterDispatch(error) => error.cause(),
+            error => error,
+        }
+    }
+
     /// Whether a failed value-write is **proven** to have gone out or may have gone out before
     /// failing — the only cases where the session's captured value is stale and must be dropped.
     /// True only for the two operation-specific post-dispatch verdicts,
@@ -352,30 +371,25 @@ impl GlassError {
     /// convert only the latter at the point that knows the mutation already dispatched.
     pub fn set_value_failed_after_writing(&self) -> bool {
         matches!(
-            self,
+            self.cause(),
             GlassError::AxValueNotApplied { .. } | GlassError::AxWriteUnconfirmed(..)
         )
     }
 
-    /// Preserve a compound operation's dispatch history on a later bounded refusal.
+    /// Preserve a compound operation's dispatch history on a later failure.
     ///
-    /// Once an earlier mutation succeeded, a later `NotDispatched` sub-operation no longer proves
-    /// the compound operation was side-effect free. Its bound and owner still describe the failed
-    /// sub-operation, so only the dispatch verdict is upgraded.
+    /// Once an earlier mutation succeeded, a later failure no longer proves the compound operation
+    /// was side-effect free. The cause, message, bound ownership, and tool detail still describe
+    /// the failed sub-operation; the wrapper carries the independent dispatch proof. Repeated
+    /// annotation is idempotent.
     pub fn after_dispatch(self) -> Self {
         match self {
-            GlassError::Bounded {
-                kind,
-                whose,
-                dispatch: BoundDispatch::NotDispatched,
-                message,
-            } => GlassError::Bounded {
-                kind,
-                whose,
+            error @ GlassError::AfterDispatch(_) => error,
+            error @ GlassError::Bounded {
                 dispatch: BoundDispatch::MayHaveDispatched,
-                message,
-            },
-            error => error,
+                ..
+            } => error,
+            error => GlassError::AfterDispatch(Box::new(error)),
         }
     }
 
@@ -426,6 +440,7 @@ impl GlassError {
     pub fn bound(&self) -> Option<BoundKind> {
         match self {
             GlassError::Bounded { kind, .. } => Some(*kind),
+            GlassError::AfterDispatch(error) => error.bound(),
             _ => None,
         }
     }
@@ -434,6 +449,7 @@ impl GlassError {
     pub fn bound_owner(&self) -> Option<Whose> {
         match self {
             GlassError::Bounded { whose, .. } => Some(*whose),
+            GlassError::AfterDispatch(error) => error.bound_owner(),
             _ => None,
         }
     }
@@ -442,6 +458,7 @@ impl GlassError {
     pub fn bound_dispatch(&self) -> Option<BoundDispatch> {
         match self {
             GlassError::Bounded { dispatch, .. } => Some(*dispatch),
+            GlassError::AfterDispatch(_) => Some(BoundDispatch::MayHaveDispatched),
             _ => None,
         }
     }
@@ -457,6 +474,7 @@ impl GlassError {
     pub fn tool_said(&self) -> Option<&str> {
         match self {
             GlassError::ToolFailed { said, .. } => Some(said.trim()),
+            GlassError::AfterDispatch(error) => error.tool_said(),
             _ => None,
         }
     }
@@ -535,6 +553,175 @@ mod tests {
     #[test]
     fn ordinary_backend_errors_have_no_bound_dispatch() {
         assert_eq!(GlassError::Backend("down".into()).bound_dispatch(), None);
+    }
+
+    #[test]
+    fn after_dispatch_preserves_a_coordinate_message_and_marks_prior_dispatch() {
+        let error = GlassError::CoordOutOfBounds {
+            x: 50,
+            y: 50,
+            width: 50,
+            height: 50,
+        }
+        .after_dispatch();
+
+        assert_eq!(
+            error.to_string(),
+            "coordinate (50,50) out of bounds for 50x50 window"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn after_dispatch_preserves_bounded_kind_owner_message_and_tool_detail() {
+        let bounded = GlassError::Bounded {
+            kind: BoundKind::NotStarted,
+            whose: Whose::Callee,
+            dispatch: BoundDispatch::NotDispatched,
+            message: "the later read was not started".into(),
+        }
+        .after_dispatch();
+        assert_eq!(bounded.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(bounded.bound_owner(), Some(Whose::Callee));
+        assert_eq!(
+            bounded.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(
+            bounded.to_string(),
+            "backend error: the later read was not started"
+        );
+
+        let tool = GlassError::ToolFailed {
+            call: "helper".into(),
+            said: " refused \n".into(),
+        }
+        .after_dispatch();
+        assert_eq!(tool.tool_said(), Some("refused"));
+        assert_eq!(
+            tool.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(
+            tool.to_string(),
+            "backend error: `helper` failed:  refused \n"
+        );
+    }
+
+    #[test]
+    fn after_dispatch_leaves_an_already_dispatched_bound_directly_matchable() {
+        let error = GlassError::caller_deadline_elapsed("later read").after_dispatch();
+
+        assert!(matches!(
+            error,
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                whose: Whose::Caller,
+                dispatch: BoundDispatch::MayHaveDispatched,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn after_dispatch_keeps_invoke_fallback_closed() {
+        for error in [
+            GlassError::AxUnsupported.after_dispatch(),
+            GlassError::AxActionUnavailable(7).after_dispatch(),
+        ] {
+            assert!(!error.invoke_fallback_eligible(), "{error}");
+        }
+    }
+
+    #[test]
+    fn after_dispatch_does_not_turn_generic_failures_into_value_write_verdicts() {
+        assert!(
+            !GlassError::Backend("pre-write read failed".into())
+                .after_dispatch()
+                .set_value_failed_after_writing()
+        );
+        assert!(
+            !GlassError::CoordOutOfBounds {
+                x: 50,
+                y: 50,
+                width: 50,
+                height: 50,
+            }
+            .after_dispatch()
+            .set_value_failed_after_writing()
+        );
+
+        assert!(
+            GlassError::AxWriteUnconfirmed(7, "read-back failed".into())
+                .after_dispatch()
+                .set_value_failed_after_writing()
+        );
+        assert!(
+            GlassError::value_not_applied(7, "requested", Some("observed"))
+                .after_dispatch()
+                .set_value_failed_after_writing()
+        );
+    }
+
+    #[test]
+    fn after_dispatch_is_idempotent_and_cause_lookup_recurses() {
+        let error = GlassError::CoordOutOfBounds {
+            x: 50,
+            y: 50,
+            width: 50,
+            height: 50,
+        }
+        .after_dispatch()
+        .after_dispatch();
+
+        let GlassError::AfterDispatch(inner) = &error else {
+            panic!("dispatch provenance must be carried structurally: {error:?}");
+        };
+        assert!(
+            !matches!(inner.as_ref(), GlassError::AfterDispatch(_)),
+            "repeated annotation must not grow a wrapper chain: {error:?}"
+        );
+        assert!(matches!(
+            error.cause(),
+            GlassError::CoordOutOfBounds {
+                x: 50,
+                y: 50,
+                width: 50,
+                height: 50,
+            }
+        ));
+    }
+
+    #[test]
+    fn dispatch_provenance_accessors_recurse_through_nested_annotations() {
+        let bounded = GlassError::AfterDispatch(Box::new(GlassError::AfterDispatch(Box::new(
+            GlassError::Bounded {
+                kind: BoundKind::NotStarted,
+                whose: Whose::Callee,
+                dispatch: BoundDispatch::NotDispatched,
+                message: "nested refusal".into(),
+            },
+        ))));
+        assert_eq!(bounded.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(bounded.bound_owner(), Some(Whose::Callee));
+        assert_eq!(
+            bounded.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(matches!(bounded.cause(), GlassError::Bounded { .. }));
+        assert_eq!(bounded.to_string(), "backend error: nested refusal");
+
+        let tool = GlassError::AfterDispatch(Box::new(GlassError::AfterDispatch(Box::new(
+            GlassError::ToolFailed {
+                call: "helper".into(),
+                said: " refused \n".into(),
+            },
+        ))));
+        assert_eq!(tool.tool_said(), Some("refused"));
+        assert!(matches!(tool.cause(), GlassError::ToolFailed { .. }));
     }
 
     #[test]

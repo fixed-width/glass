@@ -48,12 +48,7 @@ fn resolve_nested_accessibility_bound(
 }
 
 fn after_scroll_dispatch(error: GlassError) -> GlassError {
-    match error {
-        error @ GlassError::CoordOutOfBounds { .. } => GlassError::Backend(format!(
-            "scroll to element failed after an earlier scroll step dispatched: {error}"
-        )),
-        error => error.after_dispatch(),
-    }
+    error.after_dispatch()
 }
 
 /// Parameters for [`Glass::wait_stable`].
@@ -2688,6 +2683,63 @@ mod tests {
         assert!(
             error.to_string().contains("post-scroll accessibility read"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn resize_after_a_scroll_preserves_the_later_coordinate_failure() {
+        let scrolls = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100)
+            .resized_to(WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            })
+            .resized_to(WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+            })
+            .with_scroll_log(scrolls.clone());
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 1_000,
+            })
+            .expect_err("the retained anchor must be outside the resized window");
+
+        assert_eq!(
+            scrolls.lock().unwrap().len(),
+            1,
+            "one scroll must land before the resize is observed"
+        );
+        assert_eq!(
+            error.to_string(),
+            "coordinate (50,50) out of bounds for 50x50 window"
+        );
+        assert!(matches!(
+            error.cause(),
+            GlassError::CoordOutOfBounds {
+                x: 50,
+                y: 50,
+                width: 50,
+                height: 50,
+            }
+        ));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
         );
     }
 
