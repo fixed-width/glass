@@ -31,3 +31,21 @@ pub(super) enum StepOutcome {
         action: &'static str,
     },
 }
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(super) enum TerminalOutcome {
+    Completed {
+        operation: &'static str,
+        result: Value,
+        content_blocks: Vec<usize>,
+    },
+    Failed {
+        operation: &'static str,
+        error: StepError,
+        content_blocks: Vec<usize>,
+    },
+    Unexecuted {
+        operation: &'static str,
+    },
+}

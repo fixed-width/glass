@@ -6,15 +6,15 @@ use std::time::{Duration, Instant};
 
 use crate::params::*;
 use crate::tools::{
-    BatchToolResult, ContextualToolResult, OutContent, ToolContext, ToolOutput, click_element_with,
-    click_with, diff, drag_with, key_with, mouse_move_with, screenshot, scroll_to_element_with,
-    scroll_with, set_value_with, type_text_with, wait_for_element_with, wait_stable,
-    wait_stable_with,
+    BatchToolResult, ContextualOutput, ContextualToolResult, OutContent, ToolContext, ToolOutput,
+    click_element_with, click_with, diff_with, drag_with, key_with, mouse_move_with,
+    screenshot_with, scroll_to_element_with, scroll_with, set_value_with, type_text_with,
+    wait_for_element_with, wait_stable_with,
 };
 
 mod model;
 
-use model::{StepError, StepOutcome};
+use model::{StepError, StepOutcome, TerminalOutcome};
 
 const MAX_ACTIONS: usize = 64;
 const MAX_ARGUMENT_BYTES: usize = 65_536;
@@ -67,6 +67,26 @@ fn settle_args(s: &SettleArgs) -> WaitStableArgs {
         window_id: None,
         ignore: s.ignore.clone(),
     }
+}
+
+fn terminal_settle(
+    glass: &mut Glass,
+    args: &SettleArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
+    wait_stable_with(glass, &settle_args(args), context).or_else(|error| {
+        // A zero settle timeout belongs to the callee. The bounded core correctly
+        // refuses its final capture, but terminal observation still reports the
+        // documented soft result rather than converting it into a hard failure.
+        if args.timeout_ms == Some(0) && !error.sequence_deadline_exceeded {
+            Ok(ContextualOutput::with_timeout(
+                ToolOutput::result("glass_wait_stable", json!({ "settled": false })),
+                Some(Whose::Callee),
+            ))
+        } else {
+            Err(error)
+        }
+    })
 }
 
 /// Run an ordered action sequence, then the optional terminal observe.
@@ -204,19 +224,23 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
 
     let mut result = json!({ "executed": n, "steps": steps });
     if let Some(then) = &a.then {
-        match run_then(glass, then) {
-            Ok((meta, mut extra)) => {
-                result["then"] = meta;
-                siblings.append(&mut extra);
+        match run_then(glass, then, context, siblings.len() + 1) {
+            Ok(mut terminal) => {
+                result["then"] = terminal.meta;
+                result["terminal_steps"] = json!(terminal.outcomes);
+                siblings.append(&mut terminal.siblings);
             }
-            Err(detail) => {
-                siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(&detail)));
+            Err(mut terminal) => {
+                siblings.append(&mut terminal.siblings);
+                let mut outcome = failure_outcome(steps, n, started.elapsed().as_millis());
+                outcome["then"] = terminal.meta;
+                outcome["terminal_steps"] = json!(terminal.outcomes);
                 return Err(error_output(
                     json!({
                     "ok": false,
                     "tool": "glass_do",
-                    "error": { "code": "terminal_observe_failed", "summary": "terminal observation failed" },
-                    "outcome": failure_outcome(steps, n, started.elapsed().as_millis()),
+                    "error": { "code": "terminal_observe_failed", "summary": "terminal observation failed after actions completed; do not replay actions" },
+                    "outcome": outcome,
                     }),
                     siblings,
                 ));
@@ -400,31 +424,99 @@ impl Action {
     }
 }
 
-/// Run the terminal observe in fixed order: settle → diff → screenshot. Returns
-/// the `then` metadata object (each ran sub-tool's `result` payload keyed by
-/// name) and the collected image/IMAGE_NOTE sibling blocks, in run order.
+struct ThenRun {
+    meta: serde_json::Value,
+    outcomes: Vec<TerminalOutcome>,
+    siblings: Vec<OutContent>,
+}
+
+/// Run terminal observation in fixed order under the sequence's one deadline.
 fn run_then(
     glass: &mut Glass,
     then: &ThenArgs,
-) -> Result<(serde_json::Value, Vec<OutContent>), String> {
-    let mut meta = json!({});
-    let mut siblings = Vec::new();
+    context: ToolContext,
+    sibling_base: usize,
+) -> Result<ThenRun, ThenRun> {
+    let mut run = ThenRun {
+        meta: json!({}),
+        outcomes: Vec::new(),
+        siblings: Vec::new(),
+    };
+
+    macro_rules! terminal_operation {
+        ($operation:literal, $call:expr, [$($later:literal),* $(,)?]) => {{
+            if context.deadline.has_passed() {
+                run.outcomes.push(TerminalOutcome::Failed {
+                    operation: $operation,
+                    error: StepError { code: "sequence_deadline_exceeded", summary: "sequence deadline exceeded".into() },
+                    content_blocks: Vec::new(),
+                });
+                $(run.outcomes.push(TerminalOutcome::Unexecuted { operation: $later });)*
+                return Err(run);
+            }
+            match $call {
+                Ok(out) if out.timed_out_by != Some(Whose::Caller) => {
+                    let (result, mut extra) = split_sub(out.output);
+                    let start = sibling_base + run.siblings.len();
+                    let content_blocks = (start..start + extra.len()).collect();
+                    run.siblings.append(&mut extra);
+                    run.meta[$operation] = result.clone();
+                    run.outcomes.push(TerminalOutcome::Completed { operation: $operation, result, content_blocks });
+                }
+                Ok(_) => {
+                    run.outcomes.push(TerminalOutcome::Failed {
+                        operation: $operation,
+                        error: StepError { code: "sequence_deadline_exceeded", summary: "sequence deadline exceeded".into() },
+                        content_blocks: Vec::new(),
+                    });
+                    $(run.outcomes.push(TerminalOutcome::Unexecuted { operation: $later });)*
+                    return Err(run);
+                }
+                Err(error) => {
+                    let code = if error.sequence_deadline_exceeded { "sequence_deadline_exceeded" } else { "action_failed" };
+                    let summary = if error.sequence_deadline_exceeded { "sequence deadline exceeded" } else { "terminal observation failed" };
+                    let content_blocks = if error.message.is_empty() { Vec::new() } else {
+                        let index = sibling_base + run.siblings.len();
+                        run.siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(&error.message)));
+                        vec![index]
+                    };
+                    run.outcomes.push(TerminalOutcome::Failed {
+                        operation: $operation,
+                        error: StepError { code, summary: summary.into() },
+                        content_blocks,
+                    });
+                    $(run.outcomes.push(TerminalOutcome::Unexecuted { operation: $later });)*
+                    return Err(run);
+                }
+            }
+        }};
+    }
     if let Some(s) = &then.settle {
-        let (r, mut sib) = split_sub(wait_stable(glass, &settle_args(s))?);
-        meta["settle"] = r;
-        siblings.append(&mut sib);
+        if then.diff.is_some() && then.screenshot.is_some() {
+            terminal_operation!(
+                "settle",
+                terminal_settle(glass, s, context),
+                ["diff", "screenshot"]
+            );
+        } else if then.diff.is_some() {
+            terminal_operation!("settle", terminal_settle(glass, s, context), ["diff"]);
+        } else if then.screenshot.is_some() {
+            terminal_operation!("settle", terminal_settle(glass, s, context), ["screenshot"]);
+        } else {
+            terminal_operation!("settle", terminal_settle(glass, s, context), []);
+        }
     }
     if let Some(d) = &then.diff {
-        let (r, mut sib) = split_sub(diff(glass, d)?);
-        meta["diff"] = r;
-        siblings.append(&mut sib);
+        if then.screenshot.is_some() {
+            terminal_operation!("diff", diff_with(glass, d, context), ["screenshot"]);
+        } else {
+            terminal_operation!("diff", diff_with(glass, d, context), []);
+        }
     }
     if let Some(sc) = &then.screenshot {
-        let (r, mut sib) = split_sub(screenshot(glass, sc)?);
-        meta["screenshot"] = r;
-        siblings.append(&mut sib);
+        terminal_operation!("screenshot", screenshot_with(glass, sc, context), []);
     }
-    Ok((meta, siblings))
+    Ok(run)
 }
 
 #[cfg(test)]

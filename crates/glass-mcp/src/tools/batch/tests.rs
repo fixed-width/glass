@@ -1363,9 +1363,283 @@ fn terminal_failure_keeps_completed_action_steps() {
     );
     let error: serde_json::Value = serde_json::from_str(&err).unwrap();
     assert_eq!(error["error"]["code"], "terminal_observe_failed");
-    assert_eq!(error["error"]["summary"], "terminal observation failed");
+    assert_eq!(
+        error["error"]["summary"],
+        "terminal observation failed after actions completed; do not replay actions"
+    );
     assert!(!err.contains("baseline not found"));
     assert_eq!(error["outcome"]["executed"], 1);
+}
+
+#[test]
+fn terminal_steps_report_settle_diff_screenshot_in_fixed_order() {
+    let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
+    let (mut g, deadlines, _) = deadline_glass(DeadlineBehavior::Normal, vec![frame.clone(); 8]);
+    baseline_save(
+        &mut g,
+        &BaselineSaveArgs {
+            name: "base".into(),
+        },
+    )
+    .unwrap();
+    deadlines.lock().unwrap().clear();
+    let out = do_actions(
+        &mut g,
+        &DoArgs {
+            actions: vec![click(0, 0)],
+            then: Some(ThenArgs {
+                settle: Some(SettleArgs {
+                    interval_ms: Some(0),
+                    settle_frames: Some(2),
+                    tolerance: None,
+                    timeout_ms: Some(100),
+                    stability_region: None,
+                    ignore: None,
+                }),
+                diff: Some(DiffArgs {
+                    region: None,
+                    name: "base".into(),
+                    mode: Some("exact".into()),
+                    threshold: None,
+                    tolerance: None,
+                    include_image: Some(false),
+                    ignore: None,
+                }),
+                screenshot: Some(ScreenshotArgs {
+                    region: None,
+                    window_id: None,
+                }),
+            }),
+            timeout_ms: Some(1_000),
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap();
+    let result = assert_envelope(&out, "glass_do");
+    assert_eq!(
+        result["terminal_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["operation"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["settle", "diff", "screenshot"]
+    );
+    let seen = deadlines.lock().unwrap();
+    assert!(
+        seen.len() >= 5,
+        "action, settle, diff, and screenshot must dispatch: {seen:?}"
+    );
+    let terminal_deadline = *seen.last().unwrap();
+    assert_ne!(terminal_deadline, Deadline::UNBOUNDED);
+    assert_eq!(seen[0], terminal_deadline);
+}
+
+#[test]
+fn terminal_failure_marks_later_observations_unexecuted() {
+    let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
+    let mut g = started(FakePlatform::new(2, 2).with_frames(vec![frame.clone(); 4]));
+    let err = do_actions(
+        &mut g,
+        &DoArgs {
+            actions: vec![click(0, 0)],
+            then: Some(ThenArgs {
+                settle: Some(SettleArgs {
+                    interval_ms: Some(0),
+                    settle_frames: Some(1),
+                    tolerance: None,
+                    timeout_ms: Some(100),
+                    stability_region: None,
+                    ignore: None,
+                }),
+                diff: Some(DiffArgs {
+                    region: None,
+                    name: "missing".into(),
+                    mode: None,
+                    threshold: None,
+                    tolerance: None,
+                    include_image: None,
+                    ignore: None,
+                }),
+                screenshot: Some(ScreenshotArgs {
+                    region: None,
+                    window_id: None,
+                }),
+            }),
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+    let envelope: serde_json::Value = serde_json::from_str(match &err.0[0] {
+        OutContent::Text(text) => text,
+        OutContent::Image(_) => panic!("error envelope must be text"),
+    })
+    .unwrap();
+    assert_eq!(envelope["outcome"]["executed"], 1);
+    assert_eq!(envelope["outcome"]["then"]["settle"]["settled"], true);
+    assert_eq!(
+        envelope["outcome"]["terminal_steps"][0]["status"],
+        "completed"
+    );
+    assert_eq!(envelope["outcome"]["terminal_steps"][1]["status"], "failed");
+    assert_eq!(
+        envelope["outcome"]["terminal_steps"][1]["content_blocks"],
+        json!([1])
+    );
+    assert_eq!(
+        envelope["outcome"]["terminal_steps"][2]["status"],
+        "unexecuted"
+    );
+    assert!(matches!(&err.0[1], OutContent::Text(t) if t.contains("untrusted content")));
+}
+
+#[test]
+fn terminal_sequence_deadline_keeps_all_action_steps_completed() {
+    let black = Frame::solid(2, 2, [0, 0, 0, 255]);
+    let white = Frame::solid(2, 2, [255, 255, 255, 255]);
+    let (mut g, deadlines, events) = deadline_glass(
+        DeadlineBehavior::CaptureCompletesLate,
+        vec![black.clone(), white.clone(), black, white],
+    );
+    let err = do_actions(
+        &mut g,
+        &DoArgs {
+            actions: vec![
+                click(0, 0),
+                Action::Key(KeyArgs {
+                    chord: "Tab".into(),
+                }),
+            ],
+            then: Some(ThenArgs {
+                settle: Some(SettleArgs {
+                    interval_ms: Some(0),
+                    settle_frames: Some(u32::MAX),
+                    tolerance: None,
+                    timeout_ms: Some(1_000),
+                    stability_region: None,
+                    ignore: None,
+                }),
+                diff: None,
+                screenshot: Some(ScreenshotArgs {
+                    region: None,
+                    window_id: None,
+                }),
+            }),
+            timeout_ms: Some(200),
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    assert_eq!(envelope["error"]["code"], "terminal_observe_failed");
+    assert_eq!(envelope["outcome"]["executed"], 2);
+    assert!(
+        envelope["outcome"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["status"] == "completed")
+    );
+    assert_eq!(
+        envelope["outcome"]["terminal_steps"][0]["error"]["code"],
+        "sequence_deadline_exceeded"
+    );
+    assert_eq!(
+        envelope["outcome"]["terminal_steps"][1]["status"],
+        "unexecuted"
+    );
+    assert_eq!(*events.lock().unwrap(), vec!["click(0,0)", "key(Tab)"]);
+    let seen = deadlines.lock().unwrap();
+    assert!(seen.len() >= 3);
+    assert!(seen.iter().all(|deadline| *deadline == seen[0]));
+}
+
+#[test]
+fn then_shape_remains_backward_compatible() {
+    let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
+    let mut g = started(FakePlatform::new(2, 2).with_frames(vec![frame; 3]));
+    let out = do_actions(
+        &mut g,
+        &DoArgs {
+            actions: vec![click(0, 0)],
+            then: Some(ThenArgs {
+                settle: None,
+                diff: None,
+                screenshot: Some(ScreenshotArgs {
+                    region: None,
+                    window_id: None,
+                }),
+            }),
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap();
+    let result = assert_envelope(&out, "glass_do");
+    assert_eq!(
+        result["then"],
+        json!({ "screenshot": { "width": 2, "height": 2 } })
+    );
+    assert_eq!(
+        result["terminal_steps"][0]["result"],
+        result["then"]["screenshot"]
+    );
+    assert!(matches!(out.0[1], OutContent::Image(_)));
+    assert!(matches!(&out.0[2], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+}
+
+#[test]
+fn terminal_content_blocks_reference_images_and_notes_in_response_order() {
+    let base = Frame::solid(2, 2, [0, 0, 0, 255]);
+    let mut changed = base.clone();
+    changed.pixels[0] = 255;
+    let mut g =
+        started_a11y(FakePlatform::new(2, 2).with_frames(vec![base, changed.clone(), changed]));
+    baseline_save(
+        &mut g,
+        &BaselineSaveArgs {
+            name: "base".into(),
+        },
+    )
+    .unwrap();
+    let out = do_actions(
+        &mut g,
+        &DoArgs {
+            actions: vec![Action::Type(TypeArgs {
+                text: "secret".into(),
+                return_: Some("snapshot".into()),
+            })],
+            then: Some(ThenArgs {
+                settle: None,
+                diff: Some(DiffArgs {
+                    region: None,
+                    name: "base".into(),
+                    mode: Some("exact".into()),
+                    threshold: None,
+                    tolerance: None,
+                    include_image: Some(true),
+                    ignore: None,
+                }),
+                screenshot: Some(ScreenshotArgs {
+                    region: None,
+                    window_id: None,
+                }),
+            }),
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap();
+    let result = assert_envelope(&out, "glass_do");
+    assert_eq!(result["steps"][0]["content_blocks"], json!([1]));
+    assert_eq!(result["terminal_steps"][0]["content_blocks"], json!([2, 3]));
+    assert_eq!(result["terminal_steps"][1]["content_blocks"], json!([4, 5]));
+    assert!(matches!(&out.0[1], OutContent::Text(_)));
+    assert!(matches!(out.0[2], OutContent::Image(_)));
+    assert!(matches!(&out.0[3], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+    assert!(matches!(out.0[4], OutContent::Image(_)));
+    assert!(matches!(&out.0[5], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
 }
 
 #[test]
