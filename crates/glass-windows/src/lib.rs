@@ -30,6 +30,40 @@ pub mod vkmap; // pure named-keysym->VK map — cross-platform, host-tested
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
 pub const BACKEND: &str = "windows";
 
+#[cfg(any(windows, test))]
+fn run_windows_call_by<T>(
+    deadline: glass_core::Deadline,
+    op: &str,
+    call: impl FnOnce() -> glass_core::Result<T>,
+) -> glass_core::Result<T> {
+    if deadline.has_passed() {
+        return Err(glass_core::GlassError::deadline_not_started(op));
+    }
+    let answer = call().map_err(|error| {
+        if error.bound_owner() == Some(glass_core::Whose::Caller)
+            && error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched)
+        {
+            glass_core::GlassError::caller_deadline_elapsed(op)
+        } else {
+            error
+        }
+    })?;
+    if deadline.has_passed() {
+        return Err(glass_core::GlassError::caller_deadline_elapsed(op));
+    }
+    Ok(answer)
+}
+
+#[cfg(any(windows, test))]
+fn run_windows_type_by<S: glass_core::TypeSink>(
+    sink: &mut S,
+    text: &str,
+    dwell: std::time::Duration,
+    deadline: glass_core::Deadline,
+) -> glass_core::Result<()> {
+    glass_core::run_type_by(sink, text, dwell, deadline)
+}
+
 /// One-time stderr note when a contained app can't get a private clipboard (hook DLL missing):
 /// the app's clipboard is disabled to protect the user's — never a silent revert to sharing it.
 #[cfg(windows)]
@@ -265,22 +299,69 @@ mod backend {
         }
 
         fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+            self.capture_frame_by(region, glass_core::Deadline::UNBOUNDED)
+        }
+
+        fn capture_frame_by(
+            &mut self,
+            region: Option<&Region>,
+            deadline: glass_core::Deadline,
+        ) -> Result<Frame> {
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("capture"));
+            }
             let raw = self.active_hwnd.ok_or_else(|| {
                 GlassError::CaptureFailed(
                     "no active window; start an app or select a window first".into(),
                 )
             })?;
-            crate::capture::capture_window(crate::util::raw_to_hwnd(raw), region)
+            crate::capture::capture_window_by(crate::util::raw_to_hwnd(raw), region, deadline)
+        }
+
+        fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
+            self.capture_window_by(id, region, glass_core::Deadline::UNBOUNDED)
+        }
+
+        fn capture_window_by(
+            &mut self,
+            _id: WindowId,
+            _region: Option<&Region>,
+            deadline: glass_core::Deadline,
+        ) -> Result<Frame> {
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("window capture"));
+            }
+            Err(GlassError::Unsupported(
+                "capture_window is not supported by this backend".into(),
+            ))
         }
 
         fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+            self.send_pointer_by(event, glass_core::Deadline::UNBOUNDED)
+        }
+
+        fn send_pointer_by(
+            &mut self,
+            event: &PointerEvent,
+            deadline: glass_core::Deadline,
+        ) -> Result<()> {
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("pointer input"));
+            }
             let raw = self.active_hwnd.ok_or(GlassError::WindowNotFound)?;
-            crate::input::send_pointer(raw, event)
+            crate::input::send_pointer_by(raw, event, deadline)
         }
 
         fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+            self.send_key_by(event, glass_core::Deadline::UNBOUNDED)
+        }
+
+        fn send_key_by(&mut self, event: &KeyEvent, deadline: glass_core::Deadline) -> Result<()> {
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("key input"));
+            }
             let raw = self.active_hwnd.ok_or(GlassError::WindowNotFound)?;
-            crate::input::send_key(raw, event)
+            crate::input::send_key_by(raw, event, deadline)
         }
 
         fn get_clipboard(&mut self) -> Result<String> {
@@ -434,5 +515,75 @@ mod capability_tests {
         assert!(msg.contains("windows backend"), "{msg}");
         assert!(msg.contains("glass_capabilities"), "{msg}");
         assert!(!msg.contains("android"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::{run_windows_call_by, run_windows_type_by};
+    use glass_core::{BoundDispatch, Deadline, Result, TypeSink, Whose};
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct RecordingTypeSink {
+        characters: Vec<char>,
+    }
+
+    impl TypeSink for RecordingTypeSink {
+        fn character(&mut self, character: char) -> Result<()> {
+            self.characters.push(character);
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spent_input_deadline_dispatches_no_backend_events() {
+        let mut recorded_events = Vec::new();
+        let deadline = Deadline::at(Instant::now() - Duration::from_millis(1));
+
+        let error = run_windows_call_by(deadline, "pointer input", || {
+            recorded_events.push("motion");
+            Ok(())
+        })
+        .expect_err("spent input must be rejected before dispatch");
+
+        assert!(recorded_events.is_empty());
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn short_typing_deadline_stops_before_all_characters() {
+        let requested_text = "abcd";
+        let mut sink = RecordingTypeSink::default();
+
+        let error = run_windows_type_by(
+            &mut sink,
+            requested_text,
+            Duration::ZERO,
+            Deadline::from_millis(5),
+        )
+        .expect_err("typing must stop when the shared deadline expires");
+
+        assert!(sink.characters.len() < requested_text.chars().count());
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn capture_returning_after_the_deadline_is_not_success() {
+        let capture_error = run_windows_call_by(Deadline::from_millis(1), "capture", || {
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        })
+        .expect_err("a late capture must not return success");
+
+        assert_eq!(capture_error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            capture_error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
     }
 }

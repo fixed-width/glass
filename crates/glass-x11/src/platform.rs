@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
-    TEARDOWN_BUDGET, WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
+    AppSpec, BoundDispatch, Deadline, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region,
+    Result, Stream, TEARDOWN_BUDGET, Whose, WindowGeometry, WindowHint, WindowId, WindowInfo,
+    WindowOp,
 };
 use glass_pipe_unix::LineTap;
 use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, proc_tree_pids};
@@ -42,6 +43,34 @@ const XT_BTN_PRESS: u8 = 4; // ButtonPress
 const XT_BTN_RELEASE: u8 = 5; // ButtonRelease
 const XT_KEY_PRESS: u8 = 2; // KeyPress
 const XT_KEY_RELEASE: u8 = 3; // KeyRelease
+
+fn run_x11_call_by<T>(deadline: Deadline, op: &str, call: impl FnOnce() -> Result<T>) -> Result<T> {
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(op));
+    }
+    let answer = call().map_err(|error| {
+        if error.bound_owner() == Some(Whose::Caller)
+            && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
+        {
+            GlassError::caller_deadline_elapsed(op)
+        } else {
+            error
+        }
+    })?;
+    if deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed(op));
+    }
+    Ok(answer)
+}
+
+fn run_x11_type_by<S: glass_core::TypeSink>(
+    sink: &mut S,
+    text: &str,
+    dwell: Duration,
+    deadline: Deadline,
+) -> Result<()> {
+    glass_core::run_type_by(sink, text, dwell, deadline)
+}
 
 use crate::command::build_command;
 
@@ -1129,144 +1158,196 @@ impl Platform for X11Platform {
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        // `window_geometry()` itself calls `require_window()`, so it doubles as
-        // the "is there an active window" guard — no separate binding needed.
-        let geo = self.window_geometry()?;
-        let rect = self.resolve_capture_rect(&geo, region)?;
-        if let Some(note) = clip_note(&rect) {
-            eprintln!("{note}");
-        }
-        // Capture from ROOT over the window's screen region so overlapping popovers
-        // (separate override-redirect top-levels) are included, not just this window's
-        // own (possibly-obscured) drawable.
-        self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
+        self.capture_frame_by(region, Deadline::UNBOUNDED)
+    }
+
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        run_x11_call_by(deadline, "capture", || {
+            // `window_geometry()` itself calls `require_window()`, so it doubles as
+            // the "is there an active window" guard — no separate binding needed.
+            let geo = self.window_geometry()?;
+            let rect = self.resolve_capture_rect(&geo, region)?;
+            if let Some(note) = clip_note(&rect) {
+                eprintln!("{note}");
+            }
+            if deadline.has_passed() {
+                return Err(GlassError::caller_deadline_elapsed("capture"));
+            }
+            // Capture from ROOT over the window's screen region so overlapping popovers
+            // (separate override-redirect top-levels) are included, not just this window's
+            // own (possibly-obscured) drawable.
+            self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
+        })
     }
 
     fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
-        // Mirror select_window's WindowId -> Window mapping/validation, but never
-        // touch `self.window` — this must not retarget the active window.
-        let pids: Vec<u32> = self
-            .child
-            .as_ref()
-            .map(|c| proc_tree_pids(c.id()))
-            .unwrap_or_default();
-        let target = id.0 as Window;
-        if !self.scan_all_windows(&pids)?.contains(&target) {
-            return Err(GlassError::WindowNotFound);
-        }
-        let geo = self.geometry_of(target)?;
-        if let Some(r) = region {
-            // `region` must fit the TARGET window's own geometry, not just the
-            // shared Xvfb display — otherwise an over-large region that still
-            // lands inside the display would silently capture pixels outside
-            // this window (desktop / other windows) instead of erroring.
-            r.check_fits(geo.width, geo.height)?;
-        }
-        let rect = self.resolve_capture_rect(&geo, region)?;
-        if let Some(note) = clip_note(&rect) {
-            eprintln!("{note}");
-        }
-        self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
+        self.capture_window_by(id, region, Deadline::UNBOUNDED)
+    }
+
+    fn capture_window_by(
+        &mut self,
+        id: WindowId,
+        region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        run_x11_call_by(deadline, "window capture", || {
+            // Mirror select_window's WindowId -> Window mapping/validation, but never
+            // touch `self.window` — this must not retarget the active window.
+            let pids: Vec<u32> = self
+                .child
+                .as_ref()
+                .map(|c| proc_tree_pids(c.id()))
+                .unwrap_or_default();
+            let target = id.0 as Window;
+            if !self.scan_all_windows(&pids)?.contains(&target) {
+                return Err(GlassError::WindowNotFound);
+            }
+            let geo = self.geometry_of(target)?;
+            if let Some(r) = region {
+                // `region` must fit the TARGET window's own geometry, not just the
+                // shared Xvfb display — otherwise an over-large region that still
+                // lands inside the display would silently capture pixels outside
+                // this window (desktop / other windows) instead of erroring.
+                r.check_fits(geo.width, geo.height)?;
+            }
+            let rect = self.resolve_capture_rect(&geo, region)?;
+            if let Some(note) = clip_note(&rect) {
+                eprintln!("{note}");
+            }
+            if deadline.has_passed() {
+                return Err(GlassError::caller_deadline_elapsed("window capture"));
+            }
+            self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
+        })
     }
 
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
-        let origin = self.window_geometry()?;
-        let (ox, oy) = (origin.x, origin.y);
-        match *event {
-            PointerEvent::Move { x, y } => self.warp(ox, oy, x, y)?,
-            PointerEvent::Scroll {
-                x,
-                y,
-                dx,
-                dy,
-                ref modifiers,
-            } => {
-                // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
-                // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
-                let mut sink = X11ScrollSink {
-                    p: &*self,
-                    ox,
-                    oy,
+        self.send_pointer_by(event, Deadline::UNBOUNDED)
+    }
+
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        run_x11_call_by(deadline, "pointer input", || {
+            let origin = self.window_geometry()?;
+            let (ox, oy) = (origin.x, origin.y);
+            if deadline.has_passed() {
+                return Err(GlassError::caller_deadline_elapsed("pointer input"));
+            }
+            match *event {
+                PointerEvent::Move { x, y } => self.warp(ox, oy, x, y)?,
+                PointerEvent::Scroll {
                     x,
                     y,
                     dx,
                     dy,
-                    mods: modifiers.as_slice(),
-                    kcs: Vec::new(),
-                };
-                glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
-            }
-            PointerEvent::Click {
-                x,
-                y,
-                button,
-                count,
-                ref modifiers,
-            } => {
-                self.warp(ox, oy, x, y)?;
-                let kcs = self.press_mods(modifiers)?;
-                let b = button_number(button);
-                for _ in 0..count.max(1) {
-                    self.button(XT_BTN_PRESS, b)?;
-                    self.button(XT_BTN_RELEASE, b)?;
+                    ref modifiers,
+                } => {
+                    // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
+                    // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
+                    let mut sink = X11ScrollSink {
+                        p: &*self,
+                        ox,
+                        oy,
+                        x,
+                        y,
+                        dx,
+                        dy,
+                        mods: modifiers.as_slice(),
+                        kcs: Vec::new(),
+                    };
+                    glass_core::run_scroll_by(&mut sink, !modifiers.is_empty(), deadline)?;
                 }
-                self.release_mods(&kcs)?;
+                PointerEvent::Click {
+                    x,
+                    y,
+                    button,
+                    count,
+                    ref modifiers,
+                } => {
+                    self.warp(ox, oy, x, y)?;
+                    if deadline.has_passed() {
+                        return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                    }
+                    let kcs = self.press_mods(modifiers)?;
+                    let b = button_number(button);
+                    let outcome = (|| {
+                        for _ in 0..count.max(1) {
+                            if deadline.has_passed() {
+                                return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                            }
+                            self.button(XT_BTN_PRESS, b)?;
+                            if deadline.has_passed() {
+                                return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                            }
+                            self.button(XT_BTN_RELEASE, b)?;
+                        }
+                        Ok(())
+                    })();
+                    let release = self.release_mods(&kcs);
+                    outcome?;
+                    release?;
+                }
+                PointerEvent::Drag {
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                    button,
+                    ref modifiers,
+                    duration_ms,
+                } => {
+                    let gesture =
+                        glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
+                    let mut sink = X11DragSink {
+                        p: &*self,
+                        ox,
+                        oy,
+                        b: button_number(button),
+                        mods: modifiers.as_slice(),
+                        kcs: Vec::new(),
+                    };
+                    glass_core::run_drag_by(&mut sink, &gesture, deadline)?;
+                }
+                PointerEvent::Gesture { .. } => {
+                    return Err(crate::unsupported_multi_touch());
+                }
             }
-            PointerEvent::Drag {
-                from_x,
-                from_y,
-                to_x,
-                to_y,
-                button,
-                ref modifiers,
-                duration_ms,
-            } => {
-                let gesture =
-                    glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
-                let mut sink = X11DragSink {
-                    p: &*self,
-                    ox,
-                    oy,
-                    b: button_number(button),
-                    mods: modifiers.as_slice(),
-                    kcs: Vec::new(),
-                };
-                glass_core::run_drag(&mut sink, &gesture)?;
-            }
-            PointerEvent::Gesture { .. } => {
-                return Err(crate::unsupported_multi_touch());
-            }
-        }
-        self.commit()
+            self.commit()
+        })
     }
 
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-        match event {
-            KeyEvent::Text(text) => {
-                // Per-character, self-committed typing (an XFlush per char) so a heavy client
-                // (e.g. a browser) receives a long string instead of dropping events flushed
-                // once at the end — see glass_core::run_type and X11TypeSink. The 8ms dwell
-                // paces between characters (XFlush sends but does not wait).
-                let mut sink = X11TypeSink { p: &*self, idx: 0 };
-                glass_core::run_type(&mut sink, text, std::time::Duration::from_millis(8))?;
-            }
-            KeyEvent::Chord(chord) => {
-                let (mods, keysym) = glass_core::keys::parse_chord(chord)?;
-                let (keycode, needs_shift) = self.keycode_for(keysym)?;
-                let mut mods = mods;
-                if needs_shift && !mods.contains(&glass_core::keys::Modifier::Shift) {
-                    mods.push(glass_core::keys::Modifier::Shift);
+        self.send_key_by(event, Deadline::UNBOUNDED)
+    }
+
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        run_x11_call_by(deadline, "key input", || {
+            match event {
+                KeyEvent::Text(text) => {
+                    // Per-character, self-committed typing (an XFlush per char) so a heavy client
+                    // (e.g. a browser) receives a long string instead of dropping events flushed
+                    // once at the end — see glass_core::run_type and X11TypeSink. The 8ms dwell
+                    // paces between characters (XFlush sends but does not wait).
+                    let mut sink = X11TypeSink { p: &*self, idx: 0 };
+                    run_x11_type_by(&mut sink, text, Duration::from_millis(8), deadline)?;
                 }
-                let mut sink = X11ChordSink {
-                    p: &*self,
-                    mods: &mods,
-                    keycode,
-                    kcs: Vec::new(),
-                };
-                glass_core::run_chord(&mut sink)?;
+                KeyEvent::Chord(chord) => {
+                    let (mods, keysym) = glass_core::keys::parse_chord(chord)?;
+                    let (keycode, needs_shift) = self.keycode_for(keysym)?;
+                    let mut mods = mods;
+                    if needs_shift && !mods.contains(&glass_core::keys::Modifier::Shift) {
+                        mods.push(glass_core::keys::Modifier::Shift);
+                    }
+                    let mut sink = X11ChordSink {
+                        p: &*self,
+                        mods: &mods,
+                        keycode,
+                        kcs: Vec::new(),
+                    };
+                    glass_core::run_chord_by(&mut sink, deadline)?;
+                }
             }
-        }
-        self.commit()
+            self.commit()
+        })
     }
 
     fn get_clipboard(&mut self) -> Result<String> {
@@ -1464,8 +1545,72 @@ fn button_number(button: glass_core::MouseButton) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::hint_matches;
-    use glass_core::WindowHint;
+    use super::{hint_matches, run_x11_call_by, run_x11_type_by};
+    use glass_core::{BoundDispatch, Deadline, Result, TypeSink, Whose, WindowHint};
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct RecordingTypeSink {
+        characters: Vec<char>,
+    }
+
+    impl TypeSink for RecordingTypeSink {
+        fn character(&mut self, character: char) -> Result<()> {
+            self.characters.push(character);
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spent_input_deadline_dispatches_no_backend_events() {
+        let mut recorded_events = Vec::new();
+        let deadline = Deadline::at(Instant::now() - Duration::from_millis(1));
+
+        let error = run_x11_call_by(deadline, "pointer input", || {
+            recorded_events.push("motion");
+            Ok(())
+        })
+        .expect_err("spent input must be rejected before dispatch");
+
+        assert!(recorded_events.is_empty());
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn short_typing_deadline_stops_before_all_characters() {
+        let requested_text = "abcd";
+        let mut sink = RecordingTypeSink::default();
+
+        let error = run_x11_type_by(
+            &mut sink,
+            requested_text,
+            Duration::ZERO,
+            Deadline::from_millis(5),
+        )
+        .expect_err("typing must stop when the shared deadline expires");
+
+        assert!(sink.characters.len() < requested_text.chars().count());
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn capture_returning_after_the_deadline_is_not_success() {
+        let capture_error = run_x11_call_by(Deadline::from_millis(1), "capture", || {
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        })
+        .expect_err("a late capture must not return success");
+
+        assert_eq!(capture_error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            capture_error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
 
     // proc_tree_pids / collect_descendants moved to the `glass-proc-linux` crate
     // (tested there).

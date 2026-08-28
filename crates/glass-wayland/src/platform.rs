@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
-    TEARDOWN_BUDGET, WindowGeometry, WindowId, WindowInfo, WindowOp,
+    AppSpec, BoundDispatch, Deadline, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region,
+    Result, Stream, TEARDOWN_BUDGET, Whose, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 use glass_exec_unix::{Resolved, resolve_path};
 use glass_pipe_unix::LineTap;
@@ -52,6 +52,56 @@ const _: () = assert!(
     CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis() < TEARDOWN_BUDGET.as_millis(),
     "the close request + compositor reap must finish inside glass_core::TEARDOWN_BUDGET"
 );
+
+const INPUT_SETTLE: Duration = Duration::from_millis(8);
+
+fn clamped_budget(deadline: Deadline, own: Duration, now: Instant) -> (Duration, Whose) {
+    deadline.budget(own, now)
+}
+
+fn run_wayland_call_by<T>(
+    deadline: Deadline,
+    op: &str,
+    call: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(op));
+    }
+    let answer = call().map_err(|error| {
+        if error.bound_owner() == Some(Whose::Caller)
+            && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
+        {
+            GlassError::caller_deadline_elapsed(op)
+        } else {
+            error
+        }
+    })?;
+    if deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed(op));
+    }
+    Ok(answer)
+}
+
+fn run_wayland_type_by<S: glass_core::TypeSink>(
+    sink: &mut S,
+    text: &str,
+    dwell: Duration,
+    deadline: Deadline,
+) -> Result<()> {
+    glass_core::run_type_by(sink, text, dwell, deadline)
+}
+
+fn input_settle_by(deadline: Deadline) -> Result<()> {
+    if deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed("input settle"));
+    }
+    let (sleep_for, _) = clamped_budget(deadline, INPUT_SETTLE, Instant::now());
+    std::thread::sleep(sleep_for);
+    if deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed("input settle"));
+    }
+    Ok(())
+}
 
 struct ActiveSession {
     child: Child,
@@ -765,12 +815,13 @@ pub(crate) type SyncDone = Arc<std::sync::atomic::AtomicBool>;
 /// compositor that has stopped answering holds the caller forever. This asks the same question
 /// and gives it `deadline` to answer.
 ///
-pub(crate) fn roundtrip_until<S>(
+fn roundtrip_until_with<S>(
     conn: &Connection,
     queue: &mut EventQueue<S>,
     state: &mut S,
     deadline: Instant,
     who: &str,
+    expired: impl FnOnce(Duration) -> GlassError,
 ) -> Result<()>
 where
     S: Dispatch<wl_callback::WlCallback, SyncDone> + 'static,
@@ -785,19 +836,32 @@ where
         state,
         deadline,
         who,
-        // Not a bare `GlassError::Timeout`, which names no operation: every request ends in the
-        // same sync, so the caller is all that tells one failure from another.
-        |_| {
-            GlassError::Backend(format!(
-                "{who}: the compositor did not answer within {} ms",
-                budget.as_millis()
-            ))
-        },
+        |_| expired(budget),
         |_| {
             done.load(std::sync::atomic::Ordering::Relaxed)
                 .then_some(Ok(()))
         },
     )
+}
+
+pub(crate) fn roundtrip_until<S>(
+    conn: &Connection,
+    queue: &mut EventQueue<S>,
+    state: &mut S,
+    deadline: Instant,
+    who: &str,
+) -> Result<()>
+where
+    S: Dispatch<wl_callback::WlCallback, SyncDone> + 'static,
+{
+    roundtrip_until_with(conn, queue, state, deadline, who, |budget| {
+        // Not a bare `GlassError::Timeout`, which names no operation: every request ends in the
+        // same sync, so the caller is all that tells one failure from another.
+        GlassError::Backend(format!(
+            "{who}: the compositor did not answer within {} ms",
+            budget.as_millis()
+        ))
+    })
 }
 
 /// Open a wayland connection and collect the compositor's globals, bounded.
@@ -880,6 +944,34 @@ where
         state,
         Instant::now() + COMPOSITOR_SYNC_BUDGET,
         who,
+    )
+}
+
+fn roundtrip_by<S>(
+    conn: &Connection,
+    queue: &mut EventQueue<S>,
+    state: &mut S,
+    deadline: Deadline,
+    who: &str,
+) -> Result<()>
+where
+    S: Dispatch<wl_callback::WlCallback, SyncDone> + 'static,
+{
+    let now = Instant::now();
+    let (budget, owner) = clamped_budget(deadline, COMPOSITOR_SYNC_BUDGET, now);
+    roundtrip_until_with(
+        conn,
+        queue,
+        state,
+        now + budget,
+        who,
+        move |budget| match owner {
+            Whose::Caller => GlassError::caller_deadline_elapsed(who),
+            Whose::Callee => GlassError::Backend(format!(
+                "{who}: the compositor did not answer within {} ms",
+                budget.as_millis()
+            )),
+        },
     )
 }
 
@@ -1476,37 +1568,79 @@ fn sync_session(s: &mut ActiveSession, who: &str) -> Result<()> {
     roundtrip(&s.conn, &mut s.queue, &mut s.state, who)
 }
 
+fn sync_session_by(s: &mut ActiveSession, who: &str, deadline: Deadline) -> Result<()> {
+    roundtrip_by(&s.conn, &mut s.queue, &mut s.state, deadline, who)
+}
+
 /// Write the keymap to an unlinked temp file and hand its fd to the compositor,
 /// then settle so Xwayland adopts the new mapping before any key events. No
 /// unsafe: tempfile gives a normal, mmap-able fd; XKB_V1 format == 1.
-fn upload_keymap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, keymap: &str) -> Result<()> {
+fn upload_keymap_by(
+    s: &mut ActiveSession,
+    kb: &ZwpVirtualKeyboardV1,
+    keymap: &str,
+    deadline: Deadline,
+) -> Result<()> {
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started("keymap upload"));
+    }
     let mut f = tempfile::tempfile().map_err(GlassError::Io)?;
     f.write_all(keymap.as_bytes()).map_err(GlassError::Io)?;
     f.write_all(&[0]).map_err(GlassError::Io)?; // keymap string is NUL-terminated
     f.flush().map_err(GlassError::Io)?;
+    if deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed("keymap upload"));
+    }
     kb.keymap(1, f.as_fd(), keymap.len() as u32 + 1);
-    sync_session(s, "keymap upload")?;
-    std::thread::sleep(Duration::from_millis(8));
-    Ok(())
+    sync_session_by(s, "keymap upload", deadline)?;
+    input_settle_by(deadline)
 }
 
 /// Press then release evdev keycode `kc`, bumping the session clock per event and
 /// self-committing (roundtrip + settle) after each — so the compositor processes the
 /// press/release individually, like the chord sink. A heavy client (e.g. a browser) ignores
 /// taps that are merely queued and flushed once at the end.
-fn tap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, kc: u32) -> Result<()> {
+fn tap_by(
+    s: &mut ActiveSession,
+    kb: &ZwpVirtualKeyboardV1,
+    kc: u32,
+    deadline: Deadline,
+) -> Result<()> {
     let mut held = Held::default();
     for state in [1u32, 0] {
+        if deadline.has_passed() {
+            held.release(s);
+            return Err(GlassError::caller_deadline_elapsed("key tap"));
+        }
         s.time = s.time.wrapping_add(1);
         kb.key(s.time, kc, state);
         held.key = (state == 1).then_some(kc);
-        if let Err(e) = sync_session(s, "key tap") {
+        if let Err(e) = sync_session_by(s, "key tap", deadline) {
             held.release(s);
             return Err(e);
         }
-        std::thread::sleep(Duration::from_millis(8));
+        if let Err(error) = input_settle_by(deadline) {
+            held.release(s);
+            return Err(error);
+        }
     }
     Ok(())
+}
+
+struct WaylandTypeSink<'a> {
+    s: &'a mut ActiveSession,
+    kb: &'a ZwpVirtualKeyboardV1,
+    taps: std::vec::IntoIter<u32>,
+    deadline: Deadline,
+}
+
+impl glass_core::TypeSink for WaylandTypeSink<'_> {
+    fn character(&mut self, _character: char) -> Result<()> {
+        let keycode = self.taps.next().ok_or_else(|| {
+            GlassError::Backend("typing plan ended before the requested text".into())
+        })?;
+        tap_by(self.s, self.kb, keycode, self.deadline)
+    }
 }
 
 /// Fail closed: a launch that asked for a sandbox errors rather than running unconfined.
@@ -1562,6 +1696,7 @@ struct WaylandDragSink<'a> {
     b: u32,
     mask: u32,
     held: Held,
+    deadline: Deadline,
 }
 
 /// A drag that ends early — `run_drag` propagates a failed settle from any of its waypoints —
@@ -1584,9 +1719,8 @@ impl WaylandDragSink<'_> {
         (self.oy + y).max(0) as u32
     }
     fn settle(&mut self) -> Result<()> {
-        sync_session(self.s, "input settle")?;
-        std::thread::sleep(Duration::from_millis(8));
-        Ok(())
+        sync_session_by(self.s, "input settle", self.deadline)?;
+        input_settle_by(self.deadline)
     }
 }
 
@@ -1634,7 +1768,12 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         }
         let kb = self.s.keyboard.clone();
         if down {
-            upload_keymap(&mut *self.s, &kb, &crate::keyboard::build_keymap(&[]))?;
+            upload_keymap_by(
+                &mut *self.s,
+                &kb,
+                &crate::keyboard::build_keymap(&[]),
+                self.deadline,
+            )?;
             kb.modifiers(self.mask, 0, 0, 0);
         } else {
             kb.modifiers(0, 0, 0, 0);
@@ -1654,6 +1793,7 @@ struct WaylandChordSink<'a> {
     mask: u32,
     keysym: u32,
     held: Held,
+    deadline: Deadline,
 }
 
 /// A chord that ends early otherwise leaves its key or its modifier down.
@@ -1665,9 +1805,8 @@ impl Drop for WaylandChordSink<'_> {
 
 impl WaylandChordSink<'_> {
     fn settle(&mut self) -> Result<()> {
-        sync_session(self.s, "input settle")?;
-        std::thread::sleep(Duration::from_millis(8));
-        Ok(())
+        sync_session_by(self.s, "input settle", self.deadline)?;
+        input_settle_by(self.deadline)
     }
 }
 
@@ -1676,10 +1815,11 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
         let kb = self.s.keyboard.clone();
         if down {
             // Upload the keymap (chord key = keycode 1) regardless of mask, then set the modifiers.
-            upload_keymap(
+            upload_keymap_by(
                 &mut *self.s,
                 &kb,
                 &crate::keyboard::build_keymap(&[self.keysym]),
+                self.deadline,
             )?;
             if self.mask != 0 {
                 kb.modifiers(self.mask, 0, 0, 0);
@@ -1717,6 +1857,7 @@ struct WaylandScrollSink<'a> {
     dy: i32,
     mask: u32,
     held: Held,
+    deadline: Deadline,
 }
 
 /// A scroll that ends early — `wheel` settles three times after the modifier goes down —
@@ -1739,9 +1880,8 @@ impl WaylandScrollSink<'_> {
         (self.oy + y).max(0) as u32
     }
     fn settle(&mut self) -> Result<()> {
-        sync_session(self.s, "input settle")?;
-        std::thread::sleep(Duration::from_millis(8));
-        Ok(())
+        sync_session_by(self.s, "input settle", self.deadline)?;
+        input_settle_by(self.deadline)
     }
 }
 
@@ -1751,7 +1891,12 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
     fn modifiers(&mut self, down: bool) -> Result<()> {
         let kb = self.s.keyboard.clone();
         if down {
-            upload_keymap(&mut *self.s, &kb, &crate::keyboard::build_keymap(&[]))?;
+            upload_keymap_by(
+                &mut *self.s,
+                &kb,
+                &crate::keyboard::build_keymap(&[]),
+                self.deadline,
+            )?;
             kb.modifiers(self.mask, 0, 0, 0);
         } else {
             kb.modifiers(0, 0, 0, 0);
@@ -1881,255 +2026,324 @@ impl Platform for WaylandPlatform {
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        session.state.capture = CaptureScratch::default();
-        let qh = session.queue.handle();
+        self.capture_frame_by(region, Deadline::UNBOUNDED)
+    }
 
-        // Map the (window-relative) request to OUTPUT coordinates by the active
-        // window's rect, then have the compositor copy exactly that region. The
-        // selected window is raised on `select_window`, so the output framebuffer
-        // shows it on top; cropping at the source needs no CPU work and reads the
-        // existing framebuffer (robust for static, undamaged windows — unlike
-        // per-toplevel ext-image-copy-capture, which stalls until a fresh frame).
-        let wr = &session.active_rect;
-        let (cx, cy, cw, ch) = match region {
-            Some(r) => (wr.x + r.x as i32, wr.y + r.y as i32, r.width, r.height),
-            None => (wr.x, wr.y, wr.width, wr.height),
-        };
-        let mut owned = CaptureObjects {
-            frame: session.manager.capture_output_region(
-                0,
-                &session.output,
-                cx,
-                cy,
-                cw as i32,
-                ch as i32,
-                &qh,
-                (),
-            ),
-            buffer: None,
-        };
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        run_wayland_call_by(deadline, "capture", || {
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            session.state.capture = CaptureScratch::default();
+            let qh = session.queue.handle();
 
-        let deadline = Instant::now() + CAPTURE_BUDGET;
+            // Map the (window-relative) request to OUTPUT coordinates by the active
+            // window's rect, then have the compositor copy exactly that region. The
+            // selected window is raised on `select_window`, so the output framebuffer
+            // shows it on top; cropping at the source needs no CPU work and reads the
+            // existing framebuffer (robust for static, undamaged windows — unlike
+            // per-toplevel ext-image-copy-capture, which stalls until a fresh frame).
+            let wr = &session.active_rect;
+            let (cx, cy, cw, ch) = match region {
+                Some(r) => (wr.x + r.x as i32, wr.y + r.y as i32, r.width, r.height),
+                None => (wr.x, wr.y, wr.width, wr.height),
+            };
+            let mut owned = CaptureObjects {
+                frame: session.manager.capture_output_region(
+                    0,
+                    &session.output,
+                    cx,
+                    cy,
+                    cw as i32,
+                    ch as i32,
+                    &qh,
+                    (),
+                ),
+                buffer: None,
+            };
 
-        // Phase 1: dispatch until the compositor has advertised its buffer formats, then pick one
-        // we can convert (preferring 32-bit). `buffer_done` marks the end of the list — a v3
-        // event, which is why the manager is bound at v3 exactly.
-        let (format, w, h, stride) = wait_for(
-            &session.conn,
-            &mut session.queue,
-            &mut session.state,
-            deadline,
-            "screencopy",
-            |s| GlassError::CaptureFailed(s.capture.no_formats()),
-            |s| s.capture.advertised(),
-        )?;
+            let now = Instant::now();
+            let (wait_budget, owner) = clamped_budget(deadline, CAPTURE_BUDGET, now);
+            let wait_deadline = now + wait_budget;
 
-        // Allocate a matching shm buffer and request the copy.
-        let mut pool = RawPool::new((stride * h) as usize, &session.state.shm)
-            .map_err(|e| GlassError::CaptureFailed(format!("shm pool: {e}")))?;
-        let buffer = pool.create_buffer(0, w as i32, h as i32, stride as i32, format, (), &qh);
-        owned.frame.copy(&buffer);
-        owned.buffer = Some(buffer);
+            // Phase 1: dispatch until the compositor has advertised its buffer formats, then pick one
+            // we can convert (preferring 32-bit). `buffer_done` marks the end of the list — a v3
+            // event, which is why the manager is bound at v3 exactly.
+            let (format, w, h, stride) = wait_for(
+                &session.conn,
+                &mut session.queue,
+                &mut session.state,
+                wait_deadline,
+                "screencopy",
+                |s| match owner {
+                    Whose::Caller => GlassError::caller_deadline_elapsed("capture"),
+                    Whose::Callee => GlassError::CaptureFailed(s.capture.no_formats()),
+                },
+                |s| s.capture.advertised(),
+            )?;
+            if deadline.has_passed() {
+                return Err(GlassError::caller_deadline_elapsed("capture"));
+            }
 
-        // Phase 2: dispatch until ready/failed. No live test reaches this call site's bound —
-        // only the pure `wait_for` tests stand behind a change here.
-        wait_for(
-            &session.conn,
-            &mut session.queue,
-            &mut session.state,
-            deadline,
-            "screencopy",
-            |_| {
-                GlassError::CaptureFailed(
-                    "screencopy: no ready event after the copy request".into(),
-                )
-            },
-            |s| s.capture.done.take(),
-        )?;
+            // Allocate a matching shm buffer and request the copy.
+            let mut pool = RawPool::new((stride * h) as usize, &session.state.shm)
+                .map_err(|e| GlassError::CaptureFailed(format!("shm pool: {e}")))?;
+            let buffer = pool.create_buffer(0, w as i32, h as i32, stride as i32, format, (), &qh);
+            owned.frame.copy(&buffer);
+            owned.buffer = Some(buffer);
 
-        // The captured buffer already matches the requested region, so no CPU crop.
-        let rgba = crate::pixels::to_rgba(pool.mmap(), format, w, h, stride)?;
-        Frame::new(w, h, rgba)
+            // Phase 2: dispatch until ready/failed. No live test reaches this call site's bound —
+            // only the pure `wait_for` tests stand behind a change here.
+            wait_for(
+                &session.conn,
+                &mut session.queue,
+                &mut session.state,
+                wait_deadline,
+                "screencopy",
+                |_| match owner {
+                    Whose::Caller => GlassError::caller_deadline_elapsed("capture"),
+                    Whose::Callee => GlassError::CaptureFailed(
+                        "screencopy: no ready event after the copy request".into(),
+                    ),
+                },
+                |s| s.capture.done.take(),
+            )?;
+
+            // The captured buffer already matches the requested region, so no CPU crop.
+            let rgba = crate::pixels::to_rgba(pool.mmap(), format, w, h, stride)?;
+            Frame::new(w, h, rgba)
+        })
+    }
+
+    fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
+        self.capture_window_by(id, region, Deadline::UNBOUNDED)
+    }
+
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
     }
 
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        session.time = session.time.wrapping_add(1);
-        let t = session.time;
-        // Pointer motion is absolute over the OUTPUT; map window-relative coords
-        // to output coords by the active window's rect origin.
-        let (w, h) = session.output_size;
-        let (ox, oy) = (session.active_rect.x, session.active_rect.y);
-        let ax = |x: i32| (ox + x).max(0) as u32;
-        let ay = |y: i32| (oy + y).max(0) as u32;
-        let vp = session.pointer.clone();
-        let kb = session.keyboard.clone();
-        // Flush pending requests and let the compositor + Xwayland process pointer
-        // motion (enter/position) before the next event lands.
-        let settle = |s: &mut ActiveSession| -> Result<()> {
-            sync_session(s, "input settle")?;
-            std::thread::sleep(Duration::from_millis(8));
-            Ok(())
-        };
-        // Position the pointer at a window-relative point so the *next* button/axis
-        // routes to the window under it. sway (re)evaluates pointer focus only on
-        // motion, never on elapsed time: a surface that maps and settles under a
-        // now-stationary cursor never receives `enter`, and a one-shot button/axis
-        // sent to it is then silently dropped. So move there, let the surface settle,
-        // then re-assert with a 1px delta to force a fresh focus evaluation now that
-        // it is ready. Without this, fast back-to-back launch+click on a loaded host
-        // intermittently loses the very first click/scroll (the Wayland flake).
-        let position = |s: &mut ActiveSession, x: i32, y: i32| -> Result<()> {
-            vp.motion_absolute(t, ax(x), ay(y), w, h);
-            vp.frame();
-            settle(s)?;
-            vp.motion_absolute(t, nudge_x(ax(x), w), ay(y), w, h);
-            vp.frame();
-            vp.motion_absolute(t, ax(x), ay(y), w, h);
-            vp.frame();
-            settle(s)
-        };
-        match *event {
-            PointerEvent::Move { x, y } => {
-                position(session, x, y)?;
-            }
-            PointerEvent::Click {
-                x,
-                y,
-                button,
-                count,
-                ref modifiers,
-            } => {
-                position(session, x, y)?;
-                let mask = modifier_mask(modifiers);
-                if mask != 0 {
-                    upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
-                    kb.modifiers(mask, 0, 0, 0);
+        self.send_pointer_by(event, Deadline::UNBOUNDED)
+    }
+
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        run_wayland_call_by(deadline, "pointer input", || {
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            session.time = session.time.wrapping_add(1);
+            let t = session.time;
+            // Pointer motion is absolute over the OUTPUT; map window-relative coords
+            // to output coords by the active window's rect origin.
+            let (w, h) = session.output_size;
+            let (ox, oy) = (session.active_rect.x, session.active_rect.y);
+            let ax = |x: i32| (ox + x).max(0) as u32;
+            let ay = |y: i32| (oy + y).max(0) as u32;
+            let vp = session.pointer.clone();
+            let kb = session.keyboard.clone();
+            // Flush pending requests and let the compositor + Xwayland process pointer
+            // motion (enter/position) before the next event lands.
+            let settle = |s: &mut ActiveSession| -> Result<()> {
+                sync_session_by(s, "input settle", deadline)?;
+                input_settle_by(deadline)
+            };
+            // Position the pointer at a window-relative point so the *next* button/axis
+            // routes to the window under it. sway (re)evaluates pointer focus only on
+            // motion, never on elapsed time: a surface that maps and settles under a
+            // now-stationary cursor never receives `enter`, and a one-shot button/axis
+            // sent to it is then silently dropped. So move there, let the surface settle,
+            // then re-assert with a 1px delta to force a fresh focus evaluation now that
+            // it is ready. Without this, fast back-to-back launch+click on a loaded host
+            // intermittently loses the very first click/scroll (the Wayland flake).
+            let position = |s: &mut ActiveSession, x: i32, y: i32| -> Result<()> {
+                if deadline.has_passed() {
+                    return Err(GlassError::caller_deadline_elapsed("pointer input"));
                 }
-                let mut held = Held {
-                    modifiers: mask != 0,
-                    ..Held::default()
-                };
-                let b = evdev_button(button);
-                let clicks = |session: &mut ActiveSession, held: &mut Held| -> Result<()> {
-                    for _ in 0..count.max(1) {
-                        vp.button(t, b, ButtonState::Pressed);
-                        vp.frame();
-                        held.button = Some(b);
-                        settle(session)?;
-                        vp.button(t, b, ButtonState::Released);
-                        vp.frame();
-                        held.button = None;
-                        settle(session)?;
+                vp.motion_absolute(t, ax(x), ay(y), w, h);
+                vp.frame();
+                settle(s)?;
+                vp.motion_absolute(t, nudge_x(ax(x), w), ay(y), w, h);
+                vp.frame();
+                vp.motion_absolute(t, ax(x), ay(y), w, h);
+                vp.frame();
+                settle(s)
+            };
+            match *event {
+                PointerEvent::Move { x, y } => {
+                    position(session, x, y)?;
+                }
+                PointerEvent::Click {
+                    x,
+                    y,
+                    button,
+                    count,
+                    ref modifiers,
+                } => {
+                    position(session, x, y)?;
+                    let mask = modifier_mask(modifiers);
+                    if mask != 0 {
+                        upload_keymap_by(
+                            session,
+                            &kb,
+                            &crate::keyboard::build_keymap(&[]),
+                            deadline,
+                        )?;
+                        kb.modifiers(mask, 0, 0, 0);
                     }
-                    Ok(())
-                };
-                let outcome = clicks(session, &mut held);
-                // The same release on both paths: what ends the modifier on a click that worked is
-                // what has to end it on one that did not.
-                held.release(session);
-                outcome?;
-            }
-            PointerEvent::Drag {
-                from_x,
-                from_y,
-                to_x,
-                to_y,
-                button,
-                ref modifiers,
-                duration_ms,
-            } => {
-                let gesture =
-                    glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
-                let mut sink = WaylandDragSink {
-                    s: &mut *session,
-                    w,
-                    h,
-                    ox,
-                    oy,
-                    b: evdev_button(button),
-                    mask: modifier_mask(modifiers),
-                    held: Held::default(),
-                };
-                glass_core::run_drag(&mut sink, &gesture)?;
-            }
-            PointerEvent::Scroll {
-                x,
-                y,
-                dx,
-                dy,
-                ref modifiers,
-            } => {
-                // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
-                // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
-                let mut sink = WaylandScrollSink {
-                    s: &mut *session,
-                    w,
-                    h,
-                    ox,
-                    oy,
+                    let mut held = Held {
+                        modifiers: mask != 0,
+                        ..Held::default()
+                    };
+                    let b = evdev_button(button);
+                    let clicks = |session: &mut ActiveSession, held: &mut Held| -> Result<()> {
+                        for _ in 0..count.max(1) {
+                            if deadline.has_passed() {
+                                return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                            }
+                            vp.button(t, b, ButtonState::Pressed);
+                            vp.frame();
+                            held.button = Some(b);
+                            settle(session)?;
+                            if deadline.has_passed() {
+                                return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                            }
+                            vp.button(t, b, ButtonState::Released);
+                            vp.frame();
+                            held.button = None;
+                            settle(session)?;
+                        }
+                        Ok(())
+                    };
+                    let outcome = clicks(session, &mut held);
+                    // The same release on both paths: what ends the modifier on a click that worked is
+                    // what has to end it on one that did not.
+                    held.release(session);
+                    outcome?;
+                }
+                PointerEvent::Drag {
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                    button,
+                    ref modifiers,
+                    duration_ms,
+                } => {
+                    let gesture =
+                        glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
+                    let mut sink = WaylandDragSink {
+                        s: &mut *session,
+                        w,
+                        h,
+                        ox,
+                        oy,
+                        b: evdev_button(button),
+                        mask: modifier_mask(modifiers),
+                        held: Held::default(),
+                        deadline,
+                    };
+                    glass_core::run_drag_by(&mut sink, &gesture, deadline)?;
+                }
+                PointerEvent::Scroll {
                     x,
                     y,
                     dx,
                     dy,
-                    mask: modifier_mask(modifiers),
-                    held: Held::default(),
-                };
-                glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
-            }
-            PointerEvent::Gesture { .. } => {
-                return Err(crate::unsupported_multi_touch());
-            }
-        }
-        session
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-        Ok(())
-    }
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-        use glass_core::keys::parse_chord;
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        let kb = session.keyboard.clone();
-        match event {
-            KeyEvent::Text(text) => {
-                // Upload one keymap per chunk (each distinct keysym at its own keycode), then
-                // tap the planned keycode for every character. The keymap stays fixed while a
-                // chunk's key events are delivered, so a client that resolves keysyms lazily
-                // (e.g. an X11 app under Xwayland querying the keymap per press) can't read a
-                // neighbouring character by racing a mid-string keymap swap — the flake that a
-                // fresh keymap on the *same* keycode per character exhibited under load. Each
-                // tap self-commits (roundtrip + settle), which also paces a heavy client; the
-                // one keymap upload per chunk replaces one upload per character. See
-                // crate::keyboard::plan_type.
-                for chunk in crate::keyboard::plan_type(text) {
-                    upload_keymap(
-                        &mut *session,
-                        &kb,
-                        &crate::keyboard::build_keymap(&chunk.keysyms),
-                    )?;
-                    for kc in chunk.taps {
-                        tap(&mut *session, &kb, kc)?;
-                    }
+                    ref modifiers,
+                } => {
+                    // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
+                    // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
+                    let mut sink = WaylandScrollSink {
+                        s: &mut *session,
+                        w,
+                        h,
+                        ox,
+                        oy,
+                        x,
+                        y,
+                        dx,
+                        dy,
+                        mask: modifier_mask(modifiers),
+                        held: Held::default(),
+                        deadline,
+                    };
+                    glass_core::run_scroll_by(&mut sink, !modifiers.is_empty(), deadline)?;
+                }
+                PointerEvent::Gesture { .. } => {
+                    return Err(crate::unsupported_multi_touch());
                 }
             }
-            KeyEvent::Chord(c) => {
-                let (mods, keysym) = parse_chord(c)?; // validates before any traffic
-                let mut sink = WaylandChordSink {
-                    s: &mut *session,
-                    mask: modifier_mask(&mods),
-                    keysym,
-                    held: Held::default(),
-                };
-                glass_core::run_chord(&mut sink)?;
+            session
+                .conn
+                .flush()
+                .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+            Ok(())
+        })
+    }
+    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+        self.send_key_by(event, Deadline::UNBOUNDED)
+    }
+
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        run_wayland_call_by(deadline, "key input", || {
+            use glass_core::keys::parse_chord;
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            let kb = session.keyboard.clone();
+            match event {
+                KeyEvent::Text(text) => {
+                    // Upload one keymap per chunk (each distinct keysym at its own keycode), then
+                    // tap the planned keycode for every character. The keymap stays fixed while a
+                    // chunk's key events are delivered, so a client that resolves keysyms lazily
+                    // (e.g. an X11 app under Xwayland querying the keymap per press) can't read a
+                    // neighbouring character by racing a mid-string keymap swap — the flake that a
+                    // fresh keymap on the *same* keycode per character exhibited under load. Each
+                    // tap self-commits (roundtrip + settle), which also paces a heavy client; the
+                    // one keymap upload per chunk replaces one upload per character. See
+                    // crate::keyboard::plan_type.
+                    let mut characters = text.chars();
+                    for chunk in crate::keyboard::plan_type(text) {
+                        upload_keymap_by(
+                            &mut *session,
+                            &kb,
+                            &crate::keyboard::build_keymap(&chunk.keysyms),
+                            deadline,
+                        )?;
+                        let chunk_text: String =
+                            characters.by_ref().take(chunk.taps.len()).collect();
+                        let mut sink = WaylandTypeSink {
+                            s: &mut *session,
+                            kb: &kb,
+                            taps: chunk.taps.into_iter(),
+                            deadline,
+                        };
+                        run_wayland_type_by(&mut sink, &chunk_text, Duration::ZERO, deadline)?;
+                    }
+                }
+                KeyEvent::Chord(c) => {
+                    let (mods, keysym) = parse_chord(c)?; // validates before any traffic
+                    let mut sink = WaylandChordSink {
+                        s: &mut *session,
+                        mask: modifier_mask(&mods),
+                        keysym,
+                        held: Held::default(),
+                        deadline,
+                    };
+                    glass_core::run_chord_by(&mut sink, deadline)?;
+                }
             }
-        }
-        session
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-        Ok(())
+            session
+                .conn
+                .flush()
+                .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+            Ok(())
+        })
     }
 
     fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
@@ -2265,6 +2479,103 @@ mod pure_tests {
     /// Room for a wait that answers at once to be scheduled on a runner busy with the sway-backed
     /// tests, which assert on a fraction of it.
     const PROMPT_WAIT_BUDGET: Duration = Duration::from_secs(1);
+
+    #[derive(Default)]
+    struct RecordingTypeSink {
+        characters: Vec<char>,
+    }
+
+    impl glass_core::TypeSink for RecordingTypeSink {
+        fn character(&mut self, character: char) -> Result<()> {
+            self.characters.push(character);
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spent_input_deadline_dispatches_no_backend_events() {
+        let mut recorded_events = Vec::new();
+        let deadline = glass_core::Deadline::at(Instant::now() - Duration::from_millis(1));
+
+        let error = run_wayland_call_by(deadline, "pointer input", || {
+            recorded_events.push("motion");
+            Ok(())
+        })
+        .expect_err("spent input must be rejected before dispatch");
+
+        assert!(recorded_events.is_empty());
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn short_typing_deadline_stops_before_all_characters() {
+        let requested_text = "abcd";
+        let mut sink = RecordingTypeSink::default();
+
+        let error = run_wayland_type_by(
+            &mut sink,
+            requested_text,
+            Duration::ZERO,
+            glass_core::Deadline::from_millis(5),
+        )
+        .expect_err("typing must stop when the shared deadline expires");
+
+        assert!(sink.characters.len() < requested_text.chars().count());
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn capture_returning_after_the_deadline_is_not_success() {
+        let capture_error =
+            run_wayland_call_by(glass_core::Deadline::from_millis(1), "capture", || {
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(())
+            })
+            .expect_err("a late capture must not return success");
+
+        assert_eq!(capture_error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            capture_error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn caller_deadline_clamps_compositor_wait() {
+        let now = Instant::now();
+        let caller_remaining = Duration::from_millis(2);
+
+        let (observed_wait, owner) = clamped_budget(
+            glass_core::Deadline::at(now + caller_remaining),
+            COMPOSITOR_SYNC_BUDGET,
+            now,
+        );
+
+        assert!(observed_wait <= caller_remaining);
+        assert_eq!(owner, glass_core::Whose::Caller);
+    }
+
+    #[test]
+    fn caller_deadline_clamps_input_settle() {
+        let now = Instant::now();
+        let caller_remaining = Duration::from_millis(2);
+
+        let (observed_sleep, owner) = clamped_budget(
+            glass_core::Deadline::at(now + caller_remaining),
+            INPUT_SETTLE,
+            now,
+        );
+
+        assert!(observed_sleep <= caller_remaining);
+        assert_eq!(owner, glass_core::Whose::Caller);
+    }
 
     /// [`wait_for`] over a socket with nothing behind it, answering a question the peer is never
     /// told about — so only the deadline can end it. `speak` acts as the peer and hands back the
@@ -3840,6 +4151,7 @@ mod session_tests {
                 b: evdev_button(glass_core::MouseButton::Left),
                 mask: 0,
                 held: Held::default(),
+                deadline: Deadline::UNBOUNDED,
             };
             // Placed first, as `run_drag` does: sway routes a button to the surface its pointer
             // is over, and re-evaluates that only on motion.

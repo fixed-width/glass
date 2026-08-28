@@ -11,7 +11,7 @@
 
 use glass_core::keys::Modifier;
 use glass_core::platform::{KeyEvent, MouseButton, PointerEvent};
-use glass_core::{GlassError, Result};
+use glass_core::{Deadline, GlassError, Result};
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
@@ -305,146 +305,168 @@ impl glass_core::TypeSink for WindowsTypeSink {
     }
 }
 
-/// Inject a pointer event into the active window. Coordinates are window-relative.
-pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<()> {
-    // `Gesture` (multi-touch) can never succeed on this backend; reject it before
-    // `focus_window`/`extended_frame_bounds`, so it fails fast with `Unsupported` and without
-    // raising the target window or masking the call-shape error behind an unrelated
-    // frame-bounds `Backend` error (mirrors the macOS backend's early check). The
-    // `PointerEvent::Gesture` match arm below stays for exhaustiveness.
-    if matches!(event, PointerEvent::Gesture { .. }) {
-        return Err(crate::unsupported_multi_touch());
-    }
-    let hwnd = raw_to_hwnd(active_hwnd);
-    // Raise+focus first so input lands on the target (best-effort, like the probe).
-    let _ = crate::windows::focus_window(hwnd);
-
-    let fb = extended_frame_bounds(hwnd)
-        .ok_or_else(|| GlassError::Backend("no window frame bounds for input".into()))?;
-    let origin = (fb.left, fb.top);
-
-    // Virtual-screen metrics, read once.
-    // SAFETY: GetSystemMetrics is a pure query of system geometry.
-    let (v0, vs) = unsafe {
-        (
-            (
-                GetSystemMetrics(SM_XVIRTUALSCREEN),
-                GetSystemMetrics(SM_YVIRTUALSCREEN),
-            ),
-            (
-                GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                GetSystemMetrics(SM_CYVIRTUALSCREEN),
-            ),
-        )
-    };
-    let to_norm =
-        |x: i32, y: i32| dpi::screen_to_normalized(v0, vs, dpi::window_to_screen(origin, (x, y)));
-
-    match *event {
-        PointerEvent::Move { x, y } => {
-            let (nx, ny) = to_norm(x, y);
-            send(&[mouse(nx, ny, MOUSEEVENTF_MOVE | ABS)])?;
-        }
-        PointerEvent::Click {
-            x,
-            y,
-            button,
-            count,
-            ref modifiers,
-        } => {
-            let (nx, ny) = to_norm(x, y);
-            let (down, up) = button_flags(button);
-            let mut inputs = Vec::new();
-            for m in modifiers {
-                inputs.push(key_vk(modifier_vk(*m), false));
-            }
-            inputs.push(mouse(nx, ny, MOUSEEVENTF_MOVE | ABS));
-            for _ in 0..count.max(1) {
-                inputs.push(mouse(nx, ny, down | ABS));
-                inputs.push(mouse(nx, ny, up | ABS));
-            }
-            for m in modifiers.iter().rev() {
-                inputs.push(key_vk(modifier_vk(*m), true));
-            }
-            send(&inputs)?;
-        }
-        PointerEvent::Drag {
-            from_x,
-            from_y,
-            to_x,
-            to_y,
-            button,
-            ref modifiers,
-            duration_ms,
-        } => {
-            let gesture =
-                glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
-            let (down, up) = button_flags(button);
-            let mut sink = WindowsDragSink {
-                origin,
-                v0,
-                vs,
-                down,
-                up,
-                mods: modifiers,
-                last: (0, 0),
-            };
-            glass_core::run_drag(&mut sink, &gesture)?;
-        }
-        PointerEvent::Scroll {
-            x,
-            y,
-            dx,
-            dy,
-            ref modifiers,
-        } => {
-            let (nx, ny) = to_norm(x, y);
-            let mod_vks: Vec<VIRTUAL_KEY> = modifiers.iter().map(|&m| modifier_vk(m)).collect();
-            // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead of
-            // bursting modifier+wheel+release into one — see glass_core::run_scroll.
-            let mut sink = WindowsScrollSink {
-                nx,
-                ny,
-                dx,
-                dy,
-                mod_vks,
-            };
-            glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
-        }
-        PointerEvent::Gesture { .. } => {
+pub(crate) fn send_pointer_by(
+    active_hwnd: isize,
+    event: &PointerEvent,
+    deadline: Deadline,
+) -> Result<()> {
+    crate::run_windows_call_by(deadline, "pointer input", || {
+        // `Gesture` (multi-touch) can never succeed on this backend; reject it before
+        // `focus_window`/`extended_frame_bounds`, so it fails fast with `Unsupported` and without
+        // raising the target window or masking the call-shape error behind an unrelated
+        // frame-bounds `Backend` error (mirrors the macOS backend's early check). The
+        // `PointerEvent::Gesture` match arm below stays for exhaustiveness.
+        if matches!(event, PointerEvent::Gesture { .. }) {
             return Err(crate::unsupported_multi_touch());
         }
-    }
-    Ok(())
+        let hwnd = raw_to_hwnd(active_hwnd);
+        // Raise+focus first so input lands on the target (best-effort, like the probe).
+        let _ = crate::windows::focus_window(hwnd);
+        if deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed("pointer input"));
+        }
+
+        let fb = extended_frame_bounds(hwnd)
+            .ok_or_else(|| GlassError::Backend("no window frame bounds for input".into()))?;
+        if deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed("pointer input"));
+        }
+        let origin = (fb.left, fb.top);
+
+        // Virtual-screen metrics, read once.
+        // SAFETY: GetSystemMetrics is a pure query of system geometry.
+        let (v0, vs) = unsafe {
+            (
+                (
+                    GetSystemMetrics(SM_XVIRTUALSCREEN),
+                    GetSystemMetrics(SM_YVIRTUALSCREEN),
+                ),
+                (
+                    GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                ),
+            )
+        };
+        let to_norm = |x: i32, y: i32| {
+            dpi::screen_to_normalized(v0, vs, dpi::window_to_screen(origin, (x, y)))
+        };
+
+        match *event {
+            PointerEvent::Move { x, y } => {
+                let (nx, ny) = to_norm(x, y);
+                if deadline.has_passed() {
+                    return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                }
+                send(&[mouse(nx, ny, MOUSEEVENTF_MOVE | ABS)])?;
+            }
+            PointerEvent::Click {
+                x,
+                y,
+                button,
+                count,
+                ref modifiers,
+            } => {
+                let (nx, ny) = to_norm(x, y);
+                let (down, up) = button_flags(button);
+                let mut inputs = Vec::new();
+                for m in modifiers {
+                    inputs.push(key_vk(modifier_vk(*m), false));
+                }
+                inputs.push(mouse(nx, ny, MOUSEEVENTF_MOVE | ABS));
+                for _ in 0..count.max(1) {
+                    inputs.push(mouse(nx, ny, down | ABS));
+                    inputs.push(mouse(nx, ny, up | ABS));
+                }
+                for m in modifiers.iter().rev() {
+                    inputs.push(key_vk(modifier_vk(*m), true));
+                }
+                if deadline.has_passed() {
+                    return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                }
+                send(&inputs)?;
+            }
+            PointerEvent::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                button,
+                ref modifiers,
+                duration_ms,
+            } => {
+                let gesture =
+                    glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
+                let (down, up) = button_flags(button);
+                let mut sink = WindowsDragSink {
+                    origin,
+                    v0,
+                    vs,
+                    down,
+                    up,
+                    mods: modifiers,
+                    last: (0, 0),
+                };
+                glass_core::run_drag_by(&mut sink, &gesture, deadline)?;
+            }
+            PointerEvent::Scroll {
+                x,
+                y,
+                dx,
+                dy,
+                ref modifiers,
+            } => {
+                let (nx, ny) = to_norm(x, y);
+                let mod_vks: Vec<VIRTUAL_KEY> = modifiers.iter().map(|&m| modifier_vk(m)).collect();
+                // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead of
+                // bursting modifier+wheel+release into one — see glass_core::run_scroll.
+                let mut sink = WindowsScrollSink {
+                    nx,
+                    ny,
+                    dx,
+                    dy,
+                    mod_vks,
+                };
+                glass_core::run_scroll_by(&mut sink, !modifiers.is_empty(), deadline)?;
+            }
+            PointerEvent::Gesture { .. } => {
+                return Err(crate::unsupported_multi_touch());
+            }
+        }
+        Ok(())
+    })
 }
 
-/// Inject a key event into the active window.
-pub(crate) fn send_key(active_hwnd: isize, event: &KeyEvent) -> Result<()> {
-    let hwnd = raw_to_hwnd(active_hwnd);
-    let _ = crate::windows::focus_window(hwnd);
+pub(crate) fn send_key_by(active_hwnd: isize, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+    crate::run_windows_call_by(deadline, "key input", || {
+        let hwnd = raw_to_hwnd(active_hwnd);
+        let _ = crate::windows::focus_window(hwnd);
+        if deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed("key input"));
+        }
 
-    match event {
-        KeyEvent::Text(s) => {
-            // One SendInput per character, paced by an inter-character dwell. Injecting the
-            // whole string faster than the target drains it races a downstream OS bug that
-            // collapses a run of characters to the last one — see glass_core::run_type.
-            // (Empty text is a clean Ok: no characters to emit.)
-            let mut sink = WindowsTypeSink;
-            glass_core::run_type(&mut sink, s, type_dwell())?;
+        match event {
+            KeyEvent::Text(s) => {
+                // One SendInput per character, paced by an inter-character dwell. Injecting the
+                // whole string faster than the target drains it races a downstream OS bug that
+                // collapses a run of characters to the last one — see glass_core::run_type.
+                // (Empty text is a clean Ok: no characters to emit.)
+                let mut sink = WindowsTypeSink;
+                crate::run_windows_type_by(&mut sink, s, type_dwell(), deadline)?;
+            }
+            KeyEvent::Chord(s) => {
+                let (mods, keysym) = glass_core::keys::parse_chord(s)?;
+                let vk = keysym_to_vk(keysym).ok_or_else(|| {
+                    GlassError::InvalidKey(format!("key in chord {s:?} has no Windows mapping"))
+                })?;
+                let mod_vks: Vec<VIRTUAL_KEY> = mods.iter().map(|&m| modifier_vk(m)).collect();
+                // Shared, frame-aware sequencing: hold the modifier across the key's frame instead of
+                // bursting the whole chord into one — see glass_core::run_chord.
+                let mut sink = WindowsChordSink { mod_vks, vk };
+                glass_core::run_chord_by(&mut sink, deadline)?;
+            }
         }
-        KeyEvent::Chord(s) => {
-            let (mods, keysym) = glass_core::keys::parse_chord(s)?;
-            let vk = keysym_to_vk(keysym).ok_or_else(|| {
-                GlassError::InvalidKey(format!("key in chord {s:?} has no Windows mapping"))
-            })?;
-            let mod_vks: Vec<VIRTUAL_KEY> = mods.iter().map(|&m| modifier_vk(m)).collect();
-            // Shared, frame-aware sequencing: hold the modifier across the key's frame instead of
-            // bursting the whole chord into one — see glass_core::run_chord.
-            let mut sink = WindowsChordSink { mod_vks, vk };
-            glass_core::run_chord(&mut sink)?;
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// The virtual-key for a chord modifier.
@@ -486,15 +508,16 @@ mod tests {
 
     // A gesture must fail fast with the clean `Unsupported` before any window lookup: a dummy
     // hwnd (no frame bounds) still yields the backend-named message, not a `Backend` error —
-    // this is the behavior the early check in `send_pointer` guarantees.
+    // this is the behavior the early check in `send_pointer_by` guarantees.
     #[test]
     fn gesture_fails_fast_with_unsupported_before_frame_bounds() {
-        let err = send_pointer(
+        let err = send_pointer_by(
             0,
             &PointerEvent::Gesture {
                 pointers: vec![],
                 duration_ms: 0,
             },
+            Deadline::UNBOUNDED,
         );
         assert!(
             matches!(&err, Err(GlassError::Unsupported(_))),

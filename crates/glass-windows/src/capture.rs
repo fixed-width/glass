@@ -12,10 +12,11 @@
 //! unreliable for opaque windows and is normalized to opaque (255) downstream by
 //! [`crate::pixels::bgra_to_rgba`], which also does the BGRA -> RGBA swizzle.
 
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::Instant;
 
 use glass_core::frame::{Frame, Region};
-use glass_core::{GlassError, Result};
+use glass_core::{Deadline, GlassError, Result, Whose};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::IsIconic;
@@ -70,7 +71,7 @@ impl GraphicsCaptureApiHandler for OneShot {
 }
 
 /// Grab one BGRA frame for `hwnd` via WGC. Returns (bgra, width, height).
-fn wgc_one_frame(hwnd: HWND) -> std::result::Result<FramePayload, String> {
+fn wgc_one_frame_by(hwnd: HWND, deadline: Deadline) -> Result<FramePayload> {
     let (tx, rx): (Sender<FramePayload>, Receiver<FramePayload>) = channel();
 
     let window = Window::from_raw_hwnd(hwnd.0);
@@ -85,36 +86,53 @@ fn wgc_one_frame(hwnd: HWND) -> std::result::Result<FramePayload, String> {
         tx,
     );
 
-    let control =
-        OneShot::start_free_threaded(settings).map_err(|e| format!("start capture: {e}"))?;
+    let control = OneShot::start_free_threaded(settings)
+        .map_err(|e| GlassError::CaptureFailed(format!("start capture: {e}")))?;
     // Wait for the first frame; a missing display/permission stalls here, so cap it.
-    let result = rx.recv_timeout(FIRST_FRAME_TIMEOUT);
+    let (wait, owner) = deadline.budget(FIRST_FRAME_TIMEOUT, Instant::now());
+    let result = rx.recv_timeout(wait);
     // Tear the capture thread down on EVERY path. On timeout/disconnect the handler
     // never signalled stop, so without this the capture thread (+ its D3D11 device and
     // WGC session) detaches and loops in GetMessageW forever — CaptureControl has no Drop.
     // stop() sets `halt`, posts WM_QUIT until the thread accepts it (special-casing a dead
     // thread), then joins — so it cleanly unblocks a thread waiting on frames that never come.
     let _ = control.stop();
-    let got = result.map_err(|e| format!("WGC delivered no frame: {e}"))?;
-    Ok(got)
+    match result {
+        Ok(got) => Ok(got),
+        Err(RecvTimeoutError::Timeout) if owner == Whose::Caller => {
+            Err(GlassError::caller_deadline_elapsed("capture"))
+        }
+        Err(error) => Err(GlassError::CaptureFailed(format!(
+            "WGC delivered no frame: {error}"
+        ))),
+    }
 }
 
 /// Capture `hwnd` as an RGBA `Frame`, optionally cropped (window-relative).
-pub(crate) fn capture_window(hwnd: HWND, region: Option<&Region>) -> Result<Frame> {
-    // SAFETY: IsIconic is a pure query on an HWND with no preconditions; it
-    // returns a BOOL and touches no memory we own.
-    if unsafe { IsIconic(hwnd) }.as_bool() {
-        return Err(GlassError::CaptureFailed(
-            "target window is minimized; WGC returns a stale/blank frame — restore it first".into(),
-        ));
-    }
+pub(crate) fn capture_window_by(
+    hwnd: HWND,
+    region: Option<&Region>,
+    deadline: Deadline,
+) -> Result<Frame> {
+    crate::run_windows_call_by(deadline, "capture", || {
+        // SAFETY: IsIconic is a pure query on an HWND with no preconditions; it
+        // returns a BOOL and touches no memory we own.
+        if unsafe { IsIconic(hwnd) }.as_bool() {
+            return Err(GlassError::CaptureFailed(
+                "target window is minimized; WGC returns a stale/blank frame — restore it first"
+                    .into(),
+            ));
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed("capture"));
+        }
 
-    let (mut bgra, w, h) = wgc_one_frame(hwnd)
-        .map_err(|e| GlassError::CaptureFailed(format!("WGC capture failed: {e}")))?;
-    crate::pixels::bgra_to_rgba(&mut bgra);
-    let frame = Frame::new(w, h, bgra)?; // validates len; propagates CaptureFailed on mismatch
-    match region {
-        Some(r) => frame.crop(r), // propagates InvalidRegion; never clamps
-        None => Ok(frame),
-    }
+        let (mut bgra, w, h) = wgc_one_frame_by(hwnd, deadline)?;
+        crate::pixels::bgra_to_rgba(&mut bgra);
+        let frame = Frame::new(w, h, bgra)?; // validates len; propagates CaptureFailed on mismatch
+        match region {
+            Some(r) => frame.crop(r), // propagates InvalidRegion; never clamps
+            None => Ok(frame),
+        }
+    })
 }
