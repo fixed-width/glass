@@ -2805,6 +2805,44 @@ fn invalid_sequence_accepts_exact_byte_limit() {
     assert!(do_actions(&mut g, &a).is_ok());
 }
 
+fn mixed_utf8_do_args_with_compact_len(target: usize) -> Vec<u8> {
+    let mut value = serde_json::json!({
+        "actions": [{
+            "action": "click",
+            "x": 1,
+            "y": 1,
+            "ignored_action_bytes": "🙂"
+        }],
+        "ignored_top_level_bytes": "漢"
+    });
+    let base = serde_json::to_vec(&value).unwrap().len();
+    assert!(base <= target);
+    value["ignored_top_level_bytes"] =
+        serde_json::Value::String(format!("漢{}", "x".repeat(target - base)));
+    let compact = serde_json::to_vec(&value).unwrap();
+    assert_eq!(compact.len(), target);
+    compact
+}
+
+#[test]
+fn exact_mixed_utf8_argument_limit_is_checked_before_actuation() {
+    for (target, accepted) in [(MAX_ARGUMENT_BYTES, true), (MAX_ARGUMENT_BYTES + 1, false)] {
+        let compact = mixed_utf8_do_args_with_compact_len(target);
+        let args: DoArgs = serde_json::from_slice(&compact).unwrap();
+        assert_eq!(args.encoded_argument_bytes, target);
+
+        let (mut glass, _, events) = deadline_glass(DeadlineBehavior::Normal, vec![]);
+        let outcome = do_actions(&mut glass, &args);
+        if accepted {
+            assert!(outcome.is_ok());
+            assert_eq!(*events.lock().unwrap(), vec!["click(1,1)"]);
+        } else {
+            assert_eq!(error_code(outcome.unwrap_err()), "invalid_sequence");
+            assert!(events.lock().unwrap().is_empty());
+        }
+    }
+}
+
 #[test]
 fn invalid_sequence_rejects_zero_and_over_max_timeout() {
     let mut g = started(FakePlatform::new(10, 10));
