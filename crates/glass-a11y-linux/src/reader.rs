@@ -47,7 +47,7 @@ impl Accessibility for LinuxA11y {
         let ctx = ctx.clone();
         let target = target.clone();
         let text = text.to_string();
-        BUS.set_value(move || run_set_value(&ctx, &target, &text))
+        set_value_with_thread(&BUS, ctx, move |ctx| run_set_value(&ctx, &target, &text))
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
@@ -57,6 +57,14 @@ impl Accessibility for LinuxA11y {
         BUS.invoke(ctx.deadline, move || run_invoke(&ctx, &target))
             .map(|()| None)
     }
+}
+
+fn set_value_with_thread(
+    thread: &A11yThread,
+    ctx: AxContext,
+    job: impl FnOnce(AxContext) -> Result<()> + Send + 'static,
+) -> Result<()> {
+    thread.set_value(ctx.deadline, move || job(ctx))
 }
 
 fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
@@ -1023,6 +1031,34 @@ mod tests {
     use atspi_common::ObjectRef;
 
     use super::*;
+
+    #[test]
+    fn linux_set_value_forwards_ax_context_deadline_to_a11y_thread() {
+        let ctx = AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(20),
+        };
+        let thread = A11yThread::new("test a11y bus", Duration::from_secs(1));
+
+        let error = set_value_with_thread(&thread, ctx, |_| {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(!error.invoke_fallback_eligible());
+        assert!(!error.set_value_failed_after_writing());
+    }
 
     #[test]
     fn text_roles_use_native_focus_and_other_controls_activate() {

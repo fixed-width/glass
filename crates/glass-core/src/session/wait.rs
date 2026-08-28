@@ -438,9 +438,9 @@ impl Glass {
     pub fn wait_for_element_by(
         &mut self,
         params: &WaitElementParams,
-        caller: Deadline,
+        sequence_deadline: Deadline,
     ) -> Result<WaitElementOutcome> {
-        if caller.has_passed() {
+        if sequence_deadline.has_passed() {
             return Err(GlassError::deadline_not_started("wait for element"));
         }
         self.require_active()?; // fail fast; a11y_snapshot rechecks inside the loop
@@ -448,15 +448,15 @@ impl Glass {
         // Every read this wait makes carries when the wait stops: the tick is synchronous, so the
         // loop cannot take back a read a reader has started (glass#338).
         let (effective_duration, whose) =
-            caller.budget(std::time::Duration::from_millis(params.timeout_ms), started);
-        let deadline = Deadline::at(started + effective_duration);
+            sequence_deadline.budget(std::time::Duration::from_millis(params.timeout_ms), started);
+        let action_deadline = Deadline::at(started + effective_duration);
         // Before the first walk, not after: a change landing in that gap is announced to nobody,
         // and the wait then burns its whole budget on a condition that already holds.
         //
         // An interval of 0 means "re-read as fast as you can", which never pauses — so there is
         // nothing for a signal to save, and subscribing would only cost a round-trip.
         let mut signal = (params.interval_ms > 0)
-            .then(|| self.subscribe_a11y_changes(deadline))
+            .then(|| self.subscribe_a11y_changes(action_deadline))
             .flatten();
         // Subscribing spends the caller's budget, so the poll loop gets what is left. That
         // bounds the polling, not the call: a reader that does not honour `deadline` bounds its
@@ -470,16 +470,21 @@ impl Glass {
         // on such a backend failed instead of answering `{matched:false}` (glass#338).
         let mut unread: Option<GlassError> = None;
         let mut saw_a_tree = false;
-        // The first read carries no deadline: `poll_until_with_pause` guarantees one tick, so a
-        // wait must look once, and `timeout_ms: 0` ("check now") would otherwise error against a
-        // healthy app nobody consulted. Reads after it carry the bound.
+        // `poll_until_with_pause` guarantees one tick. For `timeout_ms: 0` ("check now"), that
+        // immediate read uses the live sequence deadline rather than the already-spent action
+        // deadline. Reads after it carry the action bound.
+        let first_read_deadline = if params.timeout_ms == 0 {
+            sequence_deadline
+        } else {
+            action_deadline
+        };
         let mut looked = false;
         let outcome = crate::poll::poll_until_with_pause(
             params.interval_ms,
             remaining,
             |d| {
                 let paused_at = std::time::Instant::now();
-                let pause_budget = deadline.remaining().unwrap_or(d).min(d);
+                let pause_budget = action_deadline.remaining().unwrap_or(d).min(d);
                 let read_now = match signal.as_mut() {
                     Some(s) => match s.wait(pause_budget) {
                         ChangeWait::Changed => true,
@@ -505,10 +510,10 @@ impl Glass {
             },
             || {
                 // fresh snapshot; assigns ids, caches, pumps
-                let bound = if !looked && caller == Deadline::UNBOUNDED && params.timeout_ms == 0 {
-                    Deadline::UNBOUNDED
+                let bound = if looked {
+                    action_deadline
                 } else {
-                    deadline
+                    first_read_deadline
                 };
                 looked = true;
                 let tree = match self.a11y_resnapshot(bound) {
@@ -604,16 +609,16 @@ impl Glass {
     pub fn scroll_to_element_by(
         &mut self,
         params: &ScrollToElementParams,
-        caller: Deadline,
+        sequence_deadline: Deadline,
     ) -> Result<ScrollToElementOutcome> {
-        if caller.has_passed() {
+        if sequence_deadline.has_passed() {
             return Err(GlassError::deadline_not_started("scroll to element"));
         }
         self.require_active()?;
         let start = std::time::Instant::now();
         let (effective_duration, whose) =
-            caller.budget(std::time::Duration::from_millis(params.timeout_ms), start);
-        let deadline = Deadline::at(start + effective_duration);
+            sequence_deadline.budget(std::time::Duration::from_millis(params.timeout_ms), start);
+        let action_deadline = Deadline::at(start + effective_duration);
         let geo = self.geometry()?;
         // Return a match once scrolling can't improve its visibility: it has an on-screen
         // clickable center, or its bounds are unknown (scrolling won't populate a
@@ -625,13 +630,13 @@ impl Glass {
 
         // One pre-sweep snapshot serves four jobs: early return if already visible,
         // direction inference, anchor derivation, and seeding the saturation outline.
-        let first_deadline = if caller == Deadline::UNBOUNDED && params.timeout_ms == 0 {
-            Deadline::UNBOUNDED
+        let first_read_deadline = if params.timeout_ms == 0 {
+            sequence_deadline
         } else {
-            deadline
+            action_deadline
         };
         let Some((found0, mut prev_outline)) =
-            self.snapshot_match_outline(params, first_deadline)?
+            self.snapshot_match_outline(params, first_read_deadline)?
         else {
             return Ok(ScrollToElementOutcome {
                 matched: false,
@@ -677,28 +682,33 @@ impl Glass {
         for (i, dir) in [primary, primary.opposite()].into_iter().enumerate() {
             let reversed = i == 1;
             loop {
-                if deadline.has_passed() {
+                if action_deadline.has_passed() {
                     return Ok(outcome(false, None, steps, reversed, Some(whose)));
                 }
                 if steps >= SCROLL_TO_MAX_STEPS {
                     return Ok(outcome(false, None, steps, reversed, None));
                 }
                 let (dx, dy) = dir.delta(params.step);
-                self.pointer(&PointerEvent::Scroll {
-                    x: ax,
-                    y: ay,
-                    dx,
-                    dy,
-                    modifiers: vec![],
-                })?;
+                self.pointer_by(
+                    &PointerEvent::Scroll {
+                        x: ax,
+                        y: ay,
+                        dx,
+                        dy,
+                        modifiers: vec![],
+                    },
+                    action_deadline,
+                )?;
                 steps += 1;
                 // Let the scrolled rows/columns realize in the a11y tree before re-reading.
                 let settle = std::time::Duration::from_millis(SCROLL_TO_SETTLE_MS);
-                std::thread::sleep(deadline.remaining().unwrap_or(settle).min(settle));
-                if deadline.has_passed() {
+                std::thread::sleep(action_deadline.remaining().unwrap_or(settle).min(settle));
+                if action_deadline.has_passed() {
                     return Ok(outcome(false, None, steps, reversed, Some(whose)));
                 }
-                let Some((found, outline)) = self.snapshot_match_outline(params, deadline)? else {
+                let Some((found, outline)) =
+                    self.snapshot_match_outline(params, action_deadline)?
+                else {
                     return Ok(outcome(false, None, steps, reversed, Some(whose)));
                 };
                 if let Some(info) = found.filter(|i| ready(i)) {
@@ -2159,6 +2169,50 @@ mod tests {
     }
 
     #[test]
+    fn bounded_zero_timeout_wait_performs_one_live_read() {
+        let sequence_deadline = Deadline::from_millis(1_000);
+        let (mut g, wait_read_deadlines) =
+            glass_with_a11y_deadline_log(FakePlatform::new(100, 100), fake_tree_enabled());
+        g.start(&spec()).unwrap();
+
+        g.wait_for_element_by(&never_matches(0, 0), sequence_deadline)
+            .unwrap();
+
+        assert_eq!(
+            wait_read_deadlines.lock().unwrap().as_slice(),
+            &[sequence_deadline]
+        );
+    }
+
+    #[test]
+    fn bounded_zero_timeout_scroll_performs_one_live_read() {
+        let sequence_deadline = Deadline::from_millis(1_000);
+        let (mut g, scroll_read_deadlines) =
+            glass_with_a11y_deadline_log(FakePlatform::new(100, 100), fake_tree());
+        g.start(&spec()).unwrap();
+
+        g.scroll_to_element_by(
+            &ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 0,
+            },
+            sequence_deadline,
+        )
+        .unwrap();
+
+        assert_eq!(
+            scroll_read_deadlines.lock().unwrap().as_slice(),
+            &[sequence_deadline]
+        );
+    }
+
+    #[test]
     fn scroll_saturation_is_not_reported_as_a_timeout() {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
         g.start(&spec()).unwrap();
@@ -2199,6 +2253,45 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert!(seen.len() > 1);
         assert!(seen.iter().all(|deadline| *deadline == seen[0]));
+    }
+
+    #[test]
+    fn scroll_to_element_passes_the_exact_deadline_to_pointer_dispatch() {
+        let sequence_deadline = Deadline::from_millis(1_000);
+        let recorded_pointer_deadlines = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100)
+            .with_pointer_deadline_log(recorded_pointer_deadlines.clone());
+        let absent = tree_with(100, 100, vec![]);
+        let realized = tree_with(
+            100,
+            100,
+            vec![AxNode {
+                name: Some("Ghost".into()),
+                ..ax_node(1, AxRole::Button, None, vec![])
+            }],
+        );
+        let mut g = glass_with_a11y_seq(platform, vec![absent, realized]);
+        g.start(&spec()).unwrap();
+
+        g.scroll_to_element_by(
+            &ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 2_000,
+            },
+            sequence_deadline,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recorded_pointer_deadlines.lock().unwrap().as_slice(),
+            &[sequence_deadline]
+        );
     }
 
     #[test]

@@ -98,10 +98,25 @@ impl A11yThread {
         self.detached(Op::Snapshot, wait, job, || self.never_answered(ended_by))
     }
 
-    /// Write a value under the wrapper ceiling because this seam carries no caller deadline.
-    pub fn set_value(&self, job: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
-        self.detached(Op::SetValue, self.ceiling, job, || {
-            self.timed_out(Op::SetValue)
+    /// Write under the nearer caller/ceiling deadline. The detached write may still land after the
+    /// caller stops waiting, so a caller timeout remains post-dispatch and fallback-ineligible.
+    pub fn set_value(
+        &self,
+        deadline: Deadline,
+        job: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility set_value",
+            ));
+        }
+        let (wait, ended_by) = self.bounded_wait(deadline);
+        self.detached(Op::SetValue, wait, job, || match ended_by {
+            Whose::Caller => GlassError::caller_deadline_elapsed_with_guidance(
+                "native accessibility set_value",
+                "the write may still land; re-snapshot before retrying",
+            ),
+            Whose::Callee => self.timed_out(Op::SetValue),
         })
     }
 
@@ -119,9 +134,9 @@ impl A11yThread {
         }
         let (wait, ended_by) = self.bounded_wait(deadline);
         self.detached(Op::Invoke, wait, job, || match ended_by {
-            Whose::Caller => GlassError::AccessibilityUnavailable(
-                "accessibility invoke timed out at the caller deadline; the action may still land — re-snapshot before retrying"
-                    .into(),
+            Whose::Caller => GlassError::caller_deadline_elapsed_with_guidance(
+                "native accessibility invoke",
+                "the action may still land; re-snapshot before retrying",
             ),
             Whose::Callee => self.timed_out(Op::Invoke),
         })
@@ -294,13 +309,16 @@ mod tests {
 
     #[test]
     fn the_jobs_own_error_is_returned_rather_than_a_timeout() {
-        let r: Result<()> = reader().set_value(|| Err(GlassError::AxUnsupported));
+        let r: Result<()> =
+            reader().set_value(Deadline::UNBOUNDED, || Err(GlassError::AxUnsupported));
         assert!(matches!(r, Err(GlassError::AxUnsupported)), "{r:?}");
     }
 
     #[test]
     fn a_job_that_outruns_the_ceiling_names_the_operation_that_timed_out() {
-        let e = impatient().set_value(hangs()).unwrap_err();
+        let e = impatient()
+            .set_value(Deadline::UNBOUNDED, hangs())
+            .unwrap_err();
         assert!(e.to_string().contains("set_value timed out"), "{e}");
 
         let e = impatient()
@@ -317,7 +335,9 @@ mod tests {
     #[test]
     fn a_write_or_an_action_that_timed_out_says_it_may_still_land() {
         for e in [
-            impatient().set_value(hangs()).unwrap_err(),
+            impatient()
+                .set_value(Deadline::UNBOUNDED, hangs())
+                .unwrap_err(),
             impatient()
                 .invoke(Deadline::UNBOUNDED, hangs())
                 .unwrap_err(),
@@ -376,7 +396,7 @@ mod tests {
     #[test]
     fn a_worker_that_panicked_is_not_reported_as_a_backend_that_went_quiet() {
         let e: GlassError = reader()
-            .set_value(|| panic!("the backend crate unwound"))
+            .set_value(Deadline::UNBOUNDED, || panic!("the backend crate unwound"))
             .unwrap_err();
         assert!(e.to_string().contains("panicked"), "{e}");
         assert!(!e.to_string().contains("timed out"), "{e}");
@@ -421,14 +441,51 @@ mod tests {
     }
 
     #[test]
-    fn a_hanging_invoke_returns_at_the_earlier_caller_bound() {
+    fn a_hanging_set_value_returns_a_caller_owned_timeout() {
+        let error = reader()
+            .set_value(Deadline::from_millis(20), hangs())
+            .unwrap_err();
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            error.to_string().contains("write may still land"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_hanging_invoke_returns_a_caller_owned_timeout() {
         let started = Instant::now();
-        let e = reader()
+        let error = reader()
             .invoke(Deadline::from_millis(20), hangs())
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_millis(200));
-        assert!(!e.invoke_fallback_eligible(), "{e}");
-        assert!(e.to_string().contains("may still land"), "{e}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(!error.invoke_fallback_eligible(), "{error}");
+        assert!(
+            error.to_string().contains("action may still land"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unbounded_set_value_retains_the_backend_ceiling() {
+        let error = impatient()
+            .set_value(Deadline::UNBOUNDED, hangs())
+            .unwrap_err();
+
+        assert!(matches!(error, GlassError::AccessibilityUnavailable(_)));
+        assert_eq!(error.bound_owner(), None);
     }
 
     #[test]
