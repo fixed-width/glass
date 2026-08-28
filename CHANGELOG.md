@@ -20,7 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
-- `glass_do` can now batch semantic element clicks, confirmed value writes, element waits and scroll-to-element operations, returns a structured result for every completed/failed/skipped step, and bounds the whole sequence with fixed request limits and one caller deadline.
+- `glass_do` can now batch semantic element clicks, confirmed value writes, element waits and scroll-to-element operations, returns a structured result for every completed/failed/unexecuted step, and bounds the whole sequence with fixed request limits and one caller deadline.
 
 ## [1.6.0] - 2026-08-27
 

@@ -1,10 +1,14 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::tools::SafeErrorCategory;
+
 #[derive(Debug, Serialize)]
 pub(super) struct StepError {
     pub code: &'static str,
     pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<SafeErrorCategory>,
 }
 
 #[derive(Debug, Serialize)]

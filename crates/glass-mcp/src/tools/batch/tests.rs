@@ -10,7 +10,7 @@ use glass_core::{
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum DeadlineBehavior {
     Normal,
     CompleteLate,
@@ -18,6 +18,14 @@ enum DeadlineBehavior {
     NotDispatched,
     ReturnNotDispatched,
     CaptureCompletesLate,
+    NoActiveSession,
+    MissingElement,
+    StaleElement,
+    NotEditable,
+    UnsupportedAccessibility,
+    PermissionDenied,
+    TransportFailure,
+    OtherFailure,
 }
 
 struct DeadlinePlatform {
@@ -203,6 +211,19 @@ impl Platform for DeadlinePlatform {
             DeadlineBehavior::NotDispatched => {
                 Err(GlassError::deadline_not_started("controlled pointer"))
             }
+            DeadlineBehavior::NoActiveSession => Err(GlassError::NoActiveSession),
+            DeadlineBehavior::MissingElement => Err(GlassError::AxElementNotFound(7)),
+            DeadlineBehavior::StaleElement => Err(GlassError::AxElementChanged(7)),
+            DeadlineBehavior::NotEditable => Err(GlassError::AxElementNotEditable(7)),
+            DeadlineBehavior::UnsupportedAccessibility => Err(GlassError::AxUnsupported),
+            DeadlineBehavior::PermissionDenied => Err(GlassError::PermissionDenied {
+                which: "screen recording".into(),
+                remedy: "grant access".into(),
+            }),
+            DeadlineBehavior::TransportFailure => {
+                Err(GlassError::Backend("transport disconnected".into()))
+            }
+            DeadlineBehavior::OtherFailure => Err(GlassError::InvalidKey("bad".into())),
             DeadlineBehavior::ReturnNotDispatched | DeadlineBehavior::CaptureCompletesLate => {
                 self.inner.send_pointer(event)
             }
@@ -349,6 +370,171 @@ fn envelope(output: &ToolOutput) -> serde_json::Value {
         OutContent::Image(_) => panic!("batch envelope must be text"),
     })
     .unwrap()
+}
+
+fn output_text(output: &ToolOutput) -> String {
+    output
+        .0
+        .iter()
+        .map(|block| match block {
+            OutContent::Text(text) => text.as_str(),
+            OutContent::Image(_) => "",
+        })
+        .collect()
+}
+
+fn assert_secret_absent(output: &ToolOutput, secret: &str) {
+    let all_output_text = output_text(output);
+    let envelope = envelope(output);
+    assert!(
+        !all_output_text.contains(secret),
+        "secret echoed in output: {all_output_text}"
+    );
+    assert!(
+        !serde_json::to_string(&envelope).unwrap().contains(secret),
+        "secret echoed in envelope: {envelope}"
+    );
+}
+
+#[test]
+fn safe_error_category_variant_mapping_is_stable() {
+    let cases = [
+        (DeadlineBehavior::NoActiveSession, "no_active_session"),
+        (DeadlineBehavior::MissingElement, "stale_element"),
+        (DeadlineBehavior::StaleElement, "stale_element"),
+        (DeadlineBehavior::NotEditable, "not_editable"),
+        (
+            DeadlineBehavior::UnsupportedAccessibility,
+            "unsupported_accessibility",
+        ),
+        (DeadlineBehavior::PermissionDenied, "permission_denied"),
+        (DeadlineBehavior::TransportFailure, "transport_failure"),
+        (DeadlineBehavior::FailLate, "sequence_deadline_exceeded"),
+        (DeadlineBehavior::OtherFailure, "other"),
+    ];
+
+    for (behavior, expected) in cases {
+        let (mut glass, _, _) = deadline_glass(behavior, vec![]);
+        let error = do_actions(&mut glass, &do_args(vec![click(1, 1)], 100)).unwrap_err();
+        let envelope = envelope(&error);
+        assert_eq!(
+            envelope["outcome"]["steps"][0]["error"]["category"], expected,
+            "behavior category mismatch: {behavior:?}"
+        );
+    }
+}
+
+#[test]
+fn type_secret_failure_preserves_no_active_session_without_echoing_input() {
+    let secret = "type secret {\"token\":true}";
+    let mut glass = glass_with(FakePlatform::new(100, 100));
+    let error = do_actions(
+        &mut glass,
+        &DoArgs {
+            actions: vec![Action::Type(TypeArgs {
+                text: secret.into(),
+                return_: None,
+            })],
+            then: None,
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        envelope(&error)["outcome"]["steps"][0]["error"]["category"],
+        "no_active_session"
+    );
+    assert_secret_absent(&error, secret);
+}
+
+#[test]
+fn set_value_secret_failure_preserves_no_active_session_without_echoing_input() {
+    let secret = "set secret {\"token\":true}";
+    let mut glass = glass_with(FakePlatform::new(100, 100));
+    let error = do_actions(
+        &mut glass,
+        &DoArgs {
+            actions: vec![Action::SetValue(SetValueArgs {
+                id: 1,
+                text: secret.into(),
+                return_: None,
+            })],
+            then: None,
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        envelope(&error)["outcome"]["steps"][0]["error"]["category"],
+        "no_active_session"
+    );
+    assert_secret_absent(&error, secret);
+}
+
+#[test]
+fn secret_failure_omits_backend_detail_containing_submitted_input() {
+    let typed_secret = "type-backend-secret";
+    let mut type_glass = started(
+        FakePlatform::new(100, 100)
+            .with_event_log(Arc::new(Mutex::new(Vec::new())))
+            .fail_text_dispatch_after_receiving(),
+    );
+    let type_error = do_actions(
+        &mut type_glass,
+        &DoArgs {
+            actions: vec![Action::Type(TypeArgs {
+                text: typed_secret.into(),
+                return_: None,
+            })],
+            then: None,
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+
+    let set_secret = "set-backend-secret";
+    let mut set_glass = started_a11y_session(glass_with_a11y_outcome(
+        FakePlatform::new(100, 100),
+        fake_tree(),
+        SetOutcome::EchoText,
+    ));
+    let set_error = do_actions(
+        &mut set_glass,
+        &DoArgs {
+            actions: vec![Action::SetValue(SetValueArgs {
+                id: 1,
+                text: set_secret.into(),
+                return_: None,
+            })],
+            then: None,
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+
+    for (error, secret) in [(type_error, typed_secret), (set_error, set_secret)] {
+        assert_eq!(
+            envelope(&error)["outcome"]["steps"][0]["error"]["category"],
+            "transport_failure"
+        );
+        assert_secret_absent(&error, secret);
+        assert!(!output_text(&error).contains(&format!("{secret:?}")));
+        assert!(
+            !output_text(&error).contains(
+                &secret
+                    .as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        );
+    }
 }
 
 fn run_delayed_final_click() -> ToolOutput {
@@ -1385,7 +1571,11 @@ fn stale_target_detail_is_not_embedded_in_trusted_error_json() {
     let step = &trusted["outcome"]["steps"][0];
     assert_eq!(
         step["error"],
-        json!({"code":"action_failed","summary":"action execution failed"})
+        json!({
+            "code":"action_failed",
+            "summary":"action execution failed",
+            "category":"transport_failure"
+        })
     );
     assert_eq!(step["content_blocks"], json!([1]));
     assert_eq!(trusted["outcome"]["steps"][1]["status"], "unexecuted");
@@ -1544,7 +1734,7 @@ fn typed_and_set_value_text_are_never_echoed() {
         );
         assert!(!all.contains(&debug), "debug echo leaked in {all}");
         assert!(!all.contains(&hex), "encoded echo leaked in {all}");
-        assert!(all.contains("input dispatch failed; submitted text withheld"));
+        assert!(all.contains("backend transport failed"));
         assert!(!all.contains("backend error:"), "{all}");
     }
 }
@@ -2291,6 +2481,46 @@ fn invalid_sequence_accepts_exact_action_limit() {
     )
     .unwrap();
     assert_eq!(assert_envelope(&out, "glass_do")["executed"], MAX_ACTIONS);
+}
+
+#[test]
+fn exactly_maximum_sequence_timeout_is_accepted() {
+    let mut glass = started(FakePlatform::new(10, 10));
+    let output = do_actions(
+        &mut glass,
+        &DoArgs {
+            actions: vec![click(0, 0)],
+            then: None,
+            timeout_ms: Some(120_000),
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap();
+    let maximum_result = assert_envelope(&output, "glass_do");
+
+    assert_eq!(maximum_result["status"], "completed");
+}
+
+#[test]
+fn omitted_sequence_timeout_records_about_thirty_seconds() {
+    let (mut glass, deadlines, _) = deadline_glass(DeadlineBehavior::Normal, vec![]);
+    let output = do_actions(
+        &mut glass,
+        &DoArgs {
+            actions: vec![click(0, 0)],
+            then: None,
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(assert_envelope(&output, "glass_do")["status"], "completed");
+    let default_remaining = deadlines.lock().unwrap()[0]
+        .remaining()
+        .expect("the omitted sequence timeout must still be bounded");
+
+    assert!(default_remaining > Duration::from_secs(29));
+    assert!(default_remaining <= Duration::from_secs(30));
 }
 
 #[test]

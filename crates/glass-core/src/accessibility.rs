@@ -1244,7 +1244,8 @@ pub trait Accessibility {
     }
 
     /// Actuate `target` through its role-appropriate native accessibility operation after
-    /// rewalking by id, verifying its fingerprint, and confirming the required effect.
+    /// rewalking by id and verifying its fingerprint. Confirm the effect only when the backend
+    /// operation has a confirmable post-state.
     ///
     /// Returns a substituted element id when the toolkit actuates an ancestor, or `None` when it
     /// actuates `target`.

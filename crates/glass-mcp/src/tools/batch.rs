@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use crate::params::*;
 use crate::tools::{
-    BatchToolResult, ContextualToolResult, OutContent, ToolContext, ToolOutput, click_element_with,
-    click_with, diff_with, drag_with, key_with, mouse_move_with, screenshot_with,
-    scroll_to_element_with, scroll_with, set_value_with, type_text_with, wait_for_element_with,
-    wait_stable_with,
+    BatchToolResult, ContextualError, ContextualToolResult, OutContent, SafeErrorCategory,
+    ToolContext, ToolOutput, click_element_with, click_with, diff_with, drag_with, key_with,
+    mouse_move_with, screenshot_with, scroll_to_element_with, scroll_with, set_value_with,
+    type_text_with, wait_for_element_with, wait_stable_with,
 };
 
 mod model;
@@ -119,6 +119,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 kind,
                 false,
                 false,
+                Some(SafeErrorCategory::SequenceDeadlineExceeded),
                 "sequence deadline exceeded before action started",
                 true,
                 steps,
@@ -190,7 +191,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 });
             }
             Err(error) => {
-                let detail = redacted_error_detail(action, &error.message);
+                let detail = redacted_error_detail(action, &error);
                 let attempted =
                     error.bound_dispatch != Some(glass_core::BoundDispatch::NotDispatched);
                 return Err(step_failure(
@@ -199,7 +200,8 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                     kind,
                     attempted,
                     attempted && action.is_mutating(),
-                    &detail,
+                    Some(error.category),
+                    detail,
                     error.sequence_deadline_exceeded,
                     steps,
                     siblings,
@@ -275,6 +277,8 @@ fn predicate_failure(
         error: StepError {
             code,
             summary: summary.into(),
+            category: sequence_deadline_exceeded
+                .then_some(SafeErrorCategory::SequenceDeadlineExceeded),
         },
         side_effects_may_have_occurred,
         content_blocks,
@@ -310,6 +314,7 @@ fn step_failure(
     action: &'static str,
     attempted: bool,
     side_effects_may_have_occurred: bool,
+    category: Option<SafeErrorCategory>,
     detail: &str,
     sequence_deadline_exceeded: bool,
     mut steps: Vec<StepOutcome>,
@@ -331,6 +336,7 @@ fn step_failure(
         error: StepError {
             code,
             summary: summary.into(),
+            category,
         },
         side_effects_may_have_occurred,
         content_blocks: vec![content_block],
@@ -355,13 +361,10 @@ fn step_failure(
     )
 }
 
-fn redacted_error_detail(action: &Action, detail: &str) -> String {
+fn redacted_error_detail<'a>(action: &Action, error: &'a ContextualError) -> &'a str {
     match action {
-        // Raw dispatch errors are secret-tainted because submitted text may appear transformed.
-        Action::Type(_) | Action::SetValue(_) => {
-            "input dispatch failed; submitted text withheld".into()
-        }
-        _ => detail.to_owned(),
+        Action::Type(_) | Action::SetValue(_) => error.safe_summary,
+        _ => &error.message,
     }
 }
 
@@ -460,7 +463,11 @@ fn run_then(
                 run.sequence_deadline_exceeded = true;
                 run.outcomes.push(TerminalOutcome::Failed {
                     operation: $operation,
-                    error: StepError { code: "sequence_deadline_exceeded", summary: "sequence deadline exceeded".into() },
+                    error: StepError {
+                        code: "sequence_deadline_exceeded",
+                        summary: "sequence deadline exceeded".into(),
+                        category: Some(SafeErrorCategory::SequenceDeadlineExceeded),
+                    },
                     content_blocks: Vec::new(),
                 });
                 $(run.outcomes.push(TerminalOutcome::Unexecuted { operation: $later });)*
@@ -479,7 +486,11 @@ fn run_then(
                     run.sequence_deadline_exceeded = true;
                     run.outcomes.push(TerminalOutcome::Failed {
                         operation: $operation,
-                        error: StepError { code: "sequence_deadline_exceeded", summary: "sequence deadline exceeded".into() },
+                        error: StepError {
+                            code: "sequence_deadline_exceeded",
+                            summary: "sequence deadline exceeded".into(),
+                            category: Some(SafeErrorCategory::SequenceDeadlineExceeded),
+                        },
                         content_blocks: Vec::new(),
                     });
                     $(run.outcomes.push(TerminalOutcome::Unexecuted { operation: $later });)*
@@ -496,7 +507,11 @@ fn run_then(
                     };
                     run.outcomes.push(TerminalOutcome::Failed {
                         operation: $operation,
-                        error: StepError { code, summary: summary.into() },
+                        error: StepError {
+                            code,
+                            summary: summary.into(),
+                            category: Some(error.category),
+                        },
                         content_blocks,
                     });
                     $(run.outcomes.push(TerminalOutcome::Unexecuted { operation: $later });)*

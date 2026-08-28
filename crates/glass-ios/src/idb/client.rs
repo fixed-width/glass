@@ -481,6 +481,19 @@ mod tests {
     }
 
     #[test]
+    fn a_caller_owned_hid_timeout_is_bounded_by_the_caller() {
+        let error = map_hid_outcome(
+            Path::new("/somewhere/idb_companion"),
+            None,
+            Duration::from_millis(50),
+            Whose::Caller,
+            Err::<std::result::Result<(), tonic::Status>, _>(elapsed()),
+        )
+        .unwrap_err();
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+    }
+
+    #[test]
     fn an_unrecognized_event_is_recognised_as_an_unimplemented_one() {
         let status = tonic::Status::invalid_argument("Unrecognized request.event");
         assert!(unimplemented_event(&status));

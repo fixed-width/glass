@@ -10,6 +10,7 @@ use glass_core::{
     AppSpec, AxNodeId, BoundDispatch, Glass, MarkLabel, MouseButton, WindowGeometry, WindowHint,
     WindowId, WindowOp, frame_to_webp,
 };
+use serde::Serialize;
 use serde_json::json;
 
 use crate::params::*;
@@ -108,58 +109,101 @@ impl ContextualOutput {
 #[derive(Debug)]
 pub(crate) struct ContextualError {
     pub message: String,
+    pub category: SafeErrorCategory,
+    pub safe_summary: &'static str,
     pub sequence_deadline_exceeded: bool,
     pub bound_dispatch: Option<BoundDispatch>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SafeErrorCategory {
+    NoActiveSession,
+    StaleElement,
+    NotEditable,
+    UnsupportedAccessibility,
+    PermissionDenied,
+    TransportFailure,
+    SequenceDeadlineExceeded,
+    Other,
+}
+
+impl SafeErrorCategory {
+    fn from_error(error: &glass_core::GlassError) -> Self {
+        if error.bound_owner() == Some(glass_core::Whose::Caller) {
+            return Self::SequenceDeadlineExceeded;
+        }
+
+        match error {
+            glass_core::GlassError::NoActiveSession => Self::NoActiveSession,
+            glass_core::GlassError::NoAxSnapshot
+            | glass_core::GlassError::AxElementNotFound(_)
+            | glass_core::GlassError::AxElementChanged(_)
+            | glass_core::GlassError::AxElementGone(_) => Self::StaleElement,
+            glass_core::GlassError::AxElementNotEditable(_) => Self::NotEditable,
+            glass_core::GlassError::AxUnsupported
+            | glass_core::GlassError::AxActionUnavailable(_) => Self::UnsupportedAccessibility,
+            glass_core::GlassError::PermissionDenied { .. } => Self::PermissionDenied,
+            glass_core::GlassError::CaptureFailed(_)
+            | glass_core::GlassError::AccessibilityUnavailable(_)
+            | glass_core::GlassError::Backend(_)
+            | glass_core::GlassError::ToolFailed { .. }
+            | glass_core::GlassError::Bounded { .. }
+            | glass_core::GlassError::Io(_) => Self::TransportFailure,
+            _ => Self::Other,
+        }
+    }
+
+    fn summary(self) -> &'static str {
+        match self {
+            Self::NoActiveSession => "no active session",
+            Self::StaleElement => "element is stale or missing",
+            Self::NotEditable => "element is not editable",
+            Self::UnsupportedAccessibility => "accessibility operation is unsupported",
+            Self::PermissionDenied => "permission denied",
+            Self::TransportFailure => "backend transport failed",
+            Self::SequenceDeadlineExceeded => "sequence deadline exceeded",
+            Self::Other => "action execution failed",
+        }
+    }
 }
 
 impl ContextualError {
     pub fn validation(message: String) -> Self {
         Self {
             message,
+            category: SafeErrorCategory::Other,
+            safe_summary: "action validation failed",
             sequence_deadline_exceeded: false,
             bound_dispatch: None,
         }
     }
 
-    pub fn from_core(error: glass_core::GlassError, context: ToolContext) -> Self {
-        let bound_dispatch = error.bound_dispatch();
-        let sequence_deadline_exceeded = match error.bound() {
-            Some(glass_core::BoundKind::NotStarted) => context.deadline.has_passed(),
-            Some(glass_core::BoundKind::TimedOut) => context.deadline.has_passed(),
-            None => false,
-        };
+    fn from_error(error: glass_core::GlassError) -> Self {
+        let category = SafeErrorCategory::from_error(&error);
         Self {
             message: error.to_string(),
-            sequence_deadline_exceeded,
-            bound_dispatch,
+            category,
+            safe_summary: category.summary(),
+            sequence_deadline_exceeded: error.bound_owner() == Some(glass_core::Whose::Caller),
+            bound_dispatch: error.bound_dispatch(),
         }
     }
 
-    pub fn from_caller_bound(error: glass_core::GlassError, context: ToolContext) -> Self {
-        let bound_dispatch = error.bound_dispatch();
-        let sequence_deadline_exceeded =
-            error.bound().is_some() && context.deadline.remaining().is_some();
-        Self {
-            message: error.to_string(),
-            sequence_deadline_exceeded,
-            bound_dispatch,
-        }
+    pub fn from_core(error: glass_core::GlassError, _context: ToolContext) -> Self {
+        Self::from_error(error)
+    }
+
+    pub fn from_caller_bound(error: glass_core::GlassError, _context: ToolContext) -> Self {
+        Self::from_error(error)
     }
 
     pub fn from_resolved_bound(
         error: glass_core::GlassError,
-        context: ToolContext,
-        whose: glass_core::Whose,
+        _context: ToolContext,
+        _whose: glass_core::Whose,
     ) -> Self {
-        let bound_dispatch = error.bound_dispatch();
-        let sequence_deadline_exceeded = error.bound().is_some()
-            && whose == glass_core::Whose::Caller
-            && context.deadline.remaining().is_some();
-        Self {
-            message: error.to_string(),
-            sequence_deadline_exceeded,
-            bound_dispatch,
-        }
+        Self::from_error(error)
     }
 
     pub fn after_dispatch(mut self) -> Self {
@@ -175,6 +219,8 @@ impl ContextualError {
     pub fn sequence_deadline(message: String) -> Self {
         Self {
             message,
+            category: SafeErrorCategory::SequenceDeadlineExceeded,
+            safe_summary: SafeErrorCategory::SequenceDeadlineExceeded.summary(),
             sequence_deadline_exceeded: true,
             bound_dispatch: None,
         }
