@@ -21,6 +21,7 @@ enum DeadlineBehavior {
     CaptureCompletesLate,
     CaptureFailsLate,
     A11yNotReadyLate,
+    A11yBoundedLate,
     NoActiveSession,
     MissingElement,
     StaleElement,
@@ -151,6 +152,15 @@ impl Accessibility for DeadlineAccessibility {
                 "the accessibility tree stayed unavailable".into(),
             ));
         }
+        if matches!(self.behavior, DeadlineBehavior::A11yBoundedLate)
+            && context.deadline != Deadline::UNBOUNDED
+        {
+            sleep_past(context.deadline);
+            return Err(GlassError::caller_deadline_elapsed_with_guidance(
+                "scripted accessibility read",
+                "the read reached its effective deadline",
+            ));
+        }
         Ok(self.tree.clone())
     }
 
@@ -264,7 +274,8 @@ impl Platform for DeadlinePlatform {
             DeadlineBehavior::ReturnNotDispatched
             | DeadlineBehavior::CaptureCompletesLate
             | DeadlineBehavior::CaptureFailsLate
-            | DeadlineBehavior::A11yNotReadyLate => self.inner.send_pointer(event),
+            | DeadlineBehavior::A11yNotReadyLate
+            | DeadlineBehavior::A11yBoundedLate => self.inner.send_pointer(event),
         }
     }
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> GlassResult<()> {
@@ -902,6 +913,96 @@ fn wait_with_no_tree_when_sequence_deadline_wins_is_not_action_failed() {
 }
 
 #[test]
+fn action_owned_bounded_wait_read_is_action_failed_not_sequence_deadline() {
+    let (mut g, _, _, _) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::A11yBoundedLate, vec![]);
+    let wait: WaitForElementArgs =
+        serde_json::from_str(r#"{"name":"Missing","timeout_ms":20,"interval_ms":0}"#).unwrap();
+
+    let error =
+        do_actions(&mut g, &do_args(vec![Action::WaitForElement(wait)], 1_000)).unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(envelope["error"]["code"], "action_failed");
+    assert_eq!(step["error"]["code"], "action_failed");
+    assert_eq!(step["error"]["category"], "transport_failure");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], false);
+    assert!(output_text(&error).contains("effective deadline"));
+}
+
+#[test]
+fn sequence_owned_bounded_wait_read_is_sequence_deadline_exceeded() {
+    let (mut g, _, _, _) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::A11yBoundedLate, vec![]);
+    let wait: WaitForElementArgs =
+        serde_json::from_str(r#"{"name":"Missing","timeout_ms":1000,"interval_ms":0}"#).unwrap();
+
+    let error = do_actions(&mut g, &do_args(vec![Action::WaitForElement(wait)], 20)).unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], false);
+    assert!(output_text(&error).contains("effective deadline"));
+}
+
+#[test]
+fn action_owned_bounded_scroll_read_is_predicate_not_matched() {
+    let (mut g, _, _, _) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::A11yBoundedLate, vec![]);
+    let scroll = Action::ScrollToElement(ScrollToElementArgs {
+        name: Some("Missing".into()),
+        description: None,
+        role: None,
+        value_contains: None,
+        direction: Some("down".into()),
+        x: None,
+        y: None,
+        step: None,
+        timeout_ms: Some(20),
+    });
+
+    let error = do_actions(&mut g, &do_args(vec![scroll], 1_000)).unwrap_err();
+    let envelope = envelope(&error);
+
+    assert_eq!(envelope["error"]["code"], "predicate_not_matched");
+    assert_eq!(
+        envelope["outcome"]["steps"][0]["error"]["code"],
+        "predicate_not_matched"
+    );
+}
+
+#[test]
+fn sequence_owned_bounded_scroll_read_is_sequence_deadline_exceeded() {
+    let (mut g, _, _, _) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::A11yBoundedLate, vec![]);
+    let scroll = Action::ScrollToElement(ScrollToElementArgs {
+        name: Some("Missing".into()),
+        description: None,
+        role: None,
+        value_contains: None,
+        direction: Some("down".into()),
+        x: None,
+        y: None,
+        step: None,
+        timeout_ms: Some(1_000),
+    });
+
+    let error = do_actions(&mut g, &do_args(vec![scroll], 20)).unwrap_err();
+    let envelope = envelope(&error);
+
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(
+        envelope["outcome"]["steps"][0]["error"]["code"],
+        "sequence_deadline_exceeded"
+    );
+}
+
+#[test]
 fn delayed_final_mutation_is_not_reported_completed() {
     let output = run_delayed_final_click();
     let envelope = envelope(&output);
@@ -1163,8 +1264,8 @@ fn proven_not_dispatched_mutation_is_reported_unattempted() {
 
 #[test]
 fn unknown_mutation_failure_remains_conservatively_attempted() {
-    let mut g = started(FakePlatform::new(10, 10));
-    let err = do_actions(&mut g, &do_args(vec![click(10, 1)], 100)).unwrap_err();
+    let (mut g, _, _) = deadline_glass(DeadlineBehavior::OtherFailure, vec![]);
+    let err = do_actions(&mut g, &do_args(vec![click(1, 1)], 100)).unwrap_err();
     let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
     let step = &envelope["outcome"]["steps"][0];
     assert_eq!(envelope["error"]["code"], "action_failed");
@@ -1393,8 +1494,9 @@ fn invalid_sequence_rejects_empty_actions_before_actuation() {
 #[test]
 fn mutating_action_validation_failures_are_proven_not_dispatched() {
     let events = Arc::new(Mutex::new(Vec::new()));
-    let mut g = started(FakePlatform::new(100, 100).with_event_log(events.clone()));
+    let mut g = started_a11y(FakePlatform::new(100, 100).with_event_log(events.clone()));
     let cases = vec![
+        ("click bounds", click(100, 1)),
         (
             "click button",
             Action::Click(ClickArgs {
@@ -1413,6 +1515,18 @@ fn mutating_action_validation_failures_are_proven_not_dispatched() {
                 button: None,
                 count: None,
                 modifiers: Some(vec!["invalid".into()]),
+            }),
+        ),
+        (
+            "drag bounds",
+            Action::Drag(DragArgs {
+                x1: 1,
+                y1: 1,
+                x2: 100,
+                y2: 2,
+                button: None,
+                modifiers: None,
+                duration_ms: None,
             }),
         ),
         (
@@ -1440,6 +1554,16 @@ fn mutating_action_validation_failures_are_proven_not_dispatched() {
             }),
         ),
         (
+            "scroll bounds",
+            Action::Scroll(ScrollArgs {
+                x: 100,
+                y: 1,
+                dx: None,
+                dy: Some(1),
+                modifiers: None,
+            }),
+        ),
+        (
             "scroll modifier",
             Action::Scroll(ScrollArgs {
                 x: 1,
@@ -1447,6 +1571,20 @@ fn mutating_action_validation_failures_are_proven_not_dispatched() {
                 dx: None,
                 dy: Some(1),
                 modifiers: Some(vec!["invalid".into()]),
+            }),
+        ),
+        (
+            "scroll_to_element anchor bounds",
+            Action::ScrollToElement(ScrollToElementArgs {
+                name: Some("Missing".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some("down".into()),
+                x: Some(100),
+                y: Some(1),
+                step: None,
+                timeout_ms: Some(100),
             }),
         ),
         (
@@ -1483,6 +1621,39 @@ fn mutating_action_validation_failures_are_proven_not_dispatched() {
             "{case}: {envelope}"
         );
     }
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "validation actuated the app"
+    );
+}
+
+#[test]
+fn invalid_boolean_semantic_validation_is_proven_not_dispatched() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = fake_tree();
+    tree.root.children[0].states.checkable = true;
+    let platform = FakePlatform::new(100, 100)
+        .with_event_log(events.clone())
+        .with_trailing_toggle();
+    let mut g = started_a11y_tree(platform, tree);
+
+    let error = do_actions(
+        &mut g,
+        &do_args(
+            vec![Action::SetValue(SetValueArgs {
+                id: 1,
+                text: "not-a-boolean".into(),
+                return_: None,
+            })],
+            1_000,
+        ),
+    )
+    .unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(step["attempted"], false, "{envelope}");
+    assert_eq!(step["side_effects_may_have_occurred"], false, "{envelope}");
     assert!(
         events.lock().unwrap().is_empty(),
         "validation actuated the app"

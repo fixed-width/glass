@@ -181,12 +181,23 @@ impl ContextualError {
 
     fn from_error(error: glass_core::GlassError) -> Self {
         let category = SafeErrorCategory::from_error(&error);
+        // These variants are constructed only by core preflight checks before the requested
+        // mutation can dispatch. Keep the allowlist narrow so a new ordinary error remains
+        // conservatively ambiguous.
+        let bound_dispatch = error.bound_dispatch().or_else(|| {
+            matches!(
+                &error,
+                glass_core::GlassError::CoordOutOfBounds { .. }
+                    | glass_core::GlassError::AxValueNotBoolean(..)
+            )
+            .then_some(BoundDispatch::NotDispatched)
+        });
         Self {
             message: error.to_string(),
             category,
             safe_summary: category.summary(),
             sequence_deadline_exceeded: error.bound_owner() == Some(glass_core::Whose::Caller),
-            bound_dispatch: error.bound_dispatch(),
+            bound_dispatch,
         }
     }
 

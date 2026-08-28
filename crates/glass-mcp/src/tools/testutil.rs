@@ -30,6 +30,7 @@ pub struct FakePlatform {
     /// built from `glass_start`'s arguments.
     pub specs: Arc<Mutex<Vec<AppSpec>>>,
     pub fail_text_dispatch_after_receiving: bool,
+    pub trailing_toggle: bool,
 }
 
 impl FakePlatform {
@@ -70,6 +71,10 @@ impl FakePlatform {
     }
     pub fn fail_text_dispatch_after_receiving(mut self) -> Self {
         self.fail_text_dispatch_after_receiving = true;
+        self
+    }
+    pub fn with_trailing_toggle(mut self) -> Self {
+        self.trailing_toggle = true;
         self
     }
 }
@@ -224,6 +229,9 @@ impl Platform for FakePlatform {
     fn set_clipboard(&mut self, text: &str) -> Result<()> {
         self.clipboard = text.to_string();
         Ok(())
+    }
+    fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
+        self.trailing_toggle
     }
 }
 

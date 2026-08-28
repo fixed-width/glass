@@ -1202,11 +1202,17 @@ pub trait Accessibility {
     /// window-relative coordinates. Node ids are assigned by the caller
     /// afterward via [`AxTree::assign_ids`]; the backend need not set them.
     ///
-    /// **Cap every budget of your own by [`AxContext::deadline`]**, and report a read it ended as
-    /// [`crate::GlassError::AccessibilityNotReady`] — the variant
-    /// [`crate::Glass::wait_for_element`] polls through rather than failing on. Honouring it is
-    /// per-reader: the Android, Linux and Windows readers do, so a wait's timeout does not yet
-    /// bind on macOS or iOS.
+    /// **Cap every budget of your own by [`AxContext::deadline`]**. If it is spent before external
+    /// work starts, return [`crate::GlassError::deadline_not_started`]; if it ends a dispatched
+    /// read, return a caller-owned bounded error such as
+    /// [`crate::GlassError::caller_deadline_elapsed`]. `Caller` is relative to this reader: an
+    /// enclosing wait resolves whether the supplied deadline belonged to the wait action or to its
+    /// own outer sequence.
+    ///
+    /// [`crate::GlassError::AccessibilityNotReady`] is reserved for an app that has not published a
+    /// usable tree without [`AxContext::deadline`] having ended the read.
+    /// [`crate::Glass::wait_for_element`] polls through that ordinary not-ready state; do not use it
+    /// to erase a structural deadline expiry.
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree>;
 
     /// Subscribe to change notifications for the app described by `ctx`.

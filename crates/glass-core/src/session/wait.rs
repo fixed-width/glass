@@ -16,6 +16,37 @@ use crate::accessibility::ElementSelector;
 /// the short waits that could least afford one stale read.
 const REREAD_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Resolve the accessibility reader's caller relative to the enclosing wait action.
+///
+/// A reader names the deadline in `AxContext` as its caller. That deadline may be the action's own
+/// bound, in which case it is a callee bound from the outer sequence's point of view. Preserve the
+/// kind, dispatch verdict, and detail while moving only that ownership boundary. If the outer
+/// sequence has since elapsed, it remains the owner of the returned failure.
+fn resolve_nested_accessibility_bound(
+    error: GlassError,
+    effective_owner: crate::Whose,
+    sequence_deadline: Deadline,
+) -> GlassError {
+    if effective_owner == crate::Whose::Callee && !sequence_deadline.has_passed() {
+        match error {
+            GlassError::Bounded {
+                kind,
+                whose: crate::Whose::Caller,
+                dispatch,
+                message,
+            } => GlassError::Bounded {
+                kind,
+                whose: crate::Whose::Callee,
+                dispatch,
+                message,
+            },
+            error => error,
+        }
+    } else {
+        error
+    }
+}
+
 /// Parameters for [`Glass::wait_stable`].
 #[derive(Clone, Debug)]
 pub struct WaitStableParams {
@@ -483,7 +514,7 @@ impl Glass {
         // `deadline` gives up on the tick that ends the wait, so without this every unmatched wait
         // on such a backend failed instead of answering `{matched:false}` (glass#338).
         let mut unread: Option<GlassError> = None;
-        let mut unread_owned_by_caller = false;
+        let mut unread_owner = whose;
         let mut saw_a_tree = false;
         // `poll_until_with_pause` guarantees one tick. For `timeout_ms: 0` ("check now"), that
         // immediate read uses the live sequence deadline rather than the already-spent action
@@ -525,10 +556,19 @@ impl Glass {
             },
             || {
                 // fresh snapshot; assigns ids, caches, pumps
-                let bound = if looked {
-                    action_deadline
-                } else {
+                let first_read = !looked;
+                let bound = if first_read {
                     first_read_deadline
+                } else {
+                    action_deadline
+                };
+                let read_owner = if first_read
+                    && params.timeout_ms == 0
+                    && sequence_deadline.instant().is_some()
+                {
+                    crate::Whose::Caller
+                } else {
+                    whose
                 };
                 looked = true;
                 let tree = match self.a11y_resnapshot(bound) {
@@ -538,8 +578,14 @@ impl Glass {
                     }
                     // Kept so a spent budget can report this instead of "not found" (glass#329).
                     Err(e @ GlassError::AccessibilityNotReady(_)) => {
-                        unread_owned_by_caller =
-                            bound == sequence_deadline || whose == crate::Whose::Caller;
+                        unread_owner = read_owner;
+                        unread = Some(e);
+                        return Ok(None);
+                    }
+                    // `Caller` here names the deadline supplied to the reader. The enclosing wait
+                    // resolves whether that was its own bound or the outer sequence's below.
+                    Err(e) if e.bound_owner() == Some(crate::Whose::Caller) => {
+                        unread_owner = read_owner;
                         unread = Some(e);
                         return Ok(None);
                     }
@@ -566,7 +612,14 @@ impl Glass {
             && !saw_a_tree
             && let Some(e) = unread
         {
-            if unread_owned_by_caller && sequence_deadline.has_passed() {
+            if e.bound_owner() == Some(crate::Whose::Caller) {
+                return Err(resolve_nested_accessibility_bound(
+                    e,
+                    unread_owner,
+                    sequence_deadline,
+                ));
+            }
+            if unread_owner == crate::Whose::Caller && sequence_deadline.has_passed() {
                 return Err(GlassError::caller_deadline_elapsed_with_guidance(
                     "accessibility wait",
                     &e.to_string(),
@@ -653,10 +706,17 @@ impl Glass {
 
         // One pre-sweep snapshot serves four jobs: early return if already visible,
         // direction inference, anchor derivation, and seeding the saturation outline.
-        let first_read_deadline = if params.timeout_ms == 0 {
+        let first_read_uses_sequence = params.timeout_ms == 0;
+        let first_read_deadline = if first_read_uses_sequence {
             sequence_deadline
         } else {
             action_deadline
+        };
+        let first_read_owner = if first_read_uses_sequence && sequence_deadline.instant().is_some()
+        {
+            crate::Whose::Caller
+        } else {
+            whose
         };
         let Some((found0, mut prev_outline)) =
             self.snapshot_match_outline(params, first_read_deadline)?
@@ -668,7 +728,11 @@ impl Glass {
                 steps: 0,
                 reversed: false,
                 direction: params.direction.unwrap_or(ScrollDirection::Down),
-                timed_out_by: Some(whose),
+                timed_out_by: Some(if sequence_deadline.has_passed() {
+                    crate::Whose::Caller
+                } else {
+                    first_read_owner
+                }),
             });
         };
         let found0_bounds = found0.as_ref().and_then(|i| i.bounds);
@@ -766,7 +830,13 @@ impl Glass {
     ) -> Result<Option<(Option<ElementInfo>, String)>> {
         let tree = match self.a11y_resnapshot(deadline) {
             Ok(tree) => tree,
-            Err(GlassError::AccessibilityNotReady(_)) if deadline.has_passed() => return Ok(None),
+            Err(error)
+                if deadline.has_passed()
+                    && (matches!(&error, GlassError::AccessibilityNotReady(_))
+                        || error.bound_owner() == Some(crate::Whose::Caller)) =>
+            {
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         let found = match tree.element_match_selector(
@@ -1738,6 +1808,118 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("still has no tree"), "{error}");
+    }
+
+    struct CallerBoundAtReadDeadline;
+
+    impl Accessibility for CallerBoundAtReadDeadline {
+        fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+            let left = ctx
+                .deadline
+                .remaining()
+                .expect("the nested-bound tests pass a bounded read deadline");
+            std::thread::sleep(left.saturating_add(Duration::from_millis(5)));
+            Err(GlassError::caller_deadline_elapsed_with_guidance(
+                "scripted accessibility read",
+                "the read reached its effective deadline",
+            ))
+        }
+    }
+
+    fn glass_with_caller_bound_at_read_deadline() -> Glass {
+        glass_with_backend(
+            FakePlatform::new(100, 100),
+            Box::new(CallerBoundAtReadDeadline),
+        )
+    }
+
+    #[test]
+    fn action_owned_bounded_wait_read_is_not_recast_as_the_outer_caller() {
+        let mut g = glass_with_caller_bound_at_read_deadline();
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_for_element_by(&never_matches(0, 20), Deadline::from_millis(1_000))
+            .expect_err("a wait that never obtained a tree still reports the read failure");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Callee), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert!(error.to_string().contains("effective deadline"), "{error}");
+    }
+
+    #[test]
+    fn sequence_owned_bounded_wait_read_keeps_the_outer_caller() {
+        let mut g = glass_with_caller_bound_at_read_deadline();
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_for_element_by(&never_matches(0, 1_000), Deadline::from_millis(20))
+            .expect_err("the outer sequence ended before any tree arrived");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn action_owned_bounded_scroll_read_is_a_soft_predicate_timeout() {
+        let mut g = glass_with_caller_bound_at_read_deadline();
+        g.start(&spec()).unwrap();
+
+        let out = g
+            .scroll_to_element_by(
+                &ScrollToElementParams {
+                    name: Some("Ghost".into()),
+                    description: None,
+                    role: None,
+                    value_contains: None,
+                    direction: Some(ScrollDirection::Down),
+                    anchor: None,
+                    step: SCROLL_TO_DEFAULT_STEP,
+                    timeout_ms: 20,
+                },
+                Deadline::from_millis(1_000),
+            )
+            .expect("the action's own read expiry is a soft scroll timeout");
+
+        assert!(!out.matched);
+        assert_eq!(out.steps, 0);
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Callee));
+    }
+
+    #[test]
+    fn sequence_owned_bounded_scroll_read_is_a_soft_caller_timeout() {
+        let mut g = glass_with_caller_bound_at_read_deadline();
+        g.start(&spec()).unwrap();
+
+        let out = g
+            .scroll_to_element_by(
+                &ScrollToElementParams {
+                    name: Some("Ghost".into()),
+                    description: None,
+                    role: None,
+                    value_contains: None,
+                    direction: Some(ScrollDirection::Down),
+                    anchor: None,
+                    step: SCROLL_TO_DEFAULT_STEP,
+                    timeout_ms: 1_000,
+                },
+                Deadline::from_millis(20),
+            )
+            .expect("the sequence-owned read expiry is a soft caller timeout");
+
+        assert!(!out.matched);
+        assert_eq!(out.steps, 0);
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Caller));
     }
 
     /// A wait looks once however little time it was given: `poll_until_with_pause` guarantees one
