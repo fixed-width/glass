@@ -156,7 +156,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                         &a.actions,
                         i,
                         kind,
-                        action.is_mutating(),
+                        action.is_side_effecting(),
                         true,
                         result,
                         content_blocks,
@@ -175,7 +175,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                         &a.actions,
                         i,
                         kind,
-                        action.is_mutating(),
+                        action.is_side_effecting(),
                         false,
                         result,
                         content_blocks,
@@ -205,7 +205,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                     i,
                     kind,
                     attempted,
-                    attempted && action.is_mutating(),
+                    attempted && action.is_side_effecting(),
                     Some(error.category),
                     detail,
                     error.sequence_deadline_exceeded,
@@ -434,11 +434,8 @@ impl Action {
         }
     }
 
-    fn is_mutating(&self) -> bool {
-        !matches!(
-            self,
-            Action::Move(_) | Action::Settle(_) | Action::WaitForElement(_)
-        )
+    fn is_side_effecting(&self) -> bool {
+        !matches!(self, Action::Settle(_) | Action::WaitForElement(_))
     }
 }
 

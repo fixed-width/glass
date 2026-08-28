@@ -120,6 +120,8 @@ pub struct CallView {
     pub result: Value,
     pub all_text: String,
     pub image_count: usize,
+    pub image_block_indices: Vec<usize>,
+    pub image_data_lengths: Vec<usize>,
 }
 
 fn successful_envelope_result(text: &str, tool: &str) -> Option<Value> {
@@ -148,6 +150,17 @@ pub async fn call_full(client: &Peer<RoleClient>, tool: &str, args: Value) -> Ca
         .iter()
         .filter(|c| c.as_image().is_some())
         .count();
+    let image_block_indices = res
+        .content
+        .iter()
+        .enumerate()
+        .filter_map(|(index, content)| content.as_image().map(|_| index))
+        .collect();
+    let image_data_lengths = res
+        .content
+        .iter()
+        .filter_map(|content| content.as_image().map(|image| image.data.len()))
+        .collect();
     let mut result = Value::Null;
     let mut all_text = String::new();
     for block in &res.content {
@@ -161,6 +174,64 @@ pub async fn call_full(client: &Peer<RoleClient>, tool: &str, args: Value) -> Ca
     }
     CallView {
         result,
+        all_text,
+        image_count,
+        image_block_indices,
+        image_data_lengths,
+    }
+}
+
+/// The structured envelope and complete content view of an MCP tool error.
+#[derive(Debug)]
+pub struct ErrorCallView {
+    pub envelope: Value,
+    pub all_text: String,
+    pub image_count: usize,
+}
+
+/// Call a tool that must fail while retaining its trusted envelope and sibling blocks.
+pub async fn call_error_full(client: &Peer<RoleClient>, tool: &str, args: Value) -> ErrorCallView {
+    let arguments = args
+        .as_object()
+        .expect("args must be a JSON object")
+        .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(arguments))
+        .await
+        .unwrap_or_else(|e| panic!("{tool} transport failure: {e}"));
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "{tool} unexpectedly succeeded: {res:?}"
+    );
+
+    let image_count = res
+        .content
+        .iter()
+        .filter(|content| content.as_image().is_some())
+        .count();
+    let mut envelope = Value::Null;
+    let mut all_text = String::new();
+    for block in &res.content {
+        if let Some(text) = block.as_text() {
+            all_text.push_str(&text.text);
+            all_text.push('\n');
+            if let Ok(candidate) = serde_json::from_str::<Value>(&text.text)
+                && candidate.get("ok") == Some(&Value::Bool(false))
+                && candidate.get("tool") == Some(&Value::String(tool.to_string()))
+            {
+                envelope = candidate;
+            }
+        }
+    }
+    assert_ne!(
+        envelope,
+        Value::Null,
+        "{tool} error envelope missing: {res:?}"
+    );
+
+    ErrorCallView {
+        envelope,
         all_text,
         image_count,
     }

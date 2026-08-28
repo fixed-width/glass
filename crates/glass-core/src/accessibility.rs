@@ -1259,9 +1259,10 @@ pub trait Accessibility {
     ///
     /// Only [`crate::GlassError::AxUnsupported`] and
     /// [`crate::GlassError::AxActionUnavailable`] guarantee no dispatch and permit pointer
-    /// fallback. Backends must preserve possibly-dispatched failures as `AxActionFailed` or
-    /// `AccessibilityUnavailable`; `AxElementChanged` also propagates to prevent stale-coordinate
-    /// clicks.
+    /// fallback. Every possibly-dispatched failure remains fallback-ineligible and retains any
+    /// bounded timeout owner and dispatch provenance; use `AxActionFailed` or
+    /// `AccessibilityUnavailable` for non-bounded failures. `AxElementChanged` also propagates to
+    /// prevent stale-coordinate clicks.
     ///
     /// Default: unsupported.
     fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {

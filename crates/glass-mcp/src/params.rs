@@ -5,6 +5,9 @@ use glass_core::Region;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, de::Error as _};
 
+pub(crate) const MAX_CLICK_COUNT: u32 = 10;
+pub(crate) const MAX_SCROLL_NOTCHES: i32 = 100;
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RegionArgs {
     /// Left edge in pixels, window-relative — 0 is the window's left edge, not the screen's.
@@ -182,7 +185,9 @@ pub struct ClickArgs {
     pub y: i32,
     /// "left" (default), "right", or "middle".
     pub button: Option<String>,
-    /// Consecutive clicks at this point (default 1); pass 2 for a double-click.
+    /// Consecutive clicks at this point (default 1, valid range 1 through 10); pass 2 for a
+    /// double-click.
+    #[schemars(range(min = 1, max = 10))]
     pub count: Option<u32>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
     pub modifiers: Option<Vec<String>>,
@@ -248,12 +253,16 @@ pub struct ScrollArgs {
     pub x: i32,
     /// Pointer y the wheel is aimed at, window-relative. See `x`.
     pub y: i32,
-    /// Horizontal scroll in **wheel notches** (discrete clicks — small integers like 1–5, NOT
-    /// pixels). Positive `dx` sends wheel-right, negative wheel-left; glass clicks `|dx|` times.
+    /// Horizontal scroll in **wheel notches** (valid range -100 through 100; normal usage is small
+    /// integers like 1–5, NOT pixels). Positive `dx` sends wheel-right, negative wheel-left; glass
+    /// clicks `|dx|` times.
+    #[schemars(range(min = -100, max = 100))]
     pub dx: Option<i32>,
-    /// Vertical scroll in **wheel notches** (discrete clicks — small integers like 1–5, NOT
-    /// pixels). Positive `dy` sends wheel-down, negative wheel-up; glass clicks `|dy|` times. How
-    /// an app maps a wheel notch to its view (lines, pixels, zoom) is the app's choice.
+    /// Vertical scroll in **wheel notches** (valid range -100 through 100; normal usage is small
+    /// integers like 1–5, NOT pixels). Positive `dy` sends wheel-down, negative wheel-up; glass
+    /// clicks `|dy|` times. How an app maps a wheel notch to its view (lines, pixels, zoom) is the
+    /// app's choice.
+    #[schemars(range(min = -100, max = 100))]
     pub dy: Option<i32>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
     pub modifiers: Option<Vec<String>>,

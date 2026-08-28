@@ -31,6 +31,12 @@ pub(crate) fn click_with(
     a: &ClickArgs,
     context: ToolContext,
 ) -> ContextualToolResult {
+    let count = a.count.unwrap_or(1);
+    if !(1..=MAX_CLICK_COUNT).contains(&count) {
+        return Err(ContextualError::validation(format!(
+            "`count` must be between 1 and {MAX_CLICK_COUNT}"
+        )));
+    }
     let button = parse_button(a.button.as_deref()).map_err(ContextualError::validation)?;
     let modifiers = parse_modifiers(a.modifiers.as_deref()).map_err(ContextualError::validation)?;
     glass
@@ -39,7 +45,7 @@ pub(crate) fn click_with(
                 x: a.x,
                 y: a.y,
                 button,
-                count: a.count.unwrap_or(1),
+                count,
                 modifiers,
             },
             context.deadline,
@@ -139,14 +145,22 @@ pub(crate) fn scroll_with(
     a: &ScrollArgs,
     context: ToolContext,
 ) -> ContextualToolResult {
+    let dx = a.dx.unwrap_or(0);
+    let dy = a.dy.unwrap_or(0);
+    let valid = -MAX_SCROLL_NOTCHES..=MAX_SCROLL_NOTCHES;
+    if !valid.contains(&dx) || !valid.contains(&dy) {
+        return Err(ContextualError::validation(format!(
+            "`dx` and `dy` must each be between -{MAX_SCROLL_NOTCHES} and {MAX_SCROLL_NOTCHES}"
+        )));
+    }
     let modifiers = parse_modifiers(a.modifiers.as_deref()).map_err(ContextualError::validation)?;
     glass
         .pointer_by(
             &PointerEvent::Scroll {
                 x: a.x,
                 y: a.y,
-                dx: a.dx.unwrap_or(0),
-                dy: a.dy.unwrap_or(0),
+                dx,
+                dy,
                 modifiers,
             },
             context.deadline,
@@ -212,9 +226,14 @@ mod tests {
     use super::*;
     use crate::tools::start as start_tool;
     use crate::tools::testutil::*;
+    use std::sync::{Arc, Mutex};
 
     fn started() -> Glass {
-        let mut g = glass_with(FakePlatform::new(100, 100));
+        started_with(FakePlatform::new(100, 100))
+    }
+
+    fn started_with(platform: FakePlatform) -> Glass {
+        let mut g = glass_with(platform);
         let a = StartArgs {
             build: None,
             run: vec!["app".into()],
@@ -284,6 +303,39 @@ mod tests {
     }
 
     #[test]
+    fn click_rejects_zero_and_unbounded_count_before_pointer_dispatch() {
+        for (count, expected) in [
+            (0, "between 1 and 10"),
+            (MAX_CLICK_COUNT + 1, "between 1 and 10"),
+            (u32::MAX, "between 1 and 10"),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut g =
+                started_with(FakePlatform::new(100, 100).with_event_log(Arc::clone(&events)));
+            let error = click(
+                &mut g,
+                &ClickArgs {
+                    x: 1,
+                    y: 1,
+                    button: None,
+                    count: Some(count),
+                    modifiers: None,
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                error.contains(expected),
+                "unexpected error for {count}: {error}"
+            );
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "invalid count {count} reached the platform"
+            );
+        }
+    }
+
+    #[test]
     fn type_and_key_ok() {
         let mut g = started();
         assert_ok(
@@ -330,6 +382,44 @@ mod tests {
             modifiers: None,
         };
         assert_ok(&scroll(&mut g, &s).unwrap(), "glass_scroll");
+    }
+
+    #[test]
+    fn scroll_rejects_extreme_magnitudes_before_pointer_dispatch() {
+        for (dx, dy) in [
+            (Some(-MAX_SCROLL_NOTCHES - 1), None),
+            (Some(MAX_SCROLL_NOTCHES + 1), None),
+            (Some(i32::MIN), None),
+            (Some(i32::MAX), None),
+            (None, Some(-MAX_SCROLL_NOTCHES - 1)),
+            (None, Some(MAX_SCROLL_NOTCHES + 1)),
+            (None, Some(i32::MIN)),
+            (None, Some(i32::MAX)),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut g =
+                started_with(FakePlatform::new(100, 100).with_event_log(Arc::clone(&events)));
+            let error = scroll(
+                &mut g,
+                &ScrollArgs {
+                    x: 1,
+                    y: 1,
+                    dx,
+                    dy,
+                    modifiers: None,
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                error.contains("between -100 and 100"),
+                "unexpected error for ({dx:?}, {dy:?}): {error}"
+            );
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "invalid scroll ({dx:?}, {dy:?}) reached the platform"
+            );
+        }
     }
 
     #[test]

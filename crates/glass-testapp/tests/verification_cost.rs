@@ -137,6 +137,147 @@ async fn glass_do_semantic_form_completes_in_one_action_call() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires an X server + AT-SPI bus; run via scripts/verification-cost.sh"]
+async fn glass_do_terminal_then_returns_real_ordered_image_siblings() {
+    let xvfb = Xvfb::start();
+    // SAFETY: single-threaded test setup; runs before any server task spawns.
+    unsafe { std::env::set_var("GLASS_DISPLAY", &xvfb.display) };
+
+    let client = mcp_cost::boot_mcp().await;
+    mcp_cost::start_fixture(&client).await;
+    let outline = mcp_cost::wait_for_widgets(&client).await;
+    let text_id = mcp_cost::find_by_role(&outline, "text").expect("text field id");
+    let apply_id = mcp_cost::find_named_button(&outline, "Apply").expect("Apply button id");
+
+    mcp_cost::call(
+        &client,
+        "glass_baseline_save",
+        serde_json::json!({"name":"terminal-then-public"}),
+    )
+    .await;
+    let call = mcp_cost::call_full(
+        &client,
+        "glass_do",
+        serde_json::json!({
+            "timeout_ms": 10_000,
+            "actions": [
+                {"action":"click_element","id":text_id},
+                {"action":"type","text":"terminalThen"},
+                {"action":"click_element","id":apply_id}
+            ],
+            "then": {
+                "settle": {"interval_ms":50,"settle_frames":2,"timeout_ms":3_000},
+                "diff": {
+                    "name":"terminal-then-public",
+                    "mode":"exact",
+                    "tolerance":0,
+                    "include_image":true
+                },
+                "screenshot": {}
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(call.result["status"], serde_json::json!("completed"));
+    assert_eq!(call.result["executed"], serde_json::json!(3));
+    let terminal = call.result["terminal_steps"]
+        .as_array()
+        .expect("terminal_steps array");
+    assert_eq!(
+        terminal
+            .iter()
+            .map(|step| step["operation"].as_str().expect("terminal operation"))
+            .collect::<Vec<_>>(),
+        vec!["settle", "diff", "screenshot"]
+    );
+    assert!(
+        terminal
+            .iter()
+            .all(|step| step["status"] == serde_json::json!("completed")),
+        "terminal observations did not all complete: {terminal:?}"
+    );
+    assert_eq!(terminal[0]["content_blocks"], serde_json::json!([]));
+    assert_eq!(terminal[1]["content_blocks"], serde_json::json!([1, 2]));
+    assert_eq!(terminal[2]["content_blocks"], serde_json::json!([3, 4]));
+    assert!(
+        terminal[1]["result"]["changed_pixels"]
+            .as_u64()
+            .is_some_and(|pixels| pixels > 0),
+        "real mutation did not produce a diff: {}",
+        terminal[1]
+    );
+    assert_eq!(
+        call.image_count, 2,
+        "diff and screenshot must be image siblings"
+    );
+    assert_eq!(
+        call.image_block_indices,
+        vec![1, 3],
+        "terminal content_blocks must point at the real image siblings"
+    );
+    assert_eq!(call.image_data_lengths.len(), 2);
+    assert!(
+        call.image_data_lengths.iter().all(|length| *length > 0),
+        "image siblings must contain encoded WebP data: {:?}",
+        call.image_data_lengths
+    );
+
+    mcp_cost::stop_fixture(&client).await;
+    client.cancel().await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires an X server + AT-SPI bus; run via scripts/verification-cost.sh"]
+async fn glass_do_real_terminal_failure_preserves_actions_and_unexecutes_later_observations() {
+    let xvfb = Xvfb::start();
+    // SAFETY: single-threaded test setup; runs before any server task spawns.
+    unsafe { std::env::set_var("GLASS_DISPLAY", &xvfb.display) };
+
+    let client = mcp_cost::boot_mcp().await;
+    mcp_cost::start_fixture(&client).await;
+    let outline = mcp_cost::wait_for_widgets(&client).await;
+    let apply_id = mcp_cost::find_named_button(&outline, "Apply").expect("Apply button id");
+    let call = mcp_cost::call_error_full(
+        &client,
+        "glass_do",
+        serde_json::json!({
+            "timeout_ms": 10_000,
+            "actions": [{"action":"click_element","id":apply_id}],
+            "then": {
+                "settle": {"interval_ms":50,"settle_frames":2,"timeout_ms":3_000},
+                "diff": {"name":"terminal-then-never-saved"},
+                "screenshot": {}
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(call.envelope["error"]["code"], "terminal_observe_failed");
+    assert_eq!(call.envelope["outcome"]["executed"], 1);
+    assert_eq!(call.envelope["outcome"]["steps"][0]["status"], "completed");
+    let terminal = call.envelope["outcome"]["terminal_steps"]
+        .as_array()
+        .expect("terminal_steps array");
+    assert_eq!(terminal[0]["status"], "completed");
+    assert_eq!(terminal[1]["status"], "failed");
+    assert_eq!(terminal[1]["content_blocks"], serde_json::json!([1]));
+    assert_eq!(terminal[2]["status"], "unexecuted");
+    assert!(
+        call.all_text.contains("baseline") && call.all_text.contains("not found"),
+        "real diff failure detail missing: {}",
+        call.all_text
+    );
+    assert_eq!(
+        call.image_count, 0,
+        "failed diff must prevent screenshot dispatch"
+    );
+
+    mcp_cost::stop_fixture(&client).await;
+    client.cancel().await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires an X server + AT-SPI bus; run via scripts/verification-cost.sh"]
 async fn arm_a_is_text_only_and_completes() {
     let xvfb = Xvfb::start();
     // SAFETY: single-threaded test setup; runs before any server task spawns.

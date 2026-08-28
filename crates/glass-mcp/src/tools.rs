@@ -125,6 +125,7 @@ pub(crate) enum SafeErrorCategory {
     UnsupportedAccessibility,
     PermissionDenied,
     TransportFailure,
+    ActionDeadlineExceeded,
     SequenceDeadlineExceeded,
     Other,
 }
@@ -163,6 +164,7 @@ impl SafeErrorCategory {
             Self::UnsupportedAccessibility => "accessibility operation is unsupported",
             Self::PermissionDenied => "permission denied",
             Self::TransportFailure => "backend transport failed",
+            Self::ActionDeadlineExceeded => "action deadline exceeded",
             Self::SequenceDeadlineExceeded => "sequence deadline exceeded",
             Self::Other => "action execution failed",
         }
@@ -175,6 +177,9 @@ impl SafeErrorCategory {
             }
             Self::SequenceDeadlineExceeded => {
                 "sequence deadline exceeded after the value write went out; re-snapshot to see where it landed rather than writing it again"
+            }
+            Self::ActionDeadlineExceeded => {
+                "action deadline exceeded after the value write went out; re-snapshot to see where it landed rather than writing it again"
             }
             _ => {
                 "the value write went out but could not be confirmed; re-snapshot to see where it landed rather than writing it again"
@@ -233,10 +238,24 @@ impl ContextualError {
 
     pub fn from_resolved_bound(
         error: glass_core::GlassError,
-        _context: ToolContext,
-        _whose: glass_core::Whose,
+        context: ToolContext,
+        whose: glass_core::Whose,
     ) -> Self {
-        Self::from_error(error)
+        let bounded = error.bound().is_some();
+        let mut out = Self::from_error(error);
+        if context.deadline.has_passed() {
+            return out.after_sequence_deadline();
+        }
+        if whose == glass_core::Whose::Callee && bounded {
+            out.category = SafeErrorCategory::ActionDeadlineExceeded;
+            out.safe_summary = if out.post_write {
+                SafeErrorCategory::ActionDeadlineExceeded.post_write_summary()
+            } else {
+                SafeErrorCategory::ActionDeadlineExceeded.summary()
+            };
+            out.sequence_deadline_exceeded = false;
+        }
+        out
     }
 
     pub fn after_dispatch(mut self) -> Self {
@@ -608,10 +627,9 @@ fn resolve_return_with(
         }
         Some("snapshot") => {
             // Let the UI settle before folding the tree so a screen-changing action (a
-            // navigating click) doesn't fold a mid-transition tree. Best-effort: `wait_stable`
-            // soft-times-out (`settled:false`, not an error) on a non-settling UI, and a rare
-            // real capture failure is swallowed because `a11y_snapshot` reads the accessibility
-            // tree (not pixels) and still returns the freshest tree — the caller asked for it.
+            // navigating click) doesn't fold a mid-transition tree. `wait_stable` soft-times-out
+            // (`settled:false`, not an error) on a non-settling UI; real capture/backend failures
+            // propagate because the requested observation did not complete reliably.
             let (_, whose) = context.deadline.budget(
                 Duration::from_millis(settle_params().timeout_ms),
                 Instant::now(),
@@ -623,10 +641,7 @@ fn resolve_return_with(
                     ));
                 }
                 Err(error) => {
-                    let error = ContextualError::from_resolved_bound(error, context, whose);
-                    if error.sequence_deadline_exceeded {
-                        return Err(error);
-                    }
+                    return Err(ContextualError::from_resolved_bound(error, context, whose));
                 }
                 Ok(_) => {}
             }

@@ -1,6 +1,6 @@
 use super::testutil::*;
 use super::*;
-use glass_core::{AppSpec, SandboxLevel};
+use glass_core::{AppSpec, Frame, SandboxLevel};
 
 fn start_args() -> StartArgs {
     StartArgs {
@@ -906,9 +906,7 @@ fn return_unknown_errors() {
 
 #[test]
 fn return_snapshot_appends_tree_and_refreshes_cache() {
-    // vec![] → the snapshot arm's best-effort settle can't capture and is swallowed; the
-    // tree still folds (the assertions below are unaffected by the settle).
-    let mut g = started_a11y_frames(vec![]);
+    let mut g = started_a11y_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
     let out = click_element(
         &mut g,
         &ClickElementArgs {
@@ -958,7 +956,10 @@ fn return_snapshot_appends_tree_and_refreshes_cache() {
 fn return_snapshot_discloses_an_unpublished_document_the_same_way_a_snapshot_does() {
     // The fold's steer wiring, not `a11y_steers` itself: every fold test until now used a
     // tree with nothing to disclose, so dropping the `extend` broke nothing.
-    let mut g = glass_with_a11y(FakePlatform::new(100, 100), unpublished_document_tree());
+    let mut g = glass_with_a11y(
+        FakePlatform::new(100, 100).with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]),
+        unpublished_document_tree(),
+    );
     g.start(&AppSpec {
         build: None,
         run: vec!["x".into()],
@@ -1009,7 +1010,6 @@ fn return_snapshot_discloses_an_unpublished_document_the_same_way_a_snapshot_doe
 
 #[test]
 fn return_snapshot_settles_before_folding() {
-    use glass_core::Frame;
     use std::sync::{Arc, Mutex};
     // A settleable frame + a capture counter, wired inline (started_a11y_frames doesn't
     // expose a capture log).
@@ -1050,28 +1050,24 @@ fn return_snapshot_settles_before_folding() {
 }
 
 #[test]
-fn return_snapshot_without_frames_still_folds() {
-    // No frames → the settle's `wait_stable` errors (no scripted frames); the `let _ =`
-    // swallows it and the tree is still folded. A `?` there would deny the tree.
+fn return_snapshot_without_frames_propagates_settle_failure() {
     let mut g = started_a11y_frames(vec![]);
-    let out = click_element(
+    let error = click_element(
         &mut g,
         &ClickElementArgs {
             id: 1,
             return_: Some("snapshot".into()),
         },
     )
-    .unwrap();
-    assert_eq!(
-        out.0.len(),
-        2,
-        "tree still folds even when the settle can't run"
+    .unwrap_err();
+    assert!(
+        error.contains("capture failed: no scripted frames"),
+        "{error}"
     );
 }
 
 #[test]
 fn return_settle_appends_settled_text() {
-    use glass_core::Frame;
     // wait_stable needs frames; one solid frame (repeated by the fake) settles.
     let mut g = started_a11y_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
     let out = click_element(
@@ -1094,7 +1090,7 @@ fn return_settle_appends_settled_text() {
 
 #[test]
 fn set_value_return_snapshot() {
-    let mut g = started_a11y_frames(vec![]);
+    let mut g = started_a11y_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
     let out = set_value(
         &mut g,
         &SetValueArgs {
@@ -1114,7 +1110,6 @@ fn set_value_return_snapshot() {
 
 #[test]
 fn set_value_return_settle_folds_into_observed() {
-    use glass_core::Frame;
     // Mirrors `return_settle_appends_settled_text` for `click_element`: wait_stable
     // needs frames; one solid frame (repeated by the fake) settles.
     let mut g = started_a11y_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
@@ -1139,7 +1134,6 @@ fn set_value_return_settle_folds_into_observed() {
 
 #[test]
 fn type_return_settle_folds_into_observed() {
-    use glass_core::Frame;
     // Mirrors the click_element/set_value settle observes: wait_stable needs frames;
     // one solid frame (repeated by the fake) settles.
     let mut g = started_a11y_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
@@ -1162,7 +1156,7 @@ fn type_return_settle_folds_into_observed() {
 
 #[test]
 fn type_return_snapshot_appends_outline() {
-    let mut g = started_a11y_frames(vec![]);
+    let mut g = started_a11y_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
     let out = type_text(
         &mut g,
         &TypeArgs {

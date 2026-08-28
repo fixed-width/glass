@@ -115,7 +115,7 @@ pub(crate) fn send_pointer_by(
             let (down_ty, up_ty) = click_types(button);
             // One down/up pair stamped with `clicks` in `kCGMouseEventClickState`, rather
             // than `clicks` separate down/up pairs — the documented CGEvent technique for
-            // synthesizing a double/triple click (see Task 2's brief).
+            // synthesizing a double/triple click.
             let clicks = i64::from(count.max(1));
             let down = mouse_event(source.as_deref(), down_ty, point, cg_button, flags)?;
             CGEvent::set_integer_value_field(
@@ -240,11 +240,10 @@ fn tap_key(source: Option<&CGEventSource>, keycode: u16, flags: CGEventFlags) ->
     Ok(())
 }
 
-/// `TypeSink` for macOS: one keyDown+keyUp CGEvent pair per character — already a
-/// self-committed HID post (`CGEventPost` delivers synchronously) — so `run_type_by`'s
-/// inter-character dwell (`KEY_TYPE_DWELL`) lands between keystrokes. An unmappable char (no
-/// US-layout key — `keymap::key_for` returns `None`) fails the whole call rather than silently
-/// skipping it, per the no-silent-fallback invariant.
+/// `TypeSink` for macOS: one keyDown+keyUp CGEvent pair per character. `CGEventPost` needs no
+/// separate flush, so `run_type_by` starts its inter-character dwell (`KEY_TYPE_DWELL`) after
+/// posting each pair. An unmappable char (no US-layout key — `keymap::key_for` returns `None`)
+/// fails the whole call rather than silently skipping it, per the no-silent-fallback invariant.
 struct MacTypeSink<'a> {
     source: Option<&'a CGEventSource>,
 }
@@ -519,7 +518,7 @@ impl ScrollSink for MacScrollSink<'_> {
             || {
                 // `CGEventCreateScrollWheelEvent2` carries no target point of its own — the window
                 // server delivers it to whatever's under the cursor (or the key window) — so
-                // position the cursor first (Task 2's brief).
+                // position the cursor first.
                 let mv = mouse_event(
                     self.source,
                     CGEventType::MouseMoved,

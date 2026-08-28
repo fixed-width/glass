@@ -342,7 +342,8 @@ Click at window-relative coordinates.
 
 - `x`, `y` (integer, **required**) — window-relative target.
 - `button` (string) — `"left"` (default), `"right"`, or `"middle"`.
-- `count` (integer) — click count (e.g. `2` for double-click).
+- `count` (integer, default 1, range 1–10) — consecutive click count (e.g. `2` for
+  double-click). Larger values are rejected before input dispatch.
 - `modifiers` (array of string) — keys held during the click.
 
 ### `glass_type`
@@ -368,10 +369,11 @@ Press a key chord.
 Scroll at window-relative coordinates by wheel notches.
 
 - `x`, `y` (integer, **required**) — window-relative point.
-- `dx`, `dy` (integer) — horizontal/vertical scroll in **wheel notches** (discrete clicks — small
-  integers like 1–5, not pixels). Positive `dy` is wheel-down, negative wheel-up; positive `dx`
-  reveals content to the **right**, negative to the left. glass clicks `|dx|`/`|dy|` times. How an
-  app maps a notch to its view (lines, pixels, zoom) is the app's choice.
+- `dx`, `dy` (integer, range -100–100) — horizontal/vertical scroll in **wheel notches**
+  (discrete clicks — normal usage is small integers like 1–5, not pixels). Positive `dy` is
+  wheel-down, negative wheel-up; positive `dx` reveals content to the **right**, negative to the
+  left. glass clicks `|dx|`/`|dy|` times. Values outside the safe range are rejected before input
+  dispatch. How an app maps a notch to its view (lines, pixels, zoom) is the app's choice.
 - `modifiers` (array of string) — keys held during the scroll.
 
 > **On touch backends (Android, iOS), `glass_scroll` is a real one-finger swipe — it is *input*,
@@ -444,6 +446,8 @@ loops, retries, or dynamically generated actions.
   `return` where the standalone tool supports it. A `settle` action uses `interval_ms`,
   `settle_frames`, `tolerance`, `timeout_ms`, `stability_region`, and `ignore`; it targets the active
   window and does not return an image.
+- Each action has the same backend support, setup requirements, and `Unsupported` behavior as its
+  standalone tool. `glass_do` changes sequencing and outcome reporting, not platform capability.
 - `then` (`{ settle?, diff?, screenshot? }`) — terminal observation after every action succeeds,
   performed in that order. Images are returned only when requested by `screenshot` or by a `diff`
   whose `include_image` is true.
@@ -452,7 +456,9 @@ loops, retries, or dynamically generated actions.
   when it expires first.
 
 The compact UTF-8 JSON encoding of the complete arguments object may be at most 65,536 bytes.
-Execution is fail-fast. In a batch, `wait_for_element` or `scroll_to_element` returning
+Preflight validation failures return `invalid_sequence` without action or terminal step outcomes.
+Once execution starts, the sequence is fail-fast. In a batch, `wait_for_element` or
+`scroll_to_element` returning
 `matched:false` fails the sequence; the standalone tools keep their soft `{matched:false}` result.
 
 On success, `result` contains `{status, executed, steps, elapsed_ms, then?, terminal_steps?}`.

@@ -770,9 +770,11 @@ impl GlassServer {
                        terminal settle/diff/screenshot. Fail-fast on action errors, sequence deadline, \
                        and unmatched batched wait_for_element/scroll_to_element predicates; standalone \
                        predicates remain soft. Successful calls return a structured completed outcome for every \
-                       action. Failed calls return completed, failed, and unexecuted action outcomes in the MCP \
-                       error. Optional terminal settle, diff, screenshot adds corresponding terminal_steps \
-                       outcomes. type retains return:\"none|settle|snapshot\" support. No variables, \
+                       action. Once execution starts, action failures return completed, failed, and unexecuted action \
+                       outcomes in the MCP error; terminal-observation failures return completed action outcomes plus \
+                       terminal_steps. Preflight validation failures return an invalid_sequence error without step \
+                       outcomes. Optional terminal settle, diff, screenshot adds corresponding terminal_steps outcomes. \
+                       type retains return:\"none|settle|snapshot\" support. No variables, \
                        result bindings, interpolation, branching, loops, retries, or dynamic action generation."
     )]
     async fn glass_do(
@@ -817,8 +819,10 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      30000ms, is valid from 1 through 120000ms, and uses one absolute deadline shared by all actions and terminal settle/diff/screenshot work. \
      Fail-fast on action errors, sequence deadline, and unmatched batched wait_for_element/\
      scroll_to_element predicates; standalone predicates remain soft. Successful calls return a structured \
-     completed outcome for every action. Failed calls return completed, failed, and unexecuted action outcomes \
-     in the MCP error. Optional terminal settle, diff, screenshot adds corresponding terminal_steps outcomes. \
+     completed outcome for every action. Once execution starts, action failures return completed, failed, and \
+     unexecuted action outcomes in the MCP error; terminal-observation failures return completed action outcomes \
+     plus terminal_steps. Preflight validation failures return an invalid_sequence error without step outcomes. \
+     Optional terminal settle, diff, screenshot adds corresponding terminal_steps outcomes. \
      type retains return:\"none|settle|snapshot\" support. \
      No variables, result bindings, interpolation, branching, loops, retries, or dynamic action \
      generation.\n\n\
@@ -918,6 +922,48 @@ mod tests {
         assert!(settle_timeout.contains("enclosing glass_do"));
         assert!(settle_timeout.contains("deadline fails the sequence"));
 
+        fn integer_keyword(value: &serde_json::Value, keyword: &str) -> Option<i64> {
+            value
+                .get(keyword)
+                .and_then(serde_json::Value::as_i64)
+                .or_else(|| {
+                    value.as_object().and_then(|object| {
+                        object
+                            .values()
+                            .find_map(|child| integer_keyword(child, keyword))
+                    })
+                })
+                .or_else(|| {
+                    value.as_array().and_then(|items| {
+                        items
+                            .iter()
+                            .find_map(|child| integer_keyword(child, keyword))
+                    })
+                })
+        }
+
+        let click_count = &defs["ClickArgs"]["properties"]["count"];
+        assert_eq!(integer_keyword(click_count, "minimum"), Some(1));
+        assert_eq!(integer_keyword(click_count, "maximum"), Some(10));
+        assert!(
+            click_count["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("1 through 10")),
+            "{click_count}"
+        );
+
+        for axis in ["dx", "dy"] {
+            let magnitude = &defs["ScrollArgs"]["properties"][axis];
+            assert_eq!(integer_keyword(magnitude, "minimum"), Some(-100));
+            assert_eq!(integer_keyword(magnitude, "maximum"), Some(100));
+            assert!(
+                magnitude["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("-100 through 100")),
+                "{axis}: {magnitude}"
+            );
+        }
+
         let click_element_id = defs["ClickElementArgs"]["properties"]["id"]["description"]
             .as_str()
             .expect("click_element id description");
@@ -952,8 +998,9 @@ mod tests {
             "action errors, sequence deadline, and unmatched batched wait_for_element/scroll_to_element predicates",
             "standalone predicates remain soft",
             "Successful calls return a structured completed outcome for every action",
-            "Failed calls return completed, failed, and unexecuted action outcomes in the MCP error",
-            "terminal_steps outcomes",
+            "Once execution starts, action failures return completed, failed, and unexecuted action outcomes in the MCP error",
+            "terminal-observation failures return completed action outcomes plus terminal_steps",
+            "Preflight validation failures return an invalid_sequence error without step outcomes",
             "wait_for_element",
             "scroll_to_element",
             "Optional terminal settle, diff, screenshot",
@@ -982,8 +1029,9 @@ mod tests {
             "standalone predicates remain soft",
             "Fail-fast on action errors, sequence deadline, and unmatched batched wait_for_element/scroll_to_element predicates",
             "Successful calls return a structured completed outcome for every action",
-            "Failed calls return completed, failed, and unexecuted action outcomes in the MCP error",
-            "terminal_steps outcomes",
+            "Once execution starts, action failures return completed, failed, and unexecuted action outcomes in the MCP error",
+            "terminal-observation failures return completed action outcomes plus terminal_steps",
+            "Preflight validation failures return an invalid_sequence error without step outcomes",
             "Optional terminal settle, diff, screenshot",
             "type retains return:\"none|settle|snapshot\"",
             "No variables, result bindings, interpolation, branching, loops, retries, or dynamic action generation",
