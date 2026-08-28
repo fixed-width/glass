@@ -2810,46 +2810,114 @@ mod display_tests {
         cmd.spawn().expect("the stand-in app should spawn")
     }
 
+    struct ReapedStandIn(std::process::Child);
+
+    impl ReapedStandIn {
+        fn spawn() -> Self {
+            Self(spawn_stand_in())
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for ReapedStandIn {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     const X_SERVER_RESCUE_AFTER: Duration = Duration::from_secs(2);
 
+    #[derive(Debug)]
+    enum RescueControl {
+        Arm(std::sync::mpsc::Sender<()>),
+        Cancel,
+    }
+
+    fn run_x_server_rescue(
+        commands: std::sync::mpsc::Receiver<RescueControl>,
+        rescue_after: Duration,
+        resume: impl FnOnce() -> bool,
+    ) -> bool {
+        match commands.recv() {
+            Ok(RescueControl::Arm(armed)) => {
+                if armed.send(()).is_err() {
+                    return false;
+                }
+            }
+            Ok(RescueControl::Cancel) | Err(_) => return false,
+        }
+
+        match commands.recv_timeout(rescue_after) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => resume(),
+            Ok(RescueControl::Arm(_) | RescueControl::Cancel)
+            | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => false,
+        }
+    }
+
+    fn resume_x_server(pid: rustix::process::Pid) -> bool {
+        rustix::process::kill_process(pid, rustix::process::Signal::CONT).is_ok()
+    }
+
     struct PausedXServer {
-        pid: u32,
+        pid: rustix::process::Pid,
         resumed: bool,
-        rescue_cancel: Option<std::sync::mpsc::Sender<()>>,
+        rescue_control: Option<std::sync::mpsc::Sender<RescueControl>>,
         rescue: Option<std::thread::JoinHandle<bool>>,
     }
 
     impl PausedXServer {
         fn new(pid: u32) -> Self {
-            let (rescue_cancel, cancelled) = std::sync::mpsc::channel();
+            Self::new_with_before_stop(pid, X_SERVER_RESCUE_AFTER, || {})
+        }
+
+        fn new_with_before_stop(
+            pid: u32,
+            rescue_after: Duration,
+            before_stop: impl FnOnce(),
+        ) -> Self {
+            let pid = rustix::process::Pid::from_raw(pid as i32).expect("a non-zero X-server pid");
+            let (rescue_control, commands) = std::sync::mpsc::channel();
             let rescue = std::thread::spawn(move || {
-                if cancelled.recv_timeout(X_SERVER_RESCUE_AFTER).is_ok() {
-                    return false;
-                }
-                let _ = std::process::Command::new("kill")
-                    .args(["-CONT", &pid.to_string()])
-                    .status();
-                true
+                run_x_server_rescue(commands, rescue_after, move || resume_x_server(pid))
             });
-            let paused = Self {
+            let mut paused = Self {
                 pid,
                 resumed: false,
-                rescue_cancel: Some(rescue_cancel),
+                rescue_control: Some(rescue_control),
                 rescue: Some(rescue),
             };
-            signal_process(pid, "-STOP");
+            before_stop();
+            signal_process(pid, rustix::process::Signal::STOP);
+            wait_until_stopped(pid);
+            paused.arm_rescue();
             paused
         }
 
+        fn arm_rescue(&mut self) {
+            let (armed, acknowledgement) = std::sync::mpsc::channel();
+            self.rescue_control
+                .as_ref()
+                .expect("an unarmed rescue has a control channel")
+                .send(RescueControl::Arm(armed))
+                .expect("arm the X-server rescue");
+            acknowledgement
+                .recv()
+                .expect("the X-server rescue acknowledged arming");
+        }
+
         fn resume(mut self) -> bool {
-            signal_process(self.pid, "-CONT");
+            signal_process(self.pid, rustix::process::Signal::CONT);
             self.resumed = true;
             self.join_rescue()
         }
 
         fn join_rescue(&mut self) -> bool {
-            if let Some(cancel) = self.rescue_cancel.take() {
-                let _ = cancel.send(());
+            if let Some(control) = self.rescue_control.take() {
+                let _ = control.send(RescueControl::Cancel);
             }
             self.rescue
                 .take()
@@ -2860,21 +2928,78 @@ mod display_tests {
     impl Drop for PausedXServer {
         fn drop(&mut self) {
             if !self.resumed {
-                let _ = std::process::Command::new("kill")
-                    .args(["-CONT", &self.pid.to_string()])
-                    .status();
+                let _ = rustix::process::kill_process(self.pid, rustix::process::Signal::CONT);
                 self.resumed = true;
             }
             let _ = self.join_rescue();
         }
     }
 
-    fn signal_process(pid: u32, signal: &str) {
-        let status = std::process::Command::new("kill")
-            .args([signal, &pid.to_string()])
-            .status()
-            .expect("signal the X server");
-        assert!(status.success(), "kill {signal} {pid} failed: {status}");
+    #[test]
+    #[ignore = "starts a real stand-in process"]
+    fn rescue_countdown_begins_only_after_sigstop_succeeds() {
+        let stand_in = ReapedStandIn::spawn();
+        let paused =
+            PausedXServer::new_with_before_stop(stand_in.pid(), Duration::from_millis(20), || {
+                std::thread::sleep(Duration::from_millis(80))
+            });
+
+        assert!(
+            !paused.resume(),
+            "the rescue deadline was consumed before SIGSTOP completed"
+        );
+    }
+
+    #[test]
+    #[ignore = "exercises the X-server rescue protocol"]
+    fn rescue_cancelled_before_arming_does_not_attempt_sigcont() {
+        let (control, commands) = std::sync::mpsc::channel();
+        control.send(RescueControl::Cancel).expect("cancel rescue");
+
+        let rescued = run_x_server_rescue(commands, Duration::ZERO, || {
+            panic!("a cancelled rescue must not attempt SIGCONT")
+        });
+
+        assert!(!rescued);
+    }
+
+    #[test]
+    #[ignore = "exercises the X-server rescue protocol"]
+    fn rescue_does_not_report_success_when_sigcont_fails() {
+        let (control, commands) = std::sync::mpsc::channel();
+        let (armed, _acknowledgement) = std::sync::mpsc::channel();
+        control.send(RescueControl::Arm(armed)).expect("arm rescue");
+
+        let rescued = run_x_server_rescue(commands, Duration::ZERO, || false);
+
+        assert!(!rescued);
+    }
+
+    #[test]
+    #[ignore = "exercises the direct X-server signal path"]
+    fn direct_rescue_sigcont_failure_is_reported() {
+        let impossible_pid =
+            rustix::process::Pid::from_raw(i32::MAX).expect("i32::MAX is a non-zero pid");
+
+        assert!(!resume_x_server(impossible_pid));
+    }
+
+    fn signal_process(pid: rustix::process::Pid, signal: rustix::process::Signal) {
+        rustix::process::kill_process(pid, signal)
+            .unwrap_or_else(|error| panic!("{signal:?} X server {pid:?}: {error}"));
+    }
+
+    fn wait_until_stopped(pid: rustix::process::Pid) {
+        let stat = format!("/proc/{}/stat", pid.as_raw_nonzero());
+        for _ in 0..1000 {
+            let read = std::fs::read_to_string(&stat).expect("the X server's /proc entry");
+            let after_comm = read.rsplit_once(')').expect("an X-server comm field").1;
+            if after_comm.split_whitespace().next() == Some("T") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("X server {pid:?} never reached the stopped state");
     }
 
     /// The buttons and their positions a watching window saw, as `(detail, x, y)`.
