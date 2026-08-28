@@ -71,6 +71,105 @@ fn envelope(tool: &str, result: serde_json::Value) -> String {
 /// Tool result: Ok(content) or Err(agent-readable message).
 pub type ToolResult = Result<ToolOutput, String>;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ToolContext {
+    pub deadline: glass_core::Deadline,
+}
+
+impl ToolContext {
+    pub const UNBOUNDED: Self = Self {
+        deadline: glass_core::Deadline::UNBOUNDED,
+    };
+}
+
+#[derive(Debug)]
+pub(crate) struct ContextualOutput {
+    pub output: ToolOutput,
+    pub timed_out_by: Option<glass_core::Whose>,
+}
+
+impl ContextualOutput {
+    pub fn immediate(output: ToolOutput) -> Self {
+        Self {
+            output,
+            timed_out_by: None,
+        }
+    }
+
+    pub fn with_timeout(output: ToolOutput, timed_out_by: Option<glass_core::Whose>) -> Self {
+        Self {
+            output,
+            timed_out_by,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ContextualError {
+    pub message: String,
+    pub sequence_deadline_exceeded: bool,
+}
+
+impl ContextualError {
+    pub fn validation(message: String) -> Self {
+        Self {
+            message,
+            sequence_deadline_exceeded: false,
+        }
+    }
+
+    pub fn from_core(error: glass_core::GlassError, context: ToolContext) -> Self {
+        let sequence_deadline_exceeded = match error.bound() {
+            Some(glass_core::BoundKind::NotStarted) => context.deadline.has_passed(),
+            Some(glass_core::BoundKind::TimedOut) => context.deadline.has_passed(),
+            None => false,
+        };
+        Self {
+            message: error.to_string(),
+            sequence_deadline_exceeded,
+        }
+    }
+
+    pub fn from_caller_bound(error: glass_core::GlassError, context: ToolContext) -> Self {
+        let sequence_deadline_exceeded =
+            error.bound().is_some() && context.deadline.remaining().is_some();
+        Self {
+            message: error.to_string(),
+            sequence_deadline_exceeded,
+        }
+    }
+
+    pub fn from_resolved_bound(
+        error: glass_core::GlassError,
+        context: ToolContext,
+        whose: glass_core::Whose,
+    ) -> Self {
+        let sequence_deadline_exceeded = error.bound().is_some()
+            && whose == glass_core::Whose::Caller
+            && context.deadline.remaining().is_some();
+        Self {
+            message: error.to_string(),
+            sequence_deadline_exceeded,
+        }
+    }
+
+    pub fn annotate(mut self, prefix: &str) -> Self {
+        self.message = format!("{prefix}: {}", self.message);
+        self
+    }
+}
+
+pub(crate) type ContextualToolResult = Result<ContextualOutput, ContextualError>;
+type ReturnObservation = (
+    Option<serde_json::Value>,
+    Vec<OutContent>,
+    Option<glass_core::Whose>,
+);
+
+fn erase_context(result: ContextualToolResult) -> ToolResult {
+    result.map(|o| o.output).map_err(|e| e.message)
+}
+
 /// Batch tool result: either outcome may carry structured MCP content.
 pub(crate) type BatchToolResult = Result<ToolOutput, ToolOutput>;
 
@@ -366,16 +465,18 @@ pub(crate) fn validate_return(ret: Option<&str>) -> Result<(), String> {
 /// → neither. Calls the `Glass` methods directly (not the `a11y_snapshot`/`wait_stable`
 /// tool functions) so a composed observe never nests another envelope. Unknown value
 /// → `Err` (unchanged rejection).
-fn resolve_return(
+fn resolve_return_with(
     glass: &mut Glass,
     ret: Option<&str>,
-) -> Result<(Option<serde_json::Value>, Vec<OutContent>), String> {
+    context: ToolContext,
+) -> Result<ReturnObservation, ContextualError> {
     match ret {
-        None | Some("none") => Ok((None, vec![])),
+        None | Some("none") => Ok((None, vec![], None)),
         Some("settle") => {
             let o = glass
-                .wait_stable(&settle_params())
-                .map_err(|e| e.to_string())?;
+                .wait_stable_by(&settle_params(), context.deadline)
+                .map_err(|e| ContextualError::from_core(e, context))?;
+            let timed_out_by = (!o.settled).then_some(glass_core::Whose::Callee);
             Ok((
                 Some(serde_json::json!({
                     "settled": o.settled,
@@ -383,6 +484,7 @@ fn resolve_return(
                     "observed_ms": o.observed_ms,
                 })),
                 vec![],
+                timed_out_by,
             ))
         }
         Some("snapshot") => {
@@ -391,12 +493,12 @@ fn resolve_return(
             // soft-times-out (`settled:false`, not an error) on a non-settling UI, and a rare
             // real capture failure is swallowed because `a11y_snapshot` reads the accessibility
             // tree (not pixels) and still returns the freshest tree — the caller asked for it.
-            let _ = glass.wait_stable(&settle_params());
+            let _ = glass.wait_stable_by(&settle_params(), context.deadline);
             // Reuse the session's current limits so a fold after a raised/unbounded snapshot
             // isn't silently re-truncated to the default cap.
             let tree = glass
-                .a11y_resnapshot(glass_core::Deadline::UNBOUNDED)
-                .map_err(|e| e.to_string())?;
+                .a11y_resnapshot(context.deadline)
+                .map_err(|e| ContextualError::from_core(e, context))?;
             // Same shape as `a11y_snapshot`: the app-derived outline stays untrusted-wrapped;
             // glass's own steers are separate trusted blocks, not baked into that body.
             let mut extra = vec![OutContent::Text(crate::untrusted::wrap_untrusted(
@@ -406,19 +508,30 @@ fn resolve_return(
                 extra.push(OutContent::Text(hint.to_string()));
             }
             extra.extend(a11y_steers(&tree).into_iter().map(OutContent::Text));
-            Ok((None, extra))
+            Ok((None, extra, None))
         }
-        Some(o) => Err(format!("unknown return '{o}' (use none/settle/snapshot)")),
+        Some(o) => Err(ContextualError::validation(format!(
+            "unknown return '{o}' (use none/settle/snapshot)"
+        ))),
     }
 }
 
 pub fn click_element(glass: &mut Glass, a: &ClickElementArgs) -> ToolResult {
+    erase_context(click_element_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn click_element_with(
+    glass: &mut Glass,
+    a: &ClickElementArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     // Bad `return` value → reject before the click lands (see `validate_return`).
-    validate_return(a.return_.as_deref())?;
+    validate_return(a.return_.as_deref()).map_err(ContextualError::validation)?;
     let method = glass
-        .click_element(AxNodeId(a.id))
-        .map_err(|e| e.to_string())?;
-    let (observed, extra) = resolve_return(glass, a.return_.as_deref())?;
+        .click_element_by(AxNodeId(a.id), context.deadline)
+        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+    let (observed, extra, timed_out_by) =
+        resolve_return_with(glass, a.return_.as_deref(), context)?;
     let mut result = serde_json::json!({ "id": a.id, "method": method.label() });
     if let Some(reason) = method.native_fallback() {
         result["native_fallback"] = serde_json::json!(reason);
@@ -429,25 +542,36 @@ pub fn click_element(glass: &mut Glass, a: &ClickElementArgs) -> ToolResult {
     if let Some(o) = observed {
         result["observed"] = o;
     }
-    Ok(ToolOutput::result_with(
-        "glass_click_element",
-        result,
-        extra,
+    Ok(ContextualOutput::with_timeout(
+        ToolOutput::result_with("glass_click_element", result, extra),
+        timed_out_by,
     ))
 }
 
 pub fn set_value(glass: &mut Glass, a: &SetValueArgs) -> ToolResult {
+    erase_context(set_value_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn set_value_with(
+    glass: &mut Glass,
+    a: &SetValueArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     // Bad `return` value → reject before the value is written (see `validate_return`).
-    validate_return(a.return_.as_deref())?;
+    validate_return(a.return_.as_deref()).map_err(ContextualError::validation)?;
     glass
-        .set_value(AxNodeId(a.id), &a.text)
-        .map_err(|e| e.to_string())?;
-    let (observed, extra) = resolve_return(glass, a.return_.as_deref())?;
+        .set_value_by(AxNodeId(a.id), &a.text, context.deadline)
+        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+    let (observed, extra, timed_out_by) =
+        resolve_return_with(glass, a.return_.as_deref(), context)?;
     let mut result = serde_json::json!({ "id": a.id });
     if let Some(o) = observed {
         result["observed"] = o;
     }
-    Ok(ToolOutput::result_with("glass_set_value", result, extra))
+    Ok(ContextualOutput::with_timeout(
+        ToolOutput::result_with("glass_set_value", result, extra),
+        timed_out_by,
+    ))
 }
 
 pub fn a11y_marks(glass: &mut Glass) -> ToolResult {

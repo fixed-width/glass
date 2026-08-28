@@ -1,14 +1,15 @@
 //! `glass_do`: run an ordered input sequence server-side, then optionally observe.
 
-use glass_core::Glass;
+use glass_core::{Deadline, Glass, Whose};
 use serde_json::json;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::params::*;
 use crate::tools::{
-    BatchToolResult, OutContent, ToolOutput, ToolResult, click, click_element, diff, drag, key,
-    mouse_move, screenshot, scroll, scroll_to_element, set_value, type_text, wait_for_element,
-    wait_stable,
+    BatchToolResult, ContextualToolResult, OutContent, ToolContext, ToolOutput, click_element_with,
+    click_with, diff, drag_with, key_with, mouse_move_with, screenshot, scroll_to_element_with,
+    scroll_with, set_value_with, type_text_with, wait_for_element_with, wait_stable,
+    wait_stable_with,
 };
 
 mod model;
@@ -69,7 +70,6 @@ fn settle_args(s: &SettleArgs) -> WaitStableArgs {
 /// the count that ran. A `then` failure is reported distinctly (the actions
 /// already executed).
 pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
-    let started = Instant::now();
     if a.actions.is_empty() {
         return Err(validation_error(
             "`actions` must contain at least one action",
@@ -91,30 +91,49 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
             "`timeout_ms` must be between 1 and {MAX_TIMEOUT_MS}"
         )));
     }
+    let started = Instant::now();
+    let context = ToolContext {
+        deadline: Deadline::at(started + Duration::from_millis(timeout_ms)),
+    };
     let n = a.actions.len();
     let mut steps = Vec::with_capacity(n);
     let mut siblings = Vec::new();
     for (i, action) in a.actions.iter().enumerate() {
         let kind = action.kind();
-        let result: ToolResult = match action {
-            Action::Click(args) => click(glass, args),
-            Action::Move(args) => mouse_move(glass, args),
-            Action::Drag(args) => drag(glass, args),
-            Action::Scroll(args) => scroll(glass, args),
-            Action::Type(args) => type_text(glass, args),
-            Action::Key(args) => key(glass, args),
+        if context.deadline.has_passed() {
+            return Err(step_failure(
+                &a.actions,
+                i,
+                kind,
+                false,
+                false,
+                "sequence deadline exceeded before action started",
+                true,
+                steps,
+                siblings,
+                started.elapsed().as_millis(),
+            ));
+        }
+        let result: ContextualToolResult = match action {
+            Action::Click(args) => click_with(glass, args, context),
+            Action::Move(args) => mouse_move_with(glass, args, context),
+            Action::Drag(args) => drag_with(glass, args, context),
+            Action::Scroll(args) => scroll_with(glass, args, context),
+            Action::Type(args) => type_text_with(glass, args, context),
+            Action::Key(args) => key_with(glass, args, context),
             // A settle's text-only output is discarded mid-sequence; only its
             // Err (bad region / capture failure) aborts. A non-settle (timeout)
             // is Ok and proceeds.
-            Action::Settle(args) => wait_stable(glass, &settle_args(args)),
-            Action::ClickElement(args) => click_element(glass, args),
-            Action::SetValue(args) => set_value(glass, args),
-            Action::WaitForElement(args) => wait_for_element(glass, args),
-            Action::ScrollToElement(args) => scroll_to_element(glass, args),
+            Action::Settle(args) => wait_stable_with(glass, &settle_args(args), context),
+            Action::ClickElement(args) => click_element_with(glass, args, context),
+            Action::SetValue(args) => set_value_with(glass, args, context),
+            Action::WaitForElement(args) => wait_for_element_with(glass, args, context),
+            Action::ScrollToElement(args) => scroll_to_element_with(glass, args, context),
         };
         match result {
             Ok(out) => {
-                let (result, mut extra) = split_sub(out);
+                let timed_out_by = out.timed_out_by;
+                let (result, mut extra) = split_sub(out.output);
                 let start = siblings.len() + 1;
                 let content_blocks = (start..start + extra.len()).collect();
                 siblings.append(&mut extra);
@@ -129,6 +148,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                         i,
                         kind,
                         action.is_mutating(),
+                        timed_out_by == Some(Whose::Caller),
                         result,
                         content_blocks,
                         steps,
@@ -143,14 +163,15 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                     content_blocks,
                 });
             }
-            Err(summary) => {
+            Err(error) => {
                 return Err(step_failure(
                     &a.actions,
                     i,
                     kind,
                     true,
                     action.is_mutating(),
-                    &summary,
+                    &error.message,
+                    error.sequence_deadline_exceeded,
                     steps,
                     siblings,
                     started.elapsed().as_millis(),
@@ -189,20 +210,26 @@ fn predicate_failure(
     index: usize,
     action: &'static str,
     side_effects_may_have_occurred: bool,
+    sequence_deadline_exceeded: bool,
     result: serde_json::Value,
     content_blocks: Vec<usize>,
     mut steps: Vec<StepOutcome>,
     siblings: Vec<OutContent>,
     elapsed_ms: u128,
 ) -> ToolOutput {
+    let (code, summary) = if sequence_deadline_exceeded {
+        ("sequence_deadline_exceeded", "sequence deadline exceeded")
+    } else {
+        ("predicate_not_matched", "element predicate did not match")
+    };
     steps.push(StepOutcome::Failed {
         index,
         action,
         attempted: true,
         result: Some(result),
         error: StepError {
-            code: "predicate_not_matched",
-            summary: "element predicate did not match".into(),
+            code,
+            summary: summary.into(),
         },
         side_effects_may_have_occurred,
         content_blocks,
@@ -221,9 +248,9 @@ fn predicate_failure(
             "ok": false,
             "tool": "glass_do",
             "error": {
-                "code": "predicate_not_matched",
+                "code": code,
                 "step": index,
-                "summary": "element predicate did not match",
+                "summary": summary,
             },
             "outcome": failure_outcome(steps, index, elapsed_ms),
         }),
@@ -239,10 +266,16 @@ fn step_failure(
     attempted: bool,
     side_effects_may_have_occurred: bool,
     detail: &str,
+    sequence_deadline_exceeded: bool,
     mut steps: Vec<StepOutcome>,
     mut siblings: Vec<OutContent>,
     elapsed_ms: u128,
 ) -> ToolOutput {
+    let (code, summary) = if sequence_deadline_exceeded {
+        ("sequence_deadline_exceeded", "sequence deadline exceeded")
+    } else {
+        ("action_failed", "action execution failed")
+    };
     let content_block = siblings.len() + 1;
     siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(detail)));
     steps.push(StepOutcome::Failed {
@@ -251,8 +284,8 @@ fn step_failure(
         attempted,
         result: None,
         error: StepError {
-            code: "action_failed",
-            summary: "action execution failed".into(),
+            code,
+            summary: summary.into(),
         },
         side_effects_may_have_occurred,
         content_blocks: vec![content_block],
@@ -270,7 +303,7 @@ fn step_failure(
         json!({
             "ok": false,
             "tool": "glass_do",
-            "error": { "code": "step_failed", "step": index, "summary": "action execution failed" },
+            "error": { "code": code, "step": index, "summary": summary },
             "outcome": failure_outcome(steps, index, elapsed_ms),
         }),
         siblings,

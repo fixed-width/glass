@@ -2,8 +2,318 @@ use super::*;
 use crate::tools::start as start_tool;
 use crate::tools::testutil::*;
 use crate::tools::{OutContent, baseline_save};
-use glass_core::Frame;
+use glass_core::{
+    AppSpec, Backend, BaselineStore, Deadline, Frame, GlassError, KeyEvent, Platform,
+    PlatformFactory, PointerEvent, Region, Result as GlassResult, Stream, WindowGeometry, WindowId,
+    WindowInfo, WindowOp,
+};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+#[derive(Clone, Copy)]
+enum DeadlineBehavior {
+    Normal,
+    CompleteLate,
+    FailLate,
+    FailCaptureLate,
+}
+
+struct DeadlinePlatform {
+    inner: FakePlatform,
+    deadlines: Arc<Mutex<Vec<Deadline>>>,
+    behavior: DeadlineBehavior,
+}
+
+type DeadlineFixture = (Glass, Arc<Mutex<Vec<Deadline>>>, Arc<Mutex<Vec<String>>>);
+
+impl Platform for DeadlinePlatform {
+    fn start_app(&mut self, spec: &AppSpec) -> GlassResult<WindowGeometry> {
+        self.inner.start_app(spec)
+    }
+    fn stop_app_by(&mut self, deadline: Deadline) -> GlassResult<()> {
+        self.inner.stop_app_by(deadline)
+    }
+    fn capture_frame(&mut self, region: Option<&Region>) -> GlassResult<Frame> {
+        self.inner.capture_frame(region)
+    }
+    fn capture_frame_by(
+        &mut self,
+        region: Option<&Region>,
+        deadline: Deadline,
+    ) -> GlassResult<Frame> {
+        self.deadlines.lock().unwrap().push(deadline);
+        if matches!(self.behavior, DeadlineBehavior::FailCaptureLate) {
+            std::thread::sleep(Duration::from_millis(3));
+            return Err(GlassError::caller_deadline_elapsed("controlled capture"));
+        }
+        self.inner.capture_frame(region)
+    }
+    fn send_pointer(&mut self, event: &PointerEvent) -> GlassResult<()> {
+        self.inner.send_pointer(event)
+    }
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> GlassResult<()> {
+        self.deadlines.lock().unwrap().push(deadline);
+        match self.behavior {
+            DeadlineBehavior::Normal => self.inner.send_pointer(event),
+            DeadlineBehavior::CompleteLate => {
+                std::thread::sleep(Duration::from_millis(3));
+                self.inner.send_pointer(event)
+            }
+            DeadlineBehavior::FailLate => {
+                self.inner.send_pointer(event)?;
+                std::thread::sleep(Duration::from_millis(3));
+                Err(GlassError::caller_deadline_elapsed("controlled pointer"))
+            }
+            DeadlineBehavior::FailCaptureLate => self.inner.send_pointer(event),
+        }
+    }
+    fn send_key(&mut self, event: &KeyEvent) -> GlassResult<()> {
+        self.inner.send_key(event)
+    }
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> GlassResult<()> {
+        self.deadlines.lock().unwrap().push(deadline);
+        self.inner.send_key(event)
+    }
+    fn window(&mut self, op: &WindowOp) -> GlassResult<WindowGeometry> {
+        self.inner.window(op)
+    }
+    fn list_windows(&mut self) -> GlassResult<Vec<WindowInfo>> {
+        self.inner.list_windows()
+    }
+    fn select_window(&mut self, id: WindowId) -> GlassResult<WindowGeometry> {
+        self.inner.select_window(id)
+    }
+    fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+        self.inner.drain_logs()
+    }
+}
+
+fn deadline_glass(behavior: DeadlineBehavior, frames: Vec<Frame>) -> DeadlineFixture {
+    let deadlines = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let platform = DeadlinePlatform {
+        inner: FakePlatform::new(100, 100)
+            .with_frames(frames)
+            .with_event_log(events.clone()),
+        deadlines: deadlines.clone(),
+        behavior,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    let mut held = Some(Box::new(platform) as Box<dyn Platform + Send>);
+    let factory: PlatformFactory = Box::new(move |_| {
+        Ok(Backend::display_only(held.take().ok_or_else(|| {
+            GlassError::Backend("factory called twice".into())
+        })?))
+    });
+    let mut glass = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+    start_tool(
+        &mut glass,
+        &StartArgs {
+            build: None,
+            run: vec!["app".into()],
+            backend: None,
+            sandbox: None,
+            cwd: None,
+            env: Default::default(),
+            window_hint: None,
+            timeout_ms: None,
+            a11y: None,
+        },
+    )
+    .unwrap();
+    deadlines.lock().unwrap().clear();
+    (glass, deadlines, events)
+}
+
+fn do_args(actions: Vec<Action>, timeout_ms: u64) -> DoArgs {
+    DoArgs {
+        actions,
+        then: None,
+        timeout_ms: Some(timeout_ms),
+        encoded_argument_bytes: 0,
+    }
+}
+
+#[test]
+fn standalone_handlers_use_unbounded_context_and_keep_wire_shape() {
+    let (mut g, deadlines, _) = deadline_glass(
+        DeadlineBehavior::Normal,
+        vec![Frame::solid(100, 100, [0, 0, 0, 255])],
+    );
+    let args = ClickArgs {
+        x: 1,
+        y: 2,
+        button: None,
+        count: None,
+        modifiers: None,
+    };
+    let standalone = crate::tools::click(&mut g, &args).unwrap();
+    let contextual = crate::tools::click_with(&mut g, &args, crate::tools::ToolContext::UNBOUNDED)
+        .unwrap()
+        .output;
+    assert_eq!(format!("{standalone:?}"), format!("{contextual:?}"));
+    assert_eq!(
+        *deadlines.lock().unwrap(),
+        vec![Deadline::UNBOUNDED, Deadline::UNBOUNDED]
+    );
+    let screenshot_args = ScreenshotArgs {
+        region: None,
+        window_id: None,
+    };
+    let standalone_image = crate::tools::screenshot(&mut g, &screenshot_args).unwrap();
+    let contextual_image = crate::tools::screenshot_with(
+        &mut g,
+        &screenshot_args,
+        crate::tools::ToolContext::UNBOUNDED,
+    )
+    .unwrap()
+    .output;
+    assert_eq!(
+        format!("{standalone_image:?}"),
+        format!("{contextual_image:?}")
+    );
+    assert!(matches!(standalone_image.0[0], OutContent::Image(_)));
+    let bad = ClickArgs { x: 100, ..args };
+    assert_eq!(
+        crate::tools::click(&mut g, &bad).unwrap_err(),
+        crate::tools::click_with(&mut g, &bad, crate::tools::ToolContext::UNBOUNDED)
+            .unwrap_err()
+            .message
+    );
+}
+
+#[test]
+fn sequence_uses_one_absolute_deadline_for_every_action() {
+    let frame = Frame::solid(100, 100, [0, 0, 0, 255]);
+    let (mut g, deadlines, _) =
+        deadline_glass(DeadlineBehavior::Normal, vec![frame.clone(), frame]);
+    do_actions(
+        &mut g,
+        &do_args(
+            vec![
+                click(1, 1),
+                Action::Key(KeyArgs {
+                    chord: "Tab".into(),
+                }),
+                Action::Settle(SettleArgs {
+                    interval_ms: Some(0),
+                    settle_frames: Some(1),
+                    tolerance: None,
+                    timeout_ms: Some(2000),
+                    stability_region: None,
+                    ignore: None,
+                }),
+            ],
+            1000,
+        ),
+    )
+    .unwrap();
+    let seen = deadlines.lock().unwrap();
+    assert!(
+        seen.len() >= 4,
+        "pointer, key, and settle captures must be bounded: {seen:?}"
+    );
+    assert!(seen.iter().all(|deadline| *deadline == seen[0]));
+    assert_ne!(seen[0], Deadline::UNBOUNDED);
+}
+
+#[test]
+fn deadline_spent_before_step_marks_it_failed_unattempted() {
+    let (mut g, _, events) = deadline_glass(DeadlineBehavior::CompleteLate, vec![]);
+    let err = do_actions(
+        &mut g,
+        &do_args(
+            vec![
+                click(1, 1),
+                Action::Key(KeyArgs {
+                    chord: "Return".into(),
+                }),
+                click(2, 2),
+            ],
+            1,
+        ),
+    )
+    .unwrap_err();
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(envelope["outcome"]["steps"][1]["attempted"], false);
+    assert_eq!(
+        envelope["outcome"]["steps"][1]["side_effects_may_have_occurred"],
+        false
+    );
+    assert_eq!(envelope["outcome"]["steps"][2]["status"], "unexecuted");
+    assert_eq!(*events.lock().unwrap(), vec!["click(1,1)"]);
+}
+
+#[test]
+fn wait_own_timeout_is_predicate_not_matched() {
+    let mut g = started_a11y(FakePlatform::new(100, 100));
+    let wait: WaitForElementArgs =
+        serde_json::from_str(r#"{"name":"Missing","timeout_ms":1,"interval_ms":1}"#).unwrap();
+    let err = do_actions(&mut g, &do_args(vec![Action::WaitForElement(wait)], 1000)).unwrap_err();
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    assert_eq!(envelope["error"]["code"], "predicate_not_matched");
+}
+
+#[test]
+fn wait_sequence_timeout_is_sequence_deadline_exceeded() {
+    let mut g = started_a11y(FakePlatform::new(100, 100));
+    let wait: WaitForElementArgs =
+        serde_json::from_str(r#"{"name":"Missing","timeout_ms":1000,"interval_ms":10}"#).unwrap();
+    let err = do_actions(&mut g, &do_args(vec![Action::WaitForElement(wait)], 1)).unwrap_err();
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+}
+
+#[test]
+fn settle_own_timeout_is_completed_but_sequence_timeout_fails() {
+    let black = Frame::solid(100, 100, [0, 0, 0, 255]);
+    let white = Frame::solid(100, 100, [255, 255, 255, 255]);
+    let settle = Action::Settle(SettleArgs {
+        interval_ms: Some(0),
+        settle_frames: Some(u32::MAX),
+        tolerance: None,
+        timeout_ms: Some(2),
+        stability_region: None,
+        ignore: None,
+    });
+    let (mut own, _, _) = deadline_glass(
+        DeadlineBehavior::Normal,
+        vec![black.clone(), white.clone(), black.clone(), white.clone()],
+    );
+    let out = do_actions(&mut own, &do_args(vec![settle], 1000)).unwrap();
+    assert_eq!(
+        assert_envelope(&out, "glass_do")["steps"][0]["result"]["settled"],
+        false
+    );
+    let caller_settle = Action::Settle(SettleArgs {
+        interval_ms: Some(10),
+        settle_frames: Some(3),
+        tolerance: None,
+        timeout_ms: Some(1000),
+        stability_region: None,
+        ignore: None,
+    });
+    let (mut caller, _, _) = deadline_glass(DeadlineBehavior::FailCaptureLate, vec![black, white]);
+    let err = do_actions(&mut caller, &do_args(vec![caller_settle], 1)).unwrap_err();
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+}
+
+#[test]
+fn mutating_deadline_failure_warns_side_effects_may_have_occurred() {
+    let (mut g, _, events) = deadline_glass(DeadlineBehavior::FailLate, vec![]);
+    let err = do_actions(&mut g, &do_args(vec![click(1, 1)], 1)).unwrap_err();
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    let step = &envelope["outcome"]["steps"][0];
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], true);
+    assert_eq!(envelope["outcome"]["effects_rolled_back"], false);
+    assert_eq!(*events.lock().unwrap(), vec!["click(1,1)"]);
+}
 
 fn started(platform: FakePlatform) -> Glass {
     let mut g = glass_with(platform);
@@ -171,7 +481,7 @@ fn action_failure_is_structured_and_lists_unexecuted_steps() {
         .unwrap_err(),
     );
     let error: serde_json::Value = serde_json::from_str(&err).unwrap();
-    assert_eq!(error["error"]["code"], "step_failed");
+    assert_eq!(error["error"]["code"], "action_failed");
     assert_eq!(error["error"]["step"], 1);
     assert_eq!(error["error"]["summary"], "action execution failed");
     assert_eq!(
@@ -317,7 +627,7 @@ fn click_element_stale_target_stops_with_structured_detail() {
     );
     let error: serde_json::Value = serde_json::from_str(&err).unwrap();
     let step = &error["outcome"]["steps"][0];
-    assert_eq!(error["error"]["code"], "step_failed");
+    assert_eq!(error["error"]["code"], "action_failed");
     assert_eq!(step["action"], "click_element");
     assert_eq!(step["attempted"], true);
     assert_eq!(step["side_effects_may_have_occurred"], true);

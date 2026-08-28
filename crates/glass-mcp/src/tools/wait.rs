@@ -9,23 +9,43 @@ use glass_core::{
 use serde_json::json;
 
 use crate::params::*;
-use crate::tools::{OutContent, ToolOutput, ToolResult};
+use crate::tools::{
+    ContextualError, ContextualOutput, ContextualToolResult, OutContent, ToolContext, ToolOutput,
+    ToolResult,
+};
+
+fn standalone(result: ContextualToolResult) -> ToolResult {
+    result.map(|o| o.output).map_err(|e| e.message)
+}
 
 pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult {
+    standalone(wait_for_element_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn wait_for_element_with(
+    glass: &mut Glass,
+    a: &WaitForElementArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     if a.name.is_none() && a.description.is_none() && a.role.is_none() {
-        return Err("specify `name`, `description`, and/or `role` to select an element".into());
+        return Err(ContextualError::validation(
+            "specify `name`, `description`, and/or `role` to select an element".into(),
+        ));
     }
     if a.value.is_some() && a.value_contains.is_some() {
-        return Err("specify `value` for exact matching or `value_contains` for substring matching, not both".into());
+        return Err(ContextualError::validation("specify `value` for exact matching or `value_contains` for substring matching, not both".into()));
     }
     let role = match a.role.as_deref() {
-        Some(r) => Some(AxRole::from_name(r).ok_or_else(|| format!("unknown role '{r}'"))?),
+        Some(r) => Some(
+            AxRole::from_name(r)
+                .ok_or_else(|| ContextualError::validation(format!("unknown role '{r}'")))?,
+        ),
         None => None,
     };
     let condition = match a.condition.as_deref() {
         None => ElementCondition::Appears,
         Some(c) => ElementCondition::from_name(c)
-            .ok_or_else(|| format!("unknown condition '{c}' (appears/disappears/enabled/disabled/checked/unchecked/selected/unselected/expanded/collapsed/focused/visible/hidden)"))?,
+            .ok_or_else(|| ContextualError::validation(format!("unknown condition '{c}' (appears/disappears/enabled/disabled/checked/unchecked/selected/unselected/expanded/collapsed/focused/visible/hidden)")))?,
     };
     let params = WaitElementParams {
         name: a.name.clone(),
@@ -37,15 +57,17 @@ pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult
         interval_ms: a.interval_ms.unwrap_or(200),
         timeout_ms: a.timeout_ms.unwrap_or(10_000),
     };
-    let o = glass.wait_for_element(&params).map_err(|e| e.to_string())?;
+    let o = glass
+        .wait_for_element_by(&params, context.deadline)
+        .map_err(|e| ContextualError::from_core(e, context))?;
+    let timed_out_by = o.timed_out_by;
     // `matched`/`elapsed_ms` are glass-derived and stay trusted; the matched element
     // carries app-controlled name/value, so it rides in an untrusted sibling.
     let result = json!({ "matched": o.matched, "elapsed_ms": o.elapsed_ms });
     let extra = element_sibling(o.element);
-    Ok(ToolOutput::result_with(
-        "glass_wait_for_element",
-        result,
-        extra,
+    Ok(ContextualOutput::with_timeout(
+        ToolOutput::result_with("glass_wait_for_element", result, extra),
+        timed_out_by,
     ))
 }
 
@@ -75,22 +97,32 @@ fn element_sibling(element: Option<glass_core::ElementInfo>) -> Vec<OutContent> 
 }
 
 pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResult {
+    standalone(scroll_to_element_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn scroll_to_element_with(
+    glass: &mut Glass,
+    a: &ScrollToElementArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     if a.name.is_none() && a.description.is_none() && a.role.is_none() {
-        return Err(
+        return Err(ContextualError::validation(
             "specify `name`, `description`, and/or `role` to select the element to scroll to"
                 .into(),
-        );
+        ));
     }
     let role = match a.role.as_deref() {
-        Some(r) => Some(AxRole::from_name(r).ok_or_else(|| format!("unknown role '{r}'"))?),
+        Some(r) => Some(
+            AxRole::from_name(r)
+                .ok_or_else(|| ContextualError::validation(format!("unknown role '{r}'")))?,
+        ),
         None => None,
     };
     let direction = match a.direction.as_deref() {
         None => None,
-        Some(d) => Some(
-            ScrollDirection::from_name(d)
-                .ok_or_else(|| format!("unknown direction '{d}' (use up/down/left/right)"))?,
-        ),
+        Some(d) => Some(ScrollDirection::from_name(d).ok_or_else(|| {
+            ContextualError::validation(format!("unknown direction '{d}' (use up/down/left/right)"))
+        })?),
     };
     // Anchor: both x and y, or neither (default: the target's own row/column). One
     // without the other is a caller mistake worth naming rather than silently
@@ -98,7 +130,11 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
     let anchor = match (a.x, a.y) {
         (Some(x), Some(y)) => Some((x, y)),
         (None, None) => None,
-        _ => return Err("specify both `x` and `y` for a scroll anchor, or neither".into()),
+        _ => {
+            return Err(ContextualError::validation(
+                "specify both `x` and `y` for a scroll anchor, or neither".into(),
+            ));
+        }
     };
     let params = ScrollToElementParams {
         name: a.name.clone(),
@@ -111,8 +147,9 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
         timeout_ms: a.timeout_ms.unwrap_or(SCROLL_TO_DEFAULT_TIMEOUT_MS),
     };
     let o = glass
-        .scroll_to_element(&params)
-        .map_err(|e| e.to_string())?;
+        .scroll_to_element_by(&params, context.deadline)
+        .map_err(|e| ContextualError::from_core(e, context))?;
+    let timed_out_by = o.timed_out_by;
     // `matched`/`elapsed_ms`/`scrolled` are glass-computed and stay trusted; the
     // matched element carries app-controlled name/value, so it rides untrusted.
     let result = json!({
@@ -121,10 +158,9 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
         "scrolled": { "steps": o.steps, "reversed": o.reversed, "direction": o.direction.as_str() },
     });
     let extra = element_sibling(o.element);
-    Ok(ToolOutput::result_with(
-        "glass_scroll_to_element",
-        result,
-        extra,
+    Ok(ContextualOutput::with_timeout(
+        ToolOutput::result_with("glass_scroll_to_element", result, extra),
+        timed_out_by,
     ))
 }
 
