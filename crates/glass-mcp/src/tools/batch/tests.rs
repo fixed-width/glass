@@ -1246,7 +1246,10 @@ fn then_settle_timeout_still_succeeds() {
     )
     .unwrap();
     let result = assert_envelope(&out, "glass_do");
-    assert_eq!(result["then"]["settle"]["settled"], json!(false));
+    assert_eq!(
+        result["then"]["settle"],
+        json!({"settled":false,"saw_motion":false,"observed_ms":0,"ignored_pixels":0,"width":2,"height":2})
+    );
 }
 
 #[test]
@@ -1390,9 +1393,9 @@ fn terminal_steps_report_settle_diff_screenshot_in_fixed_order() {
             then: Some(ThenArgs {
                 settle: Some(SettleArgs {
                     interval_ms: Some(0),
-                    settle_frames: Some(2),
+                    settle_frames: Some(1),
                     tolerance: None,
-                    timeout_ms: Some(100),
+                    timeout_ms: Some(2_000),
                     stability_region: None,
                     ignore: None,
                 }),
@@ -1426,19 +1429,23 @@ fn terminal_steps_report_settle_diff_screenshot_in_fixed_order() {
         vec!["settle", "diff", "screenshot"]
     );
     let seen = deadlines.lock().unwrap();
+    assert_eq!(seen.len(), 5, "action, settle, diff, screenshot: {seen:?}");
+    assert_ne!(seen[0], Deadline::UNBOUNDED);
     assert!(
-        seen.len() >= 5,
-        "action, settle, diff, and screenshot must dispatch: {seen:?}"
+        seen.iter().all(|deadline| *deadline == seen[0]),
+        "every terminal dispatch must use the sequence deadline: {seen:?}"
     );
-    let terminal_deadline = *seen.last().unwrap();
-    assert_ne!(terminal_deadline, Deadline::UNBOUNDED);
-    assert_eq!(seen[0], terminal_deadline);
 }
 
 #[test]
 fn terminal_failure_marks_later_observations_unexecuted() {
     let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
-    let mut g = started(FakePlatform::new(2, 2).with_frames(vec![frame.clone(); 4]));
+    let captures = Arc::new(Mutex::new(0usize));
+    let mut g = started(
+        FakePlatform::new(2, 2)
+            .with_frames(vec![frame.clone(); 4])
+            .with_capture_log(captures.clone()),
+    );
     let err = do_actions(
         &mut g,
         &DoArgs {
@@ -1477,6 +1484,10 @@ fn terminal_failure_marks_later_observations_unexecuted() {
     })
     .unwrap();
     assert_eq!(envelope["outcome"]["executed"], 1);
+    assert_eq!(
+        envelope["outcome"]["steps"],
+        json!([{"status":"completed","index":0,"action":"click","result":{},"content_blocks":[]}])
+    );
     assert_eq!(envelope["outcome"]["then"]["settle"]["settled"], true);
     assert_eq!(
         envelope["outcome"]["terminal_steps"][0]["status"],
@@ -1492,6 +1503,18 @@ fn terminal_failure_marks_later_observations_unexecuted() {
         "unexecuted"
     );
     assert!(matches!(&err.0[1], OutContent::Text(t) if t.contains("untrusted content")));
+    assert_eq!(
+        *captures.lock().unwrap(),
+        2,
+        "settle's two captures ran; diff failure prevented screenshot capture"
+    );
+    assert_eq!(envelope["outcome"]["effects_rolled_back"], false);
+    assert!(
+        envelope["error"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("do not replay actions")
+    );
 }
 
 #[test]
@@ -1551,7 +1574,12 @@ fn terminal_sequence_deadline_keeps_all_action_steps_completed() {
     );
     assert_eq!(*events.lock().unwrap(), vec!["click(0,0)", "key(Tab)"]);
     let seen = deadlines.lock().unwrap();
-    assert!(seen.len() >= 3);
+    assert_eq!(
+        seen.len(),
+        3,
+        "two action dispatches plus terminal settle only: {seen:?}"
+    );
+    assert_ne!(seen[0], Deadline::UNBOUNDED);
     assert!(seen.iter().all(|deadline| *deadline == seen[0]));
 }
 
