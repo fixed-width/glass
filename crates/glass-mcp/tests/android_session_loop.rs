@@ -30,6 +30,13 @@ const AWAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150
 const MCP_CLIENT_CANCEL_BUDGET: Duration = Duration::from_secs(2);
 // Allow 8s for both 3s server cleanup phases plus scheduling and transport cancellation.
 const MCP_SERVER_JOIN_BUDGET: Duration = Duration::from_secs(8);
+static ANDROID_DEVICE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_android_device() -> std::sync::MutexGuard<'static, ()> {
+    ANDROID_DEVICE_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Build `glass_mcp::boot`'s session factory with registries owned by the cleanup guard.
 fn session_glass(device: &Companions) -> Glass {
@@ -315,6 +322,7 @@ impl Drop for Companions {
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ADB + GLASS_ANDROID_A11Y_APK + GLASS_ANDROID_FIXTURE_APK"]
 fn a_session_click_reports_the_native_accessibility_action() {
+    let _device_lock = lock_android_device();
     // An unset APK path is itself the degradation this test detects, so it has to fail as
     // misconfiguration rather than as a verdict.
     std::env::var("GLASS_ANDROID_A11Y_APK").expect("set GLASS_ANDROID_A11Y_APK");
@@ -379,6 +387,7 @@ fn a_session_click_reports_the_native_accessibility_action() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a booted AVD + GLASS_ADB + GLASS_ANDROID_A11Y_APK + GLASS_ANDROID_FIXTURE_APK"]
 async fn glass_do_android_ime_form_is_confirmed_end_to_end() {
+    let _device_lock = lock_android_device();
     std::env::var("GLASS_ANDROID_A11Y_APK").expect("set GLASS_ANDROID_A11Y_APK");
     let fixture =
         std::env::var("GLASS_ANDROID_FIXTURE_APK").expect("set GLASS_ANDROID_FIXTURE_APK");
