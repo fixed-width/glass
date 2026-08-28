@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, BoundDispatch, Deadline, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region,
-    Result, Stream, TEARDOWN_BUDGET, Whose, WindowGeometry, WindowHint, WindowId, WindowInfo,
-    WindowOp,
+    AppSpec, BoundDispatch, BoundKind, Deadline, Frame, GlassError, KeyEvent, Platform,
+    PointerEvent, Region, Result, Stream, TEARDOWN_BUDGET, Whose, WindowGeometry, WindowHint,
+    WindowId, WindowInfo, WindowOp,
 };
 use glass_pipe_unix::LineTap;
 use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, proc_tree_pids};
@@ -61,15 +61,34 @@ impl X11Dispatch {
         }
     }
 
-    fn classify(&self, op: &str, error: GlassError) -> GlassError {
+    fn classify(&self, op: &str, mut error: GlassError) -> GlassError {
         if self.0.get()
             && error.bound_owner() == Some(Whose::Caller)
             && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
         {
-            GlassError::caller_deadline_elapsed(op)
-        } else {
-            error
+            if let GlassError::Bounded {
+                kind,
+                whose,
+                dispatch,
+                message,
+                ..
+            } = &mut error
+            {
+                let cleanup = message
+                    .find("; cleanup failed")
+                    .map(|at| message[at..].to_owned())
+                    .unwrap_or_default();
+                *kind = BoundKind::TimedOut;
+                *whose = Whose::Caller;
+                *dispatch = BoundDispatch::MayHaveDispatched;
+                *message = format!(
+                    "{op}: the caller deadline elapsed before the operation answered{cleanup}"
+                );
+                return error;
+            }
+            return GlassError::caller_deadline_elapsed(op);
         }
+        error
     }
 }
 
@@ -1759,6 +1778,28 @@ mod tests {
         .expect_err("the deadline expires after the press");
 
         assert_eq!(*events.borrow(), ["press", "release", "sync"]);
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("cleanup sync failed"));
+    }
+
+    #[test]
+    fn click_cleanup_failure_survives_outer_dispatch_upgrade() {
+        let error = run_x11_call_by(Deadline::UNBOUNDED, "pointer input", |dispatch| {
+            dispatch.mark();
+            run_clicks_by(
+                1,
+                || true,
+                |_| panic!("the spent click must not dispatch a button event"),
+                |_, _| Err(GlassError::Backend("cleanup sync failed".into())),
+            )
+        })
+        .expect_err("the click deadline is spent after earlier modifier dispatch");
+
         assert_eq!(error.bound(), Some(BoundKind::TimedOut));
         assert_eq!(error.bound_owner(), Some(Whose::Caller));
         assert_eq!(
