@@ -167,7 +167,9 @@ fn run_bounded_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| GlassError::Backend(format!("{op}: failed to start: {e}")))?;
+        .map_err(|e| {
+            GlassError::Backend(format!("{op}: failed to start: {e}")).before_dispatch()
+        })?;
 
     // Written on its own thread: a child that answers without consuming its input would otherwise
     // leave the parent blocked in `write` with the deadline out of reach. The outcome comes back
@@ -569,7 +571,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn a_classified_run_keeps_an_ordinary_failure_distinct() {
+    fn a_classified_spawn_failure_is_ordinary_and_proves_nothing_dispatched() {
         let run = run_bounded_classified(
             &mut Command::new("/path/glass-test-command-does-not-exist"),
             Duration::from_secs(10),
@@ -579,6 +581,8 @@ mod tests {
             panic!("a spawn refusal is an ordinary execution failure");
         };
         assert_eq!(err.bound(), None);
+        assert_eq!(err.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(matches!(err.cause(), GlassError::Backend(_)));
         assert!(err.to_string().contains("failed to start"), "{err}");
     }
 

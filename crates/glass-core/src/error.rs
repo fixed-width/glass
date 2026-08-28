@@ -277,6 +277,11 @@ pub enum GlassError {
         message: String,
     },
 
+    /// An unchanged ordinary failure from a step that provably did not dispatch external work.
+    /// The wrapped cause and its message remain authoritative; only dispatch provenance changes.
+    #[error(transparent)]
+    BeforeDispatch(Box<GlassError>),
+
     /// An unchanged failure from a later step of a compound operation after an earlier step
     /// dispatched. The wrapped cause and its message remain authoritative; only the independent
     /// compound-operation dispatch provenance changes.
@@ -348,7 +353,7 @@ impl GlassError {
     /// received from code that constructed nested annotations directly.
     pub fn cause(&self) -> &Self {
         match self {
-            GlassError::AfterDispatch(error) => error.cause(),
+            GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => error.cause(),
             error => error,
         }
     }
@@ -374,6 +379,20 @@ impl GlassError {
             self.cause(),
             GlassError::AxValueNotApplied { .. } | GlassError::AxWriteUnconfirmed(..)
         )
+    }
+
+    /// Preserve proof that an ordinary failure happened before external work was dispatched.
+    ///
+    /// Bound errors already carry their own dispatch provenance, and an after-dispatch annotation
+    /// is stronger than a later attempt to mark the same compound failure as side-effect free.
+    /// Repeated annotation is idempotent.
+    pub fn before_dispatch(self) -> Self {
+        match self {
+            error @ (GlassError::BeforeDispatch(_)
+            | GlassError::AfterDispatch(_)
+            | GlassError::Bounded { .. }) => error,
+            error => GlassError::BeforeDispatch(Box::new(error)),
+        }
     }
 
     /// Preserve a compound operation's dispatch history on a later failure.
@@ -440,7 +459,7 @@ impl GlassError {
     pub fn bound(&self) -> Option<BoundKind> {
         match self {
             GlassError::Bounded { kind, .. } => Some(*kind),
-            GlassError::AfterDispatch(error) => error.bound(),
+            GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => error.bound(),
             _ => None,
         }
     }
@@ -449,15 +468,18 @@ impl GlassError {
     pub fn bound_owner(&self) -> Option<Whose> {
         match self {
             GlassError::Bounded { whose, .. } => Some(*whose),
-            GlassError::AfterDispatch(error) => error.bound_owner(),
+            GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => {
+                error.bound_owner()
+            }
             _ => None,
         }
     }
 
-    /// Whether work may have been dispatched before this bound ended the wait.
+    /// Whether external work may have been dispatched before this failure.
     pub fn bound_dispatch(&self) -> Option<BoundDispatch> {
         match self {
             GlassError::Bounded { dispatch, .. } => Some(*dispatch),
+            GlassError::BeforeDispatch(_) => Some(BoundDispatch::NotDispatched),
             GlassError::AfterDispatch(_) => Some(BoundDispatch::MayHaveDispatched),
             _ => None,
         }
@@ -474,7 +496,9 @@ impl GlassError {
     pub fn tool_said(&self) -> Option<&str> {
         match self {
             GlassError::ToolFailed { said, .. } => Some(said.trim()),
-            GlassError::AfterDispatch(error) => error.tool_said(),
+            GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => {
+                error.tool_said()
+            }
             _ => None,
         }
     }
@@ -553,6 +577,58 @@ mod tests {
     #[test]
     fn ordinary_backend_errors_have_no_bound_dispatch() {
         assert_eq!(GlassError::Backend("down".into()).bound_dispatch(), None);
+    }
+
+    #[test]
+    fn before_dispatch_preserves_an_ordinary_cause_and_marks_no_dispatch() {
+        let error = GlassError::Backend("could not spawn helper".into()).before_dispatch();
+
+        assert_eq!(error.to_string(), "backend error: could not spawn helper");
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "could not spawn helper")
+        );
+    }
+
+    #[test]
+    fn before_dispatch_accessors_recurse_through_nested_annotations() {
+        let bounded = GlassError::BeforeDispatch(Box::new(GlassError::BeforeDispatch(Box::new(
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                whose: Whose::Callee,
+                dispatch: BoundDispatch::MayHaveDispatched,
+                message: "nested timeout".into(),
+            },
+        ))));
+        assert_eq!(bounded.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(bounded.bound_owner(), Some(Whose::Callee));
+        assert_eq!(bounded.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(matches!(bounded.cause(), GlassError::Bounded { .. }));
+
+        let tool = GlassError::BeforeDispatch(Box::new(GlassError::BeforeDispatch(Box::new(
+            GlassError::ToolFailed {
+                call: "helper".into(),
+                said: " refused \n".into(),
+            },
+        ))));
+        assert_eq!(tool.tool_said(), Some("refused"));
+        assert!(matches!(tool.cause(), GlassError::ToolFailed { .. }));
+    }
+
+    #[test]
+    fn after_dispatch_upgrades_a_before_dispatch_failure_without_marking_a_value_write() {
+        let error = GlassError::Backend("later spawn failed".into())
+            .before_dispatch()
+            .after_dispatch();
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "later spawn failed")
+        );
+        assert!(!error.set_value_failed_after_writing());
     }
 
     #[test]

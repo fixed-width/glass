@@ -2152,6 +2152,266 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    fn write_context() -> AxContext {
+        AxContext {
+            pids: vec![],
+            window: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 2400,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(30_000),
+        }
+    }
+
+    #[cfg(unix)]
+    fn field_target(value: Option<&str>) -> AxTarget {
+        AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: Some(AxRect {
+                x: 100,
+                y: 200,
+                width: 400,
+                height: 100,
+            }),
+            value: value.map(str::to_string),
+        }
+    }
+
+    /// Put a self-deleting shim in front of a [`crate::adb::FakeAdb`]. The command matching
+    /// `trigger` runs and succeeds through the real fake; the following command then gets a real
+    /// process-spawn error.
+    #[cfg(unix)]
+    fn fail_next_adb_spawn_after(
+        fake: &crate::adb::FakeAdb,
+        trigger: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = std::path::PathBuf::from(fake.adb().bin());
+        let delegate = bin.with_file_name("adb-delegate");
+        std::fs::rename(&bin, &delegate).expect("move the fake adb behind its shim");
+        let script = format!(
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+real="$dir/adb-delegate"
+case "$*" in
+  *"{trigger}"*)
+    "$real" "$@"
+    status=$?
+    rm -f "$0"
+    exit "$status"
+    ;;
+esac
+exec "$real" "$@"
+"#
+        );
+        std::fs::write(&bin, script).expect("write the self-deleting adb shim");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("make the adb shim executable");
+        (bin, delegate)
+    }
+
+    #[cfg(unix)]
+    fn restore_fake_adb(bin: &std::path::Path, delegate: &std::path::Path) {
+        let _ = std::fs::remove_file(bin);
+        std::fs::rename(delegate, bin).expect("restore the fake adb executable");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_backspace_spawn_failure_after_focus_and_selection_is_not_a_value_write() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let before = Answer::says(one_field_holding("hello"));
+        let fake = FakeAdb::new(&[("*shell cat*", before), ("*", Answer::Silent)]);
+        fail_next_adb_spawn_after(&fake, "input keycombination");
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+
+        let error = reader
+            .set_value(&write_context(), &field_target(None), "world")
+            .expect_err("Backspace cannot spawn after the shim removes adb");
+
+        assert!(fake.called("input tap 300 250"), "{:?}", fake.calls());
+        assert!(fake.called("input keycombination"), "{:?}", fake.calls());
+        assert!(!fake.called("input keyevent 67"), "{:?}", fake.calls());
+        assert!(matches!(error.cause(), GlassError::Backend(_)), "{error:?}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{error:?}"
+        );
+        assert!(!error.set_value_failed_after_writing(), "{error:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_text_spawn_failure_after_backspace_remains_an_unconfirmed_value_write() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let before = Answer::says(one_field_holding("hello"));
+        let fake = FakeAdb::new(&[("*shell cat*", before), ("*", Answer::Silent)]);
+        fail_next_adb_spawn_after(&fake, "input keyevent 67");
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+
+        let error = reader
+            .set_value(&write_context(), &field_target(None), "world")
+            .expect_err("text cannot spawn after the shim removes adb");
+
+        assert!(fake.called("input keycombination"), "{:?}", fake.calls());
+        assert!(fake.called("input keyevent 67"), "{:?}", fake.calls());
+        assert!(!fake.called("input text"), "{:?}", fake.calls());
+        assert!(matches!(error, GlassError::AxWriteUnconfirmed(1, _)));
+        assert!(error.set_value_failed_after_writing(), "{error:?}");
+    }
+
+    #[cfg(unix)]
+    struct SessionPlatform;
+
+    #[cfg(unix)]
+    impl glass_core::Platform for SessionPlatform {
+        fn start_app(&mut self, _spec: &glass_core::AppSpec) -> Result<WindowGeometry> {
+            Ok(write_context().window)
+        }
+
+        fn stop_app_by(&mut self, _deadline: Deadline) -> Result<()> {
+            Ok(())
+        }
+
+        fn capture_frame_by(
+            &mut self,
+            _region: Option<&glass_core::Region>,
+            _deadline: Deadline,
+        ) -> Result<glass_core::Frame> {
+            Err(GlassError::CaptureFailed("unused in this test".into()))
+        }
+
+        fn capture_window_by(
+            &mut self,
+            _id: glass_core::WindowId,
+            _region: Option<&glass_core::Region>,
+            _deadline: Deadline,
+        ) -> Result<glass_core::Frame> {
+            Err(GlassError::CaptureFailed("unused in this test".into()))
+        }
+
+        fn send_pointer_by(
+            &mut self,
+            _event: &glass_core::PointerEvent,
+            _deadline: Deadline,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_key_by(
+            &mut self,
+            _event: &glass_core::KeyEvent,
+            _deadline: Deadline,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn window(&mut self, _op: &glass_core::WindowOp) -> Result<WindowGeometry> {
+            Ok(write_context().window)
+        }
+
+        fn list_windows(&mut self) -> Result<Vec<glass_core::WindowInfo>> {
+            Ok(vec![])
+        }
+
+        fn select_window(&mut self, _id: glass_core::WindowId) -> Result<WindowGeometry> {
+            Ok(write_context().window)
+        }
+
+        fn drain_logs(&mut self) -> Vec<(glass_core::Stream, String)> {
+            vec![]
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_session_retains_the_captured_value_guard_after_backspace_never_spawns() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::{Backend, BaselineStore, Glass, PlatformFactory, SandboxLevel};
+
+        let alice = Answer::says(one_field_holding("Alice"));
+        let zara = Answer::says(one_field_holding("Zara"));
+        let written = Answer::says(one_field_holding("updated"));
+        let fake = FakeAdb::scripted(&[
+            ("*shell cat*", vec![&alice, &alice, &zara, &written]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+        let (bin, delegate) = fail_next_adb_spawn_after(&fake, "input keycombination");
+        let backend = Backend {
+            platform: Box::new(SessionPlatform),
+            accessibility: Some(Box::new(AndroidA11y::for_adb(fake.adb().clone()))),
+        };
+        let mut backend = Some(backend);
+        let factory: PlatformFactory = Box::new(move |_| {
+            backend
+                .take()
+                .ok_or_else(|| GlassError::Backend("test backend constructed twice".into()))
+        });
+        let baseline_root = std::env::temp_dir().join(format!(
+            "glass-android-set-value-guard-{}",
+            std::process::id()
+        ));
+        let mut glass = Glass::new(
+            factory,
+            "android-test".into(),
+            BaselineStore::new(baseline_root),
+            16,
+        );
+        glass
+            .start(&glass_core::AppSpec {
+                build: None,
+                run: vec!["test-app".into()],
+                cwd: None,
+                env: vec![],
+                window_hint: None,
+                timeout_ms: 1_000,
+                sandbox: SandboxLevel::Off,
+                a11y: true,
+            })
+            .expect("start the test session");
+        glass.a11y_snapshot(None).expect("capture Alice");
+
+        let first = glass
+            .set_value(AxNodeId(1), "updated")
+            .expect_err("Backspace cannot spawn");
+        restore_fake_adb(&bin, &delegate);
+        assert!(!first.set_value_failed_after_writing(), "{first:?}");
+
+        let retry = glass
+            .set_value(AxNodeId(1), "updated")
+            .expect_err("the recycled Zara row must still fail the Alice value guard");
+        assert!(
+            matches!(retry, GlassError::AxElementChanged(1)),
+            "{retry:?}"
+        );
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| call.contains("input tap"))
+                .count(),
+            1,
+            "the retry must stop before focusing the recycled row: {:?}",
+            fake.calls()
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn a_write_taps_the_field_clears_it_types_and_waits_for_the_value_to_land() {
