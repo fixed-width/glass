@@ -291,6 +291,30 @@ pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Ve
     }
 }
 
+fn run_compound<T>(
+    steps: impl IntoIterator<Item = T>,
+    mut dispatch: impl FnMut(T) -> Result<()>,
+) -> Result<()> {
+    let mut dispatched = false;
+    for step in steps {
+        match dispatch(step) {
+            Ok(()) => dispatched = true,
+            Err(mut error) => {
+                if dispatched
+                    && let GlassError::Bounded {
+                        dispatch: certainty,
+                        ..
+                    } = &mut error
+                {
+                    *certainty = glass_core::BoundDispatch::MayHaveDispatched;
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Injects via the on-device agent (real MotionEvents + faithful keys/Unicode). The `Adb`
 /// argument of the `Injector` methods is unused — the agent is reached over its socket.
 pub(crate) struct AgentInjector {
@@ -314,10 +338,9 @@ impl Injector for AgentInjector {
             return self.agent.gesture_by(&paths, deadline);
         }
         // One agent request per gesture: a Click{count:N} sends N sequential taps.
-        for gesture in agent_pointer(origin, event) {
-            self.agent.pointer_by(&gesture, "left", deadline)?;
-        }
-        Ok(())
+        run_compound(agent_pointer(origin, event), |gesture| {
+            self.agent.pointer_by(&gesture, "left", deadline)
+        })
     }
     fn key_by(&self, _adb: &Adb, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         match event {
@@ -357,17 +380,17 @@ impl Injector for ShellInjector {
                 "multi-touch requires the on-device agent (not yet wired)".into(),
             ));
         }
-        for argv in pointer_commands(origin, event) {
-            adb.run_until(argv.iter().map(String::as_str), deadline)?;
-        }
-        Ok(())
+        run_compound(pointer_commands(origin, event), |argv| {
+            adb.run_until(argv.iter().map(String::as_str), deadline)
+                .map(|_| ())
+        })
     }
 
     fn key_by(&self, adb: &Adb, event: &KeyEvent, deadline: Deadline) -> Result<()> {
-        for argv in key_commands(event)? {
-            adb.run_until(argv.iter().map(String::as_str), deadline)?;
-        }
-        Ok(())
+        run_compound(key_commands(event)?, |argv| {
+            adb.run_until(argv.iter().map(String::as_str), deadline)
+                .map(|_| ())
+        })
     }
 }
 
@@ -841,6 +864,33 @@ mod injector_tests {
             .unwrap();
         assert_eq!(fake.calls().len(), 3);
         assert_eq!(fake.deadlines(), vec![deadline; 3]);
+    }
+
+    #[test]
+    fn first_tap_success_plus_later_not_dispatched_is_may_have_dispatched() {
+        let mut tap = 0;
+
+        let error = run_compound([(), ()], |_| {
+            tap += 1;
+            if tap == 1 {
+                Ok(())
+            } else {
+                Err(GlassError::deadline_not_started("tap"))
+            }
+        })
+        .expect_err("the second tap did not dispatch");
+
+        assert_eq!(tap, 2);
+        assert_eq!(
+            error.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "the first tap already succeeded: {error}"
+        );
     }
 }
 

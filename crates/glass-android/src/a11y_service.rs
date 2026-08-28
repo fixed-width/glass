@@ -1530,6 +1530,7 @@ fn check_timeout(target: u32, act: &Actuated, want: bool, seen: CheckState) -> G
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conn::TimeoutFault;
     use glass_core::accessibility::{AxRole, TruncationLimit};
     use serde_json::json;
     use std::io::{BufRead, Write};
@@ -3303,6 +3304,48 @@ mod tests {
         assert_eq!(error.bound_dispatch(), Some(dispatch), "{error}");
         assert!(!error.invoke_fallback_eligible(), "{error}");
         assert!(!error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn restoration_fault_after_click_poison_reconnects_rearms_and_never_replays() {
+        for fault in [TimeoutFault::ReadRestore, TimeoutFault::WriteRestore] {
+            let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
+            let client = ServiceClient::connect(port).expect("connect to the fake service");
+            client.tree("com.example.app").expect("arm conn1");
+            client
+                .conn
+                .lock()
+                .expect("lock conn1")
+                .inject_timeout_fault(fault);
+
+            let first = client.click(1, "com.example.app", Deadline::from_millis(1_000));
+
+            assert!(first.is_err(), "{fault:?} restoration fault was discarded");
+            assert!(
+                client
+                    .conn
+                    .lock()
+                    .expect("lock poisoned conn1")
+                    .ensure_usable()
+                    .is_err(),
+                "{fault:?} restoration fault did not poison conn1"
+            );
+            client
+                .click(2, "com.example.app", Deadline::from_millis(1_000))
+                .map_err(CallFailure::into_error)
+                .expect("the distinct mutation reopens, rearms, then dispatches on conn2");
+
+            assert_eq!(
+                ops_of(&ops),
+                vec![
+                    "conn1:tree".to_string(),
+                    "conn1:click ref=1".to_string(),
+                    "conn2:tree".to_string(),
+                    "conn2:click ref=2".to_string(),
+                ],
+                "{fault:?}: conn1 mutation replayed or conn2 was not rearmed first"
+            );
+        }
     }
 
     #[test]

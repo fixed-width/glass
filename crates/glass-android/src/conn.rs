@@ -4,7 +4,7 @@
 //! reads one JSON response line.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::Duration;
 
 use glass_core::{Deadline, GlassError};
@@ -163,6 +163,9 @@ impl Conn {
 
     pub(crate) fn poison(&mut self) {
         self.poisoned = true;
+        // A poisoned connection cannot be reused. Close it now so a companion with a sequential
+        // accept/read loop can leave conn1 and accept the replacement before this value is dropped.
+        let _ = self.writer.shutdown(Shutdown::Both);
     }
 
     pub(crate) fn read_line(&mut self) -> glass_core::Result<String> {
@@ -257,6 +260,71 @@ impl Conn {
         }
     }
 
+    fn phase_wait(
+        deadline: Deadline,
+        op: &str,
+        dispatched: bool,
+    ) -> std::result::Result<Option<Duration>, CallFailure> {
+        match deadline.remaining() {
+            Some(wait) if wait.is_zero() => Err(if dispatched {
+                CallFailure::AnswerLost(GlassError::caller_deadline_elapsed(op))
+            } else {
+                CallFailure::NotSent(GlassError::deadline_not_started(op))
+            }),
+            wait => Ok(wait),
+        }
+    }
+
+    fn deadline_outcome(
+        outcome: std::result::Result<Value, CallFailure>,
+        op: &str,
+    ) -> std::result::Result<Value, CallFailure> {
+        Err(match outcome {
+            Ok(_) => CallFailure::Refused(GlassError::caller_deadline_elapsed(op)),
+            Err(failure) => failure.with_error(GlassError::caller_deadline_elapsed(op)),
+        })
+    }
+
+    fn transport_failure(dispatched: bool, error: GlassError) -> CallFailure {
+        if dispatched {
+            CallFailure::AnswerLost(error)
+        } else {
+            CallFailure::NotSent(error)
+        }
+    }
+
+    fn write_all_by(
+        &mut self,
+        bytes: &[u8],
+        deadline: Deadline,
+        op: &str,
+    ) -> std::result::Result<(), CallFailure> {
+        let mut written = 0;
+        while written < bytes.len() {
+            let dispatched = written != 0;
+            let wait = Self::phase_wait(deadline, op, dispatched)?;
+            self.write_within(wait)
+                .map_err(|error| Self::transport_failure(dispatched, error))?;
+            match self.writer.write(&bytes[written..]) {
+                Ok(0) => {
+                    return Err(Self::transport_failure(
+                        dispatched,
+                        GlassError::Backend("agent write: wrote zero bytes".into()),
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return Err(Self::transport_failure(
+                        dispatched,
+                        GlassError::Backend(format!("agent write: {error}")),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Run one request under `deadline`. The outer error is a pre-dispatch setup failure; the
     /// inner result retains how far a dispatched request got.
     pub(crate) fn call_within(
@@ -270,10 +338,17 @@ impl Conn {
             return Err(GlassError::deadline_not_started(op));
         }
 
-        let wait = deadline.remaining();
-        let install = self
-            .read_within(wait)
-            .and_then(|()| self.write_within(wait));
+        // Prove both timeout handles can be updated before anything reaches the companion. The
+        // actual write/flush/read phases update their own handle again from the then-current
+        // remainder so time spent in an earlier phase cannot be spent a second time.
+        let install = Self::phase_wait(deadline, op, false)
+            .map_err(CallFailure::into_error)
+            .and_then(|wait| self.read_within(wait))
+            .and_then(|()| {
+                Self::phase_wait(deadline, op, false)
+                    .map_err(CallFailure::into_error)
+                    .and_then(|wait| self.write_within(wait))
+            });
         if let Err(install_error) = install {
             if let Err(restore_error) = self.restore_timeouts() {
                 self.poison();
@@ -285,22 +360,22 @@ impl Conn {
             return Err(install_error);
         }
 
-        let outcome = if deadline.has_passed() {
-            Err(CallFailure::NotSent(GlassError::deadline_not_started(op)))
-        } else {
-            let outcome = self.call(req);
-            if deadline.has_passed() {
-                Err(match outcome {
-                    Ok(_) => CallFailure::Refused(GlassError::caller_deadline_elapsed(op)),
-                    Err(failure) => failure.with_error(GlassError::caller_deadline_elapsed(op)),
-                })
-            } else {
-                outcome
-            }
-        };
+        let mut outcome = self.call_by(req, deadline, op);
+
+        // Re-read the absolute deadline immediately before restoration. A reply received within
+        // the read timeout can still finish parsing at the boundary, and restoration itself must
+        // never turn that late result back into success.
+        if deadline.remaining().is_some_and(|wait| wait.is_zero()) {
+            outcome = Self::deadline_outcome(outcome, op);
+        }
 
         match self.restore_timeouts() {
-            Ok(()) => Ok(outcome),
+            Ok(()) => {
+                if deadline.has_passed() {
+                    outcome = Self::deadline_outcome(outcome, op);
+                }
+                Ok(outcome)
+            }
             Err(error) => {
                 self.poison();
                 Ok(Err(match outcome {
@@ -313,6 +388,7 @@ impl Conn {
 
     /// Send one request object (an `id` is injected) and return the response `Value`.
     /// A failure is classified by how far the request got — see [`CallFailure`].
+    #[cfg(test)]
     pub(crate) fn call(&mut self, mut req: Value) -> std::result::Result<Value, CallFailure> {
         self.ensure_usable().map_err(CallFailure::NotSent)?;
         let id = self.next_id;
@@ -325,7 +401,38 @@ impl Conn {
             .and_then(|_| self.writer.flush())
             .map_err(|e| CallFailure::NotSent(GlassError::Backend(format!("agent write: {e}"))))?;
         let resp_line = self.read_line().map_err(CallFailure::AnswerLost)?;
-        let resp: Value = serde_json::from_str(&resp_line).map_err(|e| {
+        Self::parse_response(id, &resp_line)
+    }
+
+    fn call_by(
+        &mut self,
+        mut req: Value,
+        deadline: Deadline,
+        op: &str,
+    ) -> std::result::Result<Value, CallFailure> {
+        self.ensure_usable().map_err(CallFailure::NotSent)?;
+        let id = self.next_id;
+        self.next_id += 1;
+        req["id"] = json!(id);
+        let mut line = serde_json::to_string(&req).expect("serialize request");
+        line.push('\n');
+
+        self.write_all_by(line.as_bytes(), deadline, op)?;
+
+        let wait = Self::phase_wait(deadline, op, true)?;
+        self.write_within(wait).map_err(CallFailure::AnswerLost)?;
+        self.writer.flush().map_err(|e| {
+            CallFailure::AnswerLost(GlassError::Backend(format!("agent flush: {e}")))
+        })?;
+
+        let wait = Self::phase_wait(deadline, op, true)?;
+        self.read_within(wait).map_err(CallFailure::AnswerLost)?;
+        let resp_line = self.read_line().map_err(CallFailure::AnswerLost)?;
+        Self::parse_response(id, &resp_line)
+    }
+
+    fn parse_response(id: i64, resp_line: &str) -> std::result::Result<Value, CallFailure> {
+        let resp: Value = serde_json::from_str(resp_line).map_err(|e| {
             CallFailure::Refused(GlassError::Backend(format!("agent resp parse: {e}")))
         })?;
         if resp.get("id").and_then(Value::as_i64) != Some(id) {
@@ -416,6 +523,30 @@ mod tests {
         port
     }
 
+    /// Delay draining a request large enough to fill the sender, then delay the reply too. The two
+    /// waits must spend one absolute deadline rather than each receiving its original duration.
+    fn delayed_drain_and_reply(write_delay: Duration, read_delay: Duration) -> u16 {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept connection");
+            let mut writer = stream.try_clone().expect("clone socket");
+            writeln!(writer, "{HELLO}").expect("write hello");
+            std::thread::sleep(write_delay);
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let request: Value = serde_json::from_str(&line).expect("request json");
+            std::thread::sleep(read_delay);
+            let _ = writeln!(writer, "{}", json!({"id": request["id"], "ok": true}));
+        });
+        port
+    }
+
     #[test]
     fn a_bounded_read_gives_up_at_the_bound_and_not_at_the_standing_timeout() {
         // A caller that named a deadline gets it. Without this the wait is the 30s standing
@@ -437,6 +568,45 @@ mod tests {
         assert!(
             failure.is_transport(),
             "a read that ran out of time is a transport failure, not a refusal"
+        );
+    }
+
+    #[test]
+    fn delayed_write_and_read_spend_one_total_deadline() {
+        let mut conn = Conn::open(delayed_drain_and_reply(
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        ))
+        .expect("the hello arrives");
+        // Loopback can buffer several MiB. This must be large enough for write_all to wait until
+        // the fake starts draining conn1, or only the delayed read would exercise the deadline.
+        let padding = "x".repeat(8 * 1024 * 1024);
+        let started = Instant::now();
+
+        let outcome = conn
+            .call_within(
+                json!({"op": "ping", "padding": padding}),
+                Deadline::from_millis(450),
+                "agent request",
+            )
+            .expect("socket timeout setup succeeds");
+
+        let error = outcome.expect_err("the combined phases exceed the caller deadline");
+        let error = error.into_error();
+        assert_eq!(
+            error.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(540),
+            "write and read each received the full relative wait: {:?}",
+            started.elapsed()
         );
     }
 

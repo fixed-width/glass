@@ -42,6 +42,20 @@ impl AgentClient {
     }
 
     fn call_by(&self, req: Value, deadline: Deadline) -> Result<Value> {
+        self.call_with_by(req, deadline, CallFailure::is_transport)
+    }
+
+    /// Run a side-effecting request, retrying only when the first attempt provably sent nothing.
+    fn call_once_sent_by(&self, req: Value, deadline: Deadline) -> Result<Value> {
+        self.call_with_by(req, deadline, CallFailure::nothing_sent)
+    }
+
+    fn call_with_by(
+        &self,
+        req: Value,
+        deadline: Deadline,
+        resend: fn(&CallFailure) -> bool,
+    ) -> Result<Value> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("agent request"));
         }
@@ -57,7 +71,7 @@ impl AgentClient {
             .map_err(|e| CallFailure::NotSent(e).into_error())?;
         match first {
             Ok(v) => Ok(v),
-            Err(f) if f.is_transport() => {
+            Err(f) if resend(&f) => {
                 // The agent's accept loop accepts a fresh connection after a drop.
                 if deadline.has_passed() {
                     return Err(f
@@ -127,7 +141,7 @@ impl AgentClient {
             .iter()
             .map(|p| json!({"x": p.x, "y": p.y, "t_ms": p.t_ms}))
             .collect();
-        self.call_by(
+        self.call_once_sent_by(
             json!({"op": "pointer", "gesture": g, "button": button}),
             deadline,
         )
@@ -147,21 +161,21 @@ impl AgentClient {
                 )
             })
             .collect();
-        self.call_by(json!({ "op": "gesture", "pointers": pointers }), deadline)
+        self.call_once_sent_by(json!({ "op": "gesture", "pointers": pointers }), deadline)
             .map(|_| ())
     }
     pub fn key(&self, chord: &str) -> Result<()> {
         self.key_by(chord, Deadline::UNBOUNDED)
     }
     pub fn key_by(&self, chord: &str, deadline: Deadline) -> Result<()> {
-        self.call_by(json!({"op": "key", "chord": chord}), deadline)
+        self.call_once_sent_by(json!({"op": "key", "chord": chord}), deadline)
             .map(|_| ())
     }
     pub fn text(&self, s: &str) -> Result<()> {
         self.text_by(s, Deadline::UNBOUNDED)
     }
     pub fn text_by(&self, s: &str, deadline: Deadline) -> Result<()> {
-        self.call_by(json!({"op": "text", "text": s}), deadline)
+        self.call_once_sent_by(json!({"op": "text", "text": s}), deadline)
             .map(|_| ())
     }
 }
@@ -552,6 +566,64 @@ mod tests {
         (port, requests, connections)
     }
 
+    /// Read one request on conn1 and lose only its answer. If the client reconnects, conn2 answers
+    /// the replay so the caller cannot hang and the request log proves the duplicate dispatch.
+    fn agent_that_loses_one_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_reader = BufReader::new(first);
+            let mut line = String::new();
+            first_reader
+                .read_line(&mut line)
+                .expect("read conn1 request");
+            let request = serde_json::from_str(&line).expect("conn1 request json");
+            request_log.lock().expect("request log").push((1, request));
+            drop(first_reader);
+            drop(first_writer);
+
+            listener
+                .set_nonblocking(true)
+                .expect("make replay observation bounded");
+            let until = Instant::now() + Duration::from_millis(300);
+            loop {
+                match listener.accept() {
+                    Ok((second, _)) => {
+                        let mut second_writer = second.try_clone().expect("clone conn2");
+                        writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+                        let mut second_reader = BufReader::new(second);
+                        let mut line = String::new();
+                        second_reader
+                            .read_line(&mut line)
+                            .expect("read conn2 request");
+                        let request: Value =
+                            serde_json::from_str(&line).expect("conn2 request json");
+                        let id = request["id"].clone();
+                        request_log.lock().expect("request log").push((2, request));
+                        writeln!(second_writer, "{}", json!({"id": id, "ok": true}))
+                            .expect("answer conn2 replay");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= until {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept conn2: {error}"),
+                }
+            }
+        });
+        (port, requests, join)
+    }
+
     #[test]
     fn read_timeout_install_failure_aborts_before_dispatch() {
         let (port, requests, _) = counting_agent();
@@ -622,45 +694,94 @@ mod tests {
     fn restoration_failure_poisoned_connection_reconnects_before_next_request() {
         use std::sync::atomic::Ordering;
 
-        let (port, requests, connections) = counting_agent();
-        let client = AgentClient::connect(port).expect("connect");
-        client
-            .conn
-            .lock()
-            .expect("lock")
-            .inject_timeout_fault(TimeoutFault::ReadRestore);
+        for fault in [TimeoutFault::ReadRestore, TimeoutFault::WriteRestore] {
+            let (port, requests, connections) = counting_agent();
+            let client = AgentClient::connect(port).expect("connect");
+            client
+                .conn
+                .lock()
+                .expect("lock")
+                .inject_timeout_fault(fault);
 
-        let first = client.key_by("enter", Deadline::from_millis(1_000));
-        assert!(first.is_err(), "timeout restoration failure was discarded");
-        client.ping().expect("the next request reconnects");
+            let first = client.key_by("enter", Deadline::from_millis(1_000));
+            assert!(
+                first.is_err(),
+                "{fault:?} timeout restoration failure was discarded"
+            );
+            client.ping().expect("the next request reconnects");
 
-        let seen = requests.lock().expect("request log");
-        assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0].0, 1);
-        assert_eq!(seen[1].0, 2, "the poisoned connection was reused");
-        assert_eq!(connections.load(Ordering::SeqCst), 2);
+            let seen = requests.lock().expect("request log");
+            assert_eq!(seen.len(), 2, "{fault:?}");
+            assert_eq!(seen[0].0, 1, "{fault:?}");
+            assert_eq!(seen[1].0, 2, "{fault:?}: poisoned connection reused");
+            assert_eq!(connections.load(Ordering::SeqCst), 2, "{fault:?}");
+        }
     }
 
     #[test]
     fn restoration_failure_after_reply_is_not_retried_as_the_same_mutation() {
-        let (port, requests, _) = counting_agent();
-        let client = AgentClient::connect(port).expect("connect");
-        client
-            .conn
-            .lock()
-            .expect("lock")
-            .inject_timeout_fault(TimeoutFault::ReadRestore);
+        for fault in [TimeoutFault::ReadRestore, TimeoutFault::WriteRestore] {
+            let (port, requests, _) = counting_agent();
+            let client = AgentClient::connect(port).expect("connect");
+            client
+                .conn
+                .lock()
+                .expect("lock")
+                .inject_timeout_fault(fault);
 
-        let result = client.key_by("enter", Deadline::from_millis(1_000));
+            let result = client.key_by("enter", Deadline::from_millis(1_000));
 
-        assert!(result.is_err(), "timeout restoration failure was discarded");
-        let mutation_request_count = requests
-            .lock()
-            .expect("request log")
-            .iter()
-            .filter(|(_, request)| request["op"] == "key")
-            .count();
-        assert_eq!(mutation_request_count, 1);
+            assert!(
+                result.is_err(),
+                "{fault:?} timeout restoration failure was discarded"
+            );
+            let mutation_request_count = requests
+                .lock()
+                .expect("request log")
+                .iter()
+                .filter(|(_, request)| request["op"] == "key")
+                .count();
+            assert_eq!(mutation_request_count, 1, "{fault:?}");
+        }
+    }
+
+    #[test]
+    fn mutating_requests_do_not_replay_when_their_answer_is_lost() {
+        enum Mutation {
+            Pointer,
+            Gesture,
+            Key,
+            Text,
+        }
+
+        let path = vec![Pt {
+            x: 5,
+            y: 10,
+            t_ms: 0,
+        }];
+        for (expected_op, mutation) in [
+            ("pointer", Mutation::Pointer),
+            ("gesture", Mutation::Gesture),
+            ("key", Mutation::Key),
+            ("text", Mutation::Text),
+        ] {
+            let (port, requests, join) = agent_that_loses_one_answer();
+            let client = AgentClient::connect(port).expect("connect");
+
+            let result = match mutation {
+                Mutation::Pointer => client.pointer(&path, "left"),
+                Mutation::Gesture => client.gesture(std::slice::from_ref(&path)),
+                Mutation::Key => client.key("enter"),
+                Mutation::Text => client.text("hello"),
+            };
+
+            assert!(result.is_err(), "{expected_op} replay hid the lost answer");
+            join.join().expect("fake agent");
+            let seen = requests.lock().expect("request log");
+            assert_eq!(seen.len(), 1, "{expected_op} was replayed on conn2");
+            assert_eq!(seen[0].0, 1, "{expected_op}");
+            assert_eq!(seen[0].1["op"], expected_op, "{expected_op}");
+        }
     }
 
     #[test]
@@ -802,7 +923,7 @@ mod tests {
         let client = AgentClient::connect(port).unwrap();
         let started = Instant::now();
         let err = client
-            .key_by("enter", Deadline::from_millis(150))
+            .call_by(json!({"op": "ping"}), Deadline::from_millis(150))
             .unwrap_err();
         assert!(matches!(err, GlassError::Bounded { .. }), "{err}");
         assert!(

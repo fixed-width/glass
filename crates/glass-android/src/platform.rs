@@ -224,6 +224,26 @@ fn visible_window_region(win: &WindowGeometry, disp_w: u32, disp_h: u32) -> Resu
     })
 }
 
+fn finish_capture(
+    bytes: &[u8],
+    win: &WindowGeometry,
+    region: Option<&Region>,
+    deadline: Deadline,
+) -> Result<Frame> {
+    let display = decode_screencap(bytes)?;
+    let window_region = visible_window_region(win, display.width, display.height)?;
+    let window_frame = display.crop(&window_region)?;
+    let frame = match region {
+        Some(region) => window_frame.crop(region),
+        None => Ok(window_frame),
+    }?;
+    if deadline.has_passed() {
+        Err(GlassError::caller_deadline_elapsed("capture"))
+    } else {
+        Ok(frame)
+    }
+}
+
 /// Force-stop a launch that failed after `am start` had already put the app on the device, and
 /// hand its error back — `start_app` records `self.app` only on success, so nothing else reaps it.
 fn reap_failed_launch(adb: &Adb, package: &str, e: GlassError) -> GlassError {
@@ -289,13 +309,7 @@ impl Platform for AndroidPlatform {
         let bytes = self
             .adb()
             .run_bytes_until(["exec-out", "screencap"], deadline)?;
-        let display = decode_screencap(&bytes)?;
-        let window_region = visible_window_region(&win, display.width, display.height)?;
-        let window_frame = display.crop(&window_region)?;
-        match region {
-            Some(r) => window_frame.crop(r),
-            None => Ok(window_frame),
-        }
+        finish_capture(&bytes, &win, region, deadline)
     }
 
     fn capture_window_by(
@@ -727,6 +741,46 @@ mod platform_tests {
 
         // The dialog's frame, not the 1080x2400 display behind it.
         assert_eq!((frame.width, frame.height), (800, 800));
+    }
+
+    #[test]
+    fn decode_and_crop_cannot_return_success_after_the_caller_deadline() {
+        let win = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let region = Region {
+            x: 1,
+            y: 1,
+            width: 1,
+            height: 1,
+        };
+
+        let error = finish_capture(
+            &frame_bytes(2, 2),
+            &win,
+            Some(&region),
+            Deadline::at(Instant::now()),
+        )
+        .expect_err("a frame completed after its caller left");
+
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
     }
 
     #[test]
