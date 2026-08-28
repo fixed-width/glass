@@ -1,13 +1,13 @@
 use crate::messaging_timeout::{
-    AxMessaging, TimeoutOwner, with_deadline_by as production_deadline,
-    with_doctor_timeout_by as production_doctor,
+    AxMessaging, TimeoutOwner, with_doctor_timeout_by as production_doctor,
+    with_window_query_by as production_window_query,
 };
 use glass_core::{BoundDispatch, BoundKind, Deadline, GlassError, Result, Whose};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Element {
@@ -60,6 +60,85 @@ impl AxMessaging for FakeAx {
         state.global_timeout = (seconds != 0.0).then_some(seconds);
         Ok(())
     }
+}
+
+fn assert_same_thread_reentry(error: &GlassError) {
+    assert!(
+        matches!(
+            error.cause(),
+            GlassError::Backend(message)
+                if message == "macOS AX timeout owner rejected same-thread reentry"
+        ),
+        "unexpected reentry error: {error}"
+    );
+    assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+}
+
+#[test]
+fn bounded_same_thread_reentry_is_rejected_immediately() {
+    let owner = TimeoutOwner::new();
+    let ax = FakeAx::default();
+    let nested_ran = Mutex::new(false);
+    let started = Instant::now();
+
+    let error = owner
+        .with_deadline_by(&ax, Deadline::UNBOUNDED, false, |_outer| {
+            owner.with_deadline_by(&ax, Deadline::from_millis(2_000), false, |_nested| {
+                *nested_ran.lock().unwrap() = true;
+                Ok(())
+            })
+        })
+        .unwrap_err();
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "bounded same-thread reentry waited for its deadline"
+    );
+    assert!(!*nested_ran.lock().unwrap());
+    assert_same_thread_reentry(&error);
+}
+
+#[test]
+fn unbounded_same_thread_reentry_is_rejected_immediately() {
+    let owner = Arc::new(TimeoutOwner::new());
+    let ax = Arc::new(FakeAx::default());
+    let nested_ran = Arc::new(Mutex::new(false));
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker_owner = Arc::clone(&owner);
+    let worker_ax = Arc::clone(&ax);
+    let worker_nested_ran = Arc::clone(&nested_ran);
+    let worker = thread::spawn(move || {
+        let started = Instant::now();
+        let result = worker_owner.with_deadline_by(
+            worker_ax.as_ref(),
+            Deadline::UNBOUNDED,
+            false,
+            |_outer| {
+                worker_owner.with_deadline_by(
+                    worker_ax.as_ref(),
+                    Deadline::UNBOUNDED,
+                    false,
+                    |_nested| {
+                        *worker_nested_ran.lock().unwrap() = true;
+                        Ok(())
+                    },
+                )
+            },
+        );
+        result_tx.send((started.elapsed(), result)).unwrap();
+    });
+
+    let (elapsed, result) = result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("unbounded same-thread reentry self-deadlocked");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "unbounded same-thread reentry did not fail immediately"
+    );
+    let error = result.unwrap_err();
+    assert!(!*nested_ran.lock().unwrap());
+    assert_same_thread_reentry(&error);
+    worker.join().unwrap();
 }
 
 #[test]
@@ -326,15 +405,24 @@ fn production_doctor_and_window_wrappers_share_one_owner_in_both_interleavings()
         .unwrap();
 
     let window_ran = Mutex::new(false);
-    let error = production_deadline(ax.as_ref(), Deadline::from_millis(25), false, |scope| {
-        scope.message("production window read", || {
-            *window_ran.lock().unwrap() = true;
-            Ok(())
-        })
-    })
+    let error = production_window_query(
+        ax.as_ref(),
+        Deadline::from_millis(25),
+        || Ok(()),
+        |(), scope| {
+            scope.message("production window read", || {
+                *window_ran.lock().unwrap() = true;
+                Ok(())
+            })
+        },
+    )
     .unwrap_err();
     assert!(!*window_ran.lock().unwrap());
-    assert_eq!(error.bound(), Some(BoundKind::NotStarted));
+    assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+    assert_eq!(
+        error.bound_dispatch(),
+        Some(BoundDispatch::MayHaveDispatched)
+    );
     release_doctor_tx.send(()).unwrap();
     doctor.join().unwrap();
 
@@ -342,11 +430,11 @@ fn production_doctor_and_window_wrappers_share_one_owner_in_both_interleavings()
     let (release_window_tx, release_window_rx) = mpsc::channel();
     let window_ax = Arc::clone(&ax);
     let window = thread::spawn(move || {
-        production_deadline(
+        production_window_query(
             window_ax.as_ref(),
             Deadline::from_millis(2_000),
-            false,
-            |scope| {
+            || Ok(()),
+            |(), scope| {
                 scope.message("production window read", || {
                     window_entered_tx.send(()).unwrap();
                     release_window_rx.recv().unwrap();

@@ -8,13 +8,15 @@
 
 use glass_core::{Deadline, GlassError, Result};
 use std::sync::{Condvar, Mutex};
+use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 const DOCTOR_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTAMINATION_PREFIX: &str = "AX messaging timeout owner is contaminated";
+const REENTRY_MESSAGE: &str = "macOS AX timeout owner rejected same-thread reentry";
 
 /// The only production owner of the process-global AX messaging timeout.
-pub static AX_MESSAGING_TIMEOUT_OWNER: TimeoutOwner = TimeoutOwner::new();
+static AX_MESSAGING_TIMEOUT_OWNER: TimeoutOwner = TimeoutOwner::new();
 
 /// Platform-specific access to the system-wide AX timeout setter.
 pub trait AxMessaging {
@@ -26,7 +28,7 @@ pub trait AxMessaging {
 
 #[derive(Default)]
 struct OwnerState {
-    active: bool,
+    owner_thread: Option<ThreadId>,
     contamination: Option<String>,
 }
 
@@ -46,7 +48,7 @@ impl TimeoutOwner {
     pub const fn new() -> Self {
         Self {
             state: Mutex::new(OwnerState {
-                active: false,
+                owner_thread: None,
                 contamination: None,
             }),
             available: Condvar::new(),
@@ -123,6 +125,7 @@ impl TimeoutOwner {
     }
 
     fn acquire(&self, deadline: Deadline, already_dispatched: bool) -> Result<TimeoutPermit<'_>> {
+        let current_thread = thread::current().id();
         let mut state = self
             .state
             .lock()
@@ -131,11 +134,14 @@ impl TimeoutOwner {
             if let Some(contamination) = &state.contamination {
                 return Err(contamination_error(contamination));
             }
+            if state.owner_thread == Some(current_thread) {
+                return Err(reentry_error(already_dispatched));
+            }
             if deadline.has_passed() {
                 return Err(deadline_error("macOS AX timeout owner", already_dispatched));
             }
-            if !state.active {
-                state.active = true;
+            if state.owner_thread.is_none() {
+                state.owner_thread = Some(current_thread);
                 return Ok(TimeoutPermit { owner: self });
             }
 
@@ -181,7 +187,7 @@ impl Drop for TimeoutPermit<'_> {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.active = false;
+        state.owner_thread = None;
         self.owner.available.notify_all();
     }
 }
@@ -289,6 +295,15 @@ fn contamination_error(detail: &str) -> GlassError {
     ))
 }
 
+fn reentry_error(already_dispatched: bool) -> GlassError {
+    let error = GlassError::Backend(REENTRY_MESSAGE.into());
+    if already_dispatched {
+        error.after_dispatch()
+    } else {
+        error.before_dispatch()
+    }
+}
+
 /// Whether an error reports that a failed reset left the process-global AX timeout unsafe.
 pub fn is_contamination_error(error: &GlassError) -> bool {
     matches!(
@@ -297,17 +312,20 @@ pub fn is_contamination_error(error: &GlassError) -> bool {
     )
 }
 
-/// Production deadline-bound entry point shared by the macOS window backend.
-pub fn with_deadline_by<A, T>(
+/// Production window entry point. The ScreenCaptureKit query runs before owner acquisition, so a
+/// later gate expiry retains proof that external work may already have dispatched.
+pub fn with_window_query_by<A, Q, T>(
     ax: &A,
     deadline: Deadline,
-    already_dispatched: bool,
-    operation: impl FnOnce(&mut MessageScope<'_, '_, A>) -> Result<T>,
+    query: impl FnOnce() -> Result<Q>,
+    operation: impl FnOnce(Q, &mut MessageScope<'_, '_, A>) -> Result<T>,
 ) -> Result<T>
 where
     A: AxMessaging,
 {
-    AX_MESSAGING_TIMEOUT_OWNER.with_deadline_by(ax, deadline, already_dispatched, operation)
+    let query_result = query()?;
+    AX_MESSAGING_TIMEOUT_OWNER
+        .with_deadline_by(ax, deadline, true, |scope| operation(query_result, scope))
 }
 
 /// Production fixed-timeout entry point used by `glass_doctor`.

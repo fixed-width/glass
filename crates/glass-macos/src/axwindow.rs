@@ -56,7 +56,7 @@ use objc2_core_foundation::{
 };
 
 use glass_core::platform::WindowGeometry;
-use glass_core::{Deadline, GlassError, Result};
+use glass_core::{GlassError, Result};
 
 use crate::coords::point_to_global_pixel;
 
@@ -122,13 +122,7 @@ pub(crate) type AxMessageScope<'owner, 'ax> =
 
 /// Run all exact AX object creation and work under one serialized process-global timeout scope.
 /// Unbounded callers are serialized with bounded scopes but leave AX's default timeout untouched.
-pub(crate) fn with_window_query_by<Q, T>(
-    deadline: Deadline,
-    query: impl FnOnce() -> Result<Q>,
-    operation: impl FnOnce(Q, &mut AxMessageScope<'_, '_>) -> Result<T>,
-) -> Result<T> {
-    crate::ax_timeout::with_window_query_by(&SystemWideAxMessaging, deadline, query, operation)
-}
+pub(crate) use crate::ax_timeout::with_window_query_by;
 
 /// Resolve the `AXUIElement` window for `pid` whose `CGWindowID` is `window_id`.
 ///

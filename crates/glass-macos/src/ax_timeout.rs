@@ -1,29 +1,12 @@
 //! macOS window-operation AX timeout facade and whole-operation finalization.
 
-#[cfg(target_os = "macos")]
-use glass_a11y_macos::messaging_timeout::AX_MESSAGING_TIMEOUT_OWNER;
-use glass_a11y_macos::messaging_timeout::{AxMessaging, MessageScope, TimeoutOwner};
+use glass_a11y_macos::messaging_timeout::{AxMessaging, MessageScope};
 use glass_core::{Deadline, GlassError, Result};
 
 /// Enter the AX owner after a successful ScreenCaptureKit window query.
 ///
 /// The query is external work, so expiry while waiting for the owner is a dispatched caller
 /// timeout, never `NotStarted`/`NotDispatched`.
-pub(crate) fn with_window_query_on<A, Q, T>(
-    owner: &TimeoutOwner,
-    ax: &A,
-    deadline: Deadline,
-    query: impl FnOnce() -> Result<Q>,
-    operation: impl FnOnce(Q, &mut MessageScope<'_, '_, A>) -> Result<T>,
-) -> Result<T>
-where
-    A: AxMessaging,
-{
-    let query_result = query()?;
-    owner.with_deadline_by(ax, deadline, true, |scope| operation(query_result, scope))
-}
-
-#[cfg(target_os = "macos")]
 pub(crate) fn with_window_query_by<A, Q, T>(
     ax: &A,
     deadline: Deadline,
@@ -33,7 +16,7 @@ pub(crate) fn with_window_query_by<A, Q, T>(
 where
     A: AxMessaging,
 {
-    with_window_query_on(&AX_MESSAGING_TIMEOUT_OWNER, ax, deadline, query, operation)
+    glass_a11y_macos::messaging_timeout::with_window_query_by(ax, deadline, query, operation)
 }
 
 pub(crate) fn finish_window_operation_by<T>(deadline: Deadline, result: Result<T>) -> Result<T> {
@@ -64,8 +47,10 @@ pub(crate) fn finish_window_operation_by<T>(deadline: Deadline, result: Result<T
 
 #[cfg(test)]
 mod tests {
-    use super::{finish_window_operation_by, with_window_query_on};
-    use glass_a11y_macos::messaging_timeout::{AxMessaging, TimeoutOwner};
+    use super::{finish_window_operation_by, with_window_query_by};
+    use glass_a11y_macos::messaging_timeout::{
+        AxMessaging, TimeoutOwner, with_doctor_timeout_by as production_doctor,
+    };
     use glass_core::{BoundDispatch, BoundKind, Deadline, GlassError, Result, Whose};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -101,32 +86,28 @@ mod tests {
     }
 
     #[test]
-    fn successful_screen_capture_query_makes_later_gate_expiry_dispatched() {
-        let owner = Arc::new(TimeoutOwner::new());
+    fn production_window_query_waits_for_doctor_and_preserves_query_dispatch() {
         let ax = Arc::new(FakeAx);
-        let (blocker_entered_tx, blocker_entered_rx) = mpsc::channel();
-        let (release_blocker_tx, release_blocker_rx) = mpsc::channel();
-        let blocker_owner = Arc::clone(&owner);
-        let blocker_ax = Arc::clone(&ax);
-        let blocker = thread::spawn(move || {
-            blocker_owner
-                .with_doctor_timeout_by(blocker_ax.as_ref(), |scope| {
-                    scope.message("blocking doctor probe", || {
-                        blocker_entered_tx.send(()).unwrap();
-                        release_blocker_rx.recv().unwrap();
-                        Ok(())
-                    })
+        let (doctor_entered_tx, doctor_entered_rx) = mpsc::channel();
+        let (release_doctor_tx, release_doctor_rx) = mpsc::channel();
+        let doctor_ax = Arc::clone(&ax);
+        let doctor = thread::spawn(move || {
+            production_doctor(doctor_ax.as_ref(), |scope| {
+                scope.message("production doctor probe", || {
+                    doctor_entered_tx.send(()).unwrap();
+                    release_doctor_rx.recv().unwrap();
+                    Ok(())
                 })
-                .unwrap();
+            })
+            .unwrap();
         });
-        blocker_entered_rx
+        doctor_entered_rx
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
 
         let query_ran = Mutex::new(false);
         let ax_operation_ran = Mutex::new(false);
-        let error = with_window_query_on(
-            owner.as_ref(),
+        let result = with_window_query_by(
             ax.as_ref(),
             Deadline::from_millis(25),
             || {
@@ -139,8 +120,11 @@ mod tests {
                     Ok(())
                 })
             },
-        )
-        .unwrap_err();
+        );
+
+        release_doctor_tx.send(()).unwrap();
+        doctor.join().unwrap();
+        let error = result.unwrap_err();
 
         assert!(*query_ran.lock().unwrap());
         assert!(!*ax_operation_ran.lock().unwrap());
@@ -150,8 +134,6 @@ mod tests {
             error.bound_dispatch(),
             Some(BoundDispatch::MayHaveDispatched)
         );
-        release_blocker_tx.send(()).unwrap();
-        blocker.join().unwrap();
     }
 
     #[test]

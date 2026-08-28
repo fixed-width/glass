@@ -862,6 +862,7 @@ impl Platform for MacosPlatform {
         // never resolve to another app's window.
         let mut mutation_dispatched = false;
         let result = axwindow::with_window_query_by(
+            &axwindow::SystemWideAxMessaging,
             deadline,
             || {
                 crate::scwindow::find_window_by_id_by(
