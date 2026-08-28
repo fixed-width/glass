@@ -12,7 +12,7 @@ use glass_core::accessibility::{
     Subject, WalkBudget, WalkLimits,
 };
 use glass_core::platform::WindowGeometry;
-use glass_core::{GlassError, Result, read_back_failed, write_took_no_effect};
+use glass_core::{GlassError, Result, write_took_no_effect};
 
 use crate::axmap::{LabelInputs, class_to_role, demote_web_hosts, labels};
 use crate::conn::{CallFailure, Conn};
@@ -806,10 +806,10 @@ impl Accessibility for ServiceA11y {
                 "Android accessibility set_value verification",
                 true,
             )
-            .map_err(|e| read_back_failed(target, &e))?;
+            .map_err(|e| read_back_error(target, e))?;
             let after = self
                 .snapshot_with_refs(ctx)
-                .map_err(|e| read_back_failed(target, &e))?;
+                .map_err(|e| read_back_error(target, e))?;
             let after_package = after.acting_on(&self.package);
             if after_package != acting_package {
                 return Err(GlassError::AxWriteUnconfirmed(
@@ -837,7 +837,7 @@ impl Accessibility for ServiceA11y {
                     let error = GlassError::caller_deadline_elapsed(
                         "Android accessibility set_value verification",
                     );
-                    return Err(read_back_failed(target, &error));
+                    return Err(read_back_error(target, error));
                 }
                 let WriteReading::Pending(observed) = reading else {
                     return Err(GlassError::AxWriteUnconfirmed(
@@ -868,7 +868,7 @@ impl Accessibility for ServiceA11y {
                 "Android accessibility set_value verification",
                 true,
             )
-            .map_err(|e| read_back_failed(target, &e))?;
+            .map_err(|e| read_back_error(target, e))?;
         }
     }
 
@@ -1470,15 +1470,21 @@ fn write_error(target: u32, f: CallFailure) -> GlassError {
         CallFailure::NotSent(e) => GlassError::AccessibilityUnavailable(format!(
             "the write to element {target} could not be sent: {e}"
         )),
-        CallFailure::AnswerLost(e) => GlassError::AxWriteUnconfirmed(
+        CallFailure::AnswerLost(e) => GlassError::write_unconfirmed_because(
             target,
-            format!("the write was sent and its result was lost ({e})"),
+            "the write was sent and its result was lost",
+            e,
         ),
-        CallFailure::Refused(e) => GlassError::AxWriteUnconfirmed(
+        CallFailure::Refused(e) => GlassError::write_unconfirmed_because(
             target,
-            format!("the device answered the write with something unreadable ({e})"),
+            "the device answered the write with something unreadable",
+            e,
         ),
     }
+}
+
+fn read_back_error(target: &AxTarget, error: GlassError) -> GlassError {
+    GlassError::write_unconfirmed_because(target.id.0, "reading the element back failed", error)
 }
 
 /// Map a click failure onto the invoke contract. No arm is fallback-eligible: a refusal may
@@ -3382,8 +3388,33 @@ mod tests {
     }
 
     fn assert_unconfirmed_value_write(error: &GlassError, target: AxNodeId) {
+        let id = match error {
+            GlassError::AxWriteUnconfirmed(id, _) => *id,
+            GlassError::AxWriteUnconfirmedCaused { id, .. } => *id,
+            error => panic!("expected an unconfirmed value write, got {error}"),
+        };
+        assert_eq!(id, target.0, "{error}");
+        assert!(error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn an_answer_lost_write_preserves_its_tool_source() {
+        let error = write_error(
+            7,
+            CallFailure::AnswerLost(GlassError::ToolFailed {
+                call: "Android accessibility service".into(),
+                said: " connection reset \n".into(),
+            }),
+        );
+
         assert!(
-            matches!(error, GlassError::AxWriteUnconfirmed(id, _) if *id == target.0),
+            matches!(error.cause(), GlassError::ToolFailed { .. }),
+            "{error}"
+        );
+        assert_eq!(error.tool_said(), Some("connection reset"), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
             "{error}"
         );
         assert!(error.set_value_failed_after_writing(), "{error}");
@@ -3566,6 +3597,20 @@ mod tests {
             .expect_err("verification cannot sleep past the caller deadline");
 
         assert_unconfirmed_value_write(&error, target.id);
+        assert_eq!(
+            error.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::Bounded { .. }),
+            "{error}"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_millis(350),
             "verification slept for {:?}",
@@ -3922,10 +3967,24 @@ mod tests {
 
         let error = write_error(1, failure);
         assert_unconfirmed_value_write(&error, AxNodeId(1));
-        assert_ne!(
+        assert_eq!(
+            error.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
+        assert_eq!(
             error.bound_dispatch(),
-            Some(glass_core::BoundDispatch::NotDispatched),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
             "the final verdict must keep batch side-effect reporting conservative: {error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::Bounded { .. }),
+            "{error}"
         );
         assert_eq!(
             ops_of(&ops),
@@ -4889,7 +4948,11 @@ mod tests {
         let err = a
             .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
             .expect_err("the reconnect cannot re-send into a different foreground app");
-        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(
+            matches!(err, GlassError::AxWriteUnconfirmedCaused { id: 1, .. }),
+            "{err}"
+        );
+        assert!(matches!(err.cause(), GlassError::Backend(_)), "{err}");
         assert!(err.set_value_failed_after_writing(), "{err}");
     }
 
@@ -4927,7 +4990,11 @@ mod tests {
         let err = a
             .set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
             .expect_err("the verification read is refused");
-        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(
+            matches!(err, GlassError::AxWriteUnconfirmedCaused { id: 1, .. }),
+            "{err}"
+        );
+        assert!(matches!(err.cause(), GlassError::Backend(_)), "{err}");
         assert!(err.set_value_failed_after_writing(), "{err}");
         // The wrap exists to carry the cause; without it the caller learns only that something
         // could not be confirmed.

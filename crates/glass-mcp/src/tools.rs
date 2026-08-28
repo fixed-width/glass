@@ -113,6 +113,7 @@ pub(crate) struct ContextualError {
     pub safe_summary: &'static str,
     pub sequence_deadline_exceeded: bool,
     pub bound_dispatch: Option<BoundDispatch>,
+    post_write: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -166,6 +167,20 @@ impl SafeErrorCategory {
             Self::Other => "action execution failed",
         }
     }
+
+    fn post_write_summary(self) -> &'static str {
+        match self {
+            Self::TransportFailure => {
+                "backend transport failed after the value write went out; re-snapshot to see where it landed rather than writing it again"
+            }
+            Self::SequenceDeadlineExceeded => {
+                "sequence deadline exceeded after the value write went out; re-snapshot to see where it landed rather than writing it again"
+            }
+            _ => {
+                "the value write went out but could not be confirmed; re-snapshot to see where it landed rather than writing it again"
+            }
+        }
+    }
 }
 
 impl ContextualError {
@@ -176,10 +191,12 @@ impl ContextualError {
             safe_summary: "action validation failed",
             sequence_deadline_exceeded: false,
             bound_dispatch: Some(BoundDispatch::NotDispatched),
+            post_write: false,
         }
     }
 
     fn from_error(error: glass_core::GlassError) -> Self {
+        let post_write = error.set_value_failed_after_writing();
         let category = SafeErrorCategory::from_error(&error);
         // These variants are constructed only by core preflight checks before the requested
         // mutation can dispatch. Keep the allowlist narrow so a new ordinary error remains
@@ -195,9 +212,14 @@ impl ContextualError {
         Self {
             message: error.to_string(),
             category,
-            safe_summary: category.summary(),
+            safe_summary: if post_write {
+                category.post_write_summary()
+            } else {
+                category.summary()
+            },
             sequence_deadline_exceeded: error.bound_owner() == Some(glass_core::Whose::Caller),
             bound_dispatch,
+            post_write,
         }
     }
 
@@ -226,7 +248,11 @@ impl ContextualError {
     /// operation's safe detail or its dispatch verdict.
     pub fn after_sequence_deadline(mut self) -> Self {
         self.category = SafeErrorCategory::SequenceDeadlineExceeded;
-        self.safe_summary = SafeErrorCategory::SequenceDeadlineExceeded.summary();
+        self.safe_summary = if self.post_write {
+            SafeErrorCategory::SequenceDeadlineExceeded.post_write_summary()
+        } else {
+            SafeErrorCategory::SequenceDeadlineExceeded.summary()
+        };
         self.sequence_deadline_exceeded = true;
         self
     }
@@ -243,6 +269,7 @@ impl ContextualError {
             safe_summary: SafeErrorCategory::SequenceDeadlineExceeded.summary(),
             sequence_deadline_exceeded: true,
             bound_dispatch: None,
+            post_write: false,
         }
     }
 }

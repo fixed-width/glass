@@ -169,6 +169,20 @@ pub enum GlassError {
     )]
     AxWriteUnconfirmed(u32, String),
 
+    /// A write that went out and could not be confirmed because another structured operation
+    /// failed. The source remains available for timeout ownership and transport classification;
+    /// the outer verdict remains authoritative for retry safety and dispatch provenance.
+    #[error(
+        "element #{id}: the write went out, but could not be confirmed — {detail} ({source}). \
+         Re-snapshot to see where it landed rather than writing it again"
+    )]
+    AxWriteUnconfirmedCaused {
+        id: u32,
+        detail: String,
+        #[source]
+        source: Box<GlassError>,
+    },
+
     /// A dispatched write whose read-back does not hold the request.
     ///
     /// Carries both values because three outcomes look alike from the id alone: the element
@@ -345,7 +359,8 @@ impl GlassError {
         )
     }
 
-    /// The original structured failure, without compound-operation dispatch annotations.
+    /// The original structured failure, without dispatch annotations or a caused post-write
+    /// verdict.
     ///
     /// An annotation changes whether an earlier step may have affected the app, not what the
     /// later step reported. Classification should inspect this cause while dispatch decisions use
@@ -354,16 +369,16 @@ impl GlassError {
     pub fn cause(&self) -> &Self {
         match self {
             GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => error.cause(),
+            GlassError::AxWriteUnconfirmedCaused { source, .. } => source.cause(),
             error => error,
         }
     }
 
     /// Whether a failed value-write is **proven** to have gone out or may have gone out before
     /// failing — the only cases where the session's captured value is stale and must be dropped.
-    /// True only for the two operation-specific post-dispatch verdicts,
-    /// [`GlassError::AxValueNotApplied`] and [`GlassError::AxWriteUnconfirmed`]. Generic bounded
-    /// dispatch provenance can describe a pre-write snapshot or transport call, so it is not
-    /// evidence that the value mutation itself went out.
+    /// True only for the operation-specific post-dispatch verdicts. Generic bounded dispatch
+    /// provenance can describe a pre-write snapshot or transport call, so it is not evidence that
+    /// the value mutation itself went out.
     ///
     /// Same "did anything dispatch?" question as [`Self::invoke_fallback_eligible`], but ordinary
     /// errors are decided by an allowlist because the two mistakes are not symmetric. Keeping the
@@ -375,10 +390,15 @@ impl GlassError {
     /// and its post-write read-back can fail through the same transport variants. Backends must
     /// convert only the latter at the point that knows the mutation already dispatched.
     pub fn set_value_failed_after_writing(&self) -> bool {
-        matches!(
-            self.cause(),
-            GlassError::AxValueNotApplied { .. } | GlassError::AxWriteUnconfirmed(..)
-        )
+        match self {
+            GlassError::AxValueNotApplied { .. }
+            | GlassError::AxWriteUnconfirmed(..)
+            | GlassError::AxWriteUnconfirmedCaused { .. } => true,
+            GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => {
+                error.set_value_failed_after_writing()
+            }
+            _ => false,
+        }
     }
 
     /// Preserve proof that an ordinary failure happened before external work was dispatched.
@@ -409,6 +429,27 @@ impl GlassError {
                 ..
             } => error,
             error => GlassError::AfterDispatch(Box::new(error)),
+        }
+    }
+
+    /// Preserve an operation-specific unconfirmed-write verdict together with the structured
+    /// failure that prevented confirmation.
+    ///
+    /// An existing post-write verdict already carries the stronger retry-safety decision and is
+    /// returned unchanged rather than nested inside another verdict.
+    pub fn write_unconfirmed_because(
+        id: u32,
+        detail: impl Into<String>,
+        source: GlassError,
+    ) -> GlassError {
+        if source.set_value_failed_after_writing() {
+            source
+        } else {
+            GlassError::AxWriteUnconfirmedCaused {
+                id,
+                detail: detail.into(),
+                source: Box::new(source),
+            }
         }
     }
 
@@ -459,7 +500,9 @@ impl GlassError {
     pub fn bound(&self) -> Option<BoundKind> {
         match self {
             GlassError::Bounded { kind, .. } => Some(*kind),
-            GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => error.bound(),
+            GlassError::BeforeDispatch(error)
+            | GlassError::AfterDispatch(error)
+            | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.bound(),
             _ => None,
         }
     }
@@ -468,9 +511,9 @@ impl GlassError {
     pub fn bound_owner(&self) -> Option<Whose> {
         match self {
             GlassError::Bounded { whose, .. } => Some(*whose),
-            GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => {
-                error.bound_owner()
-            }
+            GlassError::BeforeDispatch(error)
+            | GlassError::AfterDispatch(error)
+            | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.bound_owner(),
             _ => None,
         }
     }
@@ -480,7 +523,9 @@ impl GlassError {
         match self {
             GlassError::Bounded { dispatch, .. } => Some(*dispatch),
             GlassError::BeforeDispatch(_) => Some(BoundDispatch::NotDispatched),
-            GlassError::AfterDispatch(_) => Some(BoundDispatch::MayHaveDispatched),
+            GlassError::AfterDispatch(_)
+            | GlassError::AxWriteUnconfirmed(..)
+            | GlassError::AxWriteUnconfirmedCaused { .. } => Some(BoundDispatch::MayHaveDispatched),
             _ => None,
         }
     }
@@ -496,9 +541,9 @@ impl GlassError {
     pub fn tool_said(&self) -> Option<&str> {
         match self {
             GlassError::ToolFailed { said, .. } => Some(said.trim()),
-            GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => {
-                error.tool_said()
-            }
+            GlassError::BeforeDispatch(error)
+            | GlassError::AfterDispatch(error)
+            | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.tool_said(),
             _ => None,
         }
     }
@@ -1118,6 +1163,14 @@ mod tests {
     fn an_unconfirmed_write_counts_as_dispatched() {
         // The session must drop its cached value: the write went out, so the value it holds is stale.
         assert!(GlassError::AxWriteUnconfirmed(7, "x".into()).set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn a_source_less_unconfirmed_write_marks_possible_dispatch() {
+        assert_eq!(
+            GlassError::AxWriteUnconfirmed(7, "x".into()).bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
     }
 
     #[test]

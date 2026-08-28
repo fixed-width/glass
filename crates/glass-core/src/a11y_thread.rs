@@ -19,7 +19,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use crate::deadline::{Deadline, Whose};
-use crate::{GlassError, Result};
+use crate::{BoundDispatch, BoundKind, GlassError, Result};
 
 /// The bounded calls one accessibility backend makes on its detached worker thread.
 ///
@@ -211,11 +211,10 @@ impl A11yThread {
         let was_dispatched = dispatch.cancel_or_dispatched();
         match result {
             Err(error) if was_dispatched && !error.set_value_failed_after_writing() => {
-                Err(GlassError::AxWriteUnconfirmed(
+                Err(GlassError::write_unconfirmed_because(
                     target,
-                    format!(
-                        "the native value mutation was dispatched but failed before it could be confirmed ({error})"
-                    ),
+                    "the native value mutation was dispatched but failed before it could be confirmed",
+                    error,
                 ))
             }
             result => result,
@@ -257,16 +256,28 @@ impl A11yThread {
         dispatch: &SetValueDispatch,
     ) -> GlassError {
         if dispatch.cancel_or_dispatched() {
-            let cause = match ended_by {
-                Whose::Caller => "the caller deadline elapsed",
-                Whose::Callee => "the accessibility backend timed out",
-            };
-            return GlassError::AxWriteUnconfirmed(
-                target,
-                format!(
-                    "{cause} after the native value mutation was dispatched; it may still land"
+            let (detail, source) = match ended_by {
+                Whose::Caller => (
+                    "the caller deadline elapsed after the native value mutation was dispatched; it may still land",
+                    GlassError::caller_deadline_elapsed_with_guidance(
+                        "native accessibility set_value",
+                        "the value mutation may still land",
+                    ),
                 ),
-            );
+                Whose::Callee => (
+                    "the accessibility backend timed out after the native value mutation was dispatched; it may still land",
+                    GlassError::Bounded {
+                        kind: BoundKind::TimedOut,
+                        whose: Whose::Callee,
+                        dispatch: BoundDispatch::MayHaveDispatched,
+                        message: format!(
+                            "accessibility set_value timed out ({} not responding); the action may still land",
+                            self.backend
+                        ),
+                    },
+                ),
+            };
+            return GlassError::write_unconfirmed_because(target, detail, source);
         }
         match ended_by {
             Whose::Caller => GlassError::caller_deadline_elapsed_with_guidance(
@@ -282,12 +293,13 @@ impl A11yThread {
 
     fn set_value_panicked(&self, target: u32, dispatch: &SetValueDispatch) -> GlassError {
         if dispatch.was_dispatched() {
-            GlassError::AxWriteUnconfirmed(
+            GlassError::write_unconfirmed_because(
                 target,
                 format!(
                     "the {} accessibility worker panicked after the native value mutation was dispatched",
                     self.backend
                 ),
+                self.worker_panicked(Op::SetValue),
             )
         } else {
             self.worker_panicked(Op::SetValue)
@@ -662,9 +674,10 @@ mod tests {
         assert_eq!(mutations.load(Ordering::SeqCst), 1, "{result:?}");
         let error = result.expect_err("the duplicate dispatch claim must be rejected");
         assert!(
-            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
+            matches!(error, GlassError::AxWriteUnconfirmedCaused { id: 7, .. }),
             "{error}"
         );
+        assert!(matches!(error.cause(), GlassError::Backend(_)), "{error}");
         assert!(error.set_value_failed_after_writing(), "{error}");
     }
 
@@ -708,9 +721,10 @@ mod tests {
         assert_eq!(mutations.load(Ordering::SeqCst), 1, "{result:?}");
         let error = result.expect_err("one racing dispatch claim must be rejected");
         assert!(
-            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
+            matches!(error, GlassError::AxWriteUnconfirmedCaused { id: 7, .. }),
             "{error}"
         );
+        assert!(matches!(error.cause(), GlassError::Backend(_)), "{error}");
         assert!(error.set_value_failed_after_writing(), "{error}");
     }
 
@@ -817,9 +831,83 @@ mod tests {
             })
             .expect_err("the native setter outlives the caller");
 
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut), "{error}");
         assert!(
-            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
+            matches!(error.cause(), GlassError::Bounded { .. }),
             "{error}"
+        );
+        assert!(error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn a_backend_ceiling_after_native_value_dispatch_preserves_its_bound() {
+        let error = A11yThread::new("a11y bus", Duration::from_millis(20))
+            .set_value(7, Deadline::UNBOUNDED, |dispatch| {
+                dispatch.dispatch(|| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    Ok(())
+                })
+            })
+            .expect_err("the native setter outlives the backend ceiling");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Callee), "{error}");
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::Bounded { .. }),
+            "{error}"
+        );
+        assert!(error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn a_dispatched_value_failure_exposes_its_tool_source() {
+        let error = reader()
+            .set_value(7, Deadline::UNBOUNDED, |dispatch| {
+                dispatch.dispatch(|| {
+                    Err(GlassError::ToolFailed {
+                        call: "native setter".into(),
+                        said: " transport refused \n".into(),
+                    })
+                })
+            })
+            .expect_err("the dispatched native setter reports a transport failure");
+
+        assert!(
+            matches!(error.cause(), GlassError::ToolFailed { .. }),
+            "{error}"
+        );
+        assert_eq!(error.tool_said(), Some("transport refused"), "{error}");
+        let source = std::error::Error::source(&error)
+            .expect("the post-write verdict must retain its structured source");
+        assert!(
+            matches!(
+                source.downcast_ref::<Box<GlassError>>().map(Box::as_ref),
+                Some(GlassError::ToolFailed { .. })
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_post_write_verdict_overrides_an_inner_not_dispatched_retry_cause() {
+        let error = reader()
+            .set_value(7, Deadline::UNBOUNDED, |dispatch| {
+                dispatch.dispatch(|| Err(GlassError::deadline_not_started("native retry")))
+            })
+            .expect_err("the first value mutation dispatched before its retry was refused");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "the value mutation outranks its inner retry provenance: {error}"
         );
         assert!(error.set_value_failed_after_writing(), "{error}");
     }

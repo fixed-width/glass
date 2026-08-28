@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use glass_core::{
     Deadline, GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, Whose,
-    read_back_failed, verify_typed_write,
+    verify_typed_write,
 };
 
 use crate::axmap;
@@ -213,18 +213,18 @@ fn dispatch_write(
         if e.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched) {
             return e.after_dispatch();
         }
-        GlassError::AxWriteUnconfirmed(
+        GlassError::write_unconfirmed_because(
             target_id,
-            format!("sending the keystrokes failed part-way through ({e}), so the field may have been cleared without receiving the text"),
+            "sending the keystrokes failed part-way through, so the field may have been cleared without receiving the text",
+            e,
         )
     })?;
     if deadline.has_passed() {
         let error = GlassError::caller_deadline_elapsed("iOS accessibility set_value");
-        return Err(GlassError::AxWriteUnconfirmed(
+        return Err(GlassError::write_unconfirmed_because(
             target_id,
-            format!(
-                "the keystroke batch was sent but the caller deadline elapsed before its result was confirmed ({error})"
-            ),
+            "the keystroke batch was sent but the caller deadline elapsed before its result was confirmed",
+            error,
         ));
     }
     Ok(())
@@ -242,11 +242,7 @@ fn require_set_value_time(deadline: Deadline, dispatched: bool) -> Result<()> {
 }
 
 fn post_write_error(target: &AxTarget, error: GlassError) -> GlassError {
-    if error.set_value_failed_after_writing() {
-        error
-    } else {
-        read_back_failed(target, &error)
-    }
+    GlassError::write_unconfirmed_because(target.id.0, "reading the element back failed", error)
 }
 
 impl Accessibility for IosA11y {
@@ -574,7 +570,12 @@ mod tests {
             glass_core::Deadline::UNBOUNDED,
         )
         .unwrap_err();
-        assert!(matches!(err, GlassError::AxWriteUnconfirmed(7, _)), "{err}");
+        assert!(matches!(err.cause(), GlassError::Backend(_)), "{err}");
+        assert_eq!(
+            err.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{err}"
+        );
         assert!(
             err.set_value_failed_after_writing(),
             "the session must drop the value it cached: {err}"
@@ -679,11 +680,43 @@ mod tests {
         let error = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi", Deadline::UNBOUNDED)
             .expect_err("the caller-owned HID timeout may have interrupted the value mutation");
 
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
         assert!(
-            matches!(error, GlassError::AxWriteUnconfirmed(1, _)),
+            matches!(error.cause(), GlassError::Bounded { .. }),
             "{error}"
         );
         assert!(error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn a_post_write_readback_failure_preserves_its_tool_source() {
+        let error = post_write_error(
+            &matching_target(),
+            GlassError::ToolFailed {
+                call: "idb accessibility_info".into(),
+                said: " simulator transport closed \n".into(),
+            },
+        );
+
+        assert!(
+            matches!(error.cause(), GlassError::ToolFailed { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            error.tool_said(),
+            Some("simulator transport closed"),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
     }
 
     #[test]

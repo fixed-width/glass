@@ -10,7 +10,7 @@ use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTr
 use glass_core::{BoundDispatch, Deadline, Whose};
 use glass_core::{
     GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, WindowGeometry,
-    read_back_failed, verify_typed_write,
+    verify_typed_write,
 };
 
 use crate::adb::{Adb, AdbOp};
@@ -556,16 +556,19 @@ impl Accessibility for AndroidA11y {
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         fn write_unconfirmed(target: u32, error: GlassError) -> GlassError {
-            if error.set_value_failed_after_writing() {
-                error
-            } else {
-                GlassError::AxWriteUnconfirmed(
-                    target,
-                    format!(
-                        "the Android input value mutation may have run but failed before it could be confirmed ({error})"
-                    ),
-                )
-            }
+            GlassError::write_unconfirmed_because(
+                target,
+                "the Android input value mutation may have run but failed before it could be confirmed",
+                error,
+            )
+        }
+
+        fn read_back_error(target: &AxTarget, error: GlassError) -> GlassError {
+            GlassError::write_unconfirmed_because(
+                target.id.0,
+                "reading the element back failed",
+                error,
+            )
         }
 
         fn require_time(
@@ -704,21 +707,21 @@ impl Accessibility for AndroidA11y {
             )?;
             let mut after = self
                 .snapshot_within(ctx, VERIFY_BOUND)
-                .map_err(|e| read_back_failed(target, &e))?;
+                .map_err(|e| read_back_error(target, e))?;
             after.assign_ids();
             match verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED) {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later read: drift and truncation are
                 // structural, and re-dumping for them costs seconds to reach the same answer.
                 Err(e @ GlassError::AxValueNotApplied { .. }) => last = Some(e),
-                Err(e) => return Err(read_back_failed(target, &e)),
+                Err(e) => return Err(read_back_error(target, e)),
             }
             if Instant::now() >= phase_ends {
                 if phase_owner == Whose::Caller {
                     let error = GlassError::caller_deadline_elapsed(
                         "Android accessibility set_value verification",
                     );
-                    return Err(read_back_failed(target, &error));
+                    return Err(read_back_error(target, error));
                 }
                 break;
             }
@@ -2272,7 +2275,12 @@ exec "$real" "$@"
         assert!(fake.called("input keycombination"), "{:?}", fake.calls());
         assert!(fake.called("input keyevent 67"), "{:?}", fake.calls());
         assert!(!fake.called("input text"), "{:?}", fake.calls());
-        assert!(matches!(error, GlassError::AxWriteUnconfirmed(1, _)));
+        assert!(matches!(error.cause(), GlassError::Backend(_)), "{error:?}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{error:?}"
+        );
         assert!(error.set_value_failed_after_writing(), "{error:?}");
     }
 
@@ -2519,8 +2527,15 @@ exec "$real" "$@"
             .set_value(&ctx, &field, "world")
             .expect_err("the text input process outlives the caller deadline");
 
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
         assert!(
-            matches!(error, GlassError::AxWriteUnconfirmed(1, _)),
+            matches!(error.cause(), GlassError::Bounded { .. }),
             "{error}"
         );
         assert!(error.set_value_failed_after_writing(), "{error}");

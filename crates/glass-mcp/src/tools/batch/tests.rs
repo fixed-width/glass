@@ -3,9 +3,9 @@ use crate::tools::start as start_tool;
 use crate::tools::testutil::*;
 use crate::tools::{OutContent, baseline_save};
 use glass_core::{
-    Accessibility, AppSpec, AxContext, AxRole, AxTree, Backend, BaselineStore, Deadline, Frame,
-    GlassError, KeyEvent, Platform, PlatformFactory, PointerEvent, Region, Result as GlassResult,
-    Stream, WindowGeometry, WindowId, WindowInfo, WindowOp,
+    A11yThread, Accessibility, AppSpec, AxContext, AxRole, AxTree, Backend, BaselineStore,
+    Deadline, Frame, GlassError, KeyEvent, Platform, PlatformFactory, PointerEvent, Region,
+    Result as GlassResult, Stream, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,6 +22,9 @@ enum DeadlineBehavior {
     CaptureFailsLate,
     A11yNotReadyLate,
     A11yBoundedLate,
+    SetValueCallerDeadline,
+    SetValueBackendDeadline,
+    SetValueTransportFailure,
     NoActiveSession,
     MissingElement,
     StaleElement,
@@ -167,15 +170,48 @@ impl Accessibility for DeadlineAccessibility {
 
     fn set_value(
         &mut self,
-        _context: &AxContext,
-        _target: &glass_core::AxTarget,
+        context: &AxContext,
+        target: &glass_core::AxTarget,
         text: &str,
     ) -> GlassResult<()> {
         self.events
             .lock()
             .unwrap()
             .push(format!("set_value({text})"));
-        Ok(())
+        match self.behavior {
+            DeadlineBehavior::SetValueCallerDeadline => A11yThread::new(
+                "scripted accessibility backend",
+                Duration::from_secs(1),
+            )
+            .set_value(target.id.0, context.deadline, |dispatch| {
+                dispatch.dispatch(|| {
+                    std::thread::sleep(Duration::from_millis(500));
+                    Ok(())
+                })
+            }),
+            DeadlineBehavior::SetValueBackendDeadline => {
+                A11yThread::new("scripted accessibility backend", Duration::from_millis(20))
+                    .set_value(target.id.0, context.deadline, |dispatch| {
+                        dispatch.dispatch(|| {
+                            std::thread::sleep(Duration::from_millis(100));
+                            Ok(())
+                        })
+                    })
+            }
+            DeadlineBehavior::SetValueTransportFailure => A11yThread::new(
+                "scripted accessibility backend",
+                Duration::from_secs(1),
+            )
+            .set_value(target.id.0, context.deadline, |dispatch| {
+                dispatch.dispatch(|| {
+                    Err(GlassError::ToolFailed {
+                        call: "scripted accessibility transport".into(),
+                        said: " connection reset by peer \n".into(),
+                    })
+                })
+            }),
+            _ => Ok(()),
+        }
     }
 
     fn invoke(
@@ -282,7 +318,10 @@ impl Platform for DeadlinePlatform {
             | DeadlineBehavior::CaptureCompletesLate
             | DeadlineBehavior::CaptureFailsLate
             | DeadlineBehavior::A11yNotReadyLate
-            | DeadlineBehavior::A11yBoundedLate => self.inner.send_pointer(event),
+            | DeadlineBehavior::A11yBoundedLate
+            | DeadlineBehavior::SetValueCallerDeadline
+            | DeadlineBehavior::SetValueBackendDeadline
+            | DeadlineBehavior::SetValueTransportFailure => self.inner.send_pointer(event),
         }
     }
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> GlassResult<()> {
@@ -1241,6 +1280,100 @@ fn set_value_return_not_dispatched_after_actuation_remains_attempted() {
     .unwrap_err();
 
     assert_composed_mutation_was_attempted(err);
+    assert_eq!(*events.lock().unwrap(), vec!["set_value(secret)"]);
+}
+
+#[test]
+fn set_value_caller_deadline_shorter_than_backend_ceiling_is_sequence_deadline_exceeded() {
+    let (mut g, _, _, events) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::SetValueCallerDeadline, vec![]);
+    let error = do_actions(
+        &mut g,
+        &do_args(
+            vec![Action::SetValue(SetValueArgs {
+                id: 1,
+                text: "secret".into(),
+                return_: None,
+            })],
+            200,
+        ),
+    )
+    .unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["error"]["category"], "sequence_deadline_exceeded");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], true);
+    assert!(
+        output_text(&error).contains("re-snapshot")
+            && output_text(&error).contains("rather than writing it again"),
+        "post-write retry guidance was lost at the sequence deadline: {}",
+        output_text(&error)
+    );
+    assert_eq!(*events.lock().unwrap(), vec!["set_value(secret)"]);
+}
+
+#[test]
+fn set_value_backend_ceiling_shorter_than_sequence_is_transport_failure() {
+    let (mut g, _, _, events) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::SetValueBackendDeadline, vec![]);
+    let error = do_actions(
+        &mut g,
+        &do_args(
+            vec![Action::SetValue(SetValueArgs {
+                id: 1,
+                text: "secret".into(),
+                return_: None,
+            })],
+            1_000,
+        ),
+    )
+    .unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(envelope["error"]["code"], "action_failed");
+    assert_eq!(step["error"]["category"], "transport_failure");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], true);
+    assert!(
+        output_text(&error).contains("re-snapshot")
+            && output_text(&error).contains("rather than writing it again"),
+        "post-write retry guidance was lost at the backend ceiling: {}",
+        output_text(&error)
+    );
+    assert_eq!(*events.lock().unwrap(), vec!["set_value(secret)"]);
+}
+
+#[test]
+fn set_value_transport_failure_keeps_post_write_retry_guidance() {
+    let (mut g, _, _, events) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::SetValueTransportFailure, vec![]);
+    let error = do_actions(
+        &mut g,
+        &do_args(
+            vec![Action::SetValue(SetValueArgs {
+                id: 1,
+                text: "secret".into(),
+                return_: None,
+            })],
+            1_000,
+        ),
+    )
+    .unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(step["error"]["category"], "transport_failure");
+    assert_eq!(step["side_effects_may_have_occurred"], true);
+    assert!(
+        output_text(&error).contains("re-snapshot")
+            && output_text(&error).contains("rather than writing it again"),
+        "post-write retry guidance was redacted: {}",
+        output_text(&error)
+    );
     assert_eq!(*events.lock().unwrap(), vec!["set_value(secret)"]);
 }
 

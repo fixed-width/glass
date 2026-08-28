@@ -56,9 +56,10 @@ impl SemanticDeadline {
             (SemanticOperation::SetValue(_), false) => {
                 GlassError::deadline_not_started("native accessibility set_value")
             }
-            (SemanticOperation::SetValue(target), true) => GlassError::AxWriteUnconfirmed(
+            (SemanticOperation::SetValue(target), true) => GlassError::write_unconfirmed_because(
                 target,
-                "the caller deadline elapsed after the native value mutation was dispatched".into(),
+                "the caller deadline elapsed after the native value mutation was dispatched",
+                GlassError::caller_deadline_elapsed("native accessibility set_value"),
             ),
             (SemanticOperation::Invoke, false) => {
                 GlassError::deadline_not_started("native accessibility invoke")
@@ -97,11 +98,10 @@ impl SemanticDeadline {
                 let SemanticOperation::SetValue(target) = self.operation else {
                     unreachable!("guarded by the set_value operation match")
                 };
-                Err(GlassError::AxWriteUnconfirmed(
+                Err(GlassError::write_unconfirmed_because(
                     target,
-                    format!(
-                        "the native value mutation was dispatched but failed before it could be confirmed ({error})"
-                    ),
+                    "the native value mutation was dispatched but failed before it could be confirmed",
+                    error,
                 ))
             }
             result => result,
@@ -231,11 +231,39 @@ mod tests {
             .require_at(now)
             .unwrap_err();
 
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
         assert!(
-            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
+            matches!(error.cause(), GlassError::Bounded { .. }),
             "{error}"
         );
         assert!(error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn a_dispatched_set_value_failure_preserves_its_tool_source() {
+        let error = SemanticDeadline::set_value(Deadline::UNBOUNDED, 7)
+            .after_dispatch()
+            .finish::<()>(Err(GlassError::ToolFailed {
+                call: "AXUIElementSetAttributeValue".into(),
+                said: " transport unavailable \n".into(),
+            }))
+            .expect_err("the native setter failed after dispatch");
+
+        assert!(
+            matches!(error.cause(), GlassError::ToolFailed { .. }),
+            "{error}"
+        );
+        assert_eq!(error.tool_said(), Some("transport unavailable"), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
     }
 
     #[test]
@@ -264,10 +292,8 @@ mod tests {
             )
             .expect_err("confirmation observed at expiry must not report success");
 
-        assert!(
-            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
-            "{error}"
-        );
+        assert!(error.set_value_failed_after_writing(), "{error}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
     }
 
     #[test]
