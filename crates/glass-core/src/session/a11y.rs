@@ -652,11 +652,13 @@ impl Glass {
         let tree = self
             .a11y_resnapshot(deadline)
             .map_err(GlassError::after_dispatch)?;
-        let shows =
-            find_combo_near(&tree.root, target.bounds.as_ref()).and_then(|c| c.name.clone());
-        if shows
-            .as_deref()
-            .is_some_and(|n| n.eq_ignore_ascii_case(want))
+        let (shows, collapsed) = find_combo_near(&tree.root, target.bounds.as_ref())
+            .map(|combo| (combo.name.clone(), !combo.states.expanded))
+            .unwrap_or((None, false));
+        if collapsed
+            && shows
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(want))
         {
             Ok(())
         } else {
@@ -2910,7 +2912,7 @@ mod tests {
     }
 
     #[test]
-    fn combo_key_error_that_may_have_dispatched_requires_a_fresh_snapshot() {
+    fn combo_fresh_expanded_return_retry_rejects_preview_without_reclicking() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let keys = Arc::new(Mutex::new(Vec::new()));
         let platform = ScriptedKeyPlatform {
@@ -2929,9 +2931,14 @@ mod tests {
                 SnapshotReply::Tree(combo("Beta", &[])),
                 SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
                 SnapshotReply::Tree(expanded_combo_with_selected(
-                    "Beta",
+                    "Delta",
                     &["Alpha", "Beta", "Gamma", "Delta"],
-                    "Gamma",
+                    "Delta",
+                )),
+                SnapshotReply::Tree(expanded_combo_with_selected(
+                    "Delta",
+                    &["Alpha", "Beta", "Gamma", "Delta"],
+                    "Delta",
                 )),
                 SnapshotReply::Tree(combo("Delta", &[])),
             ],
@@ -2961,8 +2968,14 @@ mod tests {
         );
 
         g.a11y_resnapshot(Deadline::from_millis(2_000)).unwrap();
-        g.set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
-            .expect("the fresh expanded snapshot should finish the same selection");
+        let error = g
+            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect_err("an expanded preview after Return is not a committed value");
+        assert!(
+            matches!(&error, GlassError::AxValueNotApplied { id: 1, requested, observed, .. }
+                if requested == "Delta" && observed.as_deref() == Some("Delta")),
+            "{error}"
+        );
         assert_eq!(
             clicks.lock().unwrap().len(),
             1,
@@ -2972,14 +2985,29 @@ mod tests {
             &*keys.lock().unwrap(),
             &[
                 KeyEvent::Chord("Down".to_string()),
+                KeyEvent::Chord("Return".to_string()),
+            ]
+        );
+
+        g.set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect("the retained post-Return preview should retry the commit");
+        assert_eq!(
+            clicks.lock().unwrap().len(),
+            1,
+            "retrying the retained preview must not pointer-click again"
+        );
+        assert_eq!(
+            &*keys.lock().unwrap(),
+            &[
                 KeyEvent::Chord("Down".to_string()),
+                KeyEvent::Chord("Return".to_string()),
                 KeyEvent::Chord("Return".to_string()),
             ]
         );
     }
 
     #[test]
-    fn combo_return_refusal_retries_same_option_without_closing_open_popup() {
+    fn combo_retained_return_retry_rejects_preview_without_reclicking() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let keys = Arc::new(Mutex::new(Vec::new()));
         let platform = ScriptedKeyPlatform {
@@ -3001,6 +3029,11 @@ mod tests {
                     &["Alpha", "Beta", "Gamma", "Delta"],
                     "Delta",
                 )),
+                SnapshotReply::Tree(expanded_combo_with_selected(
+                    "Delta",
+                    &["Alpha", "Beta", "Gamma", "Delta"],
+                    "Delta",
+                )),
                 SnapshotReply::Tree(combo("Delta", &[])),
             ],
         );
@@ -3014,8 +3047,14 @@ mod tests {
         assert_eq!(clicks.lock().unwrap().len(), 1);
         assert!(keys.lock().unwrap().is_empty());
 
-        g.set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
-            .expect("the retained expanded snapshot should retry the commit");
+        let error = g
+            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect_err("an expanded preview after Return is not a committed value");
+        assert!(
+            matches!(&error, GlassError::AxValueNotApplied { id: 1, requested, observed, .. }
+                if requested == "Delta" && observed.as_deref() == Some("Delta")),
+            "{error}"
+        );
         assert_eq!(
             clicks.lock().unwrap().len(),
             1,
@@ -3024,6 +3063,21 @@ mod tests {
         assert_eq!(
             &*keys.lock().unwrap(),
             &[KeyEvent::Chord("Return".to_string())]
+        );
+
+        g.set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect("the retained post-Return preview should retry the commit");
+        assert_eq!(
+            clicks.lock().unwrap().len(),
+            1,
+            "retrying the retained preview must not pointer-click again"
+        );
+        assert_eq!(
+            &*keys.lock().unwrap(),
+            &[
+                KeyEvent::Chord("Return".to_string()),
+                KeyEvent::Chord("Return".to_string()),
+            ]
         );
     }
 
