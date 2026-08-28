@@ -41,7 +41,7 @@ pub(crate) struct FakePlatform {
     pointer_deadline_log: Option<InputDeadlineLog>,
     key_deadline_log: Option<InputDeadlineLog>,
     capture_delay: Option<Duration>,
-    capture_honors_deadline: bool,
+    capture_deadline_error_owner: Option<crate::Whose>,
     geometry_delay: Option<Duration>,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
     log_batches: std::collections::VecDeque<Vec<(Stream, String)>>,
@@ -117,7 +117,11 @@ impl FakePlatform {
         self
     }
     pub(crate) fn honoring_capture_deadline(mut self) -> Self {
-        self.capture_honors_deadline = true;
+        self.capture_deadline_error_owner = Some(crate::Whose::Caller);
+        self
+    }
+    pub(crate) fn capture_deadline_error_owned_by(mut self, whose: crate::Whose) -> Self {
+        self.capture_deadline_error_owner = Some(whose);
         self
     }
     pub(crate) fn with_geometry_delay(mut self, delay: Duration) -> Self {
@@ -237,8 +241,18 @@ impl Platform for FakePlatform {
         if let Some(delay) = self.capture_delay {
             std::thread::sleep(delay);
         }
-        if self.capture_honors_deadline && deadline.has_passed() {
-            return Err(GlassError::caller_deadline_elapsed("capture"));
+        if let Some(whose) = self.capture_deadline_error_owner
+            && deadline.has_passed()
+        {
+            return Err(match whose {
+                crate::Whose::Caller => GlassError::caller_deadline_elapsed("capture"),
+                crate::Whose::Callee => GlassError::Bounded {
+                    kind: crate::BoundKind::TimedOut,
+                    whose,
+                    dispatch: crate::BoundDispatch::MayHaveDispatched,
+                    message: "capture: the backend capture budget elapsed".into(),
+                },
+            });
         }
         self.capture_log.lock().unwrap().push(region.copied());
         let frame = match self.frames.pop_front() {

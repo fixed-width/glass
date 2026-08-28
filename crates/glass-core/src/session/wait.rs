@@ -396,7 +396,7 @@ impl Glass {
                         if tracker.is_some()
                             && whose == crate::Whose::Callee
                             && deadline.has_passed()
-                            && error.bound().is_some() =>
+                            && error.bound_owner() == Some(crate::Whose::Caller) =>
                     {
                         return Ok(None);
                     }
@@ -1176,6 +1176,34 @@ mod tests {
 
         assert!(!outcome.settled);
         assert_eq!(outcome.frame, frame);
+        assert_eq!(captures.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn backend_owned_capture_timeout_is_not_softened_by_the_wait_deadline() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])])
+            .with_capture_log(captures.clone())
+            .with_capture_delay(Duration::from_millis(15))
+            .capture_deadline_error_owned_by(crate::Whose::Callee);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 10,
+                settle_frames: 3,
+                tolerance: 0,
+                timeout_ms: 30,
+                stability_region: None,
+                ignore: Vec::new(),
+                window: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Callee));
         assert_eq!(captures.lock().unwrap().len(), 1);
     }
 
