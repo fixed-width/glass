@@ -44,6 +44,13 @@ impl<T> SnapshotRpc<T> {
     }
 }
 
+#[cfg(test)]
+pub(crate) trait IdbSnapshotRpcBoundary: std::fmt::Debug + Send + Sync {
+    fn now(&self) -> Instant;
+    fn describe(&self) -> Result<proto::ScreenDimensions>;
+    fn describe_all(&self) -> Result<String>;
+}
+
 /// Type-state gate kept immediately beside the actual snapshot gRPC invocation.
 pub(crate) struct SnapshotRpcGate {
     op: &'static str,
@@ -131,6 +138,8 @@ pub struct IdbClient {
     /// user replaces the binary as the error advises, that reports a fresh build as evidence
     /// the old one is in the way.
     build_info: Option<String>,
+    #[cfg(test)]
+    snapshot_rpc_boundary: Option<Box<dyn IdbSnapshotRpcBoundary>>,
 }
 
 /// Budget for one `hid` stream. A `HidSwipe`/`HidDelay`/`HidPinch` plays out over
@@ -339,6 +348,8 @@ impl IdbClient {
             client: CompanionServiceClient::new(channel),
             bin: bin.to_path_buf(),
             build_info: build_info.map(str::to_owned),
+            #[cfg(test)]
+            snapshot_rpc_boundary: None,
         })
     }
 
@@ -362,6 +373,17 @@ impl IdbClient {
             client: CompanionServiceClient::new(channel),
             bin: PathBuf::from("/nonexistent/idb_companion"),
             build_info: None,
+            snapshot_rpc_boundary: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_snapshot_test(
+        snapshot_rpc_boundary: Box<dyn IdbSnapshotRpcBoundary>,
+    ) -> IdbClient {
+        IdbClient {
+            snapshot_rpc_boundary: Some(snapshot_rpc_boundary),
+            ..Self::for_test()
         }
     }
 
@@ -380,6 +402,15 @@ impl IdbClient {
         };
         if let Err(error) = self.ensure_off_runtime(op) {
             return SnapshotRpc::before_dispatch(error);
+        }
+        #[cfg(test)]
+        if let Some(boundary) = self.snapshot_rpc_boundary.as_deref() {
+            let dispatched = match gate.dispatch_at(boundary.now()) {
+                Ok(dispatched) => dispatched,
+                Err(error) => return SnapshotRpc::before_dispatch(error),
+            };
+            let result = boundary.describe_all();
+            return dispatched.finish_at(boundary.now(), result);
         }
         let ends = gate.ends;
         let timeout = gate.timeout;
@@ -427,6 +458,15 @@ impl IdbClient {
         };
         if let Err(error) = self.ensure_off_runtime(op) {
             return SnapshotRpc::before_dispatch(error);
+        }
+        #[cfg(test)]
+        if let Some(boundary) = self.snapshot_rpc_boundary.as_deref() {
+            let dispatched = match gate.dispatch_at(boundary.now()) {
+                Ok(dispatched) => dispatched,
+                Err(error) => return SnapshotRpc::before_dispatch(error),
+            };
+            let result = boundary.describe();
+            return dispatched.finish_at(boundary.now(), result);
         }
         let ends = gate.ends;
         let timeout = gate.timeout;

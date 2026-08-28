@@ -107,7 +107,14 @@ impl SemanticPhase {
 
     fn finish_snapshot_rpc<T>(self, deadline: Deadline, rpc: SnapshotRpc<T>) -> Result<(T, Self)> {
         match rpc {
-            SnapshotRpc::BeforeDispatch(error) => Err(error.before_dispatch()),
+            SnapshotRpc::BeforeDispatch(error) => {
+                let error = error.before_dispatch();
+                if matches!(self, Self::Snapshot { dispatched: true }) {
+                    Err(error.after_dispatch())
+                } else {
+                    Err(error)
+                }
+            }
             SnapshotRpc::Dispatched(result) => {
                 let phase = self.after_snapshot_dispatch();
                 let value = phase.finish(deadline, result)?;
@@ -377,7 +384,7 @@ impl Accessibility for IosA11y {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::idb::client::{SnapshotRpc, SnapshotRpcGate};
+    use crate::idb::client::{IdbSnapshotRpcBoundary, SnapshotRpc, SnapshotRpcGate};
     use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -390,6 +397,43 @@ mod tests {
     struct ScriptedClient {
         scale: Mutex<VecDeque<ScaleRpc>>,
         tree: Mutex<VecDeque<TreeRpc>>,
+    }
+
+    #[derive(Debug)]
+    struct ScriptedIdbSnapshotBoundary {
+        observations: Mutex<VecDeque<std::time::Instant>>,
+        scale: Mutex<VecDeque<Result<proto::ScreenDimensions>>>,
+        tree: Mutex<VecDeque<Result<String>>>,
+        scale_called: Arc<AtomicBool>,
+        tree_called: Arc<AtomicBool>,
+    }
+
+    impl IdbSnapshotRpcBoundary for ScriptedIdbSnapshotBoundary {
+        fn now(&self) -> std::time::Instant {
+            self.observations
+                .lock()
+                .expect("snapshot clock lock")
+                .pop_front()
+                .expect("enough snapshot clock observations")
+        }
+
+        fn describe(&self) -> Result<proto::ScreenDimensions> {
+            self.scale_called.store(true, Ordering::SeqCst);
+            self.scale
+                .lock()
+                .expect("scale response lock")
+                .pop_front()
+                .expect("one scripted scale response")
+        }
+
+        fn describe_all(&self) -> Result<String> {
+            self.tree_called.store(true, Ordering::SeqCst);
+            self.tree
+                .lock()
+                .expect("tree response lock")
+                .pop_front()
+                .expect("one scripted tree response")
+        }
     }
 
     impl ScriptedClient {
@@ -510,6 +554,67 @@ mod tests {
         assert_eq!(
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn production_idb_adapter_preserves_a_first_rpc_refusal_as_not_dispatched() {
+        let scale_called = Arc::new(AtomicBool::new(false));
+        let tree_called = Arc::new(AtomicBool::new(false));
+        let expires = std::time::Instant::now() + Duration::from_secs(5);
+        let boundary = ScriptedIdbSnapshotBoundary {
+            observations: Mutex::new(vec![expires].into()),
+            scale: Mutex::new(vec![Ok(dimensions())].into()),
+            tree: Mutex::new(VecDeque::new()),
+            scale_called: Arc::clone(&scale_called),
+            tree_called: Arc::clone(&tree_called),
+        };
+        let mut a11y = IosA11y::new(IdbClient::for_snapshot_test(Box::new(boundary)));
+
+        let error = a11y
+            .snapshot(&ctx(Deadline::at(expires)))
+            .expect_err("the production adapter must preserve the lower pre-dispatch refusal");
+
+        assert!(!scale_called.load(Ordering::SeqCst));
+        assert!(!tree_called.load(Ordering::SeqCst));
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn cold_snapshot_tree_refusal_preserves_its_cause_but_marks_the_scale_dispatch() {
+        let scale_called = Arc::new(AtomicBool::new(false));
+        let tree_called = Arc::new(AtomicBool::new(false));
+        let expires = std::time::Instant::now() + Duration::from_secs(5);
+        let before = expires - Duration::from_millis(1);
+        let boundary = ScriptedIdbSnapshotBoundary {
+            observations: Mutex::new(vec![before, before, expires].into()),
+            scale: Mutex::new(vec![Ok(dimensions())].into()),
+            tree: Mutex::new(vec![Ok("[]".into())].into()),
+            scale_called: Arc::clone(&scale_called),
+            tree_called: Arc::clone(&tree_called),
+        };
+        let mut a11y = IosA11y::new(IdbClient::for_snapshot_test(Box::new(boundary)));
+
+        let error = a11y
+            .snapshot(&ctx(Deadline::at(expires)))
+            .expect_err("the tree RPC gate must refuse after the scale RPC dispatched");
+
+        assert!(scale_called.load(Ordering::SeqCst));
+        assert!(!tree_called.load(Ordering::SeqCst));
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            error.to_string().contains("idb accessibility_info"),
             "{error}"
         );
     }

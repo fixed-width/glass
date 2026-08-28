@@ -75,22 +75,56 @@ const RESOLVE_WINDOW_POLL_MS: u64 = 40;
 const ACCESSIBILITY_REMEDY: &str =
     "enable glass in System Settings > Privacy & Security > Accessibility";
 
-/// The macOS accessibility reader. Zero-sized; a fresh AX read is performed per `snapshot`.
-#[derive(Debug, Default)]
-pub struct MacosA11y;
+trait SnapshotAxBoundary: std::fmt::Debug + Send {
+    fn now(&self) -> Instant;
+    fn accessibility_is_trusted(&self) -> bool;
+}
+
+#[derive(Debug)]
+struct NativeSnapshotAxBoundary;
+
+impl SnapshotAxBoundary for NativeSnapshotAxBoundary {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn accessibility_is_trusted(&self) -> bool {
+        ffi::accessibility_is_trusted()
+    }
+}
+
+/// The macOS accessibility reader. A fresh AX read is performed per `snapshot`.
+#[derive(Debug)]
+pub struct MacosA11y {
+    snapshot_boundary: Box<dyn SnapshotAxBoundary>,
+}
+
+impl Default for MacosA11y {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl MacosA11y {
     pub fn new() -> Self {
-        Self
+        Self {
+            snapshot_boundary: Box::new(NativeSnapshotAxBoundary),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_snapshot_boundary(snapshot_boundary: Box<dyn SnapshotAxBoundary>) -> Self {
+        Self { snapshot_boundary }
     }
 }
 
 impl Accessibility for MacosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        let snapshot_boundary = self.snapshot_boundary.as_ref();
         run_snapshot(
             ctx.deadline,
-            Instant::now,
-            ffi::accessibility_is_trusted,
+            || snapshot_boundary.now(),
+            || snapshot_boundary.accessibility_is_trusted(),
             |trusted, deadline| {
                 require_accessibility_grant(trusted)?;
                 let (window_el, scale) = resolve_window_after_grant(ctx, deadline)?;
@@ -876,6 +910,30 @@ fn gather_states(
 mod tests {
     use super::*;
     use glass_core::{BoundDispatch, BoundKind, Deadline, WalkLimits, Whose};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct ScriptedSnapshotAxBoundary {
+        observations: Mutex<VecDeque<Instant>>,
+        called: Arc<AtomicBool>,
+    }
+
+    impl SnapshotAxBoundary for ScriptedSnapshotAxBoundary {
+        fn now(&self) -> Instant {
+            self.observations
+                .lock()
+                .expect("snapshot clock lock")
+                .pop_front()
+                .expect("enough snapshot clock observations")
+        }
+
+        fn accessibility_is_trusted(&self) -> bool {
+            self.called.store(true, Ordering::SeqCst);
+            true
+        }
+    }
 
     fn context(deadline: Deadline) -> AxContext {
         AxContext {
@@ -1002,6 +1060,30 @@ mod tests {
         assert_eq!(error.bound(), Some(BoundKind::NotStarted));
         assert_eq!(error.bound_owner(), Some(Whose::Caller));
         assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn snapshot_uses_the_injected_first_ax_boundary_and_marks_post_call_expiry_dispatched() {
+        let before = Instant::now();
+        let expires = before + Duration::from_secs(1);
+        let called = Arc::new(AtomicBool::new(false));
+        let boundary = ScriptedSnapshotAxBoundary {
+            observations: Mutex::new(vec![before, expires].into()),
+            called: Arc::clone(&called),
+        };
+        let mut a11y = MacosA11y::with_snapshot_boundary(Box::new(boundary));
+
+        let error = a11y
+            .snapshot(&context(Deadline::at(expires)))
+            .expect_err("expiry after the injected first AX call must stop the snapshot");
+
+        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
     }
 
     #[test]
