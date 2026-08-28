@@ -103,17 +103,20 @@ fn reap_deadline(attempt: Instant) -> Instant {
 /// What a read reports when the caller's deadline, not the device, ended it — naming what the last
 /// attempt saw, where there was one.
 ///
-/// [`GlassError::AccessibilityNotReady`] rather than the timeout adb raised: that is the variant
-/// `wait_for_element` polls through, keeping a spent budget distinguishable from an element that
-/// is genuinely absent (glass#329).
-fn out_of_time(last: Option<&GlassError>) -> GlassError {
+/// The structural caller bound is retained so an outer wait can distinguish a spent sequence
+/// budget from a device failure. `attempted` records whether adb work was dispatched before it.
+fn out_of_time(last: Option<&GlassError>, attempted: bool) -> GlassError {
+    if !attempted {
+        return GlassError::deadline_not_started("Android accessibility snapshot");
+    }
     let seen = match last {
         Some(e) => format!(" (last attempt: {e})"),
         None => String::new(),
     };
-    GlassError::AccessibilityNotReady(format!(
-        "uiautomator served no tree within the time this call allowed{seen}"
-    ))
+    GlassError::caller_deadline_elapsed_with_guidance(
+        "Android accessibility snapshot",
+        &format!("uiautomator served no tree within the time this call allowed{seen}"),
+    )
 }
 
 /// What one dump attempt settled, for a loop deciding whether another would help.
@@ -252,14 +255,16 @@ fn dump_until_ready(
     let mut owed = bound.least.max(1);
     // Kept so a spent caller deadline can name what the device last said, not just the budget.
     let mut unready: Option<GlassError> = None;
+    let mut attempted = false;
     loop {
         // Answered here rather than through the cap below: the runner seam does not promise a
         // spent deadline is refused, and a read that never happened should not have to be
         // inferred from the error it returns.
         if caller.has_passed() {
-            return Err(out_of_time(unready.as_ref()));
+            return Err(out_of_time(unready.as_ref(), attempted));
         }
         let (ends, whose) = caller.resolve(attempt_deadline());
+        attempted = true;
         match dump_once(run, prefix, ends) {
             Attempt::Dumped(xml) => return Ok(xml),
             // An attempt the *caller's* deadline cut short is not a device that failed.
@@ -268,7 +273,7 @@ fn dump_until_ready(
             // here too — it cannot be told apart from a slow one at the moment the budget ends —
             // and its message is the only place glass names the `adb kill-server` remedy.
             Attempt::Fatal(e) if whose == Whose::Caller && bound_fired(&e) => {
-                return Err(out_of_time(Some(&e)));
+                return Err(out_of_time(Some(&e), attempted));
             }
             Attempt::Fatal(e) => return Err(e),
             Attempt::NotReady(e) => {
@@ -278,7 +283,7 @@ fn dump_until_ready(
                     // The caller closing the window is about the budget, not the device — even
                     // with the device's own answer in hand.
                     return Err(if caller.has_passed() {
-                        out_of_time(Some(&e))
+                        out_of_time(Some(&e), attempted)
                     } else {
                         e
                     });
@@ -675,7 +680,6 @@ mod tests {
     use glass_core::accessibility::{
         AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree, WalkLimits,
     };
-    #[cfg(unix)]
     use glass_core::{BoundDispatch, Whose};
     use glass_core::{BoundKind, GlassError, Result, WindowGeometry};
     use std::collections::HashMap;
@@ -972,7 +976,13 @@ mod tests {
             !ran,
             "an adb step ran for a caller that had stopped waiting"
         );
-        assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
+        assert_eq!(e.bound(), Some(BoundKind::NotStarted), "{e}");
+        assert_eq!(e.bound_owner(), Some(Whose::Caller), "{e}");
+        assert_eq!(
+            e.bound_dispatch(),
+            Some(BoundDispatch::NotDispatched),
+            "{e}"
+        );
     }
 
     /// glass#338: before the deadline reached the reader, one attempt was the only safe number —
@@ -1032,7 +1042,13 @@ mod tests {
         )
         .expect_err("the caller's deadline passed during the attempt");
 
-        assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
+        assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
+        assert_eq!(e.bound_owner(), Some(Whose::Caller), "{e}");
+        assert_eq!(
+            e.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{e}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "slept a retry interval for a caller that had stopped waiting: {:?}",
@@ -1326,6 +1342,13 @@ mod tests {
         .expect_err("the caller's deadline passed during the first attempt");
 
         assert_eq!(dumps, 1, "the owed attempt ran for a caller that had gone");
+        assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
+        assert_eq!(e.bound_owner(), Some(Whose::Caller), "{e}");
+        assert_eq!(
+            e.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{e}"
+        );
         assert!(
             e.to_string().contains("null root node"),
             "the spent-budget error dropped what the device had said: {e}"
@@ -1349,7 +1372,13 @@ mod tests {
             Deadline::from_millis(20),
         )
         .expect_err("the attempt was abandoned");
-        assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
+        assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
+        assert_eq!(e.bound_owner(), Some(Whose::Caller), "{e}");
+        assert_eq!(
+            e.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{e}"
+        );
         // A wedged adb reaches this arm too, and its message is the only place glass names the
         // `adb kill-server` remedy — dropping it leaves an operator reading "the app is slow".
         assert!(

@@ -483,6 +483,7 @@ impl Glass {
         // `deadline` gives up on the tick that ends the wait, so without this every unmatched wait
         // on such a backend failed instead of answering `{matched:false}` (glass#338).
         let mut unread: Option<GlassError> = None;
+        let mut unread_owned_by_caller = false;
         let mut saw_a_tree = false;
         // `poll_until_with_pause` guarantees one tick. For `timeout_ms: 0` ("check now"), that
         // immediate read uses the live sequence deadline rather than the already-spent action
@@ -537,6 +538,8 @@ impl Glass {
                     }
                     // Kept so a spent budget can report this instead of "not found" (glass#329).
                     Err(e @ GlassError::AccessibilityNotReady(_)) => {
+                        unread_owned_by_caller =
+                            bound == sequence_deadline || whose == crate::Whose::Caller;
                         unread = Some(e);
                         return Ok(None);
                     }
@@ -563,6 +566,12 @@ impl Glass {
             && !saw_a_tree
             && let Some(e) = unread
         {
+            if unread_owned_by_caller && sequence_deadline.has_passed() {
+                return Err(GlassError::caller_deadline_elapsed_with_guidance(
+                    "accessibility wait",
+                    &e.to_string(),
+                ));
+            }
             return Err(e);
         }
         let matched = outcome.value.is_some();
@@ -703,7 +712,7 @@ impl Glass {
                     return Ok(outcome(false, None, steps, reversed, None));
                 }
                 let (dx, dy) = dir.delta(params.step);
-                self.pointer_by(
+                let scroll = self.pointer_by(
                     &PointerEvent::Scroll {
                         x: ax,
                         y: ay,
@@ -712,7 +721,12 @@ impl Glass {
                         modifiers: vec![],
                     },
                     action_deadline,
-                )?;
+                );
+                if steps > 0 {
+                    scroll.map_err(GlassError::after_dispatch)?;
+                } else {
+                    scroll?;
+                }
                 steps += 1;
                 // Let the scrolled rows/columns realize in the a11y tree before re-reading.
                 let settle = std::time::Duration::from_millis(SCROLL_TO_SETTLE_MS);
@@ -720,8 +734,9 @@ impl Glass {
                 if action_deadline.has_passed() {
                     return Ok(outcome(false, None, steps, reversed, Some(whose)));
                 }
-                let Some((found, outline)) =
-                    self.snapshot_match_outline(params, action_deadline)?
+                let Some((found, outline)) = self
+                    .snapshot_match_outline(params, action_deadline)
+                    .map_err(GlassError::after_dispatch)?
                 else {
                     return Ok(outcome(false, None, steps, reversed, Some(whose)));
                 };
@@ -1691,6 +1706,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_wait_with_no_tree_keeps_the_sequence_deadline_as_structural_owner() {
+        struct LateNotReady;
+
+        impl Accessibility for LateNotReady {
+            fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+                let left = ctx
+                    .deadline
+                    .remaining()
+                    .expect("the sequence test passes a bounded read deadline");
+                std::thread::sleep(left.saturating_add(Duration::from_millis(5)));
+                Err(GlassError::AccessibilityNotReady(
+                    "the app still has no tree".into(),
+                ))
+            }
+        }
+
+        let mut g = glass_with_backend(FakePlatform::new(100, 100), Box::new(LateNotReady));
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_for_element_by(&never_matches(0, 1_000), Deadline::from_millis(30))
+            .expect_err("the sequence deadline ended a wait that never obtained a tree");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert!(error.to_string().contains("still has no tree"), "{error}");
+    }
+
     /// A wait looks once however little time it was given: `poll_until_with_pause` guarantees one
     /// tick, and `timeout_ms: 0` means "check now" — answering for a device nobody consulted is
     /// the one outcome worse than answering late.
@@ -2387,6 +2436,67 @@ mod tests {
         assert_eq!(
             recorded_pointer_deadlines.lock().unwrap().as_slice(),
             &[sequence_deadline]
+        );
+    }
+
+    #[test]
+    fn scroll_resnapshot_refusal_after_a_step_upgrades_not_dispatched() {
+        struct OneTreeThenNotStarted {
+            first: Option<AxTree>,
+        }
+
+        impl Accessibility for OneTreeThenNotStarted {
+            fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+                match self.first.take() {
+                    Some(tree) => Ok(tree),
+                    None => Err(GlassError::deadline_not_started(
+                        "scripted post-scroll accessibility read",
+                    )),
+                }
+            }
+        }
+
+        let scrolls = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_scroll_log(scrolls.clone());
+        let mut g = glass_with_backend(
+            platform,
+            Box::new(OneTreeThenNotStarted {
+                first: Some(tree_with(100, 100, vec![])),
+            }),
+        );
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .scroll_to_element_by(
+                &ScrollToElementParams {
+                    name: Some("Ghost".into()),
+                    description: None,
+                    role: None,
+                    value_contains: None,
+                    direction: Some(ScrollDirection::Down),
+                    anchor: None,
+                    step: SCROLL_TO_DEFAULT_STEP,
+                    timeout_ms: 1_000,
+                },
+                Deadline::from_millis(1_000),
+            )
+            .expect_err("the post-scroll read is scripted to fail");
+
+        assert_eq!(error.bound(), Some(BoundKind::NotStarted), "{error}");
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert_eq!(
+            scrolls.lock().unwrap().len(),
+            1,
+            "one scroll was dispatched"
+        );
+        assert!(
+            error.to_string().contains("post-scroll accessibility read"),
+            "{error}"
         );
     }
 

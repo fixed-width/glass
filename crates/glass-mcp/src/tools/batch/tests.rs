@@ -15,9 +15,12 @@ enum DeadlineBehavior {
     Normal,
     CompleteLate,
     FailLate,
+    OrdinaryFailLate,
     NotDispatched,
     ReturnNotDispatched,
     CaptureCompletesLate,
+    CaptureFailsLate,
+    A11yNotReadyLate,
     NoActiveSession,
     MissingElement,
     StaleElement,
@@ -134,11 +137,20 @@ struct DeadlineAccessibility {
     tree: AxTree,
     deadlines: Arc<Mutex<Vec<Deadline>>>,
     events: Arc<Mutex<Vec<String>>>,
+    behavior: DeadlineBehavior,
 }
 
 impl Accessibility for DeadlineAccessibility {
     fn snapshot(&mut self, context: &AxContext) -> GlassResult<AxTree> {
         self.deadlines.lock().unwrap().push(context.deadline);
+        if matches!(self.behavior, DeadlineBehavior::A11yNotReadyLate)
+            && context.deadline != Deadline::UNBOUNDED
+        {
+            sleep_past(context.deadline);
+            return Err(GlassError::AccessibilityNotReady(
+                "the accessibility tree stayed unavailable".into(),
+            ));
+        }
         Ok(self.tree.clone())
     }
 
@@ -182,6 +194,12 @@ impl Platform for DeadlinePlatform {
             sleep_past(deadline);
             return self.inner.capture_frame(region);
         }
+        if matches!(self.behavior, DeadlineBehavior::CaptureFailsLate) {
+            sleep_past(deadline);
+            return Err(GlassError::CaptureFailed(
+                "ordinary late capture failure".into(),
+            ));
+        }
         if matches!(self.behavior, DeadlineBehavior::ReturnNotDispatched) {
             return Err(GlassError::deadline_not_started(
                 "controlled return observation",
@@ -192,17 +210,21 @@ impl Platform for DeadlinePlatform {
 
     fn capture_window_by(
         &mut self,
-        _id: WindowId,
-        _region: Option<&Region>,
+        id: WindowId,
+        region: Option<&Region>,
         deadline: Deadline,
     ) -> GlassResult<Frame> {
         self.deadlines.lock().unwrap().push(deadline);
-        if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("window capture"));
+        if matches!(self.behavior, DeadlineBehavior::CaptureCompletesLate) {
+            sleep_past(deadline);
+            return self.inner.capture_window(id, region);
         }
-        Err(GlassError::Unsupported(
-            "capture_window is not supported by this backend".into(),
-        ))
+        if matches!(self.behavior, DeadlineBehavior::ReturnNotDispatched) {
+            return Err(GlassError::deadline_not_started(
+                "controlled return observation",
+            ));
+        }
+        self.inner.capture_window_by(id, region, deadline)
     }
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> GlassResult<()> {
@@ -217,6 +239,11 @@ impl Platform for DeadlinePlatform {
                 self.inner.send_pointer(event)?;
                 std::thread::sleep(Duration::from_millis(3));
                 Err(GlassError::caller_deadline_elapsed("controlled pointer"))
+            }
+            DeadlineBehavior::OrdinaryFailLate => {
+                self.inner.send_pointer(event)?;
+                sleep_past(deadline);
+                Err(GlassError::Backend("ordinary late pointer failure".into()))
             }
             DeadlineBehavior::NotDispatched => {
                 Err(GlassError::deadline_not_started("controlled pointer"))
@@ -234,9 +261,10 @@ impl Platform for DeadlinePlatform {
                 Err(GlassError::Backend("transport disconnected".into()))
             }
             DeadlineBehavior::OtherFailure => Err(GlassError::InvalidKey("bad".into())),
-            DeadlineBehavior::ReturnNotDispatched | DeadlineBehavior::CaptureCompletesLate => {
-                self.inner.send_pointer(event)
-            }
+            DeadlineBehavior::ReturnNotDispatched
+            | DeadlineBehavior::CaptureCompletesLate
+            | DeadlineBehavior::CaptureFailsLate
+            | DeadlineBehavior::A11yNotReadyLate => self.inner.send_pointer(event),
         }
     }
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> GlassResult<()> {
@@ -260,9 +288,14 @@ impl Platform for DeadlinePlatform {
 fn deadline_glass(behavior: DeadlineBehavior, frames: Vec<Frame>) -> DeadlineFixture {
     let deadlines = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
+    let window_frame = frames
+        .last()
+        .cloned()
+        .unwrap_or_else(|| Frame::solid(100, 100, [0, 0, 0, 255]));
     let platform = DeadlinePlatform {
         inner: FakePlatform::new(100, 100)
             .with_frames(frames)
+            .with_window_frame(WindowId(7), window_frame)
             .with_event_log(events.clone()),
         deadlines: deadlines.clone(),
         behavior,
@@ -325,6 +358,7 @@ fn deadline_a11y_glass_with_behavior(
             tree: fake_tree(),
             deadlines: accessibility_deadlines.clone(),
             events: events.clone(),
+            behavior,
         })),
     });
     let factory: PlatformFactory = Box::new(move |_| {
@@ -789,6 +823,82 @@ fn late_action_is_failed_and_later_actions_are_unexecuted() {
     assert_eq!(envelope["outcome"]["steps"][1]["status"], "unexecuted");
     assert_eq!(envelope["outcome"]["steps"][2]["status"], "unexecuted");
     assert_eq!(*events.lock().unwrap(), vec!["click(1,1)"]);
+}
+
+#[test]
+fn ordinary_action_error_returned_after_deadline_is_sequence_deadline_exceeded() {
+    let (mut g, _, events) = deadline_glass(DeadlineBehavior::OrdinaryFailLate, vec![]);
+    let error = do_actions(&mut g, &do_args(vec![click(1, 1)], 1)).unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["error"]["category"], "sequence_deadline_exceeded");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], true);
+    assert!(
+        output_text(&error).contains("ordinary late pointer failure"),
+        "the safe backend detail was discarded: {}",
+        output_text(&error)
+    );
+    assert_eq!(*events.lock().unwrap(), vec!["click(1,1)"]);
+}
+
+#[test]
+fn ordinary_terminal_error_returned_after_deadline_is_sequence_deadline_exceeded() {
+    let (mut g, _, events) = deadline_glass(DeadlineBehavior::CaptureFailsLate, vec![]);
+    let args = DoArgs {
+        actions: vec![click(1, 1)],
+        then: Some(ThenArgs {
+            settle: None,
+            diff: None,
+            screenshot: Some(ScreenshotArgs {
+                region: None,
+                window_id: None,
+            }),
+        }),
+        timeout_ms: Some(20),
+        encoded_argument_bytes: 0,
+    };
+
+    let error = do_actions(&mut g, &args).unwrap_err();
+    let envelope = envelope(&error);
+    let terminal = &envelope["outcome"]["terminal_steps"][0];
+
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(envelope["outcome"]["steps"][0]["status"], "completed");
+    assert_eq!(terminal["status"], "failed");
+    assert_eq!(terminal["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(terminal["error"]["category"], "sequence_deadline_exceeded");
+    assert!(
+        output_text(&error).contains("ordinary late capture failure"),
+        "the safe terminal detail was discarded: {}",
+        output_text(&error)
+    );
+    assert_eq!(*events.lock().unwrap(), vec!["click(1,1)"]);
+}
+
+#[test]
+fn wait_with_no_tree_when_sequence_deadline_wins_is_not_action_failed() {
+    let (mut g, _, _, _) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::A11yNotReadyLate, vec![]);
+    let wait: WaitForElementArgs =
+        serde_json::from_str(r#"{"name":"Missing","timeout_ms":1000,"interval_ms":0}"#).unwrap();
+
+    let error = do_actions(&mut g, &do_args(vec![Action::WaitForElement(wait)], 20)).unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], false);
+    assert!(
+        output_text(&error).contains("accessibility tree stayed unavailable"),
+        "the readiness detail was discarded: {}",
+        output_text(&error)
+    );
 }
 
 #[test]
@@ -1278,6 +1388,105 @@ fn invalid_sequence_rejects_empty_actions_before_actuation() {
         .unwrap_err(),
     );
     assert!(err.contains("at least one"), "got: {err}");
+}
+
+#[test]
+fn mutating_action_validation_failures_are_proven_not_dispatched() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut g = started(FakePlatform::new(100, 100).with_event_log(events.clone()));
+    let cases = vec![
+        (
+            "click button",
+            Action::Click(ClickArgs {
+                x: 1,
+                y: 1,
+                button: Some("invalid".into()),
+                count: None,
+                modifiers: None,
+            }),
+        ),
+        (
+            "click modifier",
+            Action::Click(ClickArgs {
+                x: 1,
+                y: 1,
+                button: None,
+                count: None,
+                modifiers: Some(vec!["invalid".into()]),
+            }),
+        ),
+        (
+            "drag button",
+            Action::Drag(DragArgs {
+                x1: 1,
+                y1: 1,
+                x2: 2,
+                y2: 2,
+                button: Some("invalid".into()),
+                modifiers: None,
+                duration_ms: None,
+            }),
+        ),
+        (
+            "drag modifier",
+            Action::Drag(DragArgs {
+                x1: 1,
+                y1: 1,
+                x2: 2,
+                y2: 2,
+                button: None,
+                modifiers: Some(vec!["invalid".into()]),
+                duration_ms: None,
+            }),
+        ),
+        (
+            "scroll modifier",
+            Action::Scroll(ScrollArgs {
+                x: 1,
+                y: 1,
+                dx: None,
+                dy: Some(1),
+                modifiers: Some(vec!["invalid".into()]),
+            }),
+        ),
+        (
+            "type return",
+            Action::Type(TypeArgs {
+                text: "secret".into(),
+                return_: Some("invalid".into()),
+            }),
+        ),
+        (
+            "click_element return",
+            Action::ClickElement(ClickElementArgs {
+                id: 1,
+                return_: Some("invalid".into()),
+            }),
+        ),
+        (
+            "set_value return",
+            Action::SetValue(SetValueArgs {
+                id: 1,
+                text: "secret".into(),
+                return_: Some("invalid".into()),
+            }),
+        ),
+    ];
+
+    for (case, action) in cases {
+        let error = do_actions(&mut g, &do_args(vec![action], 1_000)).unwrap_err();
+        let envelope = envelope(&error);
+        let step = &envelope["outcome"]["steps"][0];
+        assert_eq!(step["attempted"], false, "{case}: {envelope}");
+        assert_eq!(
+            step["side_effects_may_have_occurred"], false,
+            "{case}: {envelope}"
+        );
+    }
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "validation actuated the app"
+    );
 }
 
 #[test]
@@ -2304,6 +2513,45 @@ fn delayed_final_screenshot_is_not_reported_completed() {
     let envelope = envelope(&output);
     assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
     assert_eq!(envelope["outcome"]["terminal_steps"][0]["status"], "failed");
+}
+
+#[test]
+fn terminal_window_screenshot_uses_sequence_deadline_and_rejects_late_success() {
+    let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
+    let (mut g, deadlines, events) =
+        deadline_glass(DeadlineBehavior::CaptureCompletesLate, vec![frame]);
+
+    let err = do_actions(
+        &mut g,
+        &DoArgs {
+            actions: vec![click(0, 0)],
+            then: Some(ThenArgs {
+                settle: None,
+                diff: None,
+                screenshot: Some(ScreenshotArgs {
+                    region: None,
+                    window_id: Some(7),
+                }),
+            }),
+            timeout_ms: Some(20),
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(envelope["outcome"]["executed"], 1);
+    assert_eq!(envelope["outcome"]["terminal_steps"][0]["status"], "failed");
+    assert_eq!(*events.lock().unwrap(), vec!["click(0,0)"]);
+    let seen = deadlines.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        2,
+        "one action plus one terminal capture: {seen:?}"
+    );
+    assert_ne!(seen[0], Deadline::UNBOUNDED);
+    assert_eq!(seen[1], seen[0]);
 }
 
 #[test]

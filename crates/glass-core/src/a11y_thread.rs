@@ -92,7 +92,9 @@ impl A11yThread {
         job: impl FnOnce() -> Result<T> + Send + 'static,
     ) -> Result<T> {
         if deadline.has_passed() {
-            return Err(self.never_answered(Whose::Caller));
+            return Err(GlassError::deadline_not_started(
+                "native accessibility snapshot",
+            ));
         }
         let (wait, ended_by) = self.bounded_wait(deadline);
         self.detached(Op::Snapshot, wait, job, || self.never_answered(ended_by))
@@ -142,13 +144,13 @@ impl A11yThread {
         })
     }
 
-    /// The verdict for a read that never answered. The caller's own deadline ending it is
-    /// `AccessibilityNotReady`, which [`crate::Glass::wait_for_element`] polls through, where the
-    /// backend going quiet for a whole ceiling is not.
+    /// The verdict for a read that never answered. A caller-owned bound remains structural so the
+    /// caller can distinguish its spent sequence budget from a backend that went quiet.
     fn never_answered(&self, ended_by: Whose) -> GlassError {
         match ended_by {
-            Whose::Caller => GlassError::AccessibilityNotReady(
-                "no accessibility tree within the time this call allowed".into(),
+            Whose::Caller => GlassError::caller_deadline_elapsed_with_guidance(
+                "native accessibility snapshot",
+                "no accessibility tree became available within the time this call allowed",
             ),
             Whose::Callee => self.timed_out(Op::Snapshot),
         }
@@ -259,15 +261,20 @@ mod tests {
         assert_eq!(ended_by, Whose::Callee);
     }
 
-    /// The variant decides whether a wait polls on or fails, so the two causes must not collapse:
-    /// a backend that went quiet for the whole ceiling is a real fault, and a caller that ran out
-    /// of its own time is not.
+    /// The structural owner decides whether a wait polls on or fails, so the two causes must not
+    /// collapse: a backend that went quiet for the whole ceiling is a real fault, and a caller that
+    /// ran out of its own time is not.
     #[test]
-    fn a_read_the_caller_cut_short_reads_as_not_ready_where_a_quiet_backend_does_not() {
-        assert!(matches!(
-            reader().never_answered(Whose::Caller),
-            GlassError::AccessibilityNotReady(_)
-        ));
+    fn a_read_the_caller_cut_short_keeps_the_caller_as_its_structural_owner() {
+        let caller = reader().never_answered(Whose::Caller);
+        assert_eq!(caller.bound(), Some(crate::BoundKind::TimedOut), "{caller}");
+        assert_eq!(caller.bound_owner(), Some(Whose::Caller), "{caller}");
+        assert_eq!(
+            caller.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{caller}"
+        );
+
         assert!(matches!(
             reader().never_answered(Whose::Callee),
             GlassError::AccessibilityUnavailable(_)
@@ -291,9 +298,13 @@ mod tests {
             let _ = started.send(());
             Ok(())
         });
-        assert!(
-            matches!(r, Err(GlassError::AccessibilityNotReady(_))),
-            "{r:?}"
+        let error = r.expect_err("a spent deadline must be refused");
+        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted), "{error}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::NotDispatched),
+            "{error}"
         );
         assert!(
             matches!(ran.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
@@ -361,10 +372,15 @@ mod tests {
     #[test]
     fn a_read_the_caller_ran_out_of_time_for_blames_the_caller_not_the_backend() {
         // A live deadline well inside the ceiling, against a job that will not answer within it.
-        let r: Result<()> = reader().snapshot(Deadline::from_millis(30), hangs());
-        assert!(
-            matches!(r, Err(GlassError::AccessibilityNotReady(_))),
-            "{r:?}"
+        let error = reader()
+            .snapshot(Deadline::from_millis(30), hangs())
+            .expect_err("the caller's deadline must end the read");
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut), "{error}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
         );
     }
 

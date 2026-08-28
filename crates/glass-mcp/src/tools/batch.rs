@@ -192,6 +192,11 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 });
             }
             Err(error) => {
+                let error = if context.deadline.has_passed() {
+                    error.after_sequence_deadline()
+                } else {
+                    error
+                };
                 let detail = redacted_error_detail(action, &error);
                 let attempted =
                     error.bound_dispatch != Some(glass_core::BoundDispatch::NotDispatched);
@@ -498,6 +503,11 @@ fn run_then(
                     return Err(run);
                 }
                 Err(error) => {
+                    let error = if context.deadline.has_passed() {
+                        error.after_sequence_deadline()
+                    } else {
+                        error
+                    };
                     run.sequence_deadline_exceeded = error.sequence_deadline_exceeded;
                     let code = if error.sequence_deadline_exceeded { "sequence_deadline_exceeded" } else { "action_failed" };
                     let summary = if error.sequence_deadline_exceeded { "sequence deadline exceeded" } else { "terminal observation failed" };

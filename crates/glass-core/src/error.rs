@@ -299,8 +299,8 @@ impl GlassError {
         Self::caller_deadline_elapsed_with_guidance(op, "")
     }
 
-    /// A caller-owned timeout for a detached mutation whose effect may still arrive.
-    pub(crate) fn caller_deadline_elapsed_with_guidance(op: &str, guidance: &str) -> Self {
+    /// A caller-owned timeout for dispatched work whose answer or effect may still arrive.
+    pub fn caller_deadline_elapsed_with_guidance(op: &str, guidance: &str) -> Self {
         let guidance = if guidance.is_empty() {
             String::new()
         } else {
@@ -334,17 +334,17 @@ impl GlassError {
         )
     }
 
-    /// Whether a failed value-write is **proven** to have gone out before failing — the only case
-    /// where the session's captured value is stale and must be dropped. True for two post-dispatch
-    /// verdicts: [`GlassError::AxValueNotApplied`] and [`GlassError::AxWriteUnconfirmed`], both
-    /// raised only after a write was dispatched; false for everything else, including variants
-    /// added later.
+    /// Whether a failed value-write is **proven** to have gone out or may have gone out before
+    /// failing — the only cases where the session's captured value is stale and must be dropped.
+    /// True for two post-dispatch verdicts, [`GlassError::AxValueNotApplied`] and
+    /// [`GlassError::AxWriteUnconfirmed`], and for a bounded failure that records
+    /// [`BoundDispatch::MayHaveDispatched`].
     ///
-    /// Same "did anything dispatch?" question as [`Self::invoke_fallback_eligible`], but decided by
-    /// an allowlist, because the two mistakes are not symmetric. Keeping the value can only make
-    /// the guard reject more — an `AxElementChanged` whose own message tells the caller to
-    /// re-snapshot, recoverable. Dropping it can only make the guard accept more, and what it then
-    /// accepts is a write onto the wrong element, reported as `Ok`.
+    /// Same "did anything dispatch?" question as [`Self::invoke_fallback_eligible`], but ordinary
+    /// errors are decided by an allowlist because the two mistakes are not symmetric. Keeping the
+    /// value can only make the guard reject more — an `AxElementChanged` whose own message tells
+    /// the caller to re-snapshot, recoverable. Dropping it can only make the guard accept more, and
+    /// what it then accepts is a write onto the wrong element, reported as `Ok`.
     ///
     /// Some verdicts cannot be classified at all: Android raises `ToolFailed`, `Bounded` and
     /// `AccessibilityUnavailable` on *both* sides of the dispatch — its pre-write re-snapshot and
@@ -354,7 +354,29 @@ impl GlassError {
         matches!(
             self,
             GlassError::AxValueNotApplied { .. } | GlassError::AxWriteUnconfirmed(..)
-        )
+        ) || self.bound_dispatch() == Some(BoundDispatch::MayHaveDispatched)
+    }
+
+    /// Preserve a compound operation's dispatch history on a later bounded refusal.
+    ///
+    /// Once an earlier mutation succeeded, a later `NotDispatched` sub-operation no longer proves
+    /// the compound operation was side-effect free. Its bound and owner still describe the failed
+    /// sub-operation, so only the dispatch verdict is upgraded.
+    pub(crate) fn after_dispatch(self) -> Self {
+        match self {
+            GlassError::Bounded {
+                kind,
+                whose,
+                dispatch: BoundDispatch::NotDispatched,
+                message,
+            } => GlassError::Bounded {
+                kind,
+                whose,
+                dispatch: BoundDispatch::MayHaveDispatched,
+                message,
+            },
+            error => error,
+        }
     }
 
     /// The verdict for a write that dispatched and whose read-back does not hold the request.
@@ -769,11 +791,20 @@ mod tests {
     }
 
     #[test]
-    fn only_a_proven_post_dispatch_verdict_invalidates_the_captured_value() {
+    fn a_post_dispatch_verdict_or_bound_invalidates_the_captured_value() {
         // The read-back verdict is reached only after the write went out.
         assert!(
             GlassError::value_not_applied(3, "world", Some("hello"))
                 .set_value_failed_after_writing()
+        );
+        assert!(
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                whose: Whose::Caller,
+                dispatch: BoundDispatch::MayHaveDispatched,
+                message: "the write may have gone out".into(),
+            }
+            .set_value_failed_after_writing()
         );
         // Everything else keeps the captured value: the pre-dispatch rejections, the transport
         // errors raised on either side of the dispatch, and any variant not named (the wildcard).
@@ -790,8 +821,8 @@ mod tests {
             GlassError::Bounded {
                 kind: BoundKind::TimedOut,
                 whose: Whose::Callee,
-                dispatch: BoundDispatch::MayHaveDispatched,
-                message: "adb:uiautomator dump: no answer within 20s".into(),
+                dispatch: BoundDispatch::NotDispatched,
+                message: "the write was refused before dispatch".into(),
             },
             GlassError::ToolFailed {
                 call: "adb shell uiautomator dump /sdcard/x.xml".into(),

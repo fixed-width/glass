@@ -475,7 +475,9 @@ impl Glass {
                 if verify_deadline.has_passed() {
                     break;
                 }
-                let tree = self.a11y_resnapshot(verify_deadline)?;
+                let tree = self
+                    .a11y_resnapshot(verify_deadline)
+                    .map_err(GlassError::after_dispatch)?;
                 if verify_deadline.has_passed() {
                     break;
                 }
@@ -565,10 +567,13 @@ impl Glass {
                     native_fallback: COMBO_OPEN_POINTER_REASON.into(),
                 })
         })?;
-        self.settle_for_popup(deadline)?;
+        self.settle_for_popup(deadline)
+            .map_err(GlassError::after_dispatch)?;
         // Ids don't survive a re-snapshot, so match the open (`expanded`) combo, else the one
         // nearest the target's bounds.
-        let tree = self.a11y_resnapshot(deadline)?;
+        let tree = self
+            .a11y_resnapshot(deadline)
+            .map_err(GlassError::after_dispatch)?;
         let combo = find_expanded_combo(&tree.root)
             .or_else(|| find_combo_near(&tree.root, target.bounds.as_ref()))
             .ok_or(GlassError::AxElementChanged(id.0))?;
@@ -602,13 +607,18 @@ impl Glass {
         // the chord is never sent — not observable either way.
         let chord = if delta.is_negative() { "Up" } else { "Down" };
         for _ in 0..delta.unsigned_abs() {
-            self.semantic_key_by(&KeyEvent::Chord(chord.to_string()), deadline)?;
+            self.semantic_key_by(&KeyEvent::Chord(chord.to_string()), deadline)
+                .map_err(GlassError::after_dispatch)?;
         }
-        self.semantic_key_by(&KeyEvent::Chord("Return".to_string()), deadline)?;
-        self.settle_for_popup(deadline)?;
+        self.semantic_key_by(&KeyEvent::Chord("Return".to_string()), deadline)
+            .map_err(GlassError::after_dispatch)?;
+        self.settle_for_popup(deadline)
+            .map_err(GlassError::after_dispatch)?;
         // Verify the model actually committed — the *target* combo (matched by bounds,
         // now closed so nothing is `expanded`) must read the wanted label.
-        let tree = self.a11y_resnapshot(deadline)?;
+        let tree = self
+            .a11y_resnapshot(deadline)
+            .map_err(GlassError::after_dispatch)?;
         let shows =
             find_combo_near(&tree.root, target.bounds.as_ref()).and_then(|c| c.name.clone());
         if shows
@@ -2520,6 +2530,136 @@ mod tests {
         tree_with(340, 300, vec![combo])
     }
 
+    enum SnapshotReply {
+        Tree(AxTree),
+        NotStarted(&'static str),
+        SleepPastDeadline(AxTree),
+    }
+
+    struct ScriptedSnapshots {
+        replies: VecDeque<SnapshotReply>,
+    }
+
+    impl Accessibility for ScriptedSnapshots {
+        fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+            match self
+                .replies
+                .pop_front()
+                .expect("scripted accessibility snapshot exhausted")
+            {
+                SnapshotReply::Tree(tree) => Ok(tree),
+                SnapshotReply::NotStarted(operation) => {
+                    Err(GlassError::deadline_not_started(operation))
+                }
+                SnapshotReply::SleepPastDeadline(tree) => {
+                    let left = ctx
+                        .deadline
+                        .remaining()
+                        .expect("sleep-past reply requires a bounded deadline");
+                    std::thread::sleep(left.saturating_add(Duration::from_millis(5)));
+                    Ok(tree)
+                }
+            }
+        }
+    }
+
+    fn glass_with_scripted_snapshots(platform: FakePlatform, replies: Vec<SnapshotReply>) -> Glass {
+        glass_with_backend(
+            platform,
+            Box::new(ScriptedSnapshots {
+                replies: replies.into(),
+            }),
+        )
+    }
+
+    fn assert_not_started_was_upgraded_after_dispatch(error: &GlassError) {
+        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted), "{error}");
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn combo_post_open_read_upgrades_not_dispatched_without_losing_bound_provenance() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300).with_click_log(clicks.clone());
+        let mut g = glass_with_scripted_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(combo("Beta", &[])),
+                SnapshotReply::NotStarted("scripted combo open read"),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect_err("the post-open read is scripted to fail");
+
+        assert_not_started_was_upgraded_after_dispatch(&error);
+        assert_eq!(clicks.lock().unwrap().len(), 1, "the combo was opened");
+    }
+
+    #[test]
+    fn combo_key_refusal_after_open_upgrades_not_dispatched() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300)
+            .with_click_log(clicks.clone())
+            .with_key_log(keys.clone());
+        let mut g = glass_with_scripted_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(combo("Beta", &[])),
+                SnapshotReply::SleepPastDeadline(combo(
+                    "Beta",
+                    &["Alpha", "Beta", "Gamma", "Delta"],
+                )),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(400))
+            .expect_err("the first option key starts after the deadline");
+
+        assert_not_started_was_upgraded_after_dispatch(&error);
+        assert_eq!(clicks.lock().unwrap().len(), 1, "the combo was opened");
+        assert!(keys.lock().unwrap().is_empty(), "the late key was not sent");
+    }
+
+    #[test]
+    fn combo_verification_read_upgrades_not_dispatched_after_keys() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300).with_key_log(keys.clone());
+        let mut g = glass_with_scripted_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(combo("Beta", &[])),
+                SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
+                SnapshotReply::NotStarted("scripted combo verification read"),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect_err("the verification read is scripted to fail");
+
+        assert_not_started_was_upgraded_after_dispatch(&error);
+        assert_eq!(
+            keys.lock().unwrap().len(),
+            3,
+            "two option steps and the commit key were sent"
+        );
+    }
+
     /// The commit walks from the currently-selected option to the wanted one, so both the
     /// direction and the number of steps come from their index difference. Asserted on the
     /// keystrokes: the end state alone is reached by any number of Downs past the target.
@@ -3069,6 +3209,12 @@ mod tests {
         for failure in [
             GlassError::Backend("uiautomator dump not ready".into()),
             GlassError::AccessibilityUnavailable("adb: device offline".into()),
+            GlassError::Bounded {
+                kind: crate::BoundKind::NotStarted,
+                whose: crate::Whose::Caller,
+                dispatch: crate::BoundDispatch::NotDispatched,
+                message: "the write was refused before dispatch".into(),
+            },
         ] {
             let set_log = Arc::new(Mutex::new(Vec::new()));
             let mut g = glass_ready_for_set_value(Box::new(FirstFailureThenGuarded {
@@ -3102,10 +3248,16 @@ mod tests {
     fn a_post_dispatch_failure_lets_the_retry_through_once_the_field_settles() {
         // The sequence glass#405 is about, end to end: a write that dispatched and could not be
         // confirmed, a field that then settles to the text it sent, and a retry the guard must
-        // accept. Both verdicts a backend can raise once it has written must clear the cache.
+        // accept. Both verdicts and a bounded call that may have dispatched must clear the cache.
         for failure in [
             GlassError::AxWriteUnconfirmed(0, "the result was lost".into()),
             GlassError::value_not_applied(0, "x", Some("Alice")),
+            GlassError::Bounded {
+                kind: crate::BoundKind::TimedOut,
+                whose: crate::Whose::Caller,
+                dispatch: crate::BoundDispatch::MayHaveDispatched,
+                message: "the write may have landed".into(),
+            },
         ] {
             let set_log = Arc::new(Mutex::new(Vec::new()));
             let mut g = glass_ready_for_set_value(Box::new(FirstFailureThenGuarded {
@@ -3293,6 +3445,30 @@ mod tests {
         g.set_value(AxNodeId(1), "true").unwrap();
 
         assert_eq!(drags.lock().unwrap().len(), 1, "a toggle swipe was emitted");
+    }
+
+    #[test]
+    fn toggle_verification_read_upgrades_not_dispatched_after_actuation() {
+        let drags = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_scripted_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(sw(false)),
+                SnapshotReply::NotStarted("scripted toggle verification read"),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .set_value_by(AxNodeId(1), "true", Deadline::from_millis(2_000))
+            .expect_err("the toggle verification read is scripted to fail");
+
+        assert_not_started_was_upgraded_after_dispatch(&error);
+        assert_eq!(drags.lock().unwrap().len(), 1, "the toggle was actuated");
     }
 
     #[test]

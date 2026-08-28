@@ -175,7 +175,7 @@ impl ContextualError {
             category: SafeErrorCategory::Other,
             safe_summary: "action validation failed",
             sequence_deadline_exceeded: false,
-            bound_dispatch: None,
+            bound_dispatch: Some(BoundDispatch::NotDispatched),
         }
     }
 
@@ -208,6 +208,15 @@ impl ContextualError {
 
     pub fn after_dispatch(mut self) -> Self {
         self.bound_dispatch = Some(BoundDispatch::MayHaveDispatched);
+        self
+    }
+
+    /// Reclassify an error observed after the enclosing batch deadline without discarding the
+    /// operation's safe detail or its dispatch verdict.
+    pub fn after_sequence_deadline(mut self) -> Self {
+        self.category = SafeErrorCategory::SequenceDeadlineExceeded;
+        self.safe_summary = SafeErrorCategory::SequenceDeadlineExceeded.summary();
+        self.sequence_deadline_exceeded = true;
         self
     }
 
