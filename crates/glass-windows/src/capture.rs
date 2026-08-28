@@ -71,7 +71,11 @@ impl GraphicsCaptureApiHandler for OneShot {
 }
 
 /// Grab one BGRA frame for `hwnd` via WGC. Returns (bgra, width, height).
-fn wgc_one_frame_by(hwnd: HWND, deadline: Deadline) -> Result<FramePayload> {
+fn wgc_one_frame_by(
+    hwnd: HWND,
+    deadline: Deadline,
+    dispatch: &crate::WindowsDispatch,
+) -> Result<FramePayload> {
     let (tx, rx): (Sender<FramePayload>, Receiver<FramePayload>) = channel();
 
     let window = Window::from_raw_hwnd(hwnd.0);
@@ -88,6 +92,7 @@ fn wgc_one_frame_by(hwnd: HWND, deadline: Deadline) -> Result<FramePayload> {
 
     let control = OneShot::start_free_threaded(settings)
         .map_err(|e| GlassError::CaptureFailed(format!("start capture: {e}")))?;
+    dispatch.mark();
     // Wait for the first frame; a missing display/permission stalls here, so cap it.
     let (wait, owner) = deadline.budget(FIRST_FRAME_TIMEOUT, Instant::now());
     let result = rx.recv_timeout(wait);
@@ -114,7 +119,7 @@ pub(crate) fn capture_window_by(
     region: Option<&Region>,
     deadline: Deadline,
 ) -> Result<Frame> {
-    crate::run_windows_call_by(deadline, "capture", || {
+    crate::run_windows_call_by(deadline, "capture", |dispatch| {
         // SAFETY: IsIconic is a pure query on an HWND with no preconditions; it
         // returns a BOOL and touches no memory we own.
         if unsafe { IsIconic(hwnd) }.as_bool() {
@@ -124,10 +129,10 @@ pub(crate) fn capture_window_by(
             ));
         }
         if deadline.has_passed() {
-            return Err(GlassError::caller_deadline_elapsed("capture"));
+            return Err(GlassError::deadline_not_started("capture"));
         }
 
-        let (mut bgra, w, h) = wgc_one_frame_by(hwnd, deadline)?;
+        let (mut bgra, w, h) = wgc_one_frame_by(hwnd, deadline, dispatch)?;
         crate::pixels::bgra_to_rgba(&mut bgra);
         let frame = Frame::new(w, h, bgra)?; // validates len; propagates CaptureFailed on mismatch
         match region {

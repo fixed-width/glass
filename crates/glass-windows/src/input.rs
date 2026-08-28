@@ -310,7 +310,7 @@ pub(crate) fn send_pointer_by(
     event: &PointerEvent,
     deadline: Deadline,
 ) -> Result<()> {
-    crate::run_windows_call_by(deadline, "pointer input", || {
+    crate::run_windows_call_by(deadline, "pointer input", |dispatch| {
         // `Gesture` (multi-touch) can never succeed on this backend; reject it before
         // `focus_window`/`extended_frame_bounds`, so it fails fast with `Unsupported` and without
         // raising the target window or masking the call-shape error behind an unrelated
@@ -322,6 +322,7 @@ pub(crate) fn send_pointer_by(
         let hwnd = raw_to_hwnd(active_hwnd);
         // Raise+focus first so input lands on the target (best-effort, like the probe).
         let _ = crate::windows::focus_window(hwnd);
+        dispatch.mark();
         if deadline.has_passed() {
             return Err(GlassError::caller_deadline_elapsed("pointer input"));
         }
@@ -437,9 +438,10 @@ pub(crate) fn send_pointer_by(
 }
 
 pub(crate) fn send_key_by(active_hwnd: isize, event: &KeyEvent, deadline: Deadline) -> Result<()> {
-    crate::run_windows_call_by(deadline, "key input", || {
+    crate::run_windows_call_by(deadline, "key input", |dispatch| {
         let hwnd = raw_to_hwnd(active_hwnd);
         let _ = crate::windows::focus_window(hwnd);
+        dispatch.mark();
         if deadline.has_passed() {
             return Err(GlassError::caller_deadline_elapsed("key input"));
         }

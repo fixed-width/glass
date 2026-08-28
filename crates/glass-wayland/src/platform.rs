@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -59,25 +60,46 @@ fn clamped_budget(deadline: Deadline, own: Duration, now: Instant) -> (Duration,
     deadline.budget(own, now)
 }
 
-fn run_wayland_call_by<T>(
-    deadline: Deadline,
-    op: &str,
-    call: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    if deadline.has_passed() {
-        return Err(GlassError::deadline_not_started(op));
+#[derive(Default)]
+struct WaylandDispatch(Cell<bool>);
+
+impl WaylandDispatch {
+    fn mark(&self) {
+        self.0.set(true);
     }
-    let answer = call().map_err(|error| {
-        if error.bound_owner() == Some(Whose::Caller)
+
+    fn deadline_error(&self, op: &str) -> GlassError {
+        if self.0.get() {
+            GlassError::caller_deadline_elapsed(op)
+        } else {
+            GlassError::deadline_not_started(op)
+        }
+    }
+
+    fn classify(&self, op: &str, error: GlassError) -> GlassError {
+        if self.0.get()
+            && error.bound_owner() == Some(Whose::Caller)
             && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
         {
             GlassError::caller_deadline_elapsed(op)
         } else {
             error
         }
-    })?;
+    }
+}
+
+fn run_wayland_call_by<T>(
+    deadline: Deadline,
+    op: &str,
+    call: impl FnOnce(&WaylandDispatch) -> Result<T>,
+) -> Result<T> {
     if deadline.has_passed() {
-        return Err(GlassError::caller_deadline_elapsed(op));
+        return Err(GlassError::deadline_not_started(op));
+    }
+    let dispatch = WaylandDispatch::default();
+    let answer = call(&dispatch).map_err(|error| dispatch.classify(op, error))?;
+    if deadline.has_passed() {
+        return Err(dispatch.deadline_error(op));
     }
     Ok(answer)
 }
@@ -1580,6 +1602,7 @@ fn upload_keymap_by(
     kb: &ZwpVirtualKeyboardV1,
     keymap: &str,
     deadline: Deadline,
+    dispatch: &WaylandDispatch,
 ) -> Result<()> {
     if deadline.has_passed() {
         return Err(GlassError::deadline_not_started("keymap upload"));
@@ -1589,9 +1612,10 @@ fn upload_keymap_by(
     f.write_all(&[0]).map_err(GlassError::Io)?; // keymap string is NUL-terminated
     f.flush().map_err(GlassError::Io)?;
     if deadline.has_passed() {
-        return Err(GlassError::caller_deadline_elapsed("keymap upload"));
+        return Err(GlassError::deadline_not_started("keymap upload"));
     }
     kb.keymap(1, f.as_fd(), keymap.len() as u32 + 1);
+    dispatch.mark();
     sync_session_by(s, "keymap upload", deadline)?;
     input_settle_by(deadline)
 }
@@ -1605,15 +1629,17 @@ fn tap_by(
     kb: &ZwpVirtualKeyboardV1,
     kc: u32,
     deadline: Deadline,
+    dispatch: &WaylandDispatch,
 ) -> Result<()> {
     let mut held = Held::default();
     for state in [1u32, 0] {
         if deadline.has_passed() {
             held.release(s);
-            return Err(GlassError::caller_deadline_elapsed("key tap"));
+            return Err(GlassError::deadline_not_started("key tap"));
         }
         s.time = s.time.wrapping_add(1);
         kb.key(s.time, kc, state);
+        dispatch.mark();
         held.key = (state == 1).then_some(kc);
         if let Err(e) = sync_session_by(s, "key tap", deadline) {
             held.release(s);
@@ -1632,6 +1658,7 @@ struct WaylandTypeSink<'a> {
     kb: &'a ZwpVirtualKeyboardV1,
     taps: std::vec::IntoIter<u32>,
     deadline: Deadline,
+    dispatch: &'a WaylandDispatch,
 }
 
 impl glass_core::TypeSink for WaylandTypeSink<'_> {
@@ -1639,7 +1666,7 @@ impl glass_core::TypeSink for WaylandTypeSink<'_> {
         let keycode = self.taps.next().ok_or_else(|| {
             GlassError::Backend("typing plan ended before the requested text".into())
         })?;
-        tap_by(self.s, self.kb, keycode, self.deadline)
+        tap_by(self.s, self.kb, keycode, self.deadline, self.dispatch)
     }
 }
 
@@ -1689,6 +1716,7 @@ fn modifier_mask(mods: &[glass_core::keys::Modifier]) -> u32 {
 /// advances the event clock so timestamps stay monotonic across the drag.
 struct WaylandDragSink<'a> {
     s: &'a mut ActiveSession,
+    dispatch: &'a WaylandDispatch,
     w: u32,
     h: u32,
     ox: i32,
@@ -1732,12 +1760,14 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         let t = self.tick();
         vp.motion_absolute(t, axx, ayy, w, h);
         vp.frame();
+        self.dispatch.mark();
         self.settle()?;
         let t = self.tick();
         vp.motion_absolute(t, nudge_x(axx, w), ayy, w, h);
         vp.frame();
         vp.motion_absolute(t, axx, ayy, w, h);
         vp.frame();
+        self.dispatch.mark();
         self.settle()
     }
     fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
@@ -1759,6 +1789,7 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         };
         vp.button(t, self.b, state);
         vp.frame();
+        self.dispatch.mark();
         self.held.button = down.then_some(self.b);
         self.settle()
     }
@@ -1773,10 +1804,13 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
                 &kb,
                 &crate::keyboard::build_keymap(&[]),
                 self.deadline,
+                self.dispatch,
             )?;
             kb.modifiers(self.mask, 0, 0, 0);
+            self.dispatch.mark();
         } else {
             kb.modifiers(0, 0, 0, 0);
+            self.dispatch.mark();
         }
         self.held.modifiers = down;
         // Self-commit so the modifier change reaches the compositor before the
@@ -1790,6 +1824,7 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
 /// each method self-commits (roundtrip + 8ms settle) so the modifier is held across the key's frame.
 struct WaylandChordSink<'a> {
     s: &'a mut ActiveSession,
+    dispatch: &'a WaylandDispatch,
     mask: u32,
     keysym: u32,
     held: Held,
@@ -1820,12 +1855,15 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
                 &kb,
                 &crate::keyboard::build_keymap(&[self.keysym]),
                 self.deadline,
+                self.dispatch,
             )?;
             if self.mask != 0 {
                 kb.modifiers(self.mask, 0, 0, 0);
+                self.dispatch.mark();
             }
         } else if self.mask != 0 {
             kb.modifiers(0, 0, 0, 0);
+            self.dispatch.mark();
         }
         self.held.modifiers = down && self.mask != 0;
         self.settle()
@@ -1835,6 +1873,7 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
         self.s.time = self.s.time.wrapping_add(1);
         let t = self.s.time;
         kb.key(t, 1, u32::from(down)); // keycode 1 = the chord's key; 1=pressed, 0=released
+        self.dispatch.mark();
         self.held.key = down.then_some(1);
         self.settle()
     }
@@ -1847,6 +1886,7 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
 /// wheel's frame.
 struct WaylandScrollSink<'a> {
     s: &'a mut ActiveSession,
+    dispatch: &'a WaylandDispatch,
     w: u32,
     h: u32,
     ox: i32,
@@ -1896,10 +1936,13 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
                 &kb,
                 &crate::keyboard::build_keymap(&[]),
                 self.deadline,
+                self.dispatch,
             )?;
             kb.modifiers(self.mask, 0, 0, 0);
+            self.dispatch.mark();
         } else {
             kb.modifiers(0, 0, 0, 0);
+            self.dispatch.mark();
         }
         self.held.modifiers = down;
         self.settle()
@@ -1912,6 +1955,7 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
         let t = self.tick();
         vp.motion_absolute(t, axx, ayy, w, h);
         vp.frame();
+        self.dispatch.mark();
         self.settle()?;
         let t = self.tick();
         vp.motion_absolute(t, nudge_x(axx, w), ayy, w, h);
@@ -2030,7 +2074,7 @@ impl Platform for WaylandPlatform {
     }
 
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
-        run_wayland_call_by(deadline, "capture", || {
+        run_wayland_call_by(deadline, "capture", |dispatch| {
             let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
             session.state.capture = CaptureScratch::default();
             let qh = session.queue.handle();
@@ -2046,17 +2090,19 @@ impl Platform for WaylandPlatform {
                 Some(r) => (wr.x + r.x as i32, wr.y + r.y as i32, r.width, r.height),
                 None => (wr.x, wr.y, wr.width, wr.height),
             };
+            let frame = session.manager.capture_output_region(
+                0,
+                &session.output,
+                cx,
+                cy,
+                cw as i32,
+                ch as i32,
+                &qh,
+                (),
+            );
+            dispatch.mark();
             let mut owned = CaptureObjects {
-                frame: session.manager.capture_output_region(
-                    0,
-                    &session.output,
-                    cx,
-                    cy,
-                    cw as i32,
-                    ch as i32,
-                    &qh,
-                    (),
-                ),
+                frame,
                 buffer: None,
             };
 
@@ -2136,7 +2182,7 @@ impl Platform for WaylandPlatform {
     }
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
-        run_wayland_call_by(deadline, "pointer input", || {
+        run_wayland_call_by(deadline, "pointer input", |dispatch| {
             let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
             session.time = session.time.wrapping_add(1);
             let t = session.time;
@@ -2164,10 +2210,11 @@ impl Platform for WaylandPlatform {
             // intermittently loses the very first click/scroll (the Wayland flake).
             let position = |s: &mut ActiveSession, x: i32, y: i32| -> Result<()> {
                 if deadline.has_passed() {
-                    return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                    return Err(GlassError::deadline_not_started("pointer input"));
                 }
                 vp.motion_absolute(t, ax(x), ay(y), w, h);
                 vp.frame();
+                dispatch.mark();
                 settle(s)?;
                 vp.motion_absolute(t, nudge_x(ax(x), w), ay(y), w, h);
                 vp.frame();
@@ -2194,8 +2241,10 @@ impl Platform for WaylandPlatform {
                             &kb,
                             &crate::keyboard::build_keymap(&[]),
                             deadline,
+                            dispatch,
                         )?;
                         kb.modifiers(mask, 0, 0, 0);
+                        dispatch.mark();
                     }
                     let mut held = Held {
                         modifiers: mask != 0,
@@ -2205,17 +2254,19 @@ impl Platform for WaylandPlatform {
                     let clicks = |session: &mut ActiveSession, held: &mut Held| -> Result<()> {
                         for _ in 0..count.max(1) {
                             if deadline.has_passed() {
-                                return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                                return Err(GlassError::deadline_not_started("pointer input"));
                             }
                             vp.button(t, b, ButtonState::Pressed);
                             vp.frame();
+                            dispatch.mark();
                             held.button = Some(b);
                             settle(session)?;
                             if deadline.has_passed() {
-                                return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                                return Err(GlassError::deadline_not_started("pointer input"));
                             }
                             vp.button(t, b, ButtonState::Released);
                             vp.frame();
+                            dispatch.mark();
                             held.button = None;
                             settle(session)?;
                         }
@@ -2240,6 +2291,7 @@ impl Platform for WaylandPlatform {
                         glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
                     let mut sink = WaylandDragSink {
                         s: &mut *session,
+                        dispatch,
                         w,
                         h,
                         ox,
@@ -2262,6 +2314,7 @@ impl Platform for WaylandPlatform {
                     // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
                     let mut sink = WaylandScrollSink {
                         s: &mut *session,
+                        dispatch,
                         w,
                         h,
                         ox,
@@ -2292,7 +2345,7 @@ impl Platform for WaylandPlatform {
     }
 
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
-        run_wayland_call_by(deadline, "key input", || {
+        run_wayland_call_by(deadline, "key input", |dispatch| {
             use glass_core::keys::parse_chord;
             let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
             let kb = session.keyboard.clone();
@@ -2314,6 +2367,7 @@ impl Platform for WaylandPlatform {
                             &kb,
                             &crate::keyboard::build_keymap(&chunk.keysyms),
                             deadline,
+                            dispatch,
                         )?;
                         let chunk_text: String =
                             characters.by_ref().take(chunk.taps.len()).collect();
@@ -2322,6 +2376,7 @@ impl Platform for WaylandPlatform {
                             kb: &kb,
                             taps: chunk.taps.into_iter(),
                             deadline,
+                            dispatch,
                         };
                         run_wayland_type_by(&mut sink, &chunk_text, Duration::ZERO, deadline)?;
                     }
@@ -2330,6 +2385,7 @@ impl Platform for WaylandPlatform {
                     let (mods, keysym) = parse_chord(c)?; // validates before any traffic
                     let mut sink = WaylandChordSink {
                         s: &mut *session,
+                        dispatch,
                         mask: modifier_mask(&mods),
                         keysym,
                         held: Held::default(),
@@ -2498,7 +2554,7 @@ mod pure_tests {
         let mut recorded_events = Vec::new();
         let deadline = glass_core::Deadline::at(Instant::now() - Duration::from_millis(1));
 
-        let error = run_wayland_call_by(deadline, "pointer input", || {
+        let error = run_wayland_call_by(deadline, "pointer input", |_| {
             recorded_events.push("motion");
             Ok(())
         })
@@ -2509,6 +2565,16 @@ mod pure_tests {
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::NotDispatched)
         );
+    }
+
+    #[test]
+    fn pre_dispatch_caller_deadline_error_stays_not_dispatched() {
+        let error = run_wayland_call_by(Deadline::UNBOUNDED, "key input", |_| {
+            Err::<(), _>(GlassError::deadline_not_started("keymap upload"))
+        })
+        .expect_err("the keymap did not reach the compositor");
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
     }
 
     #[test]
@@ -2533,12 +2599,16 @@ mod pure_tests {
 
     #[test]
     fn capture_returning_after_the_deadline_is_not_success() {
-        let capture_error =
-            run_wayland_call_by(glass_core::Deadline::from_millis(1), "capture", || {
+        let capture_error = run_wayland_call_by(
+            glass_core::Deadline::from_millis(1),
+            "capture",
+            |dispatch| {
+                dispatch.mark();
                 std::thread::sleep(Duration::from_millis(10));
                 Ok(())
-            })
-            .expect_err("a late capture must not return success");
+            },
+        )
+        .expect_err("a late capture must not return success");
 
         assert_eq!(capture_error.bound_owner(), Some(glass_core::Whose::Caller));
         assert_eq!(
@@ -4142,8 +4212,10 @@ mod session_tests {
             let session = s.platform().active.as_mut().expect("a started session");
             let (w, h) = session.output_size;
             let (ox, oy) = (session.active_rect.x, session.active_rect.y);
+            let dispatch = WaylandDispatch::default();
             let mut sink = WaylandDragSink {
                 s: session,
+                dispatch: &dispatch,
                 w,
                 h,
                 ox,

@@ -31,25 +31,48 @@ pub mod vkmap; // pure named-keysym->VK map — cross-platform, host-tested
 pub const BACKEND: &str = "windows";
 
 #[cfg(any(windows, test))]
-fn run_windows_call_by<T>(
-    deadline: glass_core::Deadline,
-    op: &str,
-    call: impl FnOnce() -> glass_core::Result<T>,
-) -> glass_core::Result<T> {
-    if deadline.has_passed() {
-        return Err(glass_core::GlassError::deadline_not_started(op));
+#[derive(Default)]
+struct WindowsDispatch(std::cell::Cell<bool>);
+
+#[cfg(any(windows, test))]
+impl WindowsDispatch {
+    fn mark(&self) {
+        self.0.set(true);
     }
-    let answer = call().map_err(|error| {
-        if error.bound_owner() == Some(glass_core::Whose::Caller)
+
+    fn deadline_error(&self, op: &str) -> glass_core::GlassError {
+        if self.0.get() {
+            glass_core::GlassError::caller_deadline_elapsed(op)
+        } else {
+            glass_core::GlassError::deadline_not_started(op)
+        }
+    }
+
+    fn classify(&self, op: &str, error: glass_core::GlassError) -> glass_core::GlassError {
+        if self.0.get()
+            && error.bound_owner() == Some(glass_core::Whose::Caller)
             && error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched)
         {
             glass_core::GlassError::caller_deadline_elapsed(op)
         } else {
             error
         }
-    })?;
+    }
+}
+
+#[cfg(any(windows, test))]
+fn run_windows_call_by<T>(
+    deadline: glass_core::Deadline,
+    op: &str,
+    call: impl FnOnce(&WindowsDispatch) -> glass_core::Result<T>,
+) -> glass_core::Result<T> {
     if deadline.has_passed() {
-        return Err(glass_core::GlassError::caller_deadline_elapsed(op));
+        return Err(glass_core::GlassError::deadline_not_started(op));
+    }
+    let dispatch = WindowsDispatch::default();
+    let answer = call(&dispatch).map_err(|error| dispatch.classify(op, error))?;
+    if deadline.has_passed() {
+        return Err(dispatch.deadline_error(op));
     }
     Ok(answer)
 }
@@ -521,7 +544,7 @@ mod capability_tests {
 #[cfg(test)]
 mod deadline_tests {
     use super::{run_windows_call_by, run_windows_type_by};
-    use glass_core::{BoundDispatch, Deadline, Result, TypeSink, Whose};
+    use glass_core::{BoundDispatch, Deadline, GlassError, Result, TypeSink, Whose};
     use std::time::{Duration, Instant};
 
     #[derive(Default)]
@@ -542,13 +565,23 @@ mod deadline_tests {
         let mut recorded_events = Vec::new();
         let deadline = Deadline::at(Instant::now() - Duration::from_millis(1));
 
-        let error = run_windows_call_by(deadline, "pointer input", || {
+        let error = run_windows_call_by(deadline, "pointer input", |_| {
             recorded_events.push("motion");
             Ok(())
         })
         .expect_err("spent input must be rejected before dispatch");
 
         assert!(recorded_events.is_empty());
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn pre_dispatch_caller_deadline_error_stays_not_dispatched() {
+        let error = run_windows_call_by(Deadline::UNBOUNDED, "capture", |_| {
+            Err::<(), _>(GlassError::deadline_not_started("WGC capture"))
+        })
+        .expect_err("capture did not reach WGC");
+
         assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
     }
 
@@ -574,7 +607,8 @@ mod deadline_tests {
 
     #[test]
     fn capture_returning_after_the_deadline_is_not_success() {
-        let capture_error = run_windows_call_by(Deadline::from_millis(1), "capture", || {
+        let capture_error = run_windows_call_by(Deadline::from_millis(1), "capture", |dispatch| {
+            dispatch.mark();
             std::thread::sleep(Duration::from_millis(10));
             Ok(())
         })

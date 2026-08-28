@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::os::fd::AsFd;
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
@@ -44,21 +45,46 @@ const XT_BTN_RELEASE: u8 = 5; // ButtonRelease
 const XT_KEY_PRESS: u8 = 2; // KeyPress
 const XT_KEY_RELEASE: u8 = 3; // KeyRelease
 
-fn run_x11_call_by<T>(deadline: Deadline, op: &str, call: impl FnOnce() -> Result<T>) -> Result<T> {
-    if deadline.has_passed() {
-        return Err(GlassError::deadline_not_started(op));
+#[derive(Default)]
+struct X11Dispatch(Cell<bool>);
+
+impl X11Dispatch {
+    fn mark(&self) {
+        self.0.set(true);
     }
-    let answer = call().map_err(|error| {
-        if error.bound_owner() == Some(Whose::Caller)
+
+    fn deadline_error(&self, op: &str) -> GlassError {
+        if self.0.get() {
+            GlassError::caller_deadline_elapsed(op)
+        } else {
+            GlassError::deadline_not_started(op)
+        }
+    }
+
+    fn classify(&self, op: &str, error: GlassError) -> GlassError {
+        if self.0.get()
+            && error.bound_owner() == Some(Whose::Caller)
             && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
         {
             GlassError::caller_deadline_elapsed(op)
         } else {
             error
         }
-    })?;
+    }
+}
+
+fn run_x11_call_by<T>(
+    deadline: Deadline,
+    op: &str,
+    call: impl FnOnce(&X11Dispatch) -> Result<T>,
+) -> Result<T> {
     if deadline.has_passed() {
-        return Err(GlassError::caller_deadline_elapsed(op));
+        return Err(GlassError::deadline_not_started(op));
+    }
+    let dispatch = X11Dispatch::default();
+    let answer = call(&dispatch).map_err(|error| dispatch.classify(op, error))?;
+    if deadline.has_passed() {
+        return Err(dispatch.deadline_error(op));
     }
     Ok(answer)
 }
@@ -70,6 +96,54 @@ fn run_x11_type_by<S: glass_core::TypeSink>(
     deadline: Deadline,
 ) -> Result<()> {
     glass_core::run_type_by(sink, text, dwell, deadline)
+}
+
+fn run_clicks_by(
+    count: u32,
+    mut deadline_passed: impl FnMut() -> bool,
+    mut button: impl FnMut(bool) -> Result<()>,
+    cleanup: impl FnOnce(bool, bool) -> Result<()>,
+) -> Result<()> {
+    let mut button_down = false;
+    let outcome = (|| {
+        for _ in 0..count.max(1) {
+            if deadline_passed() {
+                return Err(GlassError::deadline_not_started("pointer input"));
+            }
+            button(true)?;
+            button_down = true;
+            if deadline_passed() {
+                return Err(GlassError::deadline_not_started("pointer input"));
+            }
+            button(false)?;
+            button_down = false;
+        }
+        Ok(())
+    })();
+    cleanup(button_down, outcome.is_err())?;
+    outcome
+}
+
+fn run_scroll_buttons_by(
+    pos_btn: u8,
+    neg_btn: u8,
+    delta: i32,
+    mut deadline_passed: impl FnMut() -> bool,
+    mut button: impl FnMut(bool, u8) -> Result<()>,
+) -> Result<()> {
+    let (btn, times) = if delta >= 0 {
+        (pos_btn, delta)
+    } else {
+        (neg_btn, -delta)
+    };
+    for _ in 0..times {
+        if deadline_passed() {
+            return Err(GlassError::deadline_not_started("pointer input"));
+        }
+        button(true, btn)?;
+        button(false, btn)?;
+    }
+    Ok(())
 }
 
 use crate::command::build_command;
@@ -760,17 +834,20 @@ impl X11Platform {
         Ok(())
     }
 
-    fn scroll_button(&self, pos_btn: u8, neg_btn: u8, delta: i32) -> Result<()> {
-        let (btn, times) = if delta >= 0 {
-            (pos_btn, delta)
-        } else {
-            (neg_btn, -delta)
-        };
-        for _ in 0..times {
-            self.button(XT_BTN_PRESS, btn)?;
-            self.button(XT_BTN_RELEASE, btn)?;
-        }
-        Ok(())
+    fn scroll_button(
+        &self,
+        pos_btn: u8,
+        neg_btn: u8,
+        delta: i32,
+        deadline: Deadline,
+    ) -> Result<()> {
+        run_scroll_buttons_by(
+            pos_btn,
+            neg_btn,
+            delta,
+            || deadline.has_passed(),
+            |down, btn| self.button(if down { XT_BTN_PRESS } else { XT_BTN_RELEASE }, btn),
+        )
     }
 
     /// Find a keycode (and whether Shift is needed) that produces `keysym`.
@@ -983,6 +1060,7 @@ fn clip_note(rect: &crate::coords::ClippedRect) -> Option<String> {
 /// are held between `modifiers(true)`/`modifiers(false)`.
 struct X11DragSink<'a> {
     p: &'a X11Platform,
+    dispatch: &'a X11Dispatch,
     ox: i32,
     oy: i32,
     b: u8,
@@ -996,11 +1074,13 @@ impl glass_core::DragSink for X11DragSink<'_> {
     }
     fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
         self.p.warp(self.ox, self.oy, x, y)?;
+        self.dispatch.mark();
         self.p.commit()
     }
     fn button(&mut self, down: bool) -> Result<()> {
         let kind = if down { XT_BTN_PRESS } else { XT_BTN_RELEASE };
         self.p.button(kind, self.b)?;
+        self.dispatch.mark();
         self.p.commit()
     }
     fn modifiers(&mut self, down: bool) -> Result<()> {
@@ -1008,6 +1088,9 @@ impl glass_core::DragSink for X11DragSink<'_> {
             self.kcs = self.p.press_mods(self.mods)?;
         } else {
             self.p.release_mods(&self.kcs)?;
+        }
+        if !self.kcs.is_empty() {
+            self.dispatch.mark();
         }
         self.p.commit()
     }
@@ -1020,6 +1103,7 @@ impl glass_core::DragSink for X11DragSink<'_> {
 /// char value (it would leak typed content into the unredacted audit log).
 struct X11TypeSink<'a> {
     p: &'a X11Platform,
+    dispatch: &'a X11Dispatch,
     idx: usize,
 }
 
@@ -1030,6 +1114,7 @@ impl glass_core::TypeSink for X11TypeSink<'_> {
         })?;
         self.idx += 1;
         self.p.key_with_mods(keysym, false, &[])?;
+        self.dispatch.mark();
         self.p.commit()
     }
 }
@@ -1039,6 +1124,7 @@ impl glass_core::TypeSink for X11TypeSink<'_> {
 /// `modifiers(false)`, so a frame-based client sees the modifier held across the key's frame.
 struct X11ChordSink<'a> {
     p: &'a X11Platform,
+    dispatch: &'a X11Dispatch,
     mods: &'a [glass_core::keys::Modifier],
     keycode: u8,
     kcs: Vec<u8>,
@@ -1050,6 +1136,9 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
             self.kcs = self.p.press_mods(self.mods)?;
         } else {
             self.p.release_mods(&self.kcs)?;
+        }
+        if !self.kcs.is_empty() {
+            self.dispatch.mark();
         }
         self.p.commit()
     }
@@ -1067,6 +1156,7 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
                 0,
             )
             .map_err(|e| GlassError::Backend(format!("xtest key: {e}")))?;
+        self.dispatch.mark();
         self.p.commit()
     }
 }
@@ -1076,6 +1166,7 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
 /// client sees the modifier held across the wheel's frame; each method self-commits with `XFlush`.
 struct X11ScrollSink<'a> {
     p: &'a X11Platform,
+    dispatch: &'a X11Dispatch,
     ox: i32,
     oy: i32,
     x: i32,
@@ -1084,6 +1175,7 @@ struct X11ScrollSink<'a> {
     dy: i32,
     mods: &'a [glass_core::keys::Modifier],
     kcs: Vec<u8>,
+    deadline: Deadline,
 }
 
 impl glass_core::ScrollSink for X11ScrollSink<'_> {
@@ -1093,13 +1185,17 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
         } else {
             self.p.release_mods(&self.kcs)?;
         }
+        if !self.kcs.is_empty() {
+            self.dispatch.mark();
+        }
         self.p.commit()
     }
     fn wheel(&mut self) -> Result<()> {
         self.p.warp(self.ox, self.oy, self.x, self.y)?;
+        self.dispatch.mark();
         // 4=up,5=down,6=left,7=right; click |delta| times.
-        self.p.scroll_button(5, 4, self.dy)?;
-        self.p.scroll_button(7, 6, self.dx)?;
+        self.p.scroll_button(5, 4, self.dy, self.deadline)?;
+        self.p.scroll_button(7, 6, self.dx, self.deadline)?;
         self.p.commit()
     }
 }
@@ -1162,7 +1258,7 @@ impl Platform for X11Platform {
     }
 
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
-        run_x11_call_by(deadline, "capture", || {
+        run_x11_call_by(deadline, "capture", |dispatch| {
             // `window_geometry()` itself calls `require_window()`, so it doubles as
             // the "is there an active window" guard — no separate binding needed.
             let geo = self.window_geometry()?;
@@ -1171,12 +1267,14 @@ impl Platform for X11Platform {
                 eprintln!("{note}");
             }
             if deadline.has_passed() {
-                return Err(GlassError::caller_deadline_elapsed("capture"));
+                return Err(GlassError::deadline_not_started("capture"));
             }
             // Capture from ROOT over the window's screen region so overlapping popovers
             // (separate override-redirect top-levels) are included, not just this window's
             // own (possibly-obscured) drawable.
-            self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
+            let frame = self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)?;
+            dispatch.mark();
+            Ok(frame)
         })
     }
 
@@ -1190,7 +1288,7 @@ impl Platform for X11Platform {
         region: Option<&Region>,
         deadline: Deadline,
     ) -> Result<Frame> {
-        run_x11_call_by(deadline, "window capture", || {
+        run_x11_call_by(deadline, "window capture", |dispatch| {
             // Mirror select_window's WindowId -> Window mapping/validation, but never
             // touch `self.window` — this must not retarget the active window.
             let pids: Vec<u32> = self
@@ -1215,9 +1313,11 @@ impl Platform for X11Platform {
                 eprintln!("{note}");
             }
             if deadline.has_passed() {
-                return Err(GlassError::caller_deadline_elapsed("window capture"));
+                return Err(GlassError::deadline_not_started("window capture"));
             }
-            self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
+            let frame = self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)?;
+            dispatch.mark();
+            Ok(frame)
         })
     }
 
@@ -1226,14 +1326,17 @@ impl Platform for X11Platform {
     }
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
-        run_x11_call_by(deadline, "pointer input", || {
+        run_x11_call_by(deadline, "pointer input", |dispatch| {
             let origin = self.window_geometry()?;
             let (ox, oy) = (origin.x, origin.y);
             if deadline.has_passed() {
-                return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                return Err(GlassError::deadline_not_started("pointer input"));
             }
             match *event {
-                PointerEvent::Move { x, y } => self.warp(ox, oy, x, y)?,
+                PointerEvent::Move { x, y } => {
+                    self.warp(ox, oy, x, y)?;
+                    dispatch.mark();
+                }
                 PointerEvent::Scroll {
                     x,
                     y,
@@ -1245,6 +1348,7 @@ impl Platform for X11Platform {
                     // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
                     let mut sink = X11ScrollSink {
                         p: &*self,
+                        dispatch,
                         ox,
                         oy,
                         x,
@@ -1253,6 +1357,7 @@ impl Platform for X11Platform {
                         dy,
                         mods: modifiers.as_slice(),
                         kcs: Vec::new(),
+                        deadline,
                     };
                     glass_core::run_scroll_by(&mut sink, !modifiers.is_empty(), deadline)?;
                 }
@@ -1264,27 +1369,50 @@ impl Platform for X11Platform {
                     ref modifiers,
                 } => {
                     self.warp(ox, oy, x, y)?;
+                    dispatch.mark();
                     if deadline.has_passed() {
                         return Err(GlassError::caller_deadline_elapsed("pointer input"));
                     }
                     let kcs = self.press_mods(modifiers)?;
+                    if !kcs.is_empty() {
+                        dispatch.mark();
+                    }
                     let b = button_number(button);
-                    let outcome = (|| {
-                        for _ in 0..count.max(1) {
-                            if deadline.has_passed() {
-                                return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                    run_clicks_by(
+                        count,
+                        || deadline.has_passed(),
+                        |down| {
+                            self.button(if down { XT_BTN_PRESS } else { XT_BTN_RELEASE }, b)?;
+                            dispatch.mark();
+                            Ok(())
+                        },
+                        |button_down, failed| {
+                            let mut cleanup_error = None;
+                            if button_down && let Err(error) = self.button(XT_BTN_RELEASE, b) {
+                                cleanup_error = Some(error);
+                            } else if button_down {
+                                dispatch.mark();
                             }
-                            self.button(XT_BTN_PRESS, b)?;
-                            if deadline.has_passed() {
-                                return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                            if let Err(error) = self.release_mods(&kcs)
+                                && cleanup_error.is_none()
+                            {
+                                cleanup_error = Some(error);
                             }
-                            self.button(XT_BTN_RELEASE, b)?;
-                        }
-                        Ok(())
-                    })();
-                    let release = self.release_mods(&kcs);
-                    outcome?;
-                    release?;
+                            if failed
+                                && let Err(error) = self
+                                    .conn
+                                    .sync()
+                                    .map_err(|e| GlassError::Backend(format!("sync: {e}")))
+                                && cleanup_error.is_none()
+                            {
+                                cleanup_error = Some(error);
+                            }
+                            match cleanup_error {
+                                Some(error) => Err(error),
+                                None => Ok(()),
+                            }
+                        },
+                    )?;
                 }
                 PointerEvent::Drag {
                     from_x,
@@ -1299,6 +1427,7 @@ impl Platform for X11Platform {
                         glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
                     let mut sink = X11DragSink {
                         p: &*self,
+                        dispatch,
                         ox,
                         oy,
                         b: button_number(button),
@@ -1320,14 +1449,18 @@ impl Platform for X11Platform {
     }
 
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
-        run_x11_call_by(deadline, "key input", || {
+        run_x11_call_by(deadline, "key input", |dispatch| {
             match event {
                 KeyEvent::Text(text) => {
                     // Per-character, self-committed typing (an XFlush per char) so a heavy client
                     // (e.g. a browser) receives a long string instead of dropping events flushed
                     // once at the end — see glass_core::run_type and X11TypeSink. The 8ms dwell
                     // paces between characters (XFlush sends but does not wait).
-                    let mut sink = X11TypeSink { p: &*self, idx: 0 };
+                    let mut sink = X11TypeSink {
+                        p: &*self,
+                        dispatch,
+                        idx: 0,
+                    };
                     run_x11_type_by(&mut sink, text, Duration::from_millis(8), deadline)?;
                 }
                 KeyEvent::Chord(chord) => {
@@ -1339,6 +1472,7 @@ impl Platform for X11Platform {
                     }
                     let mut sink = X11ChordSink {
                         p: &*self,
+                        dispatch,
                         mods: &mods,
                         keycode,
                         kcs: Vec::new(),
@@ -1545,8 +1679,11 @@ fn button_number(button: glass_core::MouseButton) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{hint_matches, run_x11_call_by, run_x11_type_by};
-    use glass_core::{BoundDispatch, Deadline, Result, TypeSink, Whose, WindowHint};
+    use super::{
+        hint_matches, run_clicks_by, run_scroll_buttons_by, run_x11_call_by, run_x11_type_by,
+    };
+    use glass_core::{BoundDispatch, Deadline, GlassError, Result, TypeSink, Whose, WindowHint};
+    use std::cell::{Cell, RefCell};
     use std::time::{Duration, Instant};
 
     #[derive(Default)]
@@ -1567,7 +1704,7 @@ mod tests {
         let mut recorded_events = Vec::new();
         let deadline = Deadline::at(Instant::now() - Duration::from_millis(1));
 
-        let error = run_x11_call_by(deadline, "pointer input", || {
+        let error = run_x11_call_by(deadline, "pointer input", |_| {
             recorded_events.push("motion");
             Ok(())
         })
@@ -1575,6 +1712,80 @@ mod tests {
 
         assert!(recorded_events.is_empty());
         assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn pre_dispatch_caller_deadline_error_stays_not_dispatched() {
+        let error = run_x11_call_by(Deadline::UNBOUNDED, "key input", |_| {
+            Err::<(), _>(GlassError::deadline_not_started("typing"))
+        })
+        .expect_err("typing did not reach XTEST");
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn click_timeout_after_press_releases_and_syncs_before_returning() {
+        let events = RefCell::new(Vec::new());
+        let checks = Cell::new(0);
+
+        run_clicks_by(
+            1,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() == 2
+            },
+            |down| {
+                events
+                    .borrow_mut()
+                    .push(if down { "press" } else { "release" });
+                Ok(())
+            },
+            |button_down, failed| {
+                if button_down {
+                    events.borrow_mut().push("release");
+                }
+                if failed {
+                    events.borrow_mut().push("sync");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("the deadline expires after the press");
+
+        assert_eq!(*events.borrow(), ["press", "release", "sync"]);
+    }
+
+    #[test]
+    fn large_scroll_stops_before_the_first_notch_after_the_deadline() {
+        let events = RefCell::new(Vec::new());
+        let checks = Cell::new(0);
+
+        let error = run_x11_call_by(Deadline::UNBOUNDED, "pointer input", |dispatch| {
+            run_scroll_buttons_by(
+                5,
+                4,
+                1_000,
+                || {
+                    checks.set(checks.get() + 1);
+                    checks.get() > 1
+                },
+                |down, button| {
+                    events.borrow_mut().push((down, button));
+                    dispatch.mark();
+                    Ok(())
+                },
+            )
+        })
+        .expect_err("the deadline expires before the second notch");
+
+        assert_eq!(
+            (events.borrow().as_slice(), error.bound_dispatch()),
+            (
+                &[(true, 5u8), (false, 5u8)][..],
+                Some(BoundDispatch::MayHaveDispatched),
+            )
+        );
     }
 
     #[test]
@@ -1599,7 +1810,8 @@ mod tests {
 
     #[test]
     fn capture_returning_after_the_deadline_is_not_success() {
-        let capture_error = run_x11_call_by(Deadline::from_millis(1), "capture", || {
+        let capture_error = run_x11_call_by(Deadline::from_millis(1), "capture", |dispatch| {
+            dispatch.mark();
             std::thread::sleep(Duration::from_millis(10));
             Ok(())
         })
@@ -2102,7 +2314,8 @@ mod display_tests {
         commit(&plat);
         let _ = x.drain_events(Duration::from_millis(50));
 
-        plat.scroll_button(4, 5, 3).expect("scroll");
+        plat.scroll_button(4, 5, 3, Deadline::UNBOUNDED)
+            .expect("scroll");
         commit(&plat);
         assert_eq!(buttons_pressed(&x), vec![4, 4, 4], "window {win}");
     }
@@ -2123,7 +2336,8 @@ mod display_tests {
         commit(&plat);
         let _ = x.drain_events(Duration::from_millis(50));
 
-        plat.scroll_button(4, 5, -2).expect("scroll");
+        plat.scroll_button(4, 5, -2, Deadline::UNBOUNDED)
+            .expect("scroll");
         commit(&plat);
         assert_eq!(buttons_pressed(&x), vec![5, 5]);
     }
