@@ -57,6 +57,22 @@ impl CallFailure {
             CallFailure::Refused(_) => CallFailure::Refused(e),
         }
     }
+
+    /// Combine consecutive attempts without letting a retry prove less delivery than an earlier
+    /// attempt. The later error remains the cause that ended recovery.
+    pub(crate) fn merge_retry(self, retry: CallFailure) -> CallFailure {
+        match (self, retry) {
+            (CallFailure::NotSent(_), retry) => retry,
+            (CallFailure::AnswerLost(_), CallFailure::Refused(error)) => {
+                CallFailure::Refused(error)
+            }
+            (
+                CallFailure::AnswerLost(_),
+                CallFailure::NotSent(error) | CallFailure::AnswerLost(error),
+            ) => CallFailure::AnswerLost(error),
+            (CallFailure::Refused(_), retry) => CallFailure::Refused(retry.into_error()),
+        }
+    }
 }
 
 /// A live connection to the agent: a framed line reader/writer + a monotonic id.
@@ -81,6 +97,8 @@ pub(crate) struct Conn {
     poisoned: bool,
     #[cfg(test)]
     timeout_faults: std::collections::VecDeque<TimeoutFault>,
+    #[cfg(test)]
+    before_write_delay: Duration,
 }
 
 impl Conn {
@@ -130,6 +148,8 @@ impl Conn {
             poisoned: false,
             #[cfg(test)]
             timeout_faults: Default::default(),
+            #[cfg(test)]
+            before_write_delay: Duration::ZERO,
         };
         let hello = c
             .read_line_by(deadline, "agent hello")
@@ -223,6 +243,11 @@ impl Conn {
     #[cfg(test)]
     pub(crate) fn inject_timeout_fault(&mut self, fault: TimeoutFault) {
         self.timeout_faults.push_back(fault);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delay_next_write(&mut self, delay: Duration) {
+        self.before_write_delay = delay;
     }
 
     #[cfg(test)]
@@ -466,6 +491,11 @@ impl Conn {
         let mut line = serde_json::to_string(&req).expect("serialize request");
         line.push('\n');
 
+        #[cfg(test)]
+        {
+            let delay = std::mem::take(&mut self.before_write_delay);
+            std::thread::sleep(delay);
+        }
         self.write_all_by(line.as_bytes(), deadline, op)?;
 
         let wait = Self::phase_wait(deadline, op, true)?;
@@ -760,6 +790,28 @@ mod tests {
         assert!(
             conn.ensure_usable().is_err(),
             "an unassignable answer left the stream reusable"
+        );
+    }
+
+    #[test]
+    fn retry_merge_does_not_downgrade_refused_to_not_sent() {
+        let failure = CallFailure::Refused(GlassError::Backend("first refusal".into()))
+            .merge_retry(CallFailure::NotSent(GlassError::deadline_not_started(
+                "retry",
+            )));
+
+        let CallFailure::Refused(cause) = failure else {
+            panic!("a later NotSent erased proof that an earlier attempt reached the device")
+        };
+        assert_eq!(
+            cause.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{cause}"
+        );
+        assert_eq!(
+            cause.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "the latest failure still describes the retry itself: {cause}"
         );
     }
 

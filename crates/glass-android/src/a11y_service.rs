@@ -228,6 +228,8 @@ struct TreeReply {
 pub struct ServiceClient {
     conn: Mutex<Conn>,
     port: u16,
+    #[cfg(test)]
+    retry_before_write_delay: std::time::Duration,
 }
 
 impl ServiceClient {
@@ -236,6 +238,8 @@ impl ServiceClient {
         Ok(ServiceClient {
             conn: Mutex::new(conn),
             port,
+            #[cfg(test)]
+            retry_before_write_delay: std::time::Duration::ZERO,
         })
     }
 
@@ -284,8 +288,11 @@ impl ServiceClient {
                     // more about whether `req` was delivered, whichever step trips.
                     rearm_or_retire(&mut conn, pkg, deadline).map_err(|e| f.with_error(e))?;
                 }
+                #[cfg(test)]
+                conn.delay_next_write(self.retry_before_write_delay);
                 conn.call_within(req, deadline, "Android accessibility service retry")
                     .map_err(|e| f.with_error(e))?
+                    .map_err(|retry| f.merge_retry(retry))
             }
             Err(f) => Err(f),
         }
@@ -3880,6 +3887,54 @@ mod tests {
              failed, or worse — Refused's own AnswerLost sibling would read as a lost result \
              for an action that never left the host): {}",
             e.into_error()
+        );
+    }
+
+    #[test]
+    fn a_retry_not_sent_cannot_erase_an_answer_lost_set_text() {
+        let (port, ops) = fake_service_ex(
+            vec![json!({})],
+            vec![OnAction::DropWithoutAnswering, OnAction::Ok],
+            vec![TreePackage::Echo],
+        );
+        let mut client = ServiceClient::connect(port).expect("connect to the fake service");
+        client.retry_before_write_delay = std::time::Duration::from_millis(150);
+        client.tree("com.example.app").expect("primes conn1");
+
+        let failure = client
+            .set_text(1, "hi", "com.example.app", Deadline::from_millis(100))
+            .expect_err("conn1 loses its answer and conn2's retry misses the deadline");
+        match &failure {
+            CallFailure::AnswerLost(cause) => {
+                assert_eq!(
+                    cause.bound_owner(),
+                    Some(glass_core::Whose::Caller),
+                    "{cause}"
+                );
+            }
+            CallFailure::NotSent(cause) => {
+                panic!("the retry erased conn1's possible dispatch: {cause}")
+            }
+            CallFailure::Refused(cause) => {
+                panic!("the fake never refused either set_text: {cause}")
+            }
+        }
+
+        let error = write_error(1, failure);
+        assert_unconfirmed_value_write(&error, AxNodeId(1));
+        assert_ne!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "the final verdict must keep batch side-effect reporting conservative: {error}"
+        );
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:set_text ref=1".to_string(),
+                "conn2:tree".to_string(),
+            ],
+            "conn2 must rearm successfully, then the retry must expire before its first byte"
         );
     }
 
