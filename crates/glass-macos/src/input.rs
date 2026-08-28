@@ -41,6 +41,7 @@ use glass_core::{
 };
 
 use crate::coords::pixel_to_global_point;
+use crate::input_deadline::{after_focus, require_payload_time, run_scroll_wheel_by};
 use crate::keymap;
 
 /// Map a window-relative pixel coordinate to a global Quartz point, accounting for the
@@ -150,7 +151,7 @@ pub(crate) fn send_pointer_by(
                 flags: to_flags(modifiers),
                 last: CGPoint { x: 0.0, y: 0.0 },
             };
-            run_drag_input_by(&mut sink, &gesture, deadline)?;
+            after_focus(run_drag_input_by(&mut sink, &gesture, deadline))?;
         }
         PointerEvent::Scroll {
             x,
@@ -165,8 +166,13 @@ pub(crate) fn send_pointer_by(
                 dx,
                 dy,
                 flags: to_flags(modifiers),
+                deadline,
             };
-            run_scroll_input_by(&mut sink, !modifiers.is_empty(), deadline)?;
+            after_focus(run_scroll_input_by(
+                &mut sink,
+                !modifiers.is_empty(),
+                deadline,
+            ))?;
         }
         // Already rejected by the early check above (before `focus`); kept here so this
         // match stays exhaustive over `PointerEvent`'s variants and a future variant added
@@ -202,7 +208,7 @@ pub(crate) fn send_key_by(event: &KeyEvent, pid: i32, deadline: Deadline) -> Res
             let mut sink = MacTypeSink {
                 source: source.as_deref(),
             };
-            run_text_input_by(&mut sink, s, KEY_TYPE_DWELL, deadline)
+            after_focus(run_text_input_by(&mut sink, s, KEY_TYPE_DWELL, deadline))
         }
         KeyEvent::Chord(s) => send_chord_by(s, source.as_deref(), deadline),
     }
@@ -292,7 +298,7 @@ fn send_chord_by(chord: &str, source: Option<&CGEventSource>, deadline: Deadline
         keycode,
         flags,
     };
-    run_chord_input_by(&mut sink, deadline)
+    after_focus(run_chord_input_by(&mut sink, deadline))
 }
 
 struct MacChordSink<'a> {
@@ -357,14 +363,6 @@ pub(crate) fn focus_by(pid: i32, deadline: Deadline) -> Result<()> {
         .min(FOCUS_SETTLE);
     thread::sleep(settle);
     require_payload_time(deadline)
-}
-
-fn require_payload_time(deadline: Deadline) -> Result<()> {
-    if deadline.has_passed() {
-        Err(GlassError::caller_deadline_elapsed("macOS input"))
-    } else {
-        Ok(())
-    }
 }
 
 /// Build a mouse CGEvent of `ty` at global `point`, tagged with `button`/`flags`. Does not
@@ -508,6 +506,7 @@ struct MacScrollSink<'a> {
     dx: i32,
     dy: i32,
     flags: CGEventFlags,
+    deadline: Deadline,
 }
 
 impl ScrollSink for MacScrollSink<'_> {
@@ -515,38 +514,47 @@ impl ScrollSink for MacScrollSink<'_> {
         Ok(())
     }
     fn wheel(&mut self) -> Result<()> {
-        // `CGEventCreateScrollWheelEvent2` carries no target point of its own — the window
-        // server delivers it to whatever's under the cursor (or the key window) — so
-        // position the cursor first (Task 2's brief).
-        let mv = mouse_event(
-            self.source,
-            CGEventType::MouseMoved,
-            self.point,
-            CGMouseButton::Left,
-            self.flags,
-        )?;
-        post(&mv);
-
-        // Sign: verified against WebKit's macOS WebDriver wheel-action → CGEvent conversion
-        // (`PlatformMac`'s `CGEventCreateScrollWheelEvent(..., -delta.height(),
-        // -delta.width())`), which negates both axes converting a standard
-        // positive-Y-is-down/positive-X-is-right delta into `wheel1`/`wheel2` — i.e. a
-        // positive `wheel1`/`wheel2` scrolls up/left on macOS. That's the same
-        // positive-Y-is-down/positive-X-is-right contract glass's own `dx`/`dy` already use
-        // (see `glass-x11`'s `scroll_button(5=down,4=up, dy)`/`(7=right,6=left, dx)`), so the
-        // same negation applies here: `wheel1 = -dy`, `wheel2 = -dx`.
-        let ev = CGEvent::new_scroll_wheel_event2(
-            self.source,
-            CGScrollEventUnit::Line,
-            2,
-            -self.dy,
-            -self.dx,
-            0,
+        run_scroll_wheel_by(
+            self.deadline,
+            || {
+                // `CGEventCreateScrollWheelEvent2` carries no target point of its own — the window
+                // server delivers it to whatever's under the cursor (or the key window) — so
+                // position the cursor first (Task 2's brief).
+                let mv = mouse_event(
+                    self.source,
+                    CGEventType::MouseMoved,
+                    self.point,
+                    CGMouseButton::Left,
+                    self.flags,
+                )?;
+                post(&mv);
+                Ok(())
+            },
+            || {
+                // Sign: verified against WebKit's macOS WebDriver wheel-action → CGEvent conversion
+                // (`PlatformMac`'s `CGEventCreateScrollWheelEvent(..., -delta.height(),
+                // -delta.width())`), which negates both axes converting a standard
+                // positive-Y-is-down/positive-X-is-right delta into `wheel1`/`wheel2` — i.e. a
+                // positive `wheel1`/`wheel2` scrolls up/left on macOS. That's the same
+                // positive-Y-is-down/positive-X-is-right contract glass's own `dx`/`dy` already use
+                // (see `glass-x11`'s `scroll_button(5=down,4=up, dy)`/`(7=right,6=left, dx)`), so the
+                // same negation applies here: `wheel1 = -dy`, `wheel2 = -dx`.
+                let ev = CGEvent::new_scroll_wheel_event2(
+                    self.source,
+                    CGScrollEventUnit::Line,
+                    2,
+                    -self.dy,
+                    -self.dx,
+                    0,
+                )
+                .ok_or_else(|| {
+                    GlassError::Backend("CGEventCreateScrollWheelEvent2 failed".into())
+                })?;
+                CGEvent::set_flags(Some(&ev), self.flags);
+                Ok(ev)
+            },
+            |ev| post(&ev),
         )
-        .ok_or_else(|| GlassError::Backend("CGEventCreateScrollWheelEvent2 failed".into()))?;
-        CGEvent::set_flags(Some(&ev), self.flags);
-        post(&ev);
-        Ok(())
     }
 }
 
