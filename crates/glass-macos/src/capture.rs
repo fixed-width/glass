@@ -29,7 +29,7 @@ use objc2_screen_capture_kit::{
 };
 
 use glass_core::frame::{Frame, Region};
-use glass_core::{Deadline, GlassError, Result};
+use glass_core::{Deadline, GlassError, Result, Whose};
 
 use crate::scwindow::{find_on_screen_window, find_on_screen_window_by_id};
 
@@ -180,6 +180,9 @@ fn capture_resolved(
         },
     );
 
+    let capture_started = Instant::now();
+    let (timeout, timeout_owner) = capture_timeout_by(deadline, capture_started)?;
+
     // SAFETY: `content_block` matches
     // `getShareableContentExcludingDesktopWindows:onScreenWindowsOnly:completionHandler:`'s
     // documented signature (`*mut SCShareableContent, *mut NSError`) — the same call
@@ -190,25 +193,50 @@ fn capture_resolved(
         );
     }
 
-    let timeout = capture_timeout_by(deadline, Instant::now())?;
-    match rx.recv_timeout(timeout) {
-        Ok(CaptureReply::Ok(frame)) => Ok(frame),
-        Ok(CaptureReply::Err(e)) => Err(e),
+    let receive_timeout = capture_receive_timeout(timeout, capture_started, Instant::now());
+    let reply = if receive_timeout.is_zero() {
+        Err(mpsc::RecvTimeoutError::Timeout)
+    } else {
+        rx.recv_timeout(receive_timeout)
+    };
+    match receive_capture_by(reply, timeout_owner, deadline)? {
+        CaptureReply::Ok(frame) => Ok(frame),
+        CaptureReply::Err(e) => Err(e),
+    }
+}
+
+fn capture_timeout_by(deadline: Deadline, now: Instant) -> Result<(Duration, Whose)> {
+    let (timeout, whose) = deadline.budget(CAPTURE_TIMEOUT, now);
+    if timeout.is_zero() {
+        Err(GlassError::deadline_not_started("capture"))
+    } else {
+        Ok((timeout, whose))
+    }
+}
+
+fn capture_receive_timeout(timeout: Duration, started: Instant, now: Instant) -> Duration {
+    timeout.saturating_sub(now.saturating_duration_since(started))
+}
+
+fn receive_capture_by<T>(
+    reply: std::result::Result<T, mpsc::RecvTimeoutError>,
+    timeout_owner: Whose,
+    deadline: Deadline,
+) -> Result<T> {
+    match reply {
+        Ok(_) if timeout_owner == Whose::Caller && deadline.has_passed() => Err(
+            GlassError::caller_deadline_elapsed("ScreenCaptureKit capture"),
+        ),
+        Ok(value) => Ok(value),
+        Err(mpsc::RecvTimeoutError::Timeout) if timeout_owner == Whose::Caller => Err(
+            GlassError::caller_deadline_elapsed("ScreenCaptureKit capture"),
+        ),
         Err(mpsc::RecvTimeoutError::Timeout) => Err(GlassError::CaptureFailed(
             "ScreenCaptureKit capture timed out waiting for the completion handler".into(),
         )),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(GlassError::Backend(
             "ScreenCaptureKit completion handler was dropped without replying".into(),
         )),
-    }
-}
-
-fn capture_timeout_by(deadline: Deadline, now: Instant) -> Result<Duration> {
-    let timeout = deadline.within(CAPTURE_TIMEOUT, now);
-    if timeout.is_zero() {
-        Err(GlassError::deadline_not_started("capture"))
-    } else {
-        Ok(timeout)
     }
 }
 
@@ -298,13 +326,14 @@ mod tests {
     }
 
     #[test]
-    fn macos_capture_caps_recv_timeout_by_caller() {
+    fn caller_clamped_capture_timeout_preserves_caller_owner() {
         let now = Instant::now();
         let caller_budget = Duration::from_millis(10);
-        assert_eq!(
-            capture_timeout_by(Deadline::at(now + caller_budget), now).unwrap(),
-            caller_budget
-        );
+        let (timeout, capture_owner) =
+            capture_timeout_by(Deadline::at(now + caller_budget), now).unwrap();
+
+        assert_eq!(timeout, caller_budget);
+        assert_eq!(capture_owner, glass_core::Whose::Caller);
         assert!(matches!(
             capture_timeout_by(Deadline::at(now), now),
             Err(GlassError::Bounded {
@@ -312,5 +341,46 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn capture_receive_timeout_subtracts_setup_time() {
+        let started = Instant::now();
+        let timeout = Duration::from_millis(100);
+
+        assert_eq!(
+            capture_receive_timeout(timeout, started, started + Duration::from_millis(40)),
+            Duration::from_millis(60)
+        );
+    }
+
+    #[test]
+    fn caller_owned_capture_receive_timeout_may_have_dispatched() {
+        let error = receive_capture_by::<()>(
+            Err(mpsc::RecvTimeoutError::Timeout),
+            Whose::Caller,
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn caller_owned_capture_reply_after_deadline_is_not_success() {
+        let deadline = Deadline::at(Instant::now() - Duration::from_millis(1));
+
+        let error = receive_capture_by(Ok(()), Whose::Caller, deadline).unwrap_err();
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
     }
 }
