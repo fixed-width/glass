@@ -457,14 +457,19 @@ Execution is fail-fast. In a batch, `wait_for_element` or `scroll_to_element` re
 
 On success, `result` contains `{status, executed, steps, elapsed_ms, then?, terminal_steps?}`.
 `steps` records each action's index, discriminator, `completed` status, trusted result, and any
-zero-based references into the MCP content blocks. Failed execution remains an MCP error with
-`is_error:true`; its structured outcome records completed, failed, and unexecuted steps and retains
-content-block references. App-derived names, descriptions, values, outlines, images, and raw error
-details remain untrusted sibling blocks rather than trusted result fields. Text supplied to `type`
-or `set_value` is never echoed in trusted results.
+zero-based references into the MCP content blocks.
 
-Completed GUI effects are not rolled back. After an error, inspect the outcomes and current app
-state; do not automatically replay mutations already marked completed.
+Failed execution remains an MCP error with `is_error:true`. `executed` counts only successfully
+completed actions. The failed step records `attempted`, `side_effects_may_have_occurred`,
+`error.{code,summary,category?}`, and `content_blocks`; later steps use `status:"unexecuted"`.
+`effects_rolled_back:false` means effects from earlier actions persist. App-derived names,
+descriptions, values, outlines, and images remain untrusted sibling blocks. Non-secret raw error
+details also remain untrusted siblings. Failures from `type` and `set_value` instead expose only
+sanitized category and summary diagnostics, and submitted text is never echoed in any batch output.
+
+Do not replay a completed action or a failed action with
+`side_effects_may_have_occurred:true`. `attempted:false` proves only that the failed action itself
+was not dispatched. Inspect the outcomes and current app state before deciding what is safe to run.
 
 Example, using element ids obtained before the call:
 
@@ -616,19 +621,21 @@ follow as siblings (the legend untrusted-wrapped), per the image ordering above.
 
 ### `glass_click_element`
 
-Click an element by its `#id`. Tries the platform's native accessibility action first, falling back
-to a synthetic pointer click at the center of the element's bounds.
+Address an element by its `#id`. Glass tries the platform's role-appropriate native accessibility
+operation first, falling back to a synthetic pointer click at the center of the element's bounds.
+For a text editor, the native operation may focus and confirm focus rather than activate it.
 
 - `id` (integer, **required**) — the `#id` from the latest snapshot.
 - `return` (string) — `"snapshot"` appends a fresh a11y outline as an untrusted sibling block (and
   refreshes the id cache), `"settle"` folds settle metadata into `result.observed`, or `"none"`
   (default) adds nothing.
 
-Returns `{id, method}` — the `#id` you clicked and which path ran (`native-action`/`pointer`) —
-plus `native_fallback` (why the pointer path was used) when it was, `actuated_id` when the native
-action fired on a different element than the one you named (a control whose label is a separate
-element, as in Jetpack Compose, resolves to the enclosing control), and
-`observed: {settled, saw_motion, observed_ms}` when `return:"settle"`.
+Returns `{id, method}` — the addressed `#id` and which path ran (`native-action`/`pointer`).
+`native-action` is the stable umbrella label for the native path, not proof that an activation verb
+fired. The result also includes `native_fallback` (why the pointer path was used) when it was,
+`actuated_id` when the native operation targeted a different element than the one you named (a
+control whose label is a separate element, as in Jetpack Compose, resolves to the enclosing control),
+and `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`.
 
 ### `glass_set_value`
 

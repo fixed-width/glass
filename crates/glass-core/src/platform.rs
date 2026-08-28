@@ -267,8 +267,7 @@ pub trait Platform {
     /// teardown in silence — which is how both device backends came to need glass#422/#427.
     fn stop_app_by(&mut self, deadline: crate::Deadline) -> Result<()>;
 
-    /// [`Platform::stop_app_by`] with no bound — the tool path, where `glass_stop` waits as long
-    /// as the backend needs.
+    /// [`Platform::stop_app_by`] with no caller deadline; backend-owned ceilings still apply.
     fn stop_app(&mut self) -> Result<()> {
         self.stop_app_by(crate::Deadline::UNBOUNDED)
     }
@@ -282,7 +281,7 @@ pub trait Platform {
         deadline: crate::Deadline,
     ) -> Result<Frame>;
 
-    /// [`Platform::capture_frame_by`] with no bound.
+    /// [`Platform::capture_frame_by`] with no caller deadline; backend-owned ceilings still apply.
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
         self.capture_frame_by(region, crate::Deadline::UNBOUNDED)
     }
@@ -298,7 +297,7 @@ pub trait Platform {
         deadline: crate::Deadline,
     ) -> Result<Frame>;
 
-    /// [`Platform::capture_window_by`] with no bound.
+    /// [`Platform::capture_window_by`] with no caller deadline; backend-owned ceilings still apply.
     fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
         self.capture_window_by(id, region, crate::Deadline::UNBOUNDED)
     }
@@ -307,7 +306,7 @@ pub trait Platform {
     /// deadline.
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: crate::Deadline) -> Result<()>;
 
-    /// [`Platform::send_pointer_by`] with no bound.
+    /// [`Platform::send_pointer_by`] with no caller deadline; backend-owned ceilings still apply.
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
         self.send_pointer_by(event, crate::Deadline::UNBOUNDED)
     }
@@ -315,7 +314,7 @@ pub trait Platform {
     /// Inject a keyboard event, bounded by a caller's shared deadline.
     fn send_key_by(&mut self, event: &KeyEvent, deadline: crate::Deadline) -> Result<()>;
 
-    /// [`Platform::send_key_by`] with no bound.
+    /// [`Platform::send_key_by`] with no caller deadline; backend-owned ceilings still apply.
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
         self.send_key_by(event, crate::Deadline::UNBOUNDED)
     }

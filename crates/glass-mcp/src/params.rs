@@ -134,13 +134,14 @@ pub struct ClickElementArgs {
     /// window and the previously-active window is restored afterward — no extra step
     /// needed.
     ///
-    /// Clicks via the platform's native accessibility action when the element exposes
-    /// one (works even when the element is occluded or scrolled off-screen), falling
-    /// back to a synthetic pointer click at the element's center; the result's
-    /// `method` field says which path ran, and `native_fallback` says why when the
-    /// pointer path was used. Where a control's label is a separate element from the
-    /// control itself, the native action fires on the enclosing control and the
-    /// result carries `actuated_id` — the element actually clicked.
+    /// Uses the platform's role-appropriate native accessibility operation when one is
+    /// available (works even when the element is occluded or scrolled off-screen),
+    /// falling back to a synthetic pointer click at the element's center. Text editors
+    /// may receive focus instead of an activation. The result's `method:"native-action"`
+    /// is the stable umbrella label for the native path, not proof that an activation
+    /// verb fired; `native_fallback` says why the pointer path was used. Where a
+    /// control's label is separate from the control, the native operation targets the
+    /// enclosing control and `actuated_id` identifies that element.
     pub id: u32,
     /// Terminal observation: "snapshot" settles and refreshes/folds a11y, "settle" waits for
     /// visual stability and returns text-only metadata, and "none" skips observation (default).
@@ -526,8 +527,9 @@ pub struct SettleArgs {
     /// Per-channel difference (0–255) two frames may have and still count as
     /// unchanged (default 0, exact match).
     pub tolerance: Option<u8>,
-    /// Give up after this long (default 5000ms); the sequence continues rather than
-    /// failing.
+    /// Give up after this long (default 5000ms). Expiry of this settle's own timeout
+    /// returns settled:false and completes the step; expiry of the enclosing glass_do
+    /// deadline fails the sequence.
     pub timeout_ms: Option<u64>,
     /// Window-relative sub-rectangle to watch for settling; when set, changes outside
     /// it are ignored.
@@ -567,6 +569,9 @@ pub struct DoArgs {
     /// Optional observe run once after the last action, in the order settle → diff
     /// → screenshot.
     pub then: Option<ThenArgs>,
+    /// Overall sequence budget in milliseconds. Omit for 30000; valid range
+    /// 1..=120000. One absolute deadline is shared by all actions and terminal
+    /// observations.
     pub timeout_ms: Option<u64>,
     #[schemars(skip)]
     pub(crate) encoded_argument_bytes: usize,

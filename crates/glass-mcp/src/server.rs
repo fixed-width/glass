@@ -769,8 +769,10 @@ impl GlassServer {
                        timeout_ms defaults to 30000ms, is valid from 1 through 120000ms, and uses one absolute deadline shared by all actions and \
                        terminal settle/diff/screenshot. Fail-fast on action errors, sequence deadline, \
                        and unmatched batched wait_for_element/scroll_to_element predicates; standalone \
-                       predicates remain soft. Optional terminal order settle, diff, screenshot adds \
-                       structured outcomes. type retains return:\"none|settle|snapshot\" support. No variables, \
+                       predicates remain soft. Successful calls return a structured completed outcome for every \
+                       action. Failed calls return completed, failed, and unexecuted action outcomes in the MCP \
+                       error. Optional terminal settle, diff, screenshot adds corresponding terminal_steps \
+                       outcomes. type retains return:\"none|settle|snapshot\" support. No variables, \
                        result bindings, interpolation, branching, loops, retries, or dynamic action generation."
     )]
     async fn glass_do(
@@ -814,8 +816,10 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      actions and 65536 compact argument bytes. Its optional absolute sequence timeout_ms defaults to \
      30000ms, is valid from 1 through 120000ms, and uses one absolute deadline shared by all actions and terminal settle/diff/screenshot work. \
      Fail-fast on action errors, sequence deadline, and unmatched batched wait_for_element/\
-     scroll_to_element predicates; standalone predicates remain soft. Optional terminal order settle, \
-     diff, screenshot adds structured outcomes. type retains return:\"none|settle|snapshot\" support. \
+     scroll_to_element predicates; standalone predicates remain soft. Successful calls return a structured \
+     completed outcome for every action. Failed calls return completed, failed, and unexecuted action outcomes \
+     in the MCP error. Optional terminal settle, diff, screenshot adds corresponding terminal_steps outcomes. \
+     type retains return:\"none|settle|snapshot\" support. \
      No variables, result bindings, interpolation, branching, loops, retries, or dynamic action \
      generation.\n\n\
      Multiple windows: glass_list_windows and glass_select_window. Errors are real — a \
@@ -900,6 +904,27 @@ mod tests {
         .collect();
         assert_eq!(discriminators, expected);
         assert!(schema["properties"].get("timeout_ms").is_some(), "{schema}");
+        let sequence_timeout = schema["properties"]["timeout_ms"]["description"]
+            .as_str()
+            .expect("glass_do timeout description");
+        assert!(sequence_timeout.contains("Overall sequence budget"));
+        assert!(sequence_timeout.contains("1..=120000"));
+        assert!(sequence_timeout.contains("One absolute deadline"));
+
+        let settle_timeout = defs["SettleArgs"]["properties"]["timeout_ms"]["description"]
+            .as_str()
+            .expect("settle timeout description");
+        assert!(settle_timeout.contains("settled:false and completes the step"));
+        assert!(settle_timeout.contains("enclosing glass_do"));
+        assert!(settle_timeout.contains("deadline fails the sequence"));
+
+        let click_element_id = defs["ClickElementArgs"]["properties"]["id"]["description"]
+            .as_str()
+            .expect("click_element id description");
+        assert!(click_element_id.contains("role-appropriate native accessibility operation"));
+        let click_element_id_lower = click_element_id.to_ascii_lowercase();
+        assert!(click_element_id_lower.contains("text editors"));
+        assert!(click_element_id_lower.contains("may receive focus"));
         fn has_property(value: &serde_json::Value, name: &str) -> bool {
             value.as_object().is_some_and(|object| {
                 object
@@ -926,9 +951,12 @@ mod tests {
             "Fail-fast",
             "action errors, sequence deadline, and unmatched batched wait_for_element/scroll_to_element predicates",
             "standalone predicates remain soft",
+            "Successful calls return a structured completed outcome for every action",
+            "Failed calls return completed, failed, and unexecuted action outcomes in the MCP error",
+            "terminal_steps outcomes",
             "wait_for_element",
             "scroll_to_element",
-            "terminal order settle, diff, screenshot",
+            "Optional terminal settle, diff, screenshot",
             "type retains return:\"none|settle|snapshot\"",
             "No variables, result bindings, interpolation, branching, loops, retries, or dynamic action generation",
         ] {
@@ -953,7 +981,10 @@ mod tests {
             "click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element",
             "standalone predicates remain soft",
             "Fail-fast on action errors, sequence deadline, and unmatched batched wait_for_element/scroll_to_element predicates",
-            "terminal order settle, diff, screenshot",
+            "Successful calls return a structured completed outcome for every action",
+            "Failed calls return completed, failed, and unexecuted action outcomes in the MCP error",
+            "terminal_steps outcomes",
+            "Optional terminal settle, diff, screenshot",
             "type retains return:\"none|settle|snapshot\"",
             "No variables, result bindings, interpolation, branching, loops, retries, or dynamic action generation",
         ] {

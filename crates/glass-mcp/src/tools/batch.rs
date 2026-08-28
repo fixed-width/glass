@@ -75,8 +75,9 @@ fn settle_args(s: &SettleArgs) -> WaitStableArgs {
 
 /// Run an ordered action sequence, then the optional terminal observe.
 /// Fail-fast: the first failing action aborts with its index/kind/message and
-/// the count that ran. A `then` failure is reported distinctly (the actions
-/// already executed).
+/// the count of prior completed actions; the failed step separately records
+/// whether it was attempted. A `then` failure is reported distinctly after all
+/// actions completed.
 pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
     if a.actions.is_empty() {
         return Err(validation_error(
@@ -134,9 +135,9 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
             Action::Scroll(args) => scroll_with(glass, args, context),
             Action::Type(args) => type_text_with(glass, args, context),
             Action::Key(args) => key_with(glass, args, context),
-            // A settle's text-only output is discarded mid-sequence; only its
-            // Err (bad region / capture failure) aborts. A non-settle (timeout)
-            // is Ok and proceeds.
+            // A settle's result is retained in the step outcome. `settled:false`
+            // under its own timeout is completed; only an error or the enclosing
+            // sequence deadline aborts.
             Action::Settle(args) => wait_stable_with(glass, &settle_args(args), context),
             Action::ClickElement(args) => click_element_with(glass, args, context),
             Action::SetValue(args) => set_value_with(glass, args, context),

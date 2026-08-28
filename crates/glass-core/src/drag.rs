@@ -141,8 +141,9 @@ fn cleanup_drag<S: DragSink>(sink: &mut S, button_down: bool, modifiers_down: bo
 ///
 /// Every gesture event is checked immediately before and after dispatch, and
 /// pacing sleeps never exceed the remaining caller budget. If a failure occurs
-/// after a button or modifier press may have landed, releases are still attempted
-/// in button-then-modifier order so the backend is not left in a held state.
+/// after a button or modifier press may have landed, releases are attempted in
+/// button-then-modifier order. A cleanup dispatch can itself fail, so native input
+/// may remain held after an unsuccessful release attempt.
 pub fn run_drag_by<S: DragSink>(
     sink: &mut S,
     gesture: &DragGesture,

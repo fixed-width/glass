@@ -63,7 +63,9 @@ fn cleanup_chord<S: ChordSink>(sink: &mut S, key_down: bool, modifiers_down: boo
 ///
 /// The legacy modifier-down → dwell → key-down/up → dwell → modifier-up
 /// sequence is retained. Each normal event is checked before and after dispatch,
-/// both dwells are capped, and held input is released on every later failure.
+/// both dwells are capped, and held-input releases are attempted in dependency order
+/// on every later failure. A cleanup dispatch can itself fail, so native input may
+/// remain held after an unsuccessful release attempt.
 pub fn run_chord_by<S: ChordSink>(sink: &mut S, deadline: Deadline) -> crate::Result<()> {
     require_time(deadline, false)?;
 
