@@ -424,8 +424,8 @@ impl Glass {
         // A combo has no committing accessibility write: its `Selection` interface moves only
         // the popup's *preview* selection, and the model commits on row activation (Enter/click).
         //
-        // No cache patch on this path: every `Ok` either actuated nothing or followed an
-        // `a11y_resnapshot`, which replaces `last_ax` wholesale.
+        // Its compound input path invalidates the cached tree as soon as each mutation dispatches;
+        // a successful verification snapshot replaces it wholesale.
         if target.role == AxRole::ComboBox {
             return self.set_combo_value(id, &target, text, deadline);
         }
@@ -459,9 +459,10 @@ impl Glass {
             if st.checked == want {
                 return Ok(()); // truthful no-op, no actuation
             }
-            // No cache patch here either: the verify poll below re-snapshots, so `last_ax`
-            // holds the tree that observed the toggle.
             self.click_element_inner(id, deadline)?; // the toggle actuation (a swipe for a row-shaped control)
+            // The actuation may already have landed. Do not let a failed verification read leave
+            // the pre-toggle state available to a retry, which could toggle the control back.
+            self.invalidate_ax_cache()?;
             // iOS has no event stream, so polling uses the nearer caller/verification deadline
             // and never accepts state read after expiry.
             let now = std::time::Instant::now();
@@ -567,6 +568,7 @@ impl Glass {
                     native_fallback: COMBO_OPEN_POINTER_REASON.into(),
                 })
         })?;
+        self.invalidate_ax_cache()?;
         self.settle_for_popup(deadline)
             .map_err(GlassError::after_dispatch)?;
         // Ids don't survive a re-snapshot, so match the open (`expanded`) combo, else the one
@@ -586,8 +588,12 @@ impl Glass {
             .position(|(label, _)| label.eq_ignore_ascii_case(want));
         let Some(target_idx) = target_idx else {
             // Unknown option — dismiss the popup so the UI is left neutral, then report.
-            if !deadline.has_passed() {
-                let _ = self.semantic_key_by(&KeyEvent::Chord("Escape".to_string()), deadline);
+            if !deadline.has_passed()
+                && self
+                    .semantic_key_by(&KeyEvent::Chord("Escape".to_string()), deadline)
+                    .is_ok()
+            {
+                self.invalidate_ax_cache()?;
             }
             let choices = options
                 .iter()
@@ -609,9 +615,11 @@ impl Glass {
         for _ in 0..delta.unsigned_abs() {
             self.semantic_key_by(&KeyEvent::Chord(chord.to_string()), deadline)
                 .map_err(GlassError::after_dispatch)?;
+            self.invalidate_ax_cache()?;
         }
         self.semantic_key_by(&KeyEvent::Chord("Return".to_string()), deadline)
             .map_err(GlassError::after_dispatch)?;
+        self.invalidate_ax_cache()?;
         self.settle_for_popup(deadline)
             .map_err(GlassError::after_dispatch)?;
         // Verify the model actually committed — the *target* combo (matched by bounds,
@@ -637,6 +645,11 @@ impl Glass {
                 "the option was stepped to and committed, and the combo still shows another",
             ))
         }
+    }
+
+    fn invalidate_ax_cache(&mut self) -> Result<()> {
+        self.active_mut()?.last_ax = None;
+        Ok(())
     }
 
     /// Let a just-opened/closed popup realize in the a11y tree before re-reading.
@@ -2583,7 +2596,7 @@ mod tests {
     }
 
     #[test]
-    fn combo_post_open_read_upgrades_not_dispatched_without_losing_bound_provenance() {
+    fn combo_open_read_failure_requires_a_fresh_snapshot_before_retrying_actuation() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let platform = FakePlatform::new(340, 300).with_click_log(clicks.clone());
         let mut g = glass_with_scripted_snapshots(
@@ -2591,6 +2604,8 @@ mod tests {
             vec![
                 SnapshotReply::Tree(combo("Beta", &[])),
                 SnapshotReply::NotStarted("scripted combo open read"),
+                SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
+                SnapshotReply::Tree(combo("Delta", &[])),
             ],
         );
         g.start(&spec()).unwrap();
@@ -2602,6 +2617,18 @@ mod tests {
 
         assert_not_started_was_upgraded_after_dispatch(&error);
         assert_eq!(clicks.lock().unwrap().len(), 1, "the combo was opened");
+
+        let retry = g
+            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect_err("a retry without a fresh snapshot must not reopen the combo");
+        assert!(matches!(retry, GlassError::NoAxSnapshot), "{retry}");
+        assert_eq!(
+            clicks.lock().unwrap().len(),
+            1,
+            "the stale pre-open state must not dispatch a second pointer click"
+        );
+
+        g.a11y_resnapshot(Deadline::from_millis(2_000)).unwrap();
     }
 
     #[test]
@@ -2634,15 +2661,19 @@ mod tests {
     }
 
     #[test]
-    fn combo_verification_read_upgrades_not_dispatched_after_keys() {
+    fn combo_verification_failure_requires_a_fresh_snapshot_before_retrying_actuation() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
         let keys = Arc::new(Mutex::new(Vec::new()));
-        let platform = FakePlatform::new(340, 300).with_key_log(keys.clone());
+        let platform = FakePlatform::new(340, 300)
+            .with_click_log(clicks.clone())
+            .with_key_log(keys.clone());
         let mut g = glass_with_scripted_snapshots(
             platform,
             vec![
                 SnapshotReply::Tree(combo("Beta", &[])),
                 SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
                 SnapshotReply::NotStarted("scripted combo verification read"),
+                SnapshotReply::Tree(combo("Delta", &[])),
             ],
         );
         g.start(&spec()).unwrap();
@@ -2653,11 +2684,72 @@ mod tests {
             .expect_err("the verification read is scripted to fail");
 
         assert_not_started_was_upgraded_after_dispatch(&error);
+        assert_eq!(clicks.lock().unwrap().len(), 1, "the combo was opened once");
         assert_eq!(
             keys.lock().unwrap().len(),
             3,
             "two option steps and the commit key were sent"
         );
+
+        let retry = g
+            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect_err("a retry without a fresh snapshot must not reuse pre-commit state");
+        assert!(matches!(retry, GlassError::NoAxSnapshot), "{retry}");
+        assert_eq!(
+            clicks.lock().unwrap().len(),
+            1,
+            "the stale open-popup state must not reopen the combo"
+        );
+        assert_eq!(
+            keys.lock().unwrap().len(),
+            3,
+            "the stale open-popup state must not send another selection or commit key"
+        );
+
+        g.a11y_resnapshot(Deadline::from_millis(2_000)).unwrap();
+        g.set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .unwrap();
+        assert_eq!(clicks.lock().unwrap().len(), 1);
+        assert_eq!(keys.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn combo_unknown_option_escape_requires_a_fresh_snapshot_before_retrying() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300)
+            .with_click_log(clicks.clone())
+            .with_key_log(keys.clone());
+        let mut g = glass_with_scripted_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(combo("Beta", &[])),
+                SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
+                SnapshotReply::Tree(combo("Beta", &[])),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
+            .expect_err("Omega is not an option");
+        assert!(matches!(error, GlassError::AxOptionNotFound(1, _, _)));
+        assert_eq!(clicks.lock().unwrap().len(), 1, "the combo was opened once");
+        assert_eq!(
+            &*keys.lock().unwrap(),
+            &[KeyEvent::Chord("Escape".to_string())],
+            "the open popup was dismissed once"
+        );
+
+        let retry = g
+            .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
+            .expect_err("a retry without a fresh snapshot must not reuse the open-popup tree");
+        assert!(matches!(retry, GlassError::NoAxSnapshot), "{retry}");
+        assert_eq!(clicks.lock().unwrap().len(), 1);
+        assert_eq!(keys.lock().unwrap().len(), 1);
+
+        g.a11y_resnapshot(Deadline::from_millis(2_000)).unwrap();
     }
 
     /// The commit walks from the currently-selected option to the wanted one, so both the
@@ -3448,7 +3540,7 @@ mod tests {
     }
 
     #[test]
-    fn toggle_verification_read_upgrades_not_dispatched_after_actuation() {
+    fn toggle_verification_failure_requires_a_fresh_snapshot_before_retrying_actuation() {
         let drags = Arc::new(Mutex::new(Vec::new()));
         let platform = FakePlatform::new(400, 400)
             .with_drag_log(drags.clone())
@@ -3458,6 +3550,7 @@ mod tests {
             vec![
                 SnapshotReply::Tree(sw(false)),
                 SnapshotReply::NotStarted("scripted toggle verification read"),
+                SnapshotReply::Tree(sw(true)),
             ],
         );
         g.start(&spec()).unwrap();
@@ -3469,6 +3562,25 @@ mod tests {
 
         assert_not_started_was_upgraded_after_dispatch(&error);
         assert_eq!(drags.lock().unwrap().len(), 1, "the toggle was actuated");
+
+        let retry = g
+            .set_value_by(AxNodeId(1), "true", Deadline::from_millis(2_000))
+            .expect_err("a retry without a fresh snapshot must not reuse pre-toggle state");
+        assert!(matches!(retry, GlassError::NoAxSnapshot), "{retry}");
+        assert_eq!(
+            drags.lock().unwrap().len(),
+            1,
+            "the stale pre-toggle state must not dispatch a second actuation"
+        );
+
+        g.a11y_resnapshot(Deadline::from_millis(2_000)).unwrap();
+        g.set_value_by(AxNodeId(1), "true", Deadline::from_millis(2_000))
+            .unwrap();
+        assert_eq!(
+            drags.lock().unwrap().len(),
+            1,
+            "the fresh post-toggle state makes the retry a truthful no-op"
+        );
     }
 
     #[test]
