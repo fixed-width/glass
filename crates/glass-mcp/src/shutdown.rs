@@ -109,13 +109,36 @@ mod tests {
             std::thread::sleep(Duration::from_secs(2));
             Ok(())
         }
-        fn capture_frame(&mut self, _r: Option<&Region>) -> Result<Frame> {
+        fn capture_frame_by(
+            &mut self,
+            _r: Option<&Region>,
+            _deadline: glass_core::Deadline,
+        ) -> Result<Frame> {
             unimplemented!()
         }
-        fn send_pointer(&mut self, _e: &PointerEvent) -> Result<()> {
+        fn capture_window_by(
+            &mut self,
+            _id: WindowId,
+            _region: Option<&Region>,
+            deadline: glass_core::Deadline,
+        ) -> Result<Frame> {
+            if deadline.has_passed() {
+                return Err(glass_core::GlassError::deadline_not_started(
+                    "window capture",
+                ));
+            }
+            Err(glass_core::GlassError::Unsupported(
+                "capture_window is not supported by this backend".into(),
+            ))
+        }
+        fn send_pointer_by(
+            &mut self,
+            _e: &PointerEvent,
+            _deadline: glass_core::Deadline,
+        ) -> Result<()> {
             unimplemented!()
         }
-        fn send_key(&mut self, _e: &KeyEvent) -> Result<()> {
+        fn send_key_by(&mut self, _e: &KeyEvent, _deadline: glass_core::Deadline) -> Result<()> {
             unimplemented!()
         }
         fn window(&mut self, _o: &WindowOp) -> Result<WindowGeometry> {
@@ -177,13 +200,40 @@ mod tests {
                 *self.0.lock().unwrap() = deadline.remaining();
                 Ok(())
             }
-            fn capture_frame(&mut self, _r: Option<&Region>) -> Result<Frame> {
+            fn capture_frame_by(
+                &mut self,
+                _r: Option<&Region>,
+                _deadline: glass_core::Deadline,
+            ) -> Result<Frame> {
                 unimplemented!()
             }
-            fn send_pointer(&mut self, _e: &PointerEvent) -> Result<()> {
+            fn capture_window_by(
+                &mut self,
+                _id: WindowId,
+                _region: Option<&Region>,
+                deadline: glass_core::Deadline,
+            ) -> Result<Frame> {
+                if deadline.has_passed() {
+                    return Err(glass_core::GlassError::deadline_not_started(
+                        "window capture",
+                    ));
+                }
+                Err(glass_core::GlassError::Unsupported(
+                    "capture_window is not supported by this backend".into(),
+                ))
+            }
+            fn send_pointer_by(
+                &mut self,
+                _e: &PointerEvent,
+                _deadline: glass_core::Deadline,
+            ) -> Result<()> {
                 unimplemented!()
             }
-            fn send_key(&mut self, _e: &KeyEvent) -> Result<()> {
+            fn send_key_by(
+                &mut self,
+                _e: &KeyEvent,
+                _deadline: glass_core::Deadline,
+            ) -> Result<()> {
                 unimplemented!()
             }
             fn window(&mut self, _o: &WindowOp) -> Result<WindowGeometry> {

@@ -273,67 +273,51 @@ pub trait Platform {
         self.stop_app_by(crate::Deadline::UNBOUNDED)
     }
 
-    /// Capture the current window contents as an RGBA frame. `region` (if set,
-    /// window-relative) captures only that sub-rectangle; `None` captures the
-    /// whole window.
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame>;
-
-    /// [`Platform::capture_frame`] bounded by a caller's shared deadline.
+    /// Capture the current window contents as an RGBA frame, bounded by a caller's shared
+    /// deadline. `region` (if set, window-relative) captures only that sub-rectangle; `None`
+    /// captures the whole window.
     fn capture_frame_by(
         &mut self,
         region: Option<&Region>,
         deadline: crate::Deadline,
-    ) -> Result<Frame> {
-        if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("capture"));
-        }
-        self.capture_frame(region)
+    ) -> Result<Frame>;
+
+    /// [`Platform::capture_frame_by`] with no bound.
+    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+        self.capture_frame_by(region, crate::Deadline::UNBOUNDED)
     }
 
-    /// Capture a specific window's region from the compositor/root WITHOUT changing
-    /// the active window (unlike `select_window`). `region` (if set, relative to
-    /// `id`'s own geometry) captures only that sub-rectangle; `None` captures the
-    /// whole window. `WindowNotFound` if `id` is not currently one of the app's
-    /// windows. Default: unsupported.
-    fn capture_window(&mut self, _id: WindowId, _region: Option<&Region>) -> Result<Frame> {
-        Err(GlassError::Unsupported(
-            "capture_window is not supported by this backend".into(),
-        ))
-    }
-
-    /// [`Platform::capture_window`] bounded by a caller's shared deadline.
+    /// Capture a specific window's region from the compositor/root without changing the active
+    /// window (unlike `select_window`), bounded by a caller's shared deadline. `region` (if set,
+    /// relative to `id`'s own geometry) captures only that sub-rectangle; `None` captures the whole
+    /// window. `WindowNotFound` if `id` is not currently one of the app's windows.
     fn capture_window_by(
         &mut self,
         id: WindowId,
         region: Option<&Region>,
         deadline: crate::Deadline,
-    ) -> Result<Frame> {
-        if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("window capture"));
-        }
-        self.capture_window(id, region)
+    ) -> Result<Frame>;
+
+    /// [`Platform::capture_window_by`] with no bound.
+    fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
+        self.capture_window_by(id, region, crate::Deadline::UNBOUNDED)
     }
 
-    /// Inject a pointer event (coordinates are window-relative).
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()>;
+    /// Inject a pointer event (coordinates are window-relative), bounded by a caller's shared
+    /// deadline.
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: crate::Deadline) -> Result<()>;
 
-    /// [`Platform::send_pointer`] bounded by a caller's shared deadline.
-    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: crate::Deadline) -> Result<()> {
-        if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("pointer input"));
-        }
-        self.send_pointer(event)
+    /// [`Platform::send_pointer_by`] with no bound.
+    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+        self.send_pointer_by(event, crate::Deadline::UNBOUNDED)
     }
 
-    /// Inject a keyboard event.
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()>;
+    /// Inject a keyboard event, bounded by a caller's shared deadline.
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: crate::Deadline) -> Result<()>;
 
-    /// [`Platform::send_key`] bounded by a caller's shared deadline.
-    fn send_key_by(&mut self, event: &KeyEvent, deadline: crate::Deadline) -> Result<()> {
-        if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("key input"));
-        }
-        self.send_key(event)
+    /// [`Platform::send_key_by`] with no bound.
+    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+        self.send_key_by(event, crate::Deadline::UNBOUNDED)
     }
 
     /// Read the clipboard as UTF-8 text ("" if it holds no text).
@@ -493,13 +477,34 @@ mod tests {
         fn stop_app_by(&mut self, _deadline: crate::Deadline) -> Result<()> {
             Ok(())
         }
-        fn capture_frame(&mut self, _region: Option<&Region>) -> Result<Frame> {
+        fn capture_frame_by(
+            &mut self,
+            _region: Option<&Region>,
+            _deadline: crate::Deadline,
+        ) -> Result<Frame> {
             Err(GlassError::CaptureFailed("minimal".into()))
         }
-        fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
+        fn capture_window_by(
+            &mut self,
+            _id: WindowId,
+            _region: Option<&Region>,
+            deadline: crate::Deadline,
+        ) -> Result<Frame> {
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("window capture"));
+            }
+            Err(GlassError::Unsupported(
+                "capture_window is not supported by this backend".into(),
+            ))
+        }
+        fn send_pointer_by(
+            &mut self,
+            _event: &PointerEvent,
+            _deadline: crate::Deadline,
+        ) -> Result<()> {
             Ok(())
         }
-        fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
+        fn send_key_by(&mut self, _event: &KeyEvent, _deadline: crate::Deadline) -> Result<()> {
             Ok(())
         }
         fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
@@ -529,13 +534,34 @@ mod tests {
         fn stop_app_by(&mut self, _deadline: crate::Deadline) -> Result<()> {
             unimplemented!()
         }
-        fn capture_frame(&mut self, _region: Option<&Region>) -> Result<Frame> {
+        fn capture_frame_by(
+            &mut self,
+            _region: Option<&Region>,
+            _deadline: crate::Deadline,
+        ) -> Result<Frame> {
             unimplemented!()
         }
-        fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
+        fn capture_window_by(
+            &mut self,
+            _id: WindowId,
+            _region: Option<&Region>,
+            deadline: crate::Deadline,
+        ) -> Result<Frame> {
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("window capture"));
+            }
+            Err(GlassError::Unsupported(
+                "capture_window is not supported by this backend".into(),
+            ))
+        }
+        fn send_pointer_by(
+            &mut self,
+            _event: &PointerEvent,
+            _deadline: crate::Deadline,
+        ) -> Result<()> {
             unimplemented!()
         }
-        fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
+        fn send_key_by(&mut self, _event: &KeyEvent, _deadline: crate::Deadline) -> Result<()> {
             unimplemented!()
         }
         fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
@@ -554,8 +580,8 @@ mod tests {
 
     #[test]
     fn default_capture_window_is_unsupported() {
-        // A backend with no `capture_window` override (the common case today)
-        // reports `Unsupported`, not a silently-wrong capture of the active window.
+        // The legacy wrapper reaches the backend's explicit unsupported decision, rather than
+        // silently capturing the active window.
         let mut p = MinimalPlatform;
         let err = p.capture_window(WindowId(1), None).unwrap_err();
         assert!(matches!(err, GlassError::Unsupported(_)), "{err}");
@@ -566,28 +592,58 @@ mod tests {
         assert_eq!(MinimalPlatform.app_pid(), None);
     }
 
-    /// `stop_app` is now the provided half of the pair, so a body of `Ok(())` would mean the tool
-    /// path quietly stopped stopping the app — with every backend still compiling, since they
-    /// implement the other one.
+    /// The legacy methods are the provided halves of their pairs, so a body of `Ok(())` would mean
+    /// a standalone path quietly stopped reaching the backend — with every backend still compiling,
+    /// since it implements the required deadline-bearing method.
     #[test]
-    fn the_default_stop_app_reaches_stop_app_by_with_no_bound() {
-        struct CountingPlatform(Option<crate::Deadline>);
+    fn legacy_platform_methods_reach_required_methods_with_no_bound() {
+        #[derive(Default)]
+        struct CountingPlatform {
+            stop: Option<crate::Deadline>,
+            capture_frame: Option<crate::Deadline>,
+            capture_window: Option<crate::Deadline>,
+            pointer: Option<crate::Deadline>,
+            key: Option<crate::Deadline>,
+        }
         impl Platform for CountingPlatform {
             fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
                 Ok(WindowGeometry::default())
             }
             fn stop_app_by(&mut self, deadline: crate::Deadline) -> Result<()> {
-                self.0 = Some(deadline);
+                self.stop = Some(deadline);
                 Ok(())
             }
-            fn capture_frame(&mut self, _region: Option<&Region>) -> Result<Frame> {
-                unimplemented!()
+            fn capture_frame_by(
+                &mut self,
+                _region: Option<&Region>,
+                deadline: crate::Deadline,
+            ) -> Result<Frame> {
+                self.capture_frame = Some(deadline);
+                Err(GlassError::CaptureFailed("counted".into()))
             }
-            fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
-                unimplemented!()
+            fn capture_window_by(
+                &mut self,
+                _id: WindowId,
+                _region: Option<&Region>,
+                deadline: crate::Deadline,
+            ) -> Result<Frame> {
+                if deadline.has_passed() {
+                    return Err(GlassError::deadline_not_started("window capture"));
+                }
+                self.capture_window = Some(deadline);
+                Err(GlassError::Unsupported("counted".into()))
             }
-            fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
-                unimplemented!()
+            fn send_pointer_by(
+                &mut self,
+                _event: &PointerEvent,
+                deadline: crate::Deadline,
+            ) -> Result<()> {
+                self.pointer = Some(deadline);
+                Ok(())
+            }
+            fn send_key_by(&mut self, _event: &KeyEvent, deadline: crate::Deadline) -> Result<()> {
+                self.key = Some(deadline);
+                Ok(())
             }
             fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
                 unimplemented!()
@@ -603,13 +659,20 @@ mod tests {
             }
         }
 
-        let mut p = CountingPlatform(None);
+        let mut p = CountingPlatform::default();
         p.stop_app().expect("the default delegates");
-        assert_eq!(
-            p.0,
-            Some(crate::Deadline::UNBOUNDED),
-            "the tool path must reach the backend, and with no bound"
-        );
+        let _ = p.capture_frame(None);
+        let _ = p.capture_window(WindowId(1), None);
+        p.send_pointer(&PointerEvent::Move { x: 1, y: 1 })
+            .expect("the default delegates");
+        p.send_key(&KeyEvent::Chord("enter".into()))
+            .expect("the default delegates");
+
+        assert_eq!(p.stop, Some(crate::Deadline::UNBOUNDED));
+        assert_eq!(p.capture_frame, Some(crate::Deadline::UNBOUNDED));
+        assert_eq!(p.capture_window, Some(crate::Deadline::UNBOUNDED));
+        assert_eq!(p.pointer, Some(crate::Deadline::UNBOUNDED));
+        assert_eq!(p.key, Some(crate::Deadline::UNBOUNDED));
     }
 
     #[test]

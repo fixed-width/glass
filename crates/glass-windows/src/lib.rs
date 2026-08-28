@@ -321,10 +321,6 @@ mod backend {
             Ok(())
         }
 
-        fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-            self.capture_frame_by(region, glass_core::Deadline::UNBOUNDED)
-        }
-
         fn capture_frame_by(
             &mut self,
             region: Option<&Region>,
@@ -341,10 +337,6 @@ mod backend {
             crate::capture::capture_window_by(crate::util::raw_to_hwnd(raw), region, deadline)
         }
 
-        fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
-            self.capture_window_by(id, region, glass_core::Deadline::UNBOUNDED)
-        }
-
         fn capture_window_by(
             &mut self,
             _id: WindowId,
@@ -359,10 +351,6 @@ mod backend {
             ))
         }
 
-        fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
-            self.send_pointer_by(event, glass_core::Deadline::UNBOUNDED)
-        }
-
         fn send_pointer_by(
             &mut self,
             event: &PointerEvent,
@@ -373,10 +361,6 @@ mod backend {
             }
             let raw = self.active_hwnd.ok_or(GlassError::WindowNotFound)?;
             crate::input::send_pointer_by(raw, event, deadline)
-        }
-
-        fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-            self.send_key_by(event, glass_core::Deadline::UNBOUNDED)
         }
 
         fn send_key_by(&mut self, event: &KeyEvent, deadline: glass_core::Deadline) -> Result<()> {

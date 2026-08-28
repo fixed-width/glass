@@ -222,7 +222,13 @@ impl Platform for FakePlatform {
         }
         self.stop_app()
     }
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        if let Some(log) = &self.capture_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
         if let Some(delay) = self.capture_delay {
             std::thread::sleep(delay);
         }
@@ -241,16 +247,15 @@ impl Platform for FakePlatform {
             None => Ok(frame),
         }
     }
-    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
-        if let Some(log) = &self.capture_deadline_log {
-            log.lock().unwrap().push(deadline);
-        }
+    fn capture_window_by(
+        &mut self,
+        id: WindowId,
+        region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
         if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("capture"));
+            return Err(GlassError::deadline_not_started("window capture"));
         }
-        self.capture_frame(region)
-    }
-    fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
         self.capture_window_log
             .lock()
             .unwrap()
@@ -265,7 +270,13 @@ impl Platform for FakePlatform {
             None => Ok(frame),
         }
     }
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        if let Some(log) = &self.pointer_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("pointer input"));
+        }
         if let PointerEvent::Click { x, y, .. } = event {
             self.click_log.lock().unwrap().push((*x, *y));
         }
@@ -278,28 +289,12 @@ impl Platform for FakePlatform {
         self.pointer_events.push(event.clone());
         Ok(())
     }
-
-    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
-        if let Some(log) = &self.pointer_deadline_log {
-            log.lock().unwrap().push(deadline);
-        }
-        if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("pointer input"));
-        }
-        self.send_pointer(event)
-    }
     fn app_pid(&self) -> Option<u32> {
         Some(4242)
     }
     fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
         self.a11y_trailing_toggle
     }
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-        self.key_events.push(event.clone());
-        self.key_log.lock().unwrap().push(event.clone());
-        Ok(())
-    }
-
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         if let Some(log) = &self.key_deadline_log {
             log.lock().unwrap().push(deadline);
@@ -307,7 +302,9 @@ impl Platform for FakePlatform {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("key input"));
         }
-        self.send_key(event)
+        self.key_events.push(event.clone());
+        self.key_log.lock().unwrap().push(event.clone());
+        Ok(())
     }
     fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
         if matches!(op, WindowOp::Geometry)
@@ -1008,13 +1005,39 @@ impl Platform for BareMinPlatform {
     fn stop_app_by(&mut self, _deadline: crate::Deadline) -> Result<()> {
         Ok(())
     }
-    fn capture_frame(&mut self, _region: Option<&crate::frame::Region>) -> Result<Frame> {
+    fn capture_frame_by(
+        &mut self,
+        _region: Option<&crate::frame::Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
         Err(GlassError::CaptureFailed("bare".into()))
     }
-    fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&crate::frame::Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
+    }
+    fn send_pointer_by(&mut self, _event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("pointer input"));
+        }
         Ok(())
     }
-    fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
+    fn send_key_by(&mut self, _event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("key input"));
+        }
         Ok(())
     }
     fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {

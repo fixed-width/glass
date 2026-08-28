@@ -745,10 +745,6 @@ impl Platform for MacosPlatform {
     ///
     /// **Main-thread affinity:** like `start_app`, this reaches `ffi::app_kit_init()` and must
     /// run on the true main thread.
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        self.capture_frame_by(region, Deadline::UNBOUNDED)
-    }
-
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("capture"));
@@ -762,6 +758,21 @@ impl Platform for MacosPlatform {
             None => crate::capture::capture_window_by(&[pid as i32], region, deadline),
         }
     }
+
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
+    }
+
     /// Map the active window into `input::send_pointer` — see `input.rs`'s module doc for the
     /// CGEvent details and its main-thread-affinity note.
     ///
@@ -772,10 +783,6 @@ impl Platform for MacosPlatform {
     /// CGEvent focus target is the resolved window's own owning pid (`m.pid`), not
     /// `self.app_pid` — the same pid today, but `m.pid` is the one tied to the window being
     /// clicked.
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
-        self.send_pointer_by(event, Deadline::UNBOUNDED)
-    }
-
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
         if deadline
             .remaining()
@@ -798,10 +805,6 @@ impl Platform for MacosPlatform {
     /// keyboard targeting. The resolution still matters — if `active_window` is set but that
     /// window has closed, this surfaces `GlassError::WindowNotFound` instead of silently posting
     /// keys to whatever else is focused.
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-        self.send_key_by(event, Deadline::UNBOUNDED)
-    }
-
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         if deadline
             .remaining()

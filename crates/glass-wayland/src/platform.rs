@@ -2069,10 +2069,6 @@ impl Platform for WaylandPlatform {
         }
     }
 
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        self.capture_frame_by(region, Deadline::UNBOUNDED)
-    }
-
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
         run_wayland_call_by(deadline, "capture", |dispatch| {
             let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
@@ -2159,10 +2155,6 @@ impl Platform for WaylandPlatform {
         })
     }
 
-    fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
-        self.capture_window_by(id, region, Deadline::UNBOUNDED)
-    }
-
     fn capture_window_by(
         &mut self,
         _id: WindowId,
@@ -2175,10 +2167,6 @@ impl Platform for WaylandPlatform {
         Err(GlassError::Unsupported(
             "capture_window is not supported by this backend".into(),
         ))
-    }
-
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
-        self.send_pointer_by(event, Deadline::UNBOUNDED)
     }
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
@@ -2340,10 +2328,6 @@ impl Platform for WaylandPlatform {
             Ok(())
         })
     }
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-        self.send_key_by(event, Deadline::UNBOUNDED)
-    }
-
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         run_wayland_call_by(deadline, "key input", |dispatch| {
             use glass_core::keys::parse_chord;

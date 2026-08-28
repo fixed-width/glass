@@ -142,14 +142,9 @@ impl AndroidPlatform {
         }
     }
 
-    /// Re-read the active window's current on-screen frame before capturing — a rotation or
-    /// layout change can move/resize it since it was cached. Best-effort: keeps the cached
-    /// geometry if the window isn't currently listed (mirrors `app_pids`' live re-scan).
-    fn refresh_window(&mut self) -> Result<WindowGeometry> {
-        self.refresh_window_until(Deadline::UNBOUNDED)
-    }
-
-    /// Like [`Self::refresh_window`], bounded by a capture sequence's caller deadline.
+    /// Re-read the active window's current on-screen frame before capturing — a rotation or layout
+    /// change can move/resize it since it was cached. Best-effort: keeps the cached geometry if the
+    /// window isn't currently listed (mirrors `app_pids`' live re-scan).
     fn refresh_window_until(&mut self, deadline: Deadline) -> Result<WindowGeometry> {
         let (package, active_id) = {
             let app = self.running()?;
@@ -286,18 +281,6 @@ impl Platform for AndroidPlatform {
         self.stop_app_until(deadline)
     }
 
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        let win = self.refresh_window()?;
-        let bytes = self.adb().run_bytes(["exec-out", "screencap"])?;
-        let display = decode_screencap(&bytes)?;
-        let window_region = visible_window_region(&win, display.width, display.height)?;
-        let window_frame = display.crop(&window_region)?;
-        match region {
-            Some(r) => window_frame.crop(r),
-            None => Ok(window_frame),
-        }
-    }
-
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("capture"));
@@ -315,18 +298,24 @@ impl Platform for AndroidPlatform {
         }
     }
 
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
-        self.send_pointer_by(event, Deadline::UNBOUNDED)
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
     }
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
         let origin = self.running()?.window.clone();
         self.injector
             .pointer_by(self.target.adb(), &origin, event, deadline)
-    }
-
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-        self.send_key_by(event, Deadline::UNBOUNDED)
     }
 
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {

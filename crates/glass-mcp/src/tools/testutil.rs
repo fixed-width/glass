@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use glass_core::{
     Accessibility, AppSpec, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget,
-    AxTree, Backend, BaselineStore, Frame, Glass, GlassError, KeyEvent, Platform, PlatformFactory,
-    PointerEvent, Region, Result, Stream, Truncation, TruncationLimit, WindowGeometry, WindowId,
-    WindowInfo, WindowOp,
+    AxTree, Backend, BaselineStore, Deadline, Frame, Glass, GlassError, KeyEvent, Platform,
+    PlatformFactory, PointerEvent, Region, Result, Stream, Truncation, TruncationLimit,
+    WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 
 use super::{OutContent, ToolOutput};
@@ -92,7 +92,10 @@ impl Platform for FakePlatform {
         self.started = false;
         Ok(())
     }
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
         *self.captures.lock().unwrap() += 1;
         let frame = match self.frames.pop_front() {
             Some(f) => {
@@ -108,7 +111,25 @@ impl Platform for FakePlatform {
             None => Ok(frame),
         }
     }
-    fn send_pointer(&mut self, e: &PointerEvent) -> Result<()> {
+
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
+    }
+
+    fn send_pointer_by(&mut self, e: &PointerEvent, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("pointer input"));
+        }
         self.events.lock().unwrap().push(match e {
             PointerEvent::Click { x, y, .. } => format!("click({x},{y})"),
             PointerEvent::Move { x, y } => format!("move({x},{y})"),
@@ -127,7 +148,10 @@ impl Platform for FakePlatform {
         self.pointer_events.push(e.clone());
         Ok(())
     }
-    fn send_key(&mut self, e: &KeyEvent) -> Result<()> {
+    fn send_key_by(&mut self, e: &KeyEvent, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("key input"));
+        }
         self.events.lock().unwrap().push(match e {
             KeyEvent::Text(t) => format!("type({t})"),
             KeyEvent::Chord(c) => format!("key({c})"),

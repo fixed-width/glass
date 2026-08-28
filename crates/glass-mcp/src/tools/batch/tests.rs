@@ -172,9 +172,6 @@ impl Platform for DeadlinePlatform {
     fn stop_app_by(&mut self, deadline: Deadline) -> GlassResult<()> {
         self.inner.stop_app_by(deadline)
     }
-    fn capture_frame(&mut self, region: Option<&Region>) -> GlassResult<Frame> {
-        self.inner.capture_frame(region)
-    }
     fn capture_frame_by(
         &mut self,
         region: Option<&Region>,
@@ -192,9 +189,22 @@ impl Platform for DeadlinePlatform {
         }
         self.inner.capture_frame(region)
     }
-    fn send_pointer(&mut self, event: &PointerEvent) -> GlassResult<()> {
-        self.inner.send_pointer(event)
+
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&Region>,
+        deadline: Deadline,
+    ) -> GlassResult<Frame> {
+        self.deadlines.lock().unwrap().push(deadline);
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
     }
+
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> GlassResult<()> {
         self.deadlines.lock().unwrap().push(deadline);
         match self.behavior {
@@ -228,9 +238,6 @@ impl Platform for DeadlinePlatform {
                 self.inner.send_pointer(event)
             }
         }
-    }
-    fn send_key(&mut self, event: &KeyEvent) -> GlassResult<()> {
-        self.inner.send_key(event)
     }
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> GlassResult<()> {
         self.deadlines.lock().unwrap().push(deadline);

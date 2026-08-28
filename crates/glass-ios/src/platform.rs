@@ -612,10 +612,6 @@ impl Platform for IosPlatform {
         self.stop_app_until(deadline)
     }
 
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        self.capture_frame_by(region, Deadline::UNBOUNDED)
-    }
-
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
         self.running()?;
         let frame = screenshot_by(self.target.simctl(), self.target.udid(), deadline)?;
@@ -625,8 +621,18 @@ impl Platform for IosPlatform {
         }
     }
 
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
-        self.send_pointer_by(event, Deadline::UNBOUNDED)
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
     }
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
@@ -637,10 +643,6 @@ impl Platform for IosPlatform {
             return Ok(());
         }
         driver.client.hid_by(events, deadline)
-    }
-
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-        self.send_key_by(event, Deadline::UNBOUNDED)
     }
 
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {

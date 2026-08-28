@@ -1253,10 +1253,6 @@ impl Platform for X11Platform {
         Ok(())
     }
 
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        self.capture_frame_by(region, Deadline::UNBOUNDED)
-    }
-
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
         run_x11_call_by(deadline, "capture", |dispatch| {
             // `window_geometry()` itself calls `require_window()`, so it doubles as
@@ -1276,10 +1272,6 @@ impl Platform for X11Platform {
             dispatch.mark();
             Ok(frame)
         })
-    }
-
-    fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
-        self.capture_window_by(id, region, Deadline::UNBOUNDED)
     }
 
     fn capture_window_by(
@@ -1319,10 +1311,6 @@ impl Platform for X11Platform {
             dispatch.mark();
             Ok(frame)
         })
-    }
-
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
-        self.send_pointer_by(event, Deadline::UNBOUNDED)
     }
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
@@ -1442,10 +1430,6 @@ impl Platform for X11Platform {
             }
             self.commit()
         })
-    }
-
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-        self.send_key_by(event, Deadline::UNBOUNDED)
     }
 
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
