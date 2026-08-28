@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::deadline::Deadline;
-use crate::{BoundKind, GlassError, Result};
+use crate::{BoundDispatch, BoundKind, GlassError, Result, Whose};
 
 /// The phrase a timeout error carries, for a reader of the message. What a *caller* keys on is
 /// [`BoundKind::TimedOut`]: the message this appears in embeds the child's own output, so matching
@@ -104,17 +104,19 @@ pub fn run_bounded_until(
     deadline: Deadline,
     op: &str,
 ) -> Result<Output> {
-    let budget = deadline.within(budget, Instant::now());
+    let (budget, whose) = deadline.budget(budget, Instant::now());
     if budget.is_zero() {
         return Err(GlassError::Bounded {
             kind: BoundKind::NotStarted,
+            whose,
+            dispatch: BoundDispatch::NotDispatched,
             message: format!(
                 "{op}: the deadline it shares with the rest of the call was already spent, so it \
                  {NOT_STARTED}"
             ),
         });
     }
-    run_bounded_inner(cmd, budget, op, None)
+    run_bounded_inner(cmd, budget, whose, op, None)
 }
 
 /// Say on stderr that a teardown step never ran, when that is what `outcome` reports.
@@ -146,12 +148,13 @@ pub fn run_bounded_with_stdin(
     op: &str,
     stdin: &[u8],
 ) -> Result<Output> {
-    run_bounded_inner(cmd, budget, op, Some(stdin.to_vec()))
+    run_bounded_inner(cmd, budget, Whose::Callee, op, Some(stdin.to_vec()))
 }
 
 fn run_bounded_inner(
     cmd: &mut Command,
     budget: Duration,
+    whose: Whose,
     op: &str,
     stdin: Option<Vec<u8>>,
 ) -> Result<Output> {
@@ -212,7 +215,7 @@ fn run_bounded_inner(
             }
         }
         if deadline_passed(Instant::now(), deadline) {
-            return Err(timed_out(&mut child, op, budget, stdout, stderr));
+            return Err(timed_out(&mut child, op, budget, whose, stdout, stderr));
         }
         std::thread::sleep(wait);
         wait = next_wait(wait);
@@ -418,6 +421,7 @@ fn timed_out(
     child: &mut Child,
     op: &str,
     budget: Duration,
+    whose: Whose,
     stdout: Pipe,
     stderr: Pipe,
 ) -> GlassError {
@@ -430,6 +434,8 @@ fn timed_out(
     };
     GlassError::Bounded {
         kind: BoundKind::TimedOut,
+        whose,
+        dispatch: BoundDispatch::MayHaveDispatched,
         message: format!("{op}: {TIMED_OUT} {budget:?}, {fate}; {said}"),
     }
 }
@@ -447,10 +453,14 @@ mod tests {
     fn only_a_step_that_never_started_is_reported_as_skipped() {
         let skipped: Result<()> = Err(GlassError::Bounded {
             kind: BoundKind::NotStarted,
+            whose: Whose::Caller,
+            dispatch: BoundDispatch::NotDispatched,
             message: "spent".into(),
         });
         let timed_out: Result<()> = Err(GlassError::Bounded {
             kind: BoundKind::TimedOut,
+            whose: Whose::Callee,
+            dispatch: BoundDispatch::MayHaveDispatched,
             message: "ran, then gave up".into(),
         });
         assert!(note_if_skipped("a step", &skipped));
@@ -463,6 +473,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::Whose;
     #[cfg(unix)]
     use std::process::Command;
     use std::time::Duration;
@@ -873,6 +884,8 @@ mod tests {
             started.elapsed()
         );
         assert!(err.to_string().contains("test:outer-deadline"), "{err}");
+        assert_eq!(err.bound_owner(), Some(Whose::Caller));
+        assert_eq!(err.bound_dispatch(), Some(BoundDispatch::MayHaveDispatched));
     }
 
     #[test]
@@ -888,6 +901,8 @@ mod tests {
         )
         .expect_err("must time out");
         assert!(err.to_string().contains("300ms"), "{err}");
+        assert_eq!(err.bound_owner(), Some(Whose::Callee));
+        assert_eq!(err.bound_dispatch(), Some(BoundDispatch::MayHaveDispatched));
     }
 
     #[test]
@@ -959,6 +974,8 @@ mod tests {
         )
         .expect_err("a call with no time left must fail rather than run");
         assert_eq!(spent.bound(), Some(BoundKind::NotStarted), "{spent}");
+        assert_eq!(spent.bound_owner(), Some(Whose::Caller));
+        assert_eq!(spent.bound_dispatch(), Some(BoundDispatch::NotDispatched));
     }
 
     #[test]

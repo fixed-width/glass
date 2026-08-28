@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::Whose;
+
 /// Which bound ended a call that produced no answer — the distinction
 /// [`crate::run_bounded_until`] makes and [`GlassError::Bounded`] carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7,13 +9,21 @@ pub enum BoundKind {
     /// The call ran and was killed when its effective bound elapsed — its own budget or the
     /// deadline it shares, whichever was nearer.
     ///
-    /// It does not say which of the two governed, so a caller that passed a deadline must still
-    /// compare them: its own budget firing is evidence the tool is wedged, and its caller's is
-    /// evidence of nothing at all (glass#341, glass#347).
+    /// [`GlassError::bound_owner`] says which of the two governed: its own budget firing is evidence
+    /// the tool is wedged, and its caller's is evidence of nothing at all (glass#341, glass#347).
     TimedOut,
     /// The call never ran: the deadline it shares with the rest of a sequence was already spent.
     /// Nothing was asked, so nothing about the tool is known.
     NotStarted,
+}
+
+/// Whether a bounded failure proves that no external work was dispatched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundDispatch {
+    /// The bound was spent before glass dispatched any external work.
+    NotDispatched,
+    /// External work started, so its effect may have occurred before the bound ended the wait.
+    MayHaveDispatched,
 }
 
 /// Render a backend's own explanation as the clause closing [`GlassError::AxValueNotApplied`].
@@ -260,7 +270,12 @@ pub enum GlassError {
     /// clock glass does not own.
     #[non_exhaustive]
     #[error("backend error: {message}")]
-    Bounded { kind: BoundKind, message: String },
+    Bounded {
+        kind: BoundKind,
+        whose: Whose,
+        dispatch: BoundDispatch,
+        message: String,
+    },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -271,6 +286,8 @@ impl GlassError {
     pub fn deadline_not_started(op: &str) -> Self {
         GlassError::Bounded {
             kind: BoundKind::NotStarted,
+            whose: Whose::Caller,
+            dispatch: BoundDispatch::NotDispatched,
             message: format!(
                 "{op}: the deadline it shares with the rest of the call was already spent, so it was not started"
             ),
@@ -279,9 +296,23 @@ impl GlassError {
 
     /// A bounded operation started, then the caller's shared deadline elapsed before it answered.
     pub fn caller_deadline_elapsed(op: &str) -> Self {
+        Self::caller_deadline_elapsed_with_guidance(op, "")
+    }
+
+    /// A caller-owned timeout for a detached mutation whose effect may still arrive.
+    pub(crate) fn caller_deadline_elapsed_with_guidance(op: &str, guidance: &str) -> Self {
+        let guidance = if guidance.is_empty() {
+            String::new()
+        } else {
+            format!("; {guidance}")
+        };
         GlassError::Bounded {
             kind: BoundKind::TimedOut,
-            message: format!("{op}: the caller deadline elapsed before the operation answered"),
+            whose: Whose::Caller,
+            dispatch: BoundDispatch::MayHaveDispatched,
+            message: format!(
+                "{op}: the caller deadline elapsed before the operation answered{guidance}"
+            ),
         }
     }
 
@@ -377,6 +408,22 @@ impl GlassError {
         }
     }
 
+    /// Whose bound ended this call, when [`Self::bound`] reports one.
+    pub fn bound_owner(&self) -> Option<Whose> {
+        match self {
+            GlassError::Bounded { whose, .. } => Some(*whose),
+            _ => None,
+        }
+    }
+
+    /// Whether work may have been dispatched before this bound ended the wait.
+    pub fn bound_dispatch(&self) -> Option<BoundDispatch> {
+        match self {
+            GlassError::Bounded { dispatch, .. } => Some(*dispatch),
+            _ => None,
+        }
+    }
+
     /// What a tool wrote to stderr before exiting non-zero, trimmed, if a tool ran at all.
     ///
     /// `Some("")` is the one a backend acts on: a tool that failed saying nothing crashed, and
@@ -434,6 +481,39 @@ pub type Result<T> = std::result::Result<T, GlassError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BoundDispatch, Whose};
+
+    #[test]
+    fn caller_deadline_errors_preserve_the_caller_owner() {
+        let error = GlassError::caller_deadline_elapsed("capture");
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+    }
+
+    #[test]
+    fn ordinary_backend_errors_have_no_bound_owner() {
+        assert_eq!(GlassError::Backend("down".into()).bound_owner(), None);
+    }
+
+    #[test]
+    fn caller_deadline_errors_preserve_dispatch_uncertainty() {
+        let error = GlassError::caller_deadline_elapsed("capture");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn not_started_deadline_errors_preserve_that_nothing_dispatched() {
+        let error = GlassError::deadline_not_started("capture");
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn ordinary_backend_errors_have_no_bound_dispatch() {
+        assert_eq!(GlassError::Backend("down".into()).bound_dispatch(), None);
+    }
 
     #[test]
     fn display_messages_are_actionable() {
@@ -510,6 +590,8 @@ mod tests {
             GlassError::Backend("device offline".into()),
             GlassError::Bounded {
                 kind: BoundKind::TimedOut,
+                whose: Whose::Callee,
+                dispatch: BoundDispatch::MayHaveDispatched,
                 message: "adb:shell: no answer within 10s".into(),
             },
             GlassError::AccessibilityUnavailable("uiautomator dump wrote nothing".into()),
@@ -619,6 +701,8 @@ mod tests {
             GlassError::Backend("bus died".into()),
             GlassError::Bounded {
                 kind: BoundKind::TimedOut,
+                whose: Whose::Callee,
+                dispatch: BoundDispatch::MayHaveDispatched,
                 message: "adb:shell: no answer within 10s".into(),
             },
             GlassError::ToolFailed {
@@ -705,6 +789,8 @@ mod tests {
             GlassError::Timeout(10),
             GlassError::Bounded {
                 kind: BoundKind::TimedOut,
+                whose: Whose::Callee,
+                dispatch: BoundDispatch::MayHaveDispatched,
                 message: "adb:uiautomator dump: no answer within 20s".into(),
             },
             GlassError::ToolFailed {

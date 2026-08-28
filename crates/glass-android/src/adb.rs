@@ -213,7 +213,8 @@ impl Adb {
 /// Appended in place rather than wrapped: nesting one error inside another makes `Display` print
 /// `"backend error: "` twice, and an agent reads this text. In place also keeps the [`BoundKind`],
 /// which `a11y::bound_fired` reads downstream — a rebuild that dropped it would report every
-/// hint-carrying timeout as a device that failed.
+/// hint-carrying timeout as a device that failed. Matching in place also preserves which bound
+/// owned the timeout and whether dispatch may have occurred.
 fn with_adb_hint(mut e: GlassError) -> GlassError {
     if let GlassError::Bounded { kind, message, .. } = &mut e {
         match kind {

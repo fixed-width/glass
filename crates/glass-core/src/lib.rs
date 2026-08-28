@@ -7,7 +7,7 @@
 // Modules are added task-by-task.
 
 pub mod error;
-pub use error::{BoundKind, GlassError, Result};
+pub use error::{BoundDispatch, BoundKind, GlassError, Result};
 
 pub mod toolpath;
 pub use toolpath::tool_path;
