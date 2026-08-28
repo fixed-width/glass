@@ -167,9 +167,9 @@ mod backend {
     };
     use glass_core::{GlassError, Result};
 
-    use crate::run_windows_call_by;
     use crate::containment::{Launched, LogSink};
     use crate::display::{DisplayProvider, ExistingDesktop};
+    use crate::run_windows_call_by;
     use crate::windows::{
         app_window_infos, find_app_window, focus_window, geometry_of, move_window, resize_window,
     };
