@@ -754,6 +754,8 @@ fn success_retains_existing_fields_and_adds_every_step_result() {
     assert_eq!(result["status"], "completed");
     assert_eq!(result["executed"], json!(3));
     assert!(result["elapsed_ms"].is_u64());
+    assert!(result.get("then").is_none());
+    assert!(result.get("terminal_steps").is_none());
     assert_eq!(result["steps"].as_array().unwrap().len(), 3);
     assert_eq!(
         result["steps"],
