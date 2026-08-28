@@ -476,9 +476,15 @@ impl Glass {
                 if verify_deadline.has_passed() {
                     break;
                 }
-                let tree = self
-                    .a11y_resnapshot(verify_deadline)
-                    .map_err(GlassError::after_dispatch)?;
+                let tree = match self.a11y_resnapshot(verify_deadline) {
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        if let Some(active) = self.active.as_mut() {
+                            active.last_ax = None;
+                        }
+                        return Err(GlassError::after_dispatch(error));
+                    }
+                };
                 if verify_deadline.has_passed() {
                     break;
                 }
@@ -540,9 +546,9 @@ impl Glass {
         Ok(())
     }
 
-    /// Select an option in a dropdown/combo by label (case-insensitive). Opens the
-    /// popup, arrow-navigates from the current selection to the target, and presses
-    /// Enter to commit — verifying the button label changed (else `AxValueNotApplied`).
+    /// Select an option in a dropdown/combo by label (case-insensitive). Opens the popup when
+    /// needed, arrow-navigates from the current selection to the target, and presses Enter to
+    /// commit — verifying the button label changed (else `AxValueNotApplied`).
     fn set_combo_value(
         &mut self,
         id: AxNodeId,
@@ -551,35 +557,52 @@ impl Glass {
         deadline: Deadline,
     ) -> Result<()> {
         let want = text.trim();
-        // Already showing it? (the combo's name is its current selection label)
-        if target
-            .name
-            .as_deref()
-            .is_some_and(|n| n.eq_ignore_ascii_case(want))
+        let expanded_options = {
+            let s = self.require_active()?;
+            s.last_ax
+                .as_ref()
+                .and_then(|tree| tree.find(id))
+                .filter(|combo| combo.states.expanded)
+                .map(collect_combo_options)
+        };
+        // A closed combo already showing the requested label is a truthful no-op. An expanded
+        // combo may only be previewing that label and still needs Return to commit it.
+        if expanded_options.is_none()
+            && target
+                .name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(want))
         {
             return Ok(());
         }
-        // A real pointer click, deliberately NOT the native action: a programmatic expand
-        // (UIA's `ExpandCollapsePattern`) opens the popup without moving keyboard focus, so the
-        // Down/Up/Return below would go to whatever held focus instead.
-        let open = self.audited_click(id, |g, id| {
-            g.click_element_pointer_only(id, deadline)
-                .map(|()| ClickMethod::Pointer {
-                    native_fallback: COMBO_OPEN_POINTER_REASON.into(),
-                })
-        });
-        self.invalidate_ax_cache_after_possible_dispatch(open)?;
-        self.settle_for_popup(deadline)
-            .map_err(GlassError::after_dispatch)?;
-        // Ids don't survive a re-snapshot, so match the open (`expanded`) combo, else the one
-        // nearest the target's bounds.
-        let tree = self
-            .a11y_resnapshot(deadline)
-            .map_err(GlassError::after_dispatch)?;
-        let combo = find_expanded_combo(&tree.root)
-            .or_else(|| find_combo_near(&tree.root, target.bounds.as_ref()))
-            .ok_or(GlassError::AxElementChanged(id.0))?;
-        let options = collect_combo_options(combo);
+        let options = match expanded_options {
+            Some(options) if !options.is_empty() => options,
+            expanded_options => {
+                if expanded_options.is_none() {
+                    // A real pointer click, deliberately NOT the native action: a programmatic expand
+                    // (UIA's `ExpandCollapsePattern`) opens the popup without moving keyboard focus,
+                    // so the Down/Up/Return below would go to whatever held focus instead.
+                    let open = self.audited_click(id, |g, id| {
+                        g.click_element_pointer_only(id, deadline)
+                            .map(|()| ClickMethod::Pointer {
+                                native_fallback: COMBO_OPEN_POINTER_REASON.into(),
+                            })
+                    });
+                    self.invalidate_ax_cache_after_possible_dispatch(open)?;
+                }
+                self.settle_for_popup(deadline)
+                    .map_err(GlassError::after_dispatch)?;
+                // Ids don't survive a re-snapshot, so match the open (`expanded`) combo, else the one
+                // nearest the target's bounds.
+                let tree = self
+                    .a11y_resnapshot(deadline)
+                    .map_err(GlassError::after_dispatch)?;
+                let combo = find_expanded_combo(&tree.root)
+                    .or_else(|| find_combo_near(&tree.root, target.bounds.as_ref()))
+                    .ok_or(GlassError::AxElementChanged(id.0))?;
+                collect_combo_options(combo)
+            }
+        };
         if options.is_empty() {
             return Err(GlassError::AxElementNotEditable(id.0));
         }
@@ -2547,6 +2570,17 @@ mod tests {
         tree_with(340, 300, vec![combo])
     }
 
+    fn expanded_combo_with_selected(name: &str, options: &[&str], selected: &str) -> AxTree {
+        let mut tree = combo(name, options);
+        for option in &mut tree.root.children[0].children[0].children {
+            option.states.selected = option
+                .name
+                .as_deref()
+                .is_some_and(|label| label == selected);
+        }
+        tree
+    }
+
     enum SnapshotReply {
         Tree(AxTree),
         NotStarted(&'static str),
@@ -2765,37 +2799,56 @@ mod tests {
     }
 
     #[test]
-    fn combo_key_refusal_after_open_upgrades_not_dispatched() {
+    fn combo_selection_key_refusal_retries_same_option_without_closing_open_popup() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let keys = Arc::new(Mutex::new(Vec::new()));
-        let platform = FakePlatform::new(340, 300)
-            .with_click_log(clicks.clone())
-            .with_key_log(keys.clone());
-        let mut g = glass_with_scripted_snapshots(
+        let platform = ScriptedKeyPlatform {
+            inner: FakePlatform::new(340, 300)
+                .with_click_log(clicks.clone())
+                .with_key_log(keys.clone()),
+            replies: vec![Err(scripted_dispatch_error(
+                "scripted combo selection key",
+                crate::BoundDispatch::NotDispatched,
+            ))]
+            .into(),
+        };
+        let mut g = glass_with_scripted_key_snapshots(
             platform,
             vec![
                 SnapshotReply::Tree(combo("Beta", &[])),
-                SnapshotReply::SleepPastDeadline(combo(
-                    "Beta",
-                    &["Alpha", "Beta", "Gamma", "Delta"],
-                )),
+                SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
+                SnapshotReply::Tree(combo("Delta", &[])),
             ],
         );
         g.start(&spec()).unwrap();
         g.a11y_snapshot(None).unwrap();
 
         let error = g
-            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(400))
-            .expect_err("the first option key starts after the deadline");
+            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect_err("the first option key is explicitly refused before dispatch");
 
         assert_not_started_was_upgraded_after_dispatch(&error);
         assert_eq!(clicks.lock().unwrap().len(), 1, "the combo was opened");
-        assert!(keys.lock().unwrap().is_empty(), "the late key was not sent");
+        assert!(
+            keys.lock().unwrap().is_empty(),
+            "the refused key was not sent"
+        );
 
-        g.set_value_by(AxNodeId(1), "Beta", Deadline::from_millis(2_000))
-            .expect("a proven pre-dispatch key refusal keeps the open-popup snapshot usable");
-        assert_eq!(clicks.lock().unwrap().len(), 1);
-        assert!(keys.lock().unwrap().is_empty());
+        g.set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect("the retained expanded snapshot should finish the same selection");
+        assert_eq!(
+            clicks.lock().unwrap().len(),
+            1,
+            "retrying must not click the expanded combo and close its popup"
+        );
+        assert_eq!(
+            &*keys.lock().unwrap(),
+            &[
+                KeyEvent::Chord("Down".to_string()),
+                KeyEvent::Chord("Down".to_string()),
+                KeyEvent::Chord("Return".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -2859,16 +2912,10 @@ mod tests {
             inner: FakePlatform::new(340, 300)
                 .with_click_log(clicks.clone())
                 .with_key_log(keys.clone()),
-            replies: vec![
-                Err(scripted_dispatch_error(
-                    "scripted combo key",
-                    crate::BoundDispatch::MayHaveDispatched,
-                )),
-                Err(scripted_dispatch_error(
-                    "scripted combo key retry",
-                    crate::BoundDispatch::MayHaveDispatched,
-                )),
-            ]
+            replies: vec![Err(scripted_dispatch_error(
+                "scripted combo key",
+                crate::BoundDispatch::MayHaveDispatched,
+            ))]
             .into(),
         };
         let mut g = glass_with_scripted_key_snapshots(
@@ -2876,7 +2923,12 @@ mod tests {
             vec![
                 SnapshotReply::Tree(combo("Beta", &[])),
                 SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
-                SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
+                SnapshotReply::Tree(expanded_combo_with_selected(
+                    "Beta",
+                    &["Alpha", "Beta", "Gamma", "Delta"],
+                    "Gamma",
+                )),
+                SnapshotReply::Tree(combo("Delta", &[])),
             ],
         );
         g.start(&spec()).unwrap();
@@ -2904,10 +2956,160 @@ mod tests {
         );
 
         g.a11y_resnapshot(Deadline::from_millis(2_000)).unwrap();
-        g.set_value_by(AxNodeId(1), "Beta", Deadline::from_millis(2_000))
-            .unwrap();
+        g.set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect("the fresh expanded snapshot should finish the same selection");
+        assert_eq!(
+            clicks.lock().unwrap().len(),
+            1,
+            "retrying must not click the freshly observed expanded combo"
+        );
+        assert_eq!(
+            &*keys.lock().unwrap(),
+            &[
+                KeyEvent::Chord("Down".to_string()),
+                KeyEvent::Chord("Down".to_string()),
+                KeyEvent::Chord("Return".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn combo_return_refusal_retries_same_option_without_closing_open_popup() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = ScriptedKeyPlatform {
+            inner: FakePlatform::new(340, 300)
+                .with_click_log(clicks.clone())
+                .with_key_log(keys.clone()),
+            replies: vec![Err(scripted_dispatch_error(
+                "scripted combo return",
+                crate::BoundDispatch::NotDispatched,
+            ))]
+            .into(),
+        };
+        let mut g = glass_with_scripted_key_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(combo("Beta", &[])),
+                SnapshotReply::Tree(expanded_combo_with_selected(
+                    "Delta",
+                    &["Alpha", "Beta", "Gamma", "Delta"],
+                    "Delta",
+                )),
+                SnapshotReply::Tree(combo("Delta", &[])),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect_err("Return is explicitly refused before dispatch");
+        assert_not_started_was_upgraded_after_dispatch(&error);
         assert_eq!(clicks.lock().unwrap().len(), 1);
-        assert_eq!(keys.lock().unwrap().len(), 1);
+        assert!(keys.lock().unwrap().is_empty());
+
+        g.set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect("the retained expanded snapshot should retry the commit");
+        assert_eq!(
+            clicks.lock().unwrap().len(),
+            1,
+            "retrying Return must not close the already-open popup"
+        );
+        assert_eq!(
+            &*keys.lock().unwrap(),
+            &[KeyEvent::Chord("Return".to_string())]
+        );
+    }
+
+    #[test]
+    fn combo_escape_refusal_retries_unknown_option_without_closing_open_popup() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = ScriptedKeyPlatform {
+            inner: FakePlatform::new(340, 300)
+                .with_click_log(clicks.clone())
+                .with_key_log(keys.clone()),
+            replies: vec![Err(scripted_dispatch_error(
+                "scripted combo escape",
+                crate::BoundDispatch::NotDispatched,
+            ))]
+            .into(),
+        };
+        let mut g = glass_with_scripted_key_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(combo("Beta", &[])),
+                SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
+                SnapshotReply::Tree(combo("Beta", &[])),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let first = g
+            .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
+            .expect_err("Omega is not an option and Escape is refused");
+        assert!(matches!(first, GlassError::AxOptionNotFound(1, _, _)));
+        assert_eq!(clicks.lock().unwrap().len(), 1);
+        assert!(keys.lock().unwrap().is_empty());
+
+        let retry = g
+            .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
+            .expect_err("the same unknown option remains invalid");
+        assert!(matches!(retry, GlassError::AxOptionNotFound(1, _, _)));
+        assert_eq!(
+            clicks.lock().unwrap().len(),
+            1,
+            "retrying cleanup must not close the popup with a pointer click"
+        );
+        assert_eq!(
+            &*keys.lock().unwrap(),
+            &[KeyEvent::Chord("Escape".to_string())]
+        );
+    }
+
+    #[test]
+    fn combo_deadline_expired_cleanup_retries_without_closing_open_popup() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300)
+            .with_click_log(clicks.clone())
+            .with_key_log(keys.clone());
+        let mut g = glass_with_scripted_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(combo("Beta", &[])),
+                SnapshotReply::SleepPastDeadline(combo(
+                    "Beta",
+                    &["Alpha", "Beta", "Gamma", "Delta"],
+                )),
+                SnapshotReply::Tree(combo("Beta", &[])),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let first = g
+            .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(400))
+            .expect_err("the deadline expires before unknown-option cleanup");
+        assert!(matches!(first, GlassError::AxOptionNotFound(1, _, _)));
+        assert_eq!(clicks.lock().unwrap().len(), 1);
+        assert!(keys.lock().unwrap().is_empty(), "late Escape is skipped");
+
+        let retry = g
+            .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
+            .expect_err("the same unknown option remains invalid");
+        assert!(matches!(retry, GlassError::AxOptionNotFound(1, _, _)));
+        assert_eq!(
+            clicks.lock().unwrap().len(),
+            1,
+            "retrying cleanup must not close the retained expanded popup"
+        );
+        assert_eq!(
+            &*keys.lock().unwrap(),
+            &[KeyEvent::Chord("Escape".to_string())]
+        );
     }
 
     #[test]
@@ -3746,6 +3948,7 @@ mod tests {
             platform,
             vec![
                 SnapshotReply::Tree(sw(false)),
+                SnapshotReply::Tree(sw(false)),
                 SnapshotReply::NotStarted("scripted toggle verification read"),
                 SnapshotReply::Tree(sw(true)),
             ],
@@ -3755,7 +3958,7 @@ mod tests {
 
         let error = g
             .set_value_by(AxNodeId(1), "true", Deadline::from_millis(2_000))
-            .expect_err("the toggle verification read is scripted to fail");
+            .expect_err("a later toggle verification read is scripted to fail");
 
         assert_not_started_was_upgraded_after_dispatch(&error);
         assert_eq!(drags.lock().unwrap().len(), 1, "the toggle was actuated");
