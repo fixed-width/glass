@@ -25,6 +25,7 @@ pub(crate) type InputDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
 /// [`FakeAccessibility::ctx_log`].
 pub(crate) type CtxLog = Arc<Mutex<Option<AxContext>>>;
 pub(crate) type AxDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
+pub(crate) type AxReadStartLog = Arc<Mutex<Vec<(Deadline, bool)>>>;
 
 /// Scriptable in-memory backend for testing the session manager.
 #[derive(Default)]
@@ -40,6 +41,7 @@ pub(crate) struct FakePlatform {
     pointer_deadline_log: Option<InputDeadlineLog>,
     key_deadline_log: Option<InputDeadlineLog>,
     capture_delay: Option<Duration>,
+    geometry_delay: Option<Duration>,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
     log_batches: std::collections::VecDeque<Vec<(Stream, String)>>,
     key_log: Arc<Mutex<Vec<KeyEvent>>>,
@@ -111,6 +113,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_capture_delay(mut self, delay: Duration) -> Self {
         self.capture_delay = Some(delay);
+        self
+    }
+    pub(crate) fn with_geometry_delay(mut self, delay: Duration) -> Self {
+        self.geometry_delay = Some(delay);
         self
     }
     pub(crate) fn with_click_log(mut self, log: Arc<Mutex<Vec<(i32, i32)>>>) -> Self {
@@ -304,6 +310,11 @@ impl Platform for FakePlatform {
         self.send_key(event)
     }
     fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+        if matches!(op, WindowOp::Geometry)
+            && let Some(delay) = self.geometry_delay
+        {
+            std::thread::sleep(delay);
+        }
         match *op {
             WindowOp::Resize { width, height } => {
                 self.geometry.width = width;
@@ -668,11 +679,16 @@ pub(crate) struct SeqAccessibility {
     /// signal pays a round-trip for nothing.
     subscribes: Arc<AtomicUsize>,
     deadlines: AxDeadlineLog,
+    read_starts: AxReadStartLog,
 }
 
 impl Accessibility for SeqAccessibility {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         self.deadlines.lock().unwrap().push(ctx.deadline);
+        self.read_starts
+            .lock()
+            .unwrap()
+            .push((ctx.deadline, !ctx.deadline.has_passed()));
         self.walks.fetch_add(1, Ordering::Relaxed);
         let t = self.trees[self.idx.min(self.trees.len() - 1)].clone();
         self.idx += 1;
@@ -713,12 +729,27 @@ pub(crate) fn glass_with_a11y_seq_deadlines(
     trees: Vec<AxTree>,
     behavior: InvokeBehavior,
 ) -> (Glass, Arc<Mutex<Vec<AxTarget>>>, AxDeadlineLog) {
+    let (g, invoke_log, deadlines, _) = glass_with_a11y_seq_observed(platform, trees, behavior);
+    (g, invoke_log, deadlines)
+}
+
+pub(crate) fn glass_with_a11y_seq_observed(
+    platform: FakePlatform,
+    trees: Vec<AxTree>,
+    behavior: InvokeBehavior,
+) -> (
+    Glass,
+    Arc<Mutex<Vec<AxTarget>>>,
+    AxDeadlineLog,
+    AxReadStartLog,
+) {
     debug_assert!(
         !trees.is_empty(),
         "glass_with_a11y_seq_invoke needs at least one tree (snapshot indexes trees.len() - 1)"
     );
     let invoke_log = Arc::new(Mutex::new(Vec::new()));
     let deadlines = Arc::new(Mutex::new(Vec::new()));
+    let read_starts = Arc::new(Mutex::new(Vec::new()));
     let g = glass_with_backend(
         platform,
         Box::new(SeqAccessibility {
@@ -730,9 +761,10 @@ pub(crate) fn glass_with_a11y_seq_deadlines(
             signal: None,
             subscribes: Arc::new(AtomicUsize::new(0)),
             deadlines: deadlines.clone(),
+            read_starts: read_starts.clone(),
         }),
     );
-    (g, invoke_log, deadlines)
+    (g, invoke_log, deadlines, read_starts)
 }
 
 /// A session whose accessibility backend counts walks and hands out `signal`.
@@ -767,6 +799,7 @@ pub(crate) fn glass_with_a11y_counted_subs(
             signal,
             subscribes: subscribes.clone(),
             deadlines: Arc::new(Mutex::new(Vec::new())),
+            read_starts: Arc::new(Mutex::new(Vec::new())),
         }),
     );
     (g, walks, subscribes)

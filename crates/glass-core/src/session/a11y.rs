@@ -3694,12 +3694,46 @@ mod tests {
 
     #[test]
     fn set_value_by_passes_deadline_to_backend_and_verify_reads() {
-        let (mut g, ctx) = glass_with_a11y_ctx(FakePlatform::new(100, 100), fake_tree());
+        struct ContractBackend {
+            tree: AxTree,
+            stages: Arc<Mutex<Vec<(&'static str, Deadline)>>>,
+        }
+        impl Accessibility for ContractBackend {
+            fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+                Ok(self.tree.clone())
+            }
+            fn set_value(
+                &mut self,
+                ctx: &AxContext,
+                _target: &AxTarget,
+                _text: &str,
+            ) -> Result<()> {
+                self.stages.lock().unwrap().push(("dispatch", ctx.deadline));
+                // `Accessibility::set_value` is core's contract boundary. A real backend performs
+                // its post-write relocation/read-back before returning through this same context.
+                self.stages
+                    .lock()
+                    .unwrap()
+                    .push(("verification_read", ctx.deadline));
+                Ok(())
+            }
+        }
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with_backend(
+            FakePlatform::new(100, 100),
+            Box::new(ContractBackend {
+                tree: fake_tree(),
+                stages: stages.clone(),
+            }),
+        );
         g.start(&spec()).unwrap();
         g.a11y_snapshot(None).unwrap();
         let deadline = Deadline::from_millis(10_000);
         g.set_value_by(AxNodeId(1), "updated", deadline).unwrap();
-        assert_eq!(ctx.lock().unwrap().as_ref().unwrap().deadline, deadline);
+        assert_eq!(
+            &*stages.lock().unwrap(),
+            &[("dispatch", deadline), ("verification_read", deadline)]
+        );
     }
 
     #[test]
@@ -3727,8 +3761,11 @@ mod tests {
         assert_eq!(&*key_deadlines.lock().unwrap(), &[deadline, deadline]);
         assert_eq!(&*ax_deadlines.lock().unwrap(), &[deadline, deadline]);
 
+        let short_pointer = Arc::new(Mutex::new(Vec::new()));
         let short_keys = Arc::new(Mutex::new(Vec::new()));
-        let short_platform = FakePlatform::new(340, 300).with_key_deadline_log(short_keys.clone());
+        let short_platform = FakePlatform::new(340, 300)
+            .with_pointer_deadline_log(short_pointer.clone())
+            .with_key_deadline_log(short_keys.clone());
         let (mut short, _, _) = glass_with_a11y_seq_deadlines(
             short_platform,
             vec![combo("Acme", &[]), combo("Acme", &["Acme", "Globex"])],
@@ -3736,11 +3773,21 @@ mod tests {
         );
         short.start(&spec()).unwrap();
         short.a11y_snapshot(None).unwrap();
+        let short_deadline = Deadline::from_millis(20);
+        let err = short
+            .set_value_by(AxNodeId(1), "Globex", short_deadline)
+            .unwrap_err();
         assert!(
-            short
-                .set_value_by(AxNodeId(1), "Globex", Deadline::from_millis(20))
-                .is_err()
+            matches!(
+                err,
+                GlassError::Bounded {
+                    kind: crate::error::BoundKind::TimedOut,
+                    ..
+                }
+            ),
+            "{err}"
         );
+        assert_eq!(&*short_pointer.lock().unwrap(), &[short_deadline]);
         assert!(short_keys.lock().unwrap().is_empty());
     }
 
@@ -3751,7 +3798,7 @@ mod tests {
         let platform = FakePlatform::new(400, 400)
             .with_drag_log(drags.clone())
             .with_trailing_toggle_backend();
-        let (mut g, _, ax_deadlines) = glass_with_a11y_seq_deadlines(
+        let (mut g, _, ax_deadlines, read_starts) = glass_with_a11y_seq_observed(
             platform,
             vec![sw(false), sw(false)],
             InvokeBehavior::Unsupported,
@@ -3759,22 +3806,46 @@ mod tests {
         g.start(&spec()).unwrap();
         g.a11y_snapshot(None).unwrap();
         ax_deadlines.lock().unwrap().clear();
+        read_starts.lock().unwrap().clear();
         let err = g.set_value_by(AxNodeId(1), "true", deadline).unwrap_err();
-        assert!(matches!(err, GlassError::Bounded { .. }), "{err}");
+        assert!(
+            matches!(
+                err,
+                GlassError::Bounded {
+                    kind: crate::error::BoundKind::TimedOut,
+                    ..
+                }
+            ),
+            "{err}"
+        );
         assert_eq!(drags.lock().unwrap().len(), 1);
         let reads = ax_deadlines.lock().unwrap();
         assert!(!reads.is_empty());
         assert!(reads.iter().all(|seen| *seen == deadline), "{reads:?}");
+        let starts = read_starts.lock().unwrap();
+        assert!(!starts.is_empty());
+        assert!(
+            starts
+                .iter()
+                .all(|(seen, started_live)| *seen == deadline && *started_live),
+            "no verification read may start after the effective caller deadline: {starts:?}"
+        );
     }
 
     #[test]
     fn spent_deadline_dispatches_no_semantic_actuation() {
+        let assert_one_failed = |sink: &RecordingSink, action: &str| {
+            let expected = vec!["launch:true".to_string(), format!("{action}:false")];
+            assert_eq!(&*sink.0.lock().unwrap(), &expected);
+        };
         let pointer = Arc::new(Mutex::new(Vec::new()));
         let (mut g, invoke) = glass_with_a11y_invoke(
             FakePlatform::new(100, 100).with_pointer_deadline_log(pointer.clone()),
             fake_tree(),
             InvokeBehavior::Succeed,
         );
+        let click_audit = RecordingSink::default();
+        g.set_audit_sink(Box::new(click_audit.clone()));
         g.start(&spec()).unwrap();
         g.a11y_snapshot(None).unwrap();
         assert!(
@@ -3783,5 +3854,88 @@ mod tests {
         );
         assert!(invoke.lock().unwrap().is_empty());
         assert!(pointer.lock().unwrap().is_empty());
+        assert_one_failed(&click_audit, "click_element");
+
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut set =
+            glass_ready_for_set_value(Box::new(logging_a11y(fake_tree(), writes.clone())));
+        let set_audit = RecordingSink::default();
+        set.set_audit_sink(Box::new(set_audit.clone()));
+        assert!(
+            set.set_value_by(AxNodeId(1), "updated", Deadline::from_millis(0))
+                .is_err()
+        );
+        assert!(writes.lock().unwrap().is_empty());
+        assert_eq!(set_audit.0.lock().unwrap().as_slice(), &["set_value:false"]);
+
+        let combo_pointer = Arc::new(Mutex::new(Vec::new()));
+        let combo_keys = Arc::new(Mutex::new(Vec::new()));
+        let mut combo_g = glass_with_a11y(
+            FakePlatform::new(340, 300)
+                .with_pointer_deadline_log(combo_pointer.clone())
+                .with_key_deadline_log(combo_keys.clone()),
+            combo("Acme", &[]),
+        );
+        let combo_audit = RecordingSink::default();
+        combo_g.set_audit_sink(Box::new(combo_audit.clone()));
+        combo_g.start(&spec()).unwrap();
+        combo_g.a11y_snapshot(None).unwrap();
+        assert!(
+            combo_g
+                .set_value_by(AxNodeId(1), "Globex", Deadline::from_millis(0))
+                .is_err()
+        );
+        assert!(combo_pointer.lock().unwrap().is_empty());
+        assert!(combo_keys.lock().unwrap().is_empty());
+        assert_one_failed(&combo_audit, "set_value");
+
+        let toggle_pointer = Arc::new(Mutex::new(Vec::new()));
+        let (mut toggle, toggle_invoke) = glass_with_a11y_invoke(
+            FakePlatform::new(400, 400)
+                .with_pointer_deadline_log(toggle_pointer.clone())
+                .with_trailing_toggle_backend(),
+            sw(false),
+            InvokeBehavior::Succeed,
+        );
+        let toggle_audit = RecordingSink::default();
+        toggle.set_audit_sink(Box::new(toggle_audit.clone()));
+        toggle.start(&spec()).unwrap();
+        toggle.a11y_snapshot(None).unwrap();
+        assert!(
+            toggle
+                .set_value_by(AxNodeId(1), "true", Deadline::from_millis(0))
+                .is_err()
+        );
+        assert!(toggle_invoke.lock().unwrap().is_empty());
+        assert!(toggle_pointer.lock().unwrap().is_empty());
+        assert_one_failed(&toggle_audit, "set_value");
+
+        let (mut delayed_click, invoke_log) = glass_with_a11y_invoke(
+            FakePlatform::new(100, 100).with_geometry_delay(Duration::from_millis(20)),
+            fake_tree(),
+            InvokeBehavior::Succeed,
+        );
+        delayed_click.start(&spec()).unwrap();
+        delayed_click.a11y_snapshot(None).unwrap();
+        assert!(
+            delayed_click
+                .click_element_by(AxNodeId(1), Deadline::from_millis(5))
+                .is_err()
+        );
+        assert!(invoke_log.lock().unwrap().is_empty());
+
+        let delayed_writes = Arc::new(Mutex::new(Vec::new()));
+        let mut delayed_set = glass_with_backend(
+            FakePlatform::new(100, 100).with_geometry_delay(Duration::from_millis(20)),
+            Box::new(logging_a11y(fake_tree(), delayed_writes.clone())),
+        );
+        delayed_set.start(&spec()).unwrap();
+        delayed_set.a11y_snapshot(None).unwrap();
+        assert!(
+            delayed_set
+                .set_value_by(AxNodeId(1), "updated", Deadline::from_millis(5))
+                .is_err()
+        );
+        assert!(delayed_writes.lock().unwrap().is_empty());
     }
 }
