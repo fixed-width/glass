@@ -109,6 +109,7 @@ impl ContextualOutput {
 pub(crate) struct ContextualError {
     pub message: String,
     pub sequence_deadline_exceeded: bool,
+    pub not_dispatched: bool,
 }
 
 impl ContextualError {
@@ -116,10 +117,13 @@ impl ContextualError {
         Self {
             message,
             sequence_deadline_exceeded: false,
+            not_dispatched: false,
         }
     }
 
     pub fn from_core(error: glass_core::GlassError, context: ToolContext) -> Self {
+        let not_dispatched =
+            error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched);
         let sequence_deadline_exceeded = match error.bound() {
             Some(glass_core::BoundKind::NotStarted) => context.deadline.has_passed(),
             Some(glass_core::BoundKind::TimedOut) => context.deadline.has_passed(),
@@ -128,15 +132,19 @@ impl ContextualError {
         Self {
             message: error.to_string(),
             sequence_deadline_exceeded,
+            not_dispatched,
         }
     }
 
     pub fn from_caller_bound(error: glass_core::GlassError, context: ToolContext) -> Self {
+        let not_dispatched =
+            error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched);
         let sequence_deadline_exceeded =
             error.bound().is_some() && context.deadline.remaining().is_some();
         Self {
             message: error.to_string(),
             sequence_deadline_exceeded,
+            not_dispatched,
         }
     }
 
@@ -145,12 +153,15 @@ impl ContextualError {
         context: ToolContext,
         whose: glass_core::Whose,
     ) -> Self {
+        let not_dispatched =
+            error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched);
         let sequence_deadline_exceeded = error.bound().is_some()
             && whose == glass_core::Whose::Caller
             && context.deadline.remaining().is_some();
         Self {
             message: error.to_string(),
             sequence_deadline_exceeded,
+            not_dispatched,
         }
     }
 
@@ -163,6 +174,7 @@ impl ContextualError {
         Self {
             message,
             sequence_deadline_exceeded: true,
+            not_dispatched: false,
         }
     }
 }

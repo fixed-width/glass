@@ -25,6 +25,10 @@ fn checked_sequence_deadline(started: Instant, timeout: Duration) -> Option<Dead
     started.checked_add(timeout).map(Deadline::at)
 }
 
+fn caller_deadline_won(timed_out_by: Option<Whose>, deadline: Deadline) -> bool {
+    timed_out_by == Some(Whose::Caller) || deadline.has_passed()
+}
+
 /// Split a sub-tool's enveloped output into (its `result` payload, its non-envelope
 /// sibling blocks — images and the IMAGE_NOTE). The envelope text block itself is consumed.
 ///
@@ -145,7 +149,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 let start = siblings.len() + 1;
                 let content_blocks = (start..start + extra.len()).collect();
                 siblings.append(&mut extra);
-                if timed_out_by == Some(Whose::Caller) {
+                if caller_deadline_won(timed_out_by, context.deadline) {
                     return Err(predicate_failure(
                         &a.actions,
                         i,
@@ -187,12 +191,13 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
             }
             Err(error) => {
                 let detail = redacted_error_detail(action, &error.message);
+                let attempted = !error.not_dispatched;
                 return Err(step_failure(
                     &a.actions,
                     i,
                     kind,
-                    true,
-                    action.is_mutating(),
+                    attempted,
+                    attempted && action.is_mutating(),
                     &detail,
                     error.sequence_deadline_exceeded,
                     steps,
@@ -216,11 +221,22 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 let mut outcome = failure_outcome(steps, n, started.elapsed().as_millis());
                 outcome["then"] = terminal.meta;
                 outcome["terminal_steps"] = json!(terminal.outcomes);
+                let (code, summary) = if terminal.sequence_deadline_exceeded {
+                    (
+                        "sequence_deadline_exceeded",
+                        "sequence deadline exceeded after actions completed; do not replay actions",
+                    )
+                } else {
+                    (
+                        "terminal_observe_failed",
+                        "terminal observation failed after actions completed; do not replay actions",
+                    )
+                };
                 return Err(error_output(
                     json!({
                     "ok": false,
                     "tool": "glass_do",
-                    "error": { "code": "terminal_observe_failed", "summary": "terminal observation failed after actions completed; do not replay actions" },
+                    "error": { "code": code, "summary": summary },
                     "outcome": outcome,
                     }),
                     siblings,
@@ -420,6 +436,7 @@ struct ThenRun {
     meta: serde_json::Value,
     outcomes: Vec<TerminalOutcome>,
     siblings: Vec<OutContent>,
+    sequence_deadline_exceeded: bool,
 }
 
 /// Run terminal observation in fixed order under the sequence's one deadline.
@@ -433,11 +450,13 @@ fn run_then(
         meta: json!({}),
         outcomes: Vec::new(),
         siblings: Vec::new(),
+        sequence_deadline_exceeded: false,
     };
 
     macro_rules! terminal_operation {
         ($operation:literal, $call:expr, [$($later:literal),* $(,)?]) => {{
             if context.deadline.has_passed() {
+                run.sequence_deadline_exceeded = true;
                 run.outcomes.push(TerminalOutcome::Failed {
                     operation: $operation,
                     error: StepError { code: "sequence_deadline_exceeded", summary: "sequence deadline exceeded".into() },
@@ -447,7 +466,7 @@ fn run_then(
                 return Err(run);
             }
             match $call {
-                Ok(out) if out.timed_out_by != Some(Whose::Caller) => {
+                Ok(out) if !caller_deadline_won(out.timed_out_by, context.deadline) => {
                     let (result, mut extra) = split_sub(out.output);
                     let start = sibling_base + run.siblings.len();
                     let content_blocks = (start..start + extra.len()).collect();
@@ -456,6 +475,7 @@ fn run_then(
                     run.outcomes.push(TerminalOutcome::Completed { operation: $operation, result, content_blocks });
                 }
                 Ok(_) => {
+                    run.sequence_deadline_exceeded = true;
                     run.outcomes.push(TerminalOutcome::Failed {
                         operation: $operation,
                         error: StepError { code: "sequence_deadline_exceeded", summary: "sequence deadline exceeded".into() },
@@ -465,6 +485,7 @@ fn run_then(
                     return Err(run);
                 }
                 Err(error) => {
+                    run.sequence_deadline_exceeded = error.sequence_deadline_exceeded;
                     let code = if error.sequence_deadline_exceeded { "sequence_deadline_exceeded" } else { "action_failed" };
                     let summary = if error.sequence_deadline_exceeded { "sequence deadline exceeded" } else { "terminal observation failed" };
                     let content_blocks = if error.message.is_empty() { Vec::new() } else {

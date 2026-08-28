@@ -15,6 +15,7 @@ enum DeadlineBehavior {
     Normal,
     CompleteLate,
     FailLate,
+    NotDispatched,
     CaptureCompletesLate,
 }
 
@@ -143,7 +144,7 @@ impl Platform for DeadlinePlatform {
     ) -> GlassResult<Frame> {
         self.deadlines.lock().unwrap().push(deadline);
         if matches!(self.behavior, DeadlineBehavior::CaptureCompletesLate) {
-            std::thread::sleep(Duration::from_millis(250));
+            sleep_past(deadline);
             return self.inner.capture_frame(region);
         }
         self.inner.capture_frame(region)
@@ -156,13 +157,16 @@ impl Platform for DeadlinePlatform {
         match self.behavior {
             DeadlineBehavior::Normal => self.inner.send_pointer(event),
             DeadlineBehavior::CompleteLate => {
-                std::thread::sleep(Duration::from_millis(3));
+                sleep_past(deadline);
                 self.inner.send_pointer(event)
             }
             DeadlineBehavior::FailLate => {
                 self.inner.send_pointer(event)?;
                 std::thread::sleep(Duration::from_millis(3));
                 Err(GlassError::caller_deadline_elapsed("controlled pointer"))
+            }
+            DeadlineBehavior::NotDispatched => {
+                Err(GlassError::deadline_not_started("controlled pointer"))
             }
             DeadlineBehavior::CaptureCompletesLate => self.inner.send_pointer(event),
         }
@@ -277,6 +281,50 @@ fn do_args(actions: Vec<Action>, timeout_ms: u64) -> DoArgs {
         then: None,
         timeout_ms: Some(timeout_ms),
         encoded_argument_bytes: 0,
+    }
+}
+
+fn sleep_past(deadline: Deadline) {
+    let remaining = deadline
+        .remaining()
+        .expect("late-completion tests require a bounded deadline");
+    std::thread::sleep(remaining.saturating_add(Duration::from_millis(10)));
+    assert!(deadline.has_passed());
+}
+
+fn envelope(output: &ToolOutput) -> serde_json::Value {
+    serde_json::from_str(match &output.0[0] {
+        OutContent::Text(text) => text,
+        OutContent::Image(_) => panic!("batch envelope must be text"),
+    })
+    .unwrap()
+}
+
+fn run_delayed_final_click() -> ToolOutput {
+    let (mut glass, _, _) = deadline_glass(DeadlineBehavior::CompleteLate, vec![]);
+    match do_actions(&mut glass, &do_args(vec![click(1, 1)], 1)) {
+        Ok(output) | Err(output) => output,
+    }
+}
+
+fn run_delayed_terminal_screenshot() -> ToolOutput {
+    let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
+    let (mut glass, _, _) = deadline_glass(DeadlineBehavior::CaptureCompletesLate, vec![frame]);
+    let args = DoArgs {
+        actions: vec![click(0, 0)],
+        then: Some(ThenArgs {
+            settle: None,
+            diff: None,
+            screenshot: Some(ScreenshotArgs {
+                region: None,
+                window_id: None,
+            }),
+        }),
+        timeout_ms: Some(20),
+        encoded_argument_bytes: 0,
+    };
+    match do_actions(&mut glass, &args) {
+        Ok(output) | Err(output) => output,
     }
 }
 
@@ -469,7 +517,7 @@ fn sequence_uses_one_absolute_deadline_for_every_action() {
 }
 
 #[test]
-fn deadline_spent_before_step_marks_it_failed_unattempted() {
+fn late_action_is_failed_and_later_actions_are_unexecuted() {
     let (mut g, _, events) = deadline_glass(DeadlineBehavior::CompleteLate, vec![]);
     let err = do_actions(
         &mut g,
@@ -488,13 +536,28 @@ fn deadline_spent_before_step_marks_it_failed_unattempted() {
     let error = error_text(err);
     let envelope: serde_json::Value = serde_json::from_str(&error).unwrap();
     assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
-    assert_eq!(envelope["outcome"]["steps"][1]["attempted"], false);
+    assert_eq!(envelope["outcome"]["steps"][0]["status"], "failed");
+    assert_eq!(envelope["outcome"]["steps"][0]["attempted"], true);
     assert_eq!(
-        envelope["outcome"]["steps"][1]["side_effects_may_have_occurred"],
-        false
+        envelope["outcome"]["steps"][0]["side_effects_may_have_occurred"],
+        true
     );
+    assert_eq!(envelope["outcome"]["steps"][1]["status"], "unexecuted");
     assert_eq!(envelope["outcome"]["steps"][2]["status"], "unexecuted");
     assert_eq!(*events.lock().unwrap(), vec!["click(1,1)"]);
+}
+
+#[test]
+fn delayed_final_mutation_is_not_reported_completed() {
+    let output = run_delayed_final_click();
+    let envelope = envelope(&output);
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(envelope["outcome"]["steps"][0]["status"], "failed");
+    assert_eq!(envelope["outcome"]["steps"][0]["attempted"], true);
+    assert_eq!(
+        envelope["outcome"]["steps"][0]["side_effects_may_have_occurred"],
+        true
+    );
 }
 
 #[test]
@@ -662,6 +725,29 @@ fn mutating_deadline_failure_warns_side_effects_may_have_occurred() {
     assert_eq!(step["side_effects_may_have_occurred"], true);
     assert_eq!(envelope["outcome"]["effects_rolled_back"], false);
     assert_eq!(*events.lock().unwrap(), vec!["click(1,1)"]);
+}
+
+#[test]
+fn proven_not_dispatched_mutation_is_reported_unattempted() {
+    let (mut g, _, events) = deadline_glass(DeadlineBehavior::NotDispatched, vec![]);
+    let err = do_actions(&mut g, &do_args(vec![click(1, 1)], 100)).unwrap_err();
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    let step = &envelope["outcome"]["steps"][0];
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["attempted"], false);
+    assert_eq!(step["side_effects_may_have_occurred"], false);
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn unknown_mutation_failure_remains_conservatively_attempted() {
+    let mut g = started(FakePlatform::new(10, 10));
+    let err = do_actions(&mut g, &do_args(vec![click(10, 1)], 100)).unwrap_err();
+    let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
+    let step = &envelope["outcome"]["steps"][0];
+    assert_eq!(envelope["error"]["code"], "action_failed");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], true);
 }
 
 fn started(platform: FakePlatform) -> Glass {
@@ -1868,7 +1954,7 @@ fn terminal_sequence_deadline_keeps_all_action_steps_completed() {
     )
     .unwrap_err();
     let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
-    assert_eq!(envelope["error"]["code"], "terminal_observe_failed");
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
     assert_eq!(envelope["outcome"]["executed"], 2);
     assert!(
         envelope["outcome"]["steps"]
@@ -1894,6 +1980,14 @@ fn terminal_sequence_deadline_keeps_all_action_steps_completed() {
     );
     assert_ne!(seen[0], Deadline::UNBOUNDED);
     assert!(seen.iter().all(|deadline| *deadline == seen[0]));
+}
+
+#[test]
+fn delayed_final_screenshot_is_not_reported_completed() {
+    let output = run_delayed_terminal_screenshot();
+    let envelope = envelope(&output);
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(envelope["outcome"]["terminal_steps"][0]["status"], "failed");
 }
 
 #[test]
