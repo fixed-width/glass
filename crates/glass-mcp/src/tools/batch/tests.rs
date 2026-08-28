@@ -27,6 +27,34 @@ struct DeadlinePlatform {
 type DeadlineFixture = (Glass, Arc<Mutex<Vec<Deadline>>>, Arc<Mutex<Vec<String>>>);
 type A11yDeadlineFixture = (Glass, Arc<Mutex<Vec<Deadline>>>, Arc<Mutex<Vec<Deadline>>>);
 
+#[derive(Debug, PartialEq, Eq)]
+enum ExactContent {
+    Text(String),
+    Image(Vec<u8>),
+}
+
+fn exact_contents(output: &ToolOutput) -> Vec<ExactContent> {
+    output
+        .0
+        .iter()
+        .map(|content| match content {
+            OutContent::Text(text) => ExactContent::Text(canonicalize_untrusted_nonce(text)),
+            OutContent::Image(image) => ExactContent::Image(image.clone()),
+        })
+        .collect()
+}
+
+fn canonicalize_untrusted_nonce(text: &str) -> String {
+    const PREFIX: &str = "⟦untrusted:";
+    let Some(nonce_start) = text.find(PREFIX).map(|start| start + PREFIX.len()) else {
+        return text.to_owned();
+    };
+    let Some(nonce_len) = text[nonce_start..].find('⟧') else {
+        return text.to_owned();
+    };
+    text.replace(&text[nonce_start..nonce_start + nonce_len], "<nonce>")
+}
+
 struct DeadlineAccessibility {
     tree: AxTree,
     deadlines: Arc<Mutex<Vec<Deadline>>>,
@@ -56,7 +84,7 @@ impl Platform for DeadlinePlatform {
     ) -> GlassResult<Frame> {
         self.deadlines.lock().unwrap().push(deadline);
         if matches!(self.behavior, DeadlineBehavior::CaptureCompletesLate) {
-            std::thread::sleep(Duration::from_millis(160));
+            std::thread::sleep(Duration::from_millis(250));
             return self.inner.capture_frame(region);
         }
         self.inner.capture_frame(region)
@@ -196,7 +224,7 @@ fn do_args(actions: Vec<Action>, timeout_ms: u64) -> DoArgs {
 #[test]
 fn standalone_handlers_use_unbounded_context_and_keep_wire_shape() {
     let (mut g, deadlines, _) = deadline_glass(
-        DeadlineBehavior::CaptureCompletesLate,
+        DeadlineBehavior::Normal,
         vec![Frame::solid(100, 100, [0, 0, 0, 255])],
     );
     let args = ClickArgs {
@@ -313,9 +341,10 @@ fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
         panic!("contextual type snapshot envelope must lead")
     };
     assert_eq!(standalone_envelope, contextual_envelope);
-    assert_eq!(standalone_out.0.len(), contextual_out.0.len());
-    assert!(format!("{:?}", standalone_out.0[1]).contains("Save"));
-    assert!(format!("{:?}", contextual_out.0[1]).contains("Save"));
+    assert_eq!(
+        exact_contents(&standalone_out),
+        exact_contents(&contextual_out)
+    );
     for log in [standalone_platform, contextual_platform] {
         let deadlines = log.lock().unwrap();
         assert!(!deadlines.is_empty());
@@ -458,8 +487,8 @@ fn settle_own_timeout_is_completed_but_sequence_timeout_fails() {
         stability_region: None,
         ignore: None,
     });
-    let (mut caller, _, events) = deadline_glass(
-        DeadlineBehavior::Normal,
+    let (mut caller, deadlines, events) = deadline_glass(
+        DeadlineBehavior::CaptureCompletesLate,
         vec![black.clone(), white.clone(), black, white],
     );
     let err = do_actions(
@@ -472,7 +501,7 @@ fn settle_own_timeout_is_completed_but_sequence_timeout_fails() {
                     chord: "Tab".into(),
                 }),
             ],
-            1,
+            200,
         ),
     )
     .unwrap_err();
@@ -488,6 +517,12 @@ fn settle_own_timeout_is_completed_but_sequence_timeout_fails() {
     assert_eq!(step["result"]["settled"], false);
     assert_eq!(envelope["outcome"]["steps"][2]["status"], "unexecuted");
     assert_eq!(*events.lock().unwrap(), vec!["click(1,1)"]);
+    let deadlines = deadlines.lock().unwrap();
+    assert!(
+        deadlines.len() >= 2,
+        "settle capture did not run: {deadlines:?}"
+    );
+    assert!(deadlines.iter().all(|deadline| *deadline == deadlines[0]));
 }
 
 #[test]
