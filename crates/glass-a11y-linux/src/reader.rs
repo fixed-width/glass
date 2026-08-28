@@ -65,7 +65,7 @@ fn set_value_with_thread(
     thread: &A11yThread,
     ctx: AxContext,
     target: u32,
-    job: impl FnOnce(AxContext, SetValueDispatch) -> Result<()> + Send + 'static,
+    job: impl FnOnce(AxContext, &SetValueDispatch) -> Result<()> + Send + 'static,
 ) -> Result<()> {
     thread.set_value(target, ctx.deadline, move |dispatch| job(ctx, dispatch))
 }
@@ -82,13 +82,13 @@ fn run_set_value(
     ctx: &AxContext,
     target: &AxTarget,
     text: &str,
-    dispatch: SetValueDispatch,
+    dispatch: &SetValueDispatch,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
-    rt.block_on(set_value_async(ctx, target, text, &dispatch))
+    rt.block_on(set_value_async(ctx, target, text, dispatch))
 }
 
 fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
@@ -1108,9 +1108,10 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, GlassError::AxWriteUnconfirmed(7, _)),
+            matches!(error, GlassError::AxWriteUnconfirmedCaused { id: 7, .. }),
             "{error}"
         );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
         assert!(error.set_value_failed_after_writing(), "{error}");
     }
 

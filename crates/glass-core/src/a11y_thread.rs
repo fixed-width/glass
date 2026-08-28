@@ -38,11 +38,28 @@ const SET_VALUE_CANCELLED: u8 = 2;
 /// The operation-specific dispatch gate for a detached native value mutation.
 ///
 /// A backend performs all target resolution and guard reads before calling [`Self::dispatch`]. The
-/// first call from any clone atomically claims permission to begin the native setter. Every later
-/// call is refused, including after the enclosing operation returns. If the waiting caller has
-/// already timed out, the setter is also refused, so a timeout reported as pre-write cannot later
-/// mutate the value on the detached worker.
-#[derive(Clone)]
+/// first call through the borrowed capability atomically claims permission to begin the native
+/// setter. Every later call is refused. If the waiting caller has already timed out, the setter is
+/// also refused, so a timeout reported as pre-write cannot later mutate the value on the detached
+/// worker.
+///
+/// The capability is borrowed by the worker job and cannot escape to a detached helper that
+/// dispatches after the job returns:
+///
+/// ```compile_fail
+/// use glass_core::{A11yThread, Deadline, Result};
+/// use std::time::Duration;
+///
+/// let _: Result<()> = A11yThread::new("example", Duration::from_secs(1)).set_value(
+///     7,
+///     Deadline::UNBOUNDED,
+///     |dispatch| {
+///         let late = dispatch.clone();
+///         std::thread::spawn(move || late.dispatch(|| Ok(())));
+///         Ok(())
+///     },
+/// );
+/// ```
 pub struct SetValueDispatch {
     state: Arc<AtomicU8>,
 }
@@ -51,6 +68,12 @@ impl SetValueDispatch {
     fn new() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(SET_VALUE_PENDING)),
+        }
+    }
+
+    fn duplicate(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
         }
     }
 
@@ -116,10 +139,10 @@ impl Drop for SetValueCompletion {
 
 fn run_set_value_job(
     dispatch: SetValueDispatch,
-    job: impl FnOnce(SetValueDispatch) -> Result<()>,
+    job: impl FnOnce(&SetValueDispatch) -> Result<()>,
 ) -> Result<()> {
-    let _completion = SetValueCompletion(dispatch.clone());
-    job(dispatch)
+    let _completion = SetValueCompletion(dispatch.duplicate());
+    job(&dispatch)
 }
 
 /// A bounded call, for the message its failure carries.
@@ -205,7 +228,7 @@ impl A11yThread {
         &self,
         target: u32,
         deadline: Deadline,
-        job: impl FnOnce(SetValueDispatch) -> Result<()> + Send + 'static,
+        job: impl FnOnce(&SetValueDispatch) -> Result<()> + Send + 'static,
     ) -> Result<()> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started(
@@ -214,9 +237,9 @@ impl A11yThread {
         }
         let (wait, ended_by) = self.bounded_wait(deadline);
         let dispatch = SetValueDispatch::new();
-        let worker_dispatch = dispatch.clone();
-        let timeout_dispatch = dispatch.clone();
-        let panic_dispatch = dispatch.clone();
+        let worker_dispatch = dispatch.duplicate();
+        let timeout_dispatch = dispatch.duplicate();
+        let panic_dispatch = dispatch.duplicate();
         let result = self.detached(
             Op::SetValue,
             wait,
@@ -686,17 +709,16 @@ mod tests {
     }
 
     #[test]
-    fn sequential_dispatch_clones_execute_only_one_value_mutation() {
+    fn sequential_dispatch_attempts_execute_only_one_value_mutation() {
         let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_mutations = Arc::clone(&mutations);
 
         let result = reader().set_value(7, Deadline::UNBOUNDED, move |dispatch| {
-            let second = dispatch.clone();
             dispatch.dispatch(|| {
                 worker_mutations.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })?;
-            second.dispatch(|| {
+            dispatch.dispatch(|| {
                 worker_mutations.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
@@ -713,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn racing_dispatch_clones_execute_only_one_value_mutation() {
+    fn racing_scoped_dispatch_attempts_execute_only_one_value_mutation() {
         let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_mutations = Arc::clone(&mutations);
 
@@ -721,32 +743,33 @@ mod tests {
             let barrier = Arc::new(std::sync::Barrier::new(3));
             let first_barrier = Arc::clone(&barrier);
             let second_barrier = Arc::clone(&barrier);
-            let first_dispatch = dispatch.clone();
             let first_mutations = Arc::clone(&worker_mutations);
             let second_mutations = Arc::clone(&worker_mutations);
-            let first = std::thread::spawn(move || {
-                first_barrier.wait();
-                first_dispatch.dispatch(|| {
-                    first_mutations.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            });
-            let second = std::thread::spawn(move || {
-                second_barrier.wait();
-                dispatch.dispatch(|| {
-                    second_mutations.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            });
-            barrier.wait();
+            std::thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    first_barrier.wait();
+                    dispatch.dispatch(|| {
+                        first_mutations.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                });
+                let second = scope.spawn(|| {
+                    second_barrier.wait();
+                    dispatch.dispatch(|| {
+                        second_mutations.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                });
+                barrier.wait();
 
-            for result in [
-                first.join().expect("the first claimant must not panic"),
-                second.join().expect("the second claimant must not panic"),
-            ] {
-                result?;
-            }
-            Ok(())
+                for result in [
+                    first.join().expect("the first claimant must not panic"),
+                    second.join().expect("the second claimant must not panic"),
+                ] {
+                    result?;
+                }
+                Ok(())
+            })
         });
 
         assert_eq!(mutations.load(Ordering::SeqCst), 1, "{result:?}");
@@ -760,104 +783,9 @@ mod tests {
     }
 
     #[test]
-    fn a_dispatch_clone_cannot_mutate_after_set_value_returns() {
-        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let worker_mutations = Arc::clone(&mutations);
-        let (late_tx, late_rx) = mpsc::channel();
-
-        reader()
-            .set_value(7, Deadline::UNBOUNDED, move |dispatch| {
-                let late = dispatch.clone();
-                dispatch.dispatch(|| {
-                    worker_mutations.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })?;
-                assert!(
-                    late_tx.send(late).is_ok(),
-                    "the test must retain the escaped dispatch clone"
-                );
-                Ok(())
-            })
-            .expect("the first value mutation must complete");
-
-        let late = late_rx
-            .recv()
-            .expect("the worker must send its escaped clone");
-        let late_result = late.dispatch(|| {
-            mutations.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
-
-        assert_eq!(mutations.load(Ordering::SeqCst), 1, "{late_result:?}");
-        assert!(late_result.is_err(), "the late claim must be rejected");
-    }
-
-    #[test]
-    fn a_successful_noop_seals_an_escaped_dispatch_before_return() {
-        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (late_tx, late_rx) = mpsc::channel();
-
-        reader()
-            .set_value(7, Deadline::UNBOUNDED, move |dispatch| {
-                assert!(
-                    late_tx.send(dispatch.clone()).is_ok(),
-                    "the test must retain the escaped dispatch clone"
-                );
-                Ok(())
-            })
-            .expect("a backend no-op remains a successful set_value");
-
-        let late = late_rx
-            .recv()
-            .expect("the worker must send its escaped clone");
-        let late_result = late.dispatch(|| {
-            mutations.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
-
-        assert_eq!(mutations.load(Ordering::SeqCst), 0, "{late_result:?}");
-        assert!(
-            late_result.is_err(),
-            "the late first claim must be rejected"
-        );
-    }
-
-    #[test]
-    fn a_pre_write_error_seals_an_escaped_dispatch_before_return() {
-        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (late_tx, late_rx) = mpsc::channel();
-
-        let result = reader().set_value(7, Deadline::UNBOUNDED, move |dispatch| {
-            assert!(
-                late_tx.send(dispatch.clone()).is_ok(),
-                "the test must retain the escaped dispatch clone"
-            );
-            Err(GlassError::AxUnsupported)
-        });
-        assert!(
-            matches!(result, Err(GlassError::AxUnsupported)),
-            "the pre-write error must remain unchanged: {result:?}"
-        );
-
-        let late = late_rx
-            .recv()
-            .expect("the worker must send its escaped clone");
-        let late_result = late.dispatch(|| {
-            mutations.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
-
-        assert_eq!(mutations.load(Ordering::SeqCst), 0, "{late_result:?}");
-        assert!(
-            late_result.is_err(),
-            "the late first claim must be rejected"
-        );
-    }
-
-    #[test]
     fn worker_completion_seals_a_pending_noop_before_returning_its_result() {
         let dispatch = SetValueDispatch::new();
-        let escaped = dispatch.clone();
+        let escaped = dispatch.duplicate();
 
         let result = run_set_value_job(dispatch, |_| Ok(()));
 
@@ -871,7 +799,7 @@ mod tests {
     #[test]
     fn worker_completion_seals_a_pending_pre_write_error_before_returning_it() {
         let dispatch = SetValueDispatch::new();
-        let escaped = dispatch.clone();
+        let escaped = dispatch.duplicate();
 
         let result = run_set_value_job(dispatch, |_| Err(GlassError::AxUnsupported));
 
@@ -888,7 +816,7 @@ mod tests {
     #[test]
     fn worker_completion_seals_a_pending_token_before_unwinding() {
         let dispatch = SetValueDispatch::new();
-        let escaped = dispatch.clone();
+        let escaped = dispatch.duplicate();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _: Result<()> = run_set_value_job(dispatch, |_| panic!("scripted worker panic"));

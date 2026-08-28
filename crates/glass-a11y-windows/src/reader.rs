@@ -82,7 +82,7 @@ fn set_value_with_thread(
     thread: &A11yThread,
     ctx: AxContext,
     target: u32,
-    job: impl FnOnce(AxContext, SetValueDispatch) -> Result<()> + Send + 'static,
+    job: impl FnOnce(AxContext, &SetValueDispatch) -> Result<()> + Send + 'static,
 ) -> Result<()> {
     thread.set_value(target, ctx.deadline, move |dispatch| job(ctx, dispatch))
 }
@@ -373,7 +373,7 @@ fn run_set_value(
     ctx: &AxContext,
     target: &AxTarget,
     text: &str,
-    dispatch: SetValueDispatch,
+    dispatch: &SetValueDispatch,
 ) -> Result<()> {
     let automation = UIAutomation::new().map_err(|e| {
         GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))
