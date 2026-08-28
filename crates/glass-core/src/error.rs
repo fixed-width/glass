@@ -9,8 +9,10 @@ pub enum BoundKind {
     /// The call ran and was killed when its effective bound elapsed — its own budget or the
     /// deadline it shares, whichever was nearer.
     ///
-    /// [`GlassError::bound_owner`] says which of the two governed: its own budget firing is evidence
-    /// the tool is wedged, and its caller's is evidence of nothing at all (glass#341, glass#347).
+    /// [`GlassError::bound_owner`] says which of the two governed: callee-owned expiry indicates the
+    /// backend exceeded its own ceiling; caller-owned expiry says nothing about backend health. Use
+    /// [`GlassError::bound_dispatch`] separately for possible external effects (glass#341,
+    /// glass#347).
     TimedOut,
     /// The call never ran: the deadline it shares with the rest of a sequence was already spent.
     /// Nothing was asked, so nothing about the tool is known.
@@ -291,6 +293,16 @@ pub enum GlassError {
         message: String,
     },
 
+    /// Both the semantic pointer operation and the mandatory restoration of the previously active
+    /// window failed. The two structured causes remain separately inspectable rather than being
+    /// flattened into one backend string.
+    #[error("{primary}; restoring the previous active window failed: {restore}")]
+    WindowRestoreFailed {
+        #[source]
+        primary: Box<GlassError>,
+        restore: Box<GlassError>,
+    },
+
     /// An unchanged ordinary failure from a step that provably did not dispatch external work.
     /// The wrapped cause and its message remain authoritative; only dispatch provenance changes.
     #[error(transparent)]
@@ -370,6 +382,7 @@ impl GlassError {
         match self {
             GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => error.cause(),
             GlassError::AxWriteUnconfirmedCaused { source, .. } => source.cause(),
+            GlassError::WindowRestoreFailed { primary, .. } => primary.cause(),
             error => error,
         }
     }
@@ -396,6 +409,9 @@ impl GlassError {
             | GlassError::AxWriteUnconfirmedCaused { .. } => true,
             GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => {
                 error.set_value_failed_after_writing()
+            }
+            GlassError::WindowRestoreFailed { primary, restore } => {
+                primary.set_value_failed_after_writing() || restore.set_value_failed_after_writing()
             }
             _ => false,
         }
@@ -503,6 +519,9 @@ impl GlassError {
             GlassError::BeforeDispatch(error)
             | GlassError::AfterDispatch(error)
             | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.bound(),
+            GlassError::WindowRestoreFailed { primary, restore } => {
+                primary.bound().or_else(|| restore.bound())
+            }
             _ => None,
         }
     }
@@ -514,6 +533,9 @@ impl GlassError {
             GlassError::BeforeDispatch(error)
             | GlassError::AfterDispatch(error)
             | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.bound_owner(),
+            GlassError::WindowRestoreFailed { primary, restore } => {
+                primary.bound_owner().or_else(|| restore.bound_owner())
+            }
             _ => None,
         }
     }
@@ -532,6 +554,17 @@ impl GlassError {
             GlassError::AfterDispatch(_)
             | GlassError::AxWriteUnconfirmed(..)
             | GlassError::AxWriteUnconfirmedCaused { .. } => Some(BoundDispatch::MayHaveDispatched),
+            GlassError::WindowRestoreFailed { primary, restore } => {
+                match (primary.bound_dispatch(), restore.bound_dispatch()) {
+                    (Some(BoundDispatch::MayHaveDispatched), _)
+                    | (_, Some(BoundDispatch::MayHaveDispatched)) => {
+                        Some(BoundDispatch::MayHaveDispatched)
+                    }
+                    (Some(BoundDispatch::NotDispatched), _)
+                    | (_, Some(BoundDispatch::NotDispatched)) => Some(BoundDispatch::NotDispatched),
+                    (None, None) => None,
+                }
+            }
             _ => None,
         }
     }
@@ -550,6 +583,9 @@ impl GlassError {
             GlassError::BeforeDispatch(error)
             | GlassError::AfterDispatch(error)
             | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.tool_said(),
+            GlassError::WindowRestoreFailed { primary, restore } => {
+                primary.tool_said().or_else(|| restore.tool_said())
+            }
             _ => None,
         }
     }

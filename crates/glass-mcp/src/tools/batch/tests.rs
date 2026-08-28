@@ -342,14 +342,21 @@ impl Platform for DeadlinePlatform {
         self.deadlines.lock().unwrap().push(deadline);
         self.inner.send_key(event)
     }
-    fn window(&mut self, op: &WindowOp) -> GlassResult<WindowGeometry> {
-        self.inner.window(op)
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> GlassResult<WindowGeometry> {
+        self.deadlines.lock().unwrap().push(deadline);
+        self.inner.window_by(op, deadline)
     }
-    fn list_windows(&mut self) -> GlassResult<Vec<WindowInfo>> {
-        self.inner.list_windows()
+    fn list_windows_by(&mut self, deadline: Deadline) -> GlassResult<Vec<WindowInfo>> {
+        self.deadlines.lock().unwrap().push(deadline);
+        self.inner.list_windows_by(deadline)
     }
-    fn select_window(&mut self, id: WindowId) -> GlassResult<WindowGeometry> {
-        self.inner.select_window(id)
+    fn select_window_by(
+        &mut self,
+        id: WindowId,
+        deadline: Deadline,
+    ) -> GlassResult<WindowGeometry> {
+        self.deadlines.lock().unwrap().push(deadline);
+        self.inner.select_window_by(id, deadline)
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
         self.inner.drain_logs()

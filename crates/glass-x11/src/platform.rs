@@ -108,6 +108,39 @@ fn run_x11_call_by<T>(
     Ok(answer)
 }
 
+/// Cancels a blocking x11rb socket poll when a bounded window operation reaches its caller
+/// deadline. Shutting down the connection is intentionally fail-closed: after a server stalls long
+/// enough to lose request/reply framing, reusing that session would risk acting on a stale reply.
+struct X11DeadlineWatch {
+    cancel: std::sync::mpsc::Sender<()>,
+}
+
+impl X11DeadlineWatch {
+    fn start(conn: &RustConnection, deadline: Deadline) -> Result<Option<Self>> {
+        let Some(remaining) = deadline.remaining() else {
+            return Ok(None);
+        };
+        if remaining.is_zero() {
+            return Err(GlassError::deadline_not_started("X11 window operation"));
+        }
+        let socket = rustix::io::dup(conn.stream().as_fd())
+            .map_err(|error| GlassError::Backend(format!("duplicate X11 socket: {error}")))?;
+        let (cancel, cancelled) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if cancelled.recv_timeout(remaining).is_err() {
+                let _ = rustix::net::shutdown(socket, rustix::net::Shutdown::Both);
+            }
+        });
+        Ok(Some(Self { cancel }))
+    }
+}
+
+impl Drop for X11DeadlineWatch {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(());
+    }
+}
+
 fn run_x11_type_by<S: glass_core::TypeSink>(
     sink: &mut S,
     text: &str,
@@ -327,6 +360,30 @@ impl X11Platform {
             dbus: None,
             clipboard_owner: None,
         })
+    }
+
+    fn run_window_call_by<T>(
+        &mut self,
+        deadline: Deadline,
+        operation: &str,
+        call: impl FnOnce(&mut Self, &X11Dispatch) -> Result<T>,
+    ) -> Result<T> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(operation));
+        }
+        let watch = X11DeadlineWatch::start(&self.conn, deadline)?;
+        let dispatch = X11Dispatch::default();
+        let answer = match call(self, &dispatch) {
+            Ok(answer) => answer,
+            Err(_) if deadline.has_passed() => return Err(dispatch.deadline_error(operation)),
+            Err(error) => return Err(dispatch.classify(operation, error)),
+        };
+        drop(watch);
+        if deadline.has_passed() {
+            Err(dispatch.deadline_error(operation))
+        } else {
+            Ok(answer)
+        }
     }
 
     fn require_window(&self) -> Result<Window> {
@@ -1523,67 +1580,90 @@ impl Platform for X11Platform {
         }
     }
 
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
-        let win = self.require_window()?;
-        match *op {
-            WindowOp::Focus => {
-                self.focus_window(win)?;
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        self.run_window_call_by(deadline, "X11 window operation", |platform, dispatch| {
+            let win = platform.require_window()?;
+            dispatch.mark();
+            match *op {
+                WindowOp::Focus => {
+                    platform.focus_window(win)?;
+                }
+                WindowOp::Resize { width, height } => {
+                    platform.configure_active(
+                        win,
+                        &ConfigureWindowAux::new().width(width).height(height),
+                        "resize",
+                    )?;
+                }
+                WindowOp::Move { x, y } => {
+                    platform.configure_active(win, &ConfigureWindowAux::new().x(x).y(y), "move")?;
+                }
+                WindowOp::Geometry => {}
             }
-            WindowOp::Resize { width, height } => {
-                self.configure_active(
-                    win,
-                    &ConfigureWindowAux::new().width(width).height(height),
-                    "resize",
-                )?;
-            }
-            WindowOp::Move { x, y } => {
-                self.configure_active(win, &ConfigureWindowAux::new().x(x).y(y), "move")?;
-            }
-            WindowOp::Geometry => {}
-        }
-        self.commit()?;
-        self.window_geometry()
+            platform.commit()?;
+            platform.window_geometry()
+        })
     }
 
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-        self.require_window()?; // no active app -> WindowNotFound, not an empty list
-        let pids: Vec<u32> = self
-            .child
-            .as_ref()
-            .map(|c| proc_tree_pids(c.id()))
-            .unwrap_or_default();
-        let active = self.window;
-        let mut out = Vec::new();
-        for win in self.scan_all_windows(&pids)? {
-            out.push(WindowInfo {
-                id: WindowId(win as u64),
-                title: self.window_name(win),
-                class: self.window_class(win).map(|(_instance, class)| class),
-                geometry: self.geometry_of(win)?,
-                active: Some(win) == active,
-            });
-        }
-        Ok(out)
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        self.run_window_call_by(deadline, "X11 window list", |platform, dispatch| {
+            platform.require_window()?; // no active app -> WindowNotFound, not an empty list
+            let pids: Vec<u32> = platform
+                .child
+                .as_ref()
+                .map(|c| proc_tree_pids(c.id()))
+                .unwrap_or_default();
+            let active = platform.window;
+            dispatch.mark();
+            let mut out = Vec::new();
+            for win in platform.scan_all_windows(&pids)? {
+                out.push(WindowInfo {
+                    id: WindowId(win as u64),
+                    title: platform.window_name(win),
+                    class: platform.window_class(win).map(|(_instance, class)| class),
+                    geometry: platform.geometry_of(win)?,
+                    active: Some(win) == active,
+                });
+            }
+            Ok(out)
+        })
     }
 
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
-        let pids: Vec<u32> = self
-            .child
-            .as_ref()
-            .map(|c| proc_tree_pids(c.id()))
-            .unwrap_or_default();
-        let target = id.0 as Window;
-        if self.scan_all_windows(&pids)?.contains(&target) {
-            self.window = Some(target);
-            // Move keyboard focus to the selected window so subsequent synthetic
-            // keys reach it. Best-effort: a focus failure must not fail selection.
-            if let Err(e) = self.focus_window(target) {
-                eprintln!("glass: focus-on-select failed (keys may not reach the window): {e}");
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        self.run_window_call_by(deadline, "X11 window selection", |platform, dispatch| {
+            let pids: Vec<u32> = platform
+                .child
+                .as_ref()
+                .map(|c| proc_tree_pids(c.id()))
+                .unwrap_or_default();
+            let target = id.0 as Window;
+            dispatch.mark();
+            if !platform.scan_all_windows(&pids)?.contains(&target) {
+                return Err(GlassError::WindowNotFound);
             }
-            self.geometry_of(target)
-        } else {
-            Err(GlassError::WindowNotFound)
-        }
+            let previous = platform.window;
+            platform.window = Some(target);
+            if let Err(error) = platform.focus_window(target) {
+                if deadline == Deadline::UNBOUNDED {
+                    eprintln!(
+                        "glass: focus-on-select failed (keys may not reach the window): {error}"
+                    );
+                } else {
+                    platform.window = previous;
+                    return Err(error.after_dispatch());
+                }
+            }
+            match platform.geometry_of(target) {
+                Ok(geometry) => Ok(geometry),
+                Err(error) => {
+                    if deadline != Deadline::UNBOUNDED {
+                        platform.window = previous;
+                        return Err(error.after_dispatch());
+                    }
+                    Err(error)
+                }
+            }
+        })
     }
 
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {

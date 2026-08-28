@@ -333,16 +333,38 @@ pub trait Platform {
         ))
     }
 
-    /// Perform a window operation, returning the resulting geometry.
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry>;
+    /// Perform a window operation, returning the resulting geometry, bounded by the caller's
+    /// shared deadline. Backends must cap blocking query/focus work itself, not only check before
+    /// and after an otherwise-unbounded call.
+    fn window_by(&mut self, op: &WindowOp, deadline: crate::Deadline) -> Result<WindowGeometry>;
 
-    /// All top-level windows belonging to the launched app, re-scanned live.
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>>;
+    /// [`Platform::window_by`] with no caller deadline; backend-owned ceilings still apply.
+    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+        self.window_by(op, crate::Deadline::UNBOUNDED)
+    }
 
-    /// Make `id` the active window (the implicit target of capture/input/window
-    /// ops); returns the now-active window's geometry. `WindowNotFound` if `id`
-    /// is not currently one of the app's windows.
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry>;
+    /// All top-level windows belonging to the launched app, re-scanned live under the caller's
+    /// shared deadline.
+    fn list_windows_by(&mut self, deadline: crate::Deadline) -> Result<Vec<WindowInfo>>;
+
+    /// [`Platform::list_windows_by`] with no caller deadline; backend-owned ceilings still apply.
+    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+        self.list_windows_by(crate::Deadline::UNBOUNDED)
+    }
+
+    /// Make `id` the active window (the implicit target of capture/input/window ops), bounded by
+    /// the caller's shared deadline; returns the now-active window's geometry. `WindowNotFound` if
+    /// `id` is not currently one of the app's windows.
+    fn select_window_by(
+        &mut self,
+        id: WindowId,
+        deadline: crate::Deadline,
+    ) -> Result<WindowGeometry>;
+
+    /// [`Platform::select_window_by`] with no caller deadline; backend-owned ceilings still apply.
+    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+        self.select_window_by(id, crate::Deadline::UNBOUNDED)
+    }
 
     /// Hand back any log lines captured since the last call.
     fn drain_logs(&mut self) -> Vec<(Stream, String)>;
@@ -506,13 +528,21 @@ mod tests {
         fn send_key_by(&mut self, _event: &KeyEvent, _deadline: crate::Deadline) -> Result<()> {
             Ok(())
         }
-        fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
+        fn window_by(
+            &mut self,
+            _op: &WindowOp,
+            _deadline: crate::Deadline,
+        ) -> Result<WindowGeometry> {
             Ok(WindowGeometry::default())
         }
-        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+        fn list_windows_by(&mut self, _deadline: crate::Deadline) -> Result<Vec<WindowInfo>> {
             Ok(vec![])
         }
-        fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+        fn select_window_by(
+            &mut self,
+            _id: WindowId,
+            _deadline: crate::Deadline,
+        ) -> Result<WindowGeometry> {
             Err(GlassError::WindowNotFound)
         }
         fn drain_logs(&mut self) -> Vec<(Stream, String)> {
@@ -563,13 +593,21 @@ mod tests {
         fn send_key_by(&mut self, _event: &KeyEvent, _deadline: crate::Deadline) -> Result<()> {
             unimplemented!()
         }
-        fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
+        fn window_by(
+            &mut self,
+            _op: &WindowOp,
+            _deadline: crate::Deadline,
+        ) -> Result<WindowGeometry> {
             unimplemented!()
         }
-        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+        fn list_windows_by(&mut self, _deadline: crate::Deadline) -> Result<Vec<WindowInfo>> {
             unimplemented!()
         }
-        fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+        fn select_window_by(
+            &mut self,
+            _id: WindowId,
+            _deadline: crate::Deadline,
+        ) -> Result<WindowGeometry> {
             unimplemented!()
         }
         fn drain_logs(&mut self) -> Vec<(Stream, String)> {
@@ -603,6 +641,9 @@ mod tests {
             capture_window: Option<crate::Deadline>,
             pointer: Option<crate::Deadline>,
             key: Option<crate::Deadline>,
+            window: Option<crate::Deadline>,
+            list_windows: Option<crate::Deadline>,
+            select_window: Option<crate::Deadline>,
         }
         impl Platform for CountingPlatform {
             fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
@@ -644,14 +685,25 @@ mod tests {
                 self.key = Some(deadline);
                 Ok(())
             }
-            fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
-                unimplemented!()
+            fn window_by(
+                &mut self,
+                _op: &WindowOp,
+                deadline: crate::Deadline,
+            ) -> Result<WindowGeometry> {
+                self.window = Some(deadline);
+                Ok(WindowGeometry::default())
             }
-            fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-                unimplemented!()
+            fn list_windows_by(&mut self, deadline: crate::Deadline) -> Result<Vec<WindowInfo>> {
+                self.list_windows = Some(deadline);
+                Ok(vec![])
             }
-            fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
-                unimplemented!()
+            fn select_window_by(
+                &mut self,
+                _id: WindowId,
+                deadline: crate::Deadline,
+            ) -> Result<WindowGeometry> {
+                self.select_window = Some(deadline);
+                Err(GlassError::WindowNotFound)
             }
             fn drain_logs(&mut self) -> Vec<(Stream, String)> {
                 vec![]
@@ -666,12 +718,19 @@ mod tests {
             .expect("the default delegates");
         p.send_key(&KeyEvent::Chord("enter".into()))
             .expect("the default delegates");
+        p.window(&WindowOp::Geometry)
+            .expect("the default delegates");
+        p.list_windows().expect("the default delegates");
+        let _ = p.select_window(WindowId(1));
 
         assert_eq!(p.stop, Some(crate::Deadline::UNBOUNDED));
         assert_eq!(p.capture_frame, Some(crate::Deadline::UNBOUNDED));
         assert_eq!(p.capture_window, Some(crate::Deadline::UNBOUNDED));
         assert_eq!(p.pointer, Some(crate::Deadline::UNBOUNDED));
         assert_eq!(p.key, Some(crate::Deadline::UNBOUNDED));
+        assert_eq!(p.window, Some(crate::Deadline::UNBOUNDED));
+        assert_eq!(p.list_windows, Some(crate::Deadline::UNBOUNDED));
+        assert_eq!(p.select_window, Some(crate::Deadline::UNBOUNDED));
     }
 
     #[test]

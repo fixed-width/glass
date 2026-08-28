@@ -6,7 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use glass_core::{GlassError, Result};
+use glass_core::{Deadline, GlassError, Result, Whose};
 use serde::Deserialize;
 
 const MAGIC: &[u8; 6] = b"i3-ipc";
@@ -170,7 +170,16 @@ impl Ipc {
         })
     }
 
-    fn request(&mut self, msg_type: u32, payload: &[u8]) -> Result<Vec<u8>> {
+    fn request_by(
+        &mut self,
+        msg_type: u32,
+        payload: &[u8],
+        deadline: Deadline,
+        operation: &str,
+    ) -> Result<Vec<u8>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(operation));
+        }
         if self.broken {
             self.reconnect()?;
         }
@@ -179,10 +188,22 @@ impl Ipc {
         buf.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
         buf.extend_from_slice(&msg_type.to_ne_bytes());
         buf.extend_from_slice(payload);
-        self.io(|sock| sock.write_all(&buf), "write")?;
+        self.io_by(
+            deadline,
+            true,
+            |sock| sock.write_all(&buf),
+            "write",
+            operation,
+        )?;
 
         let mut header = [0u8; 14];
-        self.io(|sock| sock.read_exact(&mut header), "read")?;
+        self.io_by(
+            deadline,
+            true,
+            |sock| sock.read_exact(&mut header),
+            "read",
+            operation,
+        )?;
         if &header[0..6] != MAGIC {
             // Also a desync: whatever is in the stream is not a reply glass can resynchronize to.
             self.broken = true;
@@ -190,36 +211,98 @@ impl Ipc {
         }
         let len = u32::from_ne_bytes(header[6..10].try_into().unwrap()) as usize;
         let mut reply = vec![0u8; len];
-        self.io(|sock| sock.read_exact(&mut reply), "read")?;
-        Ok(reply)
+        self.io_by(
+            deadline,
+            true,
+            |sock| sock.read_exact(&mut reply),
+            "read",
+            operation,
+        )?;
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed(operation))
+        } else {
+            Ok(reply)
+        }
     }
 
     /// Run one socket operation, marking the connection broken if it fails. A timeout counts:
     /// the bytes are still in flight, so the next request would read them as its own reply.
-    fn io(
+    fn io_by(
         &mut self,
+        deadline: Deadline,
+        dispatched: bool,
         op: impl FnOnce(&mut UnixStream) -> std::io::Result<()>,
         what: &str,
+        operation: &str,
     ) -> Result<()> {
-        op(&mut self.sock).map_err(|e| {
+        let now = std::time::Instant::now();
+        let (timeout, owner) = deadline.budget(IPC_TIMEOUT, now);
+        if timeout.is_zero() {
+            return Err(if dispatched {
+                GlassError::caller_deadline_elapsed(operation)
+            } else {
+                GlassError::deadline_not_started(operation)
+            });
+        }
+        self.sock
+            .set_read_timeout(Some(timeout))
+            .and_then(|()| self.sock.set_write_timeout(Some(timeout)))
+            .map_err(|error| GlassError::Backend(format!("set sway IPC timeout: {error}")))?;
+        op(&mut self.sock).map_err(|error| {
             self.broken = true;
-            GlassError::Backend(format!("sway IPC {what}: {e}"))
+            if owner == Whose::Caller
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            {
+                if dispatched {
+                    GlassError::caller_deadline_elapsed(operation)
+                } else {
+                    GlassError::deadline_not_started(operation)
+                }
+            } else {
+                GlassError::Backend(format!("sway IPC {what}: {error}"))
+            }
         })
     }
 
     /// `get_tree` -> the app windows (those with a foreign-toplevel identifier).
     pub fn windows(&mut self) -> Result<Vec<Window>> {
-        let reply = self.request(MSG_GET_TREE, b"")?;
+        self.windows_by(Deadline::UNBOUNDED)
+    }
+
+    pub fn windows_by(&mut self, deadline: Deadline) -> Result<Vec<Window>> {
+        let reply = self.request_by(MSG_GET_TREE, b"", deadline, "sway window query")?;
         let root: Node = serde_json::from_slice(&reply)
             .map_err(|e| GlassError::Backend(format!("parse get_tree: {e}")))?;
-        Ok(root.windows())
+        let windows = root.windows();
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("sway window query"))
+        } else {
+            Ok(windows)
+        }
     }
 
     /// Run a sway command (e.g. `[con_id=N] focus`). Errors if sway reports the
     /// command failed (no silent fallback).
     pub fn run_command(&mut self, cmd: &str) -> Result<()> {
-        let reply = self.request(MSG_RUN_COMMAND, cmd.as_bytes())?;
-        check_command_reply(&reply, cmd)
+        self.run_command_by(cmd, Deadline::UNBOUNDED)
+    }
+
+    pub fn run_command_by(&mut self, cmd: &str, deadline: Deadline) -> Result<()> {
+        let reply = self.request_by(
+            MSG_RUN_COMMAND,
+            cmd.as_bytes(),
+            deadline,
+            "sway window command",
+        )?;
+        let result = check_command_reply(&reply, cmd);
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("sway window command"))
+        } else {
+            result
+        }
     }
 }
 
@@ -429,6 +512,27 @@ mod tests {
         let err = outcome.expect("a silent peer must not produce a window list");
         assert!(err.to_string().contains("sway IPC"), "{err}");
         drop(theirs); // held open until now: an EOF would end the read without a timeout
+    }
+
+    #[test]
+    fn a_live_window_list_read_uses_the_callers_remaining_deadline() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let mut ipc = Ipc::from_stream(ours).expect("wrap");
+        let started = std::time::Instant::now();
+        let deadline = Deadline::at(started + Duration::from_millis(20));
+
+        let err = ipc
+            .windows_by(deadline)
+            .expect_err("a silent compositor must consume only the caller's remaining budget");
+
+        assert_eq!(err.bound_owner(), Some(Whose::Caller));
+        assert_eq!(err.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(
+            err.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(theirs);
     }
 
     /// After a failed read the stream is no longer at a message boundary: the reply glass gave up

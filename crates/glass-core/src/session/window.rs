@@ -3,8 +3,12 @@ use super::*;
 
 impl Glass {
     pub fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+        self.window_by(op, Deadline::UNBOUNDED)
+    }
+
+    pub fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
         let t = std::time::Instant::now();
-        let result = self.window_inner(op);
+        let result = self.window_inner_by(op, deadline);
         if !matches!(op, WindowOp::Geometry) {
             self.emit_audit(
                 &crate::audit::Actuation::Window { op },
@@ -15,9 +19,9 @@ impl Glass {
         result
     }
 
-    fn window_inner(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_inner_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
         let s = self.active_mut()?;
-        let geometry = s.platform.window(op)?;
+        let geometry = s.platform.window_by(op, deadline)?;
         s.geometry = geometry.clone();
         s.pump();
         Ok(geometry)
@@ -25,14 +29,22 @@ impl Glass {
 
     /// All top-level windows of the active app.
     pub fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-        self.active_mut()?.platform.list_windows()
+        self.list_windows_by(Deadline::UNBOUNDED)
+    }
+
+    pub fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        self.active_mut()?.platform.list_windows_by(deadline)
     }
 
     /// Make `id` the active window; subsequent capture/input/window ops target
     /// it. Updates the cached active-window geometry.
     pub fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+        self.select_window_by(id, Deadline::UNBOUNDED)
+    }
+
+    pub fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
         let s = self.active_mut()?;
-        let geometry = s.platform.select_window(id)?;
+        let geometry = s.platform.select_window_by(id, deadline)?;
         s.geometry = geometry.clone();
         s.active_window = Some(crate::audit::WindowRef {
             id: id.0,

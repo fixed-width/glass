@@ -691,34 +691,58 @@ impl Platform for IosPlatform {
         }
     }
 
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("iOS window operation"));
+        }
         let geometry = self.running()?.geometry.clone();
-        match op {
+        let result = match op {
             WindowOp::Geometry | WindowOp::Focus => Ok(geometry),
             WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::unsupported(
                 "window_move_resize",
                 crate::BACKEND,
                 crate::capabilities().window_move_resize.note,
             )),
+        };
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("iOS window operation"))
+        } else {
+            result
         }
     }
 
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("iOS window list"));
+        }
         let app = self.running()?;
-        Ok(vec![WindowInfo {
+        let windows = vec![WindowInfo {
             id: IOS_WINDOW_ID,
             title: Some(app.bundle_id.clone()),
             class: None,
             geometry: app.geometry.clone(),
             active: true,
-        }])
+        }];
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("iOS window list"))
+        } else {
+            Ok(windows)
+        }
     }
 
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
-        if id == IOS_WINDOW_ID {
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("iOS window selection"));
+        }
+        let result = if id == IOS_WINDOW_ID {
             Ok(self.running()?.geometry.clone())
         } else {
             Err(GlassError::WindowNotFound)
+        };
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("iOS window selection"))
+        } else {
+            result
         }
     }
 

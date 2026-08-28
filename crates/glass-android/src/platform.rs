@@ -177,16 +177,64 @@ impl AndroidPlatform {
         package: &str,
         timeout_ms: u64,
     ) -> Result<(WindowId, WindowGeometry)> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        self.discover_window_by(package, timeout_ms, Deadline::UNBOUNDED)
+    }
+
+    fn discover_window_by(
+        &self,
+        package: &str,
+        timeout_ms: u64,
+        deadline: Deadline,
+    ) -> Result<(WindowId, WindowGeometry)> {
+        let started = Instant::now();
+        let (ends, owner) = deadline.resolve(started + Duration::from_millis(timeout_ms.max(1)));
+        let mut last_dump = String::new();
         loop {
-            let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
+            if Instant::now() >= ends {
+                return Err(match owner {
+                    glass_core::Whose::Caller if last_dump.is_empty() => {
+                        GlassError::deadline_not_started("Android window discovery")
+                    }
+                    glass_core::Whose::Caller => {
+                        GlassError::caller_deadline_elapsed("Android window discovery")
+                    }
+                    glass_core::Whose::Callee => {
+                        window_never_appeared(&last_dump, package, timeout_ms)
+                    }
+                });
+            }
+            let dump = self
+                .adb()
+                .run_until(
+                    ["shell", "dumpsys", "window", "windows"],
+                    Deadline::at(ends),
+                )
+                .map_err(|error| {
+                    if owner == glass_core::Whose::Callee
+                        && error.bound_owner() == Some(glass_core::Whose::Caller)
+                    {
+                        window_never_appeared(&last_dump, package, timeout_ms)
+                    } else {
+                        error
+                    }
+                })?;
             if let Some(w) = parse_app_windows(&dump, package).into_iter().next() {
                 return Ok((WindowId(w.id), w.frame));
             }
-            if Instant::now() >= deadline {
-                return Err(window_never_appeared(&dump, package, timeout_ms));
+            last_dump = dump;
+            if Instant::now() >= ends {
+                return Err(match owner {
+                    glass_core::Whose::Caller => {
+                        GlassError::caller_deadline_elapsed("Android window discovery")
+                    }
+                    glass_core::Whose::Callee => {
+                        window_never_appeared(&last_dump, package, timeout_ms)
+                    }
+                });
             }
-            std::thread::sleep(Duration::from_millis(150));
+            std::thread::sleep(
+                Duration::from_millis(150).min(ends.saturating_duration_since(Instant::now())),
+            );
         }
     }
 }
@@ -337,9 +385,21 @@ impl Platform for AndroidPlatform {
         self.injector.key_by(self.target.adb(), event, deadline)
     }
 
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("Android window operation"));
+        }
         match op {
-            WindowOp::Geometry => Ok(self.running()?.window.clone()),
+            WindowOp::Geometry => {
+                let geometry = self.running()?.window.clone();
+                if deadline.has_passed() {
+                    Err(GlassError::caller_deadline_elapsed(
+                        "Android window geometry",
+                    ))
+                } else {
+                    Ok(geometry)
+                }
+            }
             WindowOp::Focus => {
                 let (component, package) = {
                     let app = self.running()?;
@@ -347,13 +407,19 @@ impl Platform for AndroidPlatform {
                 };
                 let out = self
                     .adb()
-                    .run(launch_args(&component).iter().map(String::as_str))?;
+                    .run_until(launch_args(&component).iter().map(String::as_str), deadline)?;
                 check_am_start(&out)?;
-                let (active_id, window) = self.discover_window(&package, 5_000)?;
+                let (active_id, window) = self
+                    .discover_window_by(&package, 5_000, deadline)
+                    .map_err(GlassError::after_dispatch)?;
                 let app = self.app.as_mut().ok_or(GlassError::NoActiveSession)?;
                 app.active_id = active_id;
                 app.window = window.clone();
-                Ok(window)
+                if deadline.has_passed() {
+                    Err(GlassError::caller_deadline_elapsed("Android window focus"))
+                } else {
+                    Ok(window)
+                }
             }
             WindowOp::Resize { .. } | WindowOp::Move { .. } => {
                 Err(crate::unsupported_window_move_resize())
@@ -361,12 +427,17 @@ impl Platform for AndroidPlatform {
         }
     }
 
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("Android window list"));
+        }
         let (package, active_id) = {
             let app = self.running()?;
             (app.package.clone(), app.active_id)
         };
-        let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
+        let dump = self
+            .adb()
+            .run_until(["shell", "dumpsys", "window", "windows"], deadline)?;
         let parsed = parse_app_windows(&dump, &package);
         let any_match = parsed.iter().any(|w| WindowId(w.id) == active_id);
         Ok(parsed
@@ -386,18 +457,34 @@ impl Platform for AndroidPlatform {
             .collect())
     }
 
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("Android window selection"));
+        }
         let package = self.running()?.package.clone();
-        let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
+        let dump = self
+            .adb()
+            .run_until(["shell", "dumpsys", "window", "windows"], deadline)?;
         let found = parse_app_windows(&dump, &package)
             .into_iter()
             .find(|w| WindowId(w.id) == id);
         match found {
             Some(w) => {
+                if deadline.has_passed() {
+                    return Err(GlassError::caller_deadline_elapsed(
+                        "Android window selection",
+                    ));
+                }
                 let app = self.app.as_mut().ok_or(GlassError::NoActiveSession)?;
                 app.active_id = id;
                 app.window = w.frame.clone();
-                Ok(w.frame)
+                if deadline.has_passed() {
+                    Err(GlassError::caller_deadline_elapsed(
+                        "Android window selection",
+                    ))
+                } else {
+                    Ok(w.frame)
+                }
             }
             None => Err(GlassError::WindowNotFound),
         }

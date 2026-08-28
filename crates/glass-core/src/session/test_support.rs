@@ -60,6 +60,11 @@ pub(crate) struct FakePlatform {
     /// Every `select_window(id)` call, in order — for asserting popover routing
     /// selects the popover then restores the previously-active window.
     select_log: Arc<Mutex<Vec<WindowId>>>,
+    /// Optional delay before each selection completes, for exercising a focus change that spends
+    /// the caller's remaining semantic-action deadline.
+    select_delay: Option<Duration>,
+    /// A selected id whose lookup/focus fails, for proving restoration failures stay visible.
+    fail_select_window: Option<WindowId>,
     /// When set, `list_windows` errors instead of returning its scripted list — for
     /// proving a failed popover-probe enumeration degrades to the normal click path
     /// instead of propagating.
@@ -148,6 +153,14 @@ impl FakePlatform {
     }
     pub(crate) fn with_select_log(mut self, log: Arc<Mutex<Vec<WindowId>>>) -> Self {
         self.select_log = log;
+        self
+    }
+    pub(crate) fn with_select_delay(mut self, delay: Duration) -> Self {
+        self.select_delay = Some(delay);
+        self
+    }
+    pub(crate) fn with_failing_select_window(mut self, id: WindowId) -> Self {
+        self.fail_select_window = Some(id);
         self
     }
     pub(crate) fn counting_stops(mut self, c: Arc<Mutex<u32>>) -> Self {
@@ -347,7 +360,10 @@ impl Platform for FakePlatform {
         self.key_log.lock().unwrap().push(event.clone());
         Ok(())
     }
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window operation"));
+        }
         if matches!(op, WindowOp::Geometry)
             && let Some(delay) = self.geometry_delay
         {
@@ -372,26 +388,50 @@ impl Platform for FakePlatform {
                 }
             }
         }
-        Ok(self.geometry.clone())
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("window operation"))
+        } else {
+            Ok(self.geometry.clone())
+        }
     }
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window list"));
+        }
         if self.fail_list_windows {
             return Err(GlassError::Backend("list_windows unavailable".into()));
         }
-        if self.windows.is_empty() {
-            Ok(vec![WindowInfo {
+        let windows = if self.windows.is_empty() {
+            vec![WindowInfo {
                 id: WindowId(0),
                 title: None,
                 class: None,
                 geometry: self.geometry.clone(),
                 active: true,
-            }])
+            }]
         } else {
-            Ok(self.windows.clone())
+            self.windows.clone()
+        };
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("window list"))
+        } else {
+            Ok(windows)
         }
     }
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window selection"));
+        }
         self.select_log.lock().unwrap().push(id);
+        if let Some(delay) = self.select_delay {
+            std::thread::sleep(delay);
+        }
+        if self.fail_select_window == Some(id) {
+            return Err(GlassError::Backend(format!(
+                "scripted select_window failure for {}",
+                id.0
+            )));
+        }
         if self.windows.is_empty() {
             return if id == WindowId(0) {
                 Ok(self.geometry.clone())
@@ -1081,13 +1121,22 @@ impl Platform for BareMinPlatform {
         }
         Ok(())
     }
-    fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, _op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window operation"));
+        }
         Ok(WindowGeometry::default())
     }
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window list"));
+        }
         Ok(vec![])
     }
-    fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+    fn select_window_by(&mut self, _id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window selection"));
+        }
         Err(GlassError::WindowNotFound)
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {

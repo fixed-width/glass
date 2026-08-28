@@ -209,12 +209,14 @@ impl Glass {
         // separate popover window (an open dropdown's option list) whose own origin they
         // don't reflect.
         //
-        // The probe is best-effort: an `Err` degrades to an empty list rather than failing a
-        // normal click on a backend where `list_windows` is heavy or flaky.
-        let windows = self.list_windows().unwrap_or_default();
-        if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("click element"));
-        }
+        // Preserve the legacy best-effort probe for an untimed standalone click. A bounded
+        // semantic action cannot hide a failed or timed-out query, because doing so would sever
+        // the one absolute deadline shared by the compound operation.
+        let windows = match self.list_windows_by(deadline) {
+            Ok(windows) => windows,
+            Err(_) if deadline == Deadline::UNBOUNDED => Vec::new(),
+            Err(error) => return Err(error),
+        };
         if let Some(popover_id) = owning_popover(bounds, &active_geo, &windows) {
             let popover_geo = windows
                 .iter()
@@ -228,8 +230,8 @@ impl Glass {
             }
             .ok_or(GlassError::AxElementInUnmappedPopover(id.0))?;
             let prev = windows.iter().find(|w| w.active).map(|w| w.id);
-            self.select_window(popover_id)?;
-            let result = self.pointer_inner_by(
+            self.select_window_by(popover_id, deadline)?;
+            let primary = self.pointer_inner_by(
                 &PointerEvent::Click {
                     x: bounds.x - container.x,
                     y: bounds.y - container.y,
@@ -239,11 +241,22 @@ impl Glass {
                 },
                 deadline,
             );
-            // Best-effort restore: the click's own result (ok or err) still wins.
-            if let Some(prev) = prev {
-                let _ = self.select_window(prev);
-            }
-            return result;
+            // Cleanup is deliberately unbounded: once focus has moved, restoration must still be
+            // attempted after the caller stops waiting. The returned failure remains after-dispatch
+            // because the temporary selection already changed the compound action's state.
+            let restore = prev
+                .map(|id| self.select_window_by(id, Deadline::UNBOUNDED))
+                .transpose();
+            return match (primary, restore) {
+                (Ok(()), Ok(_)) => Ok(()),
+                (Err(primary), Ok(_)) => Err(primary.after_dispatch()),
+                (Ok(()), Err(restore)) => Err(restore.after_dispatch()),
+                (Err(primary), Err(restore)) => Err(GlassError::WindowRestoreFailed {
+                    primary: Box::new(primary),
+                    restore: Box::new(restore),
+                }
+                .after_dispatch()),
+            };
         }
         // On a backend that frames a switch as its whole row with the control at the trailing
         // edge (iOS/idb), a center tap lands on the inert label — and a `UISwitch` does NOT
@@ -309,10 +322,12 @@ impl Glass {
             // by window-RELATIVE bounds derived from `ctx.window`, so a window moved since the
             // snapshot reads as drift and rejects.
             //
-            // Best-effort, unlike the snapshot's strict refresh: an `Err` keeps the cached
-            // value so a geometry-probe hiccup can't make a click unclickable.
-            if let Ok(window) = s.platform.window(&WindowOp::Geometry) {
-                s.geometry = window;
+            // Keep legacy untimed clicks best-effort. A bounded action propagates the query's
+            // structured deadline/error instead of silently continuing with stale geometry.
+            match s.platform.window_by(&WindowOp::Geometry, deadline) {
+                Ok(window) => s.geometry = window,
+                Err(_) if deadline == Deadline::UNBOUNDED => {}
+                Err(error) => return Err(error),
             }
         }
         if deadline.has_passed() {
@@ -391,10 +406,12 @@ impl Glass {
             // element by window-RELATIVE bounds derived from `ctx.window`, so a window moved
             // since the snapshot reads as drift and rejects.
             //
-            // Best-effort, unlike the snapshot's strict refresh: an `Err` keeps the cached
-            // value so a geometry-probe hiccup can't fail a write.
-            if let Ok(window) = s.platform.window(&WindowOp::Geometry) {
-                s.geometry = window;
+            // Keep legacy untimed writes best-effort. A bounded action propagates the query's
+            // structured deadline/error instead of silently continuing with stale geometry.
+            match s.platform.window_by(&WindowOp::Geometry, deadline) {
+                Ok(window) => s.geometry = window,
+                Err(_) if deadline == Deadline::UNBOUNDED => {}
+                Err(error) => return Err(error),
             }
         }
         if deadline.has_passed() {
@@ -2336,6 +2353,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn window_geometry_query_consuming_the_click_deadline_reports_started_work() {
+        let mut g = glass_with_a11y(
+            FakePlatform::new(100, 100).with_geometry_delay(Duration::from_millis(20)),
+            fake_tree(),
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .click_element_by(AxNodeId(1), Deadline::from_millis(5))
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "the geometry query started before consuming the remaining deadline"
+        );
+    }
+
+    #[test]
+    fn popover_focus_followed_by_pointer_not_started_is_after_dispatch() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = popover_platform(clicks.clone(), select_log.clone())
+            .with_select_delay(Duration::from_millis(20));
+        let mut g = glass_with_a11y(platform, fake_tree_with_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        let error = g
+            .click_element_by(globex_id, Deadline::from_millis(5))
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "successful temporary focus makes the compound click attempted"
+        );
+        assert!(matches!(
+            error.cause(),
+            GlassError::Bounded {
+                kind: crate::BoundKind::NotStarted,
+                dispatch: crate::BoundDispatch::NotDispatched,
+                ..
+            }
+        ));
+        assert!(clicks.lock().unwrap().is_empty());
+        assert_eq!(
+            *select_log.lock().unwrap(),
+            vec![WindowId(2), WindowId(1)],
+            "focus moved before the pointer refusal and restoration was attempted"
+        );
+    }
+
+    #[test]
+    fn popover_restoration_failure_preserves_primary_and_cleanup_errors() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = popover_platform(clicks.clone(), select_log.clone())
+            .with_select_delay(Duration::from_millis(20))
+            .with_failing_select_window(WindowId(1));
+        let mut g = glass_with_a11y(platform, fake_tree_with_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        let error = g
+            .click_element_by(globex_id, Deadline::from_millis(5))
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+        let debug = format!("{error:#?}");
+        assert!(
+            debug.contains("WindowRestoreFailed")
+                && debug.contains("primary: Bounded")
+                && debug.contains("restore: Backend"),
+            "both failures must remain structurally visible: {debug}"
+        );
+        let display = error.to_string();
+        assert!(
+            display.contains("deadline")
+                && display.contains("scripted select_window failure for 1"),
+            "both failure explanations must reach the caller: {display}"
+        );
+        assert!(clicks.lock().unwrap().is_empty());
+        assert_eq!(
+            *select_log.lock().unwrap(),
+            vec![WindowId(2), WindowId(1)],
+            "the prior target restoration was attempted rather than silently skipped"
+        );
+    }
+
     /// The popover-routing platform: an active window plus the dropdown's popover window,
     /// with click + select logs — shared by the popover × native-invoke tests below.
     fn popover_platform(
@@ -2682,16 +2802,16 @@ mod tests {
             }
         }
 
-        fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
-            self.inner.window(op)
+        fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+            self.inner.window_by(op, deadline)
         }
 
-        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-            self.inner.list_windows()
+        fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+            self.inner.list_windows_by(deadline)
         }
 
-        fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
-            self.inner.select_window(id)
+        fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+            self.inner.select_window_by(id, deadline)
         }
 
         fn drain_logs(&mut self) -> Vec<(Stream, String)> {

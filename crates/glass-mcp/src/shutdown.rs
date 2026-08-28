@@ -141,15 +141,23 @@ mod tests {
         fn send_key_by(&mut self, _e: &KeyEvent, _deadline: glass_core::Deadline) -> Result<()> {
             unimplemented!()
         }
-        fn window(&mut self, _o: &WindowOp) -> Result<WindowGeometry> {
+        fn window_by(
+            &mut self,
+            _o: &WindowOp,
+            _deadline: glass_core::Deadline,
+        ) -> Result<WindowGeometry> {
             unimplemented!()
         }
         // start_on() lists windows (best-effort) to attribute audit records, so this
         // must answer rather than panic; no windows is fine for the shutdown test.
-        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+        fn list_windows_by(&mut self, _deadline: glass_core::Deadline) -> Result<Vec<WindowInfo>> {
             Ok(vec![])
         }
-        fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+        fn select_window_by(
+            &mut self,
+            _id: WindowId,
+            _deadline: glass_core::Deadline,
+        ) -> Result<WindowGeometry> {
             unimplemented!()
         }
         fn drain_logs(&mut self) -> Vec<(Stream, String)> {
@@ -236,13 +244,24 @@ mod tests {
             ) -> Result<()> {
                 unimplemented!()
             }
-            fn window(&mut self, _o: &WindowOp) -> Result<WindowGeometry> {
+            fn window_by(
+                &mut self,
+                _o: &WindowOp,
+                _deadline: glass_core::Deadline,
+            ) -> Result<WindowGeometry> {
                 unimplemented!()
             }
-            fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+            fn list_windows_by(
+                &mut self,
+                _deadline: glass_core::Deadline,
+            ) -> Result<Vec<WindowInfo>> {
                 Ok(vec![])
             }
-            fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+            fn select_window_by(
+                &mut self,
+                _id: WindowId,
+                _deadline: glass_core::Deadline,
+            ) -> Result<WindowGeometry> {
                 unimplemented!()
             }
             fn drain_logs(&mut self) -> Vec<(Stream, String)> {

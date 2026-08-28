@@ -1665,11 +1665,6 @@ fn require_healthy_input(s: &ActiveSession) -> Result<()> {
     }
 }
 
-/// Ask the compositor to answer for what this session has just sent, bounded.
-fn sync_session(s: &mut ActiveSession, who: &str) -> Result<()> {
-    roundtrip(&s.conn, &mut s.queue, &mut s.state, who)
-}
-
 fn sync_session_by(s: &mut ActiveSession, who: &str, deadline: Deadline) -> Result<()> {
     roundtrip_by(&s.conn, &mut s.queue, &mut s.state, deadline, who)
 }
@@ -2508,98 +2503,120 @@ impl Platform for WaylandPlatform {
         })
     }
 
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        let ident = session.active.clone().ok_or(GlassError::WindowNotFound)?;
-        // All window ops act on the active window's sway container. Windows are
-        // floating (see sway_config), so resize/move behave like a normal WM.
-        let con = session
-            .ipc
-            .windows()?
-            .into_iter()
-            .find(|w| w.identifier == ident)
-            .map(|w| w.con_id)
-            .ok_or(GlassError::WindowNotFound)?;
-        match *op {
-            WindowOp::Geometry => {}
-            WindowOp::Focus => session.ipc.run_command(&format!("[con_id={con}] focus"))?,
-            WindowOp::Resize { width, height } => session.ipc.run_command(&format!(
-                "[con_id={con}] resize set width {width} px height {height} px"
-            ))?,
-            // Move's (x, y) is an output-absolute origin, matching the X11 backend
-            // (root coordinates); the headless output is at (0, 0).
-            WindowOp::Move { x, y } => session
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        run_wayland_call_by(deadline, "Wayland window operation", |dispatch| {
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            let ident = session.active.clone().ok_or(GlassError::WindowNotFound)?;
+            dispatch.mark();
+            // All window ops act on the active window's sway container. Windows are
+            // floating (see sway_config), so resize/move behave like a normal WM.
+            let con = session
                 .ipc
-                .run_command(&format!("[con_id={con}] move absolute position {x} {y}"))?,
-        }
-        // Re-read the resulting rect (sway may clamp) and refresh the session
-        // contract — active_rect drives the capture crop and pointer offset.
-        let now = session
-            .ipc
-            .windows()?
-            .into_iter()
-            .find(|w| w.identifier == ident)
-            .ok_or(GlassError::WindowNotFound)?;
-        let geo = rect_to_geom(&now.rect);
-        session.active_rect = geo.clone();
-        session.geometry = geo.clone();
-        Ok(geo)
+                .windows_by(deadline)?
+                .into_iter()
+                .find(|w| w.identifier == ident)
+                .map(|w| w.con_id)
+                .ok_or(GlassError::WindowNotFound)?;
+            match *op {
+                WindowOp::Geometry => {}
+                WindowOp::Focus => session
+                    .ipc
+                    .run_command_by(&format!("[con_id={con}] focus"), deadline)?,
+                WindowOp::Resize { width, height } => session.ipc.run_command_by(
+                    &format!("[con_id={con}] resize set width {width} px height {height} px"),
+                    deadline,
+                )?,
+                // Move's (x, y) is an output-absolute origin, matching the X11 backend
+                // (root coordinates); the headless output is at (0, 0).
+                WindowOp::Move { x, y } => session.ipc.run_command_by(
+                    &format!("[con_id={con}] move absolute position {x} {y}"),
+                    deadline,
+                )?,
+            }
+            // Re-read the resulting rect (sway may clamp) and refresh the session
+            // contract — active_rect drives the capture crop and pointer offset.
+            let now = session
+                .ipc
+                .windows_by(deadline)?
+                .into_iter()
+                .find(|w| w.identifier == ident)
+                .ok_or(GlassError::WindowNotFound)?;
+            let geo = rect_to_geom(&now.rect);
+            session.active_rect = geo.clone();
+            session.geometry = geo.clone();
+            Ok(geo)
+        })
     }
 
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        // Refresh foreign-toplevel handles so capture can later find them.
-        sync_session(session, "window list")?;
-        let mut wins: Vec<SwayWindow> = session.ipc.windows()?;
-        // A window the app mapped can be missing here through no fault of the app (see
-        // `crate::xwayland`). Enumerating is where that shows up, so it is where glass repairs
-        // it — otherwise the caller is told the app has fewer windows than it does.
-        if session
-            .recovery
-            .recover_if_due(Instant::now(), &x11_ids(&wins))
-            > 0
-        {
-            std::thread::sleep(crate::xwayland::REMAP_SETTLE);
-            wins = session.ipc.windows()?;
-        }
-        let mut out = Vec::with_capacity(wins.len());
-        for w in &wins {
-            let id = mint_id(&mut session.ids, &mut session.next_id, &w.identifier);
-            out.push(WindowInfo {
-                id,
-                title: w.title.clone(),
-                class: w.class.clone(),
-                geometry: rect_to_geom(&w.rect),
-                active: w.focused,
-            });
-        }
-        Ok(out)
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        run_wayland_call_by(deadline, "Wayland window list", |dispatch| {
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            dispatch.mark();
+            // Refresh foreign-toplevel handles so capture can later find them.
+            sync_session_by(session, "window list", deadline)?;
+            let mut wins: Vec<SwayWindow> = session.ipc.windows_by(deadline)?;
+            // A window the app mapped can be missing here through no fault of the app (see
+            // `crate::xwayland`). Enumerating is where that shows up, so it is where glass repairs
+            // it — otherwise the caller is told the app has fewer windows than it does.
+            if session
+                .recovery
+                .recover_if_due(Instant::now(), &x11_ids(&wins))
+                > 0
+            {
+                let settle = deadline
+                    .remaining()
+                    .map(|left| left.min(crate::xwayland::REMAP_SETTLE))
+                    .unwrap_or(crate::xwayland::REMAP_SETTLE);
+                std::thread::sleep(settle);
+                if deadline.has_passed() {
+                    return Err(GlassError::caller_deadline_elapsed(
+                        "Wayland window list remap settle",
+                    ));
+                }
+                wins = session.ipc.windows_by(deadline)?;
+            }
+            let mut out = Vec::with_capacity(wins.len());
+            for w in &wins {
+                let id = mint_id(&mut session.ids, &mut session.next_id, &w.identifier);
+                out.push(WindowInfo {
+                    id,
+                    title: w.title.clone(),
+                    class: w.class.clone(),
+                    geometry: rect_to_geom(&w.rect),
+                    active: w.focused,
+                });
+            }
+            Ok(out)
+        })
     }
 
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        let wins = session.ipc.windows()?;
-        let target = wins
-            .into_iter()
-            .find(|w| session.ids.get(&w.identifier) == Some(&id))
-            .ok_or(GlassError::WindowNotFound)?;
-        session
-            .ipc
-            .run_command(&format!("[con_id={}] focus", target.con_id))?;
-        // Confirm the focus moved (no silent fallback).
-        let after = session.ipc.windows()?;
-        let now = after
-            .iter()
-            .find(|w| w.identifier == target.identifier)
-            .ok_or(GlassError::WindowNotFound)?;
-        if !now.focused {
-            return Err(GlassError::Backend("window did not take focus".into()));
-        }
-        let geo = rect_to_geom(&now.rect);
-        session.active = Some(target.identifier);
-        session.active_rect = geo.clone();
-        session.geometry = geo.clone();
-        Ok(geo)
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        run_wayland_call_by(deadline, "Wayland window selection", |dispatch| {
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            dispatch.mark();
+            let wins = session.ipc.windows_by(deadline)?;
+            let target = wins
+                .into_iter()
+                .find(|w| session.ids.get(&w.identifier) == Some(&id))
+                .ok_or(GlassError::WindowNotFound)?;
+            session
+                .ipc
+                .run_command_by(&format!("[con_id={}] focus", target.con_id), deadline)?;
+            // Confirm the focus moved (no silent fallback).
+            let after = session.ipc.windows_by(deadline)?;
+            let now = after
+                .iter()
+                .find(|w| w.identifier == target.identifier)
+                .ok_or(GlassError::WindowNotFound)?;
+            if !now.focused {
+                return Err(GlassError::Backend("window did not take focus".into()));
+            }
+            let geo = rect_to_geom(&now.rect);
+            session.active = Some(target.identifier);
+            session.active_rect = geo.clone();
+            session.geometry = geo.clone();
+            Ok(geo)
+        })
     }
 
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {

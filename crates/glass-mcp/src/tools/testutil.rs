@@ -190,7 +190,10 @@ impl Platform for FakePlatform {
         }
         Ok(())
     }
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window operation"));
+        }
         match *op {
             WindowOp::Resize { width, height } => {
                 self.geometry.width = width;
@@ -204,7 +207,10 @@ impl Platform for FakePlatform {
         }
         Ok(self.geometry.clone())
     }
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window list"));
+        }
         Ok(vec![WindowInfo {
             id: WindowId(0),
             title: Some("fake".into()),
@@ -213,7 +219,10 @@ impl Platform for FakePlatform {
             active: true,
         }])
     }
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window selection"));
+        }
         if id == WindowId(0) {
             Ok(self.geometry.clone())
         } else {

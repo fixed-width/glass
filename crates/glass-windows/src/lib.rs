@@ -167,6 +167,7 @@ mod backend {
     };
     use glass_core::{GlassError, Result};
 
+    use crate::run_windows_call_by;
     use crate::containment::{Launched, LogSink};
     use crate::display::{DisplayProvider, ExistingDesktop};
     use crate::windows::{
@@ -401,52 +402,69 @@ mod backend {
             }
         }
 
-        fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
-            let raw = self.active_hwnd.ok_or(GlassError::WindowNotFound)?;
-            let hwnd = crate::util::raw_to_hwnd(raw);
-            match *op {
-                WindowOp::Focus => focus_window(hwnd)?,
-                WindowOp::Move { x, y } => move_window(hwnd, x, y)?,
-                WindowOp::Resize { width, height } => resize_window(hwnd, width, height)?,
-                WindowOp::Geometry => {}
-            }
-            // Re-read the resulting geometry (the op may have moved/resized the frame).
-            geometry_of(hwnd)
+        fn window_by(
+            &mut self,
+            op: &WindowOp,
+            deadline: glass_core::Deadline,
+        ) -> Result<WindowGeometry> {
+            run_windows_call_by(deadline, "Windows window operation", |dispatch| {
+                let raw = self.active_hwnd.ok_or(GlassError::WindowNotFound)?;
+                let hwnd = crate::util::raw_to_hwnd(raw);
+                dispatch.mark();
+                match *op {
+                    WindowOp::Focus => focus_window(hwnd)?,
+                    WindowOp::Move { x, y } => move_window(hwnd, x, y)?,
+                    WindowOp::Resize { width, height } => resize_window(hwnd, width, height)?,
+                    WindowOp::Geometry => {}
+                }
+                // Re-read the resulting geometry (the op may have moved/resized the frame).
+                geometry_of(hwnd)
+            })
         }
 
-        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-            // No active app -> WindowNotFound, never an empty list (mirrors x11).
-            if self.app.is_none() {
-                return Err(GlassError::WindowNotFound);
-            }
-            let pids = self.app_pids();
-            let mut out = Vec::new();
-            for w in app_window_infos(&pids) {
-                out.push(WindowInfo {
-                    id: WindowId(w.raw as u64),
-                    title: (!w.title.is_empty()).then(|| w.title.clone()),
-                    class: (!w.class.is_empty()).then(|| w.class.clone()),
-                    geometry: geometry_of(w.hwnd())?,
-                    active: Some(w.raw) == self.active_hwnd,
-                });
-            }
-            Ok(out)
+        fn list_windows_by(&mut self, deadline: glass_core::Deadline) -> Result<Vec<WindowInfo>> {
+            run_windows_call_by(deadline, "Windows window list", |dispatch| {
+                // No active app -> WindowNotFound, never an empty list (mirrors x11).
+                if self.app.is_none() {
+                    return Err(GlassError::WindowNotFound);
+                }
+                let pids = self.app_pids();
+                dispatch.mark();
+                let mut out = Vec::new();
+                for w in app_window_infos(&pids) {
+                    out.push(WindowInfo {
+                        id: WindowId(w.raw as u64),
+                        title: (!w.title.is_empty()).then(|| w.title.clone()),
+                        class: (!w.class.is_empty()).then(|| w.class.clone()),
+                        geometry: geometry_of(w.hwnd())?,
+                        active: Some(w.raw) == self.active_hwnd,
+                    });
+                }
+                Ok(out)
+            })
         }
 
-        fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
-            if self.app.is_none() {
-                return Err(GlassError::WindowNotFound);
-            }
-            let pids = self.app_pids();
-            let raw = id.0 as isize;
-            // Validate against the current app-window set (stronger than a bare IsWindow,
-            // and matches x11): only switch to a window the app actually owns right now.
-            if app_window_infos(&pids).iter().any(|w| w.raw == raw) {
-                self.active_hwnd = Some(raw);
-                geometry_of(crate::util::raw_to_hwnd(raw))
-            } else {
-                Err(GlassError::WindowNotFound)
-            }
+        fn select_window_by(
+            &mut self,
+            id: WindowId,
+            deadline: glass_core::Deadline,
+        ) -> Result<WindowGeometry> {
+            run_windows_call_by(deadline, "Windows window selection", |dispatch| {
+                if self.app.is_none() {
+                    return Err(GlassError::WindowNotFound);
+                }
+                let pids = self.app_pids();
+                let raw = id.0 as isize;
+                dispatch.mark();
+                // Validate against the current app-window set (stronger than a bare IsWindow,
+                // and matches x11): only switch to a window the app actually owns right now.
+                if app_window_infos(&pids).iter().any(|w| w.raw == raw) {
+                    self.active_hwnd = Some(raw);
+                    geometry_of(crate::util::raw_to_hwnd(raw))
+                } else {
+                    Err(GlassError::WindowNotFound)
+                }
+            })
         }
 
         fn drain_logs(&mut self) -> Vec<(Stream, String)> {

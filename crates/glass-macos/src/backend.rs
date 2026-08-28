@@ -844,7 +844,10 @@ impl Platform for MacosPlatform {
     /// read-back reflects the request ([`move_took_effect`]/[`resize_was_refused`]), returning
     /// `GlassError::Backend` naming what didn't take rather than reporting success on a window
     /// that refused the change.
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("macOS window operation"));
+        }
         permissions::preflight()?;
         let id = self.active_window.ok_or(GlassError::NoActiveSession)?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
@@ -852,11 +855,28 @@ impl Platform for MacosPlatform {
         // `&[pid as i32]`-scoped (final-review fix 1): `id` came from this backend's own
         // `active_window`, but scoping the lookup here too means a stale/foreign id can
         // never resolve to another app's window.
-        let m = crate::scwindow::find_window_by_id(id, &[pid as i32], WINDOW_RESOLVE_TIMEOUT)?;
+        let m = crate::scwindow::find_window_by_id_by(
+            id,
+            &[pid as i32],
+            WINDOW_RESOLVE_TIMEOUT,
+            deadline,
+        )
+        .map_err(|error| {
+            if error.bound_owner() == Some(glass_core::Whose::Caller)
+                && error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched)
+            {
+                GlassError::caller_deadline_elapsed("macOS window query")
+            } else {
+                error
+            }
+        })?;
+        let _messaging_timeout = axwindow::MessagingTimeout::for_pid_by(pid as i32, deadline)?;
         let el = axwindow::ax_window_for_cgwindowid(pid as i32, id, m.geometry.clone(), m.scale)?;
 
-        match *op {
+        let mut mutation_dispatched = false;
+        let result = (|| match *op {
             WindowOp::Focus => {
+                mutation_dispatched = true;
                 crate::input::focus(pid as i32)?;
                 axwindow::ax_raise(&el)?;
                 axwindow::ax_set_main(&el)?;
@@ -864,6 +884,7 @@ impl Platform for MacosPlatform {
             }
             WindowOp::Move { x, y } => {
                 let target_pt = coords::global_pixel_to_point((x, y), m.scale);
+                mutation_dispatched = true;
                 axwindow::ax_set_position(&el, target_pt)?;
                 let geom = read_ax_geometry(&el, m.scale)?;
                 if !move_took_effect(&m.geometry, &geom, x, y) {
@@ -876,6 +897,7 @@ impl Platform for MacosPlatform {
             }
             WindowOp::Resize { width, height } => {
                 let target_size_pt = (width as f64 / m.scale, height as f64 / m.scale);
+                mutation_dispatched = true;
                 axwindow::ax_set_size(&el, target_size_pt)?;
                 let pos = axwindow::ax_position(&el)?;
                 axwindow::ax_set_position(&el, pos)?;
@@ -890,6 +912,18 @@ impl Platform for MacosPlatform {
                 Ok(geom)
             }
             WindowOp::Geometry => read_ax_geometry(&el, m.scale),
+        })();
+        let result = if mutation_dispatched {
+            result.map_err(GlassError::after_dispatch)
+        } else {
+            result
+        };
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed(
+                "macOS window operation",
+            ))
+        } else {
+            result
         }
     }
     /// Enumerate every on-screen window owned by the launched app's pid via
@@ -898,10 +932,13 @@ impl Platform for MacosPlatform {
     ///
     /// **Main-thread affinity:** reaches `ffi::app_kit_init()` and must run on the true main
     /// thread.
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("macOS window list"));
+        }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
-        let windows = crate::scwindow::list_app_windows(&[pid as i32])?;
+        let windows = crate::scwindow::list_app_windows_by(&[pid as i32], deadline)?;
         Ok(windows
             .into_iter()
             .map(|w| window_info_from(w, self.active_window))
@@ -926,13 +963,30 @@ impl Platform for MacosPlatform {
     /// window closed in the gap between the check and the `AXRaise`/`AXMain` calls —
     /// `active_window` is rolled back rather than left pointing at a window this call never
     /// confirmed glass can operate on.
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("macOS window selection"));
+        }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
         let previous = self.active_window;
-        crate::scwindow::find_window_by_id(id.0 as u32, &[pid as i32], WINDOW_RESOLVE_TIMEOUT)?;
+        crate::scwindow::find_window_by_id_by(
+            id.0 as u32,
+            &[pid as i32],
+            WINDOW_RESOLVE_TIMEOUT,
+            deadline,
+        )
+        .map_err(|error| {
+            if error.bound_owner() == Some(glass_core::Whose::Caller)
+                && error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched)
+            {
+                GlassError::caller_deadline_elapsed("macOS window selection query")
+            } else {
+                error
+            }
+        })?;
         self.active_window = Some(id.0 as u32);
-        self.window(&WindowOp::Focus)
+        self.window_by(&WindowOp::Focus, deadline)
             .inspect_err(|_| self.active_window = previous)
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {

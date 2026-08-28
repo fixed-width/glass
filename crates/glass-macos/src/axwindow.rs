@@ -56,7 +56,7 @@ use objc2_core_foundation::{
 };
 
 use glass_core::platform::WindowGeometry;
-use glass_core::{GlassError, Result};
+use glass_core::{Deadline, GlassError, Result};
 
 use crate::coords::point_to_global_pixel;
 
@@ -91,6 +91,43 @@ const FALLBACK_TOLERANCE_PX: i32 = 8;
 /// multi-window layout without deliberately forcing it. Not read anywhere outside this
 /// module; not a supported way to configure glass in normal use.
 const FORCE_AX_GEOMETRY_FALLBACK_ENV: &str = "GLASS_MACOS_FORCE_AX_GEOMETRY_FALLBACK";
+
+/// Scope synchronous AX IPC to the caller's remaining deadline, restoring the process default on
+/// drop. `None` for an unbounded caller leaves the system default untouched.
+pub(crate) struct MessagingTimeout {
+    app: CFRetained<AXUIElement>,
+}
+
+impl MessagingTimeout {
+    pub(crate) fn for_pid_by(pid: i32, deadline: Deadline) -> Result<Option<Self>> {
+        let Some(remaining) = deadline.remaining() else {
+            return Ok(None);
+        };
+        if remaining.is_zero() {
+            return Err(GlassError::deadline_not_started(
+                "macOS AX window operation",
+            ));
+        }
+        // SAFETY: the binding guarantees a live application element for a plain process id.
+        let app = unsafe { AXUIElement::new_application(pid) };
+        // SAFETY: `app` is live and the timeout is a finite scalar. A 1ms floor avoids passing
+        // zero, which means "restore the default" rather than "do not wait" in AX.
+        let error = unsafe { app.set_messaging_timeout(remaining.as_secs_f32().max(0.001)) };
+        if error != AXError::Success {
+            return Err(GlassError::Backend(format!(
+                "AXUIElementSetMessagingTimeout failed: {error:?}"
+            )));
+        }
+        Ok(Some(Self { app }))
+    }
+}
+
+impl Drop for MessagingTimeout {
+    fn drop(&mut self) {
+        // SAFETY: `self.app` remains live through drop; zero restores AX's documented default.
+        let _ = unsafe { self.app.set_messaging_timeout(0.0) };
+    }
+}
 
 /// Resolve the `AXUIElement` window for `pid` whose `CGWindowID` is `window_id`.
 ///

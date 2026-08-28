@@ -376,7 +376,10 @@ fn app_window_from(w: &SCWindow, app: &SCRunningApplication) -> AppWindow {
 /// poll-loop-friendly `Ok(None)`): this function has no outer retry loop, so silently
 /// returning an empty `Vec` on a wedged handler would be indistinguishable from "the app
 /// really has no windows right now".
-pub(crate) fn list_app_windows(pids: &[i32]) -> Result<Vec<AppWindow>> {
+pub(crate) fn list_app_windows_by(pids: &[i32], deadline: Deadline) -> Result<Vec<AppWindow>> {
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started("macOS window list"));
+    }
     crate::ffi::app_kit_init();
 
     let (tx, rx) = mpsc::channel::<ListReply>();
@@ -436,15 +439,20 @@ pub(crate) fn list_app_windows(pids: &[i32]) -> Result<Vec<AppWindow>> {
         );
     }
 
-    match rx.recv_timeout(QUERY_TIMEOUT) {
-        Ok(ListReply::Found(v)) => Ok(v),
-        Ok(ListReply::Failed(e)) => Err(e),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(GlassError::Backend(
-            "SCShareableContent completion handler did not reply within the query timeout".into(),
-        )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(GlassError::Backend(
-            "SCShareableContent completion handler was dropped without replying".into(),
-        )),
+    let (wait, owner) = deadline.budget(QUERY_TIMEOUT, std::time::Instant::now());
+    let reply = crate::shareable_receive::classify_receive_by(
+        rx.recv_timeout(wait),
+        owner,
+        "macOS window list",
+    )?;
+    let result = match reply {
+        ListReply::Found(v) => Ok(v),
+        ListReply::Failed(e) => Err(e),
+    };
+    if deadline.has_passed() {
+        Err(GlassError::caller_deadline_elapsed("macOS window list"))
+    } else {
+        result
     }
 }
 

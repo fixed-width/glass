@@ -2330,15 +2330,23 @@ exec "$real" "$@"
             Ok(())
         }
 
-        fn window(&mut self, _op: &glass_core::WindowOp) -> Result<WindowGeometry> {
+        fn window_by(
+            &mut self,
+            _op: &glass_core::WindowOp,
+            _deadline: Deadline,
+        ) -> Result<WindowGeometry> {
             Ok(write_context().window)
         }
 
-        fn list_windows(&mut self) -> Result<Vec<glass_core::WindowInfo>> {
+        fn list_windows_by(&mut self, _deadline: Deadline) -> Result<Vec<glass_core::WindowInfo>> {
             Ok(vec![])
         }
 
-        fn select_window(&mut self, _id: glass_core::WindowId) -> Result<WindowGeometry> {
+        fn select_window_by(
+            &mut self,
+            _id: glass_core::WindowId,
+            _deadline: Deadline,
+        ) -> Result<WindowGeometry> {
             Ok(write_context().window)
         }
 
