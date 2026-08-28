@@ -4,10 +4,10 @@
 //! reads one JSON response line.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use glass_core::GlassError;
+use glass_core::{Deadline, GlassError};
 use serde_json::{Value, json};
 
 /// The protocol version this client speaks (must match the agent's hello `proto`).
@@ -69,23 +69,58 @@ pub(crate) struct Conn {
 impl Conn {
     /// Connect to `127.0.0.1:port`, read + version-check the hello banner.
     pub(crate) fn open(port: u16) -> glass_core::Result<Conn> {
-        let stream = TcpStream::connect(("127.0.0.1", port))
-            .map_err(|e| GlassError::Backend(format!("agent connect :{port}: {e}")))?;
+        Self::open_by(port, Deadline::UNBOUNDED)
+    }
+
+    /// Connect and complete the hello handshake within one caller deadline.
+    pub(crate) fn open_by(port: u16, deadline: Deadline) -> glass_core::Result<Conn> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("agent connect"));
+        }
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let stream_result = match deadline.remaining() {
+            Some(wait) => TcpStream::connect_timeout(&address, wait),
+            None => TcpStream::connect(address),
+        };
+        let stream = stream_result.map_err(|e| {
+            if deadline.has_passed() {
+                GlassError::caller_deadline_elapsed("agent connect")
+            } else {
+                GlassError::Backend(format!("agent connect :{port}: {e}"))
+            }
+        })?;
         // Timeouts so a stalled agent surfaces as a transport error the reconnect path handles,
         // rather than hanging the MCP thread forever. Each goes on the handle that does that
         // half's work — see `read_within` for what puts the read one on the reader.
-        stream.set_write_timeout(Some(STANDING_TIMEOUT)).ok();
+        let setup_wait = deadline.remaining();
+        if setup_wait.is_some_and(|wait| wait.is_zero()) {
+            return Err(GlassError::caller_deadline_elapsed("agent connect"));
+        }
+        stream
+            .set_write_timeout(Some(setup_wait.unwrap_or(STANDING_TIMEOUT)))
+            .ok();
         let read_half = stream
             .try_clone()
             .map_err(|e| GlassError::Backend(format!("agent clone: {e}")))?;
-        read_half.set_read_timeout(Some(STANDING_TIMEOUT)).ok();
+        read_half
+            .set_read_timeout(Some(setup_wait.unwrap_or(STANDING_TIMEOUT)))
+            .ok();
         let reader = BufReader::new(read_half);
         let mut c = Conn {
             writer: stream,
             reader,
             next_id: 1,
         };
-        let hello = c.read_line()?;
+        let hello = c.read_line().map_err(|e| {
+            if deadline.has_passed() {
+                GlassError::caller_deadline_elapsed("agent hello")
+            } else {
+                e
+            }
+        })?;
+        if deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed("agent hello"));
+        }
         let v: Value = serde_json::from_str(&hello)
             .map_err(|e| GlassError::Backend(format!("agent hello parse: {e}")))?;
         let proto = v
@@ -97,6 +132,8 @@ impl Conn {
                 "agent protocol mismatch: got {proto:?}, want {PROTO}"
             )));
         }
+        c.read_within(None);
+        c.write_within(None);
         Ok(c)
     }
 
@@ -172,12 +209,55 @@ impl Conn {
 mod tests {
     use super::*;
     use crate::agent::fake_agent;
+    use glass_core::Deadline;
     use std::io::Write;
     use std::net::TcpListener;
     use std::time::Instant;
 
     const HELLO: &str = r#"{"hello":{"proto":1}}"#;
     const OK: &str = r#"{"ok":true}"#;
+
+    fn delayed_hello(delay: Duration) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            std::thread::sleep(delay);
+            let _ = writeln!(stream, "{HELLO}");
+        });
+        port
+    }
+
+    #[test]
+    fn bounded_connection_setup_times_out_near_the_caller_deadline() {
+        let started = Instant::now();
+        let Err(err) = Conn::open_by(
+            delayed_hello(Duration::from_secs(2)),
+            Deadline::from_millis(150),
+        ) else {
+            panic!("a delayed hello must exceed the caller deadline");
+        };
+        assert!(matches!(err, GlassError::Bounded { .. }), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn successful_bounded_connection_setup_restores_standing_timeouts() {
+        let conn = Conn::open_by(
+            delayed_hello(Duration::from_millis(20)),
+            Deadline::from_millis(500),
+        )
+        .unwrap();
+        assert_eq!(conn.writer.write_timeout().unwrap(), Some(STANDING_TIMEOUT));
+        assert_eq!(
+            conn.reader.get_ref().read_timeout().unwrap(),
+            Some(STANDING_TIMEOUT)
+        );
+    }
 
     /// A listener that says hello and then answers nothing, holding the connection open — a
     /// companion that stopped responding without dropping the socket, which is the only case a

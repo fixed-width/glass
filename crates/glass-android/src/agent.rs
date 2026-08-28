@@ -4,7 +4,7 @@
 //! owns the device server's lifecycle. Everything degrades to the adb paths on failure.
 
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use glass_core::Deadline;
@@ -45,13 +45,18 @@ impl AgentClient {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("agent request"));
         }
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| GlassError::Backend("agent client lock poisoned".into()))?;
+        let mut conn = self.lock_by(deadline)?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("agent request"));
+        }
         let wait = deadline.remaining();
         conn.read_within(wait);
         conn.write_within(wait);
+        if deadline.has_passed() {
+            conn.read_within(None);
+            conn.write_within(None);
+            return Err(GlassError::deadline_not_started("agent request"));
+        }
         let first = conn.call(req.clone());
         conn.read_within(None);
         conn.write_within(None);
@@ -60,18 +65,54 @@ impl AgentClient {
             Err(f) if f.is_transport() => {
                 // The agent's accept loop accepts a fresh connection after a drop.
                 if deadline.has_passed() {
-                    return Err(f.into_error());
+                    return Err(f
+                        .with_error(GlassError::caller_deadline_elapsed("agent request"))
+                        .into_error());
                 }
-                *conn = Conn::open(self.port)?;
+                *conn = Conn::open_by(self.port, deadline)?;
+                if deadline.has_passed() {
+                    return Err(GlassError::deadline_not_started("agent retry"));
+                }
                 let wait = deadline.remaining();
                 conn.read_within(wait);
                 conn.write_within(wait);
+                if deadline.has_passed() {
+                    conn.read_within(None);
+                    conn.write_within(None);
+                    return Err(GlassError::deadline_not_started("agent retry"));
+                }
                 let retried = conn.call(req);
                 conn.read_within(None);
                 conn.write_within(None);
                 retried.map_err(CallFailure::into_error)
             }
             Err(f) => Err(f.into_error()),
+        }
+    }
+
+    fn lock_by(&self, deadline: Deadline) -> Result<MutexGuard<'_, Conn>> {
+        if deadline.remaining().is_none() {
+            return self
+                .conn
+                .lock()
+                .map_err(|_| GlassError::Backend("agent client lock poisoned".into()));
+        }
+        loop {
+            match self.conn.try_lock() {
+                Ok(conn) => return Ok(conn),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(GlassError::Backend("agent client lock poisoned".into()));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let Some(left) = deadline.remaining() else {
+                        unreachable!("bounded lock wait became unbounded")
+                    };
+                    if left.is_zero() {
+                        return Err(GlassError::deadline_not_started("agent request"));
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(1)));
+                }
+            }
         }
     }
 
@@ -577,6 +618,61 @@ mod tests {
             conn.reader.get_ref().read_timeout().unwrap(),
             Some(crate::conn::STANDING_TIMEOUT)
         );
+    }
+
+    #[test]
+    fn deadline_expiring_while_waiting_for_connection_lock_dispatches_nothing() {
+        let (port, seen) = fake_agent(HELLO, vec![OK]);
+        let client = Arc::new(AgentClient::connect(port).unwrap());
+        let held = client.conn.lock().unwrap();
+        let caller = Arc::clone(&client);
+        let join = std::thread::spawn(move || caller.key_by("enter", Deadline::from_millis(100)));
+        std::thread::sleep(Duration::from_millis(180));
+        drop(held);
+        let err = join.join().unwrap().unwrap_err();
+        assert!(matches!(err, GlassError::Bounded { .. }), "{err}");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reconnect_hello_is_bounded_and_dispatches_no_retry_after_expiry() {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let retried = Arc::new(Mutex::new(Vec::<String>::new()));
+        let retry_log = Arc::clone(&retried);
+        std::thread::spawn(move || {
+            let (first, _) = listener.accept().unwrap();
+            let mut first_writer = first.try_clone().unwrap();
+            writeln!(first_writer, "{HELLO}").unwrap();
+            let mut line = String::new();
+            BufReader::new(first).read_line(&mut line).unwrap();
+            drop(first_writer);
+
+            let (second, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            let mut second_writer = second.try_clone().unwrap();
+            let _ = writeln!(second_writer, "{HELLO}");
+            let mut line = String::new();
+            if BufReader::new(second).read_line(&mut line).unwrap_or(0) != 0 {
+                retry_log.lock().unwrap().push(line);
+            }
+        });
+
+        let client = AgentClient::connect(port).unwrap();
+        let started = Instant::now();
+        let err = client
+            .key_by("enter", Deadline::from_millis(150))
+            .unwrap_err();
+        assert!(matches!(err, GlassError::Bounded { .. }), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(retried.lock().unwrap().is_empty());
     }
 
     #[test]
