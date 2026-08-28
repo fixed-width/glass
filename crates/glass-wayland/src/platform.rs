@@ -1650,6 +1650,12 @@ fn record_release_failure(poison: &mut Option<String>, result: &Result<()>) {
     }
 }
 
+fn confirm_release_settled<T>(held: &mut Option<T>, settled: Result<()>) -> Result<()> {
+    settled?;
+    *held = None;
+    Ok(())
+}
+
 fn require_healthy_input(s: &ActiveSession) -> Result<()> {
     match &s.input_poison {
         Some(cause) => Err(GlassError::Backend(format!(
@@ -1718,12 +1724,20 @@ fn tap_by(
         s.time = s.time.wrapping_add(1);
         kb.key(s.time, kc, state);
         dispatch.mark();
-        held.key = (state == 1).then_some(kc);
+        if state == 1 {
+            held.key = Some(kc);
+        }
         if let Err(e) = sync_session_by(s, "key tap", deadline) {
             let cleanup = held.release(s);
             return finish_input_cleanup(&mut s.input_poison, Err(e), cleanup);
         }
-        if let Err(error) = input_settle_by(deadline) {
+        let settled = input_settle_by(deadline);
+        let settled = if state == 0 {
+            confirm_release_settled(&mut held.key, settled)
+        } else {
+            settled
+        };
+        if let Err(error) = settled {
             let cleanup = held.release(s);
             return finish_input_cleanup(&mut s.input_poison, Err(error), cleanup);
         }
@@ -2363,8 +2377,7 @@ impl Platform for WaylandPlatform {
                             vp.button(t, b, ButtonState::Released);
                             vp.frame();
                             dispatch.mark();
-                            held.button = None;
-                            settle(session)?;
+                            confirm_release_settled(&mut held.button, settle(session))?;
                         }
                         Ok(())
                     };
@@ -2709,6 +2722,21 @@ mod pure_tests {
             Some(BoundDispatch::MayHaveDispatched)
         );
         assert!(error.to_string().contains("cleanup flush failed"));
+    }
+
+    #[test]
+    fn held_input_is_cleared_only_after_release_settle_succeeds() {
+        let mut held = Some(272);
+        let error = confirm_release_settled(
+            &mut held,
+            Err(GlassError::Backend("release settle failed".into())),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("release settle failed"));
+        assert_eq!(held, Some(272));
+
+        confirm_release_settled(&mut held, Ok(())).unwrap();
+        assert_eq!(held, None);
     }
 
     #[test]
