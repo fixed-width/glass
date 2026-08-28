@@ -668,6 +668,65 @@ mod tests {
         (port, requests, join)
     }
 
+    /// Answer conn1's first mutation with a stale ID, then queue the answer that actually belongs
+    /// to it. Reusing conn1 makes the next mutation consume that queued answer and leaves the
+    /// request/response stream one exchange behind; retiring conn1 sends the distinct mutation on
+    /// conn2 instead.
+    fn agent_with_stale_wrong_id_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            first
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("bound conn1 observation");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_reader = BufReader::new(first);
+            let mut line = String::new();
+            first_reader
+                .read_line(&mut line)
+                .expect("read conn1 request");
+            let request: Value = serde_json::from_str(&line).expect("conn1 request json");
+            let first_id = request["id"].clone();
+            request_log.lock().expect("request log").push((1, request));
+            writeln!(first_writer, "{}", json!({"id": 999, "ok": true}))
+                .expect("write stale conn1 answer");
+            writeln!(first_writer, "{}", json!({"id": first_id, "ok": true}))
+                .expect("queue the actual conn1 answer");
+            first_writer.flush().expect("flush conn1 answers");
+
+            line.clear();
+            if matches!(first_reader.read_line(&mut line), Ok(n) if n > 0) {
+                let request: Value =
+                    serde_json::from_str(&line).expect("second conn1 request json");
+                let id = request["id"].clone();
+                request_log.lock().expect("request log").push((1, request));
+                let _ = writeln!(first_writer, "{}", json!({"id": id, "ok": true}));
+                return;
+            }
+
+            let (second, _) = listener.accept().expect("accept conn2");
+            let mut second_writer = second.try_clone().expect("clone conn2");
+            writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+            let mut second_reader = BufReader::new(second);
+            line.clear();
+            second_reader
+                .read_line(&mut line)
+                .expect("read conn2 request");
+            let request: Value = serde_json::from_str(&line).expect("conn2 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((2, request));
+            writeln!(second_writer, "{}", json!({"id": id, "ok": true}))
+                .expect("answer conn2 request");
+        });
+        (port, requests, join)
+    }
+
     #[test]
     fn read_timeout_install_failure_aborts_before_dispatch() {
         let (port, requests, _) = counting_agent();
@@ -857,6 +916,25 @@ mod tests {
         assert_eq!(seen[0].1["chord"], "a");
         assert_eq!((seen[1].0, seen[1].1["op"].as_str()), (2, Some("key")));
         assert_eq!(seen[1].1["chord"], "b");
+    }
+
+    #[test]
+    fn wrong_id_refusal_retires_stream_before_the_next_distinct_mutation() {
+        let (port, requests, join) = agent_with_stale_wrong_id_answer();
+        let client = AgentClient::connect(port).expect("connect");
+
+        let first = client
+            .key("a")
+            .expect_err("a stale response cannot answer the first mutation");
+        assert!(first.to_string().contains("id mismatch"), "{first}");
+        let second = client.key("b");
+
+        join.join().expect("fake agent");
+        second.expect("the distinct mutation reconnects instead of consuming conn1's queued reply");
+        let seen = requests.lock().expect("request log");
+        assert_eq!(seen.len(), 2, "a mutation was replayed or lost: {seen:?}");
+        assert_eq!((seen[0].0, seen[0].1["chord"].as_str()), (1, Some("a")));
+        assert_eq!((seen[1].0, seen[1].1["chord"].as_str()), (2, Some("b")));
     }
 
     #[test]

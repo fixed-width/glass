@@ -25,6 +25,11 @@ pub(crate) enum CallFailure {
     Refused(GlassError),
 }
 
+enum ResponseAssignment {
+    Assigned(std::result::Result<Value, CallFailure>),
+    Unassignable(CallFailure),
+}
+
 impl CallFailure {
     /// The error to surface.
     pub(crate) fn into_error(self) -> GlassError {
@@ -404,7 +409,13 @@ impl Conn {
             return Err(install_error);
         }
 
-        let mut outcome = self.call_by(req, deadline, op);
+        let (mut outcome, retire_unassignable) = match self.call_by(req, deadline, op) {
+            Ok((id, response)) => match Self::parse_response(id, &response) {
+                ResponseAssignment::Assigned(outcome) => (outcome, false),
+                ResponseAssignment::Unassignable(failure) => (Err(failure), true),
+            },
+            Err(failure) => (Err(failure), false),
+        };
 
         // Re-read the absolute deadline immediately before restoration. A reply received within
         // the read timeout can still finish parsing at the boundary, and restoration itself must
@@ -428,6 +439,9 @@ impl Conn {
                 })
             }
         };
+        if retire_unassignable {
+            self.poison();
+        }
         Ok(self.retire_answer_lost(outcome))
     }
 
@@ -444,7 +458,7 @@ impl Conn {
         mut req: Value,
         deadline: Deadline,
         op: &str,
-    ) -> std::result::Result<Value, CallFailure> {
+    ) -> std::result::Result<(i64, String), CallFailure> {
         self.ensure_usable().map_err(CallFailure::NotSent)?;
         let id = self.next_id;
         self.next_id += 1;
@@ -461,29 +475,36 @@ impl Conn {
         })?;
 
         let resp_line = self.read_line_by(deadline, op)?;
-        Self::parse_response(id, &resp_line)
+        Ok((id, resp_line))
     }
 
-    fn parse_response(id: i64, resp_line: &str) -> std::result::Result<Value, CallFailure> {
-        let resp: Value = serde_json::from_str(resp_line).map_err(|e| {
-            CallFailure::Refused(GlassError::Backend(format!("agent resp parse: {e}")))
-        })?;
+    fn parse_response(id: i64, resp_line: &str) -> ResponseAssignment {
+        let resp: Value = match serde_json::from_str(resp_line) {
+            Ok(response) => response,
+            Err(error) => {
+                return ResponseAssignment::Unassignable(CallFailure::Refused(
+                    GlassError::Backend(format!("agent resp parse: {error}")),
+                ));
+            }
+        };
         if resp.get("id").and_then(Value::as_i64) != Some(id) {
-            return Err(CallFailure::Refused(GlassError::Backend(format!(
-                "agent response id mismatch (got {:?}, want {id})",
-                resp.get("id")
-            ))));
+            return ResponseAssignment::Unassignable(CallFailure::Refused(GlassError::Backend(
+                format!(
+                    "agent response id mismatch (got {:?}, want {id})",
+                    resp.get("id")
+                ),
+            )));
         }
         if resp.get("ok").and_then(Value::as_bool) != Some(true) {
             let err = resp
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("agent error");
-            return Err(CallFailure::Refused(GlassError::Backend(format!(
-                "agent: {err}"
+            return ResponseAssignment::Assigned(Err(CallFailure::Refused(GlassError::Backend(
+                format!("agent: {err}"),
             ))));
         }
-        Ok(resp)
+        ResponseAssignment::Assigned(Ok(resp))
     }
 }
 
@@ -735,6 +756,10 @@ mod tests {
         assert!(
             failure.into_error().to_string().contains("id mismatch"),
             "the error must say what did not line up"
+        );
+        assert!(
+            conn.ensure_usable().is_err(),
+            "an unassignable answer left the stream reusable"
         );
     }
 
