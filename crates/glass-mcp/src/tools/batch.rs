@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use crate::params::*;
 use crate::tools::{
-    BatchToolResult, ContextualOutput, ContextualToolResult, OutContent, ToolContext, ToolOutput,
-    click_element_with, click_with, diff_with, drag_with, key_with, mouse_move_with,
-    screenshot_with, scroll_to_element_with, scroll_with, set_value_with, type_text_with,
-    wait_for_element_with, wait_stable_with,
+    BatchToolResult, ContextualToolResult, OutContent, ToolContext, ToolOutput, click_element_with,
+    click_with, diff_with, drag_with, key_with, mouse_move_with, screenshot_with,
+    scroll_to_element_with, scroll_with, set_value_with, type_text_with, wait_for_element_with,
+    wait_stable_with,
 };
 
 mod model;
@@ -67,26 +67,6 @@ fn settle_args(s: &SettleArgs) -> WaitStableArgs {
         window_id: None,
         ignore: s.ignore.clone(),
     }
-}
-
-fn terminal_settle(
-    glass: &mut Glass,
-    args: &SettleArgs,
-    context: ToolContext,
-) -> ContextualToolResult {
-    wait_stable_with(glass, &settle_args(args), context).or_else(|error| {
-        // A zero settle timeout belongs to the callee. The bounded core correctly
-        // refuses its final capture, but terminal observation still reports the
-        // documented soft result rather than converting it into a hard failure.
-        if args.timeout_ms == Some(0) && !error.sequence_deadline_exceeded {
-            Ok(ContextualOutput::with_timeout(
-                ToolOutput::result("glass_wait_stable", json!({ "settled": false })),
-                Some(Whose::Callee),
-            ))
-        } else {
-            Err(error)
-        }
-    })
 }
 
 /// Run an ordered action sequence, then the optional terminal observe.
@@ -495,15 +475,27 @@ fn run_then(
         if then.diff.is_some() && then.screenshot.is_some() {
             terminal_operation!(
                 "settle",
-                terminal_settle(glass, s, context),
+                wait_stable_with(glass, &settle_args(s), context),
                 ["diff", "screenshot"]
             );
         } else if then.diff.is_some() {
-            terminal_operation!("settle", terminal_settle(glass, s, context), ["diff"]);
+            terminal_operation!(
+                "settle",
+                wait_stable_with(glass, &settle_args(s), context),
+                ["diff"]
+            );
         } else if then.screenshot.is_some() {
-            terminal_operation!("settle", terminal_settle(glass, s, context), ["screenshot"]);
+            terminal_operation!(
+                "settle",
+                wait_stable_with(glass, &settle_args(s), context),
+                ["screenshot"]
+            );
         } else {
-            terminal_operation!("settle", terminal_settle(glass, s, context), []);
+            terminal_operation!(
+                "settle",
+                wait_stable_with(glass, &settle_args(s), context),
+                []
+            );
         }
     }
     if let Some(d) = &then.diff {

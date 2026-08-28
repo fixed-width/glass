@@ -380,12 +380,11 @@ impl Glass {
             },
             || {
                 // Poll only the watched region (cheap) when one is set; else the full window.
-                let capture_deadline =
-                    if !looked && caller == Deadline::UNBOUNDED && params.timeout_ms == 0 {
-                        Deadline::UNBOUNDED
-                    } else {
-                        deadline
-                    };
+                let capture_deadline = if !looked && params.timeout_ms == 0 {
+                    caller
+                } else {
+                    deadline
+                };
                 looked = true;
                 let frame = self.capture_by(window, region.as_ref(), capture_deadline)?;
                 let t = match tracker {
