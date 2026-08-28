@@ -390,7 +390,18 @@ impl Glass {
                     deadline
                 };
                 looked = true;
-                let frame = self.capture_by(window, region.as_ref(), capture_deadline)?;
+                let frame = match self.capture_by(window, region.as_ref(), capture_deadline) {
+                    Ok(frame) => frame,
+                    Err(error)
+                        if tracker.is_some()
+                            && whose == crate::Whose::Callee
+                            && deadline.has_passed()
+                            && error.bound().is_some() =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
                 if compatibility_capture && caller != Deadline::UNBOUNDED && caller.has_passed() {
                     return Err(GlassError::caller_deadline_elapsed("wait for stable"));
                 }
@@ -1136,6 +1147,35 @@ mod tests {
             .unwrap();
 
         assert!(!outcome.settled);
+        assert_eq!(captures.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn callee_timeout_during_capture_uses_the_last_frame_and_stays_soft() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let frame = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![frame.clone()])
+            .with_capture_log(captures.clone())
+            .with_capture_delay(Duration::from_millis(15))
+            .honoring_capture_deadline();
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 10,
+                settle_frames: 3,
+                tolerance: 0,
+                timeout_ms: 30,
+                stability_region: None,
+                ignore: Vec::new(),
+                window: None,
+            })
+            .unwrap();
+
+        assert!(!outcome.settled);
+        assert_eq!(outcome.frame, frame);
         assert_eq!(captures.lock().unwrap().len(), 1);
     }
 

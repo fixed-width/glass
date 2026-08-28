@@ -41,6 +41,7 @@ pub(crate) struct FakePlatform {
     pointer_deadline_log: Option<InputDeadlineLog>,
     key_deadline_log: Option<InputDeadlineLog>,
     capture_delay: Option<Duration>,
+    capture_honors_deadline: bool,
     geometry_delay: Option<Duration>,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
     log_batches: std::collections::VecDeque<Vec<(Stream, String)>>,
@@ -113,6 +114,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_capture_delay(mut self, delay: Duration) -> Self {
         self.capture_delay = Some(delay);
+        self
+    }
+    pub(crate) fn honoring_capture_deadline(mut self) -> Self {
+        self.capture_honors_deadline = true;
         self
     }
     pub(crate) fn with_geometry_delay(mut self, delay: Duration) -> Self {
@@ -231,6 +236,9 @@ impl Platform for FakePlatform {
         }
         if let Some(delay) = self.capture_delay {
             std::thread::sleep(delay);
+        }
+        if self.capture_honors_deadline && deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed("capture"));
         }
         self.capture_log.lock().unwrap().push(region.copied());
         let frame = match self.frames.pop_front() {
