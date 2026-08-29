@@ -16,6 +16,11 @@ use crate::accessibility::ElementSelector;
 /// the short waits that could least afford one stale read.
 const REREAD_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Time reserved for the quiet-wait safety read to start before its absolute deadline. Never takes
+/// more than a quarter of a short wait's remaining budget, so even short waits spend meaningful
+/// time listening before the compatibility read.
+const FINAL_READ_HEADROOM: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Resolve the accessibility reader's caller relative to the enclosing wait action.
 ///
 /// A reader names the deadline in `AxContext` as its caller. That deadline may be the action's own
@@ -536,21 +541,26 @@ impl Glass {
             |d| {
                 // `poll_until_with_pause` performs its skipped-tick safety read after the timeout.
                 // Accessibility snapshots cannot return late success, so when this pause would
-                // reach the absolute deadline, spend it on one final on-time read instead. A wide
-                // interval may make that read early, but never late.
-                if !final_read_scheduled.get()
-                    && action_deadline.remaining().is_some_and(|left| left <= d)
-                {
+                // reach the absolute deadline, stop just before it and take the safety read then.
+                // Reserving at most a quarter of what remains leaves meaningful quiet time even for
+                // a short wait, while the unchanged absolute deadline still bounds the reader.
+                let left = action_deadline.remaining();
+                let final_read = !final_read_scheduled.get() && left.is_some_and(|left| left <= d);
+                if final_read {
                     final_read_scheduled.set(true);
-                    return true;
                 }
                 let paused_at = std::time::Instant::now();
-                let pause_budget = action_deadline.remaining().unwrap_or(d).min(d);
+                let pause_budget = if final_read {
+                    let left = left.expect("a final read is scheduled only for a bounded wait");
+                    left.saturating_sub(FINAL_READ_HEADROOM.min(left / 4))
+                } else {
+                    left.unwrap_or(d).min(d)
+                };
                 let read_now = match signal.as_mut() {
                     Some(s) => match s.wait(pause_budget) {
                         ChangeWait::Changed => true,
                         // Read anyway now and then — see `REREAD_AFTER`.
-                        ChangeWait::Quiet => last_read.elapsed() >= REREAD_AFTER,
+                        ChangeWait::Quiet => final_read || last_read.elapsed() >= REREAD_AFTER,
                         // See `ChangeWait`: an unusable signal must not read as a quiet one.
                         ChangeWait::Unusable => {
                             signal = None;
@@ -2197,6 +2207,29 @@ mod tests {
         }
     }
 
+    struct ChangesWithoutSignalAfter {
+        first_read: Option<std::time::Instant>,
+        after: Duration,
+        starts: Arc<Mutex<Vec<(std::time::Instant, Deadline)>>>,
+    }
+
+    impl Accessibility for ChangesWithoutSignalAfter {
+        fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+            let now = std::time::Instant::now();
+            let first_read = *self.first_read.get_or_insert(now);
+            self.starts.lock().unwrap().push((now, ctx.deadline));
+            Ok(if now.duration_since(first_read) >= self.after {
+                fake_tree_checked()
+            } else {
+                fake_tree_enabled()
+            })
+        }
+
+        fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+            Some(Box::new(NeverSignals))
+        }
+    }
+
     #[test]
     fn a_quiet_wait_walks_once_and_looks_again_at_the_deadline() {
         // The point of the change: told nothing changed, the wait must not re-read on the
@@ -2215,6 +2248,44 @@ mod tests {
             walks.load(Ordering::Relaxed),
             2,
             "a quiet wait re-walked on the interval"
+        );
+    }
+
+    #[test]
+    fn a_quiet_wait_defers_its_safety_read_until_after_an_unannounced_change() {
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with_backend(
+            FakePlatform::new(100, 100),
+            Box::new(ChangesWithoutSignalAfter {
+                first_read: None,
+                after: Duration::from_millis(80),
+                starts: starts.clone(),
+            }),
+        );
+        g.start(&spec()).unwrap();
+        let deadline_at = std::time::Instant::now() + Duration::from_millis(220);
+        let deadline = Deadline::at(deadline_at);
+
+        let outcome = g
+            .wait_for_element_by(&never_matches(500, 5_000), deadline)
+            .unwrap();
+
+        assert!(
+            outcome.matched,
+            "the safety read happened before the unannounced state change"
+        );
+        let starts = starts.lock().unwrap();
+        assert_eq!(starts.len(), 2, "one initial read and one safety read");
+        assert!(
+            starts[1].0.duration_since(starts[0].0) >= Duration::from_millis(80),
+            "the safety read followed the initial read by only {:?}",
+            starts[1].0.duration_since(starts[0].0)
+        );
+        assert!(
+            starts
+                .iter()
+                .all(|(started, received)| *started < deadline_at && *received == deadline),
+            "a reader call started at or after expiry, or received a different deadline: {starts:?}"
         );
     }
 
