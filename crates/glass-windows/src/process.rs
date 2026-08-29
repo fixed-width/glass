@@ -21,7 +21,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use glass_core::Stream;
-use glass_core::{AppSpec, GlassError, Result, SandboxLevel, TEARDOWN_BUDGET};
+use glass_core::{AppSpec, Deadline, GlassError, Result, SandboxLevel, TEARDOWN_BUDGET};
 
 use crate::teardown::{CloseStep, close_wait_step};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, WPARAM};
@@ -447,20 +447,37 @@ struct Proc {
 
 /// Snapshot every process as (pid, parent pid). Verbatim port of proc.rs::snapshot
 /// (the exe name is dropped — descendant discovery only needs the parent links).
-fn snapshot() -> Vec<Proc> {
+fn snapshot_by(deadline: Deadline) -> Result<Vec<Proc>> {
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(
+            "Windows accessibility process discovery",
+        ));
+    }
     let mut out = Vec::new();
     // SAFETY: standard Toolhelp snapshot walk; handle closed before return.
     unsafe {
         let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
             Ok(h) => h,
-            Err(_) => return out,
+            Err(_) => return Ok(out),
         };
+        if deadline.has_passed() {
+            let _ = CloseHandle(snap);
+            return Err(GlassError::caller_deadline_elapsed(
+                "Windows accessibility process discovery",
+            ));
+        }
         let mut e = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
         if Process32FirstW(snap, &mut e).is_ok() {
             loop {
+                if deadline.has_passed() {
+                    let _ = CloseHandle(snap);
+                    return Err(GlassError::caller_deadline_elapsed(
+                        "Windows accessibility process discovery",
+                    ));
+                }
                 out.push(Proc {
                     pid: e.th32ProcessID,
                     ppid: e.th32ParentProcessID,
@@ -472,25 +489,45 @@ fn snapshot() -> Vec<Proc> {
         }
         let _ = CloseHandle(snap);
     }
-    out
+    if deadline.has_passed() {
+        Err(GlassError::caller_deadline_elapsed(
+            "Windows accessibility process discovery",
+        ))
+    } else {
+        Ok(out)
+    }
 }
 
 /// All live descendant PIDs of `root` (inclusive) via a Toolhelp snapshot's parent links.
 /// Verbatim port of proc.rs::descendants, returning just the pids.
 pub(crate) fn descendant_pids(root: u32) -> Vec<u32> {
-    let all = snapshot();
+    descendant_pids_by(root, Deadline::UNBOUNDED).unwrap_or_else(|_| vec![root])
+}
+
+pub(crate) fn descendant_pids_by(root: u32, deadline: Deadline) -> Result<Vec<u32>> {
+    let all = snapshot_by(deadline)?;
     let mut keep = vec![root];
     let mut i = 0;
     while i < keep.len() {
+        if deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed(
+                "Windows accessibility process discovery",
+            ));
+        }
         let parent = keep[i];
         for p in &all {
+            if deadline.has_passed() {
+                return Err(GlassError::caller_deadline_elapsed(
+                    "Windows accessibility process discovery",
+                ));
+            }
             if p.ppid == parent && !keep.contains(&p.pid) {
                 keep.push(p.pid);
             }
         }
         i += 1;
     }
-    keep
+    Ok(keep)
 }
 
 /// [`job_pids_checked`], flattening an unreadable pid-set to an empty one — for callers that

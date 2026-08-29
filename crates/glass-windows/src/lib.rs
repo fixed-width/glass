@@ -483,6 +483,18 @@ mod backend {
             self.app.as_ref().map(|a| a.pids()).unwrap_or_default()
         }
 
+        fn app_pids_by(&self, deadline: glass_core::Deadline) -> Result<Vec<u32>> {
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started(
+                    "Windows accessibility process discovery",
+                ));
+            }
+            match &self.app {
+                Some(app) => app.pids_by(deadline),
+                None => Ok(Vec::new()),
+            }
+        }
+
         /// The adopted window's `HWND` (as `i64`), so the a11y reader binds UI Automation straight
         /// to the exact window glass drives — same handle `send_pointer`/`window` use.
         fn active_window_handle(&self) -> Option<i64> {
