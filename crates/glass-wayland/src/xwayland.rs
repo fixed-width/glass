@@ -29,7 +29,10 @@ use glass_core::{Deadline, GlassError, Result};
 use x11rb::connection::Connection;
 use x11rb::errors::{ConnectionError, ReplyError};
 use x11rb::protocol::ErrorKind;
-use x11rb::protocol::xproto::{ConnectionExt, MapState, WindowClass};
+use x11rb::protocol::Event;
+use x11rb::protocol::xproto::{
+    ChangeWindowAttributesAux, ConnectionExt, EventMask, MapState, WindowClass,
+};
 use x11rb::rust_connection::{DefaultStream, PollMode, RustConnection, Stream};
 use x11rb::utils::RawFdContainer;
 
@@ -191,6 +194,9 @@ pub struct Recovery {
     /// other X servers on the machine. Held rather than passed per call, so a cached connection
     /// and the directory it was found from cannot come from different sessions.
     runtime_dir: PathBuf,
+    /// Process table used to find the session's Xwayland. Production always uses `/proc`; tests
+    /// replace it to exercise the same discovery path against controlled entries.
+    proc_root: PathBuf,
     probe: Option<XProbe>,
     /// Windows a cross-check has already re-mapped — recorded before the attempt, so a re-map
     /// that itself fails is not retried either.
@@ -214,6 +220,7 @@ impl Recovery {
     pub fn new(runtime_dir: &Path) -> Recovery {
         Recovery {
             runtime_dir: runtime_dir.to_path_buf(),
+            proc_root: PathBuf::from(PROC),
             probe: None,
             attempted: HashSet::new(),
             missing_before: HashSet::new(),
@@ -221,6 +228,13 @@ impl Recovery {
             last_checked: None,
             warned: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_proc_root(runtime_dir: &Path, proc_root: &Path) -> Recovery {
+        let mut recovery = Recovery::new(runtime_dir);
+        recovery.proc_root = proc_root.to_path_buf();
+        recovery
     }
 
     /// How many windows glass re-mapped that never reached the compositor afterwards. A launch
@@ -252,10 +266,34 @@ impl Recovery {
         let conn = RustConnection::for_connected_stream(DeadlineStream::new(stream), setup)
             .expect("test X11 connection should initialize");
         let mut recovery = Recovery::new(runtime_dir);
-        recovery.probe = Some(XProbe { conn, root });
+        recovery.probe = Some(XProbe {
+            conn,
+            root,
+            track_generations: false,
+            deadline_clock: None,
+        });
         recovery
             .missing_before
             .extend(missing_before.iter().copied());
+        recovery
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_connection_and_clock(
+        runtime_dir: &Path,
+        stream: std::os::unix::net::UnixStream,
+        setup: x11rb::protocol::xproto::Setup,
+        root: u32,
+        missing_before: &[u32],
+        clock: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Recovery {
+        let mut recovery =
+            Self::with_test_connection(runtime_dir, stream, setup, root, missing_before);
+        recovery
+            .probe
+            .as_mut()
+            .expect("test connection was installed")
+            .deadline_clock = Some(clock);
         recovery
     }
 
@@ -302,7 +340,8 @@ impl Recovery {
         in_compositor: &[u32],
         deadline: Deadline,
     ) -> Result<usize> {
-        self.recover_if_due_in_by(Path::new(PROC), now, in_compositor, deadline)
+        let proc_root = self.proc_root.clone();
+        self.recover_if_due_in_by(&proc_root, now, in_compositor, deadline)
     }
 
     /// [`Self::recover_if_due`] with the process table to scan passed in, so the outcomes of a
@@ -372,13 +411,17 @@ impl Recovery {
                 }
             }
         };
-        let mapped = match probe.mapped_toplevels_by(deadline) {
-            Ok(m) => m,
+        let scan = match probe.mapped_toplevels_by(deadline) {
+            Ok(scan) => scan,
             Err(e) => {
                 if e.bound_owner() == Some(glass_core::Whose::Caller) {
                     // A local poll timeout does not close the socket or lose X11 framing. x11rb
                     // keeps the request's sequence distinct, so its late reply cannot satisfy a
-                    // later request on this session connection.
+                    // later request on this session connection. This read-only pass did not
+                    // complete its cross-check, so it also does not spend the successful-scan
+                    // throttle: the next caller must ask X again rather than receive a
+                    // compositor-only success.
+                    self.last_checked = None;
                     self.probe = Some(probe);
                     return Err(e);
                 }
@@ -394,9 +437,14 @@ impl Recovery {
                 return Ok(0);
             }
         };
-        // Forget windows the X server no longer has. They cannot come back — an X id is only
-        // reused after the window is destroyed — and a window that is still lost is still in
-        // `mapped`, so this prunes without ever un-suppressing one.
+        for win in scan.generation_changes {
+            self.attempted.remove(&win);
+            self.missing_before.remove(&win);
+        }
+        let mapped = scan.windows;
+        // Forget windows the X server no longer has. A destroy/create transition for a reused id
+        // was cleared above from root structure notifications; this retain handles ids that simply
+        // disappeared.
         self.attempted.retain(|w| mapped.contains(w));
         // A window re-mapped by an earlier check that is still missing did not come back. Count
         // it once, so a launch that gives up can say the recovery ran and did not take.
@@ -419,6 +467,11 @@ impl Recovery {
                 Err(e) if e.bound_owner() == Some(glass_core::Whose::Caller) => {
                     self.probe = Some(probe);
                     return Err(e);
+                }
+                Err(e)
+                    if e.bound_dispatch() == Some(glass_core::BoundDispatch::MayHaveDispatched) =>
+                {
+                    return Err(partial_visibility_failure(win, count, e));
                 }
                 // The unmap half may already have applied, which would leave a window the user
                 // can see hidden — so this is reported as a failure of glass's own machinery,
@@ -448,11 +501,29 @@ fn recovery_notice(count: usize) -> Option<String> {
     })
 }
 
+fn partial_visibility_failure(win: u32, recovered: usize, error: GlassError) -> GlassError {
+    GlassError::Backend(format!(
+        "Xwayland recovery re-mapped {recovered} window(s), then recovery of window {win:#x} \
+         failed after a visibility request may have applied: {error}"
+    ))
+    .after_dispatch()
+}
+
 /// An X11 connection to the session's own Xwayland, used to see the windows the app really has
 /// and to re-map the ones the compositor lost.
 pub struct XProbe {
     conn: RustConnection<DeadlineStream>,
     root: u32,
+    /// Whether this connection selected root structure notifications. Scripted protocol tests do
+    /// not emulate events; real probes use them to distinguish reused XIDs across scans.
+    track_generations: bool,
+    #[cfg(test)]
+    deadline_clock: Option<std::sync::Arc<dyn Fn() -> Instant + Send + Sync>>,
+}
+
+struct MappedToplevels {
+    windows: Vec<u32>,
+    generation_changes: HashSet<u32>,
 }
 
 impl XProbe {
@@ -498,7 +569,28 @@ impl XProbe {
             ))
         })?;
         let root = conn.setup().roots[screen].root;
-        Ok(XProbe { conn, root })
+        conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
+        )
+        .map_err(|error| {
+            GlassError::Backend(format!(
+                "watch Xwayland root for window generations: {error}"
+            ))
+        })?
+        .check()
+        .map_err(|error| {
+            GlassError::Backend(format!(
+                "watch Xwayland root for window generations: {error}"
+            ))
+        })?;
+        Ok(XProbe {
+            conn,
+            root,
+            track_generations: true,
+            #[cfg(test)]
+            deadline_clock: None,
+        })
     }
 
     /// A bounded recovery pass cannot safely interrupt AF_UNIX connect before x11rb owns a
@@ -516,9 +608,10 @@ impl XProbe {
     /// shows as well as any it lost. Which of them are missing is decided against sway's list.
     pub fn mapped_toplevels(&self) -> Result<Vec<u32>> {
         self.mapped_toplevels_by(Deadline::UNBOUNDED)
+            .map(|scan| scan.windows)
     }
 
-    fn mapped_toplevels_by(&self, deadline: Deadline) -> Result<Vec<u32>> {
+    fn mapped_toplevels_by(&self, deadline: Deadline) -> Result<MappedToplevels> {
         require_time(deadline, "Xwayland tree query")?;
         let _deadline = self.conn.stream().scope(deadline);
         let tree = self
@@ -527,7 +620,7 @@ impl XProbe {
             .map_err(|e| connection_error(deadline, "Xwayland tree query", e))?
             .reply()
             .map_err(|e| reply_error(deadline, "Xwayland tree query", e))?;
-        if deadline.has_passed() {
+        if self.deadline_has_passed(deadline) {
             return Err(GlassError::caller_deadline_elapsed("Xwayland tree query"));
         }
         let mut out = Vec::new();
@@ -551,12 +644,49 @@ impl XProbe {
                 out.push(win);
             }
         }
-        if deadline.has_passed() {
+        if self.deadline_has_passed(deadline) {
             return Err(GlassError::caller_deadline_elapsed(
                 "Xwayland window attributes",
             ));
         }
-        Ok(out)
+        Ok(MappedToplevels {
+            windows: out,
+            generation_changes: self.generation_changes(deadline)?,
+        })
+    }
+
+    fn generation_changes(&self, deadline: Deadline) -> Result<HashSet<u32>> {
+        if !self.track_generations {
+            return Ok(HashSet::new());
+        }
+        let mut changed = HashSet::new();
+        loop {
+            require_time(deadline, "Xwayland window generation events")?;
+            let event = self.conn.poll_for_event().map_err(|error| {
+                connection_error(deadline, "Xwayland window generation events", error)
+            })?;
+            match event {
+                Some(Event::CreateNotify(event)) if event.parent == self.root => {
+                    changed.insert(event.window);
+                }
+                Some(Event::DestroyNotify(event)) if event.event == self.root => {
+                    changed.insert(event.window);
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        Ok(changed)
+    }
+
+    fn deadline_has_passed(&self, deadline: Deadline) -> bool {
+        #[cfg(test)]
+        if let Some(clock) = &self.deadline_clock {
+            return deadline
+                .remaining_at(clock())
+                .is_some_and(|remaining| remaining.is_zero());
+        }
+        deadline.has_passed()
     }
 
     /// Ask the X server to map `win` again, restarting the map handshake the compositor missed.
@@ -579,14 +709,21 @@ impl XProbe {
             .conn
             .unmap_window(win)
             .map_err(|e| connection_error(deadline, "unmap Xwayland window", e))?
-            .check()
-            .map_err(|e| reply_error(deadline, "unmap Xwayland window", e));
-        if let Err(error) = unmap {
+            .check();
+        if let Err(raw) = unmap {
+            let transport_failed = matches!(&raw, ReplyError::ConnectionError(_));
+            let error = reply_error(deadline, "unmap Xwayland window", raw);
             return if error.bound_owner() == Some(glass_core::Whose::Caller) {
                 Err(GlassError::caller_deadline_elapsed_with_guidance(
                     "unmap Xwayland window",
                     "the unmap request may already have applied, so the window may now be hidden; restart the app to get it back",
                 ))
+            } else if transport_failed {
+                Err(GlassError::Backend(format!(
+                    "{error}. The unmap request may already have applied, so the window may now \
+                     be hidden; restart the app to get it back"
+                ))
+                .after_dispatch())
             } else {
                 Err(error)
             };
@@ -607,19 +744,33 @@ impl XProbe {
                         "the window was unmapped and its re-map request was not confirmed; window visibility is uncertain, so restart the app if it is hidden",
                     ))
                 }
-                Err(_) => Err(first),
+                Err(second) => Err(GlassError::Backend(format!(
+                    "the window was unmapped, then both re-map confirmations failed (first: \
+                     {first}; retry: {second}); window visibility is uncertain, so restart the \
+                     app if it is hidden"
+                ))
+                .after_dispatch()),
             },
         }
     }
 
     fn map_by(&self, win: u32, deadline: Deadline) -> Result<()> {
         require_time(deadline, "re-map Xwayland window")?;
-        self.conn
+        let mapped = self
+            .conn
             .map_window(win)
             .map_err(|e| connection_error(deadline, "re-map Xwayland window", e))?
-            .check()
-            .map_err(|e| reply_error(deadline, "re-map Xwayland window", e))?;
-        if deadline.has_passed() {
+            .check();
+        if let Err(raw) = mapped {
+            let transport_failed = matches!(&raw, ReplyError::ConnectionError(_));
+            let error = reply_error(deadline, "re-map Xwayland window", raw);
+            return if transport_failed && error.bound_owner().is_none() {
+                Err(error.after_dispatch())
+            } else {
+                Err(error)
+            };
+        }
+        if self.deadline_has_passed(deadline) {
             return Err(GlassError::caller_deadline_elapsed(
                 "re-map Xwayland window",
             ));
@@ -664,15 +815,58 @@ fn session_display_by(
     deadline: Deadline,
 ) -> Result<Option<String>> {
     require_time(deadline, "Xwayland recovery discovery")?;
+    if deadline.instant().is_none() {
+        return session_display_scan_by(proc_root, runtime_dir, deadline);
+    }
+    let proc_root = proc_root.to_path_buf();
+    let runtime_dir = runtime_dir.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("glass-wayland-proc-discovery".into())
+        .spawn(move || {
+            let _ = tx.send(session_display_scan_by(&proc_root, &runtime_dir, deadline));
+        })
+        .map_err(|error| {
+            GlassError::Backend(format!("start Xwayland recovery discovery worker: {error}"))
+        })?;
+    let wait = deadline
+        .remaining()
+        .expect("bounded discovery has an absolute deadline");
+    if wait.is_zero() {
+        return Err(GlassError::caller_deadline_elapsed(
+            "Xwayland recovery discovery",
+        ));
+    }
+    match rx.recv_timeout(wait) {
+        Ok(result) => {
+            require_time(deadline, "Xwayland recovery discovery")?;
+            result
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(
+            GlassError::caller_deadline_elapsed("Xwayland recovery discovery"),
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(GlassError::Backend(
+            "Xwayland recovery discovery worker stopped without an answer".into(),
+        )),
+    }
+}
+
+fn session_display_scan_by(
+    proc_root: &Path,
+    runtime_dir: &Path,
+    deadline: Deadline,
+) -> Result<Option<String>> {
+    require_time(deadline, "Xwayland recovery discovery")?;
     for pid in xwayland_pids_by(proc_root, deadline)? {
         require_time(deadline, "Xwayland recovery discovery")?;
         let dir = proc_root.join(pid.to_string());
         // Before the match a read failure is routine: another user's Xwayland is unreadable by
         // design, one that exited mid-scan is gone.
-        let Ok(environ) = std::fs::read(dir.join("environ")) else {
+        let environ = std::fs::read(dir.join("environ"));
+        require_time(deadline, "Xwayland recovery discovery")?;
+        let Ok(environ) = environ else {
             continue;
         };
-        require_time(deadline, "Xwayland recovery discovery")?;
         if !serves_session(&environ, runtime_dir) {
             continue;
         }
@@ -704,9 +898,9 @@ fn xwayland_pids(proc_root: &Path) -> Result<Vec<u32>> {
 fn xwayland_pids_by(proc_root: &Path, deadline: Deadline) -> Result<Vec<u32>> {
     require_time(deadline, "Xwayland recovery discovery")?;
     let mut found = Vec::new();
-    for pid in proc_pids(proc_root)? {
+    for pid in proc_pids(proc_root, deadline)? {
         require_time(deadline, "Xwayland recovery discovery")?;
-        if is_xwayland_in(proc_root, pid) {
+        if is_xwayland_in_by(proc_root, pid, deadline)? {
             found.push(pid);
         }
     }
@@ -718,13 +912,30 @@ fn xwayland_pids_by(proc_root: &Path, deadline: Deadline) -> Result<Vec<u32>> {
 ///
 /// The failure is returned rather than swallowed as an empty list: callers act on "nothing there",
 /// and a table that could not be read is not that (glass#381).
-fn proc_pids(proc_root: &Path) -> Result<Vec<u32>> {
-    let entries = std::fs::read_dir(proc_root)
+fn proc_pids(proc_root: &Path, deadline: Deadline) -> Result<Vec<u32>> {
+    require_time(deadline, "Xwayland recovery discovery")?;
+    let mut entries = std::fs::read_dir(proc_root)
         .map_err(|e| GlassError::Backend(format!("read {}: {e}", proc_root.display())))?;
-    Ok(entries
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .collect())
+    let mut found = Vec::new();
+    loop {
+        require_time(deadline, "Xwayland recovery discovery")?;
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        require_time(deadline, "Xwayland recovery discovery")?;
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        {
+            found.push(pid);
+        }
+    }
+    require_time(deadline, "Xwayland recovery discovery")?;
+    Ok(found)
 }
 
 /// Every process on the machine that belongs to the session `runtime_dir` was created for.
@@ -738,7 +949,7 @@ pub(crate) fn session_processes(runtime_dir: &Path) -> Result<Vec<u32>> {
 
 /// [`session_processes`] over a given process table.
 fn session_processes_in(proc_root: &Path, runtime_dir: &Path) -> Result<Vec<u32>> {
-    Ok(proc_pids(proc_root)?
+    Ok(proc_pids(proc_root, Deadline::UNBOUNDED)?
         .into_iter()
         // A process whose environ cannot be read is another user's or already gone; the
         // session's own are this process's children and readable by it.
@@ -781,8 +992,14 @@ pub fn is_xwayland(pid: u32) -> bool {
 
 /// [`is_xwayland`] over a given process table.
 fn is_xwayland_in(proc_root: &Path, pid: u32) -> bool {
-    std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm"))
-        .is_ok_and(|comm| comm.trim() == "Xwayland")
+    is_xwayland_in_by(proc_root, pid, Deadline::UNBOUNDED).unwrap_or(false)
+}
+
+fn is_xwayland_in_by(proc_root: &Path, pid: u32, deadline: Deadline) -> Result<bool> {
+    require_time(deadline, "Xwayland recovery discovery")?;
+    let comm = std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm"));
+    require_time(deadline, "Xwayland recovery discovery")?;
+    Ok(comm.is_ok_and(|comm| comm.trim() == "Xwayland"))
 }
 
 /// `:0`, `:1`, … — a bare display token. Rejects a screen-qualified (`:0.0`) or host-qualified
@@ -890,6 +1107,11 @@ mod x_tests {
         /// A window of the given shape, mapped unless `map` is false.
         fn window(&self, class: WindowClass, override_redirect: bool, map: bool) -> u32 {
             let win = self.conn.generate_id().expect("id");
+            self.create_window(win, class, override_redirect, map);
+            win
+        }
+
+        fn create_window(&self, win: u32, class: WindowClass, override_redirect: bool, map: bool) {
             let depth = if class == WindowClass::INPUT_ONLY {
                 0
             } else {
@@ -914,7 +1136,12 @@ mod x_tests {
                 self.conn.map_window(win).expect("map_window");
             }
             self.conn.sync().expect("sync");
-            win
+        }
+
+        fn recreate_mapped_toplevel(&self, win: u32) {
+            self.conn.destroy_window(win).expect("destroy old window");
+            self.conn.sync().expect("destroy confirmation");
+            self.create_window(win, WindowClass::INPUT_OUTPUT, false, true);
         }
 
         fn probe(&self) -> XProbe {
@@ -1019,6 +1246,53 @@ mod x_tests {
             "one sighting is not yet a loss"
         );
         assert_eq!(r.recover_if_due(now + CHECK_INTERVAL, &[]), 1, "re-mapped");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_recreated_same_id_does_not_inherit_the_old_windows_first_missing_sighting() {
+        let x = server();
+        let win = x.window(WindowClass::INPUT_OUTPUT, false, true);
+        let mut recovery = recovery_on(&x);
+        let now = std::time::Instant::now();
+        assert_eq!(recovery.recover_if_due(now, &[]), 0);
+
+        x.recreate_mapped_toplevel(win);
+
+        assert_eq!(
+            recovery.recover_if_due(now + CHECK_INTERVAL, &[]),
+            0,
+            "the new logical window's first sighting must not confirm the old window's loss"
+        );
+        assert_eq!(
+            recovery.recover_if_due(now + CHECK_INTERVAL * 2, &[]),
+            1,
+            "the recreated window is recoverable after its own second sighting"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_recreated_same_id_does_not_inherit_the_old_windows_attempt_suppression() {
+        let x = server();
+        let win = x.window(WindowClass::INPUT_OUTPUT, false, true);
+        let mut recovery = recovery_on(&x);
+        let now = std::time::Instant::now();
+        assert_eq!(recovery.recover_if_due(now, &[]), 0);
+        assert_eq!(recovery.recover_if_due(now + CHECK_INTERVAL, &[]), 1);
+
+        x.recreate_mapped_toplevel(win);
+
+        assert_eq!(
+            recovery.recover_if_due(now + CHECK_INTERVAL * 2, &[]),
+            0,
+            "the recreated window needs its own first sighting"
+        );
+        assert_eq!(
+            recovery.recover_if_due(now + CHECK_INTERVAL * 3, &[]),
+            1,
+            "the old generation's attempt must not suppress the recreated window"
+        );
     }
 
     /// A window sway already shows is not lost, however often it is checked.
