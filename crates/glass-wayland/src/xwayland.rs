@@ -187,6 +187,64 @@ enum Failed {
     Read,
 }
 
+/// One process-table scan shared by every bounded retry until it answers. A filesystem read can
+/// block inside the kernel past its caller's deadline, so dropping a timed-out worker and starting
+/// another would trade a truthful caller timeout for unbounded detached threads. The scan itself
+/// is persistent and unbounded; each caller only bounds how long it waits for the one answer in
+/// flight.
+struct DiscoveryWorker {
+    answer: std::sync::mpsc::Receiver<Result<Option<String>>>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+enum DiscoveryWait {
+    Answer(Result<Option<String>>),
+    Pending,
+    Disconnected,
+}
+
+impl DiscoveryWorker {
+    fn start(proc_root: &Path, runtime_dir: &Path) -> Result<DiscoveryWorker> {
+        let proc_root = proc_root.to_path_buf();
+        let runtime_dir = runtime_dir.to_path_buf();
+        let (tx, answer) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("glass-wayland-proc-discovery".into())
+            .spawn(move || {
+                let _ = tx.send(session_display_scan_by(
+                    &proc_root,
+                    &runtime_dir,
+                    Deadline::UNBOUNDED,
+                ));
+            })
+            .map_err(|error| {
+                GlassError::Backend(format!("start Xwayland recovery discovery worker: {error}"))
+            })?;
+        Ok(DiscoveryWorker { answer, thread })
+    }
+
+    fn wait_by(&self, deadline: Deadline) -> DiscoveryWait {
+        match deadline.remaining() {
+            None => match self.answer.recv() {
+                Ok(answer) => DiscoveryWait::Answer(answer),
+                Err(_) => DiscoveryWait::Disconnected,
+            },
+            Some(wait) if wait.is_zero() => DiscoveryWait::Pending,
+            Some(wait) => match self.answer.recv_timeout(wait) {
+                Ok(answer) => DiscoveryWait::Answer(answer),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => DiscoveryWait::Pending,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => DiscoveryWait::Disconnected,
+            },
+        }
+    }
+
+    fn join(self) -> Result<()> {
+        self.thread
+            .join()
+            .map_err(|_| GlassError::Backend("Xwayland recovery discovery worker panicked".into()))
+    }
+}
+
 /// A session's state for recovering lost toplevels: which session it is, the X connection once
 /// one exists, what has been tried, what was missing last time, and when the last check ran.
 pub struct Recovery {
@@ -197,6 +255,9 @@ pub struct Recovery {
     /// Process table used to find the session's Xwayland. Production always uses `/proc`; tests
     /// replace it to exercise the same discovery path against controlled entries.
     proc_root: PathBuf,
+    /// The one process-table read this session may have in flight. Kept after a caller timeout so
+    /// the next retry waits on it rather than leaking another blocked thread.
+    discovery: Option<DiscoveryWorker>,
     probe: Option<XProbe>,
     /// Windows a cross-check has already re-mapped — recorded before the attempt, so a re-map
     /// that itself fails is not retried either.
@@ -214,6 +275,10 @@ pub struct Recovery {
     /// none. One unreachable X server reads as one warning rather than a line every interval; a
     /// failure of a *different* kind is news (glass#381).
     warned: Option<Failed>,
+    /// Test observation of actual bounded discovery worker starts. Kept on the recovery rather
+    /// than globally so parallel sessions cannot perturb the assertion.
+    #[cfg(test)]
+    discovery_workers_started: usize,
 }
 
 impl Recovery {
@@ -221,12 +286,15 @@ impl Recovery {
         Recovery {
             runtime_dir: runtime_dir.to_path_buf(),
             proc_root: PathBuf::from(PROC),
+            discovery: None,
             probe: None,
             attempted: HashSet::new(),
             missing_before: HashSet::new(),
             unrecovered: 0,
             last_checked: None,
             warned: None,
+            #[cfg(test)]
+            discovery_workers_started: 0,
         }
     }
 
@@ -372,7 +440,7 @@ impl Recovery {
         let probe = match self.probe.take() {
             Some(p) => p,
             None => {
-                let display = match session_display_by(proc_root, &self.runtime_dir, deadline) {
+                let display = match self.session_display_by(proc_root, deadline) {
                     Ok(Some(d)) => d,
                     // No Xwayland holds this session's runtime directory: a native Wayland app,
                     // which never takes the path this recovers. Nothing to do, nothing to warn
@@ -487,6 +555,53 @@ impl Recovery {
             eprintln!("{notice}");
         }
         Ok(count)
+    }
+
+    fn session_display_by(
+        &mut self,
+        proc_root: &Path,
+        deadline: Deadline,
+    ) -> Result<Option<String>> {
+        require_time(deadline, "Xwayland recovery discovery")?;
+        if deadline.instant().is_none() && self.discovery.is_none() {
+            return session_display_scan_by(proc_root, &self.runtime_dir, deadline);
+        }
+        if self.discovery.is_none() {
+            let worker = DiscoveryWorker::start(proc_root, &self.runtime_dir)?;
+            self.discovery = Some(worker);
+            #[cfg(test)]
+            {
+                self.discovery_workers_started += 1;
+            }
+        }
+
+        let wait = self
+            .discovery
+            .as_ref()
+            .expect("discovery worker was installed")
+            .wait_by(deadline);
+        match wait {
+            DiscoveryWait::Answer(answer) => {
+                self.discovery
+                    .take()
+                    .expect("answer came from an installed discovery worker")
+                    .join()?;
+                require_time(deadline, "Xwayland recovery discovery")?;
+                answer
+            }
+            DiscoveryWait::Pending => Err(GlassError::caller_deadline_elapsed(
+                "Xwayland recovery discovery",
+            )),
+            DiscoveryWait::Disconnected => {
+                self.discovery
+                    .take()
+                    .expect("disconnect came from an installed discovery worker")
+                    .join()?;
+                Err(GlassError::Backend(
+                    "Xwayland recovery discovery worker stopped without an answer".into(),
+                ))
+            }
+        }
     }
 }
 
@@ -806,49 +921,7 @@ fn window_is_gone(e: &ReplyError) -> bool {
 /// `Err`, because both leave recovery off and only one of them is expected (glass#381).
 #[cfg(test)]
 fn session_display(proc_root: &Path, runtime_dir: &Path) -> Result<Option<String>> {
-    session_display_by(proc_root, runtime_dir, Deadline::UNBOUNDED)
-}
-
-fn session_display_by(
-    proc_root: &Path,
-    runtime_dir: &Path,
-    deadline: Deadline,
-) -> Result<Option<String>> {
-    require_time(deadline, "Xwayland recovery discovery")?;
-    if deadline.instant().is_none() {
-        return session_display_scan_by(proc_root, runtime_dir, deadline);
-    }
-    let proc_root = proc_root.to_path_buf();
-    let runtime_dir = runtime_dir.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("glass-wayland-proc-discovery".into())
-        .spawn(move || {
-            let _ = tx.send(session_display_scan_by(&proc_root, &runtime_dir, deadline));
-        })
-        .map_err(|error| {
-            GlassError::Backend(format!("start Xwayland recovery discovery worker: {error}"))
-        })?;
-    let wait = deadline
-        .remaining()
-        .expect("bounded discovery has an absolute deadline");
-    if wait.is_zero() {
-        return Err(GlassError::caller_deadline_elapsed(
-            "Xwayland recovery discovery",
-        ));
-    }
-    match rx.recv_timeout(wait) {
-        Ok(result) => {
-            require_time(deadline, "Xwayland recovery discovery")?;
-            result
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(
-            GlassError::caller_deadline_elapsed("Xwayland recovery discovery"),
-        ),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(GlassError::Backend(
-            "Xwayland recovery discovery worker stopped without an answer".into(),
-        )),
-    }
+    session_display_scan_by(proc_root, runtime_dir, Deadline::UNBOUNDED)
 }
 
 fn session_display_scan_by(
@@ -1538,6 +1611,78 @@ mod session_tests {
         assert_eq!(recovered, 0);
         assert!(recovery.probe.is_none());
         assert_eq!(recovery.warned, None, "a skipped connect is not a failure");
+    }
+
+    #[test]
+    fn repeated_retries_reuse_one_blocked_discovery_worker() {
+        use std::io::Write;
+
+        let proc = FakeProc::new();
+        let runtime = tempfile::tempdir().expect("runtime dir");
+        let pid = proc.process(41, "Xwayland", runtime.path(), &["Xwayland", ":77"]);
+        let comm = pid.join("comm");
+        std::fs::remove_file(&comm).expect("replace comm with a FIFO");
+        let made_fifo = std::process::Command::new("mkfifo")
+            .arg(&comm)
+            .status()
+            .expect("run mkfifo");
+        assert!(made_fifo.success(), "mkfifo failed: {made_fifo}");
+
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut fifo = std::fs::OpenOptions::new()
+                .write(true)
+                .open(comm)
+                .expect("open blocked comm writer");
+            opened_tx.send(()).expect("blocked-read observer");
+            release_rx.recv().expect("release blocked comm reads");
+            fifo.write_all(b"not-Xwayland\n")
+                .expect("release blocked comm reads");
+        });
+
+        let mut recovery = Recovery::new(runtime.path());
+        let first = recovery.recover_if_due_in_by(
+            proc.path(),
+            std::time::Instant::now(),
+            &[],
+            glass_core::Deadline::from_millis(50),
+        );
+        opened_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the discovery worker never reached the FIFO");
+        let second = recovery.recover_if_due_in_by(
+            proc.path(),
+            std::time::Instant::now(),
+            &[],
+            glass_core::Deadline::from_millis(50),
+        );
+        release_tx.send(()).expect("release blocked reads");
+        writer.join().expect("FIFO writer");
+        let completed = recovery.recover_if_due_in_by(
+            proc.path(),
+            std::time::Instant::now(),
+            &[],
+            glass_core::Deadline::from_millis(500),
+        );
+
+        assert_eq!(
+            first.expect_err("first call must time out").bound_owner(),
+            Some(glass_core::Whose::Caller)
+        );
+        assert_eq!(
+            second.expect_err("retry must time out").bound_owner(),
+            Some(glass_core::Whose::Caller)
+        );
+        assert_eq!(
+            completed.expect("released discovery should finish"),
+            0,
+            "the completed worker result should be reused"
+        );
+        assert_eq!(
+            recovery.discovery_workers_started, 1,
+            "a retry started another blocked discovery worker"
+        );
     }
 
     #[test]
