@@ -187,11 +187,8 @@ enum Failed {
     Read,
 }
 
-/// One process-table scan shared by every bounded retry until it answers. A filesystem read can
-/// block inside the kernel past its caller's deadline, so dropping a timed-out worker and starting
-/// another would trade a truthful caller timeout for unbounded detached threads. The scan itself
-/// is persistent and unbounded; each caller only bounds how long it waits for the one answer in
-/// flight.
+/// One persistent process-table scan shared by bounded retries, preventing a blocked procfs read
+/// from leaking another thread per retry.
 struct DiscoveryWorker {
     answer: std::sync::mpsc::Receiver<Result<Option<String>>>,
     thread: std::thread::JoinHandle<()>,
@@ -248,35 +245,23 @@ impl DiscoveryWorker {
 /// A session's state for recovering lost toplevels: which session it is, the X connection once
 /// one exists, what has been tried, what was missing last time, and when the last check ran.
 pub struct Recovery {
-    /// The session's private runtime directory — what identifies its own Xwayland among any
-    /// other X servers on the machine. Held rather than passed per call, so a cached connection
-    /// and the directory it was found from cannot come from different sessions.
+    /// Private runtime directory identifying this session's Xwayland.
     runtime_dir: PathBuf,
-    /// Process table used to find the session's Xwayland. Production always uses `/proc`; tests
-    /// replace it to exercise the same discovery path against controlled entries.
+    /// Process table used for discovery; tests replace production `/proc`.
     proc_root: PathBuf,
-    /// The one process-table read this session may have in flight. Kept after a caller timeout so
-    /// the next retry waits on it rather than leaking another blocked thread.
+    /// Retained scan whose bounded caller timed out before it answered.
     discovery: Option<DiscoveryWorker>,
     probe: Option<XProbe>,
-    /// Windows a cross-check has already re-mapped — recorded before the attempt, so a re-map
-    /// that itself fails is not retried either.
+    /// Windows already re-mapped, including failed attempts.
     attempted: HashSet<u32>,
-    /// Windows the previous check found mapped in X and absent from the compositor. A window has
-    /// to be missing twice running before it is re-mapped: during startup the compositor is
-    /// still publishing views, and one that is merely in flight looks exactly like a lost one.
+    /// Windows mapped in X but absent from the compositor on the previous check.
     missing_before: HashSet<u32>,
-    /// Windows re-mapped that still had not reached the compositor at the next check. Counted so
-    /// a launch that times out can say the recovery ran and did not take, instead of reporting a
-    /// bare timeout for an app whose window glass could see all along.
+    /// Re-mapped windows still absent from the compositor on the next check.
     unrecovered: usize,
     last_checked: Option<std::time::Instant>,
-    /// What the last reported failure to reach the X side was, or `None` while there has been
-    /// none. One unreachable X server reads as one warning rather than a line every interval; a
-    /// failure of a *different* kind is news (glass#381).
+    /// Last reported X-side failure kind, for per-kind warning suppression.
     warned: Option<Failed>,
-    /// Test observation of actual bounded discovery worker starts. Kept on the recovery rather
-    /// than globally so parallel sessions cannot perturb the assertion.
+    /// Bounded discovery workers started by this recovery.
     #[cfg(test)]
     discovery_workers_started: usize,
 }
@@ -399,9 +384,8 @@ impl Recovery {
             .expect("unbounded Xwayland recovery has no caller deadline")
     }
 
-    /// [`Self::recover_if_due`] under the same absolute deadline as the window enumeration that
-    /// exposed the missing view. Bounded failures after X dispatch are returned rather than hidden
-    /// as best-effort recovery misses.
+    /// Recover under the window enumeration's absolute deadline, returning bounded failures after
+    /// X dispatch.
     pub fn recover_if_due_by(
         &mut self,
         now: std::time::Instant,
@@ -483,12 +467,8 @@ impl Recovery {
             Ok(scan) => scan,
             Err(e) => {
                 if e.bound_owner() == Some(glass_core::Whose::Caller) {
-                    // A local poll timeout does not close the socket or lose X11 framing. x11rb
-                    // keeps the request's sequence distinct, so its late reply cannot satisfy a
-                    // later request on this session connection. This read-only pass did not
-                    // complete its cross-check, so it also does not spend the successful-scan
-                    // throttle: the next caller must ask X again rather than receive a
-                    // compositor-only success.
+                    // A local poll timeout preserves x11rb framing but does not spend the
+                    // successful-scan throttle, so the next caller issues a fresh X query.
                     self.last_checked = None;
                     self.probe = Some(probe);
                     return Err(e);
@@ -510,9 +490,7 @@ impl Recovery {
             self.missing_before.remove(&win);
         }
         let mapped = scan.windows;
-        // Forget windows the X server no longer has. A destroy/create transition for a reused id
-        // was cleared above from root structure notifications; this retain handles ids that simply
-        // disappeared.
+        // Drop windows no longer mapped; generation events above handle reused XIDs.
         self.attempted.retain(|w| mapped.contains(w));
         // A window re-mapped by an earlier check that is still missing did not come back. Count
         // it once, so a launch that gives up can say the recovery ran and did not take.
@@ -629,8 +607,7 @@ fn partial_visibility_failure(win: u32, recovered: usize, error: GlassError) -> 
 pub struct XProbe {
     conn: RustConnection<DeadlineStream>,
     root: u32,
-    /// Whether this connection selected root structure notifications. Scripted protocol tests do
-    /// not emulate events; real probes use them to distinguish reused XIDs across scans.
+    /// Root structure notifications distinguish reused XIDs; scripted tests disable them.
     track_generations: bool,
     #[cfg(test)]
     deadline_clock: Option<std::sync::Arc<dyn Fn() -> Instant + Send + Sync>>,
@@ -708,9 +685,8 @@ impl XProbe {
         })
     }
 
-    /// A bounded recovery pass cannot safely interrupt AF_UNIX connect before x11rb owns a
-    /// stream. Startup's legacy unbounded pass normally caches the probe; if it did not, a bounded
-    /// enumeration conservatively skips recovery rather than risk outliving its caller.
+    /// Bounded recovery skips AF_UNIX connect because it cannot be interrupted before x11rb owns
+    /// the stream.
     fn connect_by(display: &str, deadline: Deadline) -> Result<Option<XProbe>> {
         require_time(deadline, "Xwayland recovery connect")?;
         if deadline.instant().is_some() {

@@ -1,10 +1,5 @@
-//! Process-global AX messaging-timeout ownership.
-//!
-//! Apple applies a timeout set on the system-wide `AXUIElement` to every AX object in the
-//! process. Every setter therefore has to pass through this one owner, including the doctor probe
-//! and the window backend. Deadline-bound callers refresh the global value immediately before each
-//! AX message so a compound operation consumes one cumulative caller budget rather than one full
-//! budget per message.
+//! Apple propagates the system-wide AX timeout process-wide, so one owner serializes setters and
+//! refreshes the remaining budget before each AX message.
 
 use glass_core::{Deadline, GlassError, Result};
 use std::sync::{Condvar, Mutex};

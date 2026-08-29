@@ -159,8 +159,7 @@ fn cleanup_drag<S: DragSink>(
     button_down: bool,
     modifiers_down: bool,
 ) -> crate::Result<()> {
-    // Releases are safety cleanup, not continued gesture dispatch. Once a press may
-    // have landed they must still be attempted after expiry, in dependency order.
+    // A possible press requires button-then-modifier cleanup even after expiry.
     let button = if button_down {
         sink.button(false)
     } else {
@@ -177,13 +176,8 @@ fn cleanup_drag<S: DragSink>(
     }
 }
 
-/// Drive a planned drag against a backend `sink`, stopping at `deadline`.
-///
-/// Every gesture event is checked immediately before and after dispatch, and
-/// pacing sleeps never exceed the remaining caller budget. If a failure occurs
-/// after a button or modifier press may have landed, releases are attempted in
-/// button-then-modifier order. A cleanup dispatch can itself fail, so native input
-/// may remain held after an unsuccessful release attempt.
+/// Drive a planned drag until `deadline`, attempting button-then-modifier cleanup after any
+/// possible press; failed cleanup can leave native input held.
 pub fn run_drag_by<S: DragSink>(
     sink: &mut S,
     gesture: &DragGesture,
@@ -256,8 +250,7 @@ pub fn run_drag_by<S: DragSink>(
     let button_result = sink.button(false);
     let button_deadline = require_time(deadline, true);
 
-    // Always release modifiers after the button release attempt. This ordering is
-    // part of the gesture contract even when the first cleanup event fails.
+    // Attempt modifier release even when button release fails.
     let modifier_pre_deadline = require_time(deadline, true);
     let modifier_result = sink.modifiers(false);
     let modifier_deadline = require_time(deadline, true);

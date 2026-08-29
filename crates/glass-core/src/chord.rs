@@ -81,8 +81,7 @@ fn cleanup_chord<S: ChordSink>(
     key_down: bool,
     modifiers_down: bool,
 ) -> crate::Result<()> {
-    // Releases remain mandatory after expiry and run in dependency order so a
-    // failed key release never prevents the modifier release attempt.
+    // A possible press requires key-then-modifier cleanup even after expiry.
     let key = if key_down { sink.key(false) } else { Ok(()) };
     if modifiers_down {
         combine_cleanup(key, sink.modifiers(false), "releasing the chord modifiers")
@@ -91,13 +90,8 @@ fn cleanup_chord<S: ChordSink>(
     }
 }
 
-/// Drive a chord against a backend `sink`, stopping at `deadline`.
-///
-/// The legacy modifier-down → dwell → key-down/up → dwell → modifier-up
-/// sequence is retained. Each normal event is checked before and after dispatch,
-/// both dwells are capped, and held-input releases are attempted in dependency order
-/// on every later failure. A cleanup dispatch can itself fail, so native input may
-/// remain held after an unsuccessful release attempt.
+/// Drive the legacy modifier-key sequence until `deadline`, attempting key-then-modifier cleanup
+/// after any possible press; failed cleanup can leave native input held.
 pub fn run_chord_by<S: ChordSink>(sink: &mut S, deadline: Deadline) -> crate::Result<()> {
     require_time(deadline, false)?;
 

@@ -313,9 +313,7 @@ jobs:
           tool: cargo-mutants,cargo-nextest
       - name: Install the X, Wayland, and a11y stacks the gated tests drive
         if: steps.diff.outputs.touched == 'true'
-        # The mutation wrapper runs `#[ignore]`d tests. Keep this in step with the dedicated
-        # Wayland integration job: Ubuntu's sway is too old, while the portable bundle still
-        # resolves its GL/EGL/gbm/drm stack from the host.
+        # Mutants run ignored Wayland tests with the portable sway bundle and host GL stack.
         run: |
           sudo apt-get update && sudo apt-get install -y \
             xvfb at-spi2-core xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 \
@@ -340,12 +338,7 @@ jobs:
             --shard ${{ matrix.shard }}/8 --sharding round-robin \
             --in-diff "$RUNNER_TEMP/pr.diff"
 
-  # A matrix job's checks are named per shard, so the branch ruleset has nothing stable
-  # to require. This one has a fixed name and fails if any shard did.
-  #
-  # The ruleset's required check matches this name, so it is frozen — renaming it blocks every
-  # pull request. It gates glass-android, glass-x11, glass-wayland, glass-exec-unix and
-  # glass-dbus-linux too despite the name; rename only with the ruleset.
+  # The ruleset requires this fixed aggregate name; rename it only with the ruleset.
   mutants-gate:
     name: Mutation gate (glass-core)
     runs-on: ubuntu-latest

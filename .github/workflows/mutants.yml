@@ -36,9 +36,7 @@ jobs:
         with:
           tool: cargo-mutants,cargo-nextest
       - name: Install the X, Wayland, and a11y stacks the gated tests drive
-        # The mutation wrapper runs `#[ignore]`d tests. Keep this in step with the dedicated
-        # Wayland integration job: Ubuntu's sway is too old, while the portable bundle still
-        # resolves its GL/EGL/gbm/drm stack from the host.
+        # Mutants run ignored Wayland tests with the portable sway bundle and host GL stack.
         run: |
           sudo apt-get update && sudo apt-get install -y \
             xvfb at-spi2-core xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 \

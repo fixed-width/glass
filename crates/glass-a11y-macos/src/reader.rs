@@ -128,8 +128,7 @@ impl Accessibility for MacosA11y {
                 let mut tree = AxTree::new(root);
                 tree.truncated = budget.truncation();
                 tree.unreadable = budget.unreadable();
-                // Ids/count are assigned by `glass-core` (`AxTree::assign_ids`) so numbering is
-                // identical across OS backends.
+                // `glass-core` assigns ids after this walk, keeping numbering backend-independent.
                 Ok(tree)
             })
         })
@@ -140,17 +139,13 @@ impl Accessibility for MacosA11y {
         deadline.require()?;
         let (window_el, scale) = resolve_window(ctx, deadline)?;
 
-        // Start at 0 so `find_nth`'s pre-order numbering matches `snapshot`'s `walk` +
-        // `AxTree::assign_ids` (root id = 0); the role+name+bounds fingerprint below
-        // backstops any residual drift between the snapshot and this re-walk.
+        // Start at 0 to match snapshot ids; role, name, and bounds reject drift.
         let mut budget = WalkBudget::with_limits(ctx.limits);
         let found = find_nth(window_el, 0, &mut budget, target.id.0, deadline)?;
         deadline.require()?;
         let el = found.ok_or(GlassError::AxElementNotFound(target.id.0))?;
 
-        // Verify role + name + bounds (guards a stale id / tree drift): if drift landed a
-        // different same-role+name element on this pre-order id, its bounds sit elsewhere
-        // and it is rejected here rather than silently overwritten.
+        // Reject a stale pre-order id unless role, name, and bounds still match.
         let ax_role = deadline
             .observe(|| ffi::attribute_string(&el, attr::ROLE))?
             .unwrap_or_default();
@@ -171,12 +166,8 @@ impl Accessibility for MacosA11y {
             return Err(GlassError::AxElementNotEditable(target.id.0));
         }
 
-        // Pre-write value: the baseline for the "changed" check. Use the error-aware read (the
-        // same call as the post-read below) so a *present but empty* value stays a known `Some("")`
-        // baseline instead of folding to `None` — keeping macOS symmetric with the Windows reader
-        // (whose `get_value()` returns `Ok("")` for empty). `None` — a failed or absent pre-read —
-        // means the baseline is unknown, and `read_back_confirms` then requires an exact match
-        // rather than trusting a "differs from before" signal it cannot compute.
+        // Preserve an empty baseline as `Some("")`; an unknown baseline requires an exact
+        // post-write match.
         let before = deadline
             .observe(|| ffi::attribute_string_checked(&el, attr::VALUE))?
             .ok()
@@ -184,13 +175,8 @@ impl Accessibility for MacosA11y {
         deadline.dispatch(|| ffi::set_string_value(&el, text))?;
         let dispatched = deadline.after_dispatch();
 
-        // Read-back poll: some editables accept the AX write without an `AXError` but never
-        // actually change `AXValue` (a misleading success) — require the read-back to show the
-        // change before reporting success, never a silent false-success. Both reads are
-        // *error-aware*: a failed or absent post-read is inconclusive and never confirms, so we
-        // keep polling to the deadline rather than mistaking a failed read for a change. Keep the
-        // complete latest result: a later read supersedes a transient failure, while a terminal
-        // failure remains the structured cause of the unconfirmed-write verdict.
+        // AX may report a successful write without changing `AXValue`; only a confirming read
+        // counts, and the latest read error becomes the unconfirmed-write cause.
         let verification =
             dispatched.phase(Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS));
         let mut read_back = WriteVerification::new(target.id.0, text, before.as_deref());
@@ -221,11 +207,8 @@ impl Accessibility for MacosA11y {
         deadline.require()?;
         let (window_el, scale) = resolve_window(ctx, deadline)?;
 
-        // Start at 0, same numbering rationale as `set_value`. Unlike `set_value` (whose
-        // miss is `AxElementNotFound` — the id itself is unknown), a miss here is
-        // `AxElementChanged`: it means the tree drifted since the id was captured (same
-        // classification the Linux/Windows readers' `invoke` use), which is also what the
-        // fingerprint mismatch just below reports.
+        // Rewalk from the root to preserve snapshot ids; a miss or fingerprint mismatch means the
+        // captured element changed.
         let mut budget = WalkBudget::with_limits(ctx.limits);
         let found = find_nth(window_el, 0, &mut budget, target.id.0, deadline)?;
         deadline.require()?;
@@ -335,9 +318,7 @@ fn write_verdict(
     }
 }
 
-/// Resolve the `AXWindow` + point→pixel `scale` for a semantic operation that has not yet checked
-/// the grant. Snapshot performs that first AX call at its dispatch boundary, then enters
-/// [`resolve_window_after_grant`]; mutations use this wrapper while they are still pre-dispatch.
+/// Resolve `AXWindow` and scale while preserving the first AX call as the dispatch boundary.
 fn resolve_window(
     ctx: &AxContext,
     deadline: SemanticDeadline,

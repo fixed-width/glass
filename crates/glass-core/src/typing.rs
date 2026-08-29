@@ -47,11 +47,7 @@ fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
     require_time(deadline, true)
 }
 
-/// Type `text` against a backend `sink`, stopping at `deadline`.
-///
-/// Characters remain individually committed and `dwell` remains strictly
-/// inter-character, but each dispatch is checked before and after and every
-/// dwell is capped by the caller's remaining budget.
+/// Type individually committed characters until `deadline`, with `dwell` only between them.
 pub fn run_type_by<S: TypeSink>(
     sink: &mut S,
     text: &str,
@@ -93,8 +89,7 @@ mod tests {
 
     #[test]
     fn emits_each_character_in_order_including_adjacent_duplicates() {
-        // The bug class: runs of adjacent identical characters (and spaces). Each must be
-        // emitted as its own keystroke, in order — never collapsed or batched.
+        // Adjacent duplicates and spaces must remain distinct keystrokes.
         let mut sink = RecordingSink::default();
         run_type(&mut sink, "aab c", Duration::ZERO).unwrap();
         assert_eq!(sink.chars, vec!['a', 'a', 'b', ' ', 'c']);

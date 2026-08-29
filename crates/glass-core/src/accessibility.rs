@@ -1198,73 +1198,39 @@ pub enum ChangeWait {
 /// trait). Distinct from `Platform`: accessibility varies per-OS, not per-
 /// display-server.
 pub trait Accessibility {
-    /// Snapshot the active window's accessibility subtree, normalized and in
-    /// window-relative coordinates. Node ids are assigned by the caller
-    /// afterward via [`AxTree::assign_ids`]; the backend need not set them.
+    /// Snapshot the active window's accessibility subtree in window-relative coordinates; the
+    /// caller assigns node ids with [`AxTree::assign_ids`].
     ///
-    /// **Cap every budget of your own by [`AxContext::deadline`]**. If it is spent before external
-    /// work starts, return [`crate::GlassError::deadline_not_started`]; if it ends a dispatched
-    /// read, return a caller-owned bounded error such as
-    /// [`crate::GlassError::caller_deadline_elapsed`]. `Caller` is relative to this reader: an
-    /// enclosing wait resolves whether the supplied deadline belonged to the wait action or to its
-    /// own outer sequence.
+    /// Cap backend work by [`AxContext::deadline`]. Return
+    /// [`crate::GlassError::deadline_not_started`] before dispatch and a caller-owned bounded error
+    /// after dispatch; enclosing waits reinterpret this reader-relative caller.
     ///
-    /// [`crate::GlassError::AccessibilityNotReady`] is reserved for an app that has not published a
-    /// usable tree without [`AxContext::deadline`] having ended the read.
-    /// [`crate::Glass::wait_for_element`] polls through that ordinary not-ready state; do not use it
-    /// to erase a structural deadline expiry.
+    /// Use [`crate::GlassError::AccessibilityNotReady`] only when the app has not published a usable
+    /// tree before the deadline.
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree>;
 
-    /// Subscribe to change notifications for the app described by `ctx`.
-    ///
-    /// `None` — the default — means this reader has no event stream and its callers keep polling.
-    /// Two readers cannot have one as built: Android's `uiautomator` reader is a dump per call,
-    /// and iOS's is an `idb describe` per call.
-    ///
-    /// Subscribe before the first read, not after: a change that lands after a read but before the
-    /// subscription is announced to nobody, and the caller then waits out its *entire* budget on a
-    /// condition that already holds. (A change between subscribing and reading is safe — the read
-    /// sees it.)
+    /// Subscribe before the first snapshot so changes between subscription and read remain
+    /// observable; `None` means this reader has no event stream.
     fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
         None
     }
 
-    /// Set the editable element identified by `target` to `text`. The backend
-    /// re-walks pre-order to `target.id`, verifies role+name, then sets via the
-    /// native editable interface. Default: unsupported.
+    /// Set the editable `target` after rewalking and verifying its fingerprint; default:
+    /// unsupported.
     ///
-    /// # Error contract
-    ///
-    /// Every failure raised once the write has gone out MUST be a verdict
-    /// [`GlassError::set_value_failed_after_writing`] accepts —
-    /// [`GlassError::AxValueNotApplied`] where the element was read back, and
-    /// [`GlassError::AxWriteUnconfirmed`] where it could not be. That is what drops the value the
-    /// session cached for the element; keeping it makes a field that settled *after* the failure
-    /// look like drift, and the caller's retry is refused for a write that succeeded (glass#405).
-    ///
-    /// Generic transport or bounded dispatch provenance is insufficient: it may describe a guard
-    /// snapshot, target resolution, or focus operation that ran before the value mutation. Classify
-    /// at the backend point that knows the value mutation itself may have reached the device, and
-    /// convert every later failure to one of the explicit verdicts above.
+    /// After dispatch, failures must be [`GlassError::AxValueNotApplied`] or
+    /// [`GlassError::AxWriteUnconfirmed`] so the session drops its stale cached value. Classify
+    /// ambiguous transport failures where the backend knows the write may have reached the device.
     fn set_value(&mut self, _ctx: &AxContext, _target: &AxTarget, _text: &str) -> Result<()> {
         Err(crate::error::GlassError::AxUnsupported)
     }
 
-    /// Actuate `target` through its role-appropriate native accessibility operation after
-    /// rewalking by id and verifying its fingerprint. Confirm the effect only when the backend
-    /// operation has a confirmable post-state.
-    ///
-    /// Returns a substituted element id when the toolkit actuates an ancestor, or `None` when it
-    /// actuates `target`.
+    /// Actuate `target` after rewalking and verifying its fingerprint, returning a substituted
+    /// ancestor id or `None` for `target`.
     ///
     /// Only [`crate::GlassError::AxUnsupported`] and
-    /// [`crate::GlassError::AxActionUnavailable`] guarantee no dispatch and permit pointer
-    /// fallback. Every possibly-dispatched failure remains fallback-ineligible and retains any
-    /// bounded timeout owner and dispatch provenance; use `AxActionFailed` or
-    /// `AccessibilityUnavailable` for non-bounded failures. `AxElementChanged` also propagates to
-    /// prevent stale-coordinate clicks.
-    ///
-    /// Default: unsupported.
+    /// [`crate::GlassError::AxActionUnavailable`] permit pointer fallback; possibly dispatched or
+    /// stale-target failures propagate. Default: unsupported.
     fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
         Err(crate::error::GlassError::AxUnsupported)
     }

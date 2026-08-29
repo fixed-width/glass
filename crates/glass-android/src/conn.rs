@@ -193,8 +193,7 @@ impl Conn {
 
     pub(crate) fn poison(&mut self) {
         self.poisoned = true;
-        // A poisoned connection cannot be reused. Close it now so a companion with a sequential
-        // accept/read loop can leave conn1 and accept the replacement before this value is dropped.
+        // Close poisoned conn1 now so a sequential companion can accept its replacement.
         let _ = self.writer.shutdown(Shutdown::Both);
     }
 
@@ -433,8 +432,8 @@ impl Conn {
         }
     }
 
-    /// Run one request under `deadline`. The outer error is a pre-dispatch setup failure; the
-    /// inner result retains how far a dispatched request got.
+    /// Run one request under `deadline`, separating setup failure from dispatched-request
+    /// provenance.
     pub(crate) fn call_within(
         &mut self,
         req: Value,
@@ -446,9 +445,8 @@ impl Conn {
             return Err(GlassError::deadline_not_started(op));
         }
 
-        // Prove both timeout handles can be updated before anything reaches the companion. The
-        // actual write/flush/read phases update their own handle again from the then-current
-        // remainder so time spent in an earlier phase cannot be spent a second time.
+        // Install both socket timeouts before dispatch; each phase refreshes from the remaining
+        // absolute deadline.
         let install = Self::phase_wait(deadline, op, false)
             .map_err(CallFailure::into_error)
             .and_then(|wait| self.read_within(wait))
@@ -476,9 +474,7 @@ impl Conn {
             Err(failure) => (Err(failure), false),
         };
 
-        // Re-read the absolute deadline immediately before restoration. A reply received within
-        // the read timeout can still finish parsing at the boundary, and restoration itself must
-        // never turn that late result back into success.
+        // Reject a reply whose parsing reached the deadline before timeout restoration.
         if deadline.remaining().is_some_and(|wait| wait.is_zero()) {
             outcome = Self::deadline_outcome(outcome, op);
         }
@@ -636,8 +632,7 @@ mod tests {
         port
     }
 
-    /// Delay draining a request large enough to fill the sender, then delay the reply too. The two
-    /// waits must spend one absolute deadline rather than each receiving its original duration.
+    /// Delay both request drain and reply to prove they share one absolute deadline.
     fn delayed_drain_and_reply(write_delay: Duration, read_delay: Duration) -> u16 {
         use std::io::{BufRead, BufReader};
 
@@ -730,8 +725,7 @@ mod tests {
             Duration::from_millis(300),
         ))
         .expect("the hello arrives");
-        // Loopback can buffer several MiB. This must be large enough for write_all to wait until
-        // the fake starts draining conn1, or only the delayed read would exercise the deadline.
+        // Exceed loopback buffering so `write_all` waits for the fake to drain conn1.
         let padding = "x".repeat(8 * 1024 * 1024);
         let started = Instant::now();
 

@@ -23,9 +23,7 @@ use crate::{BoundDispatch, BoundKind, GlassError, Result};
 
 /// The bounded calls one accessibility backend makes on its detached worker thread.
 ///
-/// Configuration only. Anything stateful added here — an in-flight guard, a straggler count, a
-/// reused thread — must be shared across calls, so it belongs behind a lock rather than in a
-/// plain field.
+/// Native accessibility worker configuration; shared mutable state belongs behind a lock.
 pub struct A11yThread {
     backend: &'static str,
     ceiling: Duration,
@@ -35,16 +33,10 @@ const MUTATION_PENDING: u8 = 0;
 const MUTATION_DISPATCHED: u8 = 1;
 const MUTATION_CANCELLED: u8 = 2;
 
-/// The operation-specific dispatch gate for one detached native accessibility mutation.
+/// A borrowed one-shot dispatch gate for detached native accessibility mutations.
 ///
-/// A backend performs all target resolution and guard reads before calling [`Self::dispatch`]. The
-/// first call through the borrowed capability atomically claims permission to begin the native
-/// mutation. Every later call is refused. If the waiting caller has already timed out, the mutation
-/// is also refused, so a timeout reported as pre-dispatch cannot later change the app on the
-/// detached worker.
-///
-/// The capability is borrowed by the worker job and cannot escape to a detached helper that
-/// dispatches after the job returns:
+/// [`Self::dispatch`] atomically claims the mutation after target resolution; cancellation wins if
+/// the caller timed out. The borrowed capability cannot escape the worker job:
 ///
 /// ```compile_fail
 /// use glass_core::{A11yThread, Deadline, Result};
@@ -267,9 +259,8 @@ impl A11yThread {
         }
     }
 
-    /// Actuate under the nearer caller/ceiling deadline. A timeout atomically cancels an unclaimed
-    /// mutation gate; if the worker claimed it first, the action remains fallback-ineligible because
-    /// it may still land.
+    /// Actuate under the nearer caller or ceiling deadline; a claimed mutation remains
+    /// fallback-ineligible after caller timeout.
     pub fn invoke(
         &self,
         deadline: Deadline,
@@ -531,9 +522,8 @@ mod tests {
         assert_eq!(ended_by, Whose::Callee);
     }
 
-    /// The structural owner decides whether a wait polls on or fails, so the two causes must not
-    /// collapse: a backend that went quiet for the whole ceiling is a real fault, and a caller that
-    /// ran out of its own time is not.
+    /// Preserve a caller-owned bound so waits can distinguish spent sequence time from a silent
+    /// backend.
     #[test]
     fn a_read_the_caller_cut_short_keeps_the_caller_as_its_structural_owner() {
         let caller = reader().never_answered(Whose::Caller);

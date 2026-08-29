@@ -328,8 +328,7 @@ impl ServiceClient {
         self.call_with(req, CallFailure::is_transport, deadline)
     }
 
-    /// Run one tree-scoped action on the already-primed connection. A raw device ref belongs to
-    /// that connection's served tree, so reconnecting here would make its destination ambiguous.
+    /// Run one raw-ref action only on the connection that served its tree.
     fn action_once(
         &self,
         req: Value,
@@ -1286,9 +1285,8 @@ fn movement_candidates<'a>(tree: &'a AxTree, target: &AxTarget) -> Vec<&'a AxNod
     out
 }
 
-/// Rebind a captured target's positional id to the same element in a fresh tree. `relocate`
-/// requires a complete tree, a unique role/name match, and overlapping bounds before accepting a
-/// moved id; the regular action guard then rechecks the full Android fingerprint.
+/// Rebind a positional id only after a unique role/name and overlapping-bounds match in a complete
+/// fresh tree.
 fn relocated_target(tree: &AxTree, target: &AxTarget) -> Result<AxTarget> {
     let node = match target.relocate(tree) {
         Located::AtId(node) | Located::Moved(node) => node,
@@ -1483,9 +1481,8 @@ fn disabled_error(target: u32, disabled: AxNodeId) -> GlassError {
     )
 }
 
-/// Map a `set_text` failure onto the `set_value` contract. Only `NotSent` proves this mutation did
-/// not reach the device. The other two are operation-specific evidence that it may have run, even
-/// when the underlying transport error is caller-owned.
+/// Map `set_text` delivery onto `set_value`; only `NotSent` proves the mutation did not reach the
+/// device.
 fn write_error(target: u32, f: CallFailure) -> GlassError {
     match f {
         CallFailure::NotSent(e) if e.bound_owner() == Some(glass_core::Whose::Caller) => e,
@@ -3145,8 +3142,7 @@ mod tests {
         fake_service_ex(trees, vec![on_action], vec![TreePackage::Echo])
     }
 
-    /// Conn1 starts answering its click, then completes that stale line after the caller has left.
-    /// Conn2 serves a tree re-arm before accepting the next distinct click.
+    /// Finish conn1's stale click answer after conn2 serves the re-arm tree.
     fn fake_service_with_late_partial_action_answer(
         tree: Value,
     ) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
@@ -3825,12 +3821,8 @@ mod tests {
         assert!(ops_of(&ops).is_empty(), "a request reached the service");
     }
 
-    /// glass#338: this reader is the one the platform *prefers* once the companion is installed,
-    /// so a deadline it ignores is a deadline the dogfood configuration ignores.
-    ///
-    /// A caller that has stopped waiting is answered without a round-trip at all — the socket's
-    /// standing timeout is 30s and a failed call reconnects and re-sends, so one snapshot can
-    /// outlast a whole `glass_wait_for_element` twice over.
+    /// glass#338: a spent deadline must prevent this preferred reader's 30-second socket request
+    /// and reconnect retry.
     #[test]
     fn a_snapshot_the_caller_stopped_waiting_for_never_reaches_the_device() {
         let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
@@ -3857,8 +3849,7 @@ mod tests {
 
     #[test]
     fn an_action_before_any_tree_on_this_connection_is_refused() {
-        // A fresh connection — including one opened by a client reconnect — has served no
-        // tree yet, so an action on it must be refused rather than answered `ok:true`.
+        // A connection cannot accept raw refs before serving their tree.
         let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
         let client = ServiceClient::connect(port).expect("connect to the fake service");
         let e = client
@@ -3873,8 +3864,7 @@ mod tests {
 
     #[test]
     fn an_answer_lost_set_text_is_never_replayed() {
-        // The raw ref is scoped to conn1's tree. Even though set_text is value-idempotent, its
-        // destination is not: conn2 can number a different node with the same ref.
+        // A raw ref belongs to conn1's tree; conn2 may assign that number to another node.
         let (port, ops) = fake_service_ex(
             vec![json!({})],
             vec![OnAction::DropWithoutAnswering, OnAction::Ok],
@@ -5017,14 +5007,8 @@ mod tests {
 
     #[test]
     fn a_fresh_tree_for_the_asked_app_does_not_authorise_the_acting_apps_target() {
-        // The served tree answered for `com.other.app` (a dialog), not the configured
-        // `com.example.app` — `target`'s ref is numbered from the DIALOG's nodes. `set_text` is
-        // not sent; while recovering, the dialog dismisses and `com.example.app` (the
-        // asked-about app) comes forward, so the fresh reply names it. Comparing against the
-        // ASKED app (the bug) would match by construction here and replay the write against
-        // whatever unrelated node ref 1 resolves to in the real app — it must instead compare
-        // against the ACTING app (`com.other.app`), see the reply naming something else, and
-        // refuse.
+        // The target ref belongs to `com.other.app`; a fresh `com.example.app` tree cannot
+        // authorize replay against the same numeric ref.
         let (port, ops) = fake_service_ex(
             vec![
                 editable_field("old"),
@@ -5042,8 +5026,7 @@ mod tests {
         let t = built(&editable_field("old"));
         let target = target_for(&t, AxNodeId(1));
 
-        // `OnAction::Ok` is wired for conn2 so a wrongly-authorised retry would go on to
-        // SUCCEED — the false success this pins, not just a differently-worded refusal.
+        // conn2 would make an unauthorized retry falsely succeed.
         let breaker = break_set_text_write_after_guard(&mut a, &ops);
         let e = a
             .set_value(&ctx(), &target, "new")
@@ -5062,8 +5045,7 @@ mod tests {
 
     #[test]
     fn not_sent_recovery_refuses_an_omitted_original_acting_package() {
-        // The original tree supplied the ref but made no package claim. Falling back to the
-        // requested package would let an explicitly named fresh tree authorise that unknown ref.
+        // An omitted original package cannot authorize its ref in a later named tree.
         let (port, ops) = fake_service_ex(
             vec![
                 editable_field("old"),
@@ -5092,9 +5074,8 @@ mod tests {
 
     #[test]
     fn not_sent_recovery_refuses_an_omitted_refreshed_acting_package() {
-        // The first tree explicitly names the requested app. After the foreground changes, the
-        // fresh tree has a same-fingerprint field but cannot name its package; treating omission
-        // as the requested package would send set_text into that newly foreground app.
+        // An omitted refreshed package cannot authorize a same-fingerprint field after foreground
+        // change.
         let (port, ops) = fake_service_ex(
             vec![
                 editable_field("old"),
@@ -5123,10 +5104,8 @@ mod tests {
 
     #[test]
     fn a_fresh_tree_matching_the_acting_app_allows_one_newly_resolved_set_text() {
-        // Mirrors the test above with the dialog still foreground in the fresh tree: the reply
-        // names `com.other.app`, the same app the served tree described, so one fresh-ref write is
-        // safe even though it still differs from the configured `com.example.app`. Comparing
-        // against the asked app (the bug) would see that mismatch and spuriously refuse the retry.
+        // A fresh tree from the same acting app may safely rebind the ref despite differing from
+        // the configured app.
         let (port, ops) = fake_service_ex(
             vec![
                 editable_field("old"),
@@ -5163,8 +5142,7 @@ mod tests {
 
     #[test]
     fn snapshot_discloses_a_reply_naming_a_different_app() {
-        // Exercises `ServiceA11y::snapshot`'s wiring end-to-end (asked vs. the reply's
-        // `package`), not just the pure `subject_of` comparison tested above in isolation.
+        // Exercise snapshot's asked-versus-actual package wiring end to end.
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let port = listener.local_addr().expect("addr").port();
         std::thread::spawn(move || {

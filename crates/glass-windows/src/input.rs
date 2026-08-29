@@ -624,11 +624,7 @@ pub(crate) fn send_pointer_by(
 ) -> Result<()> {
     glass_core::validate_pointer_input(event)?;
     crate::run_windows_call_by(deadline, "pointer input", |dispatch| {
-        // `Gesture` (multi-touch) can never succeed on this backend; reject it before
-        // `focus_window`/`extended_frame_bounds`, so it fails fast with `Unsupported` and without
-        // raising the target window or masking the call-shape error behind an unrelated
-        // frame-bounds `Backend` error (mirrors the macOS backend's early check). The
-        // `PointerEvent::Gesture` match arm below stays for exhaustiveness.
+        // Reject unsupported gestures before focus or frame lookup can mutate or mask the error.
         if matches!(event, PointerEvent::Gesture { .. }) {
             return Err(crate::unsupported_multi_touch());
         }
@@ -755,8 +751,7 @@ pub(crate) fn send_pointer_by(
             } => {
                 let (nx, ny) = to_norm(x, y);
                 let mod_vks: Vec<VIRTUAL_KEY> = modifiers.iter().map(|&m| modifier_vk(m)).collect();
-                // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead of
-                // bursting modifier+wheel+release into one — see glass_core::run_scroll.
+                // Hold modifiers across the wheel frame; see `glass_core::run_scroll`.
                 let mut sink = WindowsScrollSink {
                     nx,
                     ny,
@@ -786,10 +781,8 @@ pub(crate) fn send_key_by(active_hwnd: isize, event: &KeyEvent, deadline: Deadli
 
         match event {
             KeyEvent::Text(s) => {
-                // One SendInput per character, paced by an inter-character dwell. Injecting the
-                // whole string faster than the target drains it races a downstream OS bug that
-                // collapses a run of characters to the last one — see glass_core::run_type.
-                // (Empty text is a clean Ok: no characters to emit.)
+                // Commit one paced `SendInput` per character; bulk injection can collapse a run to
+                // its final character.
                 let mut sink = WindowsTypeSink;
                 crate::run_windows_type_by(&mut sink, s, type_dwell(), deadline)?;
             }
@@ -799,8 +792,7 @@ pub(crate) fn send_key_by(active_hwnd: isize, event: &KeyEvent, deadline: Deadli
                     GlassError::InvalidKey(format!("key in chord {s:?} has no Windows mapping"))
                 })?;
                 let mod_vks: Vec<VIRTUAL_KEY> = mods.iter().map(|&m| modifier_vk(m)).collect();
-                // Shared, frame-aware sequencing: hold the modifier across the key's frame instead of
-                // bursting the whole chord into one — see glass_core::run_chord.
+                // Hold modifiers across the key frame; see `glass_core::run_chord`.
                 let mut inject = |inputs: &[INPUT]| {
                     // SAFETY: `inputs` is a valid slice and the stride is the real `INPUT` size.
                     (unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) }) as usize

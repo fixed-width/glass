@@ -316,9 +316,7 @@ pub trait Platform {
         self.stop_app_by(crate::Deadline::UNBOUNDED)
     }
 
-    /// Capture the current window contents as an RGBA frame, bounded by a caller's shared
-    /// deadline. `region` (if set, window-relative) captures only that sub-rectangle; `None`
-    /// captures the whole window.
+    /// Capture an optional window-relative region as RGBA under the caller's deadline.
     fn capture_frame_by(
         &mut self,
         region: Option<&Region>,
@@ -330,10 +328,8 @@ pub trait Platform {
         self.capture_frame_by(region, crate::Deadline::UNBOUNDED)
     }
 
-    /// Capture a specific window's region from the compositor/root without changing the active
-    /// window (unlike `select_window`), bounded by a caller's shared deadline. `region` (if set,
-    /// relative to `id`'s own geometry) captures only that sub-rectangle; `None` captures the whole
-    /// window. `WindowNotFound` if `id` is not currently one of the app's windows.
+    /// Capture an optional region of `id` under the caller's deadline without changing the active
+    /// window; a missing id returns `WindowNotFound`.
     fn capture_window_by(
         &mut self,
         id: WindowId,
@@ -377,9 +373,8 @@ pub trait Platform {
         ))
     }
 
-    /// Perform a window operation, returning the resulting geometry, bounded by the caller's
-    /// shared deadline. Backends must cap blocking query/focus work itself, not only check before
-    /// and after an otherwise-unbounded call.
+    /// Perform a window operation under the caller's deadline and return its geometry; backends
+    /// must bound blocking work.
     fn window_by(&mut self, op: &WindowOp, deadline: crate::Deadline) -> Result<WindowGeometry>;
 
     /// [`Platform::window_by`] with no caller deadline; backend-owned ceilings still apply.
@@ -396,9 +391,7 @@ pub trait Platform {
         self.list_windows_by(crate::Deadline::UNBOUNDED)
     }
 
-    /// Make `id` the active window (the implicit target of capture/input/window ops), bounded by
-    /// the caller's shared deadline; returns the now-active window's geometry. `WindowNotFound` if
-    /// `id` is not currently one of the app's windows.
+    /// Activate `id` under the caller's deadline and return its geometry, or `WindowNotFound`.
     fn select_window_by(
         &mut self,
         id: WindowId,
@@ -428,10 +421,8 @@ pub trait Platform {
         self.app_pid().into_iter().collect()
     }
 
-    /// Resolve [`Platform::app_pids`] under the absolute deadline shared by a semantic
-    /// accessibility operation. The default covers backends whose PID set is already in memory;
-    /// any backend that performs blocking discovery must override this method and bound that work
-    /// itself.
+    /// Resolve [`Platform::app_pids`] under the shared deadline; blocking backends must override
+    /// and bound discovery.
     fn app_pids_by(&self, deadline: crate::Deadline) -> Result<Vec<u32>> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started(
@@ -759,9 +750,7 @@ mod tests {
         assert_eq!(MinimalPlatform.app_pid(), None);
     }
 
-    /// The legacy methods are the provided halves of their pairs, so a body of `Ok(())` would mean
-    /// a standalone path quietly stopped reaching the backend — with every backend still compiling,
-    /// since it implements the required deadline-bearing method.
+    /// Legacy wrappers must still reach the required deadline-bearing backend methods.
     #[test]
     fn legacy_platform_methods_reach_required_methods_with_no_bound() {
         #[derive(Default)]

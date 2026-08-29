@@ -915,8 +915,7 @@ where
     S: Dispatch<wl_callback::WlCallback, SyncDone> + 'static,
 {
     roundtrip_until_with(conn, queue, state, deadline, who, |budget| {
-        // Not a bare `GlassError::Timeout`, which names no operation: every request ends in the
-        // same sync, so the caller is all that tells one failure from another.
+        // Name the caller because every request ends in the same sync.
         GlassError::Backend(format!(
             "{who}: the compositor did not answer within {} ms",
             budget.as_millis()
@@ -2196,12 +2195,8 @@ impl Platform for WaylandPlatform {
             session.state.capture = CaptureScratch::default();
             let qh = session.queue.handle();
 
-            // Map the (window-relative) request to OUTPUT coordinates by the active
-            // window's rect, then have the compositor copy exactly that region. The
-            // selected window is raised on `select_window`, so the output framebuffer
-            // shows it on top; cropping at the source needs no CPU work and reads the
-            // existing framebuffer (robust for static, undamaged windows — unlike
-            // per-toplevel ext-image-copy-capture, which stalls until a fresh frame).
+            // Capture the selected window from the output framebuffer so static, undamaged content
+            // is available without a CPU crop or waiting for a fresh toplevel frame.
             let wr = &session.active_rect;
             let (cx, cy, cw, ch) = match region {
                 Some(r) => (wr.x + r.x as i32, wr.y + r.y as i32, r.width, r.height),
@@ -2227,9 +2222,7 @@ impl Platform for WaylandPlatform {
             let (wait_budget, owner) = clamped_budget(deadline, CAPTURE_BUDGET, now);
             let wait_deadline = now + wait_budget;
 
-            // Phase 1: dispatch until the compositor has advertised its buffer formats, then pick one
-            // we can convert (preferring 32-bit). `buffer_done` marks the end of the list — a v3
-            // event, which is why the manager is bound at v3 exactly.
+            // Wait for the v3 buffer list to finish, then prefer a convertible 32-bit format.
             let (format, w, h, stride) = wait_for(
                 &session.conn,
                 &mut session.queue,
@@ -2311,14 +2304,8 @@ impl Platform for WaylandPlatform {
                 sync_session_by(s, "input settle", deadline)?;
                 input_settle_by(deadline)
             };
-            // Position the pointer at a window-relative point so the *next* button/axis
-            // routes to the window under it. sway (re)evaluates pointer focus only on
-            // motion, never on elapsed time: a surface that maps and settles under a
-            // now-stationary cursor never receives `enter`, and a one-shot button/axis
-            // sent to it is then silently dropped. So move there, let the surface settle,
-            // then re-assert with a 1px delta to force a fresh focus evaluation now that
-            // it is ready. Without this, fast back-to-back launch+click on a loaded host
-            // intermittently loses the very first click/scroll (the Wayland flake).
+            // sway reevaluates pointer focus only on motion, so settle after the initial move and
+            // nudge 1px before the first button or axis event.
             let position = |s: &mut ActiveSession, x: i32, y: i32| -> Result<()> {
                 if deadline.has_passed() {
                     return Err(GlassError::deadline_not_started("pointer input"));
@@ -2420,8 +2407,7 @@ impl Platform for WaylandPlatform {
                     dy,
                     ref modifiers,
                 } => {
-                    // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
-                    // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
+                    // Hold modifiers across the wheel frame; see `glass_core::run_scroll`.
                     let mut sink = WaylandScrollSink {
                         s: &mut *session,
                         dispatch,
@@ -2458,15 +2444,8 @@ impl Platform for WaylandPlatform {
             let kb = session.keyboard.clone();
             match event {
                 KeyEvent::Text(text) => {
-                    // Upload one keymap per chunk (each distinct keysym at its own keycode), then
-                    // tap the planned keycode for every character. The keymap stays fixed while a
-                    // chunk's key events are delivered, so a client that resolves keysyms lazily
-                    // (e.g. an X11 app under Xwayland querying the keymap per press) can't read a
-                    // neighbouring character by racing a mid-string keymap swap — the flake that a
-                    // fresh keymap on the *same* keycode per character exhibited under load. Each
-                    // tap self-commits (roundtrip + settle), which also paces a heavy client; the
-                    // one keymap upload per chunk replaces one upload per character. See
-                    // crate::keyboard::plan_type.
+                    // Keep each chunk's keymap fixed so Xwayland clients cannot race a per-character
+                    // keymap swap; each tap self-commits to pace heavy clients.
                     let mut characters = text.chars();
                     for chunk in crate::keyboard::plan_type(text) {
                         upload_keymap_by(
@@ -2514,8 +2493,7 @@ impl Platform for WaylandPlatform {
             let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
             let ident = session.active.clone().ok_or(GlassError::WindowNotFound)?;
             dispatch.mark();
-            // All window ops act on the active window's sway container. Windows are
-            // floating (see sway_config), so resize/move behave like a normal WM.
+            // Window operations target the active floating sway container.
             let con = session
                 .ipc
                 .windows_by(deadline)?
@@ -2532,15 +2510,13 @@ impl Platform for WaylandPlatform {
                     &format!("[con_id={con}] resize set width {width} px height {height} px"),
                     deadline,
                 )?,
-                // Move's (x, y) is an output-absolute origin, matching the X11 backend
-                // (root coordinates); the headless output is at (0, 0).
+                // Move uses output-absolute coordinates, matching X11 root coordinates.
                 WindowOp::Move { x, y } => session.ipc.run_command_by(
                     &format!("[con_id={con}] move absolute position {x} {y}"),
                     deadline,
                 )?,
             }
-            // Re-read the resulting rect (sway may clamp) and refresh the session
-            // contract — active_rect drives the capture crop and pointer offset.
+            // Refresh geometry after sway clamps the operation.
             let now = session
                 .ipc
                 .windows_by(deadline)?
@@ -2561,9 +2537,7 @@ impl Platform for WaylandPlatform {
             // Refresh foreign-toplevel handles so capture can later find them.
             sync_session_by(session, "window list", deadline)?;
             let mut wins: Vec<SwayWindow> = session.ipc.windows_by(deadline)?;
-            // A window the app mapped can be missing here through no fault of the app (see
-            // `crate::xwayland`). Enumerating is where that shows up, so it is where glass repairs
-            // it — otherwise the caller is told the app has fewer windows than it does.
+            // Enumeration exposes Xwayland views missing from sway, so repair them before return.
             if session
                 .recovery
                 .recover_if_due_by(Instant::now(), &x11_ids(&wins), deadline)?
@@ -2889,9 +2863,7 @@ mod pure_tests {
         assert_eq!(owner, glass_core::Whose::Caller);
     }
 
-    /// [`wait_for`] over a socket with nothing behind it, answering a question the peer is never
-    /// told about — so only the deadline can end it. `speak` acts as the peer and hands back the
-    /// end to keep open, or `None` to close it.
+    /// Run [`wait_for`] over a silent socket while `speak` keeps or closes the peer.
     fn wait_over_a_socket(
         budget: Duration,
         speak: impl FnOnce(UnixStream) -> Option<UnixStream>,

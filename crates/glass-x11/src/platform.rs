@@ -139,10 +139,8 @@ fn run_x11_call_by<T>(
     Ok(answer)
 }
 
-/// Cancels a blocking x11rb socket poll when a bounded window operation reaches its caller
-/// deadline. The socket is duplicated when the call begins, but shutdown is armed only by the
-/// first dispatch mark. Shutting down is intentionally fail-closed: after a server stalls long
-/// enough to lose request/reply framing, reusing that session would risk acting on a stale reply.
+/// Arms socket shutdown only after dispatch so a stalled bounded operation cannot leave reusable
+/// X11 request/reply framing.
 struct X11DeadlineWatch {
     deadline: Deadline,
     socket: Option<OwnedFd>,
@@ -1386,8 +1384,7 @@ impl Platform for X11Platform {
 
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
         run_x11_call_by(deadline, "capture", |dispatch| {
-            // `window_geometry()` itself calls `require_window()`, so it doubles as
-            // the "is there an active window" guard — no separate binding needed.
+            // `window_geometry()` also validates that an active window exists.
             let geo = self.window_geometry()?;
             let rect = self.resolve_capture_rect(&geo, region)?;
             if let Some(note) = clip_note(&rect) {
@@ -1396,9 +1393,7 @@ impl Platform for X11Platform {
             if deadline.has_passed() {
                 return Err(GlassError::deadline_not_started("capture"));
             }
-            // Capture from ROOT over the window's screen region so overlapping popovers
-            // (separate override-redirect top-levels) are included, not just this window's
-            // own (possibly-obscured) drawable.
+            // Capture from ROOT so separate override-redirect popovers are included.
             let frame = self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)?;
             dispatch.mark();
             Ok(frame)
@@ -1412,8 +1407,7 @@ impl Platform for X11Platform {
         deadline: Deadline,
     ) -> Result<Frame> {
         run_x11_call_by(deadline, "window capture", |dispatch| {
-            // Mirror select_window's WindowId -> Window mapping/validation, but never
-            // touch `self.window` — this must not retarget the active window.
+            // Validate `id` without retargeting the active window.
             let pids: Vec<u32> = self
                 .child
                 .as_ref()
@@ -1425,10 +1419,7 @@ impl Platform for X11Platform {
             }
             let geo = self.geometry_of(target)?;
             if let Some(r) = region {
-                // `region` must fit the TARGET window's own geometry, not just the
-                // shared Xvfb display — otherwise an over-large region that still
-                // lands inside the display would silently capture pixels outside
-                // this window (desktop / other windows) instead of erroring.
+                // Validate against the target window, not the larger shared display.
                 r.check_fits(geo.width, geo.height)?;
             }
             let rect = self.resolve_capture_rect(&geo, region)?;
@@ -1464,8 +1455,7 @@ impl Platform for X11Platform {
                     dy,
                     ref modifiers,
                 } => {
-                    // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
-                    // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
+                    // Hold modifiers across the wheel frame; see `glass_core::run_scroll`.
                     let mut sink = X11ScrollSink {
                         p: &*self,
                         dispatch,
@@ -1568,10 +1558,8 @@ impl Platform for X11Platform {
         run_x11_call_by(deadline, "key input", |dispatch| {
             match event {
                 KeyEvent::Text(text) => {
-                    // Per-character, self-committed typing (an XFlush per char) so a heavy client
-                    // (e.g. a browser) receives a long string instead of dropping events flushed
-                    // once at the end — see glass_core::run_type and X11TypeSink. The 8ms dwell
-                    // paces between characters (XFlush sends but does not wait).
+                    // Flush and pace each character because heavy clients can drop a string flushed
+                    // only at the end.
                     let mut sink = X11TypeSink {
                         p: &*self,
                         dispatch,

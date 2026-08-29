@@ -296,9 +296,8 @@ pub enum GlassError {
         message: String,
     },
 
-    /// Both the semantic pointer operation and the mandatory restoration of the previously active
-    /// window failed. The two structured causes remain separately inspectable rather than being
-    /// flattened into one backend string.
+    /// Both the pointer operation and restoration failed; each structured cause remains
+    /// inspectable.
     #[error("{primary}; restoring the previous active window failed: {restore}")]
     WindowRestoreFailed {
         #[source]
@@ -306,10 +305,8 @@ pub enum GlassError {
         restore: Box<GlassError>,
     },
 
-    /// Both an input operation and its mandatory held-input release failed. The primary and cleanup
-    /// failures remain separately inspectable because either can carry actionable tool output or
-    /// deadline ownership. A failed release makes the resulting input state uncertain regardless of
-    /// either inner failure's individual dispatch annotation.
+    /// Both input and mandatory release failed; either cause may own the deadline, and input state
+    /// is uncertain.
     #[error("{primary}; cleanup failed while {operation}: {cleanup}")]
     InputCleanupFailed {
         operation: &'static str,
@@ -318,14 +315,11 @@ pub enum GlassError {
         cleanup: Box<GlassError>,
     },
 
-    /// An unchanged ordinary failure from a step that provably did not dispatch external work.
-    /// The wrapped cause and its message remain authoritative; only dispatch provenance changes.
+    /// An unchanged failure from work proven not to have dispatched.
     #[error(transparent)]
     BeforeDispatch(Box<GlassError>),
 
-    /// An unchanged failure from a later step of a compound operation after an earlier step
-    /// dispatched. The wrapped cause and its message remain authoritative; only the independent
-    /// compound-operation dispatch provenance changes.
+    /// An unchanged failure following earlier dispatch in the same compound operation.
     #[error(transparent)]
     AfterDispatch(Box<GlassError>),
 
@@ -368,17 +362,10 @@ impl GlassError {
         }
     }
 
-    /// Whether a failed native-invoke attempt may safely fall back to the synthetic
-    /// pointer path. True only for outcomes where **no native action was dispatched**:
-    /// the backend has no invoke at all ([`GlassError::AxUnsupported`]), or the element
-    /// exposes no activation action ([`GlassError::AxActionUnavailable`]).
+    /// Whether native invoke may fall back to a pointer click.
     ///
-    /// Everything else fails CLOSED. A failure *after* dispatch — or an ambiguous
-    /// transport/timeout error, which cannot be distinguished from one — must propagate,
-    /// because a pointer click on top of a native action that may still land actuates the
-    /// control twice (submitting a form twice, sending a message twice). The wildcard arm
-    /// is deliberate: a new error variant is treated as "may have dispatched" until it is
-    /// proven otherwise.
+    /// Only [`GlassError::AxUnsupported`] and [`GlassError::AxActionUnavailable`] prove no dispatch;
+    /// every other failure propagates to prevent double actuation.
     pub fn invoke_fallback_eligible(&self) -> bool {
         matches!(
             self,
@@ -386,13 +373,7 @@ impl GlassError {
         )
     }
 
-    /// The original structured failure, without dispatch annotations or a caused post-write
-    /// verdict.
-    ///
-    /// An annotation changes whether an earlier step may have affected the app, not what the
-    /// later step reported. Classification should inspect this cause while dispatch decisions use
-    /// [`Self::bound_dispatch`]. Recursive unwrapping also makes this accessor robust to errors
-    /// received from code that constructed nested annotations directly.
+    /// The underlying structured failure, recursively unwrapping dispatch annotations.
     pub fn cause(&self) -> &Self {
         match self {
             GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => error.cause(),
@@ -403,21 +384,11 @@ impl GlassError {
         }
     }
 
-    /// Whether a failed value-write is **proven** to have gone out or may have gone out before
-    /// failing — the only cases where the session's captured value is stale and must be dropped.
-    /// True only for the operation-specific post-dispatch verdicts. Generic bounded dispatch
-    /// provenance can describe a pre-write snapshot or transport call, so it is not evidence that
-    /// the value mutation itself went out.
+    /// Whether the value mutation itself may have dispatched, requiring its cached value to be
+    /// dropped.
     ///
-    /// Same "did anything dispatch?" question as [`Self::invoke_fallback_eligible`], but ordinary
-    /// errors are decided by an allowlist because the two mistakes are not symmetric. Keeping the
-    /// value can only make the guard reject more — an `AxElementChanged` whose own message tells
-    /// the caller to re-snapshot, recoverable. Dropping it can only make the guard accept more, and
-    /// what it then accepts is a write onto the wrong element, reported as `Ok`.
-    ///
-    /// Some generic errors occur on both sides of the mutation — Android's pre-write re-snapshot
-    /// and its post-write read-back can fail through the same transport variants. Backends must
-    /// convert only the latter at the point that knows the mutation already dispatched.
+    /// Backends classify ambiguous transport failures where they know the write may have reached
+    /// the device.
     pub fn set_value_failed_after_writing(&self) -> bool {
         match self {
             GlassError::AxValueNotApplied { .. }
@@ -438,11 +409,8 @@ impl GlassError {
         }
     }
 
-    /// Preserve proof that an ordinary failure happened before external work was dispatched.
-    ///
-    /// Bound errors already carry their own dispatch provenance, and an after-dispatch annotation
-    /// is stronger than a later attempt to mark the same compound failure as side-effect free.
-    /// Repeated annotation is idempotent.
+    /// Preserve proof that this ordinary failure occurred before dispatch; stronger existing
+    /// provenance remains unchanged.
     pub fn before_dispatch(self) -> Self {
         match self {
             error @ (GlassError::BeforeDispatch(_)
@@ -453,12 +421,7 @@ impl GlassError {
         }
     }
 
-    /// Preserve a compound operation's dispatch history on a later failure.
-    ///
-    /// Once an earlier mutation succeeded, a later failure no longer proves the compound operation
-    /// was side-effect free. The cause, message, bound ownership, and tool detail still describe
-    /// the failed sub-operation; the wrapper carries the independent dispatch proof. Repeated
-    /// annotation is idempotent.
+    /// Preserve earlier dispatch when a later compound-operation step fails.
     pub fn after_dispatch(self) -> Self {
         match self {
             error @ (GlassError::AfterDispatch(_) | GlassError::InputCleanupFailed { .. }) => error,
@@ -470,11 +433,8 @@ impl GlassError {
         }
     }
 
-    /// Preserve an operation-specific unconfirmed-write verdict together with the structured
-    /// failure that prevented confirmation.
-    ///
-    /// An existing post-write verdict already carries the stronger retry-safety decision and is
-    /// returned unchanged rather than nested inside another verdict.
+    /// Attach the structured cause that prevented confirmation unless a stronger post-write verdict
+    /// already exists.
     pub fn write_unconfirmed_because(
         id: u32,
         detail: impl Into<String>,

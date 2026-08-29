@@ -88,10 +88,8 @@ impl Glass {
         self.snapshot_at_current_limits(deadline)
     }
 
-    /// A wait deliberately takes one final look at its already-spent deadline when a quiet change
-    /// signal may have missed an update. Let that reader see the deadline using cached geometry only
-    /// when the geometry seam proves it dispatched nothing; every started/timed-out geometry query
-    /// remains a hard error.
+    /// A final quiet-wait read may use cached geometry only after a proven pre-dispatch geometry
+    /// failure.
     pub(crate) fn a11y_resnapshot_for_wait(&mut self, deadline: Deadline) -> Result<AxTree> {
         self.snapshot_at_current_limits_with_wait_fallback(deadline, true)
     }
@@ -247,9 +245,7 @@ impl Glass {
         // separate popover window (an open dropdown's option list) whose own origin they
         // don't reflect.
         //
-        // Preserve the legacy best-effort probe for an untimed standalone click. A bounded
-        // semantic action cannot hide a failed or timed-out query, because doing so would sever
-        // the one absolute deadline shared by the compound operation.
+        // Untimed clicks retain best-effort geometry; bounded actions propagate query failures.
         let windows = match self.list_windows_by(deadline) {
             Ok(windows) => windows,
             Err(_) if deadline == Deadline::UNBOUNDED => Vec::new(),
@@ -292,9 +288,8 @@ impl Glass {
                 },
                 deadline,
             );
-            // Cleanup is deliberately unbounded: once focus has moved, restoration must still be
-            // attempted after the caller stops waiting. The returned failure remains after-dispatch
-            // because the temporary selection already changed the compound action's state.
+            // Restore focus even after expiry; temporary selection already makes failure
+            // after-dispatch.
             let restore = self.select_window_by(prev, Deadline::UNBOUNDED);
             return match (primary, restore) {
                 (Ok(()), Ok(_)) => Ok(()),
@@ -476,8 +471,7 @@ impl Glass {
         // A combo has no committing accessibility write: its `Selection` interface moves only
         // the popup's *preview* selection, and the model commits on row activation (Enter/click).
         //
-        // Its compound input path invalidates the cached tree whenever a mutation dispatches or
-        // cannot be proven not to have dispatched; a successful snapshot replaces it wholesale.
+        // Invalidate the cache unless input is proven pre-dispatch; a snapshot replaces it.
         if target.role == AxRole::ComboBox {
             return self.set_combo_value(id, &target, text, deadline);
         }
@@ -512,8 +506,7 @@ impl Glass {
                 return Ok(()); // truthful no-op, no actuation
             }
             let actuation = self.click_element_inner(id, deadline);
-            // The actuation may already have landed. Do not let a failed verification read leave
-            // the pre-toggle state available to a retry, which could toggle the control back.
+            // Drop the pre-toggle cache after ambiguous actuation to prevent a reversing retry.
             self.invalidate_ax_cache_after_possible_dispatch(actuation)?;
             // iOS has no event stream, so polling uses the nearer caller/verification deadline
             // and never accepts state read after expiry.
@@ -628,8 +621,7 @@ impl Glass {
                 .filter(|combo| combo.states.expanded)
                 .map(collect_combo_options)
         };
-        // A closed combo already showing the requested label is a truthful no-op. An expanded
-        // combo may only be previewing that label and still needs Return to commit it.
+        // A matching closed combo is done; an expanded combo still needs Return to commit.
         if expanded_options.is_none()
             && target
                 .name
@@ -642,9 +634,8 @@ impl Glass {
             Some(options) if !options.is_empty() => options,
             expanded_options => {
                 if expanded_options.is_none() {
-                    // A real pointer click, deliberately NOT the native action: a programmatic expand
-                    // (UIA's `ExpandCollapsePattern`) opens the popup without moving keyboard focus,
-                    // so the Down/Up/Return below would go to whatever held focus instead.
+                    // Use a pointer click because UIA programmatic expand does not move keyboard
+                    // focus to the popup.
                     let open = self.audited_click(id, |g, id| {
                         g.click_element_pointer_only(id, deadline)
                             .map(|()| ClickMethod::Pointer {
@@ -2879,8 +2870,7 @@ mod tests {
 
     #[test]
     fn click_element_native_invoke_drifted_for_popover_hosted_element_is_fatal() {
-        // Drift is fatal wherever the element lives: routing into the popover and clicking
-        // its stale bounds would hit whatever moved into that spot.
+        // Reject drift before stale popover bounds click whatever moved into that spot.
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let select_log = Arc::new(Mutex::new(Vec::new()));
         let (mut g, _) = glass_with_a11y_invoke(

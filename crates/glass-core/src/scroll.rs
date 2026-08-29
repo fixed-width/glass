@@ -60,16 +60,11 @@ fn preserve_primary_after_cleanup(primary: GlassError, cleanup: crate::Result<()
 }
 
 fn cleanup_modifiers<S: ScrollSink>(sink: &mut S) -> crate::Result<()> {
-    // A release is mandatory safety cleanup once modifier-down may have landed,
-    // even when the deadline has elapsed or the wheel dispatch failed.
+    // A possible modifier press requires cleanup even after expiry or wheel failure.
     sink.modifiers(false)
 }
 
-/// Drive a scroll against a backend `sink`, stopping at `deadline`.
-///
-/// A plain scroll emits only the wheel. A modified scroll keeps the legacy
-/// modifier-down → dwell → wheel → dwell → modifier-up sequence while bounding
-/// both dwells and checking the deadline around every normal event dispatch.
+/// Drive a plain wheel or the legacy modified-wheel sequence until `deadline`.
 pub fn run_scroll_by<S: ScrollSink>(
     sink: &mut S,
     has_modifiers: bool,

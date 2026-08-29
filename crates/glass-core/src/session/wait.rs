@@ -3,30 +3,14 @@
 use super::*;
 use crate::accessibility::ElementSelector;
 
-/// How long to go on a signal's word alone before reading the tree anyway.
-///
-/// A signal reports the change classes it subscribed to, from the senders it resolved; anything
-/// outside that would otherwise let a wait answer "not matched" without ever looking again — a
-/// wrong result rather than a slow one. This bounds that to added latency, one re-read per second
-/// no matter what the platform does or does not announce.
-///
-/// Wall-clock, and deliberately not a count of quiet intervals: a count scales with the caller's
-/// `interval_ms` and can sit past the caller's whole timeout — ten at the 200ms
-/// `glass_wait_for_element` default is two seconds, which put the ceiling out of reach of exactly
-/// the short waits that could least afford one stale read.
+/// Maximum wall-clock time a change signal may suppress tree reads.
 const REREAD_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Time reserved for the quiet-wait safety read to start before its absolute deadline. Never takes
-/// more than a quarter of a short wait's remaining budget, so even short waits spend meaningful
-/// time listening before the compatibility read.
+/// Reader headroom reserved before a quiet wait's deadline, capped at one quarter of the
+/// remaining budget.
 const FINAL_READ_HEADROOM: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Resolve the accessibility reader's caller relative to the enclosing wait action.
-///
-/// A reader names the deadline in `AxContext` as its caller. That deadline may be the action's own
-/// bound, in which case it is a callee bound from the outer sequence's point of view. Preserve the
-/// kind, dispatch verdict, and detail while moving only that ownership boundary. If the outer
-/// sequence has since elapsed, it remains the owner of the returned failure.
+/// Reclassify a reader-relative caller bound without overriding an expired outer sequence.
 fn resolve_nested_accessibility_bound(
     error: GlassError,
     effective_owner: crate::Whose,
@@ -525,9 +509,8 @@ impl Glass {
         let mut unread: Option<GlassError> = None;
         let mut unread_owner = whose;
         let mut saw_a_tree = false;
-        // `poll_until_with_pause` guarantees one tick. For `timeout_ms: 0` ("check now"), that
-        // immediate read uses the live sequence deadline rather than the already-spent action
-        // deadline. Reads after it carry the action bound.
+        // A zero-timeout compatibility read uses the live sequence deadline; later reads use the
+        // action deadline.
         let first_read_deadline = if params.timeout_ms == 0 {
             sequence_deadline
         } else {
@@ -539,11 +522,8 @@ impl Glass {
             params.interval_ms,
             remaining,
             |d| {
-                // `poll_until_with_pause` performs its skipped-tick safety read after the timeout.
-                // Accessibility snapshots cannot return late success, so when this pause would
-                // reach the absolute deadline, stop just before it and take the safety read then.
-                // Reserving at most a quarter of what remains leaves meaningful quiet time even for
-                // a short wait, while the unchanged absolute deadline still bounds the reader.
+                // Schedule the skipped-tick safety read before expiry because accessibility
+                // snapshots cannot return late success.
                 let left = action_deadline.remaining();
                 let final_read = !final_read_scheduled.get() && left.is_some_and(|left| left <= d);
                 if final_read {
@@ -595,9 +575,8 @@ impl Glass {
                 } else {
                     whose
                 };
-                // The generic poller asks once more after a skipped pause reaches its timeout.
-                // The branch above already scheduled that safety read while time remained, so do
-                // not turn the poller's bookkeeping tick into a semantic snapshot started late.
+                // The pause already scheduled the safety read before expiry; skip the poller's
+                // post-timeout bookkeeping tick.
                 if !first_read && bound.has_passed() {
                     return Ok(None);
                 }
@@ -613,8 +592,7 @@ impl Glass {
                         unread = Some(e);
                         return Ok(None);
                     }
-                    // `Caller` here names the deadline supplied to the reader. The enclosing wait
-                    // resolves whether that was its own bound or the outer sequence's below.
+                    // Resolve this reader-relative `Caller` against the enclosing wait below.
                     Err(e) if e.bound_owner() == Some(crate::Whose::Caller) => {
                         unread_owner = read_owner;
                         unread = Some(e);

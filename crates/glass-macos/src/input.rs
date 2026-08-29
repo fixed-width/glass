@@ -241,10 +241,8 @@ fn tap_key(source: Option<&CGEventSource>, keycode: u16, flags: CGEventFlags) ->
     Ok(())
 }
 
-/// `TypeSink` for macOS: one keyDown+keyUp CGEvent pair per character. `CGEventPost` needs no
-/// separate flush, so `run_type_by` starts its inter-character dwell (`KEY_TYPE_DWELL`) after
-/// posting each pair. An unmappable char (no US-layout key — `keymap::key_for` returns `None`)
-/// fails the whole call rather than silently skipping it, per the no-silent-fallback invariant.
+/// macOS typing emits one committed key pair per character; unmappable US-layout characters fail
+/// instead of being skipped.
 struct MacTypeSink<'a> {
     source: Option<&'a CGEventSource>,
 }
@@ -262,12 +260,8 @@ impl TypeSink for MacTypeSink<'_> {
     }
 }
 
-/// Parse and post a chord like `"ctrl+shift+a"` or `"F4"`: every token but the last must be
-/// a modifier `glass_core::keys::Modifier::from_name` recognizes (accumulated into
-/// `CGEventFlags` via the same `to_flags` `send_pointer` uses); the last token is the key,
-/// resolved via `resolve_chord_key`. `run_chord_by` sequences the keyDown+keyUp pair and its
-/// deadline checks; the sink stamps the accumulated flags on both events because macOS needs no
-/// separate native modifier events.
+/// Parse a chord and let [`run_chord_input_by`] sequence its deadline-checked key pair with
+/// accumulated modifier flags.
 fn send_chord_by(chord: &str, source: Option<&CGEventSource>, deadline: Deadline) -> Result<()> {
     let parts: Vec<&str> = chord
         .split('+')
@@ -319,11 +313,7 @@ impl ChordSink for MacChordSink<'_> {
     }
 }
 
-/// Resolve a chord's final token to `(keycode, needs_shift)`: a single char goes through
-/// [`keymap::key_for`] (which also reports whether that char needs Shift, e.g. `"ctrl+A"`);
-/// anything else goes through [`keymap::keycode_for_keyname`] (a named key has no inherent
-/// shift requirement of its own — any Shift comes from an explicit `shift` token in the
-/// chord instead).
+/// Resolve a chord's final token to a keycode and implicit Shift requirement.
 fn resolve_chord_key(token: &str) -> Option<(u16, bool)> {
     let mut chars = token.chars();
     if let (Some(c), None) = (chars.next(), chars.next())
@@ -517,9 +507,7 @@ impl ScrollSink for MacScrollSink<'_> {
         run_scroll_wheel_by(
             self.deadline,
             || {
-                // `CGEventCreateScrollWheelEvent2` carries no target point of its own — the window
-                // server delivers it to whatever's under the cursor (or the key window) — so
-                // position the cursor first.
+                // Scroll-wheel events target the cursor or key window, so position the cursor first.
                 let mv = mouse_event(
                     self.source,
                     CGEventType::MouseMoved,
@@ -531,14 +519,8 @@ impl ScrollSink for MacScrollSink<'_> {
                 Ok(())
             },
             || {
-                // Sign: verified against WebKit's macOS WebDriver wheel-action → CGEvent conversion
-                // (`PlatformMac`'s `CGEventCreateScrollWheelEvent(..., -delta.height(),
-                // -delta.width())`), which negates both axes converting a standard
-                // positive-Y-is-down/positive-X-is-right delta into `wheel1`/`wheel2` — i.e. a
-                // positive `wheel1`/`wheel2` scrolls up/left on macOS. That's the same
-                // positive-Y-is-down/positive-X-is-right contract glass's own `dx`/`dy` already use
-                // (see `glass-x11`'s `scroll_button(5=down,4=up, dy)`/`(7=right,6=left, dx)`), so the
-                // same negation applies here: `wheel1 = -dy`, `wheel2 = -dx`.
+                // WebKit's macOS WebDriver conversion negates standard down/right deltas for
+                // CGEvent, so glass maps `wheel1 = -dy` and `wheel2 = -dx`.
                 let ev = CGEvent::new_scroll_wheel_event2(
                     self.source,
                     CGScrollEventUnit::Line,

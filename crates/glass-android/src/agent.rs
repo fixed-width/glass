@@ -566,8 +566,7 @@ mod tests {
         (port, requests, connections)
     }
 
-    /// Read one request on conn1 and lose only its answer. If the client reconnects, conn2 answers
-    /// the replay so the caller cannot hang and the request log proves the duplicate dispatch.
+    /// Lose conn1's answer and record any replay accepted on conn2.
     fn agent_that_loses_one_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
         use std::io::{BufRead, BufReader};
 
@@ -624,8 +623,7 @@ mod tests {
         (port, requests, join)
     }
 
-    /// Conn1 receives only a request prefix before the client retires it. Conn2 answers one later,
-    /// distinct request so a replay of the first mutation is observable.
+    /// Record conn1's partial request and answer the next distinct request on conn2.
     fn agent_after_partial_request() -> (u16, std::thread::JoinHandle<(Vec<u8>, Value)>) {
         use std::io::{BufRead, BufReader, Read};
 
@@ -661,9 +659,7 @@ mod tests {
         (port, join)
     }
 
-    /// Start conn1's answer, let its caller time out, then finish that stale answer after the next
-    /// request could have started. A safe client retires conn1 and sends only the distinct second
-    /// mutation on conn2.
+    /// Finish conn1's partial answer after timeout and record the distinct conn2 mutation.
     fn agent_with_late_partial_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
         use std::io::{BufRead, BufReader};
 
@@ -705,10 +701,7 @@ mod tests {
         (port, requests, join)
     }
 
-    /// Answer conn1's first mutation with a stale ID, then queue the answer that actually belongs
-    /// to it. Reusing conn1 makes the next mutation consume that queued answer and leaves the
-    /// request/response stream one exchange behind; retiring conn1 sends the distinct mutation on
-    /// conn2 instead.
+    /// Queue a wrong-id and then correct conn1 answer to expose reuse one exchange behind.
     fn agent_with_stale_wrong_id_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
         use std::io::{BufRead, BufReader};
 
@@ -764,9 +757,7 @@ mod tests {
         (port, requests, join)
     }
 
-    /// Answer conn1's first mutation with malformed JSON, then queue the valid answer that belongs
-    /// to it. Reusing conn1 lets that queued line answer or desynchronize the next mutation; retiring
-    /// conn1 sends only the distinct mutation on conn2.
+    /// Queue malformed and then valid conn1 answers to expose desynchronized reuse.
     fn agent_with_malformed_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
         use std::io::{BufRead, BufReader};
 
@@ -821,8 +812,7 @@ mod tests {
         (port, requests, join)
     }
 
-    /// Refuse conn1's first request with a matching ID, then answer the distinct second request.
-    /// A synchronized refusal leaves conn1 reusable; poisoning it moves that second request to conn2.
+    /// Refuse conn1 with a matching id, then record whether the next request reuses it.
     fn agent_with_reusable_refusal() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
         use std::io::{BufRead, BufReader};
 

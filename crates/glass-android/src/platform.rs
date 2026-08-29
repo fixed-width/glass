@@ -152,9 +152,7 @@ impl AndroidPlatform {
         }
     }
 
-    /// Re-read the active window's current on-screen frame before capturing — a rotation or layout
-    /// change can move/resize it since it was cached. Best-effort: keeps the cached geometry if the
-    /// window isn't currently listed (mirrors `app_pids`' live re-scan).
+    /// Refresh active-window geometry before capture, retaining the cache if the window is absent.
     fn refresh_window_until(&mut self, deadline: Deadline) -> Result<WindowGeometry> {
         let (package, active_id) = {
             let app = self.running()?;
