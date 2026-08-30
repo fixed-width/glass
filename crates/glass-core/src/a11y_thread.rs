@@ -185,16 +185,10 @@ impl A11yThread {
         A11yThread { backend, ceiling }
     }
 
-    /// How long a call may block, and which bound ends it — one comparison, made before the wait
-    /// (glass#341, glass#432).
-    ///
-    /// One clock read, so the ceiling branch is exactly `ceiling` rather than `ceiling` minus
-    /// whatever fell between two reads. It trades the other way by the same nanoseconds on the
-    /// caller branch, where the wait now expires a read after the deadline instead of before.
-    fn bounded_wait(&self, deadline: Deadline) -> (Duration, Whose) {
+    /// Resolve the absolute end and owner from one clock read (glass#341, glass#432).
+    fn bounded_wait(&self, deadline: Deadline) -> (Instant, Whose) {
         let now = Instant::now();
-        let (ends, whose) = deadline.resolve(now + self.ceiling);
-        (ends.saturating_duration_since(now), whose)
+        deadline.resolve(now + self.ceiling)
     }
 
     /// Read the tree, bounded by whichever of the caller's deadline and the ceiling falls first.
@@ -211,10 +205,10 @@ impl A11yThread {
                 "native accessibility snapshot",
             ));
         }
-        let (wait, ended_by) = self.bounded_wait(deadline);
+        let (ends, ended_by) = self.bounded_wait(deadline);
         self.detached(
             Op::Snapshot,
-            wait,
+            ends,
             job,
             || self.never_answered(ended_by),
             || self.worker_panicked(Op::Snapshot),
@@ -234,14 +228,14 @@ impl A11yThread {
                 "native accessibility set_value",
             ));
         }
-        let (wait, ended_by) = self.bounded_wait(deadline);
+        let (ends, ended_by) = self.bounded_wait(deadline);
         let dispatch = A11yMutationDispatch::new("set_value");
         let worker_dispatch = dispatch.duplicate();
         let timeout_dispatch = dispatch.duplicate();
         let panic_dispatch = dispatch.duplicate();
         let result = self.detached(
             Op::SetValue,
-            wait,
+            ends,
             move || run_mutation_job(worker_dispatch, job),
             || self.set_value_no_answer(target, ended_by, &timeout_dispatch),
             || self.set_value_panicked(target, &panic_dispatch),
@@ -271,14 +265,14 @@ impl A11yThread {
                 "native accessibility invoke",
             ));
         }
-        let (wait, ended_by) = self.bounded_wait(deadline);
+        let (ends, ended_by) = self.bounded_wait(deadline);
         let dispatch = A11yMutationDispatch::new("invoke");
         let worker_dispatch = dispatch.duplicate();
         let timeout_dispatch = dispatch.duplicate();
         let panic_dispatch = dispatch.duplicate();
         let result = self.detached(
             Op::Invoke,
-            wait,
+            ends,
             move || run_mutation_job(worker_dispatch, job),
             || self.invoke_no_answer(ended_by, &timeout_dispatch),
             || self.invoke_panicked(&panic_dispatch),
@@ -426,7 +420,7 @@ impl A11yThread {
     fn detached<T: Send + 'static>(
         &self,
         _op: Op,
-        wait: Duration,
+        ends: Instant,
         job: impl FnOnce() -> Result<T> + Send + 'static,
         on_timeout: impl FnOnce() -> GlassError,
         on_disconnect: impl FnOnce() -> GlassError,
@@ -441,13 +435,35 @@ impl A11yThread {
                 let _ = tx.send(job());
             })
             .map_err(|error| self.worker_spawn_failed(error))?;
-        match rx.recv_timeout(wait) {
-            Ok(r) => r,
-            Err(RecvTimeoutError::Timeout) => Err(on_timeout()),
-            // The sender drops unsent only when the worker unwinds, so this is a panic, not a
-            // slow answer — a timeout would claim the backend is alive and still working.
-            Err(RecvTimeoutError::Disconnected) => Err(on_disconnect()),
-        }
+        receive_by(rx, ends, on_timeout, on_disconnect)
+    }
+}
+
+fn receive_by<T>(
+    rx: mpsc::Receiver<Result<T>>,
+    ends: Instant,
+    on_timeout: impl FnOnce() -> GlassError,
+    on_disconnect: impl FnOnce() -> GlassError,
+) -> Result<T> {
+    receive_by_with_clock(rx, ends, Instant::now, on_timeout, on_disconnect)
+}
+
+fn receive_by_with_clock<T>(
+    rx: mpsc::Receiver<Result<T>>,
+    ends: Instant,
+    mut now: impl FnMut() -> Instant,
+    on_timeout: impl FnOnce() -> GlassError,
+    on_disconnect: impl FnOnce() -> GlassError,
+) -> Result<T> {
+    let remaining = ends.saturating_duration_since(now());
+    if remaining.is_zero() {
+        return Err(on_timeout());
+    }
+    match rx.recv_timeout(remaining) {
+        Ok(result) if now() < ends => result,
+        Ok(_) | Err(RecvTimeoutError::Timeout) => Err(on_timeout()),
+        // A disconnected sender means the worker unwound before sending, not that it ran slowly.
+        Err(RecvTimeoutError::Disconnected) => Err(on_disconnect()),
     }
 }
 
@@ -502,23 +518,25 @@ mod tests {
     /// detached, so nothing outside it can shorten one that has started.
     #[test]
     fn a_read_is_bounded_by_the_caller_when_that_falls_first() {
-        let (wait, ended_by) = reader().bounded_wait(Deadline::from_millis(50));
+        let (ends, ended_by) = reader().bounded_wait(Deadline::from_millis(50));
+        let wait = ends.saturating_duration_since(Instant::now());
         assert!(wait <= Duration::from_millis(50), "{wait:?}");
         assert_eq!(ended_by, Whose::Caller);
 
         // And the whole bound, not zero: a Caller branch that waits for nothing spawns a worker,
         // then reports every read in the window as the caller running out of time.
-        let (wait, _) = reader().bounded_wait(Deadline::from_millis(5_000));
+        let (ends, _) = reader().bounded_wait(Deadline::from_millis(5_000));
+        let wait = ends.saturating_duration_since(Instant::now());
         assert!(wait > Duration::from_secs(4), "{wait:?}");
     }
 
     /// The other direction: without it the test above passes on a reader that waits for nothing.
     #[test]
     fn a_caller_that_names_no_deadline_leaves_the_read_its_own_ceiling() {
-        let (wait, ended_by) = reader().bounded_wait(Deadline::UNBOUNDED);
-        // Exactly `CEILING`: the two-read shape this replaced came up short by whatever fell
-        // between the reads.
-        assert_eq!(wait, CEILING, "{wait:?}");
+        let before = Instant::now() + CEILING;
+        let (ends, ended_by) = reader().bounded_wait(Deadline::UNBOUNDED);
+        let after = Instant::now() + CEILING;
+        assert!((before..=after).contains(&ends), "{ends:?}");
         assert_eq!(ended_by, Whose::Callee);
     }
 
@@ -576,6 +594,50 @@ mod tests {
     #[test]
     fn an_answer_within_the_bound_is_returned() {
         assert_eq!(reader().snapshot(Deadline::UNBOUNDED, || Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn an_answer_already_queued_after_the_absolute_bound_is_still_a_timeout() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(7)).unwrap();
+        let ended = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+
+        let result = receive_by(
+            rx,
+            ended,
+            || GlassError::Backend("absolute bound won".into()),
+            || GlassError::Backend("worker disconnected".into()),
+        );
+
+        assert!(
+            matches!(result, Err(GlassError::Backend(ref message)) if message == "absolute bound won"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn an_answer_dequeued_at_or_after_the_absolute_bound_is_still_a_timeout() {
+        let ends = Instant::now() + Duration::from_secs(1);
+        for observed in [ends, ends + Duration::from_millis(1)] {
+            let (tx, rx) = mpsc::channel();
+            tx.send(Ok(7)).unwrap();
+            let mut readings = [ends - Duration::from_millis(1), observed].into_iter();
+
+            let result = receive_by_with_clock(
+                rx,
+                ends,
+                || readings.next().unwrap(),
+                || GlassError::Backend("absolute bound won".into()),
+                || GlassError::Backend("worker disconnected".into()),
+            );
+
+            assert!(
+                matches!(result, Err(GlassError::Backend(ref message)) if message == "absolute bound won"),
+                "{observed:?}: {result:?}"
+            );
+        }
     }
 
     #[test]
