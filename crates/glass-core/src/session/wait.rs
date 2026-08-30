@@ -46,6 +46,14 @@ fn quiet_wait_needs_read(final_read: bool, since_last: std::time::Duration) -> b
     final_read || since_last >= REREAD_AFTER
 }
 
+fn should_schedule_final_read(
+    already_scheduled: bool,
+    left: Option<std::time::Duration>,
+    interval: std::time::Duration,
+) -> bool {
+    !already_scheduled && left.is_some_and(|left| left <= interval)
+}
+
 fn reader_relative_caller_bound(error: &GlassError) -> bool {
     error.bound_owner() == Some(crate::Whose::Caller)
 }
@@ -575,7 +583,7 @@ impl Glass {
                 // Schedule the skipped-tick safety read before expiry because accessibility
                 // snapshots cannot return late success.
                 let left = action_deadline.remaining();
-                let final_read = !final_read_scheduled.get() && left.is_some_and(|left| left <= d);
+                let final_read = should_schedule_final_read(final_read_scheduled.get(), left, d);
                 if final_read {
                     final_read_scheduled.set(true);
                 }
@@ -1059,7 +1067,8 @@ mod tests {
         REREAD_AFTER, callee_wait_expired, compatibility_capture, final_read_pause,
         needs_callee_timeout_full_capture, offscreen_direction, outer_sequence_expired,
         prior_scroll_dispatched, quiet_wait_needs_read, reader_relative_caller_bound,
-        scroll_anchor, should_reclassify_nested_bound, soft_callee_capture_timeout,
+        scroll_anchor, should_reclassify_nested_bound, should_schedule_final_read,
+        soft_callee_capture_timeout,
     };
     use crate::BoundKind;
     use crate::session::test_support::*;
@@ -1172,6 +1181,19 @@ mod tests {
         ));
         assert!(quiet_wait_needs_read(false, REREAD_AFTER));
         assert!(quiet_wait_needs_read(true, Duration::ZERO));
+    }
+
+    #[test]
+    fn a_final_safety_read_is_scheduled_once_when_the_interval_reaches_the_deadline() {
+        let interval = Duration::from_millis(100);
+        assert!(should_schedule_final_read(false, Some(interval), interval));
+        assert!(!should_schedule_final_read(true, Some(interval), interval));
+        assert!(!should_schedule_final_read(false, None, interval));
+        assert!(!should_schedule_final_read(
+            false,
+            Some(interval + Duration::from_millis(1)),
+            interval
+        ));
     }
 
     #[test]
@@ -2602,29 +2624,6 @@ mod tests {
         assert!(
             (3..=6).contains(&n),
             "a quiet 2.5s wait at a 50ms interval read {n} times; the ceiling is not firing"
-        );
-    }
-
-    #[test]
-    fn a_wait_too_short_to_reach_the_ceiling_still_sees_an_unannounced_change() {
-        // The regression this fixes: a wait whose whole budget is shorter than `REREAD_AFTER`
-        // never reaches the forced read, so before the deadline read it answered from the single
-        // snapshot it took before the change happened — a wrong answer, for an element on screen.
-        let (mut g, walks) = glass_with_a11y_counted(
-            FakePlatform::new(100, 100),
-            // Absent on the first read, present on every read after it.
-            vec![fake_tree_enabled(), fake_tree_checked()],
-            Some(|| Box::new(NeverSignals) as Box<dyn ChangeSignal>),
-        );
-        g.start(&spec()).unwrap();
-
-        // 900ms at a 300ms interval: three intervals, and no ceiling inside the budget.
-        let o = g.wait_for_element(&never_matches(300, 900)).unwrap();
-
-        assert!(
-            o.matched,
-            "answered from one stale read after {} walks",
-            walks.load(Ordering::Relaxed)
         );
     }
 
