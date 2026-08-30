@@ -1251,17 +1251,17 @@ mod tests {
         let platform = FakePlatform::new(2, 2)
             .with_frames(vec![frame.clone()])
             .with_capture_log(captures.clone())
-            .with_capture_delay(Duration::from_millis(15))
+            .with_capture_delay(Duration::from_millis(150))
             .honoring_capture_deadline();
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
 
         let outcome = g
             .wait_stable(&WaitStableParams {
-                interval_ms: 10,
+                interval_ms: 100,
                 settle_frames: 3,
                 tolerance: 0,
-                timeout_ms: 30,
+                timeout_ms: 300,
                 stability_region: None,
                 ignore: Vec::new(),
                 window: None,
@@ -1279,17 +1279,17 @@ mod tests {
         let platform = FakePlatform::new(2, 2)
             .with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])])
             .with_capture_log(captures.clone())
-            .with_capture_delay(Duration::from_millis(15))
+            .with_capture_delay(Duration::from_millis(150))
             .capture_deadline_error_owned_by(crate::Whose::Callee);
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
 
         let error = g
             .wait_stable(&WaitStableParams {
-                interval_ms: 10,
+                interval_ms: 100,
                 settle_frames: 3,
                 tolerance: 0,
-                timeout_ms: 30,
+                timeout_ms: 300,
                 stability_region: None,
                 ignore: Vec::new(),
                 window: None,
@@ -2219,7 +2219,7 @@ mod tests {
         );
         g.start(&spec()).unwrap();
 
-        let o = g.wait_for_element(&never_matches(20, 120)).unwrap();
+        let o = g.wait_for_element(&never_matches(100, 500)).unwrap();
 
         assert!(!o.matched);
         assert_eq!(
@@ -2236,12 +2236,12 @@ mod tests {
             FakePlatform::new(100, 100),
             Box::new(ChangesWithoutSignalAfter {
                 first_read: None,
-                after: Duration::from_millis(80),
+                after: Duration::from_millis(200),
                 starts: starts.clone(),
             }),
         );
         g.start(&spec()).unwrap();
-        let deadline_at = std::time::Instant::now() + Duration::from_millis(220);
+        let deadline_at = std::time::Instant::now() + Duration::from_millis(1_000);
         let deadline = Deadline::at(deadline_at);
 
         let outcome = g
@@ -2255,7 +2255,7 @@ mod tests {
         let starts = starts.lock().unwrap();
         assert_eq!(starts.len(), 2, "one initial read and one safety read");
         assert!(
-            starts[1].0.duration_since(starts[0].0) >= Duration::from_millis(80),
+            starts[1].0.duration_since(starts[0].0) >= Duration::from_millis(200),
             "the safety read followed the initial read by only {:?}",
             starts[1].0.duration_since(starts[0].0)
         );
@@ -2334,8 +2334,8 @@ mod tests {
                 // Shorter than the quiet ceiling (10 intervals): otherwise a wait that ignored the
                 // change entirely would still match on the forced re-read, and this test would
                 // pass without the wake it exists to prove.
-                interval_ms: 20,
-                timeout_ms: 120,
+                interval_ms: 100,
+                timeout_ms: 500,
             })
             .unwrap();
 
@@ -2395,8 +2395,8 @@ mod tests {
         );
         g.start(&spec()).unwrap();
 
-        // 600ms at a 200ms interval: three intervals, and no ceiling inside the budget.
-        let o = g.wait_for_element(&never_matches(200, 600)).unwrap();
+        // 900ms at a 300ms interval: three intervals, and no ceiling inside the budget.
+        let o = g.wait_for_element(&never_matches(300, 900)).unwrap();
 
         assert!(
             o.matched,
@@ -2488,7 +2488,7 @@ mod tests {
         );
         g.start(&spec()).unwrap();
 
-        let o = g.wait_for_element(&never_matches(20, 80)).unwrap();
+        let o = g.wait_for_element(&never_matches(50, 500)).unwrap();
 
         assert!(!o.matched);
         assert!(

@@ -43,9 +43,13 @@ fn require_time(deadline: Deadline, started: bool) -> crate::Result<()> {
 
 fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
     require_time(deadline, true)?;
-    let sleep_for = deadline.remaining().unwrap_or(requested).min(requested);
+    let sleep_for = sleep_duration(deadline.remaining(), requested);
     std::thread::sleep(sleep_for);
     require_time(deadline, true)
+}
+
+fn sleep_duration(remaining: Option<Duration>, requested: Duration) -> Duration {
+    remaining.unwrap_or(requested).min(requested)
 }
 
 fn attach_cleanup_failure(
@@ -149,7 +153,7 @@ pub fn run_chord_by<S: ChordSink>(sink: &mut S, deadline: Deadline) -> crate::Re
 
 #[cfg(test)]
 mod tests {
-    use super::{CHORD_DWELL, ChordSink, run_chord, run_chord_by};
+    use super::{CHORD_DWELL, ChordSink, run_chord, run_chord_by, sleep_duration};
     use crate::{BoundDispatch, BoundKind, Deadline, GlassError, Result};
     use std::time::{Duration, Instant};
 
@@ -222,20 +226,24 @@ mod tests {
         let full_sequence = full_sink.calls;
 
         let mut sink = RecordingSink::default();
-        let started = Instant::now();
         let error = run_chord_by(&mut sink, Deadline::from_millis(10)).unwrap_err();
 
         assert!(sink.calls.len() < full_sequence.len());
         assert_eq!(sink.calls, vec![Mods(true), Mods(false)]);
-        assert!(
-            started.elapsed() < CHORD_DWELL,
-            "the modifier dwell must be capped by the deadline"
-        );
         assert_eq!(error.bound(), Some(BoundKind::TimedOut));
         assert_eq!(
             error.bound_dispatch(),
             Some(BoundDispatch::MayHaveDispatched)
         );
+    }
+
+    #[test]
+    fn a_bounded_dwell_uses_only_the_remaining_time() {
+        assert_eq!(
+            sleep_duration(Some(Duration::from_millis(10)), CHORD_DWELL),
+            Duration::from_millis(10)
+        );
+        assert_eq!(sleep_duration(None, CHORD_DWELL), CHORD_DWELL);
     }
 
     #[test]

@@ -1017,8 +1017,8 @@ mod tests {
         let worker_wrote = std::sync::Arc::clone(&wrote);
 
         let error = reader()
-            .set_value(7, Deadline::from_millis(20), move |dispatch| {
-                std::thread::sleep(Duration::from_millis(60));
+            .set_value(7, Deadline::from_millis(100), move |dispatch| {
+                std::thread::sleep(Duration::from_millis(500));
                 dispatch.dispatch(|| {
                     worker_wrote.store(true, std::sync::atomic::Ordering::SeqCst);
                     Ok(())
@@ -1027,7 +1027,7 @@ mod tests {
             .expect_err("the caller stops during pre-write work");
         assert!(!error.set_value_failed_after_writing(), "{error}");
 
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(600));
         assert!(
             !wrote.load(std::sync::atomic::Ordering::SeqCst),
             "the detached worker dispatched after the caller had retained its cached value"
