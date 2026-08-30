@@ -1505,7 +1505,7 @@ impl Platform for X11Platform {
                         return Err(GlassError::caller_deadline_elapsed("pointer input"));
                     }
                     let kcs = self.press_mods(modifiers)?;
-                    if !kcs.is_empty() {
+                    if modifier_keycodes_dispatched(&kcs) {
                         dispatch.mark();
                     }
                     let b = button_number(button);
