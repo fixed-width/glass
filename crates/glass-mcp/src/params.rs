@@ -133,8 +133,8 @@ pub struct ClickElementArgs {
     /// Element `#id` from the latest `glass_a11y_snapshot`.
     /// Re-snapshot after UI changes.
     /// Popover-owned targets route to their window and restore the prior active window.
-    /// Native accessibility handles occluded or off-screen targets and separate labels through
-    /// their enclosing control.
+    /// The role-appropriate native accessibility operation handles occluded or off-screen targets
+    /// and separate labels through their enclosing control.
     /// Unavailable native operations fall back to a pointer click at the target center.
     /// Text editors may receive focus without activation.
     /// `method:"native-action"` labels any native path.
@@ -248,12 +248,12 @@ pub struct ScrollArgs {
     pub x: i32,
     /// Pointer y the wheel is aimed at, window-relative. See `x`.
     pub y: i32,
-    /// Horizontal wheel notches, not pixels.
+    /// Horizontal wheel notches from -100 through 100, not pixels.
     /// Positive is right and negative is left, repeated `|dx|` times.
     /// Typical values are 1–5.
     #[schemars(range(min = -100, max = 100))]
     pub dx: Option<i32>,
-    /// Vertical wheel notches, not pixels.
+    /// Vertical wheel notches from -100 through 100, not pixels.
     /// Positive is down and negative is up, repeated `|dy|` times.
     /// Typical values are 1–5.
     /// Apps choose how a notch maps to lines, pixels, or zoom.
@@ -532,8 +532,8 @@ pub struct SettleArgs {
     /// unchanged (default 0, exact match).
     pub tolerance: Option<u8>,
     /// Give up after this long (default 5000ms).
-    /// This settle's timeout returns `settled:false`.
-    /// The enclosing `glass_do` deadline fails the sequence.
+    /// This settle's timeout returns settled:false and completes the step.
+    /// The enclosing glass_do deadline fails the sequence.
     pub timeout_ms: Option<u64>,
     /// Window-relative sub-rectangle to watch for settling; when set, changes outside
     /// it are ignored.
