@@ -3151,6 +3151,7 @@ mod tests {
     enum SnapshotReply {
         Tree(AxTree),
         NotStarted(&'static str),
+        TimedOut(&'static str),
         SleepPastDeadline(AxTree),
     }
 
@@ -3277,6 +3278,9 @@ mod tests {
                 SnapshotReply::Tree(tree) => Ok(tree),
                 SnapshotReply::NotStarted(operation) => {
                     Err(GlassError::deadline_not_started(operation))
+                }
+                SnapshotReply::TimedOut(operation) => {
+                    Err(GlassError::caller_deadline_elapsed(operation))
                 }
                 SnapshotReply::SleepPastDeadline(tree) => {
                     let left = ctx
@@ -3863,7 +3867,7 @@ mod tests {
     }
 
     #[test]
-    fn combo_deadline_expired_cleanup_retries_without_closing_open_popup() {
+    fn combo_timed_out_open_read_retries_without_closing_open_popup() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let keys = Arc::new(Mutex::new(Vec::new()));
         let platform = FakePlatform::new(340, 300)
@@ -3873,10 +3877,7 @@ mod tests {
             platform,
             vec![
                 SnapshotReply::Tree(combo("Beta", &[])),
-                SnapshotReply::SleepPastDeadline(combo(
-                    "Beta",
-                    &["Alpha", "Beta", "Gamma", "Delta"],
-                )),
+                SnapshotReply::TimedOut("scripted combo open read"),
                 SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
             ],
         );
@@ -3884,8 +3885,8 @@ mod tests {
         g.a11y_snapshot(None).unwrap();
 
         let first = g
-            .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(400))
-            .expect_err("the deadline expires before unknown-option cleanup");
+            .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
+            .expect_err("the combo open read times out before unknown-option cleanup");
         assert_eq!(first.bound(), Some(crate::BoundKind::TimedOut));
         assert_eq!(first.bound_owner(), Some(crate::Whose::Caller));
         assert_eq!(
@@ -3893,11 +3894,14 @@ mod tests {
             Some(crate::BoundDispatch::MayHaveDispatched)
         );
         assert_eq!(clicks.lock().unwrap().len(), 1);
-        assert!(keys.lock().unwrap().is_empty(), "late Escape is skipped");
+        assert!(
+            keys.lock().unwrap().is_empty(),
+            "Escape is skipped after the timed-out read"
+        );
 
         let stale_retry = g
             .set_value_by(AxNodeId(1), "Omega", Deadline::from_millis(2_000))
-            .expect_err("a rejected late tree cannot support a retry");
+            .expect_err("a timed-out read cannot support a retry");
         assert!(matches!(stale_retry, GlassError::NoAxSnapshot));
         assert_eq!(clicks.lock().unwrap().len(), 1);
         assert!(keys.lock().unwrap().is_empty());
@@ -4999,7 +5003,7 @@ mod tests {
             vec![
                 SnapshotReply::Tree(sw(false)),
                 SnapshotReply::Tree(sw(false)),
-                SnapshotReply::SleepPastDeadline(sw(false)),
+                SnapshotReply::TimedOut("scripted toggle verification read"),
                 SnapshotReply::Tree(sw(true)),
             ],
         );
@@ -5463,7 +5467,7 @@ mod tests {
             vec![
                 SnapshotReply::Tree(sw(false)),
                 SnapshotReply::Tree(sw(false)),
-                SnapshotReply::SleepPastDeadline(sw(false)),
+                SnapshotReply::TimedOut("scripted toggle verification read"),
                 SnapshotReply::Tree(sw(true)),
             ],
         );
