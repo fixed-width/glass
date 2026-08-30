@@ -10,13 +10,57 @@ const REREAD_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 /// remaining budget.
 const FINAL_READ_HEADROOM: std::time::Duration = std::time::Duration::from_millis(20);
 
+fn should_reclassify_nested_bound(effective_owner: crate::Whose, sequence_expired: bool) -> bool {
+    effective_owner == crate::Whose::Callee && !sequence_expired
+}
+
+fn callee_wait_expired(looked: bool, owner: crate::Whose, expired: bool) -> bool {
+    looked && owner == crate::Whose::Callee && expired
+}
+
+fn compatibility_capture(looked: bool, timeout_ms: u64) -> bool {
+    !looked && timeout_ms == 0
+}
+
+fn soft_callee_capture_timeout(
+    has_tracker: bool,
+    owner: crate::Whose,
+    deadline_expired: bool,
+    error_owner: Option<crate::Whose>,
+) -> bool {
+    has_tracker
+        && owner == crate::Whose::Callee
+        && deadline_expired
+        && error_owner == Some(crate::Whose::Caller)
+}
+
+fn needs_callee_timeout_full_capture(no_value: bool, owner: crate::Whose) -> bool {
+    no_value && owner == crate::Whose::Callee
+}
+
+fn final_read_pause(left: std::time::Duration) -> std::time::Duration {
+    left.saturating_sub(FINAL_READ_HEADROOM.min(left / 4))
+}
+
+fn reader_relative_caller_bound(error: &GlassError) -> bool {
+    error.bound_owner() == Some(crate::Whose::Caller)
+}
+
+fn outer_sequence_expired(owner: crate::Whose, expired: bool) -> bool {
+    owner == crate::Whose::Caller && expired
+}
+
+fn prior_scroll_dispatched(steps: u32) -> bool {
+    steps > 0
+}
+
 /// Reclassify a reader-relative caller bound without overriding an expired outer sequence.
 fn resolve_nested_accessibility_bound(
     error: GlassError,
     effective_owner: crate::Whose,
     sequence_deadline: Deadline,
 ) -> GlassError {
-    if effective_owner == crate::Whose::Callee && !sequence_deadline.has_passed() {
+    if should_reclassify_nested_bound(effective_owner, sequence_deadline.has_passed()) {
         match error {
             GlassError::Bounded {
                 kind,
@@ -403,11 +447,11 @@ impl Glass {
                 true
             },
             || {
-                if looked && whose == crate::Whose::Callee && deadline.has_passed() {
+                if callee_wait_expired(looked, whose, deadline.has_passed()) {
                     return Ok(None);
                 }
                 // Restrict polling to the watched region when present.
-                let compatibility_capture = !looked && params.timeout_ms == 0;
+                let compatibility_capture = compatibility_capture(looked, params.timeout_ms);
                 let capture_deadline = if compatibility_capture || whose == crate::Whose::Caller {
                     caller
                 } else {
@@ -417,10 +461,12 @@ impl Glass {
                 let frame = match self.capture_by(window, region.as_ref(), capture_deadline) {
                     Ok(frame) => frame,
                     Err(error)
-                        if tracker.is_some()
-                            && whose == crate::Whose::Callee
-                            && deadline.has_passed()
-                            && error.bound_owner() == Some(crate::Whose::Caller) =>
+                        if soft_callee_capture_timeout(
+                            tracker.is_some(),
+                            whose,
+                            deadline.has_passed(),
+                            error.bound_owner(),
+                        ) =>
                     {
                         return Ok(None);
                     }
@@ -449,7 +495,7 @@ impl Glass {
         // Return the full window: a fresh capture if we were polling a sub-region
         // (the genuinely-settled state), else the just-observed full frame.
         let frame = match region {
-            Some(_) if outcome.value.is_none() && whose == crate::Whose::Callee => {
+            Some(_) if needs_callee_timeout_full_capture(outcome.value.is_none(), whose) => {
                 self.capture_by(window, None, caller)?
             }
             Some(_) => self.capture_by(window, None, deadline)?,
@@ -532,7 +578,7 @@ impl Glass {
                 let paused_at = std::time::Instant::now();
                 let pause_budget = if final_read {
                     let left = left.expect("a final read is scheduled only for a bounded wait");
-                    left.saturating_sub(FINAL_READ_HEADROOM.min(left / 4))
+                    final_read_pause(left)
                 } else {
                     left.unwrap_or(d).min(d)
                 };
@@ -593,7 +639,7 @@ impl Glass {
                         return Ok(None);
                     }
                     // Resolve this reader-relative `Caller` against the enclosing wait below.
-                    Err(e) if e.bound_owner() == Some(crate::Whose::Caller) => {
+                    Err(e) if reader_relative_caller_bound(&e) => {
                         unread_owner = read_owner;
                         unread = Some(e);
                         return Ok(None);
@@ -628,7 +674,7 @@ impl Glass {
                     sequence_deadline,
                 ));
             }
-            if unread_owner == crate::Whose::Caller && sequence_deadline.has_passed() {
+            if outer_sequence_expired(unread_owner, sequence_deadline.has_passed()) {
                 return Err(GlassError::caller_deadline_elapsed_with_guidance(
                     "accessibility wait",
                     &e.to_string(),
@@ -795,7 +841,7 @@ impl Glass {
                     },
                     action_deadline,
                 );
-                if steps > 0 {
+                if prior_scroll_dispatched(steps) {
                     scroll.map_err(after_scroll_dispatch)?;
                 } else {
                     scroll?;
@@ -1005,9 +1051,114 @@ impl Glass {
 
 #[cfg(test)]
 mod tests {
-    use super::{offscreen_direction, scroll_anchor};
+    use super::{
+        callee_wait_expired, compatibility_capture, final_read_pause,
+        needs_callee_timeout_full_capture, offscreen_direction, outer_sequence_expired,
+        prior_scroll_dispatched, reader_relative_caller_bound, scroll_anchor,
+        should_reclassify_nested_bound, soft_callee_capture_timeout,
+    };
     use crate::BoundKind;
     use crate::session::test_support::*;
+
+    #[test]
+    fn wait_deadline_helpers_require_every_provenance_clause() {
+        assert!(should_reclassify_nested_bound(crate::Whose::Callee, false));
+        assert!(!should_reclassify_nested_bound(crate::Whose::Caller, false));
+        assert!(!should_reclassify_nested_bound(crate::Whose::Callee, true));
+
+        assert!(callee_wait_expired(true, crate::Whose::Callee, true));
+        assert!(!callee_wait_expired(false, crate::Whose::Callee, true));
+        assert!(!callee_wait_expired(true, crate::Whose::Caller, true));
+        assert!(!callee_wait_expired(true, crate::Whose::Callee, false));
+
+        assert!(compatibility_capture(false, 0));
+        assert!(!compatibility_capture(true, 0));
+        assert!(!compatibility_capture(false, 1));
+
+        assert!(soft_callee_capture_timeout(
+            true,
+            crate::Whose::Callee,
+            true,
+            Some(crate::Whose::Caller)
+        ));
+        for candidate in [
+            soft_callee_capture_timeout(
+                false,
+                crate::Whose::Callee,
+                true,
+                Some(crate::Whose::Caller),
+            ),
+            soft_callee_capture_timeout(
+                true,
+                crate::Whose::Caller,
+                true,
+                Some(crate::Whose::Caller),
+            ),
+            soft_callee_capture_timeout(
+                true,
+                crate::Whose::Callee,
+                false,
+                Some(crate::Whose::Caller),
+            ),
+            soft_callee_capture_timeout(
+                true,
+                crate::Whose::Callee,
+                true,
+                Some(crate::Whose::Callee),
+            ),
+        ] {
+            assert!(!candidate);
+        }
+
+        assert!(needs_callee_timeout_full_capture(
+            true,
+            crate::Whose::Callee
+        ));
+        assert!(!needs_callee_timeout_full_capture(
+            false,
+            crate::Whose::Callee
+        ));
+        assert!(!needs_callee_timeout_full_capture(
+            true,
+            crate::Whose::Caller
+        ));
+
+        assert!(reader_relative_caller_bound(
+            &GlassError::caller_deadline_elapsed("reader")
+        ));
+        assert!(!reader_relative_caller_bound(&GlassError::Bounded {
+            kind: crate::BoundKind::TimedOut,
+            whose: crate::Whose::Callee,
+            dispatch: crate::BoundDispatch::MayHaveDispatched,
+            message: "reader ceiling".into(),
+        }));
+        assert!(!reader_relative_caller_bound(&GlassError::Backend(
+            "reader failed".into()
+        )));
+
+        assert!(outer_sequence_expired(crate::Whose::Caller, true));
+        assert!(!outer_sequence_expired(crate::Whose::Callee, true));
+        assert!(!outer_sequence_expired(crate::Whose::Caller, false));
+
+        assert!(!prior_scroll_dispatched(0));
+        assert!(prior_scroll_dispatched(1));
+    }
+
+    #[test]
+    fn final_read_pause_reserves_a_quarter_up_to_the_headroom_cap() {
+        assert_eq!(
+            final_read_pause(Duration::from_millis(80)),
+            Duration::from_millis(60)
+        );
+        assert_eq!(
+            final_read_pause(Duration::from_millis(40)),
+            Duration::from_millis(30)
+        );
+        assert_eq!(
+            final_read_pause(Duration::from_millis(4)),
+            Duration::from_millis(3)
+        );
+    }
 
     #[test]
     fn wait_stable_settles_on_repeated_frame() {
@@ -1217,6 +1368,78 @@ mod tests {
         let deadlines = deadlines.lock().unwrap();
         assert_eq!(deadlines.len(), 2);
         assert_eq!(deadlines[1], caller);
+    }
+
+    #[test]
+    fn settled_region_final_capture_keeps_the_action_deadline() {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let frame = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![frame])
+            .with_capture_deadline_log(deadlines.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1_000,
+                stability_region: Some(Region {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }),
+                ignore: Vec::new(),
+                window: None,
+            })
+            .unwrap();
+
+        assert!(outcome.settled);
+        let deadlines = deadlines.lock().unwrap();
+        assert!(deadlines.len() >= 3, "{deadlines:?}");
+        assert_ne!(
+            deadlines.last(),
+            Some(&Deadline::UNBOUNDED),
+            "the full-frame capture remains inside the settle action budget"
+        );
+    }
+
+    struct BackendOwnedReadFailure {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Accessibility for BackendOwnedReadFailure {
+        fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(GlassError::Bounded {
+                kind: crate::BoundKind::TimedOut,
+                whose: crate::Whose::Callee,
+                dispatch: crate::BoundDispatch::MayHaveDispatched,
+                message: "accessibility reader ceiling".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn backend_owned_reader_timeout_propagates_without_polling() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut g = glass_with_backend(
+            FakePlatform::new(100, 100),
+            Box::new(BackendOwnedReadFailure {
+                reads: reads.clone(),
+            }),
+        );
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_for_element(&never_matches(10, 1_000))
+            .expect_err("a backend ceiling is not a retryable reader-relative caller bound");
+
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Callee));
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
