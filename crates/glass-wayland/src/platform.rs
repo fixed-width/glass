@@ -162,6 +162,10 @@ fn input_settle_by(deadline: Deadline) -> Result<()> {
     Ok(())
 }
 
+fn recovery_needs_settle(recovered: usize) -> bool {
+    recovered > 0
+}
+
 struct ActiveSession {
     child: Child,
     /// sway's stdout/stderr readers, dropped when the session is torn down. Everything sway
@@ -1654,19 +1658,49 @@ fn record_release_failure(poison: &mut Option<String>, result: &Result<()>) {
     }
 }
 
+fn record_after_release(down: bool, poison: &mut Option<String>, result: &Result<()>) {
+    match down {
+        true => {}
+        false => record_release_failure(poison, result),
+    }
+}
+
 fn confirm_release_settled<T>(held: &mut Option<T>, settled: Result<()>) -> Result<()> {
     settled?;
     *held = None;
     Ok(())
 }
 
-fn require_healthy_input(s: &ActiveSession) -> Result<()> {
-    match &s.input_poison {
+fn settle_tap_state<T>(held: &mut Option<T>, state: u32, settled: Result<()>) -> Result<()> {
+    match state {
+        0 => confirm_release_settled(held, settled),
+        _ => settled,
+    }
+}
+
+fn tap_held_key(state: u32, keycode: u32) -> Option<u32> {
+    match state {
+        1 => Some(keycode),
+        _ => None,
+    }
+}
+
+fn require_healthy_input(input_poison: Option<&str>) -> Result<()> {
+    match input_poison {
         Some(cause) => Err(GlassError::Backend(format!(
             "input state is uncertain after a release cleanup failure ({cause}); restart the session"
         ))),
         None => Ok(()),
     }
+}
+
+fn keymap_wire_len(keymap: &str) -> Result<u32> {
+    let text_len = u32::try_from(keymap.len()).map_err(|_| {
+        GlassError::Backend("Wayland keymap exceeds the protocol size limit".into())
+    })?;
+    text_len
+        .checked_add(1)
+        .ok_or_else(|| GlassError::Backend("Wayland keymap exceeds the protocol size limit".into()))
 }
 
 fn sync_session_by(s: &mut ActiveSession, who: &str, deadline: Deadline) -> Result<()> {
@@ -1686,6 +1720,7 @@ fn upload_keymap_by(
     if deadline.has_passed() {
         return Err(GlassError::deadline_not_started("keymap upload"));
     }
+    let wire_len = keymap_wire_len(keymap)?;
     let mut f = tempfile::tempfile().map_err(GlassError::Io)?;
     f.write_all(keymap.as_bytes()).map_err(GlassError::Io)?;
     f.write_all(&[0]).map_err(GlassError::Io)?; // keymap string is NUL-terminated
@@ -1693,7 +1728,7 @@ fn upload_keymap_by(
     if deadline.has_passed() {
         return Err(GlassError::deadline_not_started("keymap upload"));
     }
-    kb.keymap(1, f.as_fd(), keymap.len() as u32 + 1);
+    kb.keymap(1, f.as_fd(), wire_len);
     dispatch.mark();
     sync_session_by(s, "keymap upload", deadline)?;
     input_settle_by(deadline)
@@ -1723,19 +1758,13 @@ fn tap_by(
         s.time = s.time.wrapping_add(1);
         kb.key(s.time, kc, state);
         dispatch.mark();
-        if state == 1 {
-            held.key = Some(kc);
-        }
+        held.key = tap_held_key(state, kc);
         if let Err(e) = sync_session_by(s, "key tap", deadline) {
             let cleanup = held.release(s);
             return finish_input_cleanup(&mut s.input_poison, Err(e), cleanup);
         }
         let settled = input_settle_by(deadline);
-        let settled = if state == 0 {
-            confirm_release_settled(&mut held.key, settled)
-        } else {
-            settled
-        };
+        let settled = settle_tap_state(&mut held.key, state, settled);
         if let Err(error) = settled {
             let cleanup = held.release(s);
             return finish_input_cleanup(&mut s.input_poison, Err(error), cleanup);
@@ -1886,9 +1915,7 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         self.dispatch.mark();
         self.held.button = down.then_some(self.b);
         let result = self.settle();
-        if !down {
-            record_release_failure(&mut self.s.input_poison, &result);
-        }
+        record_after_release(down, &mut self.s.input_poison, &result);
         result
     }
     fn modifiers(&mut self, down: bool) -> Result<()> {
@@ -1914,9 +1941,7 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         // Self-commit so the modifier change reaches the compositor before the
         // press/release that follows it (matches the X11 sink's flush-per-call).
         let result = self.settle();
-        if !down {
-            record_release_failure(&mut self.s.input_poison, &result);
-        }
+        record_after_release(down, &mut self.s.input_poison, &result);
         result
     }
 }
@@ -1950,6 +1975,10 @@ impl WaylandChordSink<'_> {
     }
 }
 
+fn chord_holds_modifiers(down: bool, mask: u32) -> bool {
+    down && mask != 0
+}
+
 impl glass_core::ChordSink for WaylandChordSink<'_> {
     fn modifiers(&mut self, down: bool) -> Result<()> {
         let kb = self.s.keyboard.clone();
@@ -1970,11 +1999,9 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
             kb.modifiers(0, 0, 0, 0);
             self.dispatch.mark();
         }
-        self.held.modifiers = down && self.mask != 0;
+        self.held.modifiers = chord_holds_modifiers(down, self.mask);
         let result = self.settle();
-        if !down {
-            record_release_failure(&mut self.s.input_poison, &result);
-        }
+        record_after_release(down, &mut self.s.input_poison, &result);
         result
     }
     fn key(&mut self, down: bool) -> Result<()> {
@@ -1985,9 +2012,7 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
         self.dispatch.mark();
         self.held.key = down.then_some(1);
         let result = self.settle();
-        if !down {
-            record_release_failure(&mut self.s.input_poison, &result);
-        }
+        record_after_release(down, &mut self.s.input_poison, &result);
         result
     }
 }
@@ -2062,9 +2087,7 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
         }
         self.held.modifiers = down;
         let result = self.settle();
-        if !down {
-            record_release_failure(&mut self.s.input_poison, &result);
-        }
+        record_after_release(down, &mut self.s.input_poison, &result);
         result
     }
     fn wheel(&mut self) -> Result<()> {
@@ -2287,7 +2310,7 @@ impl Platform for WaylandPlatform {
         glass_core::validate_pointer_input(event)?;
         run_wayland_call_by(deadline, "pointer input", |dispatch| {
             let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-            require_healthy_input(session)?;
+            require_healthy_input(session.input_poison.as_deref())?;
             session.time = session.time.wrapping_add(1);
             let t = session.time;
             // Pointer motion is absolute over the OUTPUT; map window-relative coords
@@ -2440,7 +2463,7 @@ impl Platform for WaylandPlatform {
         run_wayland_call_by(deadline, "key input", |dispatch| {
             use glass_core::keys::parse_chord;
             let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-            require_healthy_input(session)?;
+            require_healthy_input(session.input_poison.as_deref())?;
             let kb = session.keyboard.clone();
             match event {
                 KeyEvent::Text(text) => {
@@ -2538,11 +2561,11 @@ impl Platform for WaylandPlatform {
             sync_session_by(session, "window list", deadline)?;
             let mut wins: Vec<SwayWindow> = session.ipc.windows_by(deadline)?;
             // Enumeration exposes Xwayland views missing from sway, so repair them before return.
-            if session
-                .recovery
-                .recover_if_due_by(Instant::now(), &x11_ids(&wins), deadline)?
-                > 0
-            {
+            let recovered =
+                session
+                    .recovery
+                    .recover_if_due_by(Instant::now(), &x11_ids(&wins), deadline)?;
+            if recovery_needs_settle(recovered) {
                 let settle = deadline
                     .remaining()
                     .map(|left| left.min(crate::xwayland::REMAP_SETTLE))
@@ -2791,6 +2814,63 @@ mod pure_tests {
 
         confirm_release_settled(&mut held, Ok(())).unwrap();
         assert_eq!(held, None);
+    }
+
+    #[test]
+    fn input_deadline_and_health_checks_reject_unusable_input() {
+        let error = input_settle_by(Deadline::from_millis(0))
+            .expect_err("a spent input settle cannot succeed");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+
+        require_healthy_input(None).expect("unpoisoned input is healthy");
+        let error = require_healthy_input(Some("release flush failed"))
+            .expect_err("poisoned input must remain unusable");
+        assert!(error.to_string().contains("release flush failed"));
+    }
+
+    #[test]
+    fn keymap_and_release_helpers_preserve_protocol_boundaries() {
+        assert_eq!(keymap_wire_len("").unwrap(), 1);
+        assert_eq!(keymap_wire_len("abc").unwrap(), 4);
+        assert_eq!(tap_held_key(1, 272), Some(272));
+        assert_eq!(tap_held_key(0, 272), None);
+
+        let mut held = Some(272);
+        settle_tap_state(&mut held, 1, Ok(())).expect("press settle");
+        assert_eq!(held, Some(272), "a press remains held");
+        settle_tap_state(&mut held, 0, Ok(())).expect("release settle");
+        assert_eq!(held, None, "a settled release is no longer held");
+
+        let mut held = Some(272);
+        let error = settle_tap_state(
+            &mut held,
+            0,
+            Err(GlassError::Backend("release settle failed".into())),
+        )
+        .expect_err("a failed release settle must remain visible");
+        assert!(error.to_string().contains("release settle failed"));
+        assert_eq!(held, Some(272), "an unconfirmed release remains held");
+
+        let failed = Err(GlassError::Backend("release settle failed".into()));
+        let mut poison = None;
+        record_after_release(true, &mut poison, &failed);
+        assert_eq!(poison, None, "a failed press is cleaned up by its guard");
+        record_after_release(false, &mut poison, &failed);
+        assert_eq!(
+            poison.as_deref(),
+            Some("backend error: release settle failed")
+        );
+    }
+
+    #[test]
+    fn chord_and_recovery_predicates_distinguish_zero_boundaries() {
+        assert!(!chord_holds_modifiers(false, 0));
+        assert!(!chord_holds_modifiers(false, 4));
+        assert!(!chord_holds_modifiers(true, 0));
+        assert!(chord_holds_modifiers(true, 4));
+
+        assert!(!recovery_needs_settle(0));
+        assert!(recovery_needs_settle(1));
     }
 
     #[test]
@@ -5300,6 +5380,77 @@ mod session_tests {
         // `272 0` is BTN_LEFT released, so the wait is the assertion — a gesture that left the
         // button down never logs it, and the harness fails rather than hangs.
         s.wait_for_log(" 272 0");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn dropped_chord_and_scroll_sinks_release_everything_they_hold() {
+        use glass_core::{ChordSink as _, ScrollSink as _};
+
+        let mut s = Launch::new().start_mapped();
+        {
+            let session = s.platform().active.as_mut().expect("a started session");
+            let dispatch = WaylandDispatch::default();
+            let mut sink = WaylandChordSink {
+                s: session,
+                dispatch: &dispatch,
+                mask: modifier_mask(&[glass_core::keys::Modifier::Control]),
+                keysym: 'a' as u32,
+                held: Held::default(),
+                deadline: Deadline::UNBOUNDED,
+            };
+            sink.modifiers(true).expect("hold chord modifier");
+            sink.key(true).expect("hold chord key");
+        }
+        let chord = s.wait_for_log("input: mods 0");
+        assert!(
+            chord
+                .iter()
+                .any(|line| line.contains("input: key") && line.ends_with(" 0")),
+            "dropping the chord released its key: {chord:#?}"
+        );
+        s.platform().drain_logs();
+
+        {
+            let session = s.platform().active.as_mut().expect("a started session");
+            let dispatch = WaylandDispatch::default();
+            let (w, h) = session.output_size;
+            let (ox, oy) = (session.active_rect.x, session.active_rect.y);
+            let mut sink = WaylandScrollSink {
+                s: session,
+                dispatch: &dispatch,
+                w,
+                h,
+                ox,
+                oy,
+                x: 10,
+                y: 10,
+                dx: 0,
+                dy: -1,
+                mask: modifier_mask(&[glass_core::keys::Modifier::Control]),
+                held: Held::default(),
+                deadline: Deadline::UNBOUNDED,
+            };
+            sink.modifiers(true).expect("hold scroll modifier");
+        }
+        let scroll = s.wait_for_log("input: mods 0");
+        assert!(
+            scroll.iter().any(|line| line.ends_with("input: mods 4")),
+            "the scroll modifier was held before drop: {scroll:#?}"
+        );
+
+        let session = s.platform().active.as_mut().expect("a started session");
+        let dispatch = WaylandDispatch::default();
+        let mut sink = WaylandChordSink {
+            s: session,
+            dispatch: &dispatch,
+            mask: 0,
+            keysym: 'a' as u32,
+            held: Held::default(),
+            deadline: Deadline::from_millis(0),
+        };
+        sink.settle()
+            .expect_err("a chord settle must honor its caller deadline");
     }
 
     /// glass#402: waiting for the sync every request ends in was unbounded, so `glass_click` on a
