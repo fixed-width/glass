@@ -486,7 +486,7 @@ impl Glass {
                 }
                 // Restrict polling to the watched region when present.
                 let compatibility_capture = compatibility_capture(looked, params.timeout_ms);
-                let capture_deadline = if compatibility_capture || whose == crate::Whose::Caller {
+                let capture_deadline = if compatibility_capture {
                     caller
                 } else {
                     deadline
