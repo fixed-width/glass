@@ -45,6 +45,14 @@ const XT_BTN_RELEASE: u8 = 5; // ButtonRelease
 const XT_KEY_PRESS: u8 = 2; // KeyPress
 const XT_KEY_RELEASE: u8 = 3; // KeyRelease
 
+fn modifier_keycodes_dispatched(keycodes: &[u8]) -> bool {
+    !keycodes.is_empty()
+}
+
+fn legacy_window_selection(deadline: Deadline) -> bool {
+    deadline == Deadline::UNBOUNDED
+}
+
 #[derive(Default)]
 struct X11Dispatch {
     sent: Cell<bool>,
@@ -1218,7 +1226,7 @@ impl glass_core::DragSink for X11DragSink<'_> {
         } else {
             self.p.release_mods(&self.kcs)?;
         }
-        if !self.kcs.is_empty() {
+        if modifier_keycodes_dispatched(&self.kcs) {
             self.dispatch.mark();
         }
         self.p.commit()
@@ -1266,7 +1274,7 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
         } else {
             self.p.release_mods(&self.kcs)?;
         }
-        if !self.kcs.is_empty() {
+        if modifier_keycodes_dispatched(&self.kcs) {
             self.dispatch.mark();
         }
         self.p.commit()
@@ -1314,7 +1322,7 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
         } else {
             self.p.release_mods(&self.kcs)?;
         }
-        if !self.kcs.is_empty() {
+        if modifier_keycodes_dispatched(&self.kcs) {
             self.dispatch.mark();
         }
         self.p.commit()
@@ -1682,7 +1690,7 @@ impl Platform for X11Platform {
             let previous = platform.window;
             platform.window = Some(target);
             if let Err(error) = platform.focus_window(target) {
-                if deadline == Deadline::UNBOUNDED {
+                if legacy_window_selection(deadline) {
                     eprintln!(
                         "glass: focus-on-select failed (keys may not reach the window): {error}"
                     );
@@ -1694,7 +1702,7 @@ impl Platform for X11Platform {
             match platform.geometry_of(target) {
                 Ok(geometry) => Ok(geometry),
                 Err(error) => {
-                    if deadline != Deadline::UNBOUNDED {
+                    if !legacy_window_selection(deadline) {
                         platform.window = previous;
                         return Err(error.after_dispatch());
                     }
@@ -1817,13 +1825,39 @@ fn button_number(button: glass_core::MouseButton) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        hint_matches, run_clicks_by, run_scroll_buttons_by, run_x11_call_by, run_x11_type_by,
+        X11DeadlineWatch, X11Dispatch, hint_matches, legacy_window_selection,
+        modifier_keycodes_dispatched, run_clicks_by, run_scroll_buttons_by, run_x11_call_by,
+        run_x11_type_by,
     };
     use glass_core::{
         BoundDispatch, BoundKind, Deadline, GlassError, Result, TypeSink, Whose, WindowHint,
     };
     use std::cell::{Cell, RefCell};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn modifier_and_selection_helpers_distinguish_empty_and_bounded_cases() {
+        assert!(!modifier_keycodes_dispatched(&[]));
+        assert!(modifier_keycodes_dispatched(&[42]));
+        assert!(legacy_window_selection(Deadline::UNBOUNDED));
+        assert!(!legacy_window_selection(Deadline::from_millis(1_000)));
+    }
+
+    #[test]
+    fn stopping_a_dispatch_watch_removes_it() {
+        let dispatch = X11Dispatch {
+            sent: Cell::new(false),
+            deadline_watch: RefCell::new(Some(X11DeadlineWatch {
+                deadline: Deadline::UNBOUNDED,
+                socket: None,
+                cancel: None,
+            })),
+        };
+
+        dispatch.stop_watch();
+
+        assert!(dispatch.deadline_watch.borrow().is_none());
+    }
 
     #[derive(Default)]
     struct RecordingTypeSink {
