@@ -130,21 +130,16 @@ pub struct SelectWindowArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClickElementArgs {
-    /// The element `#id` from `glass_a11y_snapshot`. Valid only within the latest
-    /// snapshot — re-snapshot if the UI changed. If the element actually renders in a
-    /// popover owned by a different window than the active one (e.g. an open
-    /// dropdown's option row), the click is automatically routed into that popover
-    /// window and the previously-active window is restored afterward — no extra step
-    /// needed.
-    ///
-    /// Uses the platform's role-appropriate native accessibility operation when one is
-    /// available (works even when the element is occluded or scrolled off-screen),
-    /// falling back to a synthetic pointer click at the element's center. Text editors
-    /// may receive focus instead of an activation. The result's `method:"native-action"`
-    /// is the stable umbrella label for the native path, not proof that an activation
-    /// verb fired; `native_fallback` says why the pointer path was used. Where a
-    /// control's label is separate from the control, the native operation targets the
-    /// enclosing control and `actuated_id` identifies that element.
+    /// Element `#id` from the latest `glass_a11y_snapshot`.
+    /// Re-snapshot after UI changes.
+    /// Popover-owned targets route to their window and restore the prior active window.
+    /// Native accessibility handles occluded or off-screen targets and separate labels through
+    /// their enclosing control.
+    /// Unavailable native operations fall back to a pointer click at the target center.
+    /// Text editors may receive focus without activation.
+    /// `method:"native-action"` labels any native path.
+    /// `native_fallback` explains pointer fallback.
+    /// `actuated_id` identifies a substituted enclosing control.
     pub id: u32,
     /// Terminal observation: "snapshot" settles and refreshes/folds a11y, "settle" waits for
     /// visual stability and returns text-only metadata, and "none" skips observation (default).
@@ -253,15 +248,15 @@ pub struct ScrollArgs {
     pub x: i32,
     /// Pointer y the wheel is aimed at, window-relative. See `x`.
     pub y: i32,
-    /// Horizontal scroll in **wheel notches** (valid range -100 through 100; normal usage is small
-    /// integers like 1–5, NOT pixels). Positive `dx` sends wheel-right, negative wheel-left; glass
-    /// clicks `|dx|` times.
+    /// Horizontal wheel notches, not pixels.
+    /// Positive is right and negative is left, repeated `|dx|` times.
+    /// Typical values are 1–5.
     #[schemars(range(min = -100, max = 100))]
     pub dx: Option<i32>,
-    /// Vertical scroll in **wheel notches** (valid range -100 through 100; normal usage is small
-    /// integers like 1–5, NOT pixels). Positive `dy` sends wheel-down, negative wheel-up; glass
-    /// clicks `|dy|` times. How an app maps a wheel notch to its view (lines, pixels, zoom) is the
-    /// app's choice.
+    /// Vertical wheel notches, not pixels.
+    /// Positive is down and negative is up, repeated `|dy|` times.
+    /// Typical values are 1–5.
+    /// Apps choose how a notch maps to lines, pixels, or zoom.
     #[schemars(range(min = -100, max = 100))]
     pub dy: Option<i32>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
@@ -536,9 +531,9 @@ pub struct SettleArgs {
     /// Per-channel difference (0–255) two frames may have and still count as
     /// unchanged (default 0, exact match).
     pub tolerance: Option<u8>,
-    /// Give up after this long (default 5000ms). Expiry of this settle's own timeout
-    /// returns settled:false and completes the step; expiry of the enclosing glass_do
-    /// deadline fails the sequence.
+    /// Give up after this long (default 5000ms).
+    /// This settle's timeout returns `settled:false`.
+    /// The enclosing `glass_do` deadline fails the sequence.
     pub timeout_ms: Option<u64>,
     /// Window-relative sub-rectangle to watch for settling; when set, changes outside
     /// it are ignored.
