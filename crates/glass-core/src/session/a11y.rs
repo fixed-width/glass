@@ -23,6 +23,24 @@ const TOGGLE_VERIFY_INTERVAL_MS: u64 = 50;
 /// under load without turning a real actuation failure into an indefinite hang.
 const TOGGLE_VERIFY_TIMEOUT_MS: u64 = 2000;
 
+fn may_use_cached_geometry(allow: bool, error: &GlassError) -> bool {
+    allow
+        && error.bound() == Some(crate::BoundKind::NotStarted)
+        && error.bound_owner() == Some(crate::Whose::Caller)
+        && error.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched)
+}
+
+fn legacy_window_probe_is_best_effort(deadline: Deadline) -> bool {
+    deadline == Deadline::UNBOUNDED
+}
+
+fn popup_settle_exceeds_remaining(
+    remaining: Option<std::time::Duration>,
+    settle: std::time::Duration,
+) -> bool {
+    remaining.is_some_and(|left| left < settle)
+}
+
 impl ActiveSession {
     fn accessibility_context(
         &self,
@@ -119,12 +137,7 @@ impl Glass {
         // would not refresh.
         let window = match s.platform.window_by(&WindowOp::Geometry, deadline) {
             Ok(window) => window,
-            Err(error)
-                if allow_spent_geometry
-                    && error.bound() == Some(crate::BoundKind::NotStarted)
-                    && error.bound_owner() == Some(crate::Whose::Caller)
-                    && error.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched) =>
-            {
+            Err(error) if may_use_cached_geometry(allow_spent_geometry, &error) => {
                 s.geometry.clone()
             }
             Err(error) => return Err(error),
@@ -248,7 +261,7 @@ impl Glass {
         // Untimed clicks retain best-effort geometry; bounded actions propagate query failures.
         let windows = match self.list_windows_by(deadline) {
             Ok(windows) => windows,
-            Err(_) if deadline == Deadline::UNBOUNDED => Vec::new(),
+            Err(_) if legacy_window_probe_is_best_effort(deadline) => Vec::new(),
             Err(error) => return Err(error),
         };
         if let Some(popover_id) = owning_popover(bounds, &active_geo, &windows) {
@@ -370,7 +383,7 @@ impl Glass {
             // structured deadline/error instead of silently continuing with stale geometry.
             match s.platform.window_by(&WindowOp::Geometry, deadline) {
                 Ok(window) => s.geometry = window,
-                Err(_) if deadline == Deadline::UNBOUNDED => {}
+                Err(_) if legacy_window_probe_is_best_effort(deadline) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -447,7 +460,7 @@ impl Glass {
             // structured deadline/error instead of silently continuing with stale geometry.
             match s.platform.window_by(&WindowOp::Geometry, deadline) {
                 Ok(window) => s.geometry = window,
-                Err(_) if deadline == Deadline::UNBOUNDED => {}
+                Err(_) if legacy_window_probe_is_best_effort(deadline) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -746,10 +759,9 @@ impl Glass {
     /// Let a just-opened/closed popup realize in the a11y tree before re-reading.
     fn settle_for_popup(&self, deadline: Deadline) -> Result<()> {
         let settle = std::time::Duration::from_millis(250);
-        if let Some(left) = deadline.remaining()
-            && left < settle
-        {
-            std::thread::sleep(left);
+        let remaining = deadline.remaining();
+        if popup_settle_exceeds_remaining(remaining, settle) {
+            std::thread::sleep(remaining.unwrap_or_default());
             return Err(GlassError::caller_deadline_elapsed("combo popup settle"));
         }
         std::thread::sleep(settle);
@@ -1019,6 +1031,49 @@ mod tests {
             width: w,
             height: h,
         }
+    }
+
+    #[test]
+    fn cached_geometry_requires_the_exact_wait_fallback_proof() {
+        let not_started = || GlassError::deadline_not_started("geometry");
+        assert!(may_use_cached_geometry(true, &not_started()));
+        assert!(!may_use_cached_geometry(false, &not_started()));
+        assert!(!may_use_cached_geometry(
+            true,
+            &GlassError::caller_deadline_elapsed("geometry")
+        ));
+        assert!(!may_use_cached_geometry(
+            true,
+            &GlassError::Bounded {
+                kind: crate::BoundKind::NotStarted,
+                whose: crate::Whose::Callee,
+                dispatch: crate::BoundDispatch::NotDispatched,
+                message: "callee geometry refusal".into(),
+            }
+        ));
+        assert!(!may_use_cached_geometry(
+            true,
+            &not_started().after_dispatch()
+        ));
+    }
+
+    #[test]
+    fn only_legacy_unbounded_calls_ignore_window_probe_failures() {
+        assert!(legacy_window_probe_is_best_effort(Deadline::UNBOUNDED));
+        assert!(!legacy_window_probe_is_best_effort(Deadline::from_millis(
+            1_000
+        )));
+    }
+
+    #[test]
+    fn popup_settle_treats_an_exact_tie_as_enough_time() {
+        let settle = Duration::from_millis(250);
+        assert!(popup_settle_exceeds_remaining(
+            Some(Duration::from_millis(249)),
+            settle
+        ));
+        assert!(!popup_settle_exceeds_remaining(Some(settle), settle));
+        assert!(!popup_settle_exceeds_remaining(None, settle));
     }
 
     /// Centre is origin plus half the extent, on each axis independently. Odd extents floor,
@@ -2437,6 +2492,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bounded_click_propagates_a_failing_window_probe_before_pointer_input() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100)
+            .with_click_log(clicks.clone())
+            .with_failing_list_windows();
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let error = g
+            .click_element_by(AxNodeId(1), Deadline::from_millis(1_000))
+            .expect_err("bounded popover discovery must not hide its backend failure");
+
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "list_windows unavailable"),
+            "{error}"
+        );
+        assert!(clicks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_native_click_ignores_a_pre_dispatch_geometry_probe_failure() {
+        let platform = FakePlatform::new(100, 100).with_failing_geometry();
+        let (mut g, invokes) =
+            glass_with_a11y_invoke(platform, fake_tree(), InvokeBehavior::Succeed);
+        g.start(&spec()).unwrap();
+        let mut cached = fake_tree();
+        cached.assign_ids();
+        g.active.as_mut().unwrap().last_ax = Some(cached);
+
+        let method = g.click_element(AxNodeId(1)).unwrap();
+
+        assert!(matches!(method, ClickMethod::NativeAction { .. }));
+        assert_eq!(invokes.lock().unwrap().len(), 1);
+    }
+
     /// The click is translated into the popover's container, on both axes. The validated
     /// fixture's container sits at x=0, where subtracting and adding its origin agree, so this
     /// repeats it with the container offset horizontally.
@@ -3343,6 +3435,43 @@ mod tests {
     }
 
     #[test]
+    fn combo_expanded_without_realized_options_resnapshots_before_refusing() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300)
+            .with_click_log(clicks.clone())
+            .with_key_log(keys.clone());
+        let mut unrealized = combo("Beta", &[]);
+        unrealized.root.children[0].states.expanded = true;
+        let mut g = glass_with_scripted_snapshots(
+            platform,
+            vec![
+                SnapshotReply::Tree(unrealized),
+                SnapshotReply::Tree(combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"])),
+                SnapshotReply::Tree(combo("Delta", &[])),
+            ],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        g.set_value_by(AxNodeId(1), "Delta", Deadline::from_millis(2_000))
+            .expect("the realized option rows should complete the selection");
+
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "the popup was already open"
+        );
+        assert_eq!(
+            &*keys.lock().unwrap(),
+            &[
+                KeyEvent::Chord("Down".to_string()),
+                KeyEvent::Chord("Down".to_string()),
+                KeyEvent::Chord("Return".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn combo_selection_key_refusal_retries_same_option_without_closing_open_popup() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let keys = Arc::new(Mutex::new(Vec::new()));
@@ -4199,6 +4328,48 @@ mod tests {
         }
     }
 
+    fn glass_with_geometry_failure_ready_for_set_value(
+        set_log: Arc<Mutex<Vec<(AxTarget, String)>>>,
+    ) -> Glass {
+        let tree = editable_field_tree(Some("orig"));
+        let mut g = glass_with_backend(
+            FakePlatform::new(100, 100).with_failing_geometry(),
+            Box::new(logging_a11y(tree.clone(), set_log)),
+        );
+        g.start(&spec()).unwrap();
+        let mut cached = tree;
+        cached.assign_ids();
+        g.active.as_mut().unwrap().last_ax = Some(cached);
+        g
+    }
+
+    #[test]
+    fn legacy_set_value_ignores_a_pre_dispatch_geometry_probe_failure() {
+        let set_log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with_geometry_failure_ready_for_set_value(set_log.clone());
+
+        g.set_value(AxNodeId(0), "new").unwrap();
+
+        assert_eq!(set_log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bounded_set_value_propagates_a_pre_dispatch_geometry_probe_failure() {
+        let set_log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with_geometry_failure_ready_for_set_value(set_log.clone());
+
+        let error = g
+            .set_value_by(AxNodeId(0), "new", Deadline::from_millis(1_000))
+            .expect_err("bounded geometry failure must stop before the value backend");
+
+        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::NotDispatched)
+        );
+        assert!(set_log.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn set_value_patches_last_ax_so_a_retry_carries_the_written_value() {
         // Same mock harness as `set_value_passes_target_and_text_to_backend`: asserting on
@@ -4469,6 +4640,21 @@ mod tests {
                 .deadline,
             Deadline::UNBOUNDED,
         );
+    }
+
+    #[test]
+    fn wait_safety_snapshot_uses_cached_geometry_for_pre_dispatch_refusal() {
+        let mut g = glass_with_a11y(
+            FakePlatform::new(100, 100).with_failing_geometry(),
+            fake_tree(),
+        );
+        g.start(&spec()).unwrap();
+
+        let tree = g
+            .a11y_resnapshot_for_wait(Deadline::from_millis(1_000))
+            .expect("the exact wait fallback may reuse cached geometry");
+
+        assert_eq!(tree.root.role, AxRole::Window);
     }
 
     #[test]

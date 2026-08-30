@@ -47,6 +47,7 @@ pub(crate) struct FakePlatform {
     capture_delay: Option<Duration>,
     capture_deadline_error_owner: Option<crate::Whose>,
     geometry_delay: Option<Duration>,
+    fail_geometry_before_dispatch: bool,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
     log_batches: std::collections::VecDeque<Vec<(Stream, String)>>,
     key_log: Arc<Mutex<Vec<KeyEvent>>>,
@@ -234,6 +235,10 @@ impl FakePlatform {
         self.fail_list_windows = true;
         self
     }
+    pub(crate) fn with_failing_geometry(mut self) -> Self {
+        self.fail_geometry_before_dispatch = true;
+        self
+    }
     pub(crate) fn with_trailing_toggle_backend(mut self) -> Self {
         self.a11y_trailing_toggle = true;
         self
@@ -401,6 +406,9 @@ impl Platform for FakePlatform {
     }
     fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
         if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window operation"));
+        }
+        if matches!(op, WindowOp::Geometry) && self.fail_geometry_before_dispatch {
             return Err(GlassError::deadline_not_started("window operation"));
         }
         if matches!(op, WindowOp::Geometry)
