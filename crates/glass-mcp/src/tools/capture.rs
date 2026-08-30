@@ -2,9 +2,17 @@
 
 use glass_core::{Frame, Glass, Region, Stream, frame_to_webp};
 use serde_json::json;
+use std::time::{Duration, Instant};
 
 use crate::params::*;
-use crate::tools::{OutContent, ToolOutput, ToolResult};
+use crate::tools::{
+    ContextualError, ContextualOutput, ContextualToolResult, OutContent, ToolContext, ToolOutput,
+    ToolResult,
+};
+
+fn standalone(result: ContextualToolResult) -> ToolResult {
+    result.map(|o| o.output).map_err(|e| e.message)
+}
 
 /// Crop the captured frame to the requested region, or return it whole.
 fn crop_frame(frame: Frame, region: Option<&RegionArgs>) -> Result<Frame, String> {
@@ -15,27 +23,44 @@ fn crop_frame(frame: Frame, region: Option<&RegionArgs>) -> Result<Frame, String
 }
 
 pub fn screenshot(glass: &mut Glass, a: &ScreenshotArgs) -> ToolResult {
+    standalone(screenshot_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn screenshot_with(
+    glass: &mut Glass,
+    a: &ScreenshotArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     let frame = glass
-        .screenshot(
+        .screenshot_by(
             a.region.as_ref().map(|r| r.into()),
             a.window_id.map(glass_core::WindowId),
+            context.deadline,
         )
-        .map_err(|e| e.to_string())?;
-    let img = frame_to_webp(&frame).map_err(|e| e.to_string())?;
+        .map_err(|e| ContextualError::from_core(e, context))?;
+    let img = frame_to_webp(&frame).map_err(|e| ContextualError::from_core(e, context))?;
     let mut meta = json!({ "width": frame.width, "height": frame.height });
     if let Some(r) = a.region.as_ref() {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
     }
-    Ok(ToolOutput::image_result(
+    Ok(ContextualOutput::immediate(ToolOutput::image_result(
         "glass_screenshot",
         Some(img),
         meta,
         vec![],
-    ))
+    )))
 }
 
 pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
+    standalone(wait_stable_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn wait_stable_with(
+    glass: &mut Glass,
+    a: &WaitStableArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     let params = glass_core::WaitStableParams {
         interval_ms: a.interval_ms.unwrap_or(100),
         settle_frames: a.settle_frames.unwrap_or(3),
@@ -45,7 +70,23 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
         ignore: ignore_regions(a.ignore.as_deref()),
         window: a.window_id.map(glass_core::WindowId),
     };
-    let outcome = glass.wait_stable(&params).map_err(|e| e.to_string())?;
+    let (_, whose) = context
+        .deadline
+        .budget(Duration::from_millis(params.timeout_ms), Instant::now());
+    let outcome = glass
+        .wait_stable_by(&params, context.deadline)
+        .map_err(|e| {
+            // Core marks a successful zero-timeout compatibility capture `TimedOut` only after
+            // the shared deadline, while unrelated errors remain action failures.
+            if params.timeout_ms == 0
+                && e.bound() == Some(glass_core::BoundKind::TimedOut)
+                && context.deadline.has_passed()
+            {
+                ContextualError::from_core(e, context)
+            } else {
+                ContextualError::from_resolved_bound(e, context, whose)
+            }
+        })?;
     let settled = outcome.settled;
     // `saw_motion`/`observed_ms` make `settled` non-opaque: settled with saw_motion:false
     // over a short observed_ms is only a brief quiet window (a slow animation can hide).
@@ -67,21 +108,23 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
             "width": outcome.frame.width,
             "height": outcome.frame.height,
         });
-        return Ok(ToolOutput::result("glass_wait_stable", meta));
+        return Ok(ContextualOutput::with_timeout(
+            ToolOutput::result("glass_wait_stable", meta),
+            (!settled).then_some(whose),
+        ));
     }
 
-    let frame = crop_frame(outcome.frame, a.region.as_ref())?;
-    let img = frame_to_webp(&frame).map_err(|e| e.to_string())?;
+    let frame =
+        crop_frame(outcome.frame, a.region.as_ref()).map_err(ContextualError::validation)?;
+    let img = frame_to_webp(&frame).map_err(|e| ContextualError::from_core(e, context))?;
     let mut meta = json!({ "settled": settled, "saw_motion": saw_motion, "observed_ms": observed_ms, "ignored_pixels": ignored_pixels, "width": frame.width, "height": frame.height });
     if let Some(r) = a.region.as_ref() {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
     }
-    Ok(ToolOutput::image_result(
-        "glass_wait_stable",
-        Some(img),
-        meta,
-        vec![],
+    Ok(ContextualOutput::with_timeout(
+        ToolOutput::image_result("glass_wait_stable", Some(img), meta, vec![]),
+        (!settled).then_some(whose),
     ))
 }
 
@@ -94,28 +137,38 @@ pub fn baseline_save(glass: &mut Glass, a: &BaselineSaveArgs) -> ToolResult {
 }
 
 pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
+    standalone(diff_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn diff_with(
+    glass: &mut Glass,
+    a: &DiffArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     let region = a.region.as_ref().map(Region::from);
     let ignore = ignore_regions(a.ignore.as_deref());
     let (r, current) = match a.mode.as_deref().unwrap_or("perceptual") {
-        "perceptual" => glass.diff_baseline_perceptual_with_frame(
+        "perceptual" => glass.diff_baseline_perceptual_with_frame_by(
             &a.name,
             region.as_ref(),
             &ignore,
             a.threshold.unwrap_or(0.1),
+            context.deadline,
         ),
-        "exact" => glass.diff_baseline_with_frame(
+        "exact" => glass.diff_baseline_with_frame_by(
             &a.name,
             region.as_ref(),
             &ignore,
             a.tolerance.unwrap_or(0),
+            context.deadline,
         ),
         other => {
-            return Err(format!(
+            return Err(ContextualError::validation(format!(
                 "unknown diff mode '{other}' (use perceptual/exact)"
-            ));
+            )));
         }
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| ContextualError::from_core(e, context))?;
 
     let bbox = r
         .bbox
@@ -147,10 +200,17 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
             width: b.width,
             height: b.height,
         };
-        let cropped = current.crop(&region).map_err(|e| e.to_string())?;
-        image = Some(frame_to_webp(&cropped).map_err(|e| e.to_string())?);
+        let cropped = current
+            .crop(&region)
+            .map_err(|e| ContextualError::from_core(e, context))?;
+        image = Some(frame_to_webp(&cropped).map_err(|e| ContextualError::from_core(e, context))?);
     }
-    Ok(ToolOutput::image_result("glass_diff", image, body, vec![]))
+    Ok(ContextualOutput::immediate(ToolOutput::image_result(
+        "glass_diff",
+        image,
+        body,
+        vec![],
+    )))
 }
 
 pub fn logs(glass: &mut Glass, a: &LogsArgs) -> ToolResult {

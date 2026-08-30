@@ -68,6 +68,37 @@ async fn doctor_round_trips_over_http() {
 }
 
 #[tokio::test]
+async fn empty_glass_do_is_a_structured_error_over_http() {
+    let url = start_server(Some("tok")).await;
+    let client = ().serve(client_transport(&url, Some("tok"))).await.expect("initialize");
+    let arguments = serde_json::json!({ "actions": [] })
+        .as_object()
+        .unwrap()
+        .clone();
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("glass_do").with_arguments(arguments))
+        .await
+        .expect("glass_do call");
+
+    assert_eq!(result.is_error, Some(true));
+    let envelope = result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text())
+        .find_map(|text| serde_json::from_str::<serde_json::Value>(&text.text).ok())
+        .expect("glass_do error result must contain a JSON envelope");
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["tool"], "glass_do");
+    assert_eq!(envelope["error"]["code"], "invalid_sequence");
+    assert!(
+        envelope.get("result").is_none(),
+        "an invalid sequence must not carry a success result: {envelope}"
+    );
+    client.cancel().await.ok();
+}
+
+#[tokio::test]
 async fn rejects_missing_token() {
     let url = start_server(Some("tok")).await;
     // No auth header → initialize should fail (transport returns 401).

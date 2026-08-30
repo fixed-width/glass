@@ -3,18 +3,120 @@
 use super::*;
 use crate::accessibility::ElementSelector;
 
-/// How long to go on a signal's word alone before reading the tree anyway.
-///
-/// A signal reports the change classes it subscribed to, from the senders it resolved; anything
-/// outside that would otherwise let a wait answer "not matched" without ever looking again — a
-/// wrong result rather than a slow one. This bounds that to added latency, one re-read per second
-/// no matter what the platform does or does not announce.
-///
-/// Wall-clock, and deliberately not a count of quiet intervals: a count scales with the caller's
-/// `interval_ms` and can sit past the caller's whole timeout — ten at the 200ms
-/// `glass_wait_for_element` default is two seconds, which put the ceiling out of reach of exactly
-/// the short waits that could least afford one stale read.
+/// Maximum wall-clock time a change signal may suppress tree reads.
 const REREAD_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Reader headroom reserved before a quiet wait's deadline, capped at one quarter of the
+/// remaining budget.
+const FINAL_READ_HEADROOM: std::time::Duration = std::time::Duration::from_millis(20);
+
+fn should_reclassify_nested_bound(effective_owner: crate::Whose, sequence_expired: bool) -> bool {
+    effective_owner == crate::Whose::Callee && !sequence_expired
+}
+
+fn callee_wait_expired(looked: bool, owner: crate::Whose, expired: bool) -> bool {
+    looked && owner == crate::Whose::Callee && expired
+}
+
+fn compatibility_capture(looked: bool, timeout_ms: u64) -> bool {
+    !looked && timeout_ms == 0
+}
+
+fn soft_callee_capture_timeout(
+    has_tracker: bool,
+    owner: crate::Whose,
+    deadline_expired: bool,
+    error_owner: Option<crate::Whose>,
+) -> bool {
+    has_tracker
+        && owner == crate::Whose::Callee
+        && deadline_expired
+        && error_owner == Some(crate::Whose::Caller)
+}
+
+fn settle_capture_result(
+    has_tracker: bool,
+    owner: crate::Whose,
+    deadline_expired: bool,
+    capture: Result<Frame>,
+) -> Result<Option<Frame>> {
+    match capture {
+        Ok(frame) => Ok(Some(frame)),
+        Err(error)
+            if soft_callee_capture_timeout(
+                has_tracker,
+                owner,
+                deadline_expired,
+                error.bound_owner(),
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn needs_callee_timeout_full_capture(no_value: bool, owner: crate::Whose) -> bool {
+    no_value && owner == crate::Whose::Callee
+}
+
+fn final_read_pause(left: std::time::Duration) -> std::time::Duration {
+    left.saturating_sub(FINAL_READ_HEADROOM.min(left / 4))
+}
+
+fn quiet_wait_needs_read(final_read: bool, since_last: std::time::Duration) -> bool {
+    final_read || since_last >= REREAD_AFTER
+}
+
+fn should_schedule_final_read(
+    already_scheduled: bool,
+    left: Option<std::time::Duration>,
+    interval: std::time::Duration,
+) -> bool {
+    !already_scheduled && left.is_some_and(|left| left <= interval)
+}
+
+fn reader_relative_caller_bound(error: &GlassError) -> bool {
+    error.bound_owner() == Some(crate::Whose::Caller)
+}
+
+fn outer_sequence_expired(owner: crate::Whose, expired: bool) -> bool {
+    owner == crate::Whose::Caller && expired
+}
+
+fn prior_scroll_dispatched(steps: u32) -> bool {
+    steps > 0
+}
+
+/// Reclassify a reader-relative caller bound without overriding an expired outer sequence.
+fn resolve_nested_accessibility_bound(
+    error: GlassError,
+    effective_owner: crate::Whose,
+    sequence_deadline: Deadline,
+) -> GlassError {
+    if should_reclassify_nested_bound(effective_owner, sequence_deadline.has_passed()) {
+        match error {
+            GlassError::Bounded {
+                kind,
+                whose: crate::Whose::Caller,
+                dispatch,
+                message,
+            } => GlassError::Bounded {
+                kind,
+                whose: crate::Whose::Callee,
+                dispatch,
+                message,
+            },
+            error => error,
+        }
+    } else {
+        error
+    }
+}
+
+fn after_scroll_dispatch(error: GlassError) -> GlassError {
+    error.after_dispatch()
+}
 
 /// Parameters for [`Glass::wait_stable`].
 #[derive(Clone, Debug)]
@@ -83,6 +185,9 @@ pub struct WaitElementOutcome {
     pub element: Option<ElementInfo>,
     /// Wall-clock milliseconds elapsed when the wait returned.
     pub elapsed_ms: u64,
+    /// Which timeout ended the wait. `None` when the predicate was satisfied.
+    #[doc(hidden)]
+    pub timed_out_by: Option<crate::Whose>,
 }
 
 /// Wheel notches per scroll step; chosen so a step realizes at most a few rows
@@ -246,6 +351,9 @@ pub struct ScrollToElementOutcome {
     pub reversed: bool,
     /// The resolved (possibly inferred) primary sweep direction.
     pub direction: ScrollDirection,
+    /// The ending timeout, or `None` for a match, saturation, or the step cap.
+    #[doc(hidden)]
+    pub timed_out_by: Option<crate::Whose>,
 }
 
 /// Parameters for [`Glass::wait_for_region`].
@@ -330,6 +438,22 @@ impl Glass {
     /// Not event-gated, and must not be: this waits on *pixels* settling, and an accessibility
     /// event says nothing about that — an animation emits none, and a tree change may move none.
     pub fn wait_stable(&mut self, params: &WaitStableParams) -> Result<WaitStableOutcome> {
+        self.wait_stable_by(params, Deadline::UNBOUNDED)
+    }
+
+    /// [`Self::wait_stable`] bounded by a caller's shared deadline.
+    pub fn wait_stable_by(
+        &mut self,
+        params: &WaitStableParams,
+        caller: Deadline,
+    ) -> Result<WaitStableOutcome> {
+        if caller.has_passed() {
+            return Err(GlassError::deadline_not_started("wait for stable"));
+        }
+        let started = std::time::Instant::now();
+        let (effective_duration, whose) =
+            caller.budget(std::time::Duration::from_millis(params.timeout_ms), started);
+        let deadline = Deadline::at(started + effective_duration);
         let active = self.require_active()?;
         // The active window's cached geometry only bounds a stability_region when
         // watching the active window itself; a specific `window` is validated by
@@ -348,29 +472,63 @@ impl Glass {
         // region-local coordinates, since `capture` crops to `region` and the settle
         // comparison and the mask must agree on that space.
         let mut tracker: Option<StabilityTracker> = None;
-        let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
-            // Poll only the watched region (cheap) when one is set; else the full window.
-            let frame = self.capture(window, region.as_ref())?;
-            let t = match tracker {
-                Some(ref mut t) => t,
-                None => {
-                    let mask =
-                        mask_for(&params.ignore, region.as_ref(), frame.width, frame.height)?;
-                    tracker.insert(StabilityTracker::with_mask(
-                        params.settle_frames,
-                        params.tolerance,
-                        mask,
-                    ))
+        let mut looked = false;
+        let outcome = crate::poll::poll_until_with_pause(
+            params.interval_ms,
+            effective_duration.as_millis() as u64,
+            |d| {
+                std::thread::sleep(deadline.remaining().unwrap_or(d).min(d));
+                true
+            },
+            || {
+                if callee_wait_expired(looked, whose, deadline.has_passed()) {
+                    return Ok(None);
                 }
-            };
-            Ok(if t.observe(frame)? { Some(()) } else { None })
-        })?;
+                // Restrict polling to the watched region when present.
+                let compatibility_capture = compatibility_capture(looked, params.timeout_ms);
+                let capture_deadline = if compatibility_capture {
+                    caller
+                } else {
+                    deadline
+                };
+                looked = true;
+                let capture = self.capture_by(window, region.as_ref(), capture_deadline);
+                let Some(frame) = settle_capture_result(
+                    tracker.is_some(),
+                    whose,
+                    deadline.has_passed(),
+                    capture,
+                )?
+                else {
+                    return Ok(None);
+                };
+                if compatibility_capture && caller != Deadline::UNBOUNDED && caller.has_passed() {
+                    return Err(GlassError::caller_deadline_elapsed("wait for stable"));
+                }
+                let t = match tracker {
+                    Some(ref mut t) => t,
+                    None => {
+                        let mask =
+                            mask_for(&params.ignore, region.as_ref(), frame.width, frame.height)?;
+                        tracker.insert(StabilityTracker::with_mask(
+                            params.settle_frames,
+                            params.tolerance,
+                            mask,
+                        ))
+                    }
+                };
+                Ok(if t.observe(frame)? { Some(()) } else { None })
+            },
+        )?;
         let tracker = tracker.expect("poll_until ticks at least once");
         let settled = outcome.value.is_some();
         // Return the full window: a fresh capture if we were polling a sub-region
         // (the genuinely-settled state), else the just-observed full frame.
         let frame = match region {
-            Some(_) => self.capture(window, None)?,
+            Some(_) if needs_callee_timeout_full_capture(outcome.value.is_none(), whose) => {
+                self.capture_by(window, None, caller)?
+            }
+            Some(_) => self.capture_by(window, None, deadline)?,
             None => tracker.last().cloned().expect("a frame was just observed"),
         };
         Ok(WaitStableOutcome {
@@ -387,24 +545,37 @@ impl Glass {
     /// element id is immediately usable with `click_element`). Errors immediately if
     /// the backend has no accessibility reader (the first snapshot fails).
     pub fn wait_for_element(&mut self, params: &WaitElementParams) -> Result<WaitElementOutcome> {
+        self.wait_for_element_by(params, Deadline::UNBOUNDED)
+    }
+
+    /// [`Self::wait_for_element`] bounded by a caller's shared deadline.
+    pub fn wait_for_element_by(
+        &mut self,
+        params: &WaitElementParams,
+        sequence_deadline: Deadline,
+    ) -> Result<WaitElementOutcome> {
+        if sequence_deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("wait for element"));
+        }
         self.require_active()?; // fail fast; a11y_snapshot rechecks inside the loop
         let started = std::time::Instant::now();
         // Every read this wait makes carries when the wait stops: the tick is synchronous, so the
         // loop cannot take back a read a reader has started (glass#338).
-        let deadline = Deadline::from_millis(params.timeout_ms);
+        let (effective_duration, whose) =
+            sequence_deadline.budget(std::time::Duration::from_millis(params.timeout_ms), started);
+        let action_deadline = Deadline::at(started + effective_duration);
         // Before the first walk, not after: a change landing in that gap is announced to nobody,
         // and the wait then burns its whole budget on a condition that already holds.
         //
         // An interval of 0 means "re-read as fast as you can", which never pauses — so there is
         // nothing for a signal to save, and subscribing would only cost a round-trip.
         let mut signal = (params.interval_ms > 0)
-            .then(|| self.subscribe_a11y_changes(deadline))
+            .then(|| self.subscribe_a11y_changes(action_deadline))
             .flatten();
         // Subscribing spends the caller's budget, so the poll loop gets what is left. That
         // bounds the polling, not the call: a reader that does not honour `deadline` bounds its
         // own handshake in seconds, so a wait told to give up after 500ms can return later.
-        let remaining = params
-            .timeout_ms
+        let remaining = (effective_duration.as_millis() as u64)
             .saturating_sub(started.elapsed().as_millis() as u64);
         // Starts now rather than at the first read: the first tick follows immediately.
         let mut last_read = std::time::Instant::now();
@@ -412,21 +583,40 @@ impl Glass {
         // `deadline` gives up on the tick that ends the wait, so without this every unmatched wait
         // on such a backend failed instead of answering `{matched:false}` (glass#338).
         let mut unread: Option<GlassError> = None;
+        let mut unread_owner = whose;
         let mut saw_a_tree = false;
-        // The first read carries no deadline: `poll_until_with_pause` guarantees one tick, so a
-        // wait must look once, and `timeout_ms: 0` ("check now") would otherwise error against a
-        // healthy app nobody consulted. Reads after it carry the bound.
+        // A zero-timeout compatibility read uses the live sequence deadline; later reads use the
+        // action deadline.
+        let first_read_deadline = if params.timeout_ms == 0 {
+            sequence_deadline
+        } else {
+            action_deadline
+        };
         let mut looked = false;
+        let final_read_scheduled = std::cell::Cell::new(false);
         let outcome = crate::poll::poll_until_with_pause(
             params.interval_ms,
             remaining,
             |d| {
+                // Schedule the skipped-tick safety read before expiry because accessibility
+                // snapshots cannot return late success.
+                let left = action_deadline.remaining();
+                let final_read = should_schedule_final_read(final_read_scheduled.get(), left, d);
+                if final_read {
+                    final_read_scheduled.set(true);
+                }
                 let paused_at = std::time::Instant::now();
+                let pause_budget = if final_read {
+                    let left = left.expect("a final read is scheduled only for a bounded wait");
+                    final_read_pause(left)
+                } else {
+                    left.unwrap_or(d).min(d)
+                };
                 let read_now = match signal.as_mut() {
-                    Some(s) => match s.wait(d) {
+                    Some(s) => match s.wait(pause_budget) {
                         ChangeWait::Changed => true,
                         // Read anyway now and then — see `REREAD_AFTER`.
-                        ChangeWait::Quiet => last_read.elapsed() >= REREAD_AFTER,
+                        ChangeWait::Quiet => quiet_wait_needs_read(final_read, last_read.elapsed()),
                         // See `ChangeWait`: an unusable signal must not read as a quiet one.
                         ChangeWait::Unusable => {
                             signal = None;
@@ -442,24 +632,45 @@ impl Glass {
                 // progress bar) would otherwise drive back-to-back walks with no gap, hammering the
                 // same bus the app is trying to serve — and a signal that returns early without
                 // blocking, which nothing here can enforce, would spin this loop at full tilt.
-                std::thread::sleep(d.saturating_sub(paused_at.elapsed()));
+                std::thread::sleep(pause_budget.saturating_sub(paused_at.elapsed()));
                 read_now
             },
             || {
                 // fresh snapshot; assigns ids, caches, pumps
-                let bound = if looked {
-                    deadline
+                let first_read = !looked;
+                let bound = if first_read {
+                    first_read_deadline
                 } else {
-                    Deadline::UNBOUNDED
+                    action_deadline
                 };
+                let read_owner = if first_read
+                    && params.timeout_ms == 0
+                    && sequence_deadline.instant().is_some()
+                {
+                    crate::Whose::Caller
+                } else {
+                    whose
+                };
+                // The pause already scheduled the safety read before expiry; skip the poller's
+                // post-timeout bookkeeping tick.
+                if !first_read && bound.has_passed() {
+                    return Ok(None);
+                }
                 looked = true;
-                let tree = match self.a11y_resnapshot(bound) {
+                let tree = match self.a11y_resnapshot_for_wait(bound) {
                     Ok(t) => {
                         saw_a_tree = true;
                         t
                     }
                     // Kept so a spent budget can report this instead of "not found" (glass#329).
                     Err(e @ GlassError::AccessibilityNotReady(_)) => {
+                        unread_owner = read_owner;
+                        unread = Some(e);
+                        return Ok(None);
+                    }
+                    // Resolve this reader-relative `Caller` against the enclosing wait below.
+                    Err(e) if reader_relative_caller_bound(&e) => {
+                        unread_owner = read_owner;
                         unread = Some(e);
                         return Ok(None);
                     }
@@ -486,14 +697,29 @@ impl Glass {
             && !saw_a_tree
             && let Some(e) = unread
         {
+            if e.bound_owner() == Some(crate::Whose::Caller) {
+                return Err(resolve_nested_accessibility_bound(
+                    e,
+                    unread_owner,
+                    sequence_deadline,
+                ));
+            }
+            if outer_sequence_expired(unread_owner, sequence_deadline.has_passed()) {
+                return Err(GlassError::caller_deadline_elapsed_with_guidance(
+                    "accessibility wait",
+                    &e.to_string(),
+                ));
+            }
             return Err(e);
         }
+        let matched = outcome.value.is_some();
         Ok(WaitElementOutcome {
-            matched: outcome.value.is_some(),
+            matched,
             element: outcome.value.flatten(),
             // From before the subscription, not from the poll loop: the agent is told how long the
             // call took, and the subscribe is part of it.
             elapsed_ms: started.elapsed().as_millis() as u64,
+            timed_out_by: (!matched).then_some(whose),
         })
     }
 
@@ -537,8 +763,23 @@ impl Glass {
         &mut self,
         params: &ScrollToElementParams,
     ) -> Result<ScrollToElementOutcome> {
+        self.scroll_to_element_by(params, Deadline::UNBOUNDED)
+    }
+
+    /// [`Self::scroll_to_element`] bounded by a caller's shared deadline.
+    pub fn scroll_to_element_by(
+        &mut self,
+        params: &ScrollToElementParams,
+        sequence_deadline: Deadline,
+    ) -> Result<ScrollToElementOutcome> {
+        if sequence_deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("scroll to element"));
+        }
         self.require_active()?;
         let start = std::time::Instant::now();
+        let (effective_duration, whose) =
+            sequence_deadline.budget(std::time::Duration::from_millis(params.timeout_ms), start);
+        let action_deadline = Deadline::at(start + effective_duration);
         let geo = self.geometry()?;
         // Return a match once scrolling can't improve its visibility: it has an on-screen
         // clickable center, or its bounds are unknown (scrolling won't populate a
@@ -550,7 +791,35 @@ impl Glass {
 
         // One pre-sweep snapshot serves four jobs: early return if already visible,
         // direction inference, anchor derivation, and seeding the saturation outline.
-        let (found0, mut prev_outline) = self.snapshot_match_outline(params)?;
+        let first_read_uses_sequence = params.timeout_ms == 0;
+        let first_read_deadline = if first_read_uses_sequence {
+            sequence_deadline
+        } else {
+            action_deadline
+        };
+        let first_read_owner = if first_read_uses_sequence && sequence_deadline.instant().is_some()
+        {
+            crate::Whose::Caller
+        } else {
+            whose
+        };
+        let Some((found0, mut prev_outline)) =
+            self.snapshot_match_outline(params, first_read_deadline)?
+        else {
+            return Ok(ScrollToElementOutcome {
+                matched: false,
+                element: None,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                steps: 0,
+                reversed: false,
+                direction: params.direction.unwrap_or(ScrollDirection::Down),
+                timed_out_by: Some(if sequence_deadline.has_passed() {
+                    crate::Whose::Caller
+                } else {
+                    first_read_owner
+                }),
+            });
+        };
         let found0_bounds = found0.as_ref().and_then(|i| i.bounds);
 
         // Resolve the primary sweep direction: explicit, else inferred from the
@@ -563,17 +832,18 @@ impl Glass {
 
         // Every return shares this tail (elapsed_ms/direction); only the matched flag,
         // element, step count, and reversed flag vary.
-        let outcome = |matched, element, steps, reversed| ScrollToElementOutcome {
+        let outcome = |matched, element, steps, reversed, timed_out_by| ScrollToElementOutcome {
             matched,
             element,
             elapsed_ms: start.elapsed().as_millis() as u64,
             steps,
             reversed,
             direction: primary,
+            timed_out_by,
         };
 
         if let Some(info) = found0.filter(|i| ready(i)) {
-            return Ok(outcome(true, Some(info), 0, false));
+            return Ok(outcome(true, Some(info), 0, false, None));
         }
 
         let (ax, ay) = params
@@ -584,25 +854,43 @@ impl Glass {
         for (i, dir) in [primary, primary.opposite()].into_iter().enumerate() {
             let reversed = i == 1;
             loop {
-                if start.elapsed().as_millis() as u64 >= params.timeout_ms
-                    || steps >= SCROLL_TO_MAX_STEPS
-                {
-                    return Ok(outcome(false, None, steps, reversed));
+                if action_deadline.has_passed() {
+                    return Ok(outcome(false, None, steps, reversed, Some(whose)));
+                }
+                if steps >= SCROLL_TO_MAX_STEPS {
+                    return Ok(outcome(false, None, steps, reversed, None));
                 }
                 let (dx, dy) = dir.delta(params.step);
-                self.pointer(&PointerEvent::Scroll {
-                    x: ax,
-                    y: ay,
-                    dx,
-                    dy,
-                    modifiers: vec![],
-                })?;
+                let scroll = self.pointer_by(
+                    &PointerEvent::Scroll {
+                        x: ax,
+                        y: ay,
+                        dx,
+                        dy,
+                        modifiers: vec![],
+                    },
+                    action_deadline,
+                );
+                if prior_scroll_dispatched(steps) {
+                    scroll.map_err(after_scroll_dispatch)?;
+                } else {
+                    scroll?;
+                }
                 steps += 1;
                 // Let the scrolled rows/columns realize in the a11y tree before re-reading.
-                std::thread::sleep(std::time::Duration::from_millis(SCROLL_TO_SETTLE_MS));
-                let (found, outline) = self.snapshot_match_outline(params)?;
+                let settle = std::time::Duration::from_millis(SCROLL_TO_SETTLE_MS);
+                std::thread::sleep(action_deadline.remaining().unwrap_or(settle).min(settle));
+                if action_deadline.has_passed() {
+                    return Ok(outcome(false, None, steps, reversed, Some(whose)));
+                }
+                let Some((found, outline)) = self
+                    .snapshot_match_outline(params, action_deadline)
+                    .map_err(after_scroll_dispatch)?
+                else {
+                    return Ok(outcome(false, None, steps, reversed, Some(whose)));
+                };
                 if let Some(info) = found.filter(|i| ready(i)) {
-                    return Ok(outcome(true, Some(info), steps, reversed));
+                    return Ok(outcome(true, Some(info), steps, reversed, None));
                 }
                 // No change in the a11y tree ⇒ the container did not advance ⇒ this
                 // end is reached; sweep the opposite direction.
@@ -613,7 +901,7 @@ impl Glass {
                 }
             }
         }
-        Ok(outcome(false, None, steps, true))
+        Ok(outcome(false, None, steps, true, None))
     }
 
     /// Snapshot the current view once; return the matched element (if the selector is
@@ -623,11 +911,19 @@ impl Glass {
     fn snapshot_match_outline(
         &mut self,
         params: &ScrollToElementParams,
-    ) -> Result<(Option<ElementInfo>, String)> {
-        // No deadline, though the sweep has a `timeout_ms`: this read propagates its error with
-        // `?`, so a reader giving up at the deadline would turn the sweep's soft `{matched:false}`
-        // into an error.
-        let tree = self.a11y_resnapshot(Deadline::UNBOUNDED)?;
+        deadline: Deadline,
+    ) -> Result<Option<(Option<ElementInfo>, String)>> {
+        let tree = match self.a11y_resnapshot(deadline) {
+            Ok(tree) => tree,
+            Err(error)
+                if deadline.has_passed()
+                    && (matches!(&error, GlassError::AccessibilityNotReady(_))
+                        || error.bound_owner() == Some(crate::Whose::Caller)) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let found = match tree.element_match_selector(
             ElementSelector {
                 name: params.name.as_deref(),
@@ -641,7 +937,7 @@ impl Glass {
             ElementMatch::Satisfied(node) => node.map(ElementInfo::from_node),
             ElementMatch::Pending => None,
         };
-        Ok((found, tree.to_outline()))
+        Ok(Some((found, tree.to_outline())))
     }
 
     /// Block until a watched region diverges from / converges to a reference.
@@ -785,8 +1081,138 @@ impl Glass {
 
 #[cfg(test)]
 mod tests {
-    use super::{offscreen_direction, scroll_anchor};
+    use super::{
+        REREAD_AFTER, callee_wait_expired, compatibility_capture, final_read_pause,
+        needs_callee_timeout_full_capture, offscreen_direction, outer_sequence_expired,
+        prior_scroll_dispatched, quiet_wait_needs_read, reader_relative_caller_bound,
+        scroll_anchor, settle_capture_result, should_reclassify_nested_bound,
+        should_schedule_final_read, soft_callee_capture_timeout,
+    };
+    use crate::BoundKind;
     use crate::session::test_support::*;
+
+    #[test]
+    fn wait_deadline_helpers_require_every_provenance_clause() {
+        assert!(should_reclassify_nested_bound(crate::Whose::Callee, false));
+        assert!(!should_reclassify_nested_bound(crate::Whose::Caller, false));
+        assert!(!should_reclassify_nested_bound(crate::Whose::Callee, true));
+
+        assert!(callee_wait_expired(true, crate::Whose::Callee, true));
+        assert!(!callee_wait_expired(false, crate::Whose::Callee, true));
+        assert!(!callee_wait_expired(true, crate::Whose::Caller, true));
+        assert!(!callee_wait_expired(true, crate::Whose::Callee, false));
+
+        assert!(compatibility_capture(false, 0));
+        assert!(!compatibility_capture(true, 0));
+        assert!(!compatibility_capture(false, 1));
+
+        assert!(soft_callee_capture_timeout(
+            true,
+            crate::Whose::Callee,
+            true,
+            Some(crate::Whose::Caller)
+        ));
+        for candidate in [
+            soft_callee_capture_timeout(
+                false,
+                crate::Whose::Callee,
+                true,
+                Some(crate::Whose::Caller),
+            ),
+            soft_callee_capture_timeout(
+                true,
+                crate::Whose::Caller,
+                true,
+                Some(crate::Whose::Caller),
+            ),
+            soft_callee_capture_timeout(
+                true,
+                crate::Whose::Callee,
+                false,
+                Some(crate::Whose::Caller),
+            ),
+            soft_callee_capture_timeout(
+                true,
+                crate::Whose::Callee,
+                true,
+                Some(crate::Whose::Callee),
+            ),
+        ] {
+            assert!(!candidate);
+        }
+
+        assert!(needs_callee_timeout_full_capture(
+            true,
+            crate::Whose::Callee
+        ));
+        assert!(!needs_callee_timeout_full_capture(
+            false,
+            crate::Whose::Callee
+        ));
+        assert!(!needs_callee_timeout_full_capture(
+            true,
+            crate::Whose::Caller
+        ));
+
+        assert!(reader_relative_caller_bound(
+            &GlassError::caller_deadline_elapsed("reader")
+        ));
+        assert!(!reader_relative_caller_bound(&GlassError::Bounded {
+            kind: crate::BoundKind::TimedOut,
+            whose: crate::Whose::Callee,
+            dispatch: crate::BoundDispatch::MayHaveDispatched,
+            message: "reader ceiling".into(),
+        }));
+        assert!(!reader_relative_caller_bound(&GlassError::Backend(
+            "reader failed".into()
+        )));
+
+        assert!(outer_sequence_expired(crate::Whose::Caller, true));
+        assert!(!outer_sequence_expired(crate::Whose::Callee, true));
+        assert!(!outer_sequence_expired(crate::Whose::Caller, false));
+
+        assert!(!prior_scroll_dispatched(0));
+        assert!(prior_scroll_dispatched(1));
+    }
+
+    #[test]
+    fn final_read_pause_reserves_a_quarter_up_to_the_headroom_cap() {
+        assert_eq!(
+            final_read_pause(Duration::from_millis(80)),
+            Duration::from_millis(60)
+        );
+        assert_eq!(
+            final_read_pause(Duration::from_millis(40)),
+            Duration::from_millis(30)
+        );
+        assert_eq!(
+            final_read_pause(Duration::from_millis(4)),
+            Duration::from_millis(3)
+        );
+    }
+
+    #[test]
+    fn a_quiet_signal_reads_only_for_a_safety_or_periodic_refresh() {
+        assert!(!quiet_wait_needs_read(
+            false,
+            REREAD_AFTER - Duration::from_millis(1)
+        ));
+        assert!(quiet_wait_needs_read(false, REREAD_AFTER));
+        assert!(quiet_wait_needs_read(true, Duration::ZERO));
+    }
+
+    #[test]
+    fn a_final_safety_read_is_scheduled_once_when_the_interval_reaches_the_deadline() {
+        let interval = Duration::from_millis(100);
+        assert!(should_schedule_final_read(false, Some(interval), interval));
+        assert!(!should_schedule_final_read(true, Some(interval), interval));
+        assert!(!should_schedule_final_read(false, None, interval));
+        assert!(!should_schedule_final_read(
+            false,
+            Some(interval + Duration::from_millis(1)),
+            interval
+        ));
+    }
 
     #[test]
     fn wait_stable_settles_on_repeated_frame() {
@@ -836,6 +1262,303 @@ mod tests {
             })
             .unwrap();
         assert!(!outcome.settled);
+    }
+
+    #[test]
+    fn bounded_zero_timeout_takes_one_compatibility_capture_with_the_caller_deadline() {
+        let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let caller = Deadline::from_millis(1_000);
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![frame.clone()])
+            .with_capture_log(captures.clone())
+            .with_capture_deadline_log(deadlines.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let outcome = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 0,
+                    stability_region: None,
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                caller,
+            )
+            .unwrap();
+
+        assert!(!outcome.settled);
+        assert!(!outcome.saw_motion);
+        assert_eq!(outcome.frame, frame);
+        assert_eq!(outcome.ignored_pixels, 0);
+        assert_eq!(captures.lock().unwrap().len(), 1);
+        assert_eq!(*deadlines.lock().unwrap(), vec![caller]);
+    }
+
+    #[test]
+    fn bounded_zero_timeout_propagates_a_genuine_capture_failure() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let caller = Deadline::from_millis(1_000);
+        let platform = FakePlatform::new(2, 2).with_capture_log(captures.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 0,
+                    stability_region: None,
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                caller,
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, GlassError::CaptureFailed(ref message) if message == "no scripted frames")
+        );
+        assert_eq!(captures.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn spent_bounded_zero_timeout_starts_no_capture() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![Frame::solid(2, 2, [1, 2, 3, 255])])
+            .with_capture_log(captures.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 0,
+                    stability_region: None,
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                Deadline::from_millis(0),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(BoundKind::NotStarted));
+        assert!(captures.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bounded_zero_timeout_capture_completing_after_caller_expiry_is_a_caller_error() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let caller = Deadline::from_millis(10);
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![Frame::solid(2, 2, [1, 2, 3, 255])])
+            .with_capture_log(captures.clone())
+            .with_capture_delay(Duration::from_millis(20));
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 0,
+                    stability_region: None,
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                caller,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(captures.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn callee_timeout_final_settle_capture_keeps_the_bounded_caller_deadline() {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let caller = Deadline::from_millis(1_000);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])])
+            .with_capture_deadline_log(deadlines.clone())
+            .with_capture_delay(Duration::from_millis(20));
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let outcome = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 10,
+                    stability_region: Some(Region {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 2,
+                    }),
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                caller,
+            )
+            .unwrap();
+
+        assert!(!outcome.settled);
+        let deadlines = deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), 2);
+        assert_eq!(deadlines[1], caller);
+    }
+
+    #[test]
+    fn settled_region_final_capture_keeps_the_action_deadline() {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let frame = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![frame])
+            .with_capture_deadline_log(deadlines.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1_000,
+                stability_region: Some(Region {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }),
+                ignore: Vec::new(),
+                window: None,
+            })
+            .unwrap();
+
+        assert!(outcome.settled);
+        let deadlines = deadlines.lock().unwrap();
+        assert!(deadlines.len() >= 3, "{deadlines:?}");
+        assert_ne!(
+            deadlines.last(),
+            Some(&Deadline::UNBOUNDED),
+            "the full-frame capture remains inside the settle action budget"
+        );
+    }
+
+    struct BackendOwnedReadFailure {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Accessibility for BackendOwnedReadFailure {
+        fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(GlassError::Bounded {
+                kind: crate::BoundKind::TimedOut,
+                whose: crate::Whose::Callee,
+                dispatch: crate::BoundDispatch::MayHaveDispatched,
+                message: "accessibility reader ceiling".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn backend_owned_reader_timeout_propagates_without_polling() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut g = glass_with_backend(
+            FakePlatform::new(100, 100),
+            Box::new(BackendOwnedReadFailure {
+                reads: reads.clone(),
+            }),
+        );
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_for_element(&never_matches(10, 1_000))
+            .expect_err("a backend ceiling is not a retryable reader-relative caller bound");
+
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Callee));
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn callee_timeout_does_not_start_a_capture_at_the_spent_action_deadline() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])])
+            .with_capture_log(captures.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 50,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 10,
+                stability_region: None,
+                ignore: Vec::new(),
+                window: None,
+            })
+            .unwrap();
+
+        assert!(!outcome.settled);
+        assert_eq!(captures.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn caller_owned_capture_expiry_after_a_frame_is_a_soft_settle_timeout() {
+        let result = settle_capture_result(
+            true,
+            crate::Whose::Callee,
+            true,
+            Err(GlassError::caller_deadline_elapsed("capture")),
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn backend_owned_capture_timeout_is_not_softened_by_the_wait_deadline() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])])
+            .with_capture_log(captures.clone())
+            .with_capture_error_owners(vec![None, Some(crate::Whose::Callee)]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 3,
+                tolerance: 0,
+                timeout_ms: 1_000,
+                stability_region: None,
+                ignore: Vec::new(),
+                window: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Callee));
+        assert_eq!(captures.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -1322,6 +2045,152 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_wait_with_no_tree_keeps_the_sequence_deadline_as_structural_owner() {
+        struct LateNotReady;
+
+        impl Accessibility for LateNotReady {
+            fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+                let left = ctx
+                    .deadline
+                    .remaining()
+                    .expect("the sequence test passes a bounded read deadline");
+                std::thread::sleep(left.saturating_add(Duration::from_millis(5)));
+                Err(GlassError::AccessibilityNotReady(
+                    "the app still has no tree".into(),
+                ))
+            }
+        }
+
+        let mut g = glass_with_backend(FakePlatform::new(100, 100), Box::new(LateNotReady));
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_for_element_by(&never_matches(0, 1_000), Deadline::from_millis(30))
+            .expect_err("the sequence deadline ended a wait that never obtained a tree");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert!(error.to_string().contains("still has no tree"), "{error}");
+    }
+
+    struct CallerBoundAtReadDeadline;
+
+    impl Accessibility for CallerBoundAtReadDeadline {
+        fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+            let left = ctx
+                .deadline
+                .remaining()
+                .expect("the nested-bound tests pass a bounded read deadline");
+            std::thread::sleep(left.saturating_add(Duration::from_millis(5)));
+            Err(GlassError::caller_deadline_elapsed_with_guidance(
+                "scripted accessibility read",
+                "the read reached its effective deadline",
+            ))
+        }
+    }
+
+    fn glass_with_caller_bound_at_read_deadline() -> Glass {
+        glass_with_backend(
+            FakePlatform::new(100, 100),
+            Box::new(CallerBoundAtReadDeadline),
+        )
+    }
+
+    #[test]
+    fn action_owned_bounded_wait_read_is_not_recast_as_the_outer_caller() {
+        let mut g = glass_with_caller_bound_at_read_deadline();
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_for_element_by(&never_matches(0, 20), Deadline::from_millis(1_000))
+            .expect_err("a wait that never obtained a tree still reports the read failure");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Callee), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert!(error.to_string().contains("effective deadline"), "{error}");
+    }
+
+    #[test]
+    fn sequence_owned_bounded_wait_read_keeps_the_outer_caller() {
+        let mut g = glass_with_caller_bound_at_read_deadline();
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .wait_for_element_by(&never_matches(0, 1_000), Deadline::from_millis(20))
+            .expect_err("the outer sequence ended before any tree arrived");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn action_owned_bounded_scroll_read_is_a_soft_predicate_timeout() {
+        let mut g = glass_with_caller_bound_at_read_deadline();
+        g.start(&spec()).unwrap();
+
+        let out = g
+            .scroll_to_element_by(
+                &ScrollToElementParams {
+                    name: Some("Ghost".into()),
+                    description: None,
+                    role: None,
+                    value_contains: None,
+                    direction: Some(ScrollDirection::Down),
+                    anchor: None,
+                    step: SCROLL_TO_DEFAULT_STEP,
+                    timeout_ms: 20,
+                },
+                Deadline::from_millis(1_000),
+            )
+            .expect("the action's own read expiry is a soft scroll timeout");
+
+        assert!(!out.matched);
+        assert_eq!(out.steps, 0);
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Callee));
+    }
+
+    #[test]
+    fn sequence_owned_bounded_scroll_read_is_a_soft_caller_timeout() {
+        let mut g = glass_with_caller_bound_at_read_deadline();
+        g.start(&spec()).unwrap();
+
+        let out = g
+            .scroll_to_element_by(
+                &ScrollToElementParams {
+                    name: Some("Ghost".into()),
+                    description: None,
+                    role: None,
+                    value_contains: None,
+                    direction: Some(ScrollDirection::Down),
+                    anchor: None,
+                    step: SCROLL_TO_DEFAULT_STEP,
+                    timeout_ms: 1_000,
+                },
+                Deadline::from_millis(20),
+            )
+            .expect("the sequence-owned read expiry is a soft caller timeout");
+
+        assert!(!out.matched);
+        assert_eq!(out.steps, 0);
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Caller));
+    }
+
     /// A wait looks once however little time it was given: `poll_until_with_pause` guarantees one
     /// tick, and `timeout_ms: 0` means "check now" — answering for a device nobody consulted is
     /// the one outcome worse than answering late.
@@ -1351,14 +2220,8 @@ mod tests {
         );
     }
 
-    /// The sweep has a `timeout_ms` of its own and still leaves the reader unbounded, because its
-    /// read propagates with `?` — a reader giving up at the deadline would turn the soft
-    /// `{matched:false}` a spent sweep promises into an error.
-    ///
-    /// The asymmetry with `wait_for_element` is deliberate and lived only in a comment, one line
-    /// from a `timeout_ms` inviting a contributor to "fix" it.
     #[test]
-    fn a_scroll_sweep_leaves_the_reader_its_own_budget() {
+    fn a_scroll_sweep_bounds_the_reader_by_its_own_budget() {
         let (mut g, ctx_log) = glass_with_a11y_ctx(FakePlatform::new(100, 100), fake_tree());
         g.start(&spec()).unwrap();
         g.scroll_to_element(&ScrollToElementParams {
@@ -1373,15 +2236,128 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(
+        assert!(
             ctx_log
                 .lock()
                 .unwrap()
                 .as_ref()
                 .expect("the sweep read the tree")
-                .deadline,
-            Deadline::UNBOUNDED,
+                .deadline
+                .remaining()
+                .is_some(),
+            "the sweep did not pass its effective deadline to the reader"
         );
+    }
+
+    #[test]
+    fn standalone_scroll_snapshot_deadline_returns_a_soft_callee_timeout() {
+        let (mut g, _) = glass_with_a11y_not_ready_at_deadline(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 20,
+            })
+            .expect("an own snapshot deadline is a soft scroll timeout");
+
+        assert!(!out.matched);
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Callee));
+    }
+
+    #[test]
+    fn caller_scroll_snapshot_deadline_returns_a_soft_caller_timeout() {
+        let (mut g, _) = glass_with_a11y_not_ready_at_deadline(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+
+        let out = g
+            .scroll_to_element_by(
+                &ScrollToElementParams {
+                    name: Some("Ghost".into()),
+                    description: None,
+                    role: None,
+                    value_contains: None,
+                    direction: Some(ScrollDirection::Down),
+                    anchor: None,
+                    step: SCROLL_TO_DEFAULT_STEP,
+                    timeout_ms: 1_000,
+                },
+                Deadline::from_millis(20),
+            )
+            .expect("a caller snapshot deadline is a soft scroll timeout");
+
+        assert!(!out.matched);
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Caller));
+    }
+
+    #[test]
+    fn scroll_zero_timeout_first_snapshot_remains_unbounded() {
+        let (mut g, seen) = glass_with_a11y_not_ready_at_deadline(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Save".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 0,
+            })
+            .unwrap();
+
+        assert!(out.matched);
+        assert_eq!(*seen.lock().unwrap(), vec![Deadline::UNBOUNDED]);
+    }
+
+    #[test]
+    fn scroll_predeadline_not_ready_still_propagates() {
+        let (mut g, _) = glass_with_a11y_not_ready(FakePlatform::new(100, 100), 1);
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 1_000,
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, GlassError::AccessibilityNotReady(_)));
+    }
+
+    #[test]
+    fn scroll_accessibility_failure_still_propagates() {
+        let mut g = glass_with_a11y_unavailable(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 1_000,
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, GlassError::AccessibilityUnavailable(_)));
     }
 
     #[test]
@@ -1469,24 +2445,94 @@ mod tests {
         }
     }
 
+    struct QuietThenChanges {
+        changed: Arc<std::sync::atomic::AtomicBool>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        waits: Arc<std::sync::atomic::AtomicUsize>,
+        deadlines: Arc<Mutex<Vec<Deadline>>>,
+    }
+
+    impl Accessibility for QuietThenChanges {
+        fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.deadlines.lock().unwrap().push(ctx.deadline);
+            Ok(if self.changed.load(Ordering::SeqCst) {
+                fake_tree_checked()
+            } else {
+                fake_tree_enabled()
+            })
+        }
+
+        fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+            Some(Box::new(QuietThenChangeSignal {
+                changed: self.changed.clone(),
+                waits: self.waits.clone(),
+            }))
+        }
+    }
+
+    struct QuietThenChangeSignal {
+        changed: Arc<std::sync::atomic::AtomicBool>,
+        waits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ChangeSignal for QuietThenChangeSignal {
+        fn wait(&mut self, _timeout: Duration) -> ChangeWait {
+            if self.waits.fetch_add(1, Ordering::SeqCst) == 0 {
+                return ChangeWait::Quiet;
+            }
+            self.changed.store(true, Ordering::SeqCst);
+            ChangeWait::Changed
+        }
+    }
+
     #[test]
-    fn a_quiet_wait_walks_once_and_looks_again_at_the_deadline() {
-        // The point of the change: told nothing changed, the wait must not re-read on the
-        // interval. The second walk is the deadline read — see `poll_until_with_pause`.
-        let (mut g, walks) = glass_with_a11y_counted(
+    fn a_quiet_signal_skips_one_read_before_a_change_wakes_the_wait() {
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with_backend(
+            FakePlatform::new(100, 100),
+            Box::new(QuietThenChanges {
+                changed,
+                reads: reads.clone(),
+                waits: waits.clone(),
+                deadlines: deadlines.clone(),
+            }),
+        );
+        g.start(&spec()).unwrap();
+
+        let outcome = g.wait_for_element(&never_matches(1, 10_000)).unwrap();
+
+        assert!(outcome.matched);
+        assert_eq!(waits.load(Ordering::SeqCst), 2);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        let deadlines = deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), 2);
+        assert_ne!(deadlines[0], Deadline::UNBOUNDED);
+        assert_eq!(deadlines[0], deadlines[1]);
+    }
+
+    #[test]
+    fn caller_deadline_caps_an_element_wait_interval_and_signal_wait() {
+        let (mut g, _walks) = glass_with_a11y_counted(
             FakePlatform::new(100, 100),
             vec![fake_tree_enabled()],
             Some(|| Box::new(NeverSignals) as Box<dyn ChangeSignal>),
         );
         g.start(&spec()).unwrap();
+        let started = std::time::Instant::now();
 
-        let o = g.wait_for_element(&never_matches(20, 120)).unwrap();
+        let outcome = g
+            .wait_for_element_by(&never_matches(1_000, 5_000), Deadline::from_millis(30))
+            .unwrap();
 
-        assert!(!o.matched);
-        assert_eq!(
-            walks.load(Ordering::Relaxed),
-            2,
-            "a quiet wait re-walked on the interval"
+        assert_eq!(outcome.timed_out_by, Some(crate::Whose::Caller));
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "a 30ms caller deadline was stretched to {:?} by the 1s interval",
+            started.elapsed()
         );
     }
 
@@ -1535,8 +2581,8 @@ mod tests {
                 // Shorter than the quiet ceiling (10 intervals): otherwise a wait that ignored the
                 // change entirely would still match on the forced re-read, and this test would
                 // pass without the wake it exists to prove.
-                interval_ms: 20,
-                timeout_ms: 120,
+                interval_ms: 100,
+                timeout_ms: 500,
             })
             .unwrap();
 
@@ -1580,29 +2626,6 @@ mod tests {
         assert!(
             (3..=6).contains(&n),
             "a quiet 2.5s wait at a 50ms interval read {n} times; the ceiling is not firing"
-        );
-    }
-
-    #[test]
-    fn a_wait_too_short_to_reach_the_ceiling_still_sees_an_unannounced_change() {
-        // The regression this fixes: a wait whose whole budget is shorter than `REREAD_AFTER`
-        // never reaches the forced read, so before the deadline read it answered from the single
-        // snapshot it took before the change happened — a wrong answer, for an element on screen.
-        let (mut g, walks) = glass_with_a11y_counted(
-            FakePlatform::new(100, 100),
-            // Absent on the first read, present on every read after it.
-            vec![fake_tree_enabled(), fake_tree_checked()],
-            Some(|| Box::new(NeverSignals) as Box<dyn ChangeSignal>),
-        );
-        g.start(&spec()).unwrap();
-
-        // 600ms at a 200ms interval: three intervals, and no ceiling inside the budget.
-        let o = g.wait_for_element(&never_matches(200, 600)).unwrap();
-
-        assert!(
-            o.matched,
-            "answered from one stale read after {} walks",
-            walks.load(Ordering::Relaxed)
         );
     }
 
@@ -1689,7 +2712,7 @@ mod tests {
         );
         g.start(&spec()).unwrap();
 
-        let o = g.wait_for_element(&never_matches(20, 80)).unwrap();
+        let o = g.wait_for_element(&never_matches(50, 500)).unwrap();
 
         assert!(!o.matched);
         assert!(
@@ -1699,20 +2722,29 @@ mod tests {
     }
 
     #[test]
-    fn a_backend_without_a_signal_polls_exactly_as_before() {
-        // Every backend but one has no event stream, and two never can. Their waits must keep the
-        // behaviour they had: re-walk each interval.
-        let (mut g, walks) =
-            glass_with_a11y_counted(FakePlatform::new(100, 100), vec![fake_tree_enabled()], None);
+    fn a_backend_without_a_signal_reads_each_state_until_the_condition_matches() {
+        let (mut g, walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            vec![fake_tree(), fake_tree(), fake_tree_enabled()],
+            None,
+        );
         g.start(&spec()).unwrap();
 
-        let o = g.wait_for_element(&never_matches(10, 80)).unwrap();
+        let outcome = g
+            .wait_for_element(&WaitElementParams {
+                name: Some("Save".into()),
+                description: None,
+                role: Some(AxRole::Button),
+                value: None,
+                value_contains: None,
+                condition: ElementCondition::Enabled,
+                interval_ms: 1,
+                timeout_ms: 5_000,
+            })
+            .unwrap();
 
-        assert!(!o.matched);
-        assert!(
-            walks.load(Ordering::Relaxed) > 1,
-            "a backend with no signal stopped polling"
-        );
+        assert!(outcome.matched);
+        assert_eq!(walks.load(Ordering::Relaxed), 3, "one read per state");
     }
 
     #[test]
@@ -1733,6 +2765,341 @@ mod tests {
             .unwrap();
         assert!(!o.matched);
         assert!(o.element.is_none());
+        assert_eq!(o.timed_out_by, Some(crate::Whose::Callee));
+    }
+
+    #[test]
+    fn wait_for_element_names_its_own_timeout_callee() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree_enabled());
+        g.start(&spec()).unwrap();
+        let out = g.wait_for_element(&never_matches(0, 0)).unwrap();
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Callee));
+    }
+
+    #[test]
+    fn wait_for_element_names_the_sequence_timeout_caller() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree_enabled());
+        g.start(&spec()).unwrap();
+        let out = g
+            .wait_for_element_by(&never_matches(5, 1_000), Deadline::from_millis(20))
+            .unwrap();
+        assert_eq!(out.timed_out_by, Some(crate::Whose::Caller));
+    }
+
+    #[test]
+    fn a_caller_deadline_bounds_the_first_wait_for_element_read() {
+        let (mut g, seen) = glass_with_a11y_until_deadline(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+        g.wait_for_element_by(&never_matches(0, 1_000), Deadline::from_millis(20))
+            .unwrap();
+        assert!(
+            seen.lock().unwrap()[0].is_some(),
+            "a bounded sequence must not grant the first read an unbounded exception"
+        );
+    }
+
+    #[test]
+    fn bounded_zero_timeout_wait_performs_one_live_read() {
+        let sequence_deadline = Deadline::from_millis(1_000);
+        let (mut g, wait_read_deadlines) =
+            glass_with_a11y_deadline_log(FakePlatform::new(100, 100), fake_tree_enabled());
+        g.start(&spec()).unwrap();
+
+        g.wait_for_element_by(&never_matches(0, 0), sequence_deadline)
+            .unwrap();
+
+        assert_eq!(
+            wait_read_deadlines.lock().unwrap().as_slice(),
+            &[sequence_deadline]
+        );
+    }
+
+    #[test]
+    fn bounded_zero_timeout_scroll_performs_one_live_read() {
+        let sequence_deadline = Deadline::from_millis(1_000);
+        let (mut g, scroll_read_deadlines) =
+            glass_with_a11y_deadline_log(FakePlatform::new(100, 100), fake_tree());
+        g.start(&spec()).unwrap();
+
+        g.scroll_to_element_by(
+            &ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 0,
+            },
+            sequence_deadline,
+        )
+        .unwrap();
+
+        assert_eq!(
+            scroll_read_deadlines.lock().unwrap().as_slice(),
+            &[sequence_deadline]
+        );
+    }
+
+    #[test]
+    fn scroll_saturation_is_not_reported_as_a_timeout() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert_eq!(out.timed_out_by, None);
+    }
+
+    #[test]
+    fn scroll_to_element_passes_the_same_deadline_to_every_snapshot() {
+        let (mut g, seen) = glass_with_a11y_deadline_log(FakePlatform::new(100, 100), fake_tree());
+        g.start(&spec()).unwrap();
+        g.scroll_to_element_by(
+            &ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 2_000,
+            },
+            Deadline::from_millis(1_000),
+        )
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() > 1);
+        assert!(seen.iter().all(|deadline| *deadline == seen[0]));
+    }
+
+    #[test]
+    fn scroll_to_element_passes_the_exact_deadline_to_pointer_dispatch() {
+        let sequence_deadline = Deadline::from_millis(1_000);
+        let recorded_pointer_deadlines = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100)
+            .with_pointer_deadline_log(recorded_pointer_deadlines.clone());
+        let absent = tree_with(100, 100, vec![]);
+        let realized = tree_with(
+            100,
+            100,
+            vec![AxNode {
+                name: Some("Ghost".into()),
+                ..ax_node(1, AxRole::Button, None, vec![])
+            }],
+        );
+        let mut g = glass_with_a11y_seq(platform, vec![absent, realized]);
+        g.start(&spec()).unwrap();
+
+        g.scroll_to_element_by(
+            &ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 2_000,
+            },
+            sequence_deadline,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recorded_pointer_deadlines.lock().unwrap().as_slice(),
+            &[sequence_deadline]
+        );
+    }
+
+    #[test]
+    fn scroll_resnapshot_refusal_after_a_step_upgrades_not_dispatched() {
+        struct OneTreeThenNotStarted {
+            first: Option<AxTree>,
+        }
+
+        impl Accessibility for OneTreeThenNotStarted {
+            fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+                match self.first.take() {
+                    Some(tree) => Ok(tree),
+                    None => Err(GlassError::deadline_not_started(
+                        "scripted post-scroll accessibility read",
+                    )),
+                }
+            }
+        }
+
+        let scrolls = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_scroll_log(scrolls.clone());
+        let mut g = glass_with_backend(
+            platform,
+            Box::new(OneTreeThenNotStarted {
+                first: Some(tree_with(100, 100, vec![])),
+            }),
+        );
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .scroll_to_element_by(
+                &ScrollToElementParams {
+                    name: Some("Ghost".into()),
+                    description: None,
+                    role: None,
+                    value_contains: None,
+                    direction: Some(ScrollDirection::Down),
+                    anchor: None,
+                    step: SCROLL_TO_DEFAULT_STEP,
+                    timeout_ms: 1_000,
+                },
+                Deadline::from_millis(1_000),
+            )
+            .expect_err("the post-scroll read is scripted to fail");
+
+        assert_eq!(error.bound(), Some(BoundKind::NotStarted), "{error}");
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert_eq!(
+            scrolls.lock().unwrap().len(),
+            1,
+            "one scroll was dispatched"
+        );
+        assert!(
+            error.to_string().contains("post-scroll accessibility read"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn resize_after_a_scroll_preserves_the_later_coordinate_failure() {
+        let scrolls = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100)
+            .resized_to(WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            })
+            .resized_to(WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+            })
+            .with_scroll_log(scrolls.clone());
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&spec()).unwrap();
+
+        let error = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 1_000,
+            })
+            .expect_err("the retained anchor must be outside the resized window");
+
+        assert_eq!(
+            scrolls.lock().unwrap().len(),
+            1,
+            "one scroll must land before the resize is observed"
+        );
+        assert_eq!(
+            error.to_string(),
+            "coordinate (50,50) out of bounds for 50x50 window"
+        );
+        assert!(matches!(
+            error.cause(),
+            GlassError::CoordOutOfBounds {
+                x: 50,
+                y: 50,
+                width: 50,
+                height: 50,
+            }
+        ));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn a_spent_caller_deadline_starts_no_settle_capture() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])])
+            .with_capture_log(captures.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let error = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 0,
+                    settle_frames: 2,
+                    tolerance: 0,
+                    timeout_ms: 1_000,
+                    stability_region: None,
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                Deadline::from_millis(0),
+            )
+            .unwrap_err();
+        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+        assert!(captures.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sequence_deadline_during_settle_is_an_error_not_soft_settled_false() {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![
+                Frame::solid(4, 4, [0, 0, 0, 255]),
+                Frame::solid(4, 4, [1, 1, 1, 255]),
+            ])
+            .with_capture_log(captures.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let error = g
+            .wait_stable_by(
+                &WaitStableParams {
+                    interval_ms: 50,
+                    settle_frames: 3,
+                    tolerance: 0,
+                    timeout_ms: 1_000,
+                    stability_region: Some(Region {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 2,
+                    }),
+                    ignore: Vec::new(),
+                    window: None,
+                },
+                Deadline::from_millis(20),
+            )
+            .unwrap_err();
+        assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+        assert_eq!(captures.lock().unwrap().len(), 1);
     }
 
     #[test]

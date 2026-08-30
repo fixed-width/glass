@@ -30,6 +30,63 @@ pub mod vkmap; // pure named-keysym->VK map — cross-platform, host-tested
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
 pub const BACKEND: &str = "windows";
 
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct WindowsDispatch(std::cell::Cell<bool>);
+
+#[cfg(any(windows, test))]
+impl WindowsDispatch {
+    fn mark(&self) {
+        self.0.set(true);
+    }
+
+    fn deadline_error(&self, op: &str) -> glass_core::GlassError {
+        if self.0.get() {
+            glass_core::GlassError::caller_deadline_elapsed(op)
+        } else {
+            glass_core::GlassError::deadline_not_started(op)
+        }
+    }
+
+    fn classify(&self, op: &str, error: glass_core::GlassError) -> glass_core::GlassError {
+        if self.0.get()
+            && error.bound_owner() == Some(glass_core::Whose::Caller)
+            && error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched)
+        {
+            glass_core::GlassError::caller_deadline_elapsed(op)
+        } else {
+            error
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn run_windows_call_by<T>(
+    deadline: glass_core::Deadline,
+    op: &str,
+    call: impl FnOnce(&WindowsDispatch) -> glass_core::Result<T>,
+) -> glass_core::Result<T> {
+    if deadline.has_passed() {
+        return Err(glass_core::GlassError::deadline_not_started(op));
+    }
+    let dispatch = WindowsDispatch::default();
+    let answer = call(&dispatch).map_err(|error| dispatch.classify(op, error))?;
+    if deadline.has_passed() {
+        return Err(dispatch.deadline_error(op));
+    }
+    Ok(answer)
+}
+
+#[cfg(any(windows, test))]
+fn run_windows_type_by<S: glass_core::TypeSink>(
+    sink: &mut S,
+    text: &str,
+    dwell: std::time::Duration,
+    deadline: glass_core::Deadline,
+) -> glass_core::Result<()> {
+    glass_core::run_type_by(sink, text, dwell, deadline)
+}
+
 /// One-time stderr note when a contained app can't get a private clipboard (hook DLL missing):
 /// the app's clipboard is disabled to protect the user's — never a silent revert to sharing it.
 #[cfg(windows)]
@@ -112,6 +169,7 @@ mod backend {
 
     use crate::containment::{Launched, LogSink};
     use crate::display::{DisplayProvider, ExistingDesktop};
+    use crate::run_windows_call_by;
     use crate::windows::{
         app_window_infos, find_app_window, focus_window, geometry_of, move_window, resize_window,
     };
@@ -264,23 +322,55 @@ mod backend {
             Ok(())
         }
 
-        fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+        fn capture_frame_by(
+            &mut self,
+            region: Option<&Region>,
+            deadline: glass_core::Deadline,
+        ) -> Result<Frame> {
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("capture"));
+            }
             let raw = self.active_hwnd.ok_or_else(|| {
                 GlassError::CaptureFailed(
                     "no active window; start an app or select a window first".into(),
                 )
             })?;
-            crate::capture::capture_window(crate::util::raw_to_hwnd(raw), region)
+            crate::capture::capture_window_by(crate::util::raw_to_hwnd(raw), region, deadline)
         }
 
-        fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
-            let raw = self.active_hwnd.ok_or(GlassError::WindowNotFound)?;
-            crate::input::send_pointer(raw, event)
+        fn capture_window_by(
+            &mut self,
+            _id: WindowId,
+            _region: Option<&Region>,
+            deadline: glass_core::Deadline,
+        ) -> Result<Frame> {
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("window capture"));
+            }
+            Err(GlassError::Unsupported(
+                "capture_window is not supported by this backend".into(),
+            ))
         }
 
-        fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+        fn send_pointer_by(
+            &mut self,
+            event: &PointerEvent,
+            deadline: glass_core::Deadline,
+        ) -> Result<()> {
+            glass_core::validate_pointer_input(event)?;
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("pointer input"));
+            }
             let raw = self.active_hwnd.ok_or(GlassError::WindowNotFound)?;
-            crate::input::send_key(raw, event)
+            crate::input::send_pointer_by(raw, event, deadline)
+        }
+
+        fn send_key_by(&mut self, event: &KeyEvent, deadline: glass_core::Deadline) -> Result<()> {
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("key input"));
+            }
+            let raw = self.active_hwnd.ok_or(GlassError::WindowNotFound)?;
+            crate::input::send_key_by(raw, event, deadline)
         }
 
         fn get_clipboard(&mut self) -> Result<String> {
@@ -313,52 +403,69 @@ mod backend {
             }
         }
 
-        fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
-            let raw = self.active_hwnd.ok_or(GlassError::WindowNotFound)?;
-            let hwnd = crate::util::raw_to_hwnd(raw);
-            match *op {
-                WindowOp::Focus => focus_window(hwnd)?,
-                WindowOp::Move { x, y } => move_window(hwnd, x, y)?,
-                WindowOp::Resize { width, height } => resize_window(hwnd, width, height)?,
-                WindowOp::Geometry => {}
-            }
-            // Re-read the resulting geometry (the op may have moved/resized the frame).
-            geometry_of(hwnd)
+        fn window_by(
+            &mut self,
+            op: &WindowOp,
+            deadline: glass_core::Deadline,
+        ) -> Result<WindowGeometry> {
+            run_windows_call_by(deadline, "Windows window operation", |dispatch| {
+                let raw = self.active_hwnd.ok_or(GlassError::WindowNotFound)?;
+                let hwnd = crate::util::raw_to_hwnd(raw);
+                dispatch.mark();
+                match *op {
+                    WindowOp::Focus => focus_window(hwnd)?,
+                    WindowOp::Move { x, y } => move_window(hwnd, x, y)?,
+                    WindowOp::Resize { width, height } => resize_window(hwnd, width, height)?,
+                    WindowOp::Geometry => {}
+                }
+                // Re-read the resulting geometry (the op may have moved/resized the frame).
+                geometry_of(hwnd)
+            })
         }
 
-        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-            // No active app -> WindowNotFound, never an empty list (mirrors x11).
-            if self.app.is_none() {
-                return Err(GlassError::WindowNotFound);
-            }
-            let pids = self.app_pids();
-            let mut out = Vec::new();
-            for w in app_window_infos(&pids) {
-                out.push(WindowInfo {
-                    id: WindowId(w.raw as u64),
-                    title: (!w.title.is_empty()).then(|| w.title.clone()),
-                    class: (!w.class.is_empty()).then(|| w.class.clone()),
-                    geometry: geometry_of(w.hwnd())?,
-                    active: Some(w.raw) == self.active_hwnd,
-                });
-            }
-            Ok(out)
+        fn list_windows_by(&mut self, deadline: glass_core::Deadline) -> Result<Vec<WindowInfo>> {
+            run_windows_call_by(deadline, "Windows window list", |dispatch| {
+                // No active app -> WindowNotFound, never an empty list (mirrors x11).
+                if self.app.is_none() {
+                    return Err(GlassError::WindowNotFound);
+                }
+                let pids = self.app_pids();
+                dispatch.mark();
+                let mut out = Vec::new();
+                for w in app_window_infos(&pids) {
+                    out.push(WindowInfo {
+                        id: WindowId(w.raw as u64),
+                        title: (!w.title.is_empty()).then(|| w.title.clone()),
+                        class: (!w.class.is_empty()).then(|| w.class.clone()),
+                        geometry: geometry_of(w.hwnd())?,
+                        active: Some(w.raw) == self.active_hwnd,
+                    });
+                }
+                Ok(out)
+            })
         }
 
-        fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
-            if self.app.is_none() {
-                return Err(GlassError::WindowNotFound);
-            }
-            let pids = self.app_pids();
-            let raw = id.0 as isize;
-            // Validate against the current app-window set (stronger than a bare IsWindow,
-            // and matches x11): only switch to a window the app actually owns right now.
-            if app_window_infos(&pids).iter().any(|w| w.raw == raw) {
-                self.active_hwnd = Some(raw);
-                geometry_of(crate::util::raw_to_hwnd(raw))
-            } else {
-                Err(GlassError::WindowNotFound)
-            }
+        fn select_window_by(
+            &mut self,
+            id: WindowId,
+            deadline: glass_core::Deadline,
+        ) -> Result<WindowGeometry> {
+            run_windows_call_by(deadline, "Windows window selection", |dispatch| {
+                if self.app.is_none() {
+                    return Err(GlassError::WindowNotFound);
+                }
+                let pids = self.app_pids();
+                let raw = id.0 as isize;
+                dispatch.mark();
+                // Validate against the current app-window set (stronger than a bare IsWindow,
+                // and matches x11): only switch to a window the app actually owns right now.
+                if app_window_infos(&pids).iter().any(|w| w.raw == raw) {
+                    self.active_hwnd = Some(raw);
+                    geometry_of(crate::util::raw_to_hwnd(raw))
+                } else {
+                    Err(GlassError::WindowNotFound)
+                }
+            })
         }
 
         fn drain_logs(&mut self) -> Vec<(Stream, String)> {
@@ -374,6 +481,18 @@ mod backend {
         /// descendant walk for Sandboxie) — this just delegates. Empty if no app is launched.
         fn app_pids(&self) -> Vec<u32> {
             self.app.as_ref().map(|a| a.pids()).unwrap_or_default()
+        }
+
+        fn app_pids_by(&self, deadline: glass_core::Deadline) -> Result<Vec<u32>> {
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started(
+                    "Windows accessibility process discovery",
+                ));
+            }
+            match &self.app {
+                Some(app) => app.pids_by(deadline),
+                None => Ok(Vec::new()),
+            }
         }
 
         /// The adopted window's `HWND` (as `i64`), so the a11y reader binds UI Automation straight
@@ -434,5 +553,86 @@ mod capability_tests {
         assert!(msg.contains("windows backend"), "{msg}");
         assert!(msg.contains("glass_capabilities"), "{msg}");
         assert!(!msg.contains("android"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::{run_windows_call_by, run_windows_type_by};
+    use glass_core::{BoundDispatch, Deadline, GlassError, Result, TypeSink, Whose};
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct RecordingTypeSink {
+        characters: Vec<char>,
+    }
+
+    impl TypeSink for RecordingTypeSink {
+        fn character(&mut self, character: char) -> Result<()> {
+            self.characters.push(character);
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spent_input_deadline_dispatches_no_backend_events() {
+        let mut recorded_events = Vec::new();
+        let deadline = Deadline::at(Instant::now() - Duration::from_millis(1));
+
+        let error = run_windows_call_by(deadline, "pointer input", |_| {
+            recorded_events.push("motion");
+            Ok(())
+        })
+        .expect_err("spent input must be rejected before dispatch");
+
+        assert!(recorded_events.is_empty());
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn pre_dispatch_caller_deadline_error_stays_not_dispatched() {
+        let error = run_windows_call_by(Deadline::UNBOUNDED, "capture", |_| {
+            Err::<(), _>(GlassError::deadline_not_started("WGC capture"))
+        })
+        .expect_err("capture did not reach WGC");
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn short_typing_deadline_stops_before_all_characters() {
+        let requested_text = "abcd";
+        let mut sink = RecordingTypeSink::default();
+
+        let error = run_windows_type_by(
+            &mut sink,
+            requested_text,
+            Duration::ZERO,
+            Deadline::from_millis(5),
+        )
+        .expect_err("typing must stop when the shared deadline expires");
+
+        assert!(sink.characters.len() < requested_text.chars().count());
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn capture_returning_after_the_deadline_is_not_success() {
+        let capture_error = run_windows_call_by(Deadline::from_millis(1), "capture", |dispatch| {
+            dispatch.mark();
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        })
+        .expect_err("a late capture must not return success");
+
+        assert_eq!(capture_error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            capture_error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
     }
 }

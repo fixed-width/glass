@@ -17,9 +17,16 @@ pub(crate) use std::time::Duration;
 /// asserting it (not `capture_frame`) was used, and with what arguments.
 pub(crate) type CaptureWindowLog = Arc<Mutex<Vec<(WindowId, Option<Region>)>>>;
 
+/// Every deadline handed to a fake platform capture.
+pub(crate) type CaptureDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
+pub(crate) type InputDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
+
 /// The last `AxContext` a fake `Accessibility` was called with — see
 /// [`FakeAccessibility::ctx_log`].
 pub(crate) type CtxLog = Arc<Mutex<Option<AxContext>>>;
+pub(crate) type AxDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
+pub(crate) type AxReadStartLog = Arc<Mutex<Vec<(Deadline, bool)>>>;
+pub(crate) type PidDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
 
 /// Scriptable in-memory backend for testing the session manager.
 #[derive(Default)]
@@ -27,10 +34,21 @@ pub(crate) struct FakePlatform {
     geometry: WindowGeometry,
     frames: VecDeque<Frame>,
     pending_logs: Vec<(Stream, String)>,
+    drain_logs_delay: Option<Duration>,
     pointer_events: Vec<PointerEvent>,
+    fail_pointer: bool,
     key_events: Vec<KeyEvent>,
     started: bool,
     capture_log: Arc<Mutex<Vec<Option<Region>>>>,
+    capture_deadline_log: Option<CaptureDeadlineLog>,
+    pointer_deadline_log: Option<InputDeadlineLog>,
+    key_deadline_log: Option<InputDeadlineLog>,
+    pid_deadline_log: Option<PidDeadlineLog>,
+    capture_delay: Option<Duration>,
+    capture_deadline_error_owner: Option<crate::Whose>,
+    capture_error_owners: VecDeque<Option<crate::Whose>>,
+    geometry_delay: Option<Duration>,
+    fail_geometry_before_dispatch: bool,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
     log_batches: std::collections::VecDeque<Vec<(Stream, String)>>,
     key_log: Arc<Mutex<Vec<KeyEvent>>>,
@@ -48,6 +66,14 @@ pub(crate) struct FakePlatform {
     /// Every `select_window(id)` call, in order — for asserting popover routing
     /// selects the popover then restores the previously-active window.
     select_log: Arc<Mutex<Vec<WindowId>>>,
+    /// Optional delay before each selection completes, for exercising a focus change that spends
+    /// the caller's remaining semantic-action deadline.
+    select_delay: Option<Duration>,
+    /// A selected id whose lookup/focus fails, for proving restoration failures stay visible.
+    fail_select_window: Option<WindowId>,
+    /// A selected id rejected before any focus request is dispatched, for proving the caller does
+    /// not claim focus mutation or attempt restoration when the seam says nothing ran.
+    reject_select_window_before_dispatch: Option<WindowId>,
     /// When set, `list_windows` errors instead of returning its scripted list — for
     /// proving a failed popover-probe enumeration degrades to the normal click path
     /// instead of propagating.
@@ -88,6 +114,56 @@ impl FakePlatform {
         self.capture_log = log;
         self
     }
+    pub(crate) fn with_capture_deadline_log(mut self, log: CaptureDeadlineLog) -> Self {
+        self.capture_deadline_log = Some(log);
+        self
+    }
+    pub(crate) fn with_pointer_deadline_log(mut self, log: InputDeadlineLog) -> Self {
+        self.pointer_deadline_log = Some(log);
+        self
+    }
+    pub(crate) fn with_failing_pointer(mut self) -> Self {
+        self.fail_pointer = true;
+        self
+    }
+    pub(crate) fn with_key_deadline_log(mut self, log: InputDeadlineLog) -> Self {
+        self.key_deadline_log = Some(log);
+        self
+    }
+    pub(crate) fn with_pid_deadline_log(mut self, log: PidDeadlineLog) -> Self {
+        self.pid_deadline_log = Some(log);
+        self
+    }
+    pub(crate) fn with_capture_delay(mut self, delay: Duration) -> Self {
+        self.capture_delay = Some(delay);
+        self
+    }
+    pub(crate) fn honoring_capture_deadline(mut self) -> Self {
+        self.capture_deadline_error_owner = Some(crate::Whose::Caller);
+        self
+    }
+    pub(crate) fn with_capture_error_owners(mut self, owners: Vec<Option<crate::Whose>>) -> Self {
+        self.capture_error_owners = owners.into();
+        self
+    }
+    fn scripted_capture_error(&mut self, operation: &'static str) -> Option<GlassError> {
+        self.capture_error_owners
+            .pop_front()
+            .flatten()
+            .map(|whose| match whose {
+                crate::Whose::Caller => GlassError::caller_deadline_elapsed(operation),
+                crate::Whose::Callee => GlassError::Bounded {
+                    kind: crate::BoundKind::TimedOut,
+                    whose,
+                    dispatch: crate::BoundDispatch::MayHaveDispatched,
+                    message: format!("{operation}: the backend capture budget elapsed"),
+                },
+            })
+    }
+    pub(crate) fn with_geometry_delay(mut self, delay: Duration) -> Self {
+        self.geometry_delay = Some(delay);
+        self
+    }
     pub(crate) fn with_click_log(mut self, log: Arc<Mutex<Vec<(i32, i32)>>>) -> Self {
         self.click_log = log;
         self
@@ -110,6 +186,18 @@ impl FakePlatform {
         self.select_log = log;
         self
     }
+    pub(crate) fn with_select_delay(mut self, delay: Duration) -> Self {
+        self.select_delay = Some(delay);
+        self
+    }
+    pub(crate) fn with_failing_select_window(mut self, id: WindowId) -> Self {
+        self.fail_select_window = Some(id);
+        self
+    }
+    pub(crate) fn rejecting_select_window_before_dispatch(mut self, id: WindowId) -> Self {
+        self.reject_select_window_before_dispatch = Some(id);
+        self
+    }
     pub(crate) fn counting_stops(mut self, c: Arc<Mutex<u32>>) -> Self {
         self.stop_count = Some(c);
         self
@@ -130,6 +218,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_logs(mut self, logs: Vec<(Stream, &str)>) -> Self {
         self.pending_logs = logs.into_iter().map(|(s, t)| (s, t.to_string())).collect();
+        self
+    }
+    pub(crate) fn with_drain_logs_delay(mut self, delay: Duration) -> Self {
+        self.drain_logs_delay = Some(delay);
         self
     }
     /// One batch per drain, in order, so a line can be made to arrive on a chosen pump rather
@@ -156,6 +248,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_failing_list_windows(mut self) -> Self {
         self.fail_list_windows = true;
+        self
+    }
+    pub(crate) fn with_failing_geometry(mut self) -> Self {
+        self.fail_geometry_before_dispatch = true;
         self
     }
     pub(crate) fn with_trailing_toggle_backend(mut self) -> Self {
@@ -191,7 +287,32 @@ impl Platform for FakePlatform {
         }
         self.stop_app()
     }
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        if let Some(log) = &self.capture_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
+        if let Some(error) = self.scripted_capture_error("capture") {
+            return Err(error);
+        }
+        if let Some(delay) = self.capture_delay {
+            std::thread::sleep(delay);
+        }
+        if let Some(whose) = self.capture_deadline_error_owner
+            && deadline.has_passed()
+        {
+            return Err(match whose {
+                crate::Whose::Caller => GlassError::caller_deadline_elapsed("capture"),
+                crate::Whose::Callee => GlassError::Bounded {
+                    kind: crate::BoundKind::TimedOut,
+                    whose,
+                    dispatch: crate::BoundDispatch::MayHaveDispatched,
+                    message: "capture: the backend capture budget elapsed".into(),
+                },
+            });
+        }
         self.capture_log.lock().unwrap().push(region.copied());
         let frame = match self.frames.pop_front() {
             Some(f) => {
@@ -207,7 +328,37 @@ impl Platform for FakePlatform {
             None => Ok(frame),
         }
     }
-    fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
+    fn capture_window_by(
+        &mut self,
+        id: WindowId,
+        region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if let Some(log) = &self.capture_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        if let Some(error) = self.scripted_capture_error("window capture") {
+            return Err(error);
+        }
+        if let Some(delay) = self.capture_delay {
+            std::thread::sleep(delay);
+        }
+        if let Some(whose) = self.capture_deadline_error_owner
+            && deadline.has_passed()
+        {
+            return Err(match whose {
+                crate::Whose::Caller => GlassError::caller_deadline_elapsed("window capture"),
+                crate::Whose::Callee => GlassError::Bounded {
+                    kind: crate::BoundKind::TimedOut,
+                    whose,
+                    dispatch: crate::BoundDispatch::MayHaveDispatched,
+                    message: "window capture: the backend capture budget elapsed".into(),
+                },
+            });
+        }
         self.capture_window_log
             .lock()
             .unwrap()
@@ -222,7 +373,13 @@ impl Platform for FakePlatform {
             None => Ok(frame),
         }
     }
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        if let Some(log) = &self.pointer_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("pointer input"));
+        }
         if let PointerEvent::Click { x, y, .. } = event {
             self.click_log.lock().unwrap().push((*x, *y));
         }
@@ -233,20 +390,53 @@ impl Platform for FakePlatform {
             self.drag_log.lock().unwrap().push(event.clone());
         }
         self.pointer_events.push(event.clone());
-        Ok(())
+        if self.fail_pointer {
+            Err(GlassError::Backend("scripted pointer failure".into()))
+        } else {
+            Ok(())
+        }
     }
     fn app_pid(&self) -> Option<u32> {
         Some(4242)
     }
+    fn app_pids_by(&self, deadline: Deadline) -> Result<Vec<u32>> {
+        if let Some(log) = &self.pid_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
+        if deadline.has_passed() {
+            Err(GlassError::deadline_not_started(
+                "accessibility process discovery",
+            ))
+        } else {
+            Ok(vec![4242])
+        }
+    }
     fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
         self.a11y_trailing_toggle
     }
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        if let Some(log) = &self.key_deadline_log {
+            log.lock().unwrap().push(deadline);
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("key input"));
+        }
         self.key_events.push(event.clone());
         self.key_log.lock().unwrap().push(event.clone());
         Ok(())
     }
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window operation"));
+        }
+        if matches!(op, WindowOp::Geometry) && self.fail_geometry_before_dispatch {
+            return Err(GlassError::deadline_not_started("window operation"));
+        }
+        if matches!(op, WindowOp::Geometry)
+            && let Some(delay) = self.geometry_delay
+        {
+            std::thread::sleep(delay);
+        }
         match *op {
             WindowOp::Resize { width, height } => {
                 self.geometry.width = width;
@@ -266,42 +456,81 @@ impl Platform for FakePlatform {
                 }
             }
         }
-        Ok(self.geometry.clone())
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("window operation"))
+        } else {
+            Ok(self.geometry.clone())
+        }
     }
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window list"));
+        }
         if self.fail_list_windows {
             return Err(GlassError::Backend("list_windows unavailable".into()));
         }
-        if self.windows.is_empty() {
-            Ok(vec![WindowInfo {
+        let windows = if self.windows.is_empty() {
+            vec![WindowInfo {
                 id: WindowId(0),
                 title: None,
                 class: None,
                 geometry: self.geometry.clone(),
                 active: true,
-            }])
+            }]
         } else {
-            Ok(self.windows.clone())
+            self.windows.clone()
+        };
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("window list"))
+        } else {
+            Ok(windows)
         }
     }
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
-        self.select_log.lock().unwrap().push(id);
-        if self.windows.is_empty() {
-            return if id == WindowId(0) {
-                Ok(self.geometry.clone())
-            } else {
-                Err(GlassError::WindowNotFound)
-            };
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window selection"));
         }
-        let w = self
-            .windows
-            .iter()
-            .find(|w| w.id == id)
-            .ok_or(GlassError::WindowNotFound)?;
-        self.geometry = w.geometry.clone();
-        Ok(self.geometry.clone())
+        if self.reject_select_window_before_dispatch == Some(id) {
+            return Err(GlassError::Backend(format!(
+                "scripted pre-dispatch rejection for {}",
+                id.0
+            ))
+            .before_dispatch());
+        }
+        self.select_log.lock().unwrap().push(id);
+        if let Some(delay) = self.select_delay {
+            std::thread::sleep(delay);
+        }
+        if self.fail_select_window == Some(id) {
+            return Err(GlassError::Backend(format!(
+                "scripted select_window failure for {}",
+                id.0
+            )));
+        }
+        let geometry = if self.windows.is_empty() {
+            if id != WindowId(0) {
+                return Err(GlassError::WindowNotFound);
+            }
+            self.geometry.clone()
+        } else {
+            let w = self
+                .windows
+                .iter()
+                .find(|w| w.id == id)
+                .ok_or(GlassError::WindowNotFound)?;
+            self.geometry = w.geometry.clone();
+            self.geometry.clone()
+        };
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("window selection"))
+        } else {
+            Ok(geometry)
+        }
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+        if let Some(delay) = self.drain_logs_delay {
+            std::thread::sleep(delay);
+        }
         if let Some(batch) = self.log_batches.pop_front() {
             return batch;
         }
@@ -610,10 +839,17 @@ pub(crate) struct SeqAccessibility {
     /// How many times a subscription was asked for. A wait that subscribes when it cannot use the
     /// signal pays a round-trip for nothing.
     subscribes: Arc<AtomicUsize>,
+    deadlines: AxDeadlineLog,
+    read_starts: AxReadStartLog,
 }
 
 impl Accessibility for SeqAccessibility {
-    fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+    fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        self.deadlines.lock().unwrap().push(ctx.deadline);
+        self.read_starts
+            .lock()
+            .unwrap()
+            .push((ctx.deadline, !ctx.deadline.has_passed()));
         self.walks.fetch_add(1, Ordering::Relaxed);
         let t = self.trees[self.idx.min(self.trees.len() - 1)].clone();
         self.idx += 1;
@@ -623,10 +859,12 @@ impl Accessibility for SeqAccessibility {
         self.subscribes.fetch_add(1, Ordering::Relaxed);
         self.signal.map(|make| make())
     }
-    fn set_value(&mut self, _ctx: &AxContext, _t: &AxTarget, _s: &str) -> Result<()> {
+    fn set_value(&mut self, ctx: &AxContext, _t: &AxTarget, _s: &str) -> Result<()> {
+        self.deadlines.lock().unwrap().push(ctx.deadline);
         Ok(())
     }
-    fn invoke(&mut self, _ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
+        self.deadlines.lock().unwrap().push(ctx.deadline);
         scripted_invoke(self.invoke_behavior, &self.invoke_log, target)
     }
 }
@@ -643,11 +881,36 @@ pub(crate) fn glass_with_a11y_seq_invoke(
     trees: Vec<AxTree>,
     behavior: InvokeBehavior,
 ) -> (Glass, Arc<Mutex<Vec<AxTarget>>>) {
+    let (g, invoke_log, _) = glass_with_a11y_seq_deadlines(platform, trees, behavior);
+    (g, invoke_log)
+}
+
+pub(crate) fn glass_with_a11y_seq_deadlines(
+    platform: FakePlatform,
+    trees: Vec<AxTree>,
+    behavior: InvokeBehavior,
+) -> (Glass, Arc<Mutex<Vec<AxTarget>>>, AxDeadlineLog) {
+    let (g, invoke_log, deadlines, _) = glass_with_a11y_seq_observed(platform, trees, behavior);
+    (g, invoke_log, deadlines)
+}
+
+pub(crate) fn glass_with_a11y_seq_observed(
+    platform: FakePlatform,
+    trees: Vec<AxTree>,
+    behavior: InvokeBehavior,
+) -> (
+    Glass,
+    Arc<Mutex<Vec<AxTarget>>>,
+    AxDeadlineLog,
+    AxReadStartLog,
+) {
     debug_assert!(
         !trees.is_empty(),
         "glass_with_a11y_seq_invoke needs at least one tree (snapshot indexes trees.len() - 1)"
     );
     let invoke_log = Arc::new(Mutex::new(Vec::new()));
+    let deadlines = Arc::new(Mutex::new(Vec::new()));
+    let read_starts = Arc::new(Mutex::new(Vec::new()));
     let g = glass_with_backend(
         platform,
         Box::new(SeqAccessibility {
@@ -658,9 +921,11 @@ pub(crate) fn glass_with_a11y_seq_invoke(
             walks: Arc::new(AtomicUsize::new(0)),
             signal: None,
             subscribes: Arc::new(AtomicUsize::new(0)),
+            deadlines: deadlines.clone(),
+            read_starts: read_starts.clone(),
         }),
     );
-    (g, invoke_log)
+    (g, invoke_log, deadlines, read_starts)
 }
 
 /// A session whose accessibility backend counts walks and hands out `signal`.
@@ -694,6 +959,8 @@ pub(crate) fn glass_with_a11y_counted_subs(
             walks: walks.clone(),
             signal,
             subscribes: subscribes.clone(),
+            deadlines: Arc::new(Mutex::new(Vec::new())),
+            read_starts: Arc::new(Mutex::new(Vec::new())),
         }),
     );
     (g, walks, subscribes)
@@ -902,22 +1169,57 @@ impl Platform for BareMinPlatform {
     fn stop_app_by(&mut self, _deadline: crate::Deadline) -> Result<()> {
         Ok(())
     }
-    fn capture_frame(&mut self, _region: Option<&crate::frame::Region>) -> Result<Frame> {
+    fn capture_frame_by(
+        &mut self,
+        _region: Option<&crate::frame::Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
         Err(GlassError::CaptureFailed("bare".into()))
     }
-    fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&crate::frame::Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
+    }
+    fn send_pointer_by(&mut self, _event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("pointer input"));
+        }
         Ok(())
     }
-    fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
+    fn send_key_by(&mut self, _event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("key input"));
+        }
         Ok(())
     }
-    fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, _op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window operation"));
+        }
         Ok(WindowGeometry::default())
     }
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window list"));
+        }
         Ok(vec![])
     }
-    fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+    fn select_window_by(&mut self, _id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window selection"));
+        }
         Err(GlassError::WindowNotFound)
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
@@ -1021,6 +1323,79 @@ pub(crate) fn glass_with_a11y_until_deadline(
         platform,
         Box::new(UntilDeadline {
             tree: fake_tree_enabled(),
+            seen: seen.clone(),
+        }),
+    );
+    (g, seen)
+}
+
+/// A reader that consumes bounded snapshot budgets with the platform readiness error but answers
+/// unbounded reads.
+pub(crate) struct NotReadyAtDeadline {
+    pub(crate) tree: AxTree,
+    pub(crate) seen: Arc<Mutex<Vec<Deadline>>>,
+}
+
+impl Accessibility for NotReadyAtDeadline {
+    fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        self.seen.lock().unwrap().push(ctx.deadline);
+        if let Some(left) = ctx.deadline.remaining() {
+            std::thread::sleep(left);
+            return Err(GlassError::AccessibilityNotReady(
+                "no accessibility tree within the time this call allowed".into(),
+            ));
+        }
+        Ok(self.tree.clone())
+    }
+}
+
+pub(crate) fn glass_with_a11y_not_ready_at_deadline(
+    platform: FakePlatform,
+) -> (Glass, Arc<Mutex<Vec<Deadline>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let g = glass_with_backend(
+        platform,
+        Box::new(NotReadyAtDeadline {
+            tree: fake_tree_enabled(),
+            seen: seen.clone(),
+        }),
+    );
+    (g, seen)
+}
+
+pub(crate) struct UnavailableAccessibility;
+
+impl Accessibility for UnavailableAccessibility {
+    fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+        Err(GlassError::AccessibilityUnavailable("reader failed".into()))
+    }
+}
+
+pub(crate) fn glass_with_a11y_unavailable(platform: FakePlatform) -> Glass {
+    glass_with_backend(platform, Box::new(UnavailableAccessibility))
+}
+
+pub(crate) struct RecordingDeadlines {
+    pub(crate) tree: AxTree,
+    pub(crate) seen: Arc<Mutex<Vec<Deadline>>>,
+}
+
+impl Accessibility for RecordingDeadlines {
+    fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        self.seen.lock().unwrap().push(ctx.deadline);
+        Ok(self.tree.clone())
+    }
+}
+
+pub(crate) fn glass_with_a11y_deadline_log(
+    platform: FakePlatform,
+    tree: AxTree,
+) -> (Glass, Arc<Mutex<Vec<Deadline>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let g = glass_with_backend(
+        platform,
+        Box::new(RecordingDeadlines {
+            tree,
             seen: seen.clone(),
         }),
     );

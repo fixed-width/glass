@@ -155,30 +155,27 @@ pub(crate) fn probe_system_wide() -> SystemWideProbe {
     probe_system_wide_attr(crate::doctor::PROBE_ATTRIBUTE)
 }
 
-/// How long one doctor AX read may wait before the API gives up — chosen to leave room for a busy
-/// frontmost application rather than measured against one.
-const PROBE_TIMEOUT_SECS: f32 = 2.0;
+struct SystemWideAxMessaging;
 
-/// The process-global AX messaging timeout, restored on drop.
-///
-/// A guard rather than a pair of calls so an unwind between them cannot leave the whole server
-/// running with the probe's short bound.
-struct ProbeTimeout<'a>(&'a AXUIElement);
+impl crate::messaging_timeout::AxMessaging for SystemWideAxMessaging {
+    type Element = CFRetained<AXUIElement>;
 
-impl<'a> ProbeTimeout<'a> {
-    fn set(el: &'a AXUIElement) -> Self {
-        // SAFETY: `el` is a live `AXUIElement`; the call takes a plain timeout with no aliasing or
-        // lifetime preconditions. A timeout that could not be set leaves the system default in
-        // place: the probe is then bounded only by that default, as it was before.
-        let _ = unsafe { el.set_messaging_timeout(PROBE_TIMEOUT_SECS) };
-        Self(el)
+    fn system_wide_element(&self) -> Self::Element {
+        // SAFETY: the binding guarantees a live process-global accessibility element.
+        unsafe { AXUIElement::new_system_wide() }
     }
-}
 
-impl Drop for ProbeTimeout<'_> {
-    fn drop(&mut self) {
-        // SAFETY: as in `set`; 0 on the system-wide object restores the documented default.
-        let _ = unsafe { self.0.set_messaging_timeout(0.0) };
+    fn set_messaging_timeout(&self, element: &Self::Element, seconds: f32) -> Result<()> {
+        // SAFETY: `element` is live and `seconds` is finite. Apple documents a timeout set on the
+        // system-wide element as the process-global value inherited by exact app/window objects.
+        let error = unsafe { element.set_messaging_timeout(seconds) };
+        if error == AXError::Success {
+            Ok(())
+        } else {
+            Err(GlassError::Backend(format!(
+                "AXUIElementSetMessagingTimeout failed during glass_doctor: {error:?}"
+            )))
+        }
     }
 }
 
@@ -186,22 +183,28 @@ impl Drop for ProbeTimeout<'_> {
 /// an attribute the system-wide element does not carry and see a real non-`Success` code come back
 /// from the API rather than from a fixture.
 fn probe_system_wide_attr(attr_name: &str) -> SystemWideProbe {
-    // SAFETY: `AXUIElementCreateSystemWide` takes no arguments and never returns NULL per Apple's
-    // documented contract (the binding itself `.expect()`s on this).
-    let el = unsafe { AXUIElement::new_system_wide() };
-    // Setting a timeout on the *system-wide* object sets it globally for the process (Apple's
-    // documented behaviour), so the bound is restored the moment the read returns — otherwise one
-    // `glass_doctor` call would cap every later a11y read in the server, a diagnostic changing what
-    // the product does. `glass_doctor` does not run on the serialized platform thread, so an a11y
-    // read *concurrent* with the probe still sees the cap; that window is one attribute read long,
-    // where the alternative is an unbounded doctor.
-    let _timeout = ProbeTimeout::set(&el);
-    let attr = CFString::from_str(attr_name);
-    let mut raw: *const CFType = std::ptr::null();
-    // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
-    // `AXUIElementCopyAttributeValue`'s documented signature (mirrors `copy_attribute_checked`).
-    let err = unsafe { el.copy_attribute_value(&attr, NonNull::from(&mut raw)) };
-    drop(_timeout);
+    let result =
+        crate::messaging_timeout::with_doctor_timeout_by(&SystemWideAxMessaging, |scope| {
+            // Create the exact probe object only after acquiring the shared process-global owner.
+            // SAFETY: `AXUIElementCreateSystemWide` takes no arguments and never returns NULL per
+            // Apple's documented contract (the binding itself `.expect()`s on this).
+            let el = unsafe { AXUIElement::new_system_wide() };
+            let attr = CFString::from_str(attr_name);
+            let mut raw: *const CFType = std::ptr::null();
+            let err = scope.message("glass_doctor AX probe", || {
+                // SAFETY: `el` is live; `raw` is a valid local out-param slot matching
+                // `AXUIElementCopyAttributeValue`'s documented signature.
+                Ok(unsafe { el.copy_attribute_value(&attr, NonNull::from(&mut raw)) })
+            })?;
+            Ok((err, raw))
+        });
+    let (err, raw) = match result {
+        Ok(answer) => answer,
+        Err(error) => {
+            eprintln!("glass-a11y-macos: glass_doctor AX probe could not run safely: {error}");
+            return SystemWideProbe::DidNotComplete;
+        }
+    };
     if err == AXError::Success
         && let Some(nn) = NonNull::new(raw.cast_mut())
     {

@@ -5,7 +5,9 @@ pub mod config;
 pub mod session_gate;
 pub mod token;
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
@@ -17,6 +19,9 @@ use tokio_util::sync::CancellationToken;
 use crate::server::GlassServer;
 use config::{Exposure, ServeConfig};
 use session_gate::SingleSessionManager;
+
+/// HTTP drain allowance after shutdown begins and before bounded session teardown.
+const HTTP_GRACEFUL_DRAIN_BUDGET: Duration = Duration::from_secs(3);
 
 /// The fail-closed bind gate (spec D4): refuse to bind a network-exposed address
 /// with no token. Returns `Err` (with the operator-facing reason) only for
@@ -149,22 +154,80 @@ pub async fn run_on(
     glass: glass_core::Glass,
     report: crate::audit::AuditReport,
 ) -> anyhow::Result<()> {
+    run_on_until(
+        listener,
+        cfg,
+        glass,
+        report,
+        crate::shutdown::shutdown_signal(),
+    )
+    .await
+}
+
+/// Serve a bound listener until caller-supplied shutdown, then run the bounded teardown that
+/// `run_on` triggers from a process signal.
+pub async fn run_on_until(
+    listener: tokio::net::TcpListener,
+    cfg: ServeConfig,
+    glass: glass_core::Glass,
+    report: crate::audit::AuditReport,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let server = GlassServer::new(glass, report);
     let sessions = server.sessions();
     let cancel = CancellationToken::new();
     let app = build_router(&cfg, server, &cancel);
 
-    let r = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            crate::shutdown::shutdown_signal().await;
-            cancel.cancel();
-        })
-        .await
-        .context("serving MCP over HTTP");
+    let server_cancel = cancel.clone();
+    let serving = axum::serve(listener, app).with_graceful_shutdown(async move {
+        server_cancel.cancelled().await;
+    });
+    match run_server_then_teardown(
+        async move { serving.await },
+        shutdown,
+        &cancel,
+        HTTP_GRACEFUL_DRAIN_BUDGET,
+        crate::shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET),
+    )
+    .await
+    {
+        Ok(result) => result.context("serving MCP over HTTP"),
+        Err(()) => Err(anyhow::anyhow!(
+            "MCP HTTP graceful drain exceeded {HTTP_GRACEFUL_DRAIN_BUDGET:?}"
+        )),
+    }
+}
 
-    // Tear down the active session through the one bounded path, like stdio.
-    crate::shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET).await;
-    r
+/// Complete bounded session teardown even if graceful HTTP drain times out.
+async fn run_server_then_teardown<T>(
+    server: impl Future<Output = T>,
+    shutdown: impl Future<Output = ()>,
+    cancel: &CancellationToken,
+    drain_budget: Duration,
+    teardown: impl Future<Output = ()>,
+) -> Result<T, ()> {
+    let result = wait_for_server_or_shutdown(server, shutdown, cancel, drain_budget).await;
+    teardown.await;
+    result
+}
+
+/// Serve until exit or shutdown, then cancel MCP transports and apply `drain_budget` to outstanding
+/// HTTP work.
+async fn wait_for_server_or_shutdown<T>(
+    server: impl Future<Output = T>,
+    shutdown: impl Future<Output = ()>,
+    cancel: &CancellationToken,
+    drain_budget: Duration,
+) -> Result<T, ()> {
+    tokio::pin!(server);
+    tokio::pin!(shutdown);
+    tokio::select! {
+        result = &mut server => Ok(result),
+        _ = &mut shutdown => {
+            cancel.cancel();
+            tokio::time::timeout(drain_budget, &mut server).await.map_err(|_| ())
+        }
+    }
 }
 
 /// `glass-mcp gen-token [--out PATH]`: print a fresh token, or write it to PATH
@@ -273,6 +336,57 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "/healthz must not be reachable on a non-loopback bind"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_on_until_cancellation_runs_the_graceful_shutdown_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cancel = CancellationToken::new();
+        let shutdown = cancel.clone();
+        let task = tokio::spawn(run_on_until(
+            listener,
+            cfg("127.0.0.1:0", Some("token")),
+            crate::boot(None),
+            crate::audit::report_from_config(None, |_| None),
+            async move { shutdown.cancelled().await },
+        ));
+
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("cancellation must stop the server")
+            .expect("server task must not panic");
+        assert!(
+            result.is_ok(),
+            "graceful server shutdown failed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_graceful_drain_cancels_then_times_out() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cancel = CancellationToken::new();
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let observed = torn_down.clone();
+        let result = run_server_then_teardown(
+            std::future::pending::<()>(),
+            async {},
+            &cancel,
+            std::time::Duration::ZERO,
+            async move { observed.store(true, Ordering::SeqCst) },
+        )
+        .await;
+        assert!(result.is_err(), "a stalled drain must time out");
+        assert!(
+            cancel.is_cancelled(),
+            "shutdown must cancel active MCP sessions"
+        );
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "teardown must follow a timed-out drain"
         );
     }
 }

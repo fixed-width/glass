@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use glass_clip_shim_windows::store::PrivateClipboard;
 use glass_core::logbuf::Stream;
-use glass_core::{AppSpec, GlassError, Result, SandboxLevel};
+use glass_core::{AppSpec, Deadline, GlassError, Result, SandboxLevel};
 
 use super::clip_server::ClipServer;
 use super::config;
@@ -389,28 +389,27 @@ pub(crate) struct SandboxieApp {
 
 impl SandboxieApp {
     /// The wrapper (`Start.exe`) process pid — the launcher glass spawned. The contained app
-    /// itself runs under a separate Sandboxie-managed pid (see [`Self::pids`]).
+    /// itself runs under a separate Sandboxie-managed pid (see [`Self::pids_by`]).
     pub(crate) fn root_pid(&self) -> u32 {
         self.inner.pid()
     }
 
     /// The contained app's process set: `Start.exe /listpids` ∪ a Toolhelp descendant walk
-    /// of the wrapper, deduped.
-    pub(crate) fn pids(&self) -> Vec<u32> {
-        let mut pids: Vec<u32> = Vec::new();
-        if let Ok(out) = Command::new(start_exe(&self.dir))
-            .args([&format!("/box:{}", self.box_name), "/listpids"])
-            .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            pids = config::parse_listpids(&text);
-        }
-        for pid in crate::process::descendant_pids(self.inner.pid()) {
-            if !pids.contains(&pid) {
-                pids.push(pid);
-            }
-        }
-        pids
+    /// of the wrapper, deduped under the caller's absolute deadline.
+    pub(crate) fn pids_by(&self, deadline: Deadline) -> Result<Vec<u32>> {
+        super::pid_discovery::collect_pids_by_with(
+            deadline,
+            |received| match super::pid_discovery::sandboxie_list_pids_by(
+                &start_exe(&self.dir),
+                &self.box_name,
+                received,
+            ) {
+                Ok(pids) => Ok(pids),
+                Err(error) if error.bound().is_some() => Err(error),
+                Err(_) => Ok(Vec::new()),
+            },
+            |received| crate::process::descendant_pids_by(self.inner.pid(), received),
+        )
     }
 
     /// The class prefix Sandboxie stamps on this box's app windows (`Sandbox:<box>:`). Window
@@ -422,7 +421,7 @@ impl SandboxieApp {
 
     /// Always `Ok(None)`: the `Start.exe` wrapper exits right after handing off to the box, so
     /// its exit does not signal the app's; and a `std::process::ExitStatus` for the contained
-    /// app cannot be synthesized here. Discovery relies on `pids()` / the start timeout instead.
+    /// app cannot be synthesized here. Discovery relies on `pids_by()` / the start timeout instead.
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         Ok(None)
     }

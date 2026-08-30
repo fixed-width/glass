@@ -6,10 +6,11 @@
 //! See [`IdbClient`] for the threading invariant that `block_on` imposes, and
 //! [`CONNECT_TIMEOUT`]/[`RPC_TIMEOUT`] for the deadlines that keep a wedged
 //! companion from hanging the caller.
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use glass_core::{GlassError, Result};
+use glass_core::{Deadline, GlassError, Result, Whose};
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint, Uri};
 
@@ -20,6 +21,101 @@ use proto::companion_service_client::CompanionServiceClient;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Budget for a single RPC. 30s mirrors glass-android's socket timeout.
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Result of a snapshot RPC together with proof of whether the gRPC method was invoked.
+pub(crate) enum SnapshotRpc<T> {
+    BeforeDispatch(GlassError),
+    Dispatched(Result<T>),
+}
+
+impl<T> SnapshotRpc<T> {
+    pub(crate) fn before_dispatch(error: GlassError) -> Self {
+        Self::BeforeDispatch(error.before_dispatch())
+    }
+
+    pub(crate) fn dispatched(result: Result<T>) -> Self {
+        Self::Dispatched(result)
+    }
+
+    fn into_result(self) -> Result<T> {
+        match self {
+            Self::BeforeDispatch(error) => Err(error),
+            Self::Dispatched(result) => result,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) trait IdbSnapshotRpcBoundary: std::fmt::Debug + Send + Sync {
+    fn now(&self) -> Instant;
+    fn describe(&self) -> Result<proto::ScreenDimensions>;
+    fn describe_all(&self) -> Result<String>;
+}
+
+/// Type-state gate kept immediately beside the actual snapshot gRPC invocation.
+pub(crate) struct SnapshotRpcGate {
+    op: &'static str,
+    ends: Instant,
+    timeout: Duration,
+    whose: Whose,
+}
+
+struct DispatchedSnapshotRpcGate(SnapshotRpcGate);
+
+impl SnapshotRpcGate {
+    pub(crate) fn new(deadline: Deadline, own_timeout: Duration, op: &'static str) -> Result<Self> {
+        let (ends, timeout, whose) = rpc_bound(deadline, own_timeout, op)?;
+        Ok(Self {
+            op,
+            ends,
+            timeout,
+            whose,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ends(&self) -> Instant {
+        self.ends
+    }
+
+    fn dispatch_at(self, now: Instant) -> Result<DispatchedSnapshotRpcGate> {
+        if now >= self.ends {
+            Err(rpc_not_started_error(self.op, self.timeout, self.whose))
+        } else {
+            Ok(DispatchedSnapshotRpcGate(self))
+        }
+    }
+
+    pub(crate) async fn run_with_clock<T, F>(
+        self,
+        mut now: impl FnMut() -> Instant,
+        call: impl FnOnce() -> F,
+    ) -> SnapshotRpc<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let dispatched = match self.dispatch_at(now()) {
+            Ok(dispatched) => dispatched,
+            Err(error) => return SnapshotRpc::before_dispatch(error),
+        };
+        let result = call().await;
+        dispatched.finish_at(now(), result)
+    }
+}
+
+impl DispatchedSnapshotRpcGate {
+    fn finish_at<T>(self, observed_at: Instant, result: Result<T>) -> SnapshotRpc<T> {
+        let gate = self.0;
+        SnapshotRpc::dispatched(finish_rpc_result_at(
+            gate.op,
+            gate.timeout,
+            gate.whose,
+            gate.ends,
+            observed_at,
+            result,
+        ))
+    }
+}
 
 /// Blocking handle to `idb_companion`'s gRPC service.
 ///
@@ -45,6 +141,8 @@ pub struct IdbClient {
     /// user replaces the binary as the error advises, that reports a fresh build as evidence
     /// the old one is in the way.
     build_info: Option<String>,
+    #[cfg(test)]
+    snapshot_rpc_boundary: Option<Box<dyn IdbSnapshotRpcBoundary>>,
 }
 
 /// Budget for one `hid` stream. A `HidSwipe`/`HidDelay`/`HidPinch` plays out over
@@ -92,6 +190,70 @@ fn map_timed<T, E: std::fmt::Display>(
     }
 }
 
+fn map_rpc_outcome<T, E: std::fmt::Display>(
+    op: &str,
+    timeout: Duration,
+    whose: Whose,
+    ends: Instant,
+    outcome: std::result::Result<std::result::Result<T, E>, tokio::time::error::Elapsed>,
+) -> Result<T> {
+    if Instant::now() >= ends {
+        return Err(rpc_timeout_error(op, timeout, whose));
+    }
+    match outcome {
+        Err(_) if whose == Whose::Caller => Err(GlassError::caller_deadline_elapsed(op)),
+        other => map_timed(op, timeout, other),
+    }
+}
+
+fn rpc_timeout_error(op: &str, timeout: Duration, whose: Whose) -> GlassError {
+    match whose {
+        Whose::Caller => GlassError::caller_deadline_elapsed(op),
+        Whose::Callee => {
+            GlassError::Backend(format!("{op} timed out after {}s", timeout.as_secs()))
+        }
+    }
+}
+
+fn rpc_bound(
+    deadline: Deadline,
+    own_timeout: Duration,
+    op: &str,
+) -> Result<(Instant, Duration, Whose)> {
+    let started = Instant::now();
+    let (ends, whose) = deadline.resolve(started + own_timeout);
+    let timeout = ends.saturating_duration_since(started);
+    if timeout.is_zero() {
+        return Err(match whose {
+            Whose::Caller => GlassError::deadline_not_started(op),
+            Whose::Callee => rpc_timeout_error(op, own_timeout, whose),
+        });
+    }
+    Ok((ends, timeout, whose))
+}
+
+fn rpc_not_started_error(op: &str, timeout: Duration, whose: Whose) -> GlassError {
+    match whose {
+        Whose::Caller => GlassError::deadline_not_started(op),
+        Whose::Callee => rpc_timeout_error(op, timeout, whose),
+    }
+}
+
+fn finish_rpc_result_at<T>(
+    op: &str,
+    timeout: Duration,
+    whose: Whose,
+    ends: Instant,
+    observed_at: Instant,
+    result: Result<T>,
+) -> Result<T> {
+    if observed_at >= ends {
+        Err(rpc_timeout_error(op, timeout, whose))
+    } else {
+        result
+    }
+}
+
 /// Fold one `hid` outcome into a `Result`. An event this build does not implement is reported
 /// as that; everything else keeps the generic folding every other RPC gets.
 ///
@@ -102,12 +264,18 @@ fn map_hid_outcome<T>(
     bin: &Path,
     build_info: Option<&str>,
     timeout: Duration,
+    whose: Whose,
+    ends: Instant,
     outcome: std::result::Result<
         std::result::Result<T, tonic::Status>,
         tokio::time::error::Elapsed,
     >,
 ) -> Result<()> {
+    if Instant::now() >= ends {
+        return Err(rpc_timeout_error("idb hid", timeout, whose));
+    }
     match outcome {
+        Err(_) if whose == Whose::Caller => Err(GlassError::caller_deadline_elapsed("idb hid")),
         Ok(Err(status)) if unimplemented_event(&status) => Err(unimplemented_event_error_with(
             bin,
             &status,
@@ -183,6 +351,8 @@ impl IdbClient {
             client: CompanionServiceClient::new(channel),
             bin: bin.to_path_buf(),
             build_info: build_info.map(str::to_owned),
+            #[cfg(test)]
+            snapshot_rpc_boundary: None,
         })
     }
 
@@ -206,63 +376,172 @@ impl IdbClient {
             client: CompanionServiceClient::new(channel),
             bin: PathBuf::from("/nonexistent/idb_companion"),
             build_info: None,
+            snapshot_rpc_boundary: None,
         }
     }
 
-    /// Describe the whole accessibility tree: idb's `accessibility_info` over the entire
-    /// screen (no point) in the nested/hierarchical format. Returns the response `json`.
-    pub fn describe_all(&self) -> Result<String> {
-        self.ensure_off_runtime("idb accessibility_info")?;
+    #[cfg(test)]
+    pub(crate) fn for_snapshot_test(
+        snapshot_rpc_boundary: Box<dyn IdbSnapshotRpcBoundary>,
+    ) -> IdbClient {
+        IdbClient {
+            snapshot_rpc_boundary: Some(snapshot_rpc_boundary),
+            ..Self::for_test()
+        }
+    }
+
+    fn snapshot_rpc_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(boundary) = self.snapshot_rpc_boundary.as_deref() {
+            return boundary.now();
+        }
+        Instant::now()
+    }
+
+    async fn call_describe_all(
+        &self,
+        mut client: CompanionServiceClient<Channel>,
+        op: &'static str,
+        ends: Instant,
+        timeout: Duration,
+        whose: Whose,
+    ) -> Result<String> {
+        #[cfg(test)]
+        if let Some(boundary) = self.snapshot_rpc_boundary.as_deref() {
+            return boundary.describe_all();
+        }
         let req = proto::AccessibilityInfoRequest {
             point: None,
             format: proto::accessibility_info_request::Format::Nested as i32,
         };
-        let mut client = self.client.clone();
-        let outcome = self.rt.block_on(async move {
-            tokio::time::timeout(RPC_TIMEOUT, client.accessibility_info(req)).await
-        });
-        let resp = map_timed("idb accessibility_info", RPC_TIMEOUT, outcome)?;
-        Ok(resp.into_inner().json)
+        let outcome = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(ends),
+            client.accessibility_info(req),
+        )
+        .await;
+        map_rpc_outcome(op, timeout, whose, ends, outcome).map(|resp| resp.into_inner().json)
+    }
+
+    async fn call_describe(
+        &self,
+        mut client: CompanionServiceClient<Channel>,
+        op: &'static str,
+        ends: Instant,
+        timeout: Duration,
+        whose: Whose,
+    ) -> Result<proto::ScreenDimensions> {
+        #[cfg(test)]
+        if let Some(boundary) = self.snapshot_rpc_boundary.as_deref() {
+            return boundary.describe();
+        }
+        let outcome = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(ends),
+            client.describe(proto::TargetDescriptionRequest {
+                fetch_diagnostics: false,
+            }),
+        )
+        .await;
+        map_rpc_outcome(op, timeout, whose, ends, outcome).and_then(|resp| {
+            resp.into_inner()
+                .target_description
+                .and_then(|target| target.screen_dimensions)
+                .ok_or_else(|| {
+                    GlassError::Backend("idb describe returned no screen dimensions".into())
+                })
+        })
+    }
+
+    /// Describe the whole accessibility tree: idb's `accessibility_info` over the entire
+    /// screen (no point) in the nested/hierarchical format. Returns the response `json`.
+    #[cfg(test)]
+    pub fn describe_all_by(&self, deadline: Deadline) -> Result<String> {
+        self.describe_all_rpc_by(deadline).into_result()
+    }
+
+    pub(crate) fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String> {
+        let op = "idb accessibility_info";
+        let gate = match SnapshotRpcGate::new(deadline, RPC_TIMEOUT, op) {
+            Ok(gate) => gate,
+            Err(error) => return SnapshotRpc::before_dispatch(error),
+        };
+        if let Err(error) = self.ensure_off_runtime(op) {
+            return SnapshotRpc::before_dispatch(error);
+        }
+        let ends = gate.ends;
+        let timeout = gate.timeout;
+        let whose = gate.whose;
+        let client = self.client.clone();
+        self.rt.block_on(gate.run_with_clock(
+            || self.snapshot_rpc_now(),
+            || self.call_describe_all(client, op, ends, timeout, whose),
+        ))
     }
 
     /// Describe the target itself: its screen's pixel size, logical-point size and density.
-    /// These are properties of the device, so unlike [`describe_all`](Self::describe_all)
+    /// These are properties of the device, so unlike [`describe_all_by`](Self::describe_all_by)
     /// they are available before the app under test has rendered anything.
     pub fn describe(&self) -> Result<proto::ScreenDimensions> {
-        self.ensure_off_runtime("idb describe")?;
-        let mut client = self.client.clone();
-        let outcome = self.rt.block_on(async move {
-            tokio::time::timeout(
-                RPC_TIMEOUT,
-                client.describe(proto::TargetDescriptionRequest {
-                    fetch_diagnostics: false,
-                }),
-            )
-            .await
-        });
-        let resp = map_timed("idb describe", RPC_TIMEOUT, outcome)?;
-        resp.into_inner()
-            .target_description
-            .and_then(|t| t.screen_dimensions)
-            .ok_or_else(|| GlassError::Backend("idb describe returned no screen dimensions".into()))
+        self.describe_by(Deadline::UNBOUNDED)
+    }
+
+    pub fn describe_by(&self, deadline: Deadline) -> Result<proto::ScreenDimensions> {
+        self.describe_rpc_by(deadline).into_result()
+    }
+
+    pub(crate) fn describe_rpc_by(
+        &self,
+        deadline: Deadline,
+    ) -> SnapshotRpc<proto::ScreenDimensions> {
+        let op = "idb describe";
+        let gate = match SnapshotRpcGate::new(deadline, RPC_TIMEOUT, op) {
+            Ok(gate) => gate,
+            Err(error) => return SnapshotRpc::before_dispatch(error),
+        };
+        if let Err(error) = self.ensure_off_runtime(op) {
+            return SnapshotRpc::before_dispatch(error);
+        }
+        let ends = gate.ends;
+        let timeout = gate.timeout;
+        let whose = gate.whose;
+        let client = self.client.clone();
+        self.rt.block_on(gate.run_with_clock(
+            || self.snapshot_rpc_now(),
+            || self.call_describe(client, op, ends, timeout, whose),
+        ))
     }
 
     /// Send one HID event stream (client-streaming `hid`). A tap is two events
     /// (touch DOWN, touch UP); a chord is modifier + key down/up pairs.
-    pub fn hid(&self, events: Vec<proto::HidEvent>) -> Result<()> {
-        self.ensure_off_runtime("idb hid")?;
+    pub fn hid_by(&self, events: Vec<proto::HidEvent>, deadline: Deadline) -> Result<()> {
         // Derive the deadline from the gesture's own duration so a long swipe isn't
         // aborted mid-stream by a flat timeout (issue #116); see [`hid_timeout`].
-        let timeout = hid_timeout(&events);
+        let own_timeout = hid_timeout(&events);
+        let op = "idb hid";
+        let (ends, timeout, whose) = rpc_bound(deadline, own_timeout, op)?;
+        self.ensure_off_runtime(op)?;
         let mut client = self.client.clone();
         let outcome = self.rt.block_on(async move {
+            if Instant::now() >= ends {
+                return None;
+            }
             let stream = tokio_stream::iter(events);
-            tokio::time::timeout(timeout, client.hid(stream)).await
+            Some(
+                tokio::time::timeout_at(tokio::time::Instant::from_std(ends), client.hid(stream))
+                    .await,
+            )
         });
+        let outcome = outcome.ok_or_else(|| rpc_not_started_error(op, timeout, whose))?;
         // Swapping this line for a bare `map_timed` compiles and keeps every off-device test
         // green; only `a_pinch_is_accepted_by_a_companion_that_implements_it`, run on-box
         // against a companion that predates the event, catches it.
-        map_hid_outcome(&self.bin, self.build_info.as_deref(), timeout, outcome)
+        map_hid_outcome(
+            &self.bin,
+            self.build_info.as_deref(),
+            timeout,
+            whose,
+            ends,
+            outcome,
+        )
     }
 
     /// Guard the `block_on` threading invariant (see the type doc): calling an RPC from a
@@ -284,6 +563,57 @@ impl IdbClient {
 mod tests {
 
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SnapshotRpcEvent {
+        Gate,
+        Describe,
+        AccessibilityInfo,
+        Finish,
+    }
+
+    #[derive(Debug)]
+    struct RecordingSnapshotRpcBoundary {
+        observations: Mutex<VecDeque<(SnapshotRpcEvent, Instant)>>,
+        events: Arc<Mutex<Vec<SnapshotRpcEvent>>>,
+    }
+
+    impl RecordingSnapshotRpcBoundary {
+        fn record(&self, event: SnapshotRpcEvent) {
+            self.events.lock().expect("snapshot event lock").push(event);
+        }
+    }
+
+    impl IdbSnapshotRpcBoundary for RecordingSnapshotRpcBoundary {
+        fn now(&self) -> Instant {
+            let (event, observed_at) = self
+                .observations
+                .lock()
+                .expect("snapshot clock lock")
+                .pop_front()
+                .expect("enough snapshot clock observations");
+            self.record(event);
+            observed_at
+        }
+
+        fn describe(&self) -> Result<proto::ScreenDimensions> {
+            self.record(SnapshotRpcEvent::Describe);
+            Ok(proto::ScreenDimensions {
+                width: 400,
+                height: 800,
+                density: 2.0,
+                width_points: 200,
+                height_points: 400,
+            })
+        }
+
+        fn describe_all(&self) -> Result<String> {
+            self.record(SnapshotRpcEvent::AccessibilityInfo);
+            Ok("[]".into())
+        }
+    }
 
     /// The acceptance leg for glass#117: a pinch built by the injector is accepted and executed
     /// by a real companion. CI cannot run this — it needs a booted Simulator and a companion
@@ -332,7 +662,7 @@ mod tests {
             })
             .expect("a symmetric spread classifies as a pinch");
 
-        client.hid(events).expect(
+        client.hid_by(events, Deadline::UNBOUNDED).expect(
             "the companion must accept HIDPinch; a build that does not implement it is named \
              in this error along with its --version output",
         );
@@ -393,6 +723,137 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_read_rpc_success_observed_after_the_caller_deadline_is_not_success() {
+        let error = map_rpc_outcome(
+            "idb accessibility_info",
+            Duration::from_millis(50),
+            Whose::Caller,
+            Instant::now() - Duration::from_millis(1),
+            Ok::<std::result::Result<(), String>, _>(Ok(())),
+        )
+        .expect_err("runtime scheduling after the absolute deadline must not return read success");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn decoded_describe_success_observed_at_the_caller_deadline_is_not_success() {
+        let ends = Instant::now();
+
+        let error = finish_rpc_result_at(
+            "idb describe",
+            Duration::from_millis(5),
+            Whose::Caller,
+            ends,
+            ends,
+            Ok(()),
+        )
+        .expect_err("response decoding cannot return success at the absolute caller deadline");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn snapshot_rpcs_share_gate_call_finish_order_with_the_production_client_path() {
+        let observed_at = Instant::now();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let boundary = RecordingSnapshotRpcBoundary {
+            observations: Mutex::new(
+                vec![
+                    (SnapshotRpcEvent::Gate, observed_at),
+                    (SnapshotRpcEvent::Finish, observed_at),
+                    (SnapshotRpcEvent::Gate, observed_at),
+                    (SnapshotRpcEvent::Finish, observed_at),
+                ]
+                .into(),
+            ),
+            events: Arc::clone(&events),
+        };
+        let client = IdbClient::for_snapshot_test(Box::new(boundary));
+        let deadline = Deadline::at(observed_at + Duration::from_secs(1));
+
+        client
+            .describe_by(deadline)
+            .expect("the scripted describe call succeeds");
+        client
+            .describe_all_by(deadline)
+            .expect("the scripted accessibility_info call succeeds");
+
+        assert_eq!(
+            *events.lock().expect("snapshot event lock"),
+            [
+                SnapshotRpcEvent::Gate,
+                SnapshotRpcEvent::Describe,
+                SnapshotRpcEvent::Finish,
+                SnapshotRpcEvent::Gate,
+                SnapshotRpcEvent::AccessibilityInfo,
+                SnapshotRpcEvent::Finish,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_spent_describe_all_deadline_starts_no_rpc() {
+        let client = IdbClient::for_test();
+
+        let error = client
+            .describe_all_by(Deadline::from_millis(0))
+            .expect_err("a spent describe-all deadline must win before dialing the test channel");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn a_spent_target_describe_deadline_starts_no_rpc() {
+        let client = IdbClient::for_test();
+
+        let error = client
+            .describe_by(Deadline::from_millis(0))
+            .expect_err("a spent target describe deadline must win before dialing");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn ambient_runtime_rejection_is_explicitly_before_dispatch() {
+        let client = IdbClient::for_test();
+        let ambient = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build an ambient runtime");
+
+        let error = ambient
+            .block_on(async { client.describe_by(Deadline::UNBOUNDED) })
+            .expect_err("the synchronous idb client must reject an ambient runtime");
+
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message.contains("within an async runtime")),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+    }
+
     fn elapsed() -> tokio::time::error::Elapsed {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -416,6 +877,8 @@ mod tests {
             std::path::Path::new("/somewhere/idb_companion"),
             Some("build 2022"),
             Duration::from_secs(30),
+            Whose::Callee,
+            Instant::now() + Duration::from_secs(30),
             outcome,
         )
         .unwrap_err();
@@ -437,6 +900,8 @@ mod tests {
             std::path::Path::new("/somewhere/idb_companion"),
             None,
             Duration::from_secs(30),
+            Whose::Callee,
+            Instant::now() + Duration::from_secs(30),
             outcome,
         )
         .unwrap_err();
@@ -455,10 +920,60 @@ mod tests {
             std::path::Path::new("/somewhere/idb_companion"),
             None,
             Duration::from_secs(30),
+            Whose::Callee,
+            Instant::now() + Duration::from_secs(30),
             Err::<std::result::Result<(), tonic::Status>, _>(elapsed()),
         )
         .unwrap_err();
         assert!(err.to_string().contains("timed out after 30s"), "{err}");
+    }
+
+    #[test]
+    fn a_caller_owned_hid_timeout_is_bounded_by_the_caller() {
+        let error = map_hid_outcome(
+            Path::new("/somewhere/idb_companion"),
+            None,
+            Duration::from_millis(50),
+            Whose::Caller,
+            Instant::now() + Duration::from_millis(50),
+            Err::<std::result::Result<(), tonic::Status>, _>(elapsed()),
+        )
+        .unwrap_err();
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+    }
+
+    #[test]
+    fn a_hid_success_observed_after_the_caller_deadline_is_not_success() {
+        let error = map_hid_outcome(
+            Path::new("/somewhere/idb_companion"),
+            None,
+            Duration::from_millis(50),
+            Whose::Caller,
+            Instant::now() - Duration::from_millis(1),
+            Ok::<std::result::Result<(), tonic::Status>, _>(Ok(())),
+        )
+        .expect_err("runtime scheduling after the absolute deadline must not return HID success");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn a_read_rpc_success_observed_after_its_backend_ceiling_is_not_success() {
+        let error = map_rpc_outcome(
+            "idb accessibility_info",
+            Duration::from_secs(30),
+            Whose::Callee,
+            Instant::now() - Duration::from_millis(1),
+            Ok::<std::result::Result<(), String>, _>(Ok(())),
+        )
+        .expect_err("runtime scheduling must not turn a spent backend ceiling into success");
+
+        assert_eq!(error.bound_owner(), None);
+        assert!(error.to_string().contains("timed out after 30s"), "{error}");
     }
 
     #[test]
@@ -570,6 +1085,19 @@ mod tests {
     }
 
     #[test]
+    fn idb_hid_uses_the_nearer_of_gesture_budget_and_caller_deadline() {
+        let now = std::time::Instant::now();
+        let caller = Deadline::at(now + Duration::from_millis(250));
+        let (budget, whose) = caller.budget(RPC_TIMEOUT, now);
+        assert_eq!(budget, Duration::from_millis(250));
+        assert_eq!(whose, Whose::Caller);
+
+        let (budget, whose) = Deadline::UNBOUNDED.budget(RPC_TIMEOUT, now);
+        assert_eq!(budget, RPC_TIMEOUT);
+        assert_eq!(whose, Whose::Callee);
+    }
+
+    #[test]
     fn hid_timeout_extends_the_base_deadline_by_a_long_swipe_duration() {
         // A 45s swipe would trip a flat 30s deadline mid-gesture (issue #116); the
         // deadline must cover the swipe plus the base margin.
@@ -654,7 +1182,10 @@ mod tests {
             Err(GlassError::Backend(_)) => {}
             // `connect` optimistically succeeded; the first RPC must then fail cleanly.
             Ok(client) => assert!(
-                matches!(client.describe_all(), Err(GlassError::Backend(_))),
+                matches!(
+                    client.describe_all_by(Deadline::UNBOUNDED),
+                    Err(GlassError::Backend(_))
+                ),
                 "first RPC on a dead socket must be a clean Backend error"
             ),
             Err(other) => panic!("unexpected non-Backend error from connect: {other:?}"),

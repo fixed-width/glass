@@ -4,10 +4,10 @@
 //! reads one JSON response line.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::Duration;
 
-use glass_core::GlassError;
+use glass_core::{Deadline, GlassError};
 use serde_json::{Value, json};
 
 /// The protocol version this client speaks (must match the agent's hello `proto`).
@@ -23,6 +23,11 @@ pub(crate) enum CallFailure {
     /// The device answered — with a refusal, or with something this client could not read as
     /// a success. Either way it ran what it was going to run.
     Refused(GlassError),
+}
+
+enum ResponseAssignment {
+    Assigned(std::result::Result<Value, CallFailure>),
+    Unassignable(CallFailure),
 }
 
 impl CallFailure {
@@ -52,6 +57,22 @@ impl CallFailure {
             CallFailure::Refused(_) => CallFailure::Refused(e),
         }
     }
+
+    /// Combine consecutive attempts without letting a retry prove less delivery than an earlier
+    /// attempt. The later error remains the cause that ended recovery.
+    pub(crate) fn merge_retry(self, retry: CallFailure) -> CallFailure {
+        match (self, retry) {
+            (CallFailure::NotSent(_), retry) => retry,
+            (CallFailure::AnswerLost(_), CallFailure::Refused(error)) => {
+                CallFailure::Refused(error)
+            }
+            (
+                CallFailure::AnswerLost(_),
+                CallFailure::NotSent(error) | CallFailure::AnswerLost(error),
+            ) => CallFailure::AnswerLost(error),
+            (CallFailure::Refused(_), retry) => CallFailure::Refused(retry.into_error()),
+        }
+    }
 }
 
 /// A live connection to the agent: a framed line reader/writer + a monotonic id.
@@ -60,32 +81,119 @@ impl CallFailure {
 /// single-threaded MCP loop forever.
 pub(crate) const STANDING_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TimeoutFault {
+    ReadInstall,
+    WriteInstall,
+    ReadRestore,
+    WriteRestore,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteFault {
+    Short(usize),
+    Interrupted,
+    Timeout,
+    Zero,
+    Error,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadFault {
+    Interrupted,
+    TimedOut,
+}
+
+#[cfg(test)]
+fn short_write_count(limit: usize, len: usize) -> usize {
+    limit.min(len - 1)
+}
+
+fn interrupted(kind: std::io::ErrorKind) -> bool {
+    kind == std::io::ErrorKind::Interrupted
+}
+
+fn retryable_bounded_read_timeout(kind: std::io::ErrorKind, bounded: bool) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) && bounded
+}
+
 pub(crate) struct Conn {
     pub(crate) writer: TcpStream,
     pub(crate) reader: BufReader<TcpStream>,
     pub(crate) next_id: i64,
+    poisoned: bool,
+    #[cfg(test)]
+    timeout_faults: std::collections::VecDeque<TimeoutFault>,
+    #[cfg(test)]
+    write_faults: std::collections::VecDeque<WriteFault>,
+    #[cfg(test)]
+    read_faults: std::collections::VecDeque<ReadFault>,
 }
 
 impl Conn {
     /// Connect to `127.0.0.1:port`, read + version-check the hello banner.
     pub(crate) fn open(port: u16) -> glass_core::Result<Conn> {
-        let stream = TcpStream::connect(("127.0.0.1", port))
-            .map_err(|e| GlassError::Backend(format!("agent connect :{port}: {e}")))?;
+        Self::open_by(port, Deadline::UNBOUNDED)
+    }
+
+    /// Connect and complete the hello handshake within one caller deadline.
+    pub(crate) fn open_by(port: u16, deadline: Deadline) -> glass_core::Result<Conn> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("agent connect"));
+        }
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let stream_result = match deadline.remaining() {
+            Some(wait) => TcpStream::connect_timeout(&address, wait),
+            None => TcpStream::connect(address),
+        };
+        let stream = stream_result.map_err(|e| {
+            if deadline.has_passed() {
+                GlassError::caller_deadline_elapsed("agent connect")
+            } else {
+                GlassError::Backend(format!("agent connect :{port}: {e}"))
+            }
+        })?;
         // Timeouts so a stalled agent surfaces as a transport error the reconnect path handles,
         // rather than hanging the MCP thread forever. Each goes on the handle that does that
         // half's work — see `read_within` for what puts the read one on the reader.
-        stream.set_write_timeout(Some(STANDING_TIMEOUT)).ok();
+        let setup_wait = deadline.remaining();
+        if setup_wait.is_some_and(|wait| wait.is_zero()) {
+            return Err(GlassError::caller_deadline_elapsed("agent connect"));
+        }
+        stream
+            .set_write_timeout(Some(setup_wait.unwrap_or(STANDING_TIMEOUT)))
+            .map_err(|e| GlassError::Backend(format!("agent write timeout install: {e}")))?;
         let read_half = stream
             .try_clone()
             .map_err(|e| GlassError::Backend(format!("agent clone: {e}")))?;
-        read_half.set_read_timeout(Some(STANDING_TIMEOUT)).ok();
+        read_half
+            .set_read_timeout(Some(setup_wait.unwrap_or(STANDING_TIMEOUT)))
+            .map_err(|e| GlassError::Backend(format!("agent read timeout install: {e}")))?;
         let reader = BufReader::new(read_half);
         let mut c = Conn {
             writer: stream,
             reader,
             next_id: 1,
+            poisoned: false,
+            #[cfg(test)]
+            timeout_faults: Default::default(),
+            #[cfg(test)]
+            write_faults: Default::default(),
+            #[cfg(test)]
+            read_faults: Default::default(),
         };
-        let hello = c.read_line()?;
+        let hello = c
+            .read_line_by(deadline, "agent hello")
+            .map_err(CallFailure::into_error)?;
+        if deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed("agent hello"));
+        }
         let v: Value = serde_json::from_str(&hello)
             .map_err(|e| GlassError::Backend(format!("agent hello parse: {e}")))?;
         let proto = v
@@ -97,19 +205,24 @@ impl Conn {
                 "agent protocol mismatch: got {proto:?}, want {PROTO}"
             )));
         }
+        c.restore_timeouts()?;
         Ok(c)
     }
 
-    pub(crate) fn read_line(&mut self) -> glass_core::Result<String> {
-        let mut line = String::new();
-        let n = self
-            .reader
-            .read_line(&mut line)
-            .map_err(|e| GlassError::Backend(format!("agent read: {e}")))?;
-        if n == 0 {
-            return Err(GlassError::Backend("agent closed the connection".into()));
+    pub(crate) fn ensure_usable(&self) -> glass_core::Result<()> {
+        if self.poisoned {
+            Err(GlassError::Backend(
+                "agent connection is unusable after its transport state became uncertain".into(),
+            ))
+        } else {
+            Ok(())
         }
-        Ok(line.trim_end().to_string())
+    }
+
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+        // Close poisoned conn1 now so a sequential companion can accept its replacement.
+        let _ = self.writer.shutdown(Shutdown::Both);
     }
 
     /// Bound how long the next reads may block for, or restore the standing timeout when the
@@ -120,45 +233,388 @@ impl Conn {
     ///
     /// Do not set this on `writer`: a read timeout does not carry across `try_clone` on Windows,
     /// where a bound set there left the read on the 30s standing one instead.
-    pub(crate) fn read_within(&mut self, wait: Option<Duration>) {
+    pub(crate) fn read_within(&mut self, wait: Option<Duration>) -> glass_core::Result<()> {
+        self.read_within_for(wait, false)
+    }
+
+    fn read_within_for(
+        &mut self,
+        wait: Option<Duration>,
+        _restoring: bool,
+    ) -> glass_core::Result<()> {
+        self.ensure_usable()?;
+        #[cfg(test)]
+        self.maybe_timeout_fault(if _restoring {
+            TimeoutFault::ReadRestore
+        } else {
+            TimeoutFault::ReadInstall
+        })?;
         self.reader
             .get_ref()
             .set_read_timeout(Some(wait.unwrap_or(STANDING_TIMEOUT)))
-            .ok();
+            .map_err(|e| GlassError::Backend(format!("agent read timeout update: {e}")))
+    }
+
+    pub(crate) fn write_within(&mut self, wait: Option<Duration>) -> glass_core::Result<()> {
+        self.write_within_for(wait, false)
+    }
+
+    fn write_within_for(
+        &mut self,
+        wait: Option<Duration>,
+        _restoring: bool,
+    ) -> glass_core::Result<()> {
+        self.ensure_usable()?;
+        #[cfg(test)]
+        self.maybe_timeout_fault(if _restoring {
+            TimeoutFault::WriteRestore
+        } else {
+            TimeoutFault::WriteInstall
+        })?;
+        self.writer
+            .set_write_timeout(Some(wait.unwrap_or(STANDING_TIMEOUT)))
+            .map_err(|e| GlassError::Backend(format!("agent write timeout update: {e}")))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_timeout_fault(&mut self, fault: TimeoutFault) {
+        self.timeout_faults.push_back(fault);
+    }
+
+    #[cfg(test)]
+    fn maybe_timeout_fault(&mut self, fault: TimeoutFault) -> glass_core::Result<()> {
+        if self.timeout_faults.front() == Some(&fault) {
+            self.timeout_faults.pop_front();
+            Err(GlassError::Backend(format!(
+                "injected {fault:?} socket timeout failure"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_write_faults(&mut self, faults: impl IntoIterator<Item = WriteFault>) {
+        self.write_faults.extend(faults);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_read_faults(&mut self, faults: impl IntoIterator<Item = ReadFault>) {
+        self.read_faults.extend(faults);
+    }
+
+    #[cfg(test)]
+    fn fill_buf_with_fault(&mut self) -> std::io::Result<&[u8]> {
+        if let Some(fault) = self.read_faults.pop_front() {
+            return Err(std::io::Error::new(
+                match fault {
+                    ReadFault::Interrupted => std::io::ErrorKind::Interrupted,
+                    ReadFault::TimedOut => std::io::ErrorKind::TimedOut,
+                },
+                format!("injected {fault:?} read"),
+            ));
+        }
+        self.reader.fill_buf()
+    }
+
+    fn write_chunk(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if let Some(fault) = self.write_faults.pop_front() {
+            return match fault {
+                WriteFault::Short(limit) => {
+                    assert!(limit > 0, "an injected short write must write something");
+                    assert!(bytes.len() > 1, "an injected short write needs a remainder");
+                    let count = short_write_count(limit, bytes.len());
+                    self.writer.write_all(&bytes[..count])?;
+                    Ok(count)
+                }
+                WriteFault::Timeout => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "injected write timeout",
+                )),
+                WriteFault::Interrupted => Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected interrupted write",
+                )),
+                WriteFault::Zero => Ok(0),
+                WriteFault::Error => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected write failure",
+                )),
+            };
+        }
+        self.writer.write(bytes)
+    }
+
+    fn restore_timeouts(&mut self) -> glass_core::Result<()> {
+        let read = self.read_within_for(None, true);
+        let write = self.write_within_for(None, true);
+        match (read, write) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+            (Err(read), Err(write)) => Err(GlassError::Backend(format!(
+                "socket timeout restoration failed twice: {read}; {write}"
+            ))),
+        }
+    }
+
+    fn phase_wait(
+        deadline: Deadline,
+        op: &str,
+        dispatched: bool,
+    ) -> std::result::Result<Option<Duration>, CallFailure> {
+        match deadline.remaining() {
+            Some(wait) if wait.is_zero() => Err(if dispatched {
+                CallFailure::AnswerLost(GlassError::caller_deadline_elapsed(op))
+            } else {
+                CallFailure::NotSent(GlassError::deadline_not_started(op))
+            }),
+            wait => Ok(wait),
+        }
+    }
+
+    fn deadline_outcome(
+        outcome: std::result::Result<Value, CallFailure>,
+        op: &str,
+    ) -> std::result::Result<Value, CallFailure> {
+        Err(match outcome {
+            Ok(_) => CallFailure::Refused(GlassError::caller_deadline_elapsed(op)),
+            Err(failure) => failure.with_error(GlassError::caller_deadline_elapsed(op)),
+        })
+    }
+
+    fn retire_answer_lost(
+        &mut self,
+        outcome: std::result::Result<Value, CallFailure>,
+    ) -> std::result::Result<Value, CallFailure> {
+        if matches!(&outcome, Err(CallFailure::AnswerLost(_))) {
+            self.poison();
+        }
+        outcome
+    }
+
+    fn transport_failure(dispatched: bool, error: GlassError) -> CallFailure {
+        if dispatched {
+            CallFailure::AnswerLost(error)
+        } else {
+            CallFailure::NotSent(error)
+        }
+    }
+
+    fn write_all_by(
+        &mut self,
+        bytes: &[u8],
+        deadline: Deadline,
+        op: &str,
+    ) -> std::result::Result<(), CallFailure> {
+        let mut written = 0;
+        while written < bytes.len() {
+            let dispatched = written != 0;
+            let wait = Self::phase_wait(deadline, op, dispatched)?;
+            self.write_within(wait)
+                .map_err(|error| Self::transport_failure(dispatched, error))?;
+            match self.write_chunk(&bytes[written..]) {
+                Ok(0) => {
+                    return Err(Self::transport_failure(
+                        dispatched,
+                        GlassError::Backend("agent write: wrote zero bytes".into()),
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(error) if interrupted(error.kind()) => {}
+                Err(error) => {
+                    return Err(Self::transport_failure(
+                        dispatched,
+                        GlassError::Backend(format!("agent write: {error}")),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_line_by(
+        &mut self,
+        deadline: Deadline,
+        op: &str,
+    ) -> std::result::Result<String, CallFailure> {
+        let mut line = Vec::new();
+        loop {
+            let wait = Self::phase_wait(deadline, op, true)?;
+            self.read_within(wait).map_err(CallFailure::AnswerLost)?;
+            #[cfg(test)]
+            let filled = self.fill_buf_with_fault();
+            #[cfg(not(test))]
+            let filled = self.reader.fill_buf();
+            let (consumed, complete) = match filled {
+                Ok([]) => {
+                    return Err(CallFailure::AnswerLost(GlassError::Backend(
+                        "agent closed the connection".into(),
+                    )));
+                }
+                Ok(available) => {
+                    let consumed = available
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(available.len(), |newline| newline + 1);
+                    line.extend_from_slice(&available[..consumed]);
+                    (consumed, available[consumed - 1] == b'\n')
+                }
+                Err(error)
+                    if retryable_bounded_read_timeout(
+                        error.kind(),
+                        deadline.remaining().is_some(),
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) if interrupted(error.kind()) => continue,
+                Err(error) => {
+                    return Err(CallFailure::AnswerLost(GlassError::Backend(format!(
+                        "agent read: {error}"
+                    ))));
+                }
+            };
+            self.reader.consume(consumed);
+            if complete {
+                let line = String::from_utf8(line).map_err(|error| {
+                    CallFailure::AnswerLost(GlassError::Backend(format!(
+                        "agent read: invalid UTF-8: {error}"
+                    )))
+                })?;
+                return Ok(line.trim_end().to_string());
+            }
+        }
+    }
+
+    /// Run one request under `deadline`, separating setup failure from dispatched-request
+    /// provenance.
+    pub(crate) fn call_within(
+        &mut self,
+        req: Value,
+        deadline: Deadline,
+        op: &str,
+    ) -> glass_core::Result<std::result::Result<Value, CallFailure>> {
+        self.ensure_usable()?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(op));
+        }
+
+        // Install both socket timeouts before dispatch; each phase refreshes from the remaining
+        // absolute deadline.
+        let install = Self::phase_wait(deadline, op, false)
+            .map_err(CallFailure::into_error)
+            .and_then(|wait| self.read_within(wait))
+            .and_then(|()| {
+                Self::phase_wait(deadline, op, false)
+                    .map_err(CallFailure::into_error)
+                    .and_then(|wait| self.write_within(wait))
+            });
+        if let Err(install_error) = install {
+            if let Err(restore_error) = self.restore_timeouts() {
+                self.poison();
+                return Err(GlassError::Backend(format!(
+                    "socket timeout installation and restoration both failed: {install_error}; \
+                     {restore_error}"
+                )));
+            }
+            return Err(install_error);
+        }
+
+        let (mut outcome, retire_unassignable) = match self.call_by(req, deadline, op) {
+            Ok((id, response)) => match Self::parse_response(id, &response) {
+                ResponseAssignment::Assigned(outcome) => (outcome, false),
+                ResponseAssignment::Unassignable(failure) => (Err(failure), true),
+            },
+            Err(failure) => (Err(failure), false),
+        };
+
+        // Reject a reply whose parsing reached the deadline before timeout restoration.
+        if deadline.remaining().is_some_and(|wait| wait.is_zero()) {
+            outcome = Self::deadline_outcome(outcome, op);
+        }
+
+        let outcome = match self.restore_timeouts() {
+            Ok(()) => {
+                if deadline.has_passed() {
+                    outcome = Self::deadline_outcome(outcome, op);
+                }
+                outcome
+            }
+            Err(error) => {
+                self.poison();
+                Err(match outcome {
+                    Ok(_) => CallFailure::Refused(error),
+                    Err(failure) => failure.with_error(error),
+                })
+            }
+        };
+        if retire_unassignable {
+            self.poison();
+        }
+        Ok(self.retire_answer_lost(outcome))
     }
 
     /// Send one request object (an `id` is injected) and return the response `Value`.
     /// A failure is classified by how far the request got — see [`CallFailure`].
-    pub(crate) fn call(&mut self, mut req: Value) -> std::result::Result<Value, CallFailure> {
+    #[cfg(test)]
+    pub(crate) fn call(&mut self, req: Value) -> std::result::Result<Value, CallFailure> {
+        self.call_within(req, Deadline::UNBOUNDED, "agent request")
+            .map_err(CallFailure::NotSent)?
+    }
+
+    fn call_by(
+        &mut self,
+        mut req: Value,
+        deadline: Deadline,
+        op: &str,
+    ) -> std::result::Result<(i64, String), CallFailure> {
+        self.ensure_usable().map_err(CallFailure::NotSent)?;
         let id = self.next_id;
         self.next_id += 1;
         req["id"] = json!(id);
         let mut line = serde_json::to_string(&req).expect("serialize request");
         line.push('\n');
-        self.writer
-            .write_all(line.as_bytes())
-            .and_then(|_| self.writer.flush())
-            .map_err(|e| CallFailure::NotSent(GlassError::Backend(format!("agent write: {e}"))))?;
-        let resp_line = self.read_line().map_err(CallFailure::AnswerLost)?;
-        let resp: Value = serde_json::from_str(&resp_line).map_err(|e| {
-            CallFailure::Refused(GlassError::Backend(format!("agent resp parse: {e}")))
+
+        self.write_all_by(line.as_bytes(), deadline, op)?;
+
+        let wait = Self::phase_wait(deadline, op, true)?;
+        self.write_within(wait).map_err(CallFailure::AnswerLost)?;
+        self.writer.flush().map_err(|e| {
+            CallFailure::AnswerLost(GlassError::Backend(format!("agent flush: {e}")))
         })?;
+
+        let resp_line = self.read_line_by(deadline, op)?;
+        Ok((id, resp_line))
+    }
+
+    fn parse_response(id: i64, resp_line: &str) -> ResponseAssignment {
+        let resp: Value = match serde_json::from_str(resp_line) {
+            Ok(response) => response,
+            Err(error) => {
+                return ResponseAssignment::Unassignable(CallFailure::Refused(
+                    GlassError::Backend(format!("agent resp parse: {error}")),
+                ));
+            }
+        };
         if resp.get("id").and_then(Value::as_i64) != Some(id) {
-            return Err(CallFailure::Refused(GlassError::Backend(format!(
-                "agent response id mismatch (got {:?}, want {id})",
-                resp.get("id")
-            ))));
+            return ResponseAssignment::Unassignable(CallFailure::Refused(GlassError::Backend(
+                format!(
+                    "agent response id mismatch (got {:?}, want {id})",
+                    resp.get("id")
+                ),
+            )));
         }
         if resp.get("ok").and_then(Value::as_bool) != Some(true) {
             let err = resp
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("agent error");
-            return Err(CallFailure::Refused(GlassError::Backend(format!(
-                "agent: {err}"
+            return ResponseAssignment::Assigned(Err(CallFailure::Refused(GlassError::Backend(
+                format!("agent: {err}"),
             ))));
         }
-        Ok(resp)
+        ResponseAssignment::Assigned(Ok(resp))
     }
 }
 
@@ -166,12 +622,128 @@ impl Conn {
 mod tests {
     use super::*;
     use crate::agent::fake_agent;
+    use glass_core::Deadline;
     use std::io::Write;
     use std::net::TcpListener;
     use std::time::Instant;
 
     const HELLO: &str = r#"{"hello":{"proto":1}}"#;
     const OK: &str = r#"{"ok":true}"#;
+
+    #[test]
+    fn connection_retry_helpers_keep_short_writes_partial_and_retry_only_expected_errors() {
+        assert_eq!(short_write_count(3, 8), 3);
+        assert_eq!(short_write_count(usize::MAX, 8), 7);
+
+        assert!(interrupted(std::io::ErrorKind::Interrupted));
+        assert!(!interrupted(std::io::ErrorKind::TimedOut));
+
+        assert!(retryable_bounded_read_timeout(
+            std::io::ErrorKind::WouldBlock,
+            true
+        ));
+        assert!(retryable_bounded_read_timeout(
+            std::io::ErrorKind::TimedOut,
+            true
+        ));
+        assert!(!retryable_bounded_read_timeout(
+            std::io::ErrorKind::TimedOut,
+            false
+        ));
+        assert!(!retryable_bounded_read_timeout(
+            std::io::ErrorKind::Interrupted,
+            true
+        ));
+    }
+
+    #[test]
+    fn interrupted_request_write_retries_without_changing_delivery_classification() {
+        let (port, _) = fake_agent(HELLO, vec![OK]);
+        let mut conn = Conn::open(port).unwrap();
+        conn.inject_write_faults([WriteFault::Interrupted]);
+
+        let reply = match conn.call(json!({"op": "ping"})) {
+            Ok(reply) => reply,
+            Err(failure) => panic!(
+                "interrupted write was not retried: {}",
+                failure.into_error()
+            ),
+        };
+
+        assert_eq!(reply["ok"], true);
+    }
+
+    #[test]
+    fn bounded_timeout_and_interrupted_reads_retry_but_unbounded_timeout_does_not() {
+        for fault in [ReadFault::TimedOut, ReadFault::Interrupted] {
+            let (port, _) = fake_agent(HELLO, vec![OK]);
+            let mut conn = Conn::open(port).unwrap();
+            conn.inject_read_faults([fault]);
+
+            let outcome = conn
+                .call_within(
+                    json!({"op": "ping"}),
+                    Deadline::from_millis(1_000),
+                    "agent request",
+                )
+                .unwrap_or_else(|error| panic!("{fault:?}: timeout setup failed: {error}"));
+            let reply = match outcome {
+                Ok(reply) => reply,
+                Err(failure) => panic!("{fault:?}: read was not retried: {}", failure.into_error()),
+            };
+            assert_eq!(reply["ok"], true, "{fault:?}");
+        }
+
+        let (port, _) = fake_agent(HELLO, vec![OK]);
+        let mut conn = Conn::open(port).unwrap();
+        conn.inject_read_faults([ReadFault::TimedOut]);
+        let failure = conn
+            .call(json!({"op": "ping"}))
+            .expect_err("an unbounded call uses the standing timeout as a transport failure");
+        assert!(matches!(failure, CallFailure::AnswerLost(_)));
+    }
+
+    fn delayed_hello(delay: Duration) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            std::thread::sleep(delay);
+            let _ = writeln!(stream, "{HELLO}");
+        });
+        port
+    }
+
+    #[test]
+    fn bounded_connection_setup_times_out_near_the_caller_deadline() {
+        let started = Instant::now();
+        let Err(err) = Conn::open_by(
+            delayed_hello(Duration::from_secs(2)),
+            Deadline::from_millis(150),
+        ) else {
+            panic!("a delayed hello must exceed the caller deadline");
+        };
+        assert!(matches!(err, GlassError::Bounded { .. }), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn successful_bounded_connection_setup_restores_standing_timeouts() {
+        let conn = Conn::open_by(
+            delayed_hello(Duration::from_millis(20)),
+            Deadline::from_millis(500),
+        )
+        .unwrap();
+        assert_eq!(conn.writer.write_timeout().unwrap(), Some(STANDING_TIMEOUT));
+        assert_eq!(
+            conn.reader.get_ref().read_timeout().unwrap(),
+            Some(STANDING_TIMEOUT)
+        );
+    }
 
     /// A listener that says hello and then answers nothing, holding the connection open — a
     /// companion that stopped responding without dropping the socket, which is the only case a
@@ -188,16 +760,79 @@ mod tests {
         port
     }
 
+    /// Delay both request drain and reply to prove they share one absolute deadline.
+    fn delayed_drain_and_reply(write_delay: Duration, read_delay: Duration) -> u16 {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept connection");
+            let mut writer = stream.try_clone().expect("clone socket");
+            writeln!(writer, "{HELLO}").expect("write hello");
+            std::thread::sleep(write_delay);
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let request: Value = serde_json::from_str(&line).expect("request json");
+            std::thread::sleep(read_delay);
+            let _ = writeln!(writer, "{}", json!({"id": request["id"], "ok": true}));
+        });
+        port
+    }
+
+    /// Send a syntactically valid reply in chunks whose individual gaps fit the original socket
+    /// timeout, but whose total duration exceeds the caller's absolute deadline.
+    fn trickled_reply(chunk_gap: Duration) -> u16 {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept connection");
+            let mut writer = stream.try_clone().expect("clone socket");
+            writeln!(writer, "{HELLO}").expect("write hello");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let request: Value = serde_json::from_str(&line).expect("request json");
+            let chunks = [
+                format!(r#"{{"id":{},"#, request["id"]),
+                "\"ok\":".to_string(),
+                "true".to_string(),
+                "}\n".to_string(),
+            ];
+            for (index, chunk) in chunks.iter().enumerate() {
+                if index != 0 {
+                    std::thread::sleep(chunk_gap);
+                }
+                if writer.write_all(chunk.as_bytes()).is_err() || writer.flush().is_err() {
+                    return;
+                }
+            }
+        });
+        port
+    }
+
     #[test]
     fn a_bounded_read_gives_up_at_the_bound_and_not_at_the_standing_timeout() {
         // A caller that named a deadline gets it. Without this the wait is the 30s standing
         // timeout, which is the single-threaded MCP loop blocked for half a minute on a
         // companion that has already stopped talking.
         let mut conn = Conn::open(silent_after_hello()).expect("the hello arrives");
-        conn.read_within(Some(Duration::from_millis(200)));
-
         let started = Instant::now();
-        let Err(failure) = conn.call(json!({"op": "ping"})) else {
+        let outcome = conn
+            .call_within(
+                json!({"op": "ping"}),
+                Deadline::from_millis(200),
+                "agent request",
+            )
+            .expect("install the bounded socket timeouts");
+        let Err(failure) = outcome else {
             panic!("a companion that answers nothing cannot have answered");
         };
         assert!(
@@ -208,6 +843,105 @@ mod tests {
         assert!(
             failure.is_transport(),
             "a read that ran out of time is a transport failure, not a refusal"
+        );
+    }
+
+    #[test]
+    fn delayed_write_and_read_spend_one_total_deadline() {
+        let mut conn = Conn::open(delayed_drain_and_reply(
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        ))
+        .expect("the hello arrives");
+        // Exceed loopback buffering so `write_all` waits for the fake to drain conn1.
+        let padding = "x".repeat(8 * 1024 * 1024);
+        let started = Instant::now();
+
+        let outcome = conn
+            .call_within(
+                json!({"op": "ping", "padding": padding}),
+                Deadline::from_millis(450),
+                "agent request",
+            )
+            .expect("socket timeout setup succeeds");
+
+        let error = outcome.expect_err("the combined phases exceed the caller deadline");
+        let error = error.into_error();
+        assert_eq!(
+            error.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "write and read each received the full relative wait: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_successful_short_write_makes_every_later_write_fault_answer_lost() {
+        for fault in [WriteFault::Timeout, WriteFault::Zero, WriteFault::Error] {
+            let mut conn = Conn::open(silent_after_hello()).expect("the hello arrives");
+            conn.inject_write_faults([WriteFault::Short(8), fault]);
+
+            let outcome = conn
+                .call_within(
+                    json!({"op": "key", "chord": "a"}),
+                    Deadline::from_millis(1_000),
+                    "agent request",
+                )
+                .expect("socket timeout setup succeeds");
+            let failure = outcome.expect_err("the second write does not complete the request");
+
+            assert!(
+                matches!(&failure, CallFailure::AnswerLost(_)),
+                "{fault:?} after a successful short write was not AnswerLost"
+            );
+            assert!(!failure.nothing_sent(), "{fault:?}");
+            assert!(
+                conn.ensure_usable().is_err(),
+                "{fault:?} left the partially written stream reusable"
+            );
+        }
+    }
+
+    #[test]
+    fn trickled_response_chunks_share_one_absolute_read_deadline() {
+        let mut conn =
+            Conn::open(trickled_reply(Duration::from_millis(120))).expect("the hello arrives");
+        let started = Instant::now();
+
+        let outcome = conn
+            .call_within(
+                json!({"op": "ping"}),
+                Deadline::from_millis(200),
+                "agent request",
+            )
+            .expect("socket timeout setup succeeds");
+
+        let error = outcome
+            .expect_err("the trickled reply exceeds the one caller deadline")
+            .into_error();
+        assert_eq!(
+            error.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "each response chunk reused the original socket timeout: {:?}",
+            started.elapsed()
         );
     }
 
@@ -231,6 +965,32 @@ mod tests {
             failure.into_error().to_string().contains("id mismatch"),
             "the error must say what did not line up"
         );
+        assert!(
+            conn.ensure_usable().is_err(),
+            "an unassignable answer left the stream reusable"
+        );
+    }
+
+    #[test]
+    fn retry_merge_does_not_downgrade_refused_to_not_sent() {
+        let failure = CallFailure::Refused(GlassError::Backend("first refusal".into()))
+            .merge_retry(CallFailure::NotSent(GlassError::deadline_not_started(
+                "retry",
+            )));
+
+        let CallFailure::Refused(cause) = failure else {
+            panic!("a later NotSent erased proof that an earlier attempt reached the device")
+        };
+        assert_eq!(
+            cause.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{cause}"
+        );
+        assert_eq!(
+            cause.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "the latest failure still describes the retry itself: {cause}"
+        );
     }
 
     #[test]
@@ -253,5 +1013,33 @@ mod tests {
             .filter_map(|r| r.get("id").and_then(Value::as_i64))
             .collect();
         assert_eq!(ids, [1, 2, 3]);
+    }
+
+    #[test]
+    fn install_and_restore_failures_are_aggregated_and_poison_the_connection() {
+        let (port, seen) = fake_agent(HELLO, vec![OK]);
+        let mut conn = Conn::open(port).expect("the hello arrives");
+        conn.inject_timeout_fault(TimeoutFault::ReadInstall);
+        conn.inject_timeout_fault(TimeoutFault::ReadRestore);
+
+        let result = conn.call_within(
+            json!({"op": "ping"}),
+            Deadline::from_millis(1_000),
+            "agent request",
+        );
+
+        let Err(GlassError::Backend(message)) = result else {
+            panic!("setup failure must remain an outer, pre-dispatch error");
+        };
+        assert!(message.contains("ReadInstall"), "{message}");
+        assert!(message.contains("ReadRestore"), "{message}");
+        assert!(
+            conn.ensure_usable().is_err(),
+            "the connection was not poisoned"
+        );
+        assert!(
+            seen.lock().expect("request log").is_empty(),
+            "a request was dispatched despite failed timeout installation"
+        );
     }
 }

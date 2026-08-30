@@ -3,32 +3,131 @@
 //! on a different element), focuses it, then clears and types it in one batch of synthetic HID
 //! input, and finally reads the element back and reports the write as not applied if it does not
 //! hold the text.
-use glass_core::accessibility::{Accessibility, AxContext, AxRect, AxTarget, AxTree, Located};
+use glass_core::accessibility::{
+    Accessibility, AxContext, AxNodeId, AxRect, AxTarget, AxTree, Located,
+};
 use std::time::Duration;
 
 use glass_core::{
-    GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, read_back_failed,
+    Deadline, GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, Whose,
     verify_typed_write,
 };
 
 use crate::axmap;
-use crate::idb::client::IdbClient;
+use crate::idb::client::{IdbClient, SnapshotRpc};
 use crate::idb::proto;
 use crate::injector::IdbInjector;
+
+trait IosA11yClient: Send {
+    fn describe_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<proto::ScreenDimensions>;
+    fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String>;
+    fn hid_by(&self, events: Vec<proto::HidEvent>, deadline: Deadline) -> Result<()>;
+}
+
+impl IosA11yClient for IdbClient {
+    fn describe_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<proto::ScreenDimensions> {
+        IdbClient::describe_rpc_by(self, deadline)
+    }
+
+    fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String> {
+        IdbClient::describe_all_rpc_by(self, deadline)
+    }
+
+    fn hid_by(&self, events: Vec<proto::HidEvent>, deadline: Deadline) -> Result<()> {
+        IdbClient::hid_by(self, events, deadline)
+    }
+}
 
 /// Reads and writes the accessibility tree of the app under test in the
 /// Simulator, over idb's `accessibility_info` and HID RPCs.
 pub struct IosA11y {
-    client: IdbClient,
+    client: Box<dyn IosA11yClient>,
     /// The target's scale, fetched on first need and kept: a property of the device, so it
     /// does not change between snapshots.
     scale: Option<f64>,
 }
 
+#[derive(Clone, Copy)]
+enum SemanticPhase {
+    Snapshot { dispatched: bool },
+    Invoke,
+    SetValue { dispatched: bool },
+}
+
+impl SemanticPhase {
+    fn expired(self) -> GlassError {
+        match self {
+            Self::Snapshot { dispatched: false } => {
+                GlassError::deadline_not_started("native accessibility snapshot")
+            }
+            Self::Snapshot { dispatched: true } => {
+                GlassError::caller_deadline_elapsed_with_guidance(
+                    "native accessibility snapshot",
+                    "no accessibility tree became available within the time this call allowed",
+                )
+            }
+            Self::Invoke => GlassError::deadline_not_started("native accessibility invoke"),
+            Self::SetValue { dispatched: false } => {
+                GlassError::deadline_not_started("native accessibility set_value")
+            }
+            Self::SetValue { dispatched: true } => {
+                GlassError::caller_deadline_elapsed("native accessibility set_value")
+            }
+        }
+    }
+
+    fn after_snapshot_dispatch(self) -> Self {
+        match self {
+            Self::Snapshot { .. } => Self::Snapshot { dispatched: true },
+            phase => phase,
+        }
+    }
+
+    fn require(self, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            Err(self.expired())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish<T>(self, deadline: Deadline, result: Result<T>) -> Result<T> {
+        self.require(deadline)?;
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) if error.bound_owner() == Some(Whose::Caller) => Err(self.expired()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn run<T>(self, deadline: Deadline, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.require(deadline)?;
+        self.finish(deadline, work())
+    }
+
+    fn finish_snapshot_rpc<T>(self, deadline: Deadline, rpc: SnapshotRpc<T>) -> Result<(T, Self)> {
+        match rpc {
+            SnapshotRpc::BeforeDispatch(error) => {
+                let error = error.before_dispatch();
+                if matches!(self, Self::Snapshot { dispatched: true }) {
+                    Err(error.after_dispatch())
+                } else {
+                    Err(error)
+                }
+            }
+            SnapshotRpc::Dispatched(result) => {
+                let phase = self.after_snapshot_dispatch();
+                let value = phase.finish(deadline, result)?;
+                Ok((value, phase))
+            }
+        }
+    }
+}
+
 impl IosA11y {
     pub(crate) fn new(client: IdbClient) -> Self {
         IosA11y {
-            client,
+            client: Box::new(client),
             scale: None,
         }
     }
@@ -40,23 +139,36 @@ impl IosA11y {
     /// unavailable at all for the second or so an app takes to render. The platform's
     /// injector converts with the device's scale, so a reader using a different one would
     /// report bounds that tap somewhere else.
-    fn scale(&mut self) -> Result<f64> {
+    fn scale(&mut self, deadline: Deadline, phase: SemanticPhase) -> Result<(f64, SemanticPhase)> {
+        phase.require(deadline)?;
         if let Some(scale) = self.scale {
-            return Ok(scale);
+            phase.require(deadline)?;
+            return Ok((scale, phase));
         }
-        let scale = crate::platform::checked_scale(self.client.describe()?.density)?;
+        let (dimensions, phase) =
+            phase.finish_snapshot_rpc(deadline, self.client.describe_rpc_by(deadline))?;
+        let scale = phase.run(deadline, || {
+            crate::platform::checked_scale(dimensions.density)
+        })?;
         self.scale = Some(scale);
-        Ok(scale)
+        phase.require(deadline)?;
+        Ok((scale, phase))
     }
 
     /// One describe round-trip: fetch the accessibility JSON and map the id-assigned tree at
     /// the target's scale. Returns the scale alongside it, since `set_value` places synthetic
     /// input at the same one.
-    fn describe(&mut self, ctx: &AxContext) -> Result<(AxTree, f64)> {
-        let scale = self.scale()?;
-        let json = self.client.describe_all()?;
-        let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
-        tree.assign_ids();
+    fn describe(&mut self, ctx: &AxContext, phase: SemanticPhase) -> Result<(AxTree, f64)> {
+        phase.require(ctx.deadline)?;
+        let (scale, phase) = self.scale(ctx.deadline, phase)?;
+        let (json, phase) = phase
+            .finish_snapshot_rpc(ctx.deadline, self.client.describe_all_rpc_by(ctx.deadline))?;
+        let tree = phase.run(ctx.deadline, || {
+            let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
+            tree.assign_ids();
+            Ok(tree)
+        })?;
+        phase.require(ctx.deadline)?;
         Ok((tree, scale))
     }
 }
@@ -109,6 +221,13 @@ const _: () = assert!(
     "set_value reports the last read-back, so there must be one"
 );
 
+fn bounded_sleep_at(deadline: Deadline, requested: Duration, now: std::time::Instant) -> Duration {
+    deadline
+        .remaining_at(now)
+        .unwrap_or(requested)
+        .min(requested)
+}
+
 /// The write's keystrokes as one batch of HID events: select-all, delete, then the text.
 ///
 /// Do not send these a group at a time again: each `IdbClient::hid` is its own RPC, and the
@@ -136,30 +255,68 @@ fn dispatch_write(
     tap: &PointerEvent,
     target_id: u32,
     text: &str,
+    deadline: Deadline,
 ) -> Result<()> {
+    require_set_value_time(deadline, false)?;
     let keys = clear_and_type_keys(injector, text)?;
+    require_set_value_time(deadline, false)?;
     send(injector.pointer_events(tap)?)?;
+    require_set_value_time(deadline, true)?;
     send(keys).map_err(|e| {
-        GlassError::AxWriteUnconfirmed(
+        if e.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched) {
+            return e.after_dispatch();
+        }
+        GlassError::write_unconfirmed_because(
             target_id,
-            format!("sending the keystrokes failed part-way through ({e}), so the field may have been cleared without receiving the text"),
+            "sending the keystrokes failed part-way through, so the field may have been cleared without receiving the text",
+            e,
         )
+    })?;
+    if deadline.has_passed() {
+        let error = GlassError::caller_deadline_elapsed("iOS accessibility set_value");
+        return Err(GlassError::write_unconfirmed_because(
+            target_id,
+            "the keystroke batch was sent but the caller deadline elapsed before its result was confirmed",
+            error,
+        ));
+    }
+    Ok(())
+}
+
+fn require_set_value_time(deadline: Deadline, dispatched: bool) -> Result<()> {
+    if !deadline.has_passed() {
+        return Ok(());
+    }
+    Err(if dispatched {
+        GlassError::caller_deadline_elapsed("iOS accessibility set_value")
+    } else {
+        GlassError::deadline_not_started("iOS accessibility set_value")
     })
+}
+
+fn post_write_error(target: &AxTarget, error: GlassError) -> GlassError {
+    GlassError::write_unconfirmed_because(target.id.0, "reading the element back failed", error)
 }
 
 impl Accessibility for IosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        Ok(self.describe(ctx)?.0)
+        Ok(self
+            .describe(ctx, SemanticPhase::Snapshot { dispatched: false })?
+            .0)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+        let before_dispatch = SemanticPhase::SetValue { dispatched: false };
+        before_dispatch.require(ctx.deadline)?;
         // One describe serves both the guard and the injector's scale — no second read before the
         // keystrokes go out.
-        let (tree, scale) = self.describe(ctx)?;
-        let bounds = verify(&tree, target)?;
-        let (cx, cy) = bounds
-            .clamped_center(ctx.window.width, ctx.window.height)
-            .ok_or(GlassError::AxElementNotClickable(target.id.0))?;
+        let (tree, scale) = self.describe(ctx, before_dispatch)?;
+        let bounds = before_dispatch.run(ctx.deadline, || verify(&tree, target))?;
+        let (cx, cy) = before_dispatch.run(ctx.deadline, || {
+            bounds
+                .clamped_center(ctx.window.width, ctx.window.height)
+                .ok_or(GlassError::AxElementNotClickable(target.id.0))
+        })?;
         // Focus by tapping the element, select-all + delete to clear, then type — all
         // through an injector at this describe's scale.
         let injector = IdbInjector::new(scale);
@@ -174,22 +331,36 @@ impl Accessibility for IosA11y {
         // loses the text.
         let client = &self.client;
         dispatch_write(
-            &mut |events| client.hid(events),
+            &mut |events| client.hid_by(events, ctx.deadline),
             &injector,
             &tap,
             target.id.0,
             text,
+            ctx.deadline,
         )?;
 
         // A failure of this read is not a failure of the write — the field has already been cleared
         // and typed into — so it says so rather than letting a caller retry blindly and type twice.
+        let after_dispatch = SemanticPhase::SetValue { dispatched: true };
         let mut last = None;
         for _ in 0..VERIFY_ATTEMPTS {
-            std::thread::sleep(VERIFY_SETTLE);
+            after_dispatch
+                .require(ctx.deadline)
+                .map_err(|e| post_write_error(target, e))?;
+            let sleep = bounded_sleep_at(ctx.deadline, VERIFY_SETTLE, std::time::Instant::now());
+            std::thread::sleep(sleep);
+            after_dispatch
+                .require(ctx.deadline)
+                .map_err(|e| post_write_error(target, e))?;
             let (after, _) = self
-                .describe(ctx)
-                .map_err(|e| read_back_failed(target, &e))?;
-            match verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED) {
+                .describe(ctx, after_dispatch)
+                .map_err(|e| post_write_error(target, e))?;
+            match after_dispatch
+                .run(ctx.deadline, || {
+                    verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED)
+                })
+                .map_err(|e| post_write_error(target, e))
+            {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later describe: drift and truncation
                 // are structural, so re-describing for them reaches the same answer more slowly.
@@ -199,14 +370,492 @@ impl Accessibility for IosA11y {
         }
         // The const assert on `VERIFY_ATTEMPTS` is what makes `last` always set; the fallback only
         // avoids an unwrap.
+        after_dispatch
+            .require(ctx.deadline)
+            .map_err(|e| post_write_error(target, e))?;
         Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
+    }
+
+    fn invoke(&mut self, ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
+        SemanticPhase::Invoke.run(ctx.deadline, || Err(GlassError::AxUnsupported))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::idb::client::{IdbSnapshotRpcBoundary, SnapshotRpc, SnapshotRpcGate};
     use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    type ScaleRpc =
+        Box<dyn FnOnce(Deadline) -> SnapshotRpc<proto::ScreenDimensions> + Send + 'static>;
+    type TreeRpc = Box<dyn FnOnce(Deadline) -> SnapshotRpc<String> + Send + 'static>;
+
+    struct ScriptedClient {
+        scale: Mutex<VecDeque<ScaleRpc>>,
+        tree: Mutex<VecDeque<TreeRpc>>,
+    }
+
+    #[derive(Debug)]
+    struct ScriptedIdbSnapshotBoundary {
+        observations: Mutex<VecDeque<std::time::Instant>>,
+        scale: Mutex<VecDeque<Result<proto::ScreenDimensions>>>,
+        tree: Mutex<VecDeque<Result<String>>>,
+        scale_called: Arc<AtomicBool>,
+        tree_called: Arc<AtomicBool>,
+    }
+
+    impl IdbSnapshotRpcBoundary for ScriptedIdbSnapshotBoundary {
+        fn now(&self) -> std::time::Instant {
+            self.observations
+                .lock()
+                .expect("snapshot clock lock")
+                .pop_front()
+                .expect("enough snapshot clock observations")
+        }
+
+        fn describe(&self) -> Result<proto::ScreenDimensions> {
+            self.scale_called.store(true, Ordering::SeqCst);
+            self.scale
+                .lock()
+                .expect("scale response lock")
+                .pop_front()
+                .expect("one scripted scale response")
+        }
+
+        fn describe_all(&self) -> Result<String> {
+            self.tree_called.store(true, Ordering::SeqCst);
+            self.tree
+                .lock()
+                .expect("tree response lock")
+                .pop_front()
+                .expect("one scripted tree response")
+        }
+    }
+
+    impl ScriptedClient {
+        fn new(scale: Vec<ScaleRpc>, tree: Vec<TreeRpc>) -> Self {
+            Self {
+                scale: Mutex::new(scale.into()),
+                tree: Mutex::new(tree.into()),
+            }
+        }
+    }
+
+    impl IosA11yClient for ScriptedClient {
+        fn describe_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<proto::ScreenDimensions> {
+            self.scale
+                .lock()
+                .expect("scale script lock")
+                .pop_front()
+                .expect("one scripted scale RPC")(deadline)
+        }
+
+        fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String> {
+            self.tree
+                .lock()
+                .expect("tree script lock")
+                .pop_front()
+                .expect("one scripted tree RPC")(deadline)
+        }
+
+        fn hid_by(&self, _events: Vec<proto::HidEvent>, _deadline: Deadline) -> Result<()> {
+            panic!("snapshot deadline tests never send HID")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RpcExpiry {
+        BeforeCall,
+        AfterCall,
+    }
+
+    fn expiring_rpc<T: Send + 'static>(
+        op: &'static str,
+        expiry: RpcExpiry,
+        called: Arc<AtomicBool>,
+        result: Result<T>,
+    ) -> Box<dyn FnOnce(Deadline) -> SnapshotRpc<T> + Send> {
+        Box::new(move |deadline| {
+            let gate = SnapshotRpcGate::new(deadline, Duration::from_secs(30), op)
+                .expect("the outer snapshot deadline starts live");
+            let expires = gate.ends();
+            let before = expires
+                .checked_sub(Duration::from_millis(1))
+                .expect("the RPC bound is longer than one millisecond");
+            let mut observations = match expiry {
+                RpcExpiry::BeforeCall => vec![expires].into_iter(),
+                RpcExpiry::AfterCall => vec![before, expires].into_iter(),
+            };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build a current-thread runtime for the scripted snapshot RPC")
+                .block_on(gate.run_with_clock(
+                    || observations.next().expect("enough clock observations"),
+                    || async move {
+                        called.store(true, Ordering::SeqCst);
+                        result
+                    },
+                ))
+        })
+    }
+
+    fn dimensions() -> proto::ScreenDimensions {
+        proto::ScreenDimensions {
+            width: 400,
+            height: 800,
+            density: 2.0,
+            width_points: 200,
+            height_points: 400,
+        }
+    }
+
+    fn scripted_a11y(
+        scale: Vec<ScaleRpc>,
+        tree: Vec<TreeRpc>,
+        cached_scale: Option<f64>,
+    ) -> IosA11y {
+        IosA11y {
+            client: Box::new(ScriptedClient::new(scale, tree)),
+            scale: cached_scale,
+        }
+    }
+
+    fn ctx(deadline: glass_core::Deadline) -> AxContext {
+        AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 200,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline,
+        }
+    }
+
+    #[test]
+    fn snapshot_with_a_spent_deadline_starts_no_describe() {
+        let mut a11y = IosA11y::new(IdbClient::for_test());
+
+        let error = a11y
+            .snapshot(&ctx(glass_core::Deadline::from_millis(0)))
+            .expect_err("a spent snapshot deadline must stop before idb describe");
+
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::NotStarted),
+            "{error}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn production_idb_adapter_preserves_a_first_rpc_refusal_as_not_dispatched() {
+        let scale_called = Arc::new(AtomicBool::new(false));
+        let tree_called = Arc::new(AtomicBool::new(false));
+        let expires = std::time::Instant::now() + Duration::from_secs(5);
+        let boundary = ScriptedIdbSnapshotBoundary {
+            observations: Mutex::new(vec![expires].into()),
+            scale: Mutex::new(vec![Ok(dimensions())].into()),
+            tree: Mutex::new(VecDeque::new()),
+            scale_called: Arc::clone(&scale_called),
+            tree_called: Arc::clone(&tree_called),
+        };
+        let mut a11y = IosA11y::new(IdbClient::for_snapshot_test(Box::new(boundary)));
+
+        let error = a11y
+            .snapshot(&ctx(Deadline::at(expires)))
+            .expect_err("the production adapter must preserve the lower pre-dispatch refusal");
+
+        assert!(!scale_called.load(Ordering::SeqCst));
+        assert!(!tree_called.load(Ordering::SeqCst));
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn cold_snapshot_tree_refusal_preserves_its_cause_but_marks_the_scale_dispatch() {
+        let scale_called = Arc::new(AtomicBool::new(false));
+        let tree_called = Arc::new(AtomicBool::new(false));
+        let expires = std::time::Instant::now() + Duration::from_secs(5);
+        let before = expires - Duration::from_millis(1);
+        let boundary = ScriptedIdbSnapshotBoundary {
+            observations: Mutex::new(vec![before, before, expires].into()),
+            scale: Mutex::new(vec![Ok(dimensions())].into()),
+            tree: Mutex::new(vec![Ok("[]".into())].into()),
+            scale_called: Arc::clone(&scale_called),
+            tree_called: Arc::clone(&tree_called),
+        };
+        let mut a11y = IosA11y::new(IdbClient::for_snapshot_test(Box::new(boundary)));
+
+        let error = a11y
+            .snapshot(&ctx(Deadline::at(expires)))
+            .expect_err("the tree RPC gate must refuse after the scale RPC dispatched");
+
+        assert!(scale_called.load(Ordering::SeqCst));
+        assert!(!tree_called.load(Ordering::SeqCst));
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            error.to_string().contains("idb accessibility_info"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn scale_rpc_expiry_before_the_injected_call_is_not_dispatched() {
+        let called = Arc::new(AtomicBool::new(false));
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(5));
+        let mut a11y = scripted_a11y(
+            vec![expiring_rpc(
+                "idb describe",
+                RpcExpiry::BeforeCall,
+                Arc::clone(&called),
+                Ok(dimensions()),
+            )],
+            vec![],
+            None,
+        );
+
+        let error = a11y
+            .snapshot(&ctx(deadline))
+            .expect_err("expiry at the scale RPC gate must stop before the call");
+
+        assert!(!called.load(Ordering::SeqCst), "scale RPC must not begin");
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn scale_rpc_expiry_after_the_injected_call_is_a_caller_timeout() {
+        let called = Arc::new(AtomicBool::new(false));
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(5));
+        let mut a11y = scripted_a11y(
+            vec![expiring_rpc(
+                "idb describe",
+                RpcExpiry::AfterCall,
+                Arc::clone(&called),
+                Ok(dimensions()),
+            )],
+            vec![],
+            None,
+        );
+
+        let error = a11y
+            .snapshot(&ctx(deadline))
+            .expect_err("expiry after the scale RPC begins must be a caller timeout");
+
+        assert!(called.load(Ordering::SeqCst), "scale RPC must begin");
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tree_rpc_expiry_before_the_injected_call_is_not_dispatched() {
+        let called = Arc::new(AtomicBool::new(false));
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(5));
+        let mut a11y = scripted_a11y(
+            vec![],
+            vec![expiring_rpc(
+                "idb accessibility_info",
+                RpcExpiry::BeforeCall,
+                Arc::clone(&called),
+                Ok("[]".into()),
+            )],
+            Some(2.0),
+        );
+
+        let error = a11y
+            .snapshot(&ctx(deadline))
+            .expect_err("expiry at the tree RPC gate must stop before the call");
+
+        assert!(!called.load(Ordering::SeqCst), "tree RPC must not begin");
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::NotStarted),
+            "{error}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tree_rpc_expiry_after_the_injected_call_is_a_caller_timeout() {
+        let called = Arc::new(AtomicBool::new(false));
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(5));
+        let mut a11y = scripted_a11y(
+            vec![],
+            vec![expiring_rpc(
+                "idb accessibility_info",
+                RpcExpiry::AfterCall,
+                Arc::clone(&called),
+                Ok("[]".into()),
+            )],
+            Some(2.0),
+        );
+
+        let error = a11y
+            .snapshot(&ctx(deadline))
+            .expect_err("expiry after the tree RPC begins must be a caller timeout");
+
+        assert!(called.load(Ordering::SeqCst), "tree RPC must begin");
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pre_rpc_backend_failure_survives_deadline_expiry_before_snapshot_returns() {
+        let mut a11y = scripted_a11y(
+            vec![Box::new(move |deadline| {
+                while !deadline.has_passed() {
+                    std::thread::yield_now();
+                }
+                SnapshotRpc::BeforeDispatch(GlassError::Backend(
+                    "idb describe preflight failed".into(),
+                ))
+            })],
+            vec![],
+            None,
+        );
+
+        let error = a11y
+            .snapshot(&ctx(Deadline::at(
+                std::time::Instant::now() + Duration::from_millis(10),
+            )))
+            .expect_err("the real pre-RPC failure must survive the outer deadline recheck");
+
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "idb describe preflight failed"),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn live_tree_rpc_accessibility_not_ready_is_preserved() {
+        let called = Arc::new(AtomicBool::new(false));
+        let saw_call = Arc::clone(&called);
+        let mut a11y = scripted_a11y(
+            vec![],
+            vec![Box::new(move |_deadline| {
+                saw_call.store(true, Ordering::SeqCst);
+                SnapshotRpc::dispatched(Err(GlassError::AccessibilityNotReady(
+                    "the app has not published a tree yet".into(),
+                )))
+            })],
+            Some(2.0),
+        );
+
+        let error = a11y
+            .snapshot(&ctx(Deadline::UNBOUNDED))
+            .expect_err("a live no-tree result must remain retryable");
+
+        assert!(called.load(Ordering::SeqCst), "tree RPC must begin");
+        assert!(
+            matches!(error, GlassError::AccessibilityNotReady(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn invoke_with_a_spent_deadline_is_not_dispatched() {
+        let mut a11y = IosA11y::new(IdbClient::for_test());
+
+        let error = a11y
+            .invoke(
+                &ctx(glass_core::Deadline::from_millis(0)),
+                &matching_target(),
+            )
+            .expect_err("a spent invoke deadline must win over pointer fallback");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn set_value_with_a_spent_deadline_starts_no_describe_or_hid() {
+        let mut a11y = IosA11y::new(IdbClient::for_test());
+
+        let error = a11y
+            .set_value(
+                &ctx(glass_core::Deadline::from_millis(0)),
+                &matching_target(),
+                "new",
+            )
+            .expect_err("a spent set_value deadline must stop before idb describe");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn verification_sleep_is_capped_by_the_absolute_caller_deadline() {
+        let now = std::time::Instant::now();
+        let left = Duration::from_millis(5);
+
+        assert_eq!(
+            bounded_sleep_at(
+                glass_core::Deadline::at(now + left),
+                Duration::from_millis(300),
+                now,
+            ),
+            left
+        );
+    }
 
     fn leaf(id: u32, role: AxRole, name: &str, r: AxRect) -> AxNode {
         AxNode {
@@ -302,7 +951,15 @@ mod tests {
         // the text loses the text.
         let injector = IdbInjector::new(2.0);
         let mut log = Vec::new();
-        dispatch_write(&mut recording_send(&mut log), &injector, &a_tap(), 1, "hi").unwrap();
+        dispatch_write(
+            &mut recording_send(&mut log),
+            &injector,
+            &a_tap(),
+            1,
+            "hi",
+            glass_core::Deadline::UNBOUNDED,
+        )
+        .unwrap();
 
         assert_eq!(log.len(), 2, "the tap, then every keystroke in one call");
         assert_eq!(log[0], injector.pointer_events(&a_tap()).unwrap());
@@ -318,7 +975,15 @@ mod tests {
             calls += 1;
             Err(GlassError::Backend("idb: connection reset".into()))
         };
-        let err = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi").unwrap_err();
+        let err = dispatch_write(
+            &mut send,
+            &injector,
+            &a_tap(),
+            1,
+            "hi",
+            glass_core::Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
         assert_eq!(calls, 1, "the keystrokes must not follow a tap that failed");
         assert!(
             !err.set_value_failed_after_writing(),
@@ -340,8 +1005,21 @@ mod tests {
                 Err(GlassError::Backend("idb hid timed out after 30s".into()))
             }
         };
-        let err = dispatch_write(&mut send, &injector, &a_tap(), 7, "hi").unwrap_err();
-        assert!(matches!(err, GlassError::AxWriteUnconfirmed(7, _)), "{err}");
+        let err = dispatch_write(
+            &mut send,
+            &injector,
+            &a_tap(),
+            7,
+            "hi",
+            glass_core::Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+        assert!(matches!(err.cause(), GlassError::Backend(_)), "{err}");
+        assert_eq!(
+            err.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{err}"
+        );
         assert!(
             err.set_value_failed_after_writing(),
             "the session must drop the value it cached: {err}"
@@ -361,6 +1039,7 @@ mod tests {
             &a_tap(),
             1,
             "café",
+            glass_core::Deadline::UNBOUNDED,
         )
         .unwrap_err();
         assert!(matches!(err, GlassError::Unsupported(_)), "{err}");
@@ -369,6 +1048,137 @@ mod tests {
             "nothing may be sent for a write that cannot be built"
         );
         assert!(!err.set_value_failed_after_writing(), "{err}");
+    }
+
+    #[test]
+    fn deadline_expiring_after_the_focus_tap_prevents_the_keystroke_batch() {
+        let injector = IdbInjector::new(1.0);
+        let deadline = glass_core::Deadline::from_millis(5);
+        let mut sends = 0;
+        let mut send = |_events| {
+            sends += 1;
+            if sends == 1 {
+                while !deadline.has_passed() {
+                    std::thread::yield_now();
+                }
+            }
+            Ok(())
+        };
+
+        let error = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi", deadline)
+            .expect_err("the keystrokes must not begin after the shared deadline expires");
+
+        assert_eq!(sends, 1, "the keystroke batch started after expiry");
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            !error.set_value_failed_after_writing(),
+            "the focus tap did not mutate the value: {error}"
+        );
+    }
+
+    #[test]
+    fn a_spent_second_hid_keeps_its_bound_but_records_the_focus_dispatch() {
+        let injector = IdbInjector::new(1.0);
+        let mut sends = 0;
+        let mut send = |_events| {
+            sends += 1;
+            if sends == 1 {
+                Ok(())
+            } else {
+                Err(GlassError::deadline_not_started("idb hid"))
+            }
+        };
+
+        let error = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi", Deadline::UNBOUNDED)
+            .expect_err("the second HID was refused after the focus tap landed");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            !error.set_value_failed_after_writing(),
+            "only the focus tap went out, not the value mutation: {error}"
+        );
+    }
+
+    #[test]
+    fn caller_timeout_from_the_keystroke_stream_is_an_unconfirmed_write() {
+        let injector = IdbInjector::new(1.0);
+        let mut sends = 0;
+        let mut send = |_events| {
+            sends += 1;
+            if sends == 1 {
+                Ok(())
+            } else {
+                Err(GlassError::caller_deadline_elapsed("idb hid"))
+            }
+        };
+
+        let error = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi", Deadline::UNBOUNDED)
+            .expect_err("the caller-owned HID timeout may have interrupted the value mutation");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::Bounded { .. }),
+            "{error}"
+        );
+        assert!(error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn a_post_write_readback_failure_preserves_its_tool_source() {
+        let error = post_write_error(
+            &matching_target(),
+            GlassError::ToolFailed {
+                call: "idb accessibility_info".into(),
+                said: " simulator transport closed \n".into(),
+            },
+        );
+
+        assert!(
+            matches!(error.cause(), GlassError::ToolFailed { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            error.tool_said(),
+            Some("simulator transport closed"),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_verification_error_observed_after_expiry_stays_caller_owned() {
+        let deadline = glass_core::Deadline::at(std::time::Instant::now());
+
+        let error = SemanticPhase::SetValue { dispatched: true }
+            .finish(
+                deadline,
+                Err::<(), _>(GlassError::AxElementChanged(matching_target().id.0)),
+            )
+            .expect_err("expiry after HID dispatch must override an ordinary verification error");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
     }
 
     #[test]

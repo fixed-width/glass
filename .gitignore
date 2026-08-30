@@ -41,3 +41,6 @@ mutants.out.old/
 # The Android role fixture's throwaway signing key, generated on first build. It lives outside
 # build/ so rebuilds keep signing with the same key; see that example's build.sh.
 /examples/android-role-fixture/.signing-key.jks
+
+# Local linked worktrees
+/.worktrees/

@@ -42,6 +42,27 @@ impl Glass {
         Ok((baseline, current))
     }
 
+    fn baseline_and_current_by(
+        &mut self,
+        name: &str,
+        region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<(Frame, Frame)> {
+        if let Some(r) = region {
+            let geo = self.require_active()?.geometry.clone();
+            r.check_fits(geo.width, geo.height)?;
+        }
+        let baseline = {
+            let base = self.baselines.load(name)?;
+            match region {
+                Some(r) => base.crop(r)?,
+                None => base,
+            }
+        };
+        let current = self.capture_by(None, region, deadline)?;
+        Ok((baseline, current))
+    }
+
     /// Exact per-channel diff of the current frame against a saved baseline.
     /// `region` scopes the comparison to a window-relative sub-rectangle.
     /// `ignore` rects are window-relative animated regions to exclude from the
@@ -68,6 +89,21 @@ impl Glass {
         tolerance: u8,
     ) -> Result<(DiffResult, Frame)> {
         let (baseline, current) = self.baseline_and_current(name, region)?;
+        let mask = mask_for(ignore, region, baseline.width, baseline.height)?;
+        let r = diff_with_mask(&baseline, &current, tolerance, &mask)?;
+        Ok((r, current))
+    }
+
+    /// Like [`diff_baseline_with_frame`] but bounds the current capture by `deadline`.
+    pub fn diff_baseline_with_frame_by(
+        &mut self,
+        name: &str,
+        region: Option<&Region>,
+        ignore: &[Region],
+        tolerance: u8,
+        deadline: Deadline,
+    ) -> Result<(DiffResult, Frame)> {
+        let (baseline, current) = self.baseline_and_current_by(name, region, deadline)?;
         let mask = mask_for(ignore, region, baseline.width, baseline.height)?;
         let r = diff_with_mask(&baseline, &current, tolerance, &mask)?;
         Ok((r, current))
@@ -102,6 +138,21 @@ impl Glass {
         let r = diff_perceptual_with_mask(&baseline, &current, threshold, &mask)?;
         Ok((r, current))
     }
+
+    /// Like [`diff_baseline_perceptual_with_frame`] but bounds the current capture by `deadline`.
+    pub fn diff_baseline_perceptual_with_frame_by(
+        &mut self,
+        name: &str,
+        region: Option<&Region>,
+        ignore: &[Region],
+        threshold: f32,
+        deadline: Deadline,
+    ) -> Result<(DiffResult, Frame)> {
+        let (baseline, current) = self.baseline_and_current_by(name, region, deadline)?;
+        let mask = mask_for(ignore, region, baseline.width, baseline.height)?;
+        let r = diff_perceptual_with_mask(&baseline, &current, threshold, &mask)?;
+        Ok((r, current))
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +171,46 @@ mod tests {
         g.save_baseline("main").unwrap();
         let result = g.diff_baseline("main", None, &[], 0).unwrap();
         assert_eq!(result.changed_pixels, 1);
+    }
+
+    #[test]
+    fn exact_diff_by_uses_deadline_aware_current_capture() {
+        let frame = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with(
+            FakePlatform::new(2, 2)
+                .with_frames(vec![frame.clone(), frame])
+                .with_capture_deadline_log(log.clone()),
+        );
+        g.start(&spec()).unwrap();
+        g.save_baseline("main").unwrap();
+        log.lock().unwrap().clear();
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(1));
+
+        g.diff_baseline_with_frame_by("main", None, &[], 0, deadline)
+            .unwrap();
+
+        assert_eq!(*log.lock().unwrap(), vec![deadline]);
+    }
+
+    #[test]
+    fn perceptual_diff_by_uses_deadline_aware_current_capture() {
+        let frame = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with(
+            FakePlatform::new(2, 2)
+                .with_frames(vec![frame.clone(), frame])
+                .with_capture_deadline_log(log.clone()),
+        );
+        g.start(&spec()).unwrap();
+        g.save_baseline("main").unwrap();
+        log.lock().unwrap().clear();
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(1));
+
+        g.diff_baseline_perceptual_with_frame_by("main", None, &[], 0.1, deadline)
+            .unwrap();
+
+        assert_eq!(*log.lock().unwrap(), vec![deadline]);
     }
 
     #[test]

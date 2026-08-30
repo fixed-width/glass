@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::Whose;
+
 /// Which bound ended a call that produced no answer — the distinction
 /// [`crate::run_bounded_until`] makes and [`GlassError::Bounded`] carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7,13 +9,23 @@ pub enum BoundKind {
     /// The call ran and was killed when its effective bound elapsed — its own budget or the
     /// deadline it shares, whichever was nearer.
     ///
-    /// It does not say which of the two governed, so a caller that passed a deadline must still
-    /// compare them: its own budget firing is evidence the tool is wedged, and its caller's is
-    /// evidence of nothing at all (glass#341, glass#347).
+    /// [`GlassError::bound_owner`] says which of the two governed: callee-owned expiry indicates the
+    /// backend exceeded its own ceiling; caller-owned expiry says nothing about backend health. Use
+    /// [`GlassError::bound_dispatch`] separately for possible external effects (glass#341,
+    /// glass#347).
     TimedOut,
     /// The call never ran: the deadline it shares with the rest of a sequence was already spent.
     /// Nothing was asked, so nothing about the tool is known.
     NotStarted,
+}
+
+/// Whether a bounded failure proves that no external work was dispatched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundDispatch {
+    /// The bound was spent before glass dispatched any external work.
+    NotDispatched,
+    /// External work started, so its effect may have occurred before the bound ended the wait.
+    MayHaveDispatched,
 }
 
 /// Render a backend's own explanation as the clause closing [`GlassError::AxValueNotApplied`].
@@ -106,6 +118,9 @@ pub enum GlassError {
     #[error("invalid region: {0}")]
     InvalidRegion(String),
 
+    #[error("invalid pointer input: {0}")]
+    InvalidPointerInput(&'static str),
+
     #[error("frames differ in size: {a:?} vs {b:?}")]
     SizeMismatch { a: (u32, u32), b: (u32, u32) },
 
@@ -158,6 +173,20 @@ pub enum GlassError {
          where it landed rather than writing it again"
     )]
     AxWriteUnconfirmed(u32, String),
+
+    /// A write that went out and could not be confirmed because another structured operation
+    /// failed. The source remains available for timeout ownership and transport classification;
+    /// the outer verdict remains authoritative for retry safety and dispatch provenance.
+    #[error(
+        "element #{id}: the write went out, but could not be confirmed — {detail} ({source}). \
+         Re-snapshot to see where it landed rather than writing it again"
+    )]
+    AxWriteUnconfirmedCaused {
+        id: u32,
+        detail: String,
+        #[source]
+        source: Box<GlassError>,
+    },
 
     /// A dispatched write whose read-back does not hold the request.
     ///
@@ -260,24 +289,83 @@ pub enum GlassError {
     /// clock glass does not own.
     #[non_exhaustive]
     #[error("backend error: {message}")]
-    Bounded { kind: BoundKind, message: String },
+    Bounded {
+        kind: BoundKind,
+        whose: Whose,
+        dispatch: BoundDispatch,
+        message: String,
+    },
+
+    /// Both the pointer operation and restoration failed; each structured cause remains
+    /// inspectable.
+    #[error("{primary}; restoring the previous active window failed: {restore}")]
+    WindowRestoreFailed {
+        #[source]
+        primary: Box<GlassError>,
+        restore: Box<GlassError>,
+    },
+
+    /// Both input and mandatory release failed; either cause may own the deadline, and input state
+    /// is uncertain.
+    #[error("{primary}; cleanup failed while {operation}: {cleanup}")]
+    InputCleanupFailed {
+        operation: &'static str,
+        #[source]
+        primary: Box<GlassError>,
+        cleanup: Box<GlassError>,
+    },
+
+    /// An unchanged failure from work proven not to have dispatched.
+    #[error(transparent)]
+    BeforeDispatch(Box<GlassError>),
+
+    /// An unchanged failure following earlier dispatch in the same compound operation.
+    #[error(transparent)]
+    AfterDispatch(Box<GlassError>),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
 
 impl GlassError {
-    /// Whether a failed native-invoke attempt may safely fall back to the synthetic
-    /// pointer path. True only for outcomes where **no native action was dispatched**:
-    /// the backend has no invoke at all ([`GlassError::AxUnsupported`]), or the element
-    /// exposes no activation action ([`GlassError::AxActionUnavailable`]).
+    /// A sequence step rejected before dispatch because its shared deadline was already spent.
+    pub fn deadline_not_started(op: &str) -> Self {
+        GlassError::Bounded {
+            kind: BoundKind::NotStarted,
+            whose: Whose::Caller,
+            dispatch: BoundDispatch::NotDispatched,
+            message: format!(
+                "{op}: the deadline it shares with the rest of the call was already spent, so it was not started"
+            ),
+        }
+    }
+
+    /// A bounded operation started, then the caller's shared deadline elapsed before it answered.
+    pub fn caller_deadline_elapsed(op: &str) -> Self {
+        Self::caller_deadline_elapsed_with_guidance(op, "")
+    }
+
+    /// A caller-owned timeout for dispatched work whose answer or effect may still arrive.
+    pub fn caller_deadline_elapsed_with_guidance(op: &str, guidance: &str) -> Self {
+        let guidance = if guidance.is_empty() {
+            String::new()
+        } else {
+            format!("; {guidance}")
+        };
+        GlassError::Bounded {
+            kind: BoundKind::TimedOut,
+            whose: Whose::Caller,
+            dispatch: BoundDispatch::MayHaveDispatched,
+            message: format!(
+                "{op}: the caller deadline elapsed before the operation answered{guidance}"
+            ),
+        }
+    }
+
+    /// Whether native invoke may fall back to a pointer click.
     ///
-    /// Everything else fails CLOSED. A failure *after* dispatch — or an ambiguous
-    /// transport/timeout error, which cannot be distinguished from one — must propagate,
-    /// because a pointer click on top of a native action that may still land actuates the
-    /// control twice (submitting a form twice, sending a message twice). The wildcard arm
-    /// is deliberate: a new error variant is treated as "may have dispatched" until it is
-    /// proven otherwise.
+    /// Only [`GlassError::AxUnsupported`] and [`GlassError::AxActionUnavailable`] prove no dispatch;
+    /// every other failure propagates to prevent double actuation.
     pub fn invoke_fallback_eligible(&self) -> bool {
         matches!(
             self,
@@ -285,27 +373,82 @@ impl GlassError {
         )
     }
 
-    /// Whether a failed value-write is **proven** to have gone out before failing — the only case
-    /// where the session's captured value is stale and must be dropped. True for two post-dispatch
-    /// verdicts: [`GlassError::AxValueNotApplied`] and [`GlassError::AxWriteUnconfirmed`], both
-    /// raised only after a write was dispatched; false for everything else, including variants
-    /// added later.
+    /// The underlying structured failure, recursively unwrapping dispatch annotations.
+    pub fn cause(&self) -> &Self {
+        match self {
+            GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => error.cause(),
+            GlassError::AxWriteUnconfirmedCaused { source, .. } => source.cause(),
+            GlassError::WindowRestoreFailed { primary, .. } => primary.cause(),
+            GlassError::InputCleanupFailed { primary, .. } => primary.cause(),
+            error => error,
+        }
+    }
+
+    /// Whether the value mutation itself may have dispatched, requiring its cached value to be
+    /// dropped.
     ///
-    /// Same "did anything dispatch?" question as [`Self::invoke_fallback_eligible`], but decided by
-    /// an allowlist, because the two mistakes are not symmetric. Keeping the value can only make
-    /// the guard reject more — an `AxElementChanged` whose own message tells the caller to
-    /// re-snapshot, recoverable. Dropping it can only make the guard accept more, and what it then
-    /// accepts is a write onto the wrong element, reported as `Ok`.
-    ///
-    /// Some verdicts cannot be classified at all: Android raises `ToolFailed`, `Bounded` and
-    /// `AccessibilityUnavailable` on *both* sides of the dispatch — its pre-write re-snapshot and
-    /// adb handshake fail the same way its post-write read-back does — so no variant-level split
-    /// separates them, and the recoverable answer has to win.
+    /// Backends classify ambiguous transport failures where they know the write may have reached
+    /// the device.
     pub fn set_value_failed_after_writing(&self) -> bool {
-        matches!(
-            self,
-            GlassError::AxValueNotApplied { .. } | GlassError::AxWriteUnconfirmed(..)
-        )
+        match self {
+            GlassError::AxValueNotApplied { .. }
+            | GlassError::AxWriteUnconfirmed(..)
+            | GlassError::AxWriteUnconfirmedCaused { .. } => true,
+            GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => {
+                error.set_value_failed_after_writing()
+            }
+            GlassError::WindowRestoreFailed { primary, restore } => {
+                primary.set_value_failed_after_writing() || restore.set_value_failed_after_writing()
+            }
+            GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            } => {
+                primary.set_value_failed_after_writing() || cleanup.set_value_failed_after_writing()
+            }
+            _ => false,
+        }
+    }
+
+    /// Preserve proof that this ordinary failure occurred before dispatch; stronger existing
+    /// provenance remains unchanged.
+    pub fn before_dispatch(self) -> Self {
+        match self {
+            error @ (GlassError::BeforeDispatch(_)
+            | GlassError::AfterDispatch(_)
+            | GlassError::Bounded { .. }
+            | GlassError::InputCleanupFailed { .. }) => error,
+            error => GlassError::BeforeDispatch(Box::new(error)),
+        }
+    }
+
+    /// Preserve earlier dispatch when a later compound-operation step fails.
+    pub fn after_dispatch(self) -> Self {
+        match self {
+            error @ (GlassError::AfterDispatch(_) | GlassError::InputCleanupFailed { .. }) => error,
+            error @ GlassError::Bounded {
+                dispatch: BoundDispatch::MayHaveDispatched,
+                ..
+            } => error,
+            error => GlassError::AfterDispatch(Box::new(error)),
+        }
+    }
+
+    /// Attach the structured cause that prevented confirmation unless a stronger post-write verdict
+    /// already exists.
+    pub fn write_unconfirmed_because(
+        id: u32,
+        detail: impl Into<String>,
+        source: GlassError,
+    ) -> GlassError {
+        if source.set_value_failed_after_writing() {
+            source
+        } else {
+            GlassError::AxWriteUnconfirmedCaused {
+                id,
+                detail: detail.into(),
+                source: Box::new(source),
+            }
+        }
     }
 
     /// The verdict for a write that dispatched and whose read-back does not hold the request.
@@ -346,6 +489,19 @@ impl GlassError {
         }
     }
 
+    /// Preserve both a failed input operation and the mandatory release that also failed.
+    pub fn input_cleanup_failed(
+        operation: &'static str,
+        primary: GlassError,
+        cleanup: GlassError,
+    ) -> GlassError {
+        GlassError::InputCleanupFailed {
+            operation,
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        }
+    }
+
     /// Which of glass's own bounds ended this call, if one did rather than the tool answering.
     ///
     /// The question a backend asks before retrying, before offering a wedged-tool remedy, and
@@ -355,6 +511,62 @@ impl GlassError {
     pub fn bound(&self) -> Option<BoundKind> {
         match self {
             GlassError::Bounded { kind, .. } => Some(*kind),
+            GlassError::BeforeDispatch(error)
+            | GlassError::AfterDispatch(error)
+            | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.bound(),
+            GlassError::WindowRestoreFailed { primary, restore } => {
+                primary.bound().or_else(|| restore.bound())
+            }
+            GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            } => primary.bound().or_else(|| cleanup.bound()),
+            _ => None,
+        }
+    }
+
+    /// Whose bound ended this call, when [`Self::bound`] reports one.
+    pub fn bound_owner(&self) -> Option<Whose> {
+        match self {
+            GlassError::Bounded { whose, .. } => Some(*whose),
+            GlassError::BeforeDispatch(error)
+            | GlassError::AfterDispatch(error)
+            | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.bound_owner(),
+            GlassError::WindowRestoreFailed { primary, restore } => {
+                primary.bound_owner().or_else(|| restore.bound_owner())
+            }
+            GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            } => primary.bound_owner().or_else(|| cleanup.bound_owner()),
+            _ => None,
+        }
+    }
+
+    /// Whether external work may have been dispatched before this failure.
+    pub fn bound_dispatch(&self) -> Option<BoundDispatch> {
+        match self {
+            GlassError::Bounded { dispatch, .. } => Some(*dispatch),
+            GlassError::BeforeDispatch(error) => {
+                if error.bound_dispatch() == Some(BoundDispatch::MayHaveDispatched) {
+                    Some(BoundDispatch::MayHaveDispatched)
+                } else {
+                    Some(BoundDispatch::NotDispatched)
+                }
+            }
+            GlassError::AfterDispatch(_)
+            | GlassError::AxWriteUnconfirmed(..)
+            | GlassError::AxWriteUnconfirmedCaused { .. } => Some(BoundDispatch::MayHaveDispatched),
+            GlassError::WindowRestoreFailed { primary, restore } => {
+                match (primary.bound_dispatch(), restore.bound_dispatch()) {
+                    (Some(BoundDispatch::MayHaveDispatched), _)
+                    | (_, Some(BoundDispatch::MayHaveDispatched)) => {
+                        Some(BoundDispatch::MayHaveDispatched)
+                    }
+                    (Some(BoundDispatch::NotDispatched), _)
+                    | (_, Some(BoundDispatch::NotDispatched)) => Some(BoundDispatch::NotDispatched),
+                    (None, None) => None,
+                }
+            }
+            GlassError::InputCleanupFailed { .. } => Some(BoundDispatch::MayHaveDispatched),
             _ => None,
         }
     }
@@ -370,6 +582,15 @@ impl GlassError {
     pub fn tool_said(&self) -> Option<&str> {
         match self {
             GlassError::ToolFailed { said, .. } => Some(said.trim()),
+            GlassError::BeforeDispatch(error)
+            | GlassError::AfterDispatch(error)
+            | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.tool_said(),
+            GlassError::WindowRestoreFailed { primary, restore } => {
+                primary.tool_said().or_else(|| restore.tool_said())
+            }
+            GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            } => primary.tool_said().or_else(|| cleanup.tool_said()),
             _ => None,
         }
     }
@@ -416,6 +637,336 @@ pub type Result<T> = std::result::Result<T, GlassError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BoundDispatch, Whose};
+
+    #[test]
+    fn caller_deadline_errors_preserve_the_caller_owner() {
+        let error = GlassError::caller_deadline_elapsed("capture");
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+    }
+
+    #[test]
+    fn ordinary_backend_errors_have_no_bound_owner() {
+        assert_eq!(GlassError::Backend("down".into()).bound_owner(), None);
+    }
+
+    #[test]
+    fn caller_deadline_errors_preserve_dispatch_uncertainty() {
+        let error = GlassError::caller_deadline_elapsed("capture");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn not_started_deadline_errors_preserve_that_nothing_dispatched() {
+        let error = GlassError::deadline_not_started("capture");
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn ordinary_backend_errors_have_no_bound_dispatch() {
+        assert_eq!(GlassError::Backend("down".into()).bound_dispatch(), None);
+    }
+
+    #[test]
+    fn input_cleanup_failure_preserves_both_sources_and_metadata() {
+        let error = GlassError::InputCleanupFailed {
+            operation: "releasing held input",
+            primary: Box::new(GlassError::caller_deadline_elapsed("pointer input")),
+            cleanup: Box::new(GlassError::ToolFailed {
+                call: "release-input".into(),
+                said: "  device refused release  ".into(),
+            }),
+        };
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(error.tool_said(), Some("device refused release"));
+        assert!(matches!(error.cause(), GlassError::Bounded { .. }));
+        let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("cleanup failure must remain structurally inspectable");
+        };
+        assert_eq!(operation, "releasing held input");
+        assert!(matches!(*primary, GlassError::Bounded { .. }));
+        assert!(matches!(*cleanup, GlassError::ToolFailed { .. }));
+    }
+
+    #[test]
+    fn before_dispatch_preserves_an_ordinary_cause_and_marks_no_dispatch() {
+        let error = GlassError::Backend("could not spawn helper".into()).before_dispatch();
+
+        assert_eq!(error.to_string(), "backend error: could not spawn helper");
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "could not spawn helper")
+        );
+    }
+
+    #[test]
+    fn before_dispatch_accessors_recurse_through_nested_annotations() {
+        let bounded = GlassError::BeforeDispatch(Box::new(GlassError::BeforeDispatch(Box::new(
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                whose: Whose::Callee,
+                dispatch: BoundDispatch::MayHaveDispatched,
+                message: "nested timeout".into(),
+            },
+        ))));
+        assert_eq!(bounded.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(bounded.bound_owner(), Some(Whose::Callee));
+        assert_eq!(
+            bounded.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "an inner dispatched bound must outrank outer preflight annotations"
+        );
+        assert!(matches!(bounded.cause(), GlassError::Bounded { .. }));
+
+        let tool = GlassError::BeforeDispatch(Box::new(GlassError::BeforeDispatch(Box::new(
+            GlassError::ToolFailed {
+                call: "helper".into(),
+                said: " refused \n".into(),
+            },
+        ))));
+        assert_eq!(tool.tool_said(), Some("refused"));
+        assert!(matches!(tool.cause(), GlassError::ToolFailed { .. }));
+    }
+
+    #[test]
+    fn after_dispatch_upgrades_a_before_dispatch_failure_without_marking_a_value_write() {
+        let error = GlassError::Backend("later spawn failed".into())
+            .before_dispatch()
+            .after_dispatch();
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "later spawn failed")
+        );
+        assert!(!error.set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn after_dispatch_preserves_a_coordinate_message_and_marks_prior_dispatch() {
+        let error = GlassError::CoordOutOfBounds {
+            x: 50,
+            y: 50,
+            width: 50,
+            height: 50,
+        }
+        .after_dispatch();
+
+        assert_eq!(
+            error.to_string(),
+            "coordinate (50,50) out of bounds for 50x50 window"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn after_dispatch_preserves_bounded_kind_owner_message_and_tool_detail() {
+        let bounded = GlassError::Bounded {
+            kind: BoundKind::NotStarted,
+            whose: Whose::Callee,
+            dispatch: BoundDispatch::NotDispatched,
+            message: "the later read was not started".into(),
+        }
+        .after_dispatch();
+        assert_eq!(bounded.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(bounded.bound_owner(), Some(Whose::Callee));
+        assert_eq!(
+            bounded.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(
+            bounded.to_string(),
+            "backend error: the later read was not started"
+        );
+
+        let tool = GlassError::ToolFailed {
+            call: "helper".into(),
+            said: " refused \n".into(),
+        }
+        .after_dispatch();
+        assert_eq!(tool.tool_said(), Some("refused"));
+        assert_eq!(
+            tool.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(
+            tool.to_string(),
+            "backend error: `helper` failed:  refused \n"
+        );
+    }
+
+    #[test]
+    fn after_dispatch_leaves_an_already_dispatched_bound_directly_matchable() {
+        let error = GlassError::caller_deadline_elapsed("later read").after_dispatch();
+
+        assert!(matches!(
+            error,
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                whose: Whose::Caller,
+                dispatch: BoundDispatch::MayHaveDispatched,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn after_dispatch_keeps_invoke_fallback_closed() {
+        for error in [
+            GlassError::AxUnsupported.after_dispatch(),
+            GlassError::AxActionUnavailable(7).after_dispatch(),
+        ] {
+            assert!(!error.invoke_fallback_eligible(), "{error}");
+        }
+    }
+
+    #[test]
+    fn after_dispatch_does_not_turn_generic_failures_into_value_write_verdicts() {
+        assert!(
+            !GlassError::Backend("pre-write read failed".into())
+                .after_dispatch()
+                .set_value_failed_after_writing()
+        );
+        assert!(
+            !GlassError::CoordOutOfBounds {
+                x: 50,
+                y: 50,
+                width: 50,
+                height: 50,
+            }
+            .after_dispatch()
+            .set_value_failed_after_writing()
+        );
+
+        assert!(
+            GlassError::AxWriteUnconfirmed(7, "read-back failed".into())
+                .after_dispatch()
+                .set_value_failed_after_writing()
+        );
+        assert!(
+            GlassError::value_not_applied(7, "requested", Some("observed"))
+                .after_dispatch()
+                .set_value_failed_after_writing()
+        );
+    }
+
+    #[test]
+    fn after_dispatch_is_idempotent_and_cause_lookup_recurses() {
+        let error = GlassError::CoordOutOfBounds {
+            x: 50,
+            y: 50,
+            width: 50,
+            height: 50,
+        }
+        .after_dispatch()
+        .after_dispatch();
+
+        let GlassError::AfterDispatch(inner) = &error else {
+            panic!("dispatch provenance must be carried structurally: {error:?}");
+        };
+        assert!(
+            !matches!(inner.as_ref(), GlassError::AfterDispatch(_)),
+            "repeated annotation must not grow a wrapper chain: {error:?}"
+        );
+        assert!(matches!(
+            error.cause(),
+            GlassError::CoordOutOfBounds {
+                x: 50,
+                y: 50,
+                width: 50,
+                height: 50,
+            }
+        ));
+    }
+
+    #[test]
+    fn dispatch_provenance_accessors_recurse_through_nested_annotations() {
+        let bounded = GlassError::AfterDispatch(Box::new(GlassError::AfterDispatch(Box::new(
+            GlassError::Bounded {
+                kind: BoundKind::NotStarted,
+                whose: Whose::Callee,
+                dispatch: BoundDispatch::NotDispatched,
+                message: "nested refusal".into(),
+            },
+        ))));
+        assert_eq!(bounded.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(bounded.bound_owner(), Some(Whose::Callee));
+        assert_eq!(
+            bounded.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(matches!(bounded.cause(), GlassError::Bounded { .. }));
+        assert_eq!(bounded.to_string(), "backend error: nested refusal");
+
+        let tool = GlassError::AfterDispatch(Box::new(GlassError::AfterDispatch(Box::new(
+            GlassError::ToolFailed {
+                call: "helper".into(),
+                said: " refused \n".into(),
+            },
+        ))));
+        assert_eq!(tool.tool_said(), Some("refused"));
+        assert!(matches!(tool.cause(), GlassError::ToolFailed { .. }));
+    }
+
+    fn window_restore_failed(primary: GlassError, restore: GlassError) -> GlassError {
+        GlassError::WindowRestoreFailed {
+            primary: Box::new(primary),
+            restore: Box::new(restore),
+        }
+    }
+
+    #[test]
+    fn compound_failures_preserve_a_value_write_from_either_branch() {
+        let write = || GlassError::value_not_applied(7, "new", Some("old"));
+        let plain = || GlassError::Backend("plain failure".into());
+
+        for error in [
+            window_restore_failed(write(), plain()),
+            window_restore_failed(plain(), write()),
+            GlassError::input_cleanup_failed("cleanup", write(), plain()),
+            GlassError::input_cleanup_failed("cleanup", plain(), write()),
+        ] {
+            assert!(error.set_value_failed_after_writing(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn window_restore_failure_combines_dispatch_and_tool_details() {
+        let error = window_restore_failed(
+            GlassError::Backend("primary".into()).before_dispatch(),
+            GlassError::ToolFailed {
+                call: "restore helper".into(),
+                said: " restore failed \n".into(),
+            }
+            .after_dispatch(),
+        );
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(error.tool_said(), Some("restore failed"));
+    }
 
     #[test]
     fn display_messages_are_actionable() {
@@ -492,6 +1043,8 @@ mod tests {
             GlassError::Backend("device offline".into()),
             GlassError::Bounded {
                 kind: BoundKind::TimedOut,
+                whose: Whose::Callee,
+                dispatch: BoundDispatch::MayHaveDispatched,
                 message: "adb:shell: no answer within 10s".into(),
             },
             GlassError::AccessibilityUnavailable("uiautomator dump wrote nothing".into()),
@@ -601,6 +1154,8 @@ mod tests {
             GlassError::Backend("bus died".into()),
             GlassError::Bounded {
                 kind: BoundKind::TimedOut,
+                whose: Whose::Callee,
+                dispatch: BoundDispatch::MayHaveDispatched,
                 message: "adb:shell: no answer within 10s".into(),
             },
             GlassError::ToolFailed {
@@ -667,14 +1222,14 @@ mod tests {
     }
 
     #[test]
-    fn only_a_proven_post_dispatch_verdict_invalidates_the_captured_value() {
-        // The read-back verdict is reached only after the write went out.
+    fn only_operation_specific_post_write_verdicts_invalidate_the_captured_value() {
+        // These verdicts are reached only after the value mutation itself went out.
         assert!(
             GlassError::value_not_applied(3, "world", Some("hello"))
                 .set_value_failed_after_writing()
         );
-        // Everything else keeps the captured value: the pre-dispatch rejections, the transport
-        // errors raised on either side of the dispatch, and any variant not named (the wildcard).
+        // Everything else keeps the captured value: the pre-write rejections, generic transport
+        // evidence that may describe a guard read, and any variant not named (the wildcard).
         for e in [
             GlassError::AxElementNotFound(3),
             GlassError::AxElementChanged(3),
@@ -687,7 +1242,15 @@ mod tests {
             GlassError::Timeout(10),
             GlassError::Bounded {
                 kind: BoundKind::TimedOut,
-                message: "adb:uiautomator dump: no answer within 20s".into(),
+                whose: Whose::Callee,
+                dispatch: BoundDispatch::NotDispatched,
+                message: "the write was refused before dispatch".into(),
+            },
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                whose: Whose::Caller,
+                dispatch: BoundDispatch::MayHaveDispatched,
+                message: "a pre-write snapshot may have gone out".into(),
             },
             GlassError::ToolFailed {
                 call: "adb shell uiautomator dump /sdcard/x.xml".into(),
@@ -723,6 +1286,27 @@ mod tests {
     fn an_unconfirmed_write_counts_as_dispatched() {
         // The session must drop its cached value: the write went out, so the value it holds is stale.
         assert!(GlassError::AxWriteUnconfirmed(7, "x".into()).set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn a_source_less_unconfirmed_write_marks_possible_dispatch() {
+        assert_eq!(
+            GlassError::AxWriteUnconfirmed(7, "x".into()).bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn nested_prior_dispatch_cannot_be_downgraded_by_an_outer_preflight_annotation() {
+        let error = GlassError::BeforeDispatch(Box::new(GlassError::AfterDispatch(Box::new(
+            GlassError::Backend("later failure".into()),
+        ))));
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "an inner dispatch must dominate an outer not-dispatched annotation"
+        );
     }
 
     #[test]

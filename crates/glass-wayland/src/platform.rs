@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -7,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
-    TEARDOWN_BUDGET, WindowGeometry, WindowId, WindowInfo, WindowOp,
+    AppSpec, BoundDispatch, Deadline, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region,
+    Result, Stream, TEARDOWN_BUDGET, Whose, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 use glass_exec_unix::{Resolved, resolve_path};
 use glass_pipe_unix::LineTap;
@@ -53,6 +54,118 @@ const _: () = assert!(
     "the close request + compositor reap must finish inside glass_core::TEARDOWN_BUDGET"
 );
 
+const INPUT_SETTLE: Duration = Duration::from_millis(8);
+
+fn clamped_budget(deadline: Deadline, own: Duration, now: Instant) -> (Duration, Whose) {
+    deadline.budget(own, now)
+}
+
+#[derive(Default)]
+struct WaylandDispatch(Cell<bool>);
+
+impl WaylandDispatch {
+    fn mark(&self) {
+        self.0.set(true);
+    }
+
+    fn deadline_error(&self, op: &str) -> GlassError {
+        if self.0.get() {
+            GlassError::caller_deadline_elapsed(op)
+        } else {
+            GlassError::deadline_not_started(op)
+        }
+    }
+
+    fn classify(&self, op: &str, mut error: GlassError) -> GlassError {
+        if let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        {
+            return GlassError::input_cleanup_failed(
+                operation,
+                self.classify(op, *primary),
+                *cleanup,
+            );
+        }
+        if self.0.get()
+            && error.bound_owner() == Some(Whose::Caller)
+            && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
+        {
+            if let GlassError::Bounded {
+                kind,
+                whose,
+                dispatch,
+                message,
+                ..
+            } = &mut error
+            {
+                let cleanup_at = [
+                    message.find("; cleanup failed"),
+                    message.find("; input cleanup failed"),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
+                let cleanup = cleanup_at
+                    .map(|at| message[at..].to_owned())
+                    .unwrap_or_default();
+                *kind = glass_core::BoundKind::TimedOut;
+                *whose = Whose::Caller;
+                *dispatch = BoundDispatch::MayHaveDispatched;
+                *message = format!(
+                    "{op}: the caller deadline elapsed before the operation answered{cleanup}"
+                );
+                return error;
+            }
+            return GlassError::caller_deadline_elapsed(op);
+        }
+        error
+    }
+}
+
+fn run_wayland_call_by<T>(
+    deadline: Deadline,
+    op: &str,
+    call: impl FnOnce(&WaylandDispatch) -> Result<T>,
+) -> Result<T> {
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(op));
+    }
+    let dispatch = WaylandDispatch::default();
+    let answer = call(&dispatch).map_err(|error| dispatch.classify(op, error))?;
+    if deadline.has_passed() {
+        return Err(dispatch.deadline_error(op));
+    }
+    Ok(answer)
+}
+
+fn run_wayland_type_by<S: glass_core::TypeSink>(
+    sink: &mut S,
+    text: &str,
+    dwell: Duration,
+    deadline: Deadline,
+) -> Result<()> {
+    glass_core::run_type_by(sink, text, dwell, deadline)
+}
+
+fn input_settle_by(deadline: Deadline) -> Result<()> {
+    if deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed("input settle"));
+    }
+    let (sleep_for, _) = clamped_budget(deadline, INPUT_SETTLE, Instant::now());
+    std::thread::sleep(sleep_for);
+    if deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed("input settle"));
+    }
+    Ok(())
+}
+
+fn recovery_needs_settle(recovered: usize) -> bool {
+    recovered > 0
+}
+
 struct ActiveSession {
     child: Child,
     /// sway's stdout/stderr readers, dropped when the session is torn down. Everything sway
@@ -77,6 +190,7 @@ struct ActiveSession {
     active_rect: WindowGeometry,         // active window's output rect (capture/input origin)
     geometry: WindowGeometry,            // active window geometry (session contract)
     time: u32,
+    input_poison: Option<String>,
 }
 
 /// Linux/Wayland backend (wlroots protocols, per-session headless `sway` compositor).
@@ -765,12 +879,13 @@ pub(crate) type SyncDone = Arc<std::sync::atomic::AtomicBool>;
 /// compositor that has stopped answering holds the caller forever. This asks the same question
 /// and gives it `deadline` to answer.
 ///
-pub(crate) fn roundtrip_until<S>(
+fn roundtrip_until_with<S>(
     conn: &Connection,
     queue: &mut EventQueue<S>,
     state: &mut S,
     deadline: Instant,
     who: &str,
+    expired: impl FnOnce(Duration) -> GlassError,
 ) -> Result<()>
 where
     S: Dispatch<wl_callback::WlCallback, SyncDone> + 'static,
@@ -785,19 +900,31 @@ where
         state,
         deadline,
         who,
-        // Not a bare `GlassError::Timeout`, which names no operation: every request ends in the
-        // same sync, so the caller is all that tells one failure from another.
-        |_| {
-            GlassError::Backend(format!(
-                "{who}: the compositor did not answer within {} ms",
-                budget.as_millis()
-            ))
-        },
+        |_| expired(budget),
         |_| {
             done.load(std::sync::atomic::Ordering::Relaxed)
                 .then_some(Ok(()))
         },
     )
+}
+
+pub(crate) fn roundtrip_until<S>(
+    conn: &Connection,
+    queue: &mut EventQueue<S>,
+    state: &mut S,
+    deadline: Instant,
+    who: &str,
+) -> Result<()>
+where
+    S: Dispatch<wl_callback::WlCallback, SyncDone> + 'static,
+{
+    roundtrip_until_with(conn, queue, state, deadline, who, |budget| {
+        // Name the caller because every request ends in the same sync.
+        GlassError::Backend(format!(
+            "{who}: the compositor did not answer within {} ms",
+            budget.as_millis()
+        ))
+    })
 }
 
 /// Open a wayland connection and collect the compositor's globals, bounded.
@@ -880,6 +1007,34 @@ where
         state,
         Instant::now() + COMPOSITOR_SYNC_BUDGET,
         who,
+    )
+}
+
+fn roundtrip_by<S>(
+    conn: &Connection,
+    queue: &mut EventQueue<S>,
+    state: &mut S,
+    deadline: Deadline,
+    who: &str,
+) -> Result<()>
+where
+    S: Dispatch<wl_callback::WlCallback, SyncDone> + 'static,
+{
+    let now = Instant::now();
+    let (budget, owner) = clamped_budget(deadline, COMPOSITOR_SYNC_BUDGET, now);
+    roundtrip_until_with(
+        conn,
+        queue,
+        state,
+        now + budget,
+        who,
+        move |budget| match owner {
+            Whose::Caller => GlassError::caller_deadline_elapsed(who),
+            Whose::Callee => GlassError::Backend(format!(
+                "{who}: the compositor did not answer within {} ms",
+                budget.as_millis()
+            )),
+        },
     )
 }
 
@@ -1429,6 +1584,7 @@ fn bring_up_session(
         active_rect,
         geometry: geometry.clone(),
         time: 0,
+        input_poison: None,
     };
     Ok((session, geometry))
 }
@@ -1449,11 +1605,11 @@ struct Held {
 }
 
 impl Held {
-    /// Put the seat back, best effort — what failed is the compositor answering, so there is
-    /// nothing to wait for.
-    fn release(&mut self, s: &mut ActiveSession) {
+    /// Put the seat back without waiting for the compositor, but require the release requests to
+    /// reach the Wayland transport.
+    fn release(&mut self, s: &mut ActiveSession) -> Result<()> {
         if self.button.is_none() && self.key.is_none() && !self.modifiers {
-            return;
+            return Ok(());
         }
         s.time = s.time.wrapping_add(1);
         let t = s.time;
@@ -1467,46 +1623,171 @@ impl Held {
         if std::mem::take(&mut self.modifiers) {
             s.keyboard.modifiers(0, 0, 0, 0);
         }
-        let _ = s.conn.flush();
+        s.conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("input cleanup flush: {e}")))
     }
 }
 
-/// Ask the compositor to answer for what this session has just sent, bounded.
-fn sync_session(s: &mut ActiveSession, who: &str) -> Result<()> {
-    roundtrip(&s.conn, &mut s.queue, &mut s.state, who)
+fn attach_cleanup_failure(primary: GlassError, cleanup: GlassError) -> GlassError {
+    GlassError::input_cleanup_failed("releasing Wayland input", primary, cleanup)
+}
+
+fn finish_input_cleanup<T>(
+    poison: &mut Option<String>,
+    primary: Result<T>,
+    cleanup: Result<()>,
+) -> Result<T> {
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => {
+            poison.get_or_insert_with(|| cleanup.to_string());
+            Err(attach_cleanup_failure(primary, cleanup))
+        }
+        (Ok(_), Err(cleanup)) => {
+            poison.get_or_insert_with(|| cleanup.to_string());
+            Err(cleanup)
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+fn record_release_failure(poison: &mut Option<String>, result: &Result<()>) {
+    if let Err(error) = result {
+        poison.get_or_insert_with(|| error.to_string());
+    }
+}
+
+fn record_after_release(down: bool, poison: &mut Option<String>, result: &Result<()>) {
+    match down {
+        true => {}
+        false => record_release_failure(poison, result),
+    }
+}
+
+fn confirm_release_settled<T>(held: &mut Option<T>, settled: Result<()>) -> Result<()> {
+    settled?;
+    *held = None;
+    Ok(())
+}
+
+fn settle_tap_state<T>(held: &mut Option<T>, state: u32, settled: Result<()>) -> Result<()> {
+    match state {
+        0 => confirm_release_settled(held, settled),
+        _ => settled,
+    }
+}
+
+fn tap_held_key(state: u32, keycode: u32) -> Option<u32> {
+    match state {
+        1 => Some(keycode),
+        _ => None,
+    }
+}
+
+fn require_healthy_input(input_poison: Option<&str>) -> Result<()> {
+    match input_poison {
+        Some(cause) => Err(GlassError::Backend(format!(
+            "input state is uncertain after a release cleanup failure ({cause}); restart the session"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn keymap_wire_len(keymap: &str) -> Result<u32> {
+    let text_len = u32::try_from(keymap.len()).map_err(|_| {
+        GlassError::Backend("Wayland keymap exceeds the protocol size limit".into())
+    })?;
+    text_len
+        .checked_add(1)
+        .ok_or_else(|| GlassError::Backend("Wayland keymap exceeds the protocol size limit".into()))
+}
+
+fn sync_session_by(s: &mut ActiveSession, who: &str, deadline: Deadline) -> Result<()> {
+    roundtrip_by(&s.conn, &mut s.queue, &mut s.state, deadline, who)
 }
 
 /// Write the keymap to an unlinked temp file and hand its fd to the compositor,
 /// then settle so Xwayland adopts the new mapping before any key events. No
 /// unsafe: tempfile gives a normal, mmap-able fd; XKB_V1 format == 1.
-fn upload_keymap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, keymap: &str) -> Result<()> {
+fn upload_keymap_by(
+    s: &mut ActiveSession,
+    kb: &ZwpVirtualKeyboardV1,
+    keymap: &str,
+    deadline: Deadline,
+    dispatch: &WaylandDispatch,
+) -> Result<()> {
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started("keymap upload"));
+    }
+    let wire_len = keymap_wire_len(keymap)?;
     let mut f = tempfile::tempfile().map_err(GlassError::Io)?;
     f.write_all(keymap.as_bytes()).map_err(GlassError::Io)?;
     f.write_all(&[0]).map_err(GlassError::Io)?; // keymap string is NUL-terminated
     f.flush().map_err(GlassError::Io)?;
-    kb.keymap(1, f.as_fd(), keymap.len() as u32 + 1);
-    sync_session(s, "keymap upload")?;
-    std::thread::sleep(Duration::from_millis(8));
-    Ok(())
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started("keymap upload"));
+    }
+    kb.keymap(1, f.as_fd(), wire_len);
+    dispatch.mark();
+    sync_session_by(s, "keymap upload", deadline)?;
+    input_settle_by(deadline)
 }
 
 /// Press then release evdev keycode `kc`, bumping the session clock per event and
 /// self-committing (roundtrip + settle) after each — so the compositor processes the
 /// press/release individually, like the chord sink. A heavy client (e.g. a browser) ignores
 /// taps that are merely queued and flushed once at the end.
-fn tap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, kc: u32) -> Result<()> {
+fn tap_by(
+    s: &mut ActiveSession,
+    kb: &ZwpVirtualKeyboardV1,
+    kc: u32,
+    deadline: Deadline,
+    dispatch: &WaylandDispatch,
+) -> Result<()> {
     let mut held = Held::default();
     for state in [1u32, 0] {
+        if deadline.has_passed() {
+            let cleanup = held.release(s);
+            return finish_input_cleanup(
+                &mut s.input_poison,
+                Err(GlassError::deadline_not_started("key tap")),
+                cleanup,
+            );
+        }
         s.time = s.time.wrapping_add(1);
         kb.key(s.time, kc, state);
-        held.key = (state == 1).then_some(kc);
-        if let Err(e) = sync_session(s, "key tap") {
-            held.release(s);
-            return Err(e);
+        dispatch.mark();
+        held.key = tap_held_key(state, kc);
+        if let Err(e) = sync_session_by(s, "key tap", deadline) {
+            let cleanup = held.release(s);
+            return finish_input_cleanup(&mut s.input_poison, Err(e), cleanup);
         }
-        std::thread::sleep(Duration::from_millis(8));
+        let settled = input_settle_by(deadline);
+        let settled = settle_tap_state(&mut held.key, state, settled);
+        if let Err(error) = settled {
+            let cleanup = held.release(s);
+            return finish_input_cleanup(&mut s.input_poison, Err(error), cleanup);
+        }
     }
     Ok(())
+}
+
+struct WaylandTypeSink<'a> {
+    s: &'a mut ActiveSession,
+    kb: &'a ZwpVirtualKeyboardV1,
+    taps: std::vec::IntoIter<u32>,
+    deadline: Deadline,
+    dispatch: &'a WaylandDispatch,
+}
+
+impl glass_core::TypeSink for WaylandTypeSink<'_> {
+    fn character(&mut self, _character: char) -> Result<()> {
+        let keycode = self.taps.next().ok_or_else(|| {
+            GlassError::Backend("typing plan ended before the requested text".into())
+        })?;
+        tap_by(self.s, self.kb, keycode, self.deadline, self.dispatch)
+    }
 }
 
 /// Fail closed: a launch that asked for a sandbox errors rather than running unconfined.
@@ -1555,6 +1836,7 @@ fn modifier_mask(mods: &[glass_core::keys::Modifier]) -> u32 {
 /// advances the event clock so timestamps stay monotonic across the drag.
 struct WaylandDragSink<'a> {
     s: &'a mut ActiveSession,
+    dispatch: &'a WaylandDispatch,
     w: u32,
     h: u32,
     ox: i32,
@@ -1562,13 +1844,17 @@ struct WaylandDragSink<'a> {
     b: u32,
     mask: u32,
     held: Held,
+    deadline: Deadline,
 }
 
 /// A drag that ends early — `run_drag` propagates a failed settle from any of its waypoints —
 /// otherwise leaves the button down.
 impl Drop for WaylandDragSink<'_> {
     fn drop(&mut self) {
-        self.held.release(self.s);
+        let cleanup = self.held.release(self.s);
+        if let Err(error) = finish_input_cleanup(&mut self.s.input_poison, Ok(()), cleanup) {
+            eprintln!("glass-wayland: drag cleanup failed: {error}");
+        }
     }
 }
 
@@ -1584,9 +1870,8 @@ impl WaylandDragSink<'_> {
         (self.oy + y).max(0) as u32
     }
     fn settle(&mut self) -> Result<()> {
-        sync_session(self.s, "input settle")?;
-        std::thread::sleep(Duration::from_millis(8));
-        Ok(())
+        sync_session_by(self.s, "input settle", self.deadline)?;
+        input_settle_by(self.deadline)
     }
 }
 
@@ -1598,12 +1883,14 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         let t = self.tick();
         vp.motion_absolute(t, axx, ayy, w, h);
         vp.frame();
+        self.dispatch.mark();
         self.settle()?;
         let t = self.tick();
         vp.motion_absolute(t, nudge_x(axx, w), ayy, w, h);
         vp.frame();
         vp.motion_absolute(t, axx, ayy, w, h);
         vp.frame();
+        self.dispatch.mark();
         self.settle()
     }
     fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
@@ -1625,8 +1912,11 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         };
         vp.button(t, self.b, state);
         vp.frame();
+        self.dispatch.mark();
         self.held.button = down.then_some(self.b);
-        self.settle()
+        let result = self.settle();
+        record_after_release(down, &mut self.s.input_poison, &result);
+        result
     }
     fn modifiers(&mut self, down: bool) -> Result<()> {
         if self.mask == 0 {
@@ -1634,15 +1924,25 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
         }
         let kb = self.s.keyboard.clone();
         if down {
-            upload_keymap(&mut *self.s, &kb, &crate::keyboard::build_keymap(&[]))?;
+            upload_keymap_by(
+                &mut *self.s,
+                &kb,
+                &crate::keyboard::build_keymap(&[]),
+                self.deadline,
+                self.dispatch,
+            )?;
             kb.modifiers(self.mask, 0, 0, 0);
+            self.dispatch.mark();
         } else {
             kb.modifiers(0, 0, 0, 0);
+            self.dispatch.mark();
         }
         self.held.modifiers = down;
         // Self-commit so the modifier change reaches the compositor before the
         // press/release that follows it (matches the X11 sink's flush-per-call).
-        self.settle()
+        let result = self.settle();
+        record_after_release(down, &mut self.s.input_poison, &result);
+        result
     }
 }
 
@@ -1651,24 +1951,32 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
 /// each method self-commits (roundtrip + 8ms settle) so the modifier is held across the key's frame.
 struct WaylandChordSink<'a> {
     s: &'a mut ActiveSession,
+    dispatch: &'a WaylandDispatch,
     mask: u32,
     keysym: u32,
     held: Held,
+    deadline: Deadline,
 }
 
 /// A chord that ends early otherwise leaves its key or its modifier down.
 impl Drop for WaylandChordSink<'_> {
     fn drop(&mut self) {
-        self.held.release(self.s);
+        let cleanup = self.held.release(self.s);
+        if let Err(error) = finish_input_cleanup(&mut self.s.input_poison, Ok(()), cleanup) {
+            eprintln!("glass-wayland: chord cleanup failed: {error}");
+        }
     }
 }
 
 impl WaylandChordSink<'_> {
     fn settle(&mut self) -> Result<()> {
-        sync_session(self.s, "input settle")?;
-        std::thread::sleep(Duration::from_millis(8));
-        Ok(())
+        sync_session_by(self.s, "input settle", self.deadline)?;
+        input_settle_by(self.deadline)
     }
+}
+
+fn chord_holds_modifiers(down: bool, mask: u32) -> bool {
+    down && mask != 0
 }
 
 impl glass_core::ChordSink for WaylandChordSink<'_> {
@@ -1676,27 +1984,36 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
         let kb = self.s.keyboard.clone();
         if down {
             // Upload the keymap (chord key = keycode 1) regardless of mask, then set the modifiers.
-            upload_keymap(
+            upload_keymap_by(
                 &mut *self.s,
                 &kb,
                 &crate::keyboard::build_keymap(&[self.keysym]),
+                self.deadline,
+                self.dispatch,
             )?;
             if self.mask != 0 {
                 kb.modifiers(self.mask, 0, 0, 0);
+                self.dispatch.mark();
             }
         } else if self.mask != 0 {
             kb.modifiers(0, 0, 0, 0);
+            self.dispatch.mark();
         }
-        self.held.modifiers = down && self.mask != 0;
-        self.settle()
+        self.held.modifiers = chord_holds_modifiers(down, self.mask);
+        let result = self.settle();
+        record_after_release(down, &mut self.s.input_poison, &result);
+        result
     }
     fn key(&mut self, down: bool) -> Result<()> {
         let kb = self.s.keyboard.clone();
         self.s.time = self.s.time.wrapping_add(1);
         let t = self.s.time;
         kb.key(t, 1, u32::from(down)); // keycode 1 = the chord's key; 1=pressed, 0=released
+        self.dispatch.mark();
         self.held.key = down.then_some(1);
-        self.settle()
+        let result = self.settle();
+        record_after_release(down, &mut self.s.input_poison, &result);
+        result
     }
 }
 
@@ -1707,6 +2024,7 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
 /// wheel's frame.
 struct WaylandScrollSink<'a> {
     s: &'a mut ActiveSession,
+    dispatch: &'a WaylandDispatch,
     w: u32,
     h: u32,
     ox: i32,
@@ -1717,13 +2035,17 @@ struct WaylandScrollSink<'a> {
     dy: i32,
     mask: u32,
     held: Held,
+    deadline: Deadline,
 }
 
 /// A scroll that ends early — `wheel` settles three times after the modifier goes down —
 /// otherwise leaves that modifier down.
 impl Drop for WaylandScrollSink<'_> {
     fn drop(&mut self) {
-        self.held.release(self.s);
+        let cleanup = self.held.release(self.s);
+        if let Err(error) = finish_input_cleanup(&mut self.s.input_poison, Ok(()), cleanup) {
+            eprintln!("glass-wayland: scroll cleanup failed: {error}");
+        }
     }
 }
 
@@ -1739,9 +2061,8 @@ impl WaylandScrollSink<'_> {
         (self.oy + y).max(0) as u32
     }
     fn settle(&mut self) -> Result<()> {
-        sync_session(self.s, "input settle")?;
-        std::thread::sleep(Duration::from_millis(8));
-        Ok(())
+        sync_session_by(self.s, "input settle", self.deadline)?;
+        input_settle_by(self.deadline)
     }
 }
 
@@ -1751,13 +2072,23 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
     fn modifiers(&mut self, down: bool) -> Result<()> {
         let kb = self.s.keyboard.clone();
         if down {
-            upload_keymap(&mut *self.s, &kb, &crate::keyboard::build_keymap(&[]))?;
+            upload_keymap_by(
+                &mut *self.s,
+                &kb,
+                &crate::keyboard::build_keymap(&[]),
+                self.deadline,
+                self.dispatch,
+            )?;
             kb.modifiers(self.mask, 0, 0, 0);
+            self.dispatch.mark();
         } else {
             kb.modifiers(0, 0, 0, 0);
+            self.dispatch.mark();
         }
         self.held.modifiers = down;
-        self.settle()
+        let result = self.settle();
+        record_after_release(down, &mut self.s.input_poison, &result);
+        result
     }
     fn wheel(&mut self) -> Result<()> {
         let vp = self.s.pointer.clone();
@@ -1767,6 +2098,7 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
         let t = self.tick();
         vp.motion_absolute(t, axx, ayy, w, h);
         vp.frame();
+        self.dispatch.mark();
         self.settle()?;
         let t = self.tick();
         vp.motion_absolute(t, nudge_x(axx, w), ayy, w, h);
@@ -1880,24 +2212,20 @@ impl Platform for WaylandPlatform {
         }
     }
 
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        session.state.capture = CaptureScratch::default();
-        let qh = session.queue.handle();
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        run_wayland_call_by(deadline, "capture", |dispatch| {
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            session.state.capture = CaptureScratch::default();
+            let qh = session.queue.handle();
 
-        // Map the (window-relative) request to OUTPUT coordinates by the active
-        // window's rect, then have the compositor copy exactly that region. The
-        // selected window is raised on `select_window`, so the output framebuffer
-        // shows it on top; cropping at the source needs no CPU work and reads the
-        // existing framebuffer (robust for static, undamaged windows — unlike
-        // per-toplevel ext-image-copy-capture, which stalls until a fresh frame).
-        let wr = &session.active_rect;
-        let (cx, cy, cw, ch) = match region {
-            Some(r) => (wr.x + r.x as i32, wr.y + r.y as i32, r.width, r.height),
-            None => (wr.x, wr.y, wr.width, wr.height),
-        };
-        let mut owned = CaptureObjects {
-            frame: session.manager.capture_output_region(
+            // Capture the selected window from the output framebuffer so static, undamaged content
+            // is available without a CPU crop or waiting for a fresh toplevel frame.
+            let wr = &session.active_rect;
+            let (cx, cy, cw, ch) = match region {
+                Some(r) => (wr.x + r.x as i32, wr.y + r.y as i32, r.width, r.height),
+                None => (wr.x, wr.y, wr.width, wr.height),
+            };
+            let frame = session.manager.capture_output_region(
                 0,
                 &session.output,
                 cx,
@@ -1906,324 +2234,392 @@ impl Platform for WaylandPlatform {
                 ch as i32,
                 &qh,
                 (),
-            ),
-            buffer: None,
-        };
+            );
+            dispatch.mark();
+            let mut owned = CaptureObjects {
+                frame,
+                buffer: None,
+            };
 
-        let deadline = Instant::now() + CAPTURE_BUDGET;
+            let now = Instant::now();
+            let (wait_budget, owner) = clamped_budget(deadline, CAPTURE_BUDGET, now);
+            let wait_deadline = now + wait_budget;
 
-        // Phase 1: dispatch until the compositor has advertised its buffer formats, then pick one
-        // we can convert (preferring 32-bit). `buffer_done` marks the end of the list — a v3
-        // event, which is why the manager is bound at v3 exactly.
-        let (format, w, h, stride) = wait_for(
-            &session.conn,
-            &mut session.queue,
-            &mut session.state,
-            deadline,
-            "screencopy",
-            |s| GlassError::CaptureFailed(s.capture.no_formats()),
-            |s| s.capture.advertised(),
-        )?;
+            // Wait for the v3 buffer list to finish, then prefer a convertible 32-bit format.
+            let (format, w, h, stride) = wait_for(
+                &session.conn,
+                &mut session.queue,
+                &mut session.state,
+                wait_deadline,
+                "screencopy",
+                |s| match owner {
+                    Whose::Caller => GlassError::caller_deadline_elapsed("capture"),
+                    Whose::Callee => GlassError::CaptureFailed(s.capture.no_formats()),
+                },
+                |s| s.capture.advertised(),
+            )?;
+            if deadline.has_passed() {
+                return Err(GlassError::caller_deadline_elapsed("capture"));
+            }
 
-        // Allocate a matching shm buffer and request the copy.
-        let mut pool = RawPool::new((stride * h) as usize, &session.state.shm)
-            .map_err(|e| GlassError::CaptureFailed(format!("shm pool: {e}")))?;
-        let buffer = pool.create_buffer(0, w as i32, h as i32, stride as i32, format, (), &qh);
-        owned.frame.copy(&buffer);
-        owned.buffer = Some(buffer);
+            // Allocate a matching shm buffer and request the copy.
+            let mut pool = RawPool::new((stride * h) as usize, &session.state.shm)
+                .map_err(|e| GlassError::CaptureFailed(format!("shm pool: {e}")))?;
+            let buffer = pool.create_buffer(0, w as i32, h as i32, stride as i32, format, (), &qh);
+            owned.frame.copy(&buffer);
+            owned.buffer = Some(buffer);
 
-        // Phase 2: dispatch until ready/failed. No live test reaches this call site's bound —
-        // only the pure `wait_for` tests stand behind a change here.
-        wait_for(
-            &session.conn,
-            &mut session.queue,
-            &mut session.state,
-            deadline,
-            "screencopy",
-            |_| {
-                GlassError::CaptureFailed(
-                    "screencopy: no ready event after the copy request".into(),
-                )
-            },
-            |s| s.capture.done.take(),
-        )?;
+            // Phase 2: dispatch until ready/failed. No live test reaches this call site's bound —
+            // only the pure `wait_for` tests stand behind a change here.
+            wait_for(
+                &session.conn,
+                &mut session.queue,
+                &mut session.state,
+                wait_deadline,
+                "screencopy",
+                |_| match owner {
+                    Whose::Caller => GlassError::caller_deadline_elapsed("capture"),
+                    Whose::Callee => GlassError::CaptureFailed(
+                        "screencopy: no ready event after the copy request".into(),
+                    ),
+                },
+                |s| s.capture.done.take(),
+            )?;
 
-        // The captured buffer already matches the requested region, so no CPU crop.
-        let rgba = crate::pixels::to_rgba(pool.mmap(), format, w, h, stride)?;
-        Frame::new(w, h, rgba)
+            // The captured buffer already matches the requested region, so no CPU crop.
+            let rgba = crate::pixels::to_rgba(pool.mmap(), format, w, h, stride)?;
+            Frame::new(w, h, rgba)
+        })
     }
 
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        session.time = session.time.wrapping_add(1);
-        let t = session.time;
-        // Pointer motion is absolute over the OUTPUT; map window-relative coords
-        // to output coords by the active window's rect origin.
-        let (w, h) = session.output_size;
-        let (ox, oy) = (session.active_rect.x, session.active_rect.y);
-        let ax = |x: i32| (ox + x).max(0) as u32;
-        let ay = |y: i32| (oy + y).max(0) as u32;
-        let vp = session.pointer.clone();
-        let kb = session.keyboard.clone();
-        // Flush pending requests and let the compositor + Xwayland process pointer
-        // motion (enter/position) before the next event lands.
-        let settle = |s: &mut ActiveSession| -> Result<()> {
-            sync_session(s, "input settle")?;
-            std::thread::sleep(Duration::from_millis(8));
-            Ok(())
-        };
-        // Position the pointer at a window-relative point so the *next* button/axis
-        // routes to the window under it. sway (re)evaluates pointer focus only on
-        // motion, never on elapsed time: a surface that maps and settles under a
-        // now-stationary cursor never receives `enter`, and a one-shot button/axis
-        // sent to it is then silently dropped. So move there, let the surface settle,
-        // then re-assert with a 1px delta to force a fresh focus evaluation now that
-        // it is ready. Without this, fast back-to-back launch+click on a loaded host
-        // intermittently loses the very first click/scroll (the Wayland flake).
-        let position = |s: &mut ActiveSession, x: i32, y: i32| -> Result<()> {
-            vp.motion_absolute(t, ax(x), ay(y), w, h);
-            vp.frame();
-            settle(s)?;
-            vp.motion_absolute(t, nudge_x(ax(x), w), ay(y), w, h);
-            vp.frame();
-            vp.motion_absolute(t, ax(x), ay(y), w, h);
-            vp.frame();
-            settle(s)
-        };
-        match *event {
-            PointerEvent::Move { x, y } => {
-                position(session, x, y)?;
-            }
-            PointerEvent::Click {
-                x,
-                y,
-                button,
-                count,
-                ref modifiers,
-            } => {
-                position(session, x, y)?;
-                let mask = modifier_mask(modifiers);
-                if mask != 0 {
-                    upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
-                    kb.modifiers(mask, 0, 0, 0);
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
+    }
+
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
+        run_wayland_call_by(deadline, "pointer input", |dispatch| {
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            require_healthy_input(session.input_poison.as_deref())?;
+            session.time = session.time.wrapping_add(1);
+            let t = session.time;
+            // Pointer motion is absolute over the OUTPUT; map window-relative coords
+            // to output coords by the active window's rect origin.
+            let (w, h) = session.output_size;
+            let (ox, oy) = (session.active_rect.x, session.active_rect.y);
+            let ax = |x: i32| (ox + x).max(0) as u32;
+            let ay = |y: i32| (oy + y).max(0) as u32;
+            let vp = session.pointer.clone();
+            let kb = session.keyboard.clone();
+            // Flush pending requests and let the compositor + Xwayland process pointer
+            // motion (enter/position) before the next event lands.
+            let settle = |s: &mut ActiveSession| -> Result<()> {
+                sync_session_by(s, "input settle", deadline)?;
+                input_settle_by(deadline)
+            };
+            // sway reevaluates pointer focus only on motion, so settle after the initial move and
+            // nudge 1px before the first button or axis event.
+            let position = |s: &mut ActiveSession, x: i32, y: i32| -> Result<()> {
+                if deadline.has_passed() {
+                    return Err(GlassError::deadline_not_started("pointer input"));
                 }
-                let mut held = Held {
-                    modifiers: mask != 0,
-                    ..Held::default()
-                };
-                let b = evdev_button(button);
-                let clicks = |session: &mut ActiveSession, held: &mut Held| -> Result<()> {
-                    for _ in 0..count.max(1) {
-                        vp.button(t, b, ButtonState::Pressed);
-                        vp.frame();
-                        held.button = Some(b);
-                        settle(session)?;
-                        vp.button(t, b, ButtonState::Released);
-                        vp.frame();
-                        held.button = None;
-                        settle(session)?;
+                vp.motion_absolute(t, ax(x), ay(y), w, h);
+                vp.frame();
+                dispatch.mark();
+                settle(s)?;
+                vp.motion_absolute(t, nudge_x(ax(x), w), ay(y), w, h);
+                vp.frame();
+                vp.motion_absolute(t, ax(x), ay(y), w, h);
+                vp.frame();
+                settle(s)
+            };
+            match *event {
+                PointerEvent::Move { x, y } => {
+                    position(session, x, y)?;
+                }
+                PointerEvent::Click {
+                    x,
+                    y,
+                    button,
+                    count,
+                    ref modifiers,
+                } => {
+                    position(session, x, y)?;
+                    let mask = modifier_mask(modifiers);
+                    if mask != 0 {
+                        upload_keymap_by(
+                            session,
+                            &kb,
+                            &crate::keyboard::build_keymap(&[]),
+                            deadline,
+                            dispatch,
+                        )?;
+                        kb.modifiers(mask, 0, 0, 0);
+                        dispatch.mark();
                     }
-                    Ok(())
-                };
-                let outcome = clicks(session, &mut held);
-                // The same release on both paths: what ends the modifier on a click that worked is
-                // what has to end it on one that did not.
-                held.release(session);
-                outcome?;
-            }
-            PointerEvent::Drag {
-                from_x,
-                from_y,
-                to_x,
-                to_y,
-                button,
-                ref modifiers,
-                duration_ms,
-            } => {
-                let gesture =
-                    glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
-                let mut sink = WaylandDragSink {
-                    s: &mut *session,
-                    w,
-                    h,
-                    ox,
-                    oy,
-                    b: evdev_button(button),
-                    mask: modifier_mask(modifiers),
-                    held: Held::default(),
-                };
-                glass_core::run_drag(&mut sink, &gesture)?;
-            }
-            PointerEvent::Scroll {
-                x,
-                y,
-                dx,
-                dy,
-                ref modifiers,
-            } => {
-                // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
-                // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
-                let mut sink = WaylandScrollSink {
-                    s: &mut *session,
-                    w,
-                    h,
-                    ox,
-                    oy,
+                    let mut held = Held {
+                        modifiers: mask != 0,
+                        ..Held::default()
+                    };
+                    let b = evdev_button(button);
+                    let clicks = |session: &mut ActiveSession, held: &mut Held| -> Result<()> {
+                        for _ in 0..count {
+                            if deadline.has_passed() {
+                                return Err(GlassError::deadline_not_started("pointer input"));
+                            }
+                            vp.button(t, b, ButtonState::Pressed);
+                            vp.frame();
+                            dispatch.mark();
+                            held.button = Some(b);
+                            settle(session)?;
+                            if deadline.has_passed() {
+                                return Err(GlassError::deadline_not_started("pointer input"));
+                            }
+                            vp.button(t, b, ButtonState::Released);
+                            vp.frame();
+                            dispatch.mark();
+                            confirm_release_settled(&mut held.button, settle(session))?;
+                        }
+                        Ok(())
+                    };
+                    let outcome = clicks(session, &mut held);
+                    // The same release on both paths: what ends the modifier on a click that worked is
+                    // what has to end it on one that did not.
+                    let cleanup = held.release(session);
+                    finish_input_cleanup(&mut session.input_poison, outcome, cleanup)?;
+                }
+                PointerEvent::Drag {
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                    button,
+                    ref modifiers,
+                    duration_ms,
+                } => {
+                    let gesture =
+                        glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
+                    let mut sink = WaylandDragSink {
+                        s: &mut *session,
+                        dispatch,
+                        w,
+                        h,
+                        ox,
+                        oy,
+                        b: evdev_button(button),
+                        mask: modifier_mask(modifiers),
+                        held: Held::default(),
+                        deadline,
+                    };
+                    glass_core::run_drag_by(&mut sink, &gesture, deadline)?;
+                }
+                PointerEvent::Scroll {
                     x,
                     y,
                     dx,
                     dy,
-                    mask: modifier_mask(modifiers),
-                    held: Held::default(),
-                };
-                glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
-            }
-            PointerEvent::Gesture { .. } => {
-                return Err(crate::unsupported_multi_touch());
-            }
-        }
-        session
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-        Ok(())
-    }
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-        use glass_core::keys::parse_chord;
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        let kb = session.keyboard.clone();
-        match event {
-            KeyEvent::Text(text) => {
-                // Upload one keymap per chunk (each distinct keysym at its own keycode), then
-                // tap the planned keycode for every character. The keymap stays fixed while a
-                // chunk's key events are delivered, so a client that resolves keysyms lazily
-                // (e.g. an X11 app under Xwayland querying the keymap per press) can't read a
-                // neighbouring character by racing a mid-string keymap swap — the flake that a
-                // fresh keymap on the *same* keycode per character exhibited under load. Each
-                // tap self-commits (roundtrip + settle), which also paces a heavy client; the
-                // one keymap upload per chunk replaces one upload per character. See
-                // crate::keyboard::plan_type.
-                for chunk in crate::keyboard::plan_type(text) {
-                    upload_keymap(
-                        &mut *session,
-                        &kb,
-                        &crate::keyboard::build_keymap(&chunk.keysyms),
-                    )?;
-                    for kc in chunk.taps {
-                        tap(&mut *session, &kb, kc)?;
-                    }
+                    ref modifiers,
+                } => {
+                    // Hold modifiers across the wheel frame; see `glass_core::run_scroll`.
+                    let mut sink = WaylandScrollSink {
+                        s: &mut *session,
+                        dispatch,
+                        w,
+                        h,
+                        ox,
+                        oy,
+                        x,
+                        y,
+                        dx,
+                        dy,
+                        mask: modifier_mask(modifiers),
+                        held: Held::default(),
+                        deadline,
+                    };
+                    glass_core::run_scroll_by(&mut sink, !modifiers.is_empty(), deadline)?;
+                }
+                PointerEvent::Gesture { .. } => {
+                    return Err(crate::unsupported_multi_touch());
                 }
             }
-            KeyEvent::Chord(c) => {
-                let (mods, keysym) = parse_chord(c)?; // validates before any traffic
-                let mut sink = WaylandChordSink {
-                    s: &mut *session,
-                    mask: modifier_mask(&mods),
-                    keysym,
-                    held: Held::default(),
-                };
-                glass_core::run_chord(&mut sink)?;
+            session
+                .conn
+                .flush()
+                .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+            Ok(())
+        })
+    }
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        run_wayland_call_by(deadline, "key input", |dispatch| {
+            use glass_core::keys::parse_chord;
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            require_healthy_input(session.input_poison.as_deref())?;
+            let kb = session.keyboard.clone();
+            match event {
+                KeyEvent::Text(text) => {
+                    // Keep each chunk's keymap fixed so Xwayland clients cannot race a per-character
+                    // keymap swap; each tap self-commits to pace heavy clients.
+                    let mut characters = text.chars();
+                    for chunk in crate::keyboard::plan_type(text) {
+                        upload_keymap_by(
+                            &mut *session,
+                            &kb,
+                            &crate::keyboard::build_keymap(&chunk.keysyms),
+                            deadline,
+                            dispatch,
+                        )?;
+                        let chunk_text: String =
+                            characters.by_ref().take(chunk.taps.len()).collect();
+                        let mut sink = WaylandTypeSink {
+                            s: &mut *session,
+                            kb: &kb,
+                            taps: chunk.taps.into_iter(),
+                            deadline,
+                            dispatch,
+                        };
+                        run_wayland_type_by(&mut sink, &chunk_text, Duration::ZERO, deadline)?;
+                    }
+                }
+                KeyEvent::Chord(c) => {
+                    let (mods, keysym) = parse_chord(c)?; // validates before any traffic
+                    let mut sink = WaylandChordSink {
+                        s: &mut *session,
+                        dispatch,
+                        mask: modifier_mask(&mods),
+                        keysym,
+                        held: Held::default(),
+                        deadline,
+                    };
+                    glass_core::run_chord_by(&mut sink, deadline)?;
+                }
             }
-        }
-        session
-            .conn
-            .flush()
-            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-        Ok(())
+            session
+                .conn
+                .flush()
+                .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+            Ok(())
+        })
     }
 
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        let ident = session.active.clone().ok_or(GlassError::WindowNotFound)?;
-        // All window ops act on the active window's sway container. Windows are
-        // floating (see sway_config), so resize/move behave like a normal WM.
-        let con = session
-            .ipc
-            .windows()?
-            .into_iter()
-            .find(|w| w.identifier == ident)
-            .map(|w| w.con_id)
-            .ok_or(GlassError::WindowNotFound)?;
-        match *op {
-            WindowOp::Geometry => {}
-            WindowOp::Focus => session.ipc.run_command(&format!("[con_id={con}] focus"))?,
-            WindowOp::Resize { width, height } => session.ipc.run_command(&format!(
-                "[con_id={con}] resize set width {width} px height {height} px"
-            ))?,
-            // Move's (x, y) is an output-absolute origin, matching the X11 backend
-            // (root coordinates); the headless output is at (0, 0).
-            WindowOp::Move { x, y } => session
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        run_wayland_call_by(deadline, "Wayland window operation", |dispatch| {
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            let ident = session.active.clone().ok_or(GlassError::WindowNotFound)?;
+            dispatch.mark();
+            // Window operations target the active floating sway container.
+            let con = session
                 .ipc
-                .run_command(&format!("[con_id={con}] move absolute position {x} {y}"))?,
-        }
-        // Re-read the resulting rect (sway may clamp) and refresh the session
-        // contract — active_rect drives the capture crop and pointer offset.
-        let now = session
-            .ipc
-            .windows()?
-            .into_iter()
-            .find(|w| w.identifier == ident)
-            .ok_or(GlassError::WindowNotFound)?;
-        let geo = rect_to_geom(&now.rect);
-        session.active_rect = geo.clone();
-        session.geometry = geo.clone();
-        Ok(geo)
+                .windows_by(deadline)?
+                .into_iter()
+                .find(|w| w.identifier == ident)
+                .map(|w| w.con_id)
+                .ok_or(GlassError::WindowNotFound)?;
+            match *op {
+                WindowOp::Geometry => {}
+                WindowOp::Focus => session
+                    .ipc
+                    .run_command_by(&format!("[con_id={con}] focus"), deadline)?,
+                WindowOp::Resize { width, height } => session.ipc.run_command_by(
+                    &format!("[con_id={con}] resize set width {width} px height {height} px"),
+                    deadline,
+                )?,
+                // Move uses output-absolute coordinates, matching X11 root coordinates.
+                WindowOp::Move { x, y } => session.ipc.run_command_by(
+                    &format!("[con_id={con}] move absolute position {x} {y}"),
+                    deadline,
+                )?,
+            }
+            // Refresh geometry after sway clamps the operation.
+            let now = session
+                .ipc
+                .windows_by(deadline)?
+                .into_iter()
+                .find(|w| w.identifier == ident)
+                .ok_or(GlassError::WindowNotFound)?;
+            let geo = rect_to_geom(&now.rect);
+            session.active_rect = geo.clone();
+            session.geometry = geo.clone();
+            Ok(geo)
+        })
     }
 
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        // Refresh foreign-toplevel handles so capture can later find them.
-        sync_session(session, "window list")?;
-        let mut wins: Vec<SwayWindow> = session.ipc.windows()?;
-        // A window the app mapped can be missing here through no fault of the app (see
-        // `crate::xwayland`). Enumerating is where that shows up, so it is where glass repairs
-        // it — otherwise the caller is told the app has fewer windows than it does.
-        if session
-            .recovery
-            .recover_if_due(Instant::now(), &x11_ids(&wins))
-            > 0
-        {
-            std::thread::sleep(crate::xwayland::REMAP_SETTLE);
-            wins = session.ipc.windows()?;
-        }
-        let mut out = Vec::with_capacity(wins.len());
-        for w in &wins {
-            let id = mint_id(&mut session.ids, &mut session.next_id, &w.identifier);
-            out.push(WindowInfo {
-                id,
-                title: w.title.clone(),
-                class: w.class.clone(),
-                geometry: rect_to_geom(&w.rect),
-                active: w.focused,
-            });
-        }
-        Ok(out)
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        run_wayland_call_by(deadline, "Wayland window list", |dispatch| {
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            dispatch.mark();
+            // Refresh foreign-toplevel handles so capture can later find them.
+            sync_session_by(session, "window list", deadline)?;
+            let mut wins: Vec<SwayWindow> = session.ipc.windows_by(deadline)?;
+            // Enumeration exposes Xwayland views missing from sway, so repair them before return.
+            let recovered =
+                session
+                    .recovery
+                    .recover_if_due_by(Instant::now(), &x11_ids(&wins), deadline)?;
+            if recovery_needs_settle(recovered) {
+                let settle = deadline
+                    .remaining()
+                    .map(|left| left.min(crate::xwayland::REMAP_SETTLE))
+                    .unwrap_or(crate::xwayland::REMAP_SETTLE);
+                std::thread::sleep(settle);
+                if deadline.has_passed() {
+                    return Err(GlassError::caller_deadline_elapsed(
+                        "Wayland window list remap settle",
+                    ));
+                }
+                wins = session.ipc.windows_by(deadline)?;
+            }
+            let mut out = Vec::with_capacity(wins.len());
+            for w in &wins {
+                let id = mint_id(&mut session.ids, &mut session.next_id, &w.identifier);
+                out.push(WindowInfo {
+                    id,
+                    title: w.title.clone(),
+                    class: w.class.clone(),
+                    geometry: rect_to_geom(&w.rect),
+                    active: w.focused,
+                });
+            }
+            Ok(out)
+        })
     }
 
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
-        let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        let wins = session.ipc.windows()?;
-        let target = wins
-            .into_iter()
-            .find(|w| session.ids.get(&w.identifier) == Some(&id))
-            .ok_or(GlassError::WindowNotFound)?;
-        session
-            .ipc
-            .run_command(&format!("[con_id={}] focus", target.con_id))?;
-        // Confirm the focus moved (no silent fallback).
-        let after = session.ipc.windows()?;
-        let now = after
-            .iter()
-            .find(|w| w.identifier == target.identifier)
-            .ok_or(GlassError::WindowNotFound)?;
-        if !now.focused {
-            return Err(GlassError::Backend("window did not take focus".into()));
-        }
-        let geo = rect_to_geom(&now.rect);
-        session.active = Some(target.identifier);
-        session.active_rect = geo.clone();
-        session.geometry = geo.clone();
-        Ok(geo)
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        run_wayland_call_by(deadline, "Wayland window selection", |dispatch| {
+            let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            dispatch.mark();
+            let wins = session.ipc.windows_by(deadline)?;
+            let target = wins
+                .into_iter()
+                .find(|w| session.ids.get(&w.identifier) == Some(&id))
+                .ok_or(GlassError::WindowNotFound)?;
+            session
+                .ipc
+                .run_command_by(&format!("[con_id={}] focus", target.con_id), deadline)?;
+            // Confirm the focus moved (no silent fallback).
+            let after = session.ipc.windows_by(deadline)?;
+            let now = after
+                .iter()
+                .find(|w| w.identifier == target.identifier)
+                .ok_or(GlassError::WindowNotFound)?;
+            if !now.focused {
+                return Err(GlassError::Backend("window did not take focus".into()));
+            }
+            let geo = rect_to_geom(&now.rect);
+            session.active = Some(target.identifier);
+            session.active_rect = geo.clone();
+            session.geometry = geo.clone();
+            Ok(geo)
+        })
     }
 
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
@@ -2256,6 +2652,7 @@ mod pure_tests {
 
     use super::*;
     use crate::testw::on_a_thread;
+    use glass_core::MouseButton;
     use glass_exec_unix::is_executable_file;
 
     /// The budget the pure waits below are given. `on_a_thread` allows a multiple of it, so a lost
@@ -2266,9 +2663,287 @@ mod pure_tests {
     /// tests, which assert on a fraction of it.
     const PROMPT_WAIT_BUDGET: Duration = Duration::from_secs(1);
 
-    /// [`wait_for`] over a socket with nothing behind it, answering a question the peer is never
-    /// told about — so only the deadline can end it. `speak` acts as the peer and hands back the
-    /// end to keep open, or `None` to close it.
+    #[derive(Default)]
+    struct RecordingTypeSink {
+        characters: Vec<char>,
+    }
+
+    impl glass_core::TypeSink for RecordingTypeSink {
+        fn character(&mut self, character: char) -> Result<()> {
+            self.characters.push(character);
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spent_input_deadline_dispatches_no_backend_events() {
+        let mut recorded_events = Vec::new();
+        let deadline = glass_core::Deadline::at(Instant::now() - Duration::from_millis(1));
+
+        let error = run_wayland_call_by(deadline, "pointer input", |_| {
+            recorded_events.push("motion");
+            Ok(())
+        })
+        .expect_err("spent input must be rejected before dispatch");
+
+        assert!(recorded_events.is_empty());
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn pre_dispatch_caller_deadline_error_stays_not_dispatched() {
+        let error = run_wayland_call_by(Deadline::UNBOUNDED, "key input", |_| {
+            Err::<(), _>(GlassError::deadline_not_started("keymap upload"))
+        })
+        .expect_err("the keymap did not reach the compositor");
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn invalid_pointer_work_is_rejected_before_session_lookup() {
+        let mut platform = WaylandPlatform {
+            sway: PathBuf::new(),
+            logs: Arc::new(Mutex::new(Vec::new())),
+            active: None,
+            clipboard_owner: None,
+            dbus: None,
+        };
+        let events = [
+            PointerEvent::Click {
+                x: 0,
+                y: 0,
+                button: MouseButton::Left,
+                count: 0,
+                modifiers: vec![],
+            },
+            PointerEvent::Click {
+                x: 0,
+                y: 0,
+                button: MouseButton::Left,
+                count: u32::MAX,
+                modifiers: vec![],
+            },
+            PointerEvent::Scroll {
+                x: 0,
+                y: 0,
+                dx: i32::MIN,
+                dy: i32::MAX,
+                modifiers: vec![],
+            },
+        ];
+        for event in events {
+            let error = platform
+                .send_pointer_by(&event, Deadline::UNBOUNDED)
+                .expect_err("invalid pointer work must fail before backend/session work");
+
+            assert!(matches!(error.cause(), GlassError::InvalidPointerInput(_)));
+            assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        }
+    }
+
+    #[test]
+    fn failed_cleanup_flush_preserves_primary_provenance_and_poisons_input() {
+        let mut poison = None;
+        let primary = Err::<(), _>(GlassError::caller_deadline_elapsed("pointer input"));
+        let cleanup = Err(GlassError::Backend("cleanup flush failed".into()));
+
+        let error = finish_input_cleanup(&mut poison, primary, cleanup).unwrap_err();
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("cleanup flush failed"));
+        let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("Wayland cleanup failure must remain structured");
+        };
+        assert_eq!(operation, "releasing Wayland input");
+        assert!(matches!(*primary, GlassError::Bounded { .. }));
+        assert!(
+            matches!(*cleanup, GlassError::Backend(message) if message == "cleanup flush failed")
+        );
+        assert_eq!(
+            poison.as_deref(),
+            Some("backend error: cleanup flush failed")
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_survives_outer_dispatch_upgrade() {
+        let mut poison = None;
+        let primary = Err::<(), _>(GlassError::deadline_not_started("pointer input"));
+        let cleanup = Err(GlassError::Backend("cleanup flush failed".into()));
+        let error = finish_input_cleanup(&mut poison, primary, cleanup).unwrap_err();
+        let dispatch = WaylandDispatch::default();
+        dispatch.mark();
+
+        let error = dispatch.classify("pointer input", error);
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("cleanup flush failed"));
+        assert!(matches!(error, GlassError::InputCleanupFailed { .. }));
+    }
+
+    #[test]
+    fn held_input_is_cleared_only_after_release_settle_succeeds() {
+        let mut held = Some(272);
+        let error = confirm_release_settled(
+            &mut held,
+            Err(GlassError::Backend("release settle failed".into())),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("release settle failed"));
+        assert_eq!(held, Some(272));
+
+        confirm_release_settled(&mut held, Ok(())).unwrap();
+        assert_eq!(held, None);
+    }
+
+    #[test]
+    fn input_deadline_and_health_checks_reject_unusable_input() {
+        let error = input_settle_by(Deadline::from_millis(0))
+            .expect_err("a spent input settle cannot succeed");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+
+        require_healthy_input(None).expect("unpoisoned input is healthy");
+        let error = require_healthy_input(Some("release flush failed"))
+            .expect_err("poisoned input must remain unusable");
+        assert!(error.to_string().contains("release flush failed"));
+    }
+
+    #[test]
+    fn keymap_and_release_helpers_preserve_protocol_boundaries() {
+        assert_eq!(keymap_wire_len("").unwrap(), 1);
+        assert_eq!(keymap_wire_len("abc").unwrap(), 4);
+        assert_eq!(tap_held_key(1, 272), Some(272));
+        assert_eq!(tap_held_key(0, 272), None);
+
+        let mut held = Some(272);
+        settle_tap_state(&mut held, 1, Ok(())).expect("press settle");
+        assert_eq!(held, Some(272), "a press remains held");
+        settle_tap_state(&mut held, 0, Ok(())).expect("release settle");
+        assert_eq!(held, None, "a settled release is no longer held");
+
+        let mut held = Some(272);
+        let error = settle_tap_state(
+            &mut held,
+            0,
+            Err(GlassError::Backend("release settle failed".into())),
+        )
+        .expect_err("a failed release settle must remain visible");
+        assert!(error.to_string().contains("release settle failed"));
+        assert_eq!(held, Some(272), "an unconfirmed release remains held");
+
+        let failed = Err(GlassError::Backend("release settle failed".into()));
+        let mut poison = None;
+        record_after_release(true, &mut poison, &failed);
+        assert_eq!(poison, None, "a failed press is cleaned up by its guard");
+        record_after_release(false, &mut poison, &failed);
+        assert_eq!(
+            poison.as_deref(),
+            Some("backend error: release settle failed")
+        );
+    }
+
+    #[test]
+    fn chord_and_recovery_predicates_distinguish_zero_boundaries() {
+        assert!(!chord_holds_modifiers(false, 0));
+        assert!(!chord_holds_modifiers(false, 4));
+        assert!(!chord_holds_modifiers(true, 0));
+        assert!(chord_holds_modifiers(true, 4));
+
+        assert!(!recovery_needs_settle(0));
+        assert!(recovery_needs_settle(1));
+    }
+
+    #[test]
+    fn short_typing_deadline_stops_before_all_characters() {
+        let requested_text = "abcd";
+        let mut sink = RecordingTypeSink::default();
+
+        let error = run_wayland_type_by(
+            &mut sink,
+            requested_text,
+            Duration::ZERO,
+            glass_core::Deadline::from_millis(5),
+        )
+        .expect_err("typing must stop when the shared deadline expires");
+
+        assert!(sink.characters.len() < requested_text.chars().count());
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn capture_returning_after_the_deadline_is_not_success() {
+        let capture_error = run_wayland_call_by(
+            glass_core::Deadline::from_millis(1),
+            "capture",
+            |dispatch| {
+                dispatch.mark();
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(())
+            },
+        )
+        .expect_err("a late capture must not return success");
+
+        assert_eq!(capture_error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            capture_error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn caller_deadline_clamps_compositor_wait() {
+        let now = Instant::now();
+        let caller_remaining = Duration::from_millis(2);
+
+        let (observed_wait, owner) = clamped_budget(
+            glass_core::Deadline::at(now + caller_remaining),
+            COMPOSITOR_SYNC_BUDGET,
+            now,
+        );
+
+        assert!(observed_wait <= caller_remaining);
+        assert_eq!(owner, glass_core::Whose::Caller);
+    }
+
+    #[test]
+    fn caller_deadline_clamps_input_settle() {
+        let now = Instant::now();
+        let caller_remaining = Duration::from_millis(2);
+
+        let (observed_sleep, owner) = clamped_budget(
+            glass_core::Deadline::at(now + caller_remaining),
+            INPUT_SETTLE,
+            now,
+        );
+
+        assert!(observed_sleep <= caller_remaining);
+        assert_eq!(owner, glass_core::Whose::Caller);
+    }
+
+    /// Run [`wait_for`] over a silent socket while `speak` keeps or closes the peer.
     fn wait_over_a_socket(
         budget: Duration,
         speak: impl FnOnce(UnixStream) -> Option<UnixStream>,
@@ -3266,8 +3941,859 @@ mod session_tests {
     //! The backend against a real compositor. Every method below talks to sway or to the wayland
     //! connection, so there is nothing underneath them to fake; [`crate::testw`] launches a
     //! private session and observes it over a connection the backend does not own.
+    use std::collections::VecDeque;
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixStream;
+
     use super::*;
     use crate::testw::{Launch, READY_LINE};
+    use x11rb::protocol::xproto::{
+        GetInputFocusReply, GetWindowAttributesReply, MapState, QueryTreeReply, Setup, WindowClass,
+    };
+    use x11rb::x11_utils::Serialize as _;
+
+    const SCRIPTED_X_ROOT: u32 = 0x100;
+    const SCRIPTED_X_WINDOW: u32 = 0x200;
+    const SCRIPTED_X_WINDOW_2: u32 = 0x201;
+    const STALLED_X_REPLY: Duration = Duration::from_secs(1);
+    const X_REPLY_DEADLINE: Duration = Duration::from_millis(50);
+
+    fn scripted_x_recovery(
+        missing_before: &[u32],
+        script: impl FnOnce(UnixStream) + Send + 'static,
+    ) -> (crate::xwayland::Recovery, std::thread::JoinHandle<()>) {
+        let (client, server) = UnixStream::pair().expect("scripted X11 socketpair");
+        let setup = Setup {
+            resource_id_base: 0x0100_0000,
+            resource_id_mask: 0x00ff_ffff,
+            maximum_request_length: u16::MAX,
+            ..Setup::default()
+        };
+        let recovery = crate::xwayland::Recovery::with_test_connection(
+            Path::new("/nonexistent/scripted-xwayland"),
+            client,
+            setup,
+            SCRIPTED_X_ROOT,
+            missing_before,
+        );
+        (recovery, std::thread::spawn(move || script(server)))
+    }
+
+    fn scripted_x_recovery_with_clock(
+        missing_before: &[u32],
+        observations: Vec<Instant>,
+        script: impl FnOnce(UnixStream) + Send + 'static,
+    ) -> (crate::xwayland::Recovery, std::thread::JoinHandle<()>) {
+        let (client, server) = UnixStream::pair().expect("scripted X11 socketpair");
+        let setup = Setup {
+            resource_id_base: 0x0100_0000,
+            resource_id_mask: 0x00ff_ffff,
+            maximum_request_length: u16::MAX,
+            ..Setup::default()
+        };
+        let observations = Arc::new(Mutex::new(VecDeque::from(observations)));
+        let clock = {
+            let observations = Arc::clone(&observations);
+            Arc::new(move || {
+                observations
+                    .lock()
+                    .expect("deadline observation mutex")
+                    .pop_front()
+                    .expect("unexpected Xwayland deadline observation")
+            })
+        };
+        let recovery = crate::xwayland::Recovery::with_test_connection_and_clock(
+            Path::new("/nonexistent/scripted-xwayland"),
+            client,
+            setup,
+            SCRIPTED_X_ROOT,
+            missing_before,
+            clock,
+        );
+        (recovery, std::thread::spawn(move || script(server)))
+    }
+
+    fn expect_x_request(peer: &mut UnixStream, sequence: &mut u16, opcode: u8) {
+        let mut header = [0u8; 4];
+        peer.read_exact(&mut header).expect("X11 request header");
+        let words = u16::from_ne_bytes([header[2], header[3]]) as usize;
+        assert!(words > 0, "the fixture does not accept BigRequests");
+        let mut body = vec![0u8; words * 4 - header.len()];
+        peer.read_exact(&mut body).expect("X11 request body");
+        *sequence += 1;
+        assert_eq!(
+            header[0], opcode,
+            "unexpected X11 request at sequence {sequence}"
+        );
+    }
+
+    fn answer_query_tree(peer: &mut UnixStream, sequence: u16, children: Vec<u32>) {
+        let reply = QueryTreeReply {
+            sequence,
+            length: children.len() as u32,
+            root: SCRIPTED_X_ROOT,
+            parent: 0,
+            children,
+        };
+        peer.write_all(&reply.serialize())
+            .expect("query-tree reply");
+    }
+
+    fn answer_viewable_attributes(peer: &mut UnixStream, sequence: u16) {
+        let reply = GetWindowAttributesReply {
+            sequence,
+            length: 3,
+            class: WindowClass::INPUT_OUTPUT,
+            map_state: MapState::VIEWABLE,
+            override_redirect: false,
+            ..GetWindowAttributesReply::default()
+        };
+        peer.write_all(&reply.serialize())
+            .expect("attributes reply");
+    }
+
+    fn answer_sync(peer: &mut UnixStream, sequence: u16) {
+        let reply = GetInputFocusReply {
+            sequence,
+            ..GetInputFocusReply::default()
+        };
+        let mut bytes = reply.serialize().to_vec();
+        bytes.resize(32, 0);
+        peer.write_all(&bytes).expect("sync reply");
+    }
+
+    fn hold_scripted_peer_open() {
+        // x11rb drains every packet currently readable before returning one reply. A live peer
+        // makes the next non-blocking read report WouldBlock rather than EOF.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    fn install_recovery(session: &mut crate::testw::Session, recovery: crate::xwayland::Recovery) {
+        session
+            .platform()
+            .active
+            .as_mut()
+            .expect("a started session")
+            .recovery = recovery;
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_blocked_proc_entry_read_cannot_outlive_the_window_list_deadline() {
+        let proc = tempfile::tempdir().expect("fake proc root");
+        let pid = proc.path().join("4242");
+        std::fs::create_dir(&pid).expect("fake pid directory");
+        let comm = pid.join("comm");
+        let made_fifo = std::process::Command::new("mkfifo")
+            .arg(&comm)
+            .status()
+            .expect("run mkfifo");
+        assert!(made_fifo.success(), "mkfifo failed: {made_fifo}");
+
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut fifo = std::fs::OpenOptions::new()
+                .write(true)
+                .open(comm)
+                .expect("open blocked comm writer");
+            opened_tx.send(()).expect("blocked-read observer");
+            release_rx.recv().expect("release blocked comm read");
+            fifo.write_all(b"not-Xwayland\n")
+                .expect("release blocked comm read");
+        });
+
+        let runtime = tempfile::tempdir().expect("runtime directory");
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let call = std::thread::spawn(move || {
+            let mut session = Launch::new().start_mapped();
+            let recovery =
+                crate::xwayland::Recovery::with_test_proc_root(runtime.path(), proc.path());
+            install_recovery(&mut session, recovery);
+            let started = Instant::now();
+            let result = session
+                .platform()
+                .list_windows_by(Deadline::at(started + X_REPLY_DEADLINE));
+            result_tx
+                .send((started.elapsed(), result))
+                .expect("window-list result receiver");
+        });
+
+        opened_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the production discovery read never reached the FIFO");
+        let bounded = result_rx.recv_timeout(Duration::from_millis(300));
+        release_tx.send(()).expect("release blocked read");
+        writer.join().expect("FIFO writer");
+        call.join().expect("window-list caller");
+
+        let (elapsed, result) =
+            bounded.expect("the blocked proc read outlived its caller deadline");
+        let error = result.expect_err("the caller deadline must end blocked discovery");
+        assert!(elapsed < Duration::from_millis(250), "{elapsed:?}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert!(
+            error.to_string().contains("Xwayland recovery discovery"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn spent_window_list_deadline_sends_no_x_request_and_the_session_remains_usable() {
+        let mut session = Launch::new().start_mapped();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (recovery, server) = scripted_x_recovery(&[], move |mut peer| {
+            peer.set_read_timeout(Some(Duration::from_millis(150)))
+                .expect("read timeout");
+            let mut first = [0u8; 1];
+            let no_request = peer.read(&mut first).is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            });
+            observed_tx.send(no_request).expect("observation receiver");
+            peer.set_read_timeout(None).expect("clear read timeout");
+
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            answer_query_tree(&mut peer, sequence, Vec::new());
+            hold_scripted_peer_open();
+        });
+        install_recovery(&mut session, recovery);
+
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(Instant::now() - Duration::from_millis(1)))
+            .expect_err("an already-spent window-list deadline must reject before dispatch");
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(
+            observed_rx.recv().expect("X11 observation"),
+            "the rejected call sent an X11 request"
+        );
+        let windows = session
+            .platform()
+            .list_windows_by(Deadline::from_millis(1_000))
+            .expect("the next window list should still use the session");
+        assert!(!windows.is_empty());
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_late_xwayland_tree_reply_cannot_become_window_list_success() {
+        let mut session = Launch::new().start_mapped();
+        let (recovery, server) = scripted_x_recovery(&[], |mut peer| {
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            std::thread::sleep(STALLED_X_REPLY);
+            answer_query_tree(&mut peer, sequence, Vec::new());
+            hold_scripted_peer_open();
+        });
+        install_recovery(&mut session, recovery);
+
+        let started = Instant::now();
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(started + X_REPLY_DEADLINE))
+            .expect_err("a query reply after the caller deadline is not success");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < STALLED_X_REPLY * 3 / 4,
+            "the Xwayland query outlived its deadline: {elapsed:?}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("Xwayland tree"), "{error}");
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_successful_tree_reply_observed_after_the_deadline_is_rejected() {
+        let mut session = Launch::new().start_mapped();
+        let expires = Instant::now() + Duration::from_secs(5);
+        let (recovery, server) = scripted_x_recovery_with_clock(
+            &[],
+            vec![expires + Duration::from_millis(1)],
+            |mut peer| {
+                let mut sequence = 0;
+                expect_x_request(
+                    &mut peer,
+                    &mut sequence,
+                    x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+                );
+                answer_query_tree(&mut peer, sequence, Vec::new());
+                hold_scripted_peer_open();
+            },
+        );
+        install_recovery(&mut session, recovery);
+
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(expires))
+            .expect_err("a completed tree reply observed after expiry is not success");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert!(error.to_string().contains("Xwayland tree query"), "{error}");
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn successful_attributes_observed_after_the_deadline_are_rejected() {
+        let mut session = Launch::new().start_mapped();
+        let expires = Instant::now() + Duration::from_secs(5);
+        let before = expires - Duration::from_millis(1);
+        let (recovery, server) = scripted_x_recovery_with_clock(
+            &[],
+            vec![before, expires + Duration::from_millis(1)],
+            |mut peer| {
+                let mut sequence = 0;
+                expect_x_request(
+                    &mut peer,
+                    &mut sequence,
+                    x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+                );
+                answer_query_tree(&mut peer, sequence, vec![SCRIPTED_X_WINDOW]);
+                expect_x_request(
+                    &mut peer,
+                    &mut sequence,
+                    x11rb::protocol::xproto::GET_WINDOW_ATTRIBUTES_REQUEST,
+                );
+                answer_viewable_attributes(&mut peer, sequence);
+                hold_scripted_peer_open();
+            },
+        );
+        install_recovery(&mut session, recovery);
+
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(expires))
+            .expect_err("completed attributes observed after expiry are not success");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert!(
+            error.to_string().contains("Xwayland window attributes"),
+            "{error}"
+        );
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_timed_out_cached_scan_accepts_its_late_reply_then_performs_a_fresh_recheck() {
+        let mut session = Launch::new().start_mapped();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (rechecked_tx, rechecked_rx) = std::sync::mpsc::channel();
+        let (recovery, server) = scripted_x_recovery(&[], move |mut peer| {
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            release_rx
+                .recv()
+                .expect("release the first query's late reply");
+            answer_query_tree(&mut peer, sequence, Vec::new());
+
+            peer.set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("fresh-query observation timeout");
+            let mut header = [0u8; 4];
+            let rechecked = match peer.read_exact(&mut header) {
+                Ok(()) => {
+                    let words = u16::from_ne_bytes([header[2], header[3]]) as usize;
+                    let mut body = vec![0u8; words * 4 - header.len()];
+                    peer.read_exact(&mut body).expect("fresh query body");
+                    sequence += 1;
+                    assert_eq!(
+                        header[0],
+                        x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+                        "the retry sent a different X11 request"
+                    );
+                    answer_query_tree(&mut peer, sequence, Vec::new());
+                    true
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => panic!("read fresh query: {error}"),
+            };
+            rechecked_tx.send(rechecked).expect("fresh-query observer");
+            hold_scripted_peer_open();
+        });
+        install_recovery(&mut session, recovery);
+
+        let first = session
+            .platform()
+            .list_windows_by(Deadline::from_millis(X_REPLY_DEADLINE.as_millis() as u64))
+            .expect_err("the first cached scan must time out");
+        assert_eq!(first.bound_owner(), Some(Whose::Caller));
+        release_tx.send(()).expect("release late query reply");
+
+        let windows = session
+            .platform()
+            .list_windows_by(Deadline::from_millis(1_000))
+            .expect("the retry should complete a fresh X cross-check");
+        assert!(!windows.is_empty());
+        assert!(
+            rechecked_rx.recv().expect("fresh-query observation"),
+            "the timed-out read-only scan consumed the successful throttle window"
+        );
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_stalled_xwayland_attribute_reply_obeys_the_window_list_deadline() {
+        let mut session = Launch::new().start_mapped();
+        let (recovery, server) = scripted_x_recovery(&[], |mut peer| {
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            answer_query_tree(&mut peer, sequence, vec![SCRIPTED_X_WINDOW]);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_WINDOW_ATTRIBUTES_REQUEST,
+            );
+            std::thread::sleep(STALLED_X_REPLY);
+            answer_viewable_attributes(&mut peer, sequence);
+            hold_scripted_peer_open();
+        });
+        install_recovery(&mut session, recovery);
+
+        let started = Instant::now();
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(started + X_REPLY_DEADLINE))
+            .expect_err("a stalled attribute reply must not hold the window list");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < STALLED_X_REPLY * 3 / 4,
+            "the Xwayland attribute read outlived its deadline: {elapsed:?}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            error.to_string().contains("Xwayland window attributes"),
+            "{error}"
+        );
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn an_unmap_confirmation_stall_reports_the_possible_hidden_window_and_sends_no_map() {
+        let mut session = Launch::new().start_mapped();
+        let (mapped_tx, mapped_rx) = std::sync::mpsc::channel();
+        let (recovery, server) = scripted_x_recovery(&[SCRIPTED_X_WINDOW], move |mut peer| {
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            answer_query_tree(&mut peer, sequence, vec![SCRIPTED_X_WINDOW]);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_WINDOW_ATTRIBUTES_REQUEST,
+            );
+            answer_viewable_attributes(&mut peer, sequence);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::UNMAP_WINDOW_REQUEST,
+            );
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+            );
+            std::thread::sleep(STALLED_X_REPLY);
+            answer_sync(&mut peer, sequence);
+            peer.set_read_timeout(Some(Duration::from_millis(150)))
+                .expect("read timeout");
+            let mut next = [0u8; 4];
+            let no_map = peer.read_exact(&mut next).is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            });
+            mapped_tx.send(no_map).expect("map observation receiver");
+        });
+        install_recovery(&mut session, recovery);
+
+        let started = Instant::now();
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(started + X_REPLY_DEADLINE))
+            .expect_err("an unconfirmed unmap must be surfaced");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < STALLED_X_REPLY * 3 / 4, "{elapsed:?}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("may now be hidden"), "{error}");
+        assert!(
+            mapped_rx.recv().expect("map observation"),
+            "recovery dispatched a map after its shared deadline"
+        );
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_remap_confirmation_stall_preserves_partial_side_effect_provenance() {
+        let mut session = Launch::new().start_mapped();
+        let (retried_tx, retried_rx) = std::sync::mpsc::channel();
+        let (recovery, server) = scripted_x_recovery(&[SCRIPTED_X_WINDOW], move |mut peer| {
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            answer_query_tree(&mut peer, sequence, vec![SCRIPTED_X_WINDOW]);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_WINDOW_ATTRIBUTES_REQUEST,
+            );
+            answer_viewable_attributes(&mut peer, sequence);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::UNMAP_WINDOW_REQUEST,
+            );
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+            );
+            answer_sync(&mut peer, sequence);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::MAP_WINDOW_REQUEST,
+            );
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+            );
+            std::thread::sleep(STALLED_X_REPLY);
+            answer_sync(&mut peer, sequence);
+            peer.set_read_timeout(Some(Duration::from_millis(150)))
+                .expect("read timeout");
+            let mut next = [0u8; 4];
+            let no_retry = peer.read_exact(&mut next).is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            });
+            retried_tx
+                .send(no_retry)
+                .expect("retry observation receiver");
+        });
+        install_recovery(&mut session, recovery);
+
+        let started = Instant::now();
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(started + X_REPLY_DEADLINE))
+            .expect_err("an unconfirmed re-map must be surfaced");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < STALLED_X_REPLY * 3 / 4, "{elapsed:?}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            error.to_string().contains("window visibility is uncertain"),
+            "{error}"
+        );
+        assert!(
+            retried_rx.recv().expect("retry observation"),
+            "recovery retried the map after its shared deadline"
+        );
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_successful_map_confirmation_observed_after_the_deadline_is_rejected() {
+        let mut session = Launch::new().start_mapped();
+        let expires = Instant::now() + Duration::from_secs(5);
+        let before = expires - Duration::from_millis(1);
+        let (recovery, server) = scripted_x_recovery_with_clock(
+            &[SCRIPTED_X_WINDOW],
+            vec![before, before, expires + Duration::from_millis(1)],
+            |mut peer| {
+                let mut sequence = 0;
+                expect_x_request(
+                    &mut peer,
+                    &mut sequence,
+                    x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+                );
+                answer_query_tree(&mut peer, sequence, vec![SCRIPTED_X_WINDOW]);
+                expect_x_request(
+                    &mut peer,
+                    &mut sequence,
+                    x11rb::protocol::xproto::GET_WINDOW_ATTRIBUTES_REQUEST,
+                );
+                answer_viewable_attributes(&mut peer, sequence);
+                expect_x_request(
+                    &mut peer,
+                    &mut sequence,
+                    x11rb::protocol::xproto::UNMAP_WINDOW_REQUEST,
+                );
+                expect_x_request(
+                    &mut peer,
+                    &mut sequence,
+                    x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+                );
+                answer_sync(&mut peer, sequence);
+                expect_x_request(
+                    &mut peer,
+                    &mut sequence,
+                    x11rb::protocol::xproto::MAP_WINDOW_REQUEST,
+                );
+                expect_x_request(
+                    &mut peer,
+                    &mut sequence,
+                    x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+                );
+                answer_sync(&mut peer, sequence);
+                hold_scripted_peer_open();
+            },
+        );
+        install_recovery(&mut session, recovery);
+
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::at(expires))
+            .expect_err("a completed map confirmation observed after expiry is not success");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            error.to_string().contains("visibility is uncertain"),
+            "{error}"
+        );
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_transport_failure_after_unmap_is_a_structured_visibility_failure() {
+        let mut session = Launch::new().start_mapped();
+        let (recovery, server) = scripted_x_recovery(&[SCRIPTED_X_WINDOW], |mut peer| {
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            answer_query_tree(&mut peer, sequence, vec![SCRIPTED_X_WINDOW]);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_WINDOW_ATTRIBUTES_REQUEST,
+            );
+            answer_viewable_attributes(&mut peer, sequence);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::UNMAP_WINDOW_REQUEST,
+            );
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+            );
+        });
+        install_recovery(&mut session, recovery);
+
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::from_millis(1_000))
+            .expect_err("a closed transport after unmap cannot become window-list success");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(matches!(error, GlassError::AfterDispatch(_)), "{error:?}");
+        assert!(error.to_string().contains("0 window(s)"), "{error}");
+        assert!(error.to_string().contains("0x200"), "{error}");
+        assert!(error.to_string().contains("may now be hidden"), "{error}");
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_transport_failure_after_map_is_a_structured_visibility_failure() {
+        let mut session = Launch::new().start_mapped();
+        let (recovery, server) = scripted_x_recovery(&[SCRIPTED_X_WINDOW], |mut peer| {
+            let mut sequence = 0;
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+            );
+            answer_query_tree(&mut peer, sequence, vec![SCRIPTED_X_WINDOW]);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_WINDOW_ATTRIBUTES_REQUEST,
+            );
+            answer_viewable_attributes(&mut peer, sequence);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::UNMAP_WINDOW_REQUEST,
+            );
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+            );
+            answer_sync(&mut peer, sequence);
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::MAP_WINDOW_REQUEST,
+            );
+            expect_x_request(
+                &mut peer,
+                &mut sequence,
+                x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+            );
+        });
+        install_recovery(&mut session, recovery);
+
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::from_millis(1_000))
+            .expect_err("a closed transport after map cannot become window-list success");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(matches!(error, GlassError::AfterDispatch(_)), "{error:?}");
+        assert!(error.to_string().contains("0 window(s)"), "{error}");
+        assert!(error.to_string().contains("0x200"), "{error}");
+        assert!(
+            error.to_string().contains("visibility is uncertain"),
+            "{error}"
+        );
+        server.join().expect("scripted X11 server");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn a_later_transport_failure_reports_earlier_successful_remaps() {
+        let mut session = Launch::new().start_mapped();
+        let (recovery, server) =
+            scripted_x_recovery(&[SCRIPTED_X_WINDOW, SCRIPTED_X_WINDOW_2], |mut peer| {
+                let mut sequence = 0;
+                expect_x_request(
+                    &mut peer,
+                    &mut sequence,
+                    x11rb::protocol::xproto::QUERY_TREE_REQUEST,
+                );
+                answer_query_tree(
+                    &mut peer,
+                    sequence,
+                    vec![SCRIPTED_X_WINDOW, SCRIPTED_X_WINDOW_2],
+                );
+                for _ in 0..2 {
+                    expect_x_request(
+                        &mut peer,
+                        &mut sequence,
+                        x11rb::protocol::xproto::GET_WINDOW_ATTRIBUTES_REQUEST,
+                    );
+                    answer_viewable_attributes(&mut peer, sequence);
+                }
+
+                for opcode in [
+                    x11rb::protocol::xproto::UNMAP_WINDOW_REQUEST,
+                    x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+                ] {
+                    expect_x_request(&mut peer, &mut sequence, opcode);
+                }
+                answer_sync(&mut peer, sequence);
+                for opcode in [
+                    x11rb::protocol::xproto::MAP_WINDOW_REQUEST,
+                    x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+                ] {
+                    expect_x_request(&mut peer, &mut sequence, opcode);
+                }
+                answer_sync(&mut peer, sequence);
+
+                for opcode in [
+                    x11rb::protocol::xproto::UNMAP_WINDOW_REQUEST,
+                    x11rb::protocol::xproto::GET_INPUT_FOCUS_REQUEST,
+                ] {
+                    expect_x_request(&mut peer, &mut sequence, opcode);
+                }
+            });
+        install_recovery(&mut session, recovery);
+
+        let error = session
+            .platform()
+            .list_windows_by(Deadline::from_millis(1_000))
+            .expect_err("partial Xwayland recovery must not become window-list success");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("1 window(s)"), "{error}");
+        assert!(error.to_string().contains("0x201"), "{error}");
+        assert!(error.to_string().contains("may now be hidden"), "{error}");
+        server.join().expect("scripted X11 server");
+    }
 
     #[test]
     #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
@@ -3831,8 +5357,10 @@ mod session_tests {
             let session = s.platform().active.as_mut().expect("a started session");
             let (w, h) = session.output_size;
             let (ox, oy) = (session.active_rect.x, session.active_rect.y);
+            let dispatch = WaylandDispatch::default();
             let mut sink = WaylandDragSink {
                 s: session,
+                dispatch: &dispatch,
                 w,
                 h,
                 ox,
@@ -3840,6 +5368,7 @@ mod session_tests {
                 b: evdev_button(glass_core::MouseButton::Left),
                 mask: 0,
                 held: Held::default(),
+                deadline: Deadline::UNBOUNDED,
             };
             // Placed first, as `run_drag` does: sway routes a button to the surface its pointer
             // is over, and re-evaluates that only on motion.
@@ -3851,6 +5380,77 @@ mod session_tests {
         // `272 0` is BTN_LEFT released, so the wait is the assertion — a gesture that left the
         // button down never logs it, and the harness fails rather than hangs.
         s.wait_for_log(" 272 0");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn dropped_chord_and_scroll_sinks_release_everything_they_hold() {
+        use glass_core::{ChordSink as _, ScrollSink as _};
+
+        let mut s = Launch::new().start_mapped();
+        {
+            let session = s.platform().active.as_mut().expect("a started session");
+            let dispatch = WaylandDispatch::default();
+            let mut sink = WaylandChordSink {
+                s: session,
+                dispatch: &dispatch,
+                mask: modifier_mask(&[glass_core::keys::Modifier::Control]),
+                keysym: 'a' as u32,
+                held: Held::default(),
+                deadline: Deadline::UNBOUNDED,
+            };
+            sink.modifiers(true).expect("hold chord modifier");
+            sink.key(true).expect("hold chord key");
+        }
+        let chord = s.wait_for_log("input: mods 0");
+        assert!(
+            chord
+                .iter()
+                .any(|line| line.contains("input: key") && line.ends_with(" 0")),
+            "dropping the chord released its key: {chord:#?}"
+        );
+        s.platform().drain_logs();
+
+        {
+            let session = s.platform().active.as_mut().expect("a started session");
+            let dispatch = WaylandDispatch::default();
+            let (w, h) = session.output_size;
+            let (ox, oy) = (session.active_rect.x, session.active_rect.y);
+            let mut sink = WaylandScrollSink {
+                s: session,
+                dispatch: &dispatch,
+                w,
+                h,
+                ox,
+                oy,
+                x: 10,
+                y: 10,
+                dx: 0,
+                dy: -1,
+                mask: modifier_mask(&[glass_core::keys::Modifier::Control]),
+                held: Held::default(),
+                deadline: Deadline::UNBOUNDED,
+            };
+            sink.modifiers(true).expect("hold scroll modifier");
+        }
+        let scroll = s.wait_for_log("input: mods 0");
+        assert!(
+            scroll.iter().any(|line| line.ends_with("input: mods 4")),
+            "the scroll modifier was held before drop: {scroll:#?}"
+        );
+
+        let session = s.platform().active.as_mut().expect("a started session");
+        let dispatch = WaylandDispatch::default();
+        let mut sink = WaylandChordSink {
+            s: session,
+            dispatch: &dispatch,
+            mask: 0,
+            keysym: 'a' as u32,
+            held: Held::default(),
+            deadline: Deadline::from_millis(0),
+        };
+        sink.settle()
+            .expect_err("a chord settle must honor its caller deadline");
     }
 
     /// glass#402: waiting for the sync every request ends in was unbounded, so `glass_click` on a

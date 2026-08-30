@@ -3,7 +3,10 @@
 
 use glass_core::Region;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Error as _};
+
+pub(crate) const MAX_CLICK_COUNT: u32 = glass_core::MAX_CLICK_COUNT;
+pub(crate) const MAX_SCROLL_NOTCHES: i32 = glass_core::MAX_SCROLL_NOTCHES as i32;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RegionArgs {
@@ -127,24 +130,19 @@ pub struct SelectWindowArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClickElementArgs {
-    /// The element `#id` from `glass_a11y_snapshot`. Valid only within the latest
-    /// snapshot — re-snapshot if the UI changed. If the element actually renders in a
-    /// popover owned by a different window than the active one (e.g. an open
-    /// dropdown's option row), the click is automatically routed into that popover
-    /// window and the previously-active window is restored afterward — no extra step
-    /// needed.
-    ///
-    /// Clicks via the platform's native accessibility action when the element exposes
-    /// one (works even when the element is occluded or scrolled off-screen), falling
-    /// back to a synthetic pointer click at the element's center; the result's
-    /// `method` field says which path ran, and `native_fallback` says why when the
-    /// pointer path was used. Where a control's label is a separate element from the
-    /// control itself, the native action fires on the enclosing control and the
-    /// result carries `actuated_id` — the element actually clicked.
+    /// Element `#id` from the latest `glass_a11y_snapshot`.
+    /// Re-snapshot after UI changes.
+    /// Popover-owned targets route to their window and restore the prior active window.
+    /// The role-appropriate native accessibility operation handles occluded or off-screen targets
+    /// and separate labels through their enclosing control.
+    /// Unavailable native operations fall back to a pointer click at the target center.
+    /// Text editors may receive focus without activation.
+    /// `method:"native-action"` labels any native path.
+    /// `native_fallback` explains pointer fallback.
+    /// `actuated_id` identifies a substituted enclosing control.
     pub id: u32,
-    /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
-    /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI
-    /// to stop changing, text-only), or "none" (default).
+    /// Terminal observation: "snapshot" settles and refreshes/folds a11y, "settle" waits for
+    /// visual stability and returns text-only metadata, and "none" skips observation (default).
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }
@@ -159,8 +157,8 @@ pub struct SetValueArgs {
     /// (case-insensitive); glass opens it and picks that option.
     pub text: String,
     /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
-    /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI
-    /// to stop changing, text-only), or "none" (default).
+    /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (waits for visual
+    /// stability and returns text-only metadata), or "none" (default).
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }
@@ -182,7 +180,9 @@ pub struct ClickArgs {
     pub y: i32,
     /// "left" (default), "right", or "middle".
     pub button: Option<String>,
-    /// Consecutive clicks at this point (default 1); pass 2 for a double-click.
+    /// Consecutive clicks at this point (default 1, valid range 1 through 10); pass 2 for a
+    /// double-click.
+    #[schemars(range(min = 1, max = 10))]
     pub count: Option<u32>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
     pub modifiers: Option<Vec<String>>,
@@ -248,12 +248,16 @@ pub struct ScrollArgs {
     pub x: i32,
     /// Pointer y the wheel is aimed at, window-relative. See `x`.
     pub y: i32,
-    /// Horizontal scroll in **wheel notches** (discrete clicks — small integers like 1–5, NOT
-    /// pixels). Positive `dx` sends wheel-right, negative wheel-left; glass clicks `|dx|` times.
+    /// Horizontal wheel notches from -100 through 100, not pixels.
+    /// Positive is right and negative is left, repeated `|dx|` times.
+    /// Typical values are 1–5.
+    #[schemars(range(min = -100, max = 100))]
     pub dx: Option<i32>,
-    /// Vertical scroll in **wheel notches** (discrete clicks — small integers like 1–5, NOT
-    /// pixels). Positive `dy` sends wheel-down, negative wheel-up; glass clicks `|dy|` times. How
-    /// an app maps a wheel notch to its view (lines, pixels, zoom) is the app's choice.
+    /// Vertical wheel notches from -100 through 100, not pixels.
+    /// Positive is down and negative is up, repeated `|dy|` times.
+    /// Typical values are 1–5.
+    /// Apps choose how a notch maps to lines, pixels, or zoom.
+    #[schemars(range(min = -100, max = 100))]
     pub dy: Option<i32>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
     pub modifiers: Option<Vec<String>>,
@@ -265,10 +269,8 @@ pub struct TypeArgs {
     /// focus a field, so click or `glass_click_element` one first. Sent as synthetic
     /// key events, not pasted, so an app's per-keystroke handlers run.
     pub text: String,
-    /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
-    /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI
-    /// to stop changing, text-only), or "none" (default). Not accepted inside a `glass_do`
-    /// `type` action — use a `settle` action or the terminal `then` observe there.
+    /// Terminal observation: "snapshot" settles and refreshes/folds a11y, "settle" waits for
+    /// visual stability and returns text-only metadata, and "none" skips observation (default).
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }
@@ -513,6 +515,10 @@ pub enum Action {
     Type(TypeArgs),
     Key(KeyArgs),
     Settle(SettleArgs),
+    ClickElement(ClickElementArgs),
+    SetValue(SetValueArgs),
+    WaitForElement(WaitForElementArgs),
+    ScrollToElement(ScrollToElementArgs),
 }
 
 /// A mid-sequence or terminal settle — the `wait_stable` knobs, no image/return.
@@ -525,8 +531,9 @@ pub struct SettleArgs {
     /// Per-channel difference (0–255) two frames may have and still count as
     /// unchanged (default 0, exact match).
     pub tolerance: Option<u8>,
-    /// Give up after this long (default 5000ms); the sequence continues rather than
-    /// failing.
+    /// Give up after this long (default 5000ms).
+    /// This settle's timeout returns settled:false and completes the step.
+    /// The enclosing glass_do deadline fails the sequence.
     pub timeout_ms: Option<u64>,
     /// Window-relative sub-rectangle to watch for settling; when set, changes outside
     /// it are ignored.
@@ -557,7 +564,7 @@ pub struct ThenArgs {
 }
 
 /// Arguments for `glass_do`: an ordered, non-empty action sequence + optional observe.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, JsonSchema)]
 pub struct DoArgs {
     /// Actions to run in order; must be non-empty. Fail-fast — the first failing
     /// action aborts the rest and reports its index, so a partial sequence may
@@ -566,6 +573,36 @@ pub struct DoArgs {
     /// Optional observe run once after the last action, in the order settle → diff
     /// → screenshot.
     pub then: Option<ThenArgs>,
+    /// Overall sequence budget in milliseconds. Omit for 30000; valid range
+    /// 1..=120000. One absolute deadline is shared by all actions and terminal
+    /// observations.
+    pub timeout_ms: Option<u64>,
+    #[schemars(skip)]
+    pub(crate) encoded_argument_bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct DoArgsWire {
+    actions: Vec<Action>,
+    then: Option<ThenArgs>,
+    timeout_ms: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for DoArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let encoded_argument_bytes = serde_json::to_vec(&raw).map_err(D::Error::custom)?.len();
+        let wire = DoArgsWire::deserialize(raw).map_err(D::Error::custom)?;
+        Ok(Self {
+            actions: wire.actions,
+            then: wire.then,
+            timeout_ms: wire.timeout_ms,
+            encoded_argument_bytes,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -887,6 +924,25 @@ mod tests {
         assert!(matches!(a.actions[2], Action::Key(_)));
         assert!(matches!(a.actions[3], Action::Settle(_)));
         assert!(a.then.is_none());
+        assert!(a.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn do_args_accepts_every_documented_type_return_mode() {
+        for return_mode in ["none", "settle", "snapshot"] {
+            let raw = serde_json::json!({
+                "actions": [{
+                    "action": "type",
+                    "text": "hé🙂",
+                    "return": return_mode
+                }]
+            });
+            let args: DoArgs = serde_json::from_value(raw).unwrap();
+            let Action::Type(type_args) = &args.actions[0] else {
+                panic!("the action must remain a type action");
+            };
+            assert_eq!(type_args.return_.as_deref(), Some(return_mode));
+        }
     }
 
     #[test]
@@ -905,5 +961,73 @@ mod tests {
         assert_eq!(a.actions.len(), 1);
         assert!(a.then.is_some());
         assert!(a.then.unwrap().screenshot.is_some());
+        assert!(a.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn do_args_parse_semantic_actions_and_timeout() {
+        let a: DoArgs = serde_json::from_str(
+            r#"{
+            "actions":[
+              {"action":"click_element","id":3,"return":"snapshot"},
+              {"action":"set_value","id":4,"text":"Alice","return":"settle"},
+              {"action":"wait_for_element","description":"Name","value":"Alice"},
+              {"action":"scroll_to_element","name":"Row 250","direction":"down"}
+            ],
+            "timeout_ms":10000
+        }"#,
+        )
+        .unwrap();
+        assert!(matches!(a.actions[0], Action::ClickElement(_)));
+        assert!(matches!(a.actions[1], Action::SetValue(_)));
+        assert!(matches!(a.actions[2], Action::WaitForElement(_)));
+        assert!(matches!(a.actions[3], Action::ScrollToElement(_)));
+        assert_eq!(a.timeout_ms, Some(10_000));
+    }
+
+    #[test]
+    fn do_args_measure_compact_json_before_unknown_fields_are_ignored() {
+        let raw = r#"{"actions":[{"action":"key","chord":"a","ignored":"xxxxxxxx"}]}"#;
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let a: DoArgs = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            a.encoded_argument_bytes,
+            serde_json::to_vec(&value).unwrap().len()
+        );
+    }
+
+    fn mixed_utf8_do_args_with_compact_len(target: usize) -> Vec<u8> {
+        let mut value = serde_json::json!({
+            "actions": [{
+                "action": "key",
+                "chord": "é",
+                "ignored_action_bytes": "🙂"
+            }],
+            "ignored_top_level_bytes": "漢"
+        });
+        let base = serde_json::to_vec(&value).unwrap().len();
+        assert!(base <= target);
+        value["ignored_top_level_bytes"] =
+            serde_json::Value::String(format!("漢{}", "x".repeat(target - base)));
+        let compact = serde_json::to_vec(&value).unwrap();
+        assert_eq!(compact.len(), target);
+        compact
+    }
+
+    #[test]
+    fn do_args_measure_exact_mixed_utf8_boundaries_before_ignoring_unknown_fields() {
+        for target in [65_536, 65_537] {
+            let compact = mixed_utf8_do_args_with_compact_len(target);
+            let args: DoArgs = serde_json::from_slice(&compact).unwrap();
+            assert_eq!(args.encoded_argument_bytes, target);
+        }
+    }
+
+    #[test]
+    fn do_args_schema_hides_internal_measurement() {
+        let schema = serde_json::to_value(schemars::schema_for!(DoArgs)).unwrap();
+        let text = schema.to_string();
+        assert!(text.contains("timeout_ms"));
+        assert!(!text.contains("encoded_argument_bytes"));
     }
 }

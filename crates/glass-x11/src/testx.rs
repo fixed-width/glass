@@ -54,6 +54,10 @@ impl TestX {
         &self.xvfb.display
     }
 
+    pub(crate) fn server_pid(&self) -> u32 {
+        self.xvfb.pid()
+    }
+
     /// A backend attached to this display.
     pub(crate) fn platform(&self) -> X11Platform {
         X11Platform::connect(Some(self.display())).expect("the backend should connect")

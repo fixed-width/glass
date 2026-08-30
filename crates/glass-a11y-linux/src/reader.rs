@@ -10,9 +10,9 @@ use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
-    A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, Deadline,
-    GlassError, Result, WalkBudget, normalize_description, normalize_name, read_back_confirms,
-    write_took_no_effect,
+    A11yMutationDispatch, A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget,
+    AxTree, Deadline, GlassError, Result, WalkBudget, Whose, normalize_description, normalize_name,
+    read_back_confirms, write_took_no_effect,
 };
 
 use crate::mapping::{map_role, map_states};
@@ -47,15 +47,37 @@ impl Accessibility for LinuxA11y {
         let ctx = ctx.clone();
         let target = target.clone();
         let text = text.to_string();
-        BUS.set_value(move || run_set_value(&ctx, &target, &text))
+        set_value_with_thread(&BUS, ctx, target.id.0, move |ctx, dispatch| {
+            run_set_value(&ctx, &target, &text, dispatch)
+        })
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         let ctx = ctx.clone();
         let target = target.clone();
         // This reader actuates the element it resolved, so it never substitutes another.
-        BUS.invoke(move || run_invoke(&ctx, &target)).map(|()| None)
+        invoke_with_thread(&BUS, ctx, move |ctx, dispatch| {
+            run_invoke(&ctx, &target, dispatch)
+        })
+        .map(|()| None)
     }
+}
+
+fn set_value_with_thread(
+    thread: &A11yThread,
+    ctx: AxContext,
+    target: u32,
+    job: impl FnOnce(AxContext, &A11yMutationDispatch) -> Result<()> + Send + 'static,
+) -> Result<()> {
+    thread.set_value(target, ctx.deadline, move |dispatch| job(ctx, dispatch))
+}
+
+fn invoke_with_thread(
+    thread: &A11yThread,
+    ctx: AxContext,
+    job: impl FnOnce(AxContext, &A11yMutationDispatch) -> Result<()> + Send + 'static,
+) -> Result<()> {
+    thread.invoke(ctx.deadline, move |dispatch| job(ctx, dispatch))
 }
 
 fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
@@ -66,20 +88,25 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     rt.block_on(snapshot_async(ctx))
 }
 
-fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+fn run_set_value(
+    ctx: &AxContext,
+    target: &AxTarget,
+    text: &str,
+    dispatch: &A11yMutationDispatch,
+) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
-    rt.block_on(set_value_async(ctx, target, text))
+    rt.block_on(set_value_async(ctx, target, text, dispatch))
 }
 
-fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
+fn run_invoke(ctx: &AxContext, target: &AxTarget, dispatch: &A11yMutationDispatch) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
-    rt.block_on(invoke_async(ctx, target))
+    rt.block_on(invoke_async(ctx, target, dispatch))
 }
 
 fn bus_err(e: impl std::fmt::Display) -> GlassError {
@@ -169,6 +196,13 @@ fn writes_value_only(role: glass_core::AxRole, text: &str) -> bool {
     matches!(role, Slider | SpinButton | ScrollBar) && text.parse::<f64>().is_ok()
 }
 
+fn writes_editable_text(role: glass_core::AxRole) -> bool {
+    matches!(
+        role,
+        glass_core::AxRole::TextField | glass_core::AxRole::TextArea
+    )
+}
+
 /// Poll bound for confirming a write or toggle landed — the toolkit applies it on a later
 /// main-loop pass, so the first read after dispatch is expected to be stale. [`confirm_write`]
 /// reads first and stops early once its `deadline` passes; [`set_toggle`] and
@@ -187,7 +221,12 @@ const VERIFY_INTERVAL: Duration = Duration::from_millis(120);
 const ACKNOWLEDGED_NOT_APPLIED: &str = "this element's accessibility interface acknowledged the write without applying it — focus the \
      element and type into it instead";
 
-async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+async fn set_value_async(
+    ctx: &AxContext,
+    target: &AxTarget,
+    text: &str,
+    dispatch: &A11yMutationDispatch,
+) -> Result<()> {
     let (app_ref, conn) = find_app(ctx).await?;
     let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
     let mut budget = WalkBudget::with_limits(ctx.limits);
@@ -212,7 +251,7 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
         if matches!(role, CheckBox | ToggleButton | RadioButton)
             && let Some(on) = parse_bool(text)
         {
-            return set_toggle(&conn, &node, role, on, text, target.id.0).await;
+            return set_toggle(&conn, &node, role, on, text, target.id.0, dispatch).await;
         }
     }
 
@@ -222,7 +261,7 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
     // also exposes EditableText, but writing its entry buffer doesn't commit to the adjustment.
     // Text widgets prefer EditableText, falling back to Value for anything numeric that lacks it.
     // The builder `.ok()` chaining mirrors the working ComponentProxy build in `extents`.
-    if !writes_value_only(role, text) {
+    if writes_editable_text(role) {
         let editable = atspi::proxy::editable_text::EditableTextProxy::builder(&conn)
             .destination(dest.clone())
             .ok()
@@ -233,7 +272,10 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
             // The baseline for the confirmation below: without one, only an exact read-back
             // confirms.
             let before = read_text(&node, &conn).await;
-            match et.set_text_contents(text).await {
+            match dispatch
+                .dispatch_async(async { et.set_text_contents(text).await.map_err(bus_err) })
+                .await
+            {
                 Ok(true) => {
                     return confirm_write(
                         &node,
@@ -248,11 +290,13 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
                 }
                 // EditableText is present but rejected the write — don't try Value.
                 Ok(false) => return Err(GlassError::AxElementNotEditable(target.id.0)),
-                Err(_) => {} // interface absent / call failed — fall through to Value
+                Err(error) => return Err(error),
             }
         }
     }
-    if let Ok(v) = text.parse::<f64>() {
+    if writes_value_only(role, text)
+        && let Ok(v) = text.parse::<f64>()
+    {
         let value_proxy = atspi::proxy::value::ValueProxy::builder(&conn)
             .destination(dest)
             .ok()
@@ -261,18 +305,19 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
             && let Ok(vp) = b.build().await
         {
             let before = read_number(&node, &conn).await;
-            if vp.set_current_value(v).await.is_ok() {
-                return confirm_write(
-                    &node,
-                    &conn,
-                    WrittenVia::Value,
-                    before,
-                    text,
-                    target.id.0,
-                    ctx.deadline,
-                )
-                .await;
-            }
+            dispatch
+                .dispatch_async(async { vp.set_current_value(v).await.map_err(bus_err) })
+                .await?;
+            return confirm_write(
+                &node,
+                &conn,
+                WrittenVia::Value,
+                before,
+                text,
+                target.id.0,
+                ctx.deadline,
+            )
+            .await;
         }
     }
     Err(GlassError::AxElementNotEditable(target.id.0))
@@ -551,7 +596,7 @@ enum ActionAttempt {
     /// failed `DoAction` may still have reached the toolkit. Distinct from
     /// `Fired(false)` (the toolkit answered "I did not run it") so a caller can't
     /// report a transport failure as a truthful "did not run".
-    Error(String),
+    Error(GlassError),
 }
 
 /// Fire the node's first Action whose name is in `names`.
@@ -563,6 +608,7 @@ async fn try_action(
     conn: &zbus::Connection,
     node: &AccessibleProxy<'_>,
     names: &[&str],
+    dispatch: &A11yMutationDispatch,
 ) -> ActionAttempt {
     let dest = node.inner().destination().to_owned();
     let path = node.inner().path().to_owned();
@@ -578,21 +624,34 @@ async fn try_action(
     };
     let n = match a.n_actions().await {
         Ok(n) => n,
-        Err(e) => return ActionAttempt::Error(format!("NActions: {e}")),
+        Err(e) => return ActionAttempt::Error(bus_err(format!("NActions: {e}"))),
     };
     for i in 0..n {
         let name = match a.get_name(i).await {
             Ok(name) => name.to_ascii_lowercase(),
-            Err(e) => return ActionAttempt::Error(format!("GetName({i}): {e}")),
+            Err(e) => return ActionAttempt::Error(bus_err(format!("GetName({i}): {e}"))),
         };
         if names.contains(&name.as_str()) {
-            return match a.do_action(i).await {
+            let result = dispatch
+                .dispatch_async(async { a.do_action(i).await.map_err(bus_err) })
+                .await;
+            return match result {
                 Ok(ok) => ActionAttempt::Fired { ok, action: name },
-                Err(e) => ActionAttempt::Error(format!("DoAction({i}): {e}")),
+                Err(e) => ActionAttempt::Error(e),
             };
         }
     }
     ActionAttempt::Unavailable
+}
+
+fn toggle_action_result(attempt: ActionAttempt, id: u32) -> Result<()> {
+    match attempt {
+        ActionAttempt::Fired { ok: true, .. } => Ok(()),
+        ActionAttempt::Fired { ok: false, .. } | ActionAttempt::Unavailable => {
+            Err(GlassError::AxElementNotEditable(id))
+        }
+        ActionAttempt::Error(error) => Err(error),
+    }
 }
 
 /// The AT-SPI state flag carrying a widget's boolean state: toggle buttons expose it as
@@ -619,23 +678,16 @@ async fn set_toggle(
     target_on: bool,
     requested: &str,
     id: u32,
+    dispatch: &A11yMutationDispatch,
 ) -> Result<()> {
     let flag = toggle_state_flag(role);
     if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
         return Ok(()); // already in the desired state
     }
-    // `Error` (an AT-SPI call that failed) folds in with "did not fire" here, keeping
-    // `set_value`'s behavior unchanged: this path verifies the state below and reports
-    // `AxValueNotApplied` on no change, so an ambiguous outcome is caught by that check
-    // rather than needing its own classification.
-    if !matches!(
-        try_action(conn, node, TOGGLE_ACTION_NAMES).await,
-        ActionAttempt::Fired { ok: true, .. }
-    ) {
-        // No toggle action (e.g. a GTK4 GtkCheckButton exposes none) — can't set it
-        // through accessibility; the caller should drive it with click_element.
-        return Err(GlassError::AxElementNotEditable(id));
-    }
+    toggle_action_result(
+        try_action(conn, node, TOGGLE_ACTION_NAMES, dispatch).await,
+        id,
+    )?;
     // Poll until the toolkit applies it; a no-op activation never converges.
     let mut last_on = None;
     for _ in 0..VERIFY_POLLS {
@@ -684,6 +736,160 @@ const TOGGLE_ACTION: &str = "toggle";
 const ACTIVATE_ACTION_NAMES: &[&str] =
     &["click", "activate", "press", "push", "jump", TOGGLE_ACTION];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeInvokeKind {
+    Focus,
+    Activate,
+}
+
+fn native_invoke_kind(role: glass_core::AxRole) -> NativeInvokeKind {
+    match role {
+        glass_core::AxRole::TextField | glass_core::AxRole::TextArea => NativeInvokeKind::Focus,
+        _ => NativeInvokeKind::Activate,
+    }
+}
+
+const FOCUS_CONFIRM_POLL: Duration = Duration::from_millis(10);
+const FOCUS_CONFIRM_CEILING: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusConfirmationStep {
+    Confirmed,
+    Sleep(Duration),
+    Expired(Whose),
+}
+
+fn focus_confirmation_step(
+    caller: Deadline,
+    backend_end: std::time::Instant,
+    now: std::time::Instant,
+    focused: bool,
+) -> FocusConfirmationStep {
+    let (end, whose) = caller.resolve(backend_end);
+    let remaining = end.saturating_duration_since(now);
+    if remaining.is_zero() {
+        FocusConfirmationStep::Expired(whose)
+    } else if focused {
+        FocusConfirmationStep::Confirmed
+    } else {
+        FocusConfirmationStep::Sleep(FOCUS_CONFIRM_POLL.min(remaining))
+    }
+}
+
+async fn await_caller_deadline<F: std::future::Future>(
+    deadline: Deadline,
+    future: F,
+) -> std::result::Result<F::Output, ()> {
+    match deadline.instant() {
+        Some(end) => tokio::time::timeout_at(tokio::time::Instant::from_std(end), future)
+            .await
+            .map_err(|_| ()),
+        None => Ok(future.await),
+    }
+}
+
+fn focus_confirmation_expired(id: u32, whose: Whose) -> GlassError {
+    match whose {
+        Whose::Caller => GlassError::caller_deadline_elapsed("native accessibility focus"),
+        Whose::Callee => GlassError::AxActionFailed(
+            id,
+            "focus was requested but the element did not become focused within the confirmation window"
+                .into(),
+        ),
+    }
+}
+
+async fn focus_text_editor(
+    ctx: &AxContext,
+    conn: &zbus::Connection,
+    node: &AccessibleProxy<'_>,
+    id: u32,
+    dispatch: &A11yMutationDispatch,
+) -> Result<()> {
+    const OP: &str = "native accessibility focus";
+    if ctx.deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(OP));
+    }
+    let dest = node.inner().destination().to_owned();
+    let path = node.inner().path().to_owned();
+    let builder = ComponentProxy::builder(conn)
+        .destination(dest)
+        .map_err(|_| GlassError::AxActionUnavailable(id))?
+        .path(path)
+        .map_err(|_| GlassError::AxActionUnavailable(id))?;
+    let built = await_caller_deadline(ctx.deadline, builder.build())
+        .await
+        .map_err(|()| GlassError::deadline_not_started(OP))?;
+    if ctx.deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(OP));
+    }
+    let component = built.map_err(|e| {
+        GlassError::AccessibilityUnavailable(format!("AT-SPI focus proxy failed: {e}"))
+    })?;
+    if ctx.deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(OP));
+    }
+    let focus_reply = dispatch
+        .dispatch_async(async {
+            await_caller_deadline(ctx.deadline, component.grab_focus())
+                .await
+                .map_err(|()| GlassError::caller_deadline_elapsed(OP))
+        })
+        .await?;
+    if ctx.deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed(OP));
+    }
+    match focus_reply {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(GlassError::AxActionFailed(
+                id,
+                "the toolkit reported focus did not run".into(),
+            ));
+        }
+        Err(e) => {
+            return Err(GlassError::AccessibilityUnavailable(format!(
+                "AT-SPI focus call failed: {e}"
+            )));
+        }
+    }
+
+    let backend_end = std::time::Instant::now() + FOCUS_CONFIRM_CEILING;
+    loop {
+        let (effective_end, whose) = ctx.deadline.resolve(backend_end);
+        if effective_end
+            .saturating_duration_since(std::time::Instant::now())
+            .is_zero()
+        {
+            return Err(focus_confirmation_expired(id, whose));
+        }
+        let state_reply = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(effective_end),
+            node.get_state(),
+        )
+        .await
+        .map_err(|_| focus_confirmation_expired(id, whose))?;
+        let observed_at = std::time::Instant::now();
+        if let FocusConfirmationStep::Expired(expired_by) =
+            focus_confirmation_step(ctx.deadline, backend_end, observed_at, false)
+        {
+            return Err(focus_confirmation_expired(id, expired_by));
+        }
+        let focused = state_reply
+            .map_err(|e| {
+                GlassError::AccessibilityUnavailable(format!("AT-SPI focus state read failed: {e}"))
+            })?
+            .contains(atspi_common::State::Focused);
+        match focus_confirmation_step(ctx.deadline, backend_end, observed_at, focused) {
+            FocusConfirmationStep::Confirmed => return Ok(()),
+            FocusConfirmationStep::Sleep(duration) => tokio::time::sleep(duration).await,
+            FocusConfirmationStep::Expired(expired_by) => {
+                return Err(focus_confirmation_expired(id, expired_by));
+            }
+        }
+    }
+}
+
 /// Confirm a fired `toggle` action actually moved the control: poll its boolean state until
 /// it differs from `was_on`. Without this, a toolkit that accepts and acknowledges the action
 /// but never applies it (or applies it to nothing) reports a successful click on a control
@@ -708,15 +914,16 @@ async fn verify_toggle_flipped(
     ))
 }
 
-/// Actuate the element identified by `target` via its native AT-SPI Action — the
-/// backend for `Accessibility::invoke`. Re-walks pre-order to `target.id`, verifies
-/// the fingerprint (same gate as `set_value_async`, guarding a stale id / mirror
-/// drift), then fires the first action in [`ACTIVATE_ACTION_NAMES`].
+/// Actuate `target` through its role-appropriate AT-SPI operation after rewalking by id and
+/// verifying the same stale-target fingerprint as `set_value_async`.
 ///
-/// When the action that fired is [`TOGGLE_ACTION`], the ack alone is not accepted as
-/// success: the control's boolean state must be observed to change (see
-/// [`verify_toggle_flipped`]).
-async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
+/// Text editors receive focus, while other controls fire the first [`ACTIVATE_ACTION_NAMES`] match.
+/// [`TOGGLE_ACTION`] succeeds only after [`verify_toggle_flipped`] observes a state change.
+async fn invoke_async(
+    ctx: &AxContext,
+    target: &AxTarget,
+    dispatch: &A11yMutationDispatch,
+) -> Result<()> {
     let (app_ref, conn) = find_app(ctx).await?;
     let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
     let mut budget = WalkBudget::with_limits(ctx.limits);
@@ -731,6 +938,9 @@ async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
     if !target.matches(role, name.as_deref()) {
         return Err(GlassError::AxElementChanged(target.id.0));
     }
+    if native_invoke_kind(role) == NativeInvokeKind::Focus {
+        return focus_text_editor(ctx, &conn, &node, target.id.0, dispatch).await;
+    }
     // Read the control's boolean state BEFORE firing, so a `toggle` action can be verified by
     // an actual flip below — afterwards there is nothing left to compare against. Costs one
     // property read on every native click; the alternative is trusting a toolkit ack that a
@@ -738,7 +948,7 @@ async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
     // button), which is why only the `toggle` rung consults it.
     let flag = toggle_state_flag(role);
     let was_on = node.get_state().await.map_err(bus_err)?.contains(flag);
-    match try_action(&conn, &node, ACTIVATE_ACTION_NAMES).await {
+    match try_action(&conn, &node, ACTIVATE_ACTION_NAMES, dispatch).await {
         ActionAttempt::Fired { ok: true, action } if action == TOGGLE_ACTION => {
             verify_toggle_flipped(&node, flag, was_on, target.id.0).await
         }
@@ -751,9 +961,7 @@ async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
         // Not `AxActionUnavailable`: the call may have reached the toolkit, so this must not
         // be fallback-eligible (see `GlassError::invoke_fallback_eligible`) — a pointer click
         // on top of a landed action would actuate the control twice.
-        ActionAttempt::Error(msg) => Err(GlassError::AccessibilityUnavailable(format!(
-            "AT-SPI action call failed: {msg}"
-        ))),
+        ActionAttempt::Error(error) => Err(error),
     }
 }
 
@@ -869,10 +1077,294 @@ mod toggle_label_tests {
 }
 
 #[cfg(test)]
+mod toggle_action_tests {
+    use super::{ActionAttempt, toggle_action_result};
+    use glass_core::{BoundDispatch, BoundKind, GlassError, Whose};
+
+    #[test]
+    fn toggle_action_propagates_the_structured_dispatch_error() {
+        let error = toggle_action_result(
+            ActionAttempt::Error(GlassError::caller_deadline_elapsed("native toggle action")),
+            17,
+        )
+        .expect_err("a native dispatch failure must not become not-editable");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(matches!(error.cause(), GlassError::Bounded { .. }));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use atspi_common::ObjectRef;
 
     use super::*;
+
+    #[test]
+    fn linux_set_value_forwards_ax_context_deadline_to_a11y_thread() {
+        let ctx = AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(20),
+        };
+        let thread = A11yThread::new("test a11y bus", Duration::from_secs(1));
+
+        let error = set_value_with_thread(&thread, ctx, 7, |_, _| {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(!error.invoke_fallback_eligible());
+        assert!(!error.set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn linux_set_value_timeout_after_native_dispatch_is_unconfirmed() {
+        let ctx = AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(20),
+        };
+        let thread = A11yThread::new("test a11y bus", Duration::from_secs(1));
+
+        let error = set_value_with_thread(&thread, ctx, 7, |_, dispatch| {
+            dispatch.dispatch(|| {
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(())
+            })
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, GlassError::AxWriteUnconfirmedCaused { id: 7, .. }),
+            "{error}"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert!(error.set_value_failed_after_writing(), "{error}");
+    }
+
+    #[test]
+    fn linux_invoke_timeout_before_native_dispatch_cancels_the_late_action() {
+        let ctx = AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(20),
+        };
+        let thread = A11yThread::new("test a11y bus", Duration::from_secs(1));
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_invoked = std::sync::Arc::clone(&invoked);
+
+        let error = invoke_with_thread(&thread, ctx, move |_, dispatch| {
+            std::thread::sleep(Duration::from_millis(60));
+            dispatch.dispatch(|| {
+                worker_invoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .expect_err("the caller stops during target resolution");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "the Linux wrapper allowed a detached invoke to dispatch after timeout"
+        );
+    }
+
+    #[test]
+    fn linux_invoke_timeout_after_native_dispatch_remains_may_have_dispatched() {
+        let ctx = AxContext {
+            pids: vec![],
+            window: glass_core::WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: glass_core::WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(20),
+        };
+        let thread = A11yThread::new("test a11y bus", Duration::from_secs(1));
+
+        let error = invoke_with_thread(&thread, ctx, |_, dispatch| {
+            dispatch.dispatch(|| {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(())
+            })
+        })
+        .expect_err("the native action outlives the caller");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn text_roles_use_native_focus_and_other_controls_activate() {
+        use glass_core::AxRole::*;
+
+        for role in [TextField, TextArea] {
+            assert_eq!(
+                native_invoke_kind(role),
+                NativeInvokeKind::Focus,
+                "{role:?}"
+            );
+        }
+        for role in [
+            Button,
+            ToggleButton,
+            CheckBox,
+            ComboBox,
+            SpinButton,
+            Slider,
+            Link,
+            MenuItem,
+        ] {
+            assert_eq!(
+                native_invoke_kind(role),
+                NativeInvokeKind::Activate,
+                "{role:?}"
+            );
+        }
+        assert_eq!(
+            glass_core::AxRole::ALL
+                .into_iter()
+                .filter(|&role| native_invoke_kind(role) == NativeInvokeKind::Focus)
+                .collect::<Vec<_>>(),
+            vec![TextField, TextArea]
+        );
+    }
+
+    #[test]
+    fn focus_confirmation_succeeds_immediately_without_sleep() {
+        let now = std::time::Instant::now();
+        assert_eq!(
+            focus_confirmation_step(
+                Deadline::at(now + Duration::from_millis(20)),
+                now + Duration::from_millis(40),
+                now,
+                true,
+            ),
+            FocusConfirmationStep::Confirmed
+        );
+    }
+
+    #[test]
+    fn focused_observation_cannot_override_an_expired_bound() {
+        use glass_core::Whose;
+
+        let now = std::time::Instant::now();
+        let caller_end = now + Duration::from_millis(20);
+        let backend_end = now + Duration::from_millis(40);
+        for observed in [caller_end, caller_end + Duration::from_millis(1)] {
+            assert_eq!(
+                focus_confirmation_step(Deadline::at(caller_end), backend_end, observed, true,),
+                FocusConfirmationStep::Expired(Whose::Caller)
+            );
+        }
+
+        let backend_end = now + Duration::from_millis(20);
+        for deadline in [
+            Deadline::UNBOUNDED,
+            Deadline::at(now + Duration::from_millis(40)),
+        ] {
+            for observed in [backend_end, backend_end + Duration::from_millis(1)] {
+                assert_eq!(
+                    focus_confirmation_step(deadline, backend_end, observed, true),
+                    FocusConfirmationStep::Expired(Whose::Callee)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_deadline_caps_pending_focus_phase() {
+        let started = std::time::Instant::now();
+        let result =
+            await_caller_deadline(Deadline::from_millis(10), std::future::pending::<()>()).await;
+        assert_eq!(result, Err(()));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn unbounded_focus_phase_waits_for_its_reply() {
+        let result = await_caller_deadline(Deadline::UNBOUNDED, async { 7 }).await;
+        assert_eq!(result, Ok(7));
+    }
+
+    #[test]
+    fn focus_confirmation_attributes_the_earlier_bound() {
+        use glass_core::Whose;
+
+        let now = std::time::Instant::now();
+        let caller_end = now + Duration::from_millis(20);
+        let backend_end = now + Duration::from_millis(40);
+        assert_eq!(
+            focus_confirmation_step(Deadline::at(caller_end), backend_end, caller_end, false),
+            FocusConfirmationStep::Expired(Whose::Caller)
+        );
+
+        let backend_end = now + Duration::from_millis(20);
+        for deadline in [
+            Deadline::UNBOUNDED,
+            Deadline::at(now + Duration::from_millis(40)),
+        ] {
+            assert_eq!(
+                focus_confirmation_step(deadline, backend_end, backend_end, false),
+                FocusConfirmationStep::Expired(Whose::Callee)
+            );
+        }
+    }
+
+    #[test]
+    fn focus_confirmation_sleep_is_capped_by_every_bound() {
+        let now = std::time::Instant::now();
+        for (caller, backend, expected) in [
+            (50, 50, FOCUS_CONFIRM_POLL),
+            (3, 50, Duration::from_millis(3)),
+            (50, 4, Duration::from_millis(4)),
+        ] {
+            assert_eq!(
+                focus_confirmation_step(
+                    Deadline::at(now + Duration::from_millis(caller)),
+                    now + Duration::from_millis(backend),
+                    now,
+                    false,
+                ),
+                FocusConfirmationStep::Sleep(expected)
+            );
+        }
+    }
 
     /// The reading behind the skip (Brave 151 on X11, 2026-08-24): the browser window's one child
     /// is a null ObjectRef while renderer accessibility is off, and the proxy build's error read
@@ -981,5 +1473,14 @@ mod tests {
         // A non-numeric target isn't the value path.
         assert!(!writes_value_only(SpinButton, "abc"));
         assert!(!writes_value_only(Button, "x"));
+    }
+
+    #[test]
+    fn editable_text_writes_are_limited_to_text_roles() {
+        use glass_core::AxRole::*;
+        assert!(writes_editable_text(TextField));
+        assert!(writes_editable_text(TextArea));
+        assert!(!writes_editable_text(Button));
+        assert!(!writes_editable_text(SpinButton));
     }
 }

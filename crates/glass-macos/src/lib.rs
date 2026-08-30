@@ -14,12 +14,20 @@
 use glass_core::capability::{CapabilityMap, CapabilityStatus};
 
 pub mod adoption_log; // pure window-adoption diagnostic rendering — cross-platform, host-tested
+#[cfg(any(target_os = "macos", test))]
+mod ax_timeout; // pure AX messaging-timeout orchestration — cross-platform, host-tested
 pub mod bundle; // pure .app-bundle logic — cross-platform, host-tested
 pub mod clipboard_route; // pure clipboard-routing policy — cross-platform, host-tested
 pub mod coords; // pure window-relative <-> global math — cross-platform, host-tested
+#[cfg(any(target_os = "macos", test))]
+mod input_deadline; // pure post-focus/input deadline sequencing — cross-platform, host-tested
 pub mod keymap; // pure ASCII -> (keycode, shift) US map — cross-platform, host-tested
 pub mod settle; // settle policy + poll loop over successive readings — cross-platform, host-tested
+#[cfg(any(target_os = "macos", test))]
+mod shareable_receive; // pure completion-channel receive classification — cross-platform, host-tested
 pub mod shim_path; // pure clip-shim dylib path resolution — cross-platform, host-tested
+#[cfg(any(target_os = "macos", test))]
+mod window_resolve; // pure active-window deadline policy — cross-platform, host-tested
 
 #[cfg(target_os = "macos")]
 mod axwindow;

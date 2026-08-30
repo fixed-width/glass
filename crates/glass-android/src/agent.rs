@@ -4,7 +4,7 @@
 //! owns the device server's lifecycle. Everything degrades to the adb paths on failure.
 
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use glass_core::Deadline;
@@ -38,18 +38,82 @@ impl AgentClient {
 
     /// Run a request, transparently reconnecting once if the socket dropped.
     fn call(&self, req: Value) -> Result<Value> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| GlassError::Backend("agent client lock poisoned".into()))?;
-        match conn.call(req.clone()) {
+        self.call_by(req, Deadline::UNBOUNDED)
+    }
+
+    fn call_by(&self, req: Value, deadline: Deadline) -> Result<Value> {
+        self.call_with_by(req, deadline, CallFailure::is_transport)
+    }
+
+    /// Run a side-effecting request, retrying only when the first attempt provably sent nothing.
+    fn call_once_sent_by(&self, req: Value, deadline: Deadline) -> Result<Value> {
+        self.call_with_by(req, deadline, CallFailure::nothing_sent)
+    }
+
+    fn call_with_by(
+        &self,
+        req: Value,
+        deadline: Deadline,
+        resend: fn(&CallFailure) -> bool,
+    ) -> Result<Value> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("agent request"));
+        }
+        let mut conn = self.lock_by(deadline)?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("agent request"));
+        }
+        if conn.ensure_usable().is_err() {
+            *conn = Conn::open_by(self.port, deadline)?;
+        }
+        let first = conn
+            .call_within(req.clone(), deadline, "agent request")
+            .map_err(|e| CallFailure::NotSent(e).into_error())?;
+        match first {
             Ok(v) => Ok(v),
-            Err(f) if f.is_transport() => {
+            Err(f) if resend(&f) => {
                 // The agent's accept loop accepts a fresh connection after a drop.
-                *conn = Conn::open(self.port)?;
-                conn.call(req).map_err(CallFailure::into_error)
+                if deadline.has_passed() {
+                    return Err(f
+                        .with_error(GlassError::caller_deadline_elapsed("agent request"))
+                        .into_error());
+                }
+                *conn = Conn::open_by(self.port, deadline)?;
+                if deadline.has_passed() {
+                    return Err(GlassError::deadline_not_started("agent retry"));
+                }
+                let retried = conn
+                    .call_within(req, deadline, "agent retry")
+                    .map_err(|e| CallFailure::NotSent(e).into_error())?;
+                retried.map_err(CallFailure::into_error)
             }
             Err(f) => Err(f.into_error()),
+        }
+    }
+
+    fn lock_by(&self, deadline: Deadline) -> Result<MutexGuard<'_, Conn>> {
+        if deadline.remaining().is_none() {
+            return self
+                .conn
+                .lock()
+                .map_err(|_| GlassError::Backend("agent client lock poisoned".into()));
+        }
+        loop {
+            match self.conn.try_lock() {
+                Ok(conn) => return Ok(conn),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(GlassError::Backend("agent client lock poisoned".into()));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let Some(left) = deadline.remaining() else {
+                        unreachable!("bounded lock wait became unbounded")
+                    };
+                    if left.is_zero() {
+                        return Err(GlassError::deadline_not_started("agent request"));
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(1)));
+                }
+            }
         }
     }
 
@@ -70,14 +134,23 @@ impl AgentClient {
             .map(|_| ())
     }
     pub fn pointer(&self, gesture: &[Pt], button: &str) -> Result<()> {
+        self.pointer_by(gesture, button, Deadline::UNBOUNDED)
+    }
+    pub fn pointer_by(&self, gesture: &[Pt], button: &str, deadline: Deadline) -> Result<()> {
         let g: Vec<Value> = gesture
             .iter()
             .map(|p| json!({"x": p.x, "y": p.y, "t_ms": p.t_ms}))
             .collect();
-        self.call(json!({"op": "pointer", "gesture": g, "button": button}))
-            .map(|_| ())
+        self.call_once_sent_by(
+            json!({"op": "pointer", "gesture": g, "button": button}),
+            deadline,
+        )
+        .map(|_| ())
     }
     pub fn gesture(&self, paths: &[Vec<Pt>]) -> Result<()> {
+        self.gesture_by(paths, Deadline::UNBOUNDED)
+    }
+    pub fn gesture_by(&self, paths: &[Vec<Pt>], deadline: Deadline) -> Result<()> {
         let pointers: Vec<Value> = paths
             .iter()
             .map(|path| {
@@ -88,14 +161,22 @@ impl AgentClient {
                 )
             })
             .collect();
-        self.call(json!({ "op": "gesture", "pointers": pointers }))
+        self.call_once_sent_by(json!({ "op": "gesture", "pointers": pointers }), deadline)
             .map(|_| ())
     }
     pub fn key(&self, chord: &str) -> Result<()> {
-        self.call(json!({"op": "key", "chord": chord})).map(|_| ())
+        self.key_by(chord, Deadline::UNBOUNDED)
+    }
+    pub fn key_by(&self, chord: &str, deadline: Deadline) -> Result<()> {
+        self.call_once_sent_by(json!({"op": "key", "chord": chord}), deadline)
+            .map(|_| ())
     }
     pub fn text(&self, s: &str) -> Result<()> {
-        self.call(json!({"op": "text", "text": s})).map(|_| ())
+        self.text_by(s, Deadline::UNBOUNDED)
+    }
+    pub fn text_by(&self, s: &str, deadline: Deadline) -> Result<()> {
+        self.call_once_sent_by(json!({"op": "text", "text": s}), deadline)
+            .map(|_| ())
     }
 }
 
@@ -375,6 +456,7 @@ fn wait_for_agent_until(port: u16, deadline: Instant) -> Result<AgentClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conn::{TimeoutFault, WriteFault};
 
     /// The deadline-bearing half of the agent's teardown — without it a wedged device leaks an
     /// `adb forward` into a server that outlives glass (glass#422).
@@ -443,6 +525,637 @@ mod tests {
 
     const HELLO: &str = r#"{"hello":{"proto":1}}"#;
     const OK: &str = r#"{"ok":true}"#;
+
+    type CountedRequests = Arc<Mutex<Vec<(usize, Value)>>>;
+
+    fn counting_agent() -> (u16, CountedRequests, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let request_log = Arc::clone(&requests);
+        let connection_count = Arc::clone(&connections);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let connection = connection_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let log = Arc::clone(&request_log);
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().expect("clone socket");
+                    let mut reader = BufReader::new(stream);
+                    if writeln!(writer, "{HELLO}").is_err() {
+                        return;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        if !matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).expect("request json");
+                        let id = req["id"].clone();
+                        log.lock().expect("request log").push((connection, req));
+                        if writeln!(writer, "{}", json!({"id": id, "ok": true})).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, requests, connections)
+    }
+
+    /// Lose conn1's answer and record any replay accepted on conn2.
+    fn agent_that_loses_one_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_reader = BufReader::new(first);
+            let mut line = String::new();
+            first_reader
+                .read_line(&mut line)
+                .expect("read conn1 request");
+            let request = serde_json::from_str(&line).expect("conn1 request json");
+            request_log.lock().expect("request log").push((1, request));
+            drop(first_reader);
+            drop(first_writer);
+
+            listener
+                .set_nonblocking(true)
+                .expect("make replay observation bounded");
+            let until = Instant::now() + Duration::from_millis(300);
+            loop {
+                match listener.accept() {
+                    Ok((second, _)) => {
+                        let mut second_writer = second.try_clone().expect("clone conn2");
+                        writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+                        let mut second_reader = BufReader::new(second);
+                        let mut line = String::new();
+                        second_reader
+                            .read_line(&mut line)
+                            .expect("read conn2 request");
+                        let request: Value =
+                            serde_json::from_str(&line).expect("conn2 request json");
+                        let id = request["id"].clone();
+                        request_log.lock().expect("request log").push((2, request));
+                        writeln!(second_writer, "{}", json!({"id": id, "ok": true}))
+                            .expect("answer conn2 replay");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= until {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept conn2: {error}"),
+                }
+            }
+        });
+        (port, requests, join)
+    }
+
+    /// Record conn1's partial request and answer the next distinct request on conn2.
+    fn agent_after_partial_request() -> (u16, std::thread::JoinHandle<(Vec<u8>, Value)>) {
+        use std::io::{BufRead, BufReader, Read};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_bytes = Vec::new();
+            first
+                .take(4 * 1024)
+                .read_to_end(&mut first_bytes)
+                .expect("read conn1 prefix through retirement");
+
+            let (second, _) = listener.accept().expect("accept conn2");
+            let mut second_writer = second.try_clone().expect("clone conn2");
+            writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+            let mut second_reader = BufReader::new(second);
+            let mut line = String::new();
+            second_reader
+                .read_line(&mut line)
+                .expect("read conn2 request");
+            let request: Value = serde_json::from_str(&line).expect("conn2 request json");
+            writeln!(
+                second_writer,
+                "{}",
+                json!({"id": request["id"], "ok": true})
+            )
+            .expect("answer conn2 request");
+            (first_bytes, request)
+        });
+        (port, join)
+    }
+
+    /// Finish conn1's partial answer after timeout and record the distinct conn2 mutation.
+    fn agent_with_late_partial_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_reader = BufReader::new(first);
+            let mut line = String::new();
+            first_reader
+                .read_line(&mut line)
+                .expect("read conn1 request");
+            let request: Value = serde_json::from_str(&line).expect("conn1 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((1, request));
+            write!(first_writer, r#"{{"id":{id},"#).expect("write partial conn1 answer");
+            first_writer.flush().expect("flush partial conn1 answer");
+            std::thread::sleep(Duration::from_millis(180));
+            let _ = writeln!(first_writer, r#""ok":true}}"#);
+
+            let (second, _) = listener.accept().expect("accept conn2");
+            let mut second_writer = second.try_clone().expect("clone conn2");
+            writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+            let mut second_reader = BufReader::new(second);
+            let mut line = String::new();
+            second_reader
+                .read_line(&mut line)
+                .expect("read conn2 request");
+            let request: Value = serde_json::from_str(&line).expect("conn2 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((2, request));
+            writeln!(second_writer, "{}", json!({"id": id, "ok": true}))
+                .expect("answer conn2 request");
+        });
+        (port, requests, join)
+    }
+
+    /// Queue a wrong-id and then correct conn1 answer to expose reuse one exchange behind.
+    fn agent_with_stale_wrong_id_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            first
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("bound conn1 observation");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_reader = BufReader::new(first);
+            let mut line = String::new();
+            first_reader
+                .read_line(&mut line)
+                .expect("read conn1 request");
+            let request: Value = serde_json::from_str(&line).expect("conn1 request json");
+            let first_id = request["id"].clone();
+            request_log.lock().expect("request log").push((1, request));
+            let replies = format!(
+                "{}\n{}\n",
+                json!({"id": 999, "ok": true}),
+                json!({"id": first_id, "ok": true})
+            );
+            first_writer
+                .write_all(replies.as_bytes())
+                .expect("queue both conn1 answers");
+            first_writer.flush().expect("flush conn1 answers");
+
+            line.clear();
+            if matches!(first_reader.read_line(&mut line), Ok(n) if n > 0) {
+                let request: Value =
+                    serde_json::from_str(&line).expect("second conn1 request json");
+                let id = request["id"].clone();
+                request_log.lock().expect("request log").push((1, request));
+                let _ = writeln!(first_writer, "{}", json!({"id": id, "ok": true}));
+                return;
+            }
+
+            let (second, _) = listener.accept().expect("accept conn2");
+            let mut second_writer = second.try_clone().expect("clone conn2");
+            writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+            let mut second_reader = BufReader::new(second);
+            line.clear();
+            second_reader
+                .read_line(&mut line)
+                .expect("read conn2 request");
+            let request: Value = serde_json::from_str(&line).expect("conn2 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((2, request));
+            writeln!(second_writer, "{}", json!({"id": id, "ok": true}))
+                .expect("answer conn2 request");
+        });
+        (port, requests, join)
+    }
+
+    /// Queue malformed and then valid conn1 answers to expose desynchronized reuse.
+    fn agent_with_malformed_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            first
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("bound conn1 observation");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_reader = BufReader::new(first);
+            let mut line = String::new();
+            first_reader
+                .read_line(&mut line)
+                .expect("read conn1 request");
+            let request: Value = serde_json::from_str(&line).expect("conn1 request json");
+            let first_id = request["id"].clone();
+            request_log.lock().expect("request log").push((1, request));
+            let replies = format!("not json\n{}\n", json!({"id": first_id, "ok": true}));
+            first_writer
+                .write_all(replies.as_bytes())
+                .expect("queue both conn1 answers");
+            first_writer.flush().expect("flush conn1 answers");
+
+            line.clear();
+            if matches!(first_reader.read_line(&mut line), Ok(n) if n > 0) {
+                let request: Value =
+                    serde_json::from_str(&line).expect("second conn1 request json");
+                let id = request["id"].clone();
+                request_log.lock().expect("request log").push((1, request));
+                let _ = writeln!(first_writer, "{}", json!({"id": id, "ok": true}));
+                return;
+            }
+
+            let (second, _) = listener.accept().expect("accept conn2");
+            let mut second_writer = second.try_clone().expect("clone conn2");
+            writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+            let mut second_reader = BufReader::new(second);
+            line.clear();
+            second_reader
+                .read_line(&mut line)
+                .expect("read conn2 request");
+            let request: Value = serde_json::from_str(&line).expect("conn2 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((2, request));
+            writeln!(second_writer, "{}", json!({"id": id, "ok": true}))
+                .expect("answer conn2 request");
+        });
+        (port, requests, join)
+    }
+
+    /// Refuse conn1 with a matching id, then record whether the next request reuses it.
+    fn agent_with_reusable_refusal() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let join = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept conn1");
+            first
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("bound conn1 observation");
+            let mut first_writer = first.try_clone().expect("clone conn1");
+            writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
+            let mut first_reader = BufReader::new(first);
+            let mut line = String::new();
+            first_reader
+                .read_line(&mut line)
+                .expect("read first conn1 request");
+            let request: Value = serde_json::from_str(&line).expect("first conn1 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((1, request));
+            writeln!(
+                first_writer,
+                "{}",
+                json!({"id": id, "ok": false, "error": "denied"})
+            )
+            .expect("refuse first conn1 request");
+
+            line.clear();
+            if matches!(first_reader.read_line(&mut line), Ok(n) if n > 0) {
+                let request: Value =
+                    serde_json::from_str(&line).expect("second conn1 request json");
+                let id = request["id"].clone();
+                request_log.lock().expect("request log").push((1, request));
+                writeln!(first_writer, "{}", json!({"id": id, "ok": true}))
+                    .expect("answer second conn1 request");
+                return;
+            }
+
+            let (second, _) = listener.accept().expect("accept conn2");
+            let mut second_writer = second.try_clone().expect("clone conn2");
+            writeln!(second_writer, "{HELLO}").expect("write conn2 hello");
+            let mut second_reader = BufReader::new(second);
+            line.clear();
+            second_reader
+                .read_line(&mut line)
+                .expect("read conn2 request");
+            let request: Value = serde_json::from_str(&line).expect("conn2 request json");
+            let id = request["id"].clone();
+            request_log.lock().expect("request log").push((2, request));
+            writeln!(second_writer, "{}", json!({"id": id, "ok": true}))
+                .expect("answer conn2 request");
+        });
+        (port, requests, join)
+    }
+
+    #[test]
+    fn read_timeout_install_failure_aborts_before_dispatch() {
+        let (port, requests, _) = counting_agent();
+        let client = AgentClient::connect(port).expect("connect");
+        client
+            .conn
+            .lock()
+            .expect("lock")
+            .inject_timeout_fault(TimeoutFault::ReadInstall);
+
+        let result = client.key_by("enter", Deadline::from_millis(1_000));
+
+        assert!(
+            result.is_err(),
+            "timeout installation failure was discarded"
+        );
+        assert!(
+            requests.lock().expect("request log").is_empty(),
+            "the request was dispatched after timeout installation failed"
+        );
+    }
+
+    #[test]
+    fn write_timeout_install_failure_aborts_before_dispatch() {
+        let (port, requests, _) = counting_agent();
+        let client = AgentClient::connect(port).expect("connect");
+        client
+            .conn
+            .lock()
+            .expect("lock")
+            .inject_timeout_fault(TimeoutFault::WriteInstall);
+
+        let result = client.key_by("enter", Deadline::from_millis(1_000));
+
+        assert!(
+            result.is_err(),
+            "timeout installation failure was discarded"
+        );
+        assert!(
+            requests.lock().expect("request log").is_empty(),
+            "the request was dispatched after timeout installation failed"
+        );
+    }
+
+    #[test]
+    fn unbounded_timeout_install_failure_aborts_before_dispatch() {
+        let (port, requests, _) = counting_agent();
+        let client = AgentClient::connect(port).expect("connect");
+        client
+            .conn
+            .lock()
+            .expect("lock")
+            .inject_timeout_fault(TimeoutFault::ReadInstall);
+
+        let result = client.key("enter");
+
+        assert!(
+            result.is_err(),
+            "timeout installation failure was discarded"
+        );
+        assert!(
+            requests.lock().expect("request log").is_empty(),
+            "the unbounded request was dispatched after timeout installation failed"
+        );
+    }
+
+    #[test]
+    fn restoration_failure_poisoned_connection_reconnects_before_next_request() {
+        use std::sync::atomic::Ordering;
+
+        for fault in [TimeoutFault::ReadRestore, TimeoutFault::WriteRestore] {
+            let (port, requests, connections) = counting_agent();
+            let client = AgentClient::connect(port).expect("connect");
+            client
+                .conn
+                .lock()
+                .expect("lock")
+                .inject_timeout_fault(fault);
+
+            let first = client.key_by("enter", Deadline::from_millis(1_000));
+            assert!(
+                first.is_err(),
+                "{fault:?} timeout restoration failure was discarded"
+            );
+            client.ping().expect("the next request reconnects");
+
+            let seen = requests.lock().expect("request log");
+            assert_eq!(seen.len(), 2, "{fault:?}");
+            assert_eq!(seen[0].0, 1, "{fault:?}");
+            assert_eq!(seen[1].0, 2, "{fault:?}: poisoned connection reused");
+            assert_eq!(connections.load(Ordering::SeqCst), 2, "{fault:?}");
+        }
+    }
+
+    #[test]
+    fn restoration_failure_after_reply_is_not_retried_as_the_same_mutation() {
+        for fault in [TimeoutFault::ReadRestore, TimeoutFault::WriteRestore] {
+            let (port, requests, _) = counting_agent();
+            let client = AgentClient::connect(port).expect("connect");
+            client
+                .conn
+                .lock()
+                .expect("lock")
+                .inject_timeout_fault(fault);
+
+            let result = client.key_by("enter", Deadline::from_millis(1_000));
+
+            assert!(
+                result.is_err(),
+                "{fault:?} timeout restoration failure was discarded"
+            );
+            let mutation_request_count = requests
+                .lock()
+                .expect("request log")
+                .iter()
+                .filter(|(_, request)| request["op"] == "key")
+                .count();
+            assert_eq!(mutation_request_count, 1, "{fault:?}");
+        }
+    }
+
+    #[test]
+    fn mutating_requests_do_not_replay_when_their_answer_is_lost() {
+        enum Mutation {
+            Pointer,
+            Gesture,
+            Key,
+            Text,
+        }
+
+        let path = vec![Pt {
+            x: 5,
+            y: 10,
+            t_ms: 0,
+        }];
+        for (expected_op, mutation) in [
+            ("pointer", Mutation::Pointer),
+            ("gesture", Mutation::Gesture),
+            ("key", Mutation::Key),
+            ("text", Mutation::Text),
+        ] {
+            let (port, requests, join) = agent_that_loses_one_answer();
+            let client = AgentClient::connect(port).expect("connect");
+
+            let result = match mutation {
+                Mutation::Pointer => client.pointer(&path, "left"),
+                Mutation::Gesture => client.gesture(std::slice::from_ref(&path)),
+                Mutation::Key => client.key("enter"),
+                Mutation::Text => client.text("hello"),
+            };
+
+            assert!(result.is_err(), "{expected_op} replay hid the lost answer");
+            join.join().expect("fake agent");
+            let seen = requests.lock().expect("request log");
+            assert_eq!(seen.len(), 1, "{expected_op} was replayed on conn2");
+            assert_eq!(seen[0].0, 1, "{expected_op}");
+            assert_eq!(seen[0].1["op"], expected_op, "{expected_op}");
+        }
+    }
+
+    #[test]
+    fn answer_lost_retires_partial_stream_before_the_next_distinct_mutation() {
+        let (port, requests, join) = agent_with_late_partial_answer();
+        let client = AgentClient::connect(port).expect("connect");
+
+        let first = client
+            .key_by("a", Deadline::from_millis(100))
+            .expect_err("conn1 finishes its answer after the caller deadline");
+        assert_eq!(
+            first.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{first}"
+        );
+        assert_eq!(
+            first.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{first}"
+        );
+        client
+            .key_by("b", Deadline::from_millis(1_000))
+            .expect("the distinct mutation uses a clean conn2");
+
+        join.join().expect("fake agent");
+        let seen = requests.lock().expect("request log");
+        assert_eq!(seen.len(), 2, "a mutation was replayed or lost: {seen:?}");
+        assert_eq!((seen[0].0, seen[0].1["op"].as_str()), (1, Some("key")));
+        assert_eq!(seen[0].1["chord"], "a");
+        assert_eq!((seen[1].0, seen[1].1["op"].as_str()), (2, Some("key")));
+        assert_eq!(seen[1].1["chord"], "b");
+    }
+
+    #[test]
+    fn partial_request_write_faults_do_not_replay_and_the_next_mutation_uses_conn2() {
+        for fault in [WriteFault::Timeout, WriteFault::Zero, WriteFault::Error] {
+            let (port, join) = agent_after_partial_request();
+            let client = AgentClient::connect(port).expect("connect");
+            client
+                .conn
+                .lock()
+                .expect("lock conn1")
+                .inject_write_faults([WriteFault::Short(16), fault]);
+
+            let first = client
+                .key_by("a", Deadline::from_millis(1_000))
+                .expect_err("a partially written mutation cannot be reported unsent");
+            assert!(
+                first.to_string().contains("agent write"),
+                "{fault:?}: {first}"
+            );
+            client
+                .key_by("b", Deadline::from_millis(1_000))
+                .expect("the distinct mutation opens a fresh conn2");
+
+            let (partial, second) = join.join().expect("fake agent");
+            assert!(!partial.is_empty(), "{fault:?}: conn1 received no prefix");
+            assert!(
+                !partial.ends_with(b"\n"),
+                "{fault:?}: conn1 received a full frame"
+            );
+            assert_eq!(second["op"], "key", "{fault:?}");
+            assert_eq!(second["chord"], "b", "{fault:?}: mutation a was replayed");
+        }
+    }
+
+    #[test]
+    fn wrong_id_refusal_retires_stream_before_the_next_distinct_mutation() {
+        let (port, requests, join) = agent_with_stale_wrong_id_answer();
+        let client = AgentClient::connect(port).expect("connect");
+
+        let first = client
+            .key("a")
+            .expect_err("a stale response cannot answer the first mutation");
+        assert!(first.to_string().contains("id mismatch"), "{first}");
+        let second = client.key("b");
+
+        join.join().expect("fake agent");
+        second.expect("the distinct mutation reconnects instead of consuming conn1's queued reply");
+        let seen = requests.lock().expect("request log");
+        assert_eq!(seen.len(), 2, "a mutation was replayed or lost: {seen:?}");
+        assert_eq!((seen[0].0, seen[0].1["chord"].as_str()), (1, Some("a")));
+        assert_eq!((seen[1].0, seen[1].1["chord"].as_str()), (2, Some("b")));
+    }
+
+    #[test]
+    fn malformed_response_retires_stream_before_the_next_distinct_mutation() {
+        let (port, requests, join) = agent_with_malformed_answer();
+        let client = AgentClient::connect(port).expect("connect");
+
+        let first = client
+            .key("a")
+            .expect_err("malformed JSON cannot answer the first mutation");
+        assert!(first.to_string().contains("agent resp parse"), "{first}");
+        let second = client.key("b");
+
+        join.join().expect("fake agent");
+        second.expect("the distinct mutation reconnects instead of consuming conn1's queued reply");
+        let seen = requests.lock().expect("request log");
+        assert_eq!(seen.len(), 2, "a mutation was replayed or lost: {seen:?}");
+        assert_eq!((seen[0].0, seen[0].1["chord"].as_str()), (1, Some("a")));
+        assert_eq!((seen[1].0, seen[1].1["chord"].as_str()), (2, Some("b")));
+    }
+
+    #[test]
+    fn matching_id_refusal_leaves_stream_reusable_for_the_next_distinct_request() {
+        let (port, requests, join) = agent_with_reusable_refusal();
+        let client = AgentClient::connect(port).expect("connect");
+
+        let first = client
+            .key("a")
+            .expect_err("the agent refuses the first request");
+        assert!(first.to_string().contains("denied"), "{first}");
+        client
+            .key("b")
+            .expect("the distinct request stays on synchronized conn1");
+
+        join.join().expect("fake agent");
+        let seen = requests.lock().expect("request log");
+        assert_eq!(seen.len(), 2, "a request was replayed or lost: {seen:?}");
+        assert_eq!((seen[0].0, seen[0].1["chord"].as_str()), (1, Some("a")));
+        assert_eq!((seen[1].0, seen[1].1["chord"].as_str()), (1, Some("b")));
+    }
 
     #[test]
     fn connect_checks_proto() {
@@ -520,6 +1233,79 @@ mod tests {
         assert_eq!(sent[1]["pointers"][1][1]["x"], 7);
         assert_eq!(sent[2]["chord"], "ctrl+a");
         assert_eq!(sent[3]["text"], "hi");
+    }
+
+    #[test]
+    fn agent_call_restores_socket_timeouts_after_a_bounded_request() {
+        let (port, _) = fake_agent(HELLO, vec![OK]);
+        let client = AgentClient::connect(port).unwrap();
+        client
+            .key_by("enter", Deadline::from_millis(1_000))
+            .unwrap();
+        let conn = client.conn.lock().unwrap();
+        assert_eq!(
+            conn.writer.write_timeout().unwrap(),
+            Some(crate::conn::STANDING_TIMEOUT)
+        );
+        assert_eq!(
+            conn.reader.get_ref().read_timeout().unwrap(),
+            Some(crate::conn::STANDING_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn deadline_expiring_while_waiting_for_connection_lock_dispatches_nothing() {
+        let (port, seen) = fake_agent(HELLO, vec![OK]);
+        let client = Arc::new(AgentClient::connect(port).unwrap());
+        let held = client.conn.lock().unwrap();
+        let caller = Arc::clone(&client);
+        let join = std::thread::spawn(move || caller.key_by("enter", Deadline::from_millis(100)));
+        std::thread::sleep(Duration::from_millis(180));
+        drop(held);
+        let err = join.join().unwrap().unwrap_err();
+        assert!(matches!(err, GlassError::Bounded { .. }), "{err}");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reconnect_hello_is_bounded_and_dispatches_no_retry_after_expiry() {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let retried = Arc::new(Mutex::new(Vec::<String>::new()));
+        let retry_log = Arc::clone(&retried);
+        std::thread::spawn(move || {
+            let (first, _) = listener.accept().unwrap();
+            let mut first_writer = first.try_clone().unwrap();
+            writeln!(first_writer, "{HELLO}").unwrap();
+            let mut line = String::new();
+            BufReader::new(first).read_line(&mut line).unwrap();
+            drop(first_writer);
+
+            let (second, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            let mut second_writer = second.try_clone().unwrap();
+            let _ = writeln!(second_writer, "{HELLO}");
+            let mut line = String::new();
+            if BufReader::new(second).read_line(&mut line).unwrap_or(0) != 0 {
+                retry_log.lock().unwrap().push(line);
+            }
+        });
+
+        let client = AgentClient::connect(port).unwrap();
+        let started = Instant::now();
+        let err = client
+            .call_by(json!({"op": "ping"}), Deadline::from_millis(150))
+            .unwrap_err();
+        assert!(matches!(err, GlassError::Bounded { .. }), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(retried.lock().unwrap().is_empty());
     }
 
     #[test]

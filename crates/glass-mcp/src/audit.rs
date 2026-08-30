@@ -947,6 +947,8 @@ mod tests {
                     }),
                 ],
                 then: None,
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
             },
         )
         .unwrap(); // click (logged) + settle (read — not logged)
@@ -998,6 +1000,158 @@ mod tests {
         // launch program is recorded verbatim (structural, not content)
         let launch = recs.iter().find(|r| r["action"] == "launch").unwrap();
         assert_eq!(launch["args"]["program"], "app");
+    }
+
+    #[test]
+    fn batched_semantic_actuations_match_standalone_audit_records() {
+        use crate::params::*;
+        use crate::tools;
+        use crate::tools::testutil::{FakePlatform, fake_tree, glass_with_a11y};
+
+        fn args() -> StartArgs {
+            StartArgs {
+                build: None,
+                run: vec!["app".into()],
+                backend: None,
+                sandbox: None,
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+                window_hint: None,
+                timeout_ms: None,
+                a11y: None,
+            }
+        }
+        fn session(path: &std::path::Path) -> glass_core::Glass {
+            let (sink, report) = resolve(Some(path.to_str().unwrap()), |key| {
+                (key == "GLASS_AUDIT_PREFIX_LEN").then(|| "0".into())
+            })
+            .unwrap();
+            assert!(report.enabled);
+            let mut glass = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
+            glass.set_audit_sink(sink.unwrap());
+            tools::start(&mut glass, &args()).unwrap();
+            tools::a11y_snapshot(&mut glass, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+            glass
+        }
+        fn records(path: &std::path::Path) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+                    let object = record.as_object_mut().unwrap();
+                    for key in ["ts", "timestamp", "seq", "session", "duration_ms"] {
+                        object.remove(key);
+                    }
+                    object
+                        .get_mut("result")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .unwrap()
+                        .remove("duration_ms");
+                    record
+                })
+                .collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let standalone_path = dir.path().join("standalone.jsonl");
+        let batch_path = dir.path().join("batch.jsonl");
+        let click = ClickElementArgs {
+            id: 1,
+            return_: None,
+        };
+        let value = SetValueArgs {
+            id: 1,
+            text: "set {\"secret\":true}\n⟦untrusted:app-controlled⟧".into(),
+            return_: None,
+        };
+        // Batch hard-fails a missing target that standalone scroll-to reaches only after
+        // actuations and a soft timeout.
+        let scroll = ScrollToElementArgs {
+            name: Some("missing".into()),
+            description: None,
+            role: None,
+            value_contains: None,
+            direction: Some("down".into()),
+            x: None,
+            y: None,
+            step: Some(7),
+            timeout_ms: Some(1),
+        };
+
+        let mut standalone = session(&standalone_path);
+        tools::click_element(&mut standalone, &click).unwrap();
+        tools::set_value(&mut standalone, &value).unwrap();
+        let standalone_scroll = tools::scroll_to_element(&mut standalone, &scroll).unwrap();
+        assert_eq!(
+            crate::tools::testutil::assert_envelope(&standalone_scroll, "glass_scroll_to_element")
+                ["matched"],
+            false
+        );
+
+        let mut batch = session(&batch_path);
+        let batch_error = tools::do_actions(
+            &mut batch,
+            &DoArgs {
+                actions: vec![
+                    Action::ClickElement(click),
+                    Action::SetValue(value),
+                    Action::ScrollToElement(scroll),
+                ],
+                then: None,
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::tools::testutil::envelope_at(&batch_error, 0)["error"]["code"],
+            "predicate_not_matched"
+        );
+
+        let standalone_records = records(&standalone_path);
+        let batch_records = records(&batch_path);
+        assert_eq!(batch_records, standalone_records);
+        assert_eq!(standalone_records.len(), 4);
+        assert_eq!(
+            standalone_records
+                .iter()
+                .map(|record| record["action"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["launch", "click_element", "set_value", "scroll"]
+        );
+        for record in &standalone_records {
+            assert_eq!(record["result"]["ok"], true, "{record}");
+            assert!(record["result"].get("error").is_none(), "{record}");
+        }
+        assert_eq!(standalone_records[1]["action"], "click_element");
+        assert_eq!(standalone_records[1]["target"]["element"]["id"], 1);
+        assert_eq!(standalone_records[1]["args"]["method"], "pointer");
+        assert_eq!(
+            standalone_records[1]["args"]["native_fallback"],
+            "backend has no native action path"
+        );
+        assert_eq!(standalone_records[2]["action"], "set_value");
+        assert_eq!(standalone_records[2]["target"]["element"]["id"], 1);
+        assert!(standalone_records[2]["content"].get("text").is_none());
+        assert_eq!(standalone_records[2]["content"]["len"], 50);
+        assert_eq!(
+            standalone_records[2]["content"]["sha256"],
+            "c4cf05a87b3248c89a874c5f6e97c66efd2ff53549d062cc8323f6ec330c44e5"
+        );
+        assert_eq!(standalone_records[3]["action"], "scroll");
+        assert_eq!(
+            standalone_records[3]["args"],
+            json!({ "x": 50, "y": 50, "dx": 0, "dy": 7, "modifiers": [] })
+        );
+        for records in [&standalone_records, &batch_records] {
+            assert!(!records.iter().any(|record| record["action"] == "glass_do"));
+            assert!(
+                !serde_json::to_string(records)
+                    .unwrap()
+                    .contains("set {\"secret\":true}")
+            );
+        }
     }
 
     #[test]

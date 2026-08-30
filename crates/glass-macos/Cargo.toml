@@ -95,6 +95,7 @@ name = "glass-macos-sandbox-probe"
 path = "src/bin/sandbox_probe.rs"
 
 [dependencies]
+glass-a11y-macos.workspace = true
 glass-core.workspace = true
 plist = "1"
 
@@ -249,12 +250,6 @@ glass-sandbox-macos.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-
-# Mac-only: the accessibility-reader integration test (tests/a11y.rs) drives the standalone
-# `glass-a11y-macos` snapshot. Kept in the cfg(macos) dev-dep table so the crate still
-# builds/tests off macOS (where the cfg(macos) test is a bare skip `main`).
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-glass-a11y-macos.workspace = true
 
 [lints]
 workspace = true

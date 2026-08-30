@@ -7,7 +7,7 @@
 // Modules are added task-by-task.
 
 pub mod error;
-pub use error::{BoundKind, GlassError, Result};
+pub use error::{BoundDispatch, BoundKind, GlassError, Result};
 
 pub mod toolpath;
 pub use toolpath::tool_path;
@@ -19,7 +19,7 @@ pub use bounded::{
 };
 
 pub mod a11y_thread;
-pub use a11y_thread::A11yThread;
+pub use a11y_thread::{A11yMutationDispatch, A11yThread, SetValueDispatch};
 
 pub mod set_value;
 pub use set_value::{
@@ -34,21 +34,21 @@ pub mod pixels;
 pub use pixels::{SourceOrder, to_opaque_rgba, to_opaque_rgba_in_place};
 
 pub mod drag;
-pub use drag::{DragGesture, DragSink, run_drag};
+pub use drag::{DragGesture, DragSink, run_drag, run_drag_by};
 
 pub mod pinch;
 pub use pinch::{NotAPinch, Pinch};
 
 pub mod chord;
-pub use chord::{CHORD_DWELL, ChordSink, run_chord};
+pub use chord::{CHORD_DWELL, ChordSink, run_chord, run_chord_by};
 
 pub mod coords;
 
 pub mod scroll;
-pub use scroll::{SCROLL_DWELL, ScrollSink, run_scroll};
+pub use scroll::{SCROLL_DWELL, ScrollSink, run_scroll, run_scroll_by};
 
 pub mod typing;
-pub use typing::{TYPE_DWELL, TypeSink, run_type};
+pub use typing::{TYPE_DWELL, TypeSink, run_type, run_type_by};
 
 pub mod keys;
 pub use keys::Modifier;
@@ -81,9 +81,10 @@ pub use logbuf::{LogBuffer, LogLine, Stream};
 
 pub mod platform;
 pub use platform::{
-    A11yBind, AppSpec, KeyEvent, MAX_GESTURE_POINTERS, MouseButton, Platform, PointerEvent,
-    SandboxLevel, Segment, TEARDOWN_BUDGET, TEARDOWN_HOOK_RESERVE, TEARDOWN_REAP_HEADROOM,
-    WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
+    A11yBind, AppSpec, KeyEvent, MAX_CLICK_COUNT, MAX_GESTURE_POINTERS, MAX_SCROLL_NOTCHES,
+    MouseButton, Platform, PointerEvent, SandboxLevel, Segment, TEARDOWN_BUDGET,
+    TEARDOWN_HOOK_RESERVE, TEARDOWN_REAP_HEADROOM, WindowGeometry, WindowHint, WindowId,
+    WindowInfo, WindowOp, validate_click_count, validate_pointer_input, validate_scroll_delta,
 };
 
 pub mod deadline;

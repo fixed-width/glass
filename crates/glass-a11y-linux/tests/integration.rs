@@ -724,8 +724,16 @@ fn set_value_selects_dropdown_option() {
     // A non-existent option returns a clear error listing the choices.
     let err = glass.set_value(combo2.id, "Nope").unwrap_err();
     assert!(
-        matches!(err, glass_core::GlassError::AxOptionNotFound(_, _, _)),
+        matches!(
+            err.cause(),
+            glass_core::GlassError::AxOptionNotFound(_, _, _)
+        ),
         "got: {err:?}"
+    );
+    assert_eq!(
+        err.bound_dispatch(),
+        Some(glass_core::BoundDispatch::MayHaveDispatched),
+        "opening and dismissing the popup must remain visible in dispatch provenance: {err:?}"
     );
     glass.stop().expect("stop");
 }

@@ -3,7 +3,14 @@
 use glass_core::{Glass, KeyEvent, Modifier, PointerEvent};
 
 use crate::params::*;
-use crate::tools::{ToolOutput, ToolResult, parse_button};
+use crate::tools::{
+    ContextualError, ContextualOutput, ContextualToolResult, ToolContext, ToolOutput, ToolResult,
+    parse_button,
+};
+
+fn standalone(result: ContextualToolResult) -> ToolResult {
+    result.map(|o| o.output).map_err(|e| e.message)
+}
 
 pub(crate) fn parse_modifiers(mods: Option<&[String]>) -> Result<Vec<Modifier>, String> {
     let mut out = Vec::new();
@@ -16,42 +23,87 @@ pub(crate) fn parse_modifiers(mods: Option<&[String]>) -> Result<Vec<Modifier>, 
 }
 
 pub fn click(glass: &mut Glass, a: &ClickArgs) -> ToolResult {
-    let button = parse_button(a.button.as_deref())?;
-    let modifiers = parse_modifiers(a.modifiers.as_deref())?;
+    standalone(click_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn click_with(
+    glass: &mut Glass,
+    a: &ClickArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
+    let count = a.count.unwrap_or(1);
+    if !(1..=MAX_CLICK_COUNT).contains(&count) {
+        return Err(ContextualError::validation(format!(
+            "`count` must be between 1 and {MAX_CLICK_COUNT}"
+        )));
+    }
+    let button = parse_button(a.button.as_deref()).map_err(ContextualError::validation)?;
+    let modifiers = parse_modifiers(a.modifiers.as_deref()).map_err(ContextualError::validation)?;
     glass
-        .pointer(&PointerEvent::Click {
-            x: a.x,
-            y: a.y,
-            button,
-            count: a.count.unwrap_or(1),
-            modifiers,
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::result("glass_click", serde_json::json!({})))
+        .pointer_by(
+            &PointerEvent::Click {
+                x: a.x,
+                y: a.y,
+                button,
+                count,
+                modifiers,
+            },
+            context.deadline,
+        )
+        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+    Ok(ContextualOutput::immediate(ToolOutput::result(
+        "glass_click",
+        serde_json::json!({}),
+    )))
 }
 
 pub fn mouse_move(glass: &mut Glass, a: &MoveArgs) -> ToolResult {
+    standalone(mouse_move_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn mouse_move_with(
+    glass: &mut Glass,
+    a: &MoveArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     glass
-        .pointer(&PointerEvent::Move { x: a.x, y: a.y })
-        .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::result("glass_move", serde_json::json!({})))
+        .pointer_by(&PointerEvent::Move { x: a.x, y: a.y }, context.deadline)
+        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+    Ok(ContextualOutput::immediate(ToolOutput::result(
+        "glass_move",
+        serde_json::json!({}),
+    )))
 }
 
 pub fn drag(glass: &mut Glass, a: &DragArgs) -> ToolResult {
-    let button = parse_button(a.button.as_deref())?;
-    let modifiers = parse_modifiers(a.modifiers.as_deref())?;
+    standalone(drag_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn drag_with(
+    glass: &mut Glass,
+    a: &DragArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
+    let button = parse_button(a.button.as_deref()).map_err(ContextualError::validation)?;
+    let modifiers = parse_modifiers(a.modifiers.as_deref()).map_err(ContextualError::validation)?;
     glass
-        .pointer(&PointerEvent::Drag {
-            from_x: a.x1,
-            from_y: a.y1,
-            to_x: a.x2,
-            to_y: a.y2,
-            button,
-            modifiers,
-            duration_ms: a.duration_ms.unwrap_or(200).min(10_000),
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::result("glass_drag", serde_json::json!({})))
+        .pointer_by(
+            &PointerEvent::Drag {
+                from_x: a.x1,
+                from_y: a.y1,
+                to_x: a.x2,
+                to_y: a.y2,
+                button,
+                modifiers,
+                duration_ms: a.duration_ms.unwrap_or(200).min(10_000),
+            },
+            context.deadline,
+        )
+        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+    Ok(ContextualOutput::immediate(ToolOutput::result(
+        "glass_drag",
+        serde_json::json!({}),
+    )))
 }
 
 pub fn gesture(glass: &mut Glass, a: &GestureArgs) -> ToolResult {
@@ -85,41 +137,88 @@ pub fn gesture(glass: &mut Glass, a: &GestureArgs) -> ToolResult {
 }
 
 pub fn scroll(glass: &mut Glass, a: &ScrollArgs) -> ToolResult {
-    let modifiers = parse_modifiers(a.modifiers.as_deref())?;
+    standalone(scroll_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn scroll_with(
+    glass: &mut Glass,
+    a: &ScrollArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
+    let dx = a.dx.unwrap_or(0);
+    let dy = a.dy.unwrap_or(0);
+    let valid = -MAX_SCROLL_NOTCHES..=MAX_SCROLL_NOTCHES;
+    if !valid.contains(&dx) || !valid.contains(&dy) {
+        return Err(ContextualError::validation(format!(
+            "`dx` and `dy` must each be between -{MAX_SCROLL_NOTCHES} and {MAX_SCROLL_NOTCHES}"
+        )));
+    }
+    let modifiers = parse_modifiers(a.modifiers.as_deref()).map_err(ContextualError::validation)?;
     glass
-        .pointer(&PointerEvent::Scroll {
-            x: a.x,
-            y: a.y,
-            dx: a.dx.unwrap_or(0),
-            dy: a.dy.unwrap_or(0),
-            modifiers,
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::result("glass_scroll", serde_json::json!({})))
+        .pointer_by(
+            &PointerEvent::Scroll {
+                x: a.x,
+                y: a.y,
+                dx,
+                dy,
+                modifiers,
+            },
+            context.deadline,
+        )
+        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+    Ok(ContextualOutput::immediate(ToolOutput::result(
+        "glass_scroll",
+        serde_json::json!({}),
+    )))
 }
 
 pub fn type_text(glass: &mut Glass, a: &TypeArgs) -> ToolResult {
+    standalone(type_text_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn type_text_with(
+    glass: &mut Glass,
+    a: &TypeArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     // Bad `return` value → reject before injecting anything (see `validate_return`).
-    crate::tools::validate_return(a.return_.as_deref())?;
+    crate::tools::validate_return(a.return_.as_deref()).map_err(ContextualError::validation)?;
     glass
-        .key(&KeyEvent::Text(a.text.clone()))
-        .map_err(|e| e.to_string())?;
+        .key_by(&KeyEvent::Text(a.text.clone()), context.deadline)
+        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
     // Past this point the keystrokes have landed: a failing observe (e.g. `snapshot`
     // with no a11y reader) must say so, or an agent retries and types the text twice.
-    let (observed, extra) = crate::tools::resolve_return(glass, a.return_.as_deref())
-        .map_err(|msg| format!("text was typed; return observe failed: {msg}"))?;
+    let (observed, extra, timed_out_by) =
+        crate::tools::resolve_return_with(glass, a.return_.as_deref(), context).map_err(|e| {
+            e.after_dispatch()
+                .annotate("text was typed; return observe failed")
+        })?;
     let mut result = serde_json::json!({});
     if let Some(o) = observed {
         result["observed"] = o;
     }
-    Ok(ToolOutput::result_with("glass_type", result, extra))
+    Ok(ContextualOutput::with_timeout(
+        ToolOutput::result_with("glass_type", result, extra),
+        timed_out_by,
+    ))
 }
 
 pub fn key(glass: &mut Glass, a: &KeyArgs) -> ToolResult {
+    standalone(key_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn key_with(
+    glass: &mut Glass,
+    a: &KeyArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     glass
-        .key(&KeyEvent::Chord(a.chord.clone()))
-        .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::result("glass_key", serde_json::json!({})))
+        .key_by(&KeyEvent::Chord(a.chord.clone()), context.deadline)
+        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+    Ok(ContextualOutput::immediate(ToolOutput::result(
+        "glass_key",
+        serde_json::json!({}),
+    )))
 }
 
 #[cfg(test)]
@@ -127,9 +226,14 @@ mod tests {
     use super::*;
     use crate::tools::start as start_tool;
     use crate::tools::testutil::*;
+    use std::sync::{Arc, Mutex};
 
     fn started() -> Glass {
-        let mut g = glass_with(FakePlatform::new(100, 100));
+        started_with(FakePlatform::new(100, 100))
+    }
+
+    fn started_with(platform: FakePlatform) -> Glass {
+        let mut g = glass_with(platform);
         let a = StartArgs {
             build: None,
             run: vec!["app".into()],
@@ -199,6 +303,39 @@ mod tests {
     }
 
     #[test]
+    fn click_rejects_zero_and_unbounded_count_before_pointer_dispatch() {
+        for (count, expected) in [
+            (0, "between 1 and 10"),
+            (MAX_CLICK_COUNT + 1, "between 1 and 10"),
+            (u32::MAX, "between 1 and 10"),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut g =
+                started_with(FakePlatform::new(100, 100).with_event_log(Arc::clone(&events)));
+            let error = click(
+                &mut g,
+                &ClickArgs {
+                    x: 1,
+                    y: 1,
+                    button: None,
+                    count: Some(count),
+                    modifiers: None,
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                error.contains(expected),
+                "unexpected error for {count}: {error}"
+            );
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "invalid count {count} reached the platform"
+            );
+        }
+    }
+
+    #[test]
     fn type_and_key_ok() {
         let mut g = started();
         assert_ok(
@@ -245,6 +382,44 @@ mod tests {
             modifiers: None,
         };
         assert_ok(&scroll(&mut g, &s).unwrap(), "glass_scroll");
+    }
+
+    #[test]
+    fn scroll_rejects_extreme_magnitudes_before_pointer_dispatch() {
+        for (dx, dy) in [
+            (Some(-MAX_SCROLL_NOTCHES - 1), None),
+            (Some(MAX_SCROLL_NOTCHES + 1), None),
+            (Some(i32::MIN), None),
+            (Some(i32::MAX), None),
+            (None, Some(-MAX_SCROLL_NOTCHES - 1)),
+            (None, Some(MAX_SCROLL_NOTCHES + 1)),
+            (None, Some(i32::MIN)),
+            (None, Some(i32::MAX)),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut g =
+                started_with(FakePlatform::new(100, 100).with_event_log(Arc::clone(&events)));
+            let error = scroll(
+                &mut g,
+                &ScrollArgs {
+                    x: 1,
+                    y: 1,
+                    dx,
+                    dy,
+                    modifiers: None,
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                error.contains("between -100 and 100"),
+                "unexpected error for ({dx:?}, {dy:?}): {error}"
+            );
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "invalid scroll ({dx:?}, {dy:?}) reached the platform"
+            );
+        }
     }
 
     #[test]

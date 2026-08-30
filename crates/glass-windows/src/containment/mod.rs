@@ -3,6 +3,9 @@
 
 pub(crate) mod config;
 
+#[cfg(any(windows, test))]
+mod pid_discovery;
+
 #[cfg(windows)]
 mod clip_server;
 
@@ -36,7 +39,7 @@ pub(crate) fn config_shim_dll_path(exe_dir: Option<&str>) -> Option<String> {
 
 #[cfg(windows)]
 mod imp {
-    use glass_core::{AppSpec, GlassError, Result};
+    use glass_core::{AppSpec, Deadline, GlassError, Result};
 
     /// Log lines captured from the app, tagged by stream. One alias, defined with the readers
     /// that fill it, rather than a second structurally-equal one here.
@@ -128,20 +131,21 @@ mod imp {
         /// - Sandboxie: `Start.exe /listpids` ∪ a descendant walk of the wrapper (the boxed
         ///   app pids come from `/listpids`; the wrapper itself owns no app window).
         pub(crate) fn pids(&self) -> Vec<u32> {
+            self.pids_by(Deadline::UNBOUNDED)
+                .unwrap_or_else(|_| match self {
+                    Launched::Unconfined(a) => crate::process::descendant_pids(a.pid()),
+                    Launched::Sandboxie(a) => crate::process::descendant_pids(a.root_pid()),
+                })
+        }
+
+        pub(crate) fn pids_by(&self, deadline: Deadline) -> Result<Vec<u32>> {
             match self {
-                Launched::Unconfined(a) => {
-                    let mut pids = a.job_pids();
-                    for p in crate::process::descendant_pids(a.pid()) {
-                        if !pids.contains(&p) {
-                            pids.push(p);
-                        }
-                    }
-                    if !pids.contains(&a.pid()) {
-                        pids.push(a.pid());
-                    }
-                    pids
-                }
-                Launched::Sandboxie(a) => a.pids(),
+                Launched::Unconfined(a) => super::pid_discovery::collect_pids_by_with(
+                    deadline,
+                    |_| Ok(a.job_pids()),
+                    |received| crate::process::descendant_pids_by(a.pid(), received),
+                ),
+                Launched::Sandboxie(a) => a.pids_by(deadline),
             }
         }
         /// The window-class prefix that positively identifies this launch's app windows, when the

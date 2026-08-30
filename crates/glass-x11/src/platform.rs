@@ -1,11 +1,13 @@
-use std::os::fd::AsFd;
+use std::cell::{Cell, RefCell};
+use std::os::fd::{AsFd, OwnedFd};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
-    TEARDOWN_BUDGET, WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
+    AppSpec, BoundDispatch, BoundKind, Deadline, Frame, GlassError, KeyEvent, Platform,
+    PointerEvent, Region, Result, Stream, TEARDOWN_BUDGET, Whose, WindowGeometry, WindowHint,
+    WindowId, WindowInfo, WindowOp,
 };
 use glass_pipe_unix::LineTap;
 use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, proc_tree_pids};
@@ -43,6 +45,230 @@ const XT_BTN_RELEASE: u8 = 5; // ButtonRelease
 const XT_KEY_PRESS: u8 = 2; // KeyPress
 const XT_KEY_RELEASE: u8 = 3; // KeyRelease
 
+fn modifier_keycodes_dispatched(keycodes: &[u8]) -> bool {
+    !keycodes.is_empty()
+}
+
+fn legacy_window_selection(deadline: Deadline) -> bool {
+    deadline == Deadline::UNBOUNDED
+}
+
+fn rollback_bounded_window_selection(
+    selected: &mut Option<Window>,
+    previous: Option<Window>,
+    deadline: Deadline,
+) -> bool {
+    if legacy_window_selection(deadline) {
+        false
+    } else {
+        *selected = previous;
+        true
+    }
+}
+
+#[derive(Default)]
+struct X11Dispatch {
+    sent: Cell<bool>,
+    deadline_watch: RefCell<Option<X11DeadlineWatch>>,
+}
+
+impl X11Dispatch {
+    fn for_window(conn: &RustConnection, deadline: Deadline) -> Result<Self> {
+        Ok(Self {
+            sent: Cell::new(false),
+            deadline_watch: RefCell::new(X11DeadlineWatch::prepare(conn, deadline)?),
+        })
+    }
+
+    fn mark(&self) {
+        if self.sent.replace(true) {
+            return;
+        }
+        if let Some(watch) = self.deadline_watch.borrow_mut().as_mut() {
+            watch.arm();
+        }
+    }
+
+    fn stop_watch(&self) {
+        self.deadline_watch.borrow_mut().take();
+    }
+
+    fn deadline_error(&self, op: &str) -> GlassError {
+        if self.sent.get() {
+            GlassError::caller_deadline_elapsed(op)
+        } else {
+            GlassError::deadline_not_started(op)
+        }
+    }
+
+    fn classify(&self, op: &str, mut error: GlassError) -> GlassError {
+        if let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        {
+            return GlassError::input_cleanup_failed(
+                operation,
+                self.classify(op, *primary),
+                *cleanup,
+            );
+        }
+        if self.sent.get()
+            && error.bound_owner() == Some(Whose::Caller)
+            && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
+        {
+            if let GlassError::Bounded {
+                kind,
+                whose,
+                dispatch,
+                message,
+                ..
+            } = &mut error
+            {
+                let cleanup = message
+                    .find("; cleanup failed")
+                    .map(|at| message[at..].to_owned())
+                    .unwrap_or_default();
+                *kind = BoundKind::TimedOut;
+                *whose = Whose::Caller;
+                *dispatch = BoundDispatch::MayHaveDispatched;
+                *message = format!(
+                    "{op}: the caller deadline elapsed before the operation answered{cleanup}"
+                );
+                return error;
+            }
+            return GlassError::caller_deadline_elapsed(op);
+        }
+        error
+    }
+}
+
+fn run_x11_call_by<T>(
+    deadline: Deadline,
+    op: &str,
+    call: impl FnOnce(&X11Dispatch) -> Result<T>,
+) -> Result<T> {
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(op));
+    }
+    let dispatch = X11Dispatch::default();
+    let answer = call(&dispatch).map_err(|error| dispatch.classify(op, error))?;
+    if deadline.has_passed() {
+        return Err(dispatch.deadline_error(op));
+    }
+    Ok(answer)
+}
+
+/// Arms socket shutdown only after dispatch so a stalled bounded operation cannot leave reusable
+/// X11 request/reply framing.
+struct X11DeadlineWatch {
+    deadline: Deadline,
+    socket: Option<OwnedFd>,
+    cancel: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl X11DeadlineWatch {
+    fn prepare(conn: &RustConnection, deadline: Deadline) -> Result<Option<Self>> {
+        if deadline.remaining().is_none() {
+            return Ok(None);
+        }
+        let socket = rustix::io::dup(conn.stream().as_fd())
+            .map_err(|error| GlassError::Backend(format!("duplicate X11 socket: {error}")))?;
+        Ok(Some(Self {
+            deadline,
+            socket: Some(socket),
+            cancel: None,
+        }))
+    }
+
+    fn arm(&mut self) {
+        let Some(socket) = self.socket.take() else {
+            return;
+        };
+        let remaining = self.deadline.remaining().unwrap_or(Duration::ZERO);
+        let (cancel, cancelled) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if cancelled.recv_timeout(remaining).is_err() {
+                let _ = rustix::net::shutdown(socket, rustix::net::Shutdown::Both);
+            }
+        });
+        self.cancel = Some(cancel);
+    }
+}
+
+impl Drop for X11DeadlineWatch {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+fn run_x11_type_by<S: glass_core::TypeSink>(
+    sink: &mut S,
+    text: &str,
+    dwell: Duration,
+    deadline: Deadline,
+) -> Result<()> {
+    glass_core::run_type_by(sink, text, dwell, deadline)
+}
+
+fn attach_cleanup_failure(primary: GlassError, cleanup: GlassError) -> GlassError {
+    GlassError::input_cleanup_failed("releasing X11 pointer input", primary, cleanup)
+}
+
+fn run_clicks_by(
+    count: u32,
+    mut deadline_passed: impl FnMut() -> bool,
+    mut button: impl FnMut(bool) -> Result<()>,
+    cleanup: impl FnOnce(bool, bool) -> Result<()>,
+) -> Result<()> {
+    glass_core::validate_click_count(count)?;
+    let mut button_down = false;
+    let outcome = (|| {
+        for _ in 0..count {
+            if deadline_passed() {
+                return Err(GlassError::deadline_not_started("pointer input"));
+            }
+            button(true)?;
+            button_down = true;
+            if deadline_passed() {
+                return Err(GlassError::caller_deadline_elapsed("pointer input"));
+            }
+            button(false)?;
+            button_down = false;
+        }
+        Ok(())
+    })();
+    let cleanup = cleanup(button_down, outcome.is_err());
+    match (outcome, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(attach_cleanup_failure(primary, cleanup)),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn run_scroll_buttons_by(
+    pos_btn: u8,
+    neg_btn: u8,
+    delta: i32,
+    mut deadline_passed: impl FnMut() -> bool,
+    mut button: impl FnMut(bool, u8) -> Result<()>,
+) -> Result<()> {
+    let times = glass_core::validate_scroll_delta(delta)?;
+    let btn = if delta >= 0 { pos_btn } else { neg_btn };
+    for _ in 0..times {
+        if deadline_passed() {
+            return Err(GlassError::deadline_not_started("pointer input"));
+        }
+        button(true, btn)?;
+        button(false, btn)?;
+    }
+    Ok(())
+}
+
 use crate::command::build_command;
 
 type LogSink = Arc<Mutex<Vec<(Stream, String)>>>;
@@ -70,6 +296,8 @@ pub struct X11Platform {
     dbus: Option<glass_dbus_linux::PrivateBus>,
     // Background thread that owns the CLIPBOARD selection and serves pastes.
     clipboard_owner: Option<crate::clipboard::ClipboardOwner>,
+    #[cfg(test)]
+    window_process_tree_delay: Duration,
 }
 
 /// What display the X11 backend should use, derived from `GLASS_DISPLAY`.
@@ -188,7 +416,32 @@ impl X11Platform {
             xvfb: None,
             dbus: None,
             clipboard_owner: None,
+            #[cfg(test)]
+            window_process_tree_delay: Duration::ZERO,
         })
+    }
+
+    fn run_window_call_by<T>(
+        &mut self,
+        deadline: Deadline,
+        operation: &str,
+        call: impl FnOnce(&mut Self, &X11Dispatch) -> Result<T>,
+    ) -> Result<T> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(operation));
+        }
+        let dispatch = X11Dispatch::for_window(&self.conn, deadline)?;
+        let answer = match call(self, &dispatch) {
+            Ok(answer) => answer,
+            Err(_) if deadline.has_passed() => return Err(dispatch.deadline_error(operation)),
+            Err(error) => return Err(dispatch.classify(operation, error)),
+        };
+        dispatch.stop_watch();
+        if deadline.has_passed() {
+            Err(dispatch.deadline_error(operation))
+        } else {
+            Ok(answer)
+        }
     }
 
     fn require_window(&self) -> Result<Window> {
@@ -731,17 +984,20 @@ impl X11Platform {
         Ok(())
     }
 
-    fn scroll_button(&self, pos_btn: u8, neg_btn: u8, delta: i32) -> Result<()> {
-        let (btn, times) = if delta >= 0 {
-            (pos_btn, delta)
-        } else {
-            (neg_btn, -delta)
-        };
-        for _ in 0..times {
-            self.button(XT_BTN_PRESS, btn)?;
-            self.button(XT_BTN_RELEASE, btn)?;
-        }
-        Ok(())
+    fn scroll_button(
+        &self,
+        pos_btn: u8,
+        neg_btn: u8,
+        delta: i32,
+        deadline: Deadline,
+    ) -> Result<()> {
+        run_scroll_buttons_by(
+            pos_btn,
+            neg_btn,
+            delta,
+            || deadline.has_passed(),
+            |down, btn| self.button(if down { XT_BTN_PRESS } else { XT_BTN_RELEASE }, btn),
+        )
     }
 
     /// Find a keycode (and whether Shift is needed) that produces `keysym`.
@@ -954,6 +1210,7 @@ fn clip_note(rect: &crate::coords::ClippedRect) -> Option<String> {
 /// are held between `modifiers(true)`/`modifiers(false)`.
 struct X11DragSink<'a> {
     p: &'a X11Platform,
+    dispatch: &'a X11Dispatch,
     ox: i32,
     oy: i32,
     b: u8,
@@ -967,11 +1224,13 @@ impl glass_core::DragSink for X11DragSink<'_> {
     }
     fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
         self.p.warp(self.ox, self.oy, x, y)?;
+        self.dispatch.mark();
         self.p.commit()
     }
     fn button(&mut self, down: bool) -> Result<()> {
         let kind = if down { XT_BTN_PRESS } else { XT_BTN_RELEASE };
         self.p.button(kind, self.b)?;
+        self.dispatch.mark();
         self.p.commit()
     }
     fn modifiers(&mut self, down: bool) -> Result<()> {
@@ -979,6 +1238,9 @@ impl glass_core::DragSink for X11DragSink<'_> {
             self.kcs = self.p.press_mods(self.mods)?;
         } else {
             self.p.release_mods(&self.kcs)?;
+        }
+        if modifier_keycodes_dispatched(&self.kcs) {
+            self.dispatch.mark();
         }
         self.p.commit()
     }
@@ -991,6 +1253,7 @@ impl glass_core::DragSink for X11DragSink<'_> {
 /// char value (it would leak typed content into the unredacted audit log).
 struct X11TypeSink<'a> {
     p: &'a X11Platform,
+    dispatch: &'a X11Dispatch,
     idx: usize,
 }
 
@@ -1001,6 +1264,7 @@ impl glass_core::TypeSink for X11TypeSink<'_> {
         })?;
         self.idx += 1;
         self.p.key_with_mods(keysym, false, &[])?;
+        self.dispatch.mark();
         self.p.commit()
     }
 }
@@ -1010,6 +1274,7 @@ impl glass_core::TypeSink for X11TypeSink<'_> {
 /// `modifiers(false)`, so a frame-based client sees the modifier held across the key's frame.
 struct X11ChordSink<'a> {
     p: &'a X11Platform,
+    dispatch: &'a X11Dispatch,
     mods: &'a [glass_core::keys::Modifier],
     keycode: u8,
     kcs: Vec<u8>,
@@ -1021,6 +1286,9 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
             self.kcs = self.p.press_mods(self.mods)?;
         } else {
             self.p.release_mods(&self.kcs)?;
+        }
+        if modifier_keycodes_dispatched(&self.kcs) {
+            self.dispatch.mark();
         }
         self.p.commit()
     }
@@ -1038,6 +1306,7 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
                 0,
             )
             .map_err(|e| GlassError::Backend(format!("xtest key: {e}")))?;
+        self.dispatch.mark();
         self.p.commit()
     }
 }
@@ -1047,6 +1316,7 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
 /// client sees the modifier held across the wheel's frame; each method self-commits with `XFlush`.
 struct X11ScrollSink<'a> {
     p: &'a X11Platform,
+    dispatch: &'a X11Dispatch,
     ox: i32,
     oy: i32,
     x: i32,
@@ -1055,6 +1325,7 @@ struct X11ScrollSink<'a> {
     dy: i32,
     mods: &'a [glass_core::keys::Modifier],
     kcs: Vec<u8>,
+    deadline: Deadline,
 }
 
 impl glass_core::ScrollSink for X11ScrollSink<'_> {
@@ -1064,13 +1335,17 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
         } else {
             self.p.release_mods(&self.kcs)?;
         }
+        if modifier_keycodes_dispatched(&self.kcs) {
+            self.dispatch.mark();
+        }
         self.p.commit()
     }
     fn wheel(&mut self) -> Result<()> {
         self.p.warp(self.ox, self.oy, self.x, self.y)?;
+        self.dispatch.mark();
         // 4=up,5=down,6=left,7=right; click |delta| times.
-        self.p.scroll_button(5, 4, self.dy)?;
-        self.p.scroll_button(7, 6, self.dx)?;
+        self.p.scroll_button(5, 4, self.dy, self.deadline)?;
+        self.p.scroll_button(7, 6, self.dx, self.deadline)?;
         self.p.commit()
     }
 }
@@ -1128,145 +1403,210 @@ impl Platform for X11Platform {
         Ok(())
     }
 
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        // `window_geometry()` itself calls `require_window()`, so it doubles as
-        // the "is there an active window" guard — no separate binding needed.
-        let geo = self.window_geometry()?;
-        let rect = self.resolve_capture_rect(&geo, region)?;
-        if let Some(note) = clip_note(&rect) {
-            eprintln!("{note}");
-        }
-        // Capture from ROOT over the window's screen region so overlapping popovers
-        // (separate override-redirect top-levels) are included, not just this window's
-        // own (possibly-obscured) drawable.
-        self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        run_x11_call_by(deadline, "capture", |dispatch| {
+            // `window_geometry()` also validates that an active window exists.
+            let geo = self.window_geometry()?;
+            let rect = self.resolve_capture_rect(&geo, region)?;
+            if let Some(note) = clip_note(&rect) {
+                eprintln!("{note}");
+            }
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("capture"));
+            }
+            // Capture from ROOT so separate override-redirect popovers are included.
+            let frame = self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)?;
+            dispatch.mark();
+            Ok(frame)
+        })
     }
 
-    fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
-        // Mirror select_window's WindowId -> Window mapping/validation, but never
-        // touch `self.window` — this must not retarget the active window.
-        let pids: Vec<u32> = self
-            .child
-            .as_ref()
-            .map(|c| proc_tree_pids(c.id()))
-            .unwrap_or_default();
-        let target = id.0 as Window;
-        if !self.scan_all_windows(&pids)?.contains(&target) {
-            return Err(GlassError::WindowNotFound);
-        }
-        let geo = self.geometry_of(target)?;
-        if let Some(r) = region {
-            // `region` must fit the TARGET window's own geometry, not just the
-            // shared Xvfb display — otherwise an over-large region that still
-            // lands inside the display would silently capture pixels outside
-            // this window (desktop / other windows) instead of erroring.
-            r.check_fits(geo.width, geo.height)?;
-        }
-        let rect = self.resolve_capture_rect(&geo, region)?;
-        if let Some(note) = clip_note(&rect) {
-            eprintln!("{note}");
-        }
-        self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
+    fn capture_window_by(
+        &mut self,
+        id: WindowId,
+        region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        run_x11_call_by(deadline, "window capture", |dispatch| {
+            // Validate `id` without retargeting the active window.
+            let pids: Vec<u32> = self
+                .child
+                .as_ref()
+                .map(|c| proc_tree_pids(c.id()))
+                .unwrap_or_default();
+            let target = id.0 as Window;
+            if !self.scan_all_windows(&pids)?.contains(&target) {
+                return Err(GlassError::WindowNotFound);
+            }
+            let geo = self.geometry_of(target)?;
+            if let Some(r) = region {
+                // Validate against the target window, not the larger shared display.
+                r.check_fits(geo.width, geo.height)?;
+            }
+            let rect = self.resolve_capture_rect(&geo, region)?;
+            if let Some(note) = clip_note(&rect) {
+                eprintln!("{note}");
+            }
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("window capture"));
+            }
+            let frame = self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)?;
+            dispatch.mark();
+            Ok(frame)
+        })
     }
 
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
-        let origin = self.window_geometry()?;
-        let (ox, oy) = (origin.x, origin.y);
-        match *event {
-            PointerEvent::Move { x, y } => self.warp(ox, oy, x, y)?,
-            PointerEvent::Scroll {
-                x,
-                y,
-                dx,
-                dy,
-                ref modifiers,
-            } => {
-                // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
-                // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
-                let mut sink = X11ScrollSink {
-                    p: &*self,
-                    ox,
-                    oy,
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
+        run_x11_call_by(deadline, "pointer input", |dispatch| {
+            let origin = self.window_geometry()?;
+            let (ox, oy) = (origin.x, origin.y);
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("pointer input"));
+            }
+            match *event {
+                PointerEvent::Move { x, y } => {
+                    self.warp(ox, oy, x, y)?;
+                    dispatch.mark();
+                }
+                PointerEvent::Scroll {
                     x,
                     y,
                     dx,
                     dy,
-                    mods: modifiers.as_slice(),
-                    kcs: Vec::new(),
-                };
-                glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
-            }
-            PointerEvent::Click {
-                x,
-                y,
-                button,
-                count,
-                ref modifiers,
-            } => {
-                self.warp(ox, oy, x, y)?;
-                let kcs = self.press_mods(modifiers)?;
-                let b = button_number(button);
-                for _ in 0..count.max(1) {
-                    self.button(XT_BTN_PRESS, b)?;
-                    self.button(XT_BTN_RELEASE, b)?;
+                    ref modifiers,
+                } => {
+                    // Hold modifiers across the wheel frame; see `glass_core::run_scroll`.
+                    let mut sink = X11ScrollSink {
+                        p: &*self,
+                        dispatch,
+                        ox,
+                        oy,
+                        x,
+                        y,
+                        dx,
+                        dy,
+                        mods: modifiers.as_slice(),
+                        kcs: Vec::new(),
+                        deadline,
+                    };
+                    glass_core::run_scroll_by(&mut sink, !modifiers.is_empty(), deadline)?;
                 }
-                self.release_mods(&kcs)?;
+                PointerEvent::Click {
+                    x,
+                    y,
+                    button,
+                    count,
+                    ref modifiers,
+                } => {
+                    self.warp(ox, oy, x, y)?;
+                    dispatch.mark();
+                    if deadline.has_passed() {
+                        return Err(GlassError::caller_deadline_elapsed("pointer input"));
+                    }
+                    let kcs = self.press_mods(modifiers)?;
+                    if modifier_keycodes_dispatched(&kcs) {
+                        dispatch.mark();
+                    }
+                    let b = button_number(button);
+                    run_clicks_by(
+                        count,
+                        || deadline.has_passed(),
+                        |down| {
+                            self.button(if down { XT_BTN_PRESS } else { XT_BTN_RELEASE }, b)?;
+                            dispatch.mark();
+                            Ok(())
+                        },
+                        |button_down, failed| {
+                            let mut cleanup_error = None;
+                            if button_down && let Err(error) = self.button(XT_BTN_RELEASE, b) {
+                                cleanup_error = Some(error);
+                            } else if button_down {
+                                dispatch.mark();
+                            }
+                            if let Err(error) = self.release_mods(&kcs)
+                                && cleanup_error.is_none()
+                            {
+                                cleanup_error = Some(error);
+                            }
+                            if failed
+                                && let Err(error) = self
+                                    .conn
+                                    .sync()
+                                    .map_err(|e| GlassError::Backend(format!("sync: {e}")))
+                                && cleanup_error.is_none()
+                            {
+                                cleanup_error = Some(error);
+                            }
+                            match cleanup_error {
+                                Some(error) => Err(error),
+                                None => Ok(()),
+                            }
+                        },
+                    )?;
+                }
+                PointerEvent::Drag {
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                    button,
+                    ref modifiers,
+                    duration_ms,
+                } => {
+                    let gesture =
+                        glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
+                    let mut sink = X11DragSink {
+                        p: &*self,
+                        dispatch,
+                        ox,
+                        oy,
+                        b: button_number(button),
+                        mods: modifiers.as_slice(),
+                        kcs: Vec::new(),
+                    };
+                    glass_core::run_drag_by(&mut sink, &gesture, deadline)?;
+                }
+                PointerEvent::Gesture { .. } => {
+                    return Err(crate::unsupported_multi_touch());
+                }
             }
-            PointerEvent::Drag {
-                from_x,
-                from_y,
-                to_x,
-                to_y,
-                button,
-                ref modifiers,
-                duration_ms,
-            } => {
-                let gesture =
-                    glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
-                let mut sink = X11DragSink {
-                    p: &*self,
-                    ox,
-                    oy,
-                    b: button_number(button),
-                    mods: modifiers.as_slice(),
-                    kcs: Vec::new(),
-                };
-                glass_core::run_drag(&mut sink, &gesture)?;
-            }
-            PointerEvent::Gesture { .. } => {
-                return Err(crate::unsupported_multi_touch());
-            }
-        }
-        self.commit()
+            self.commit()
+        })
     }
 
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-        match event {
-            KeyEvent::Text(text) => {
-                // Per-character, self-committed typing (an XFlush per char) so a heavy client
-                // (e.g. a browser) receives a long string instead of dropping events flushed
-                // once at the end — see glass_core::run_type and X11TypeSink. The 8ms dwell
-                // paces between characters (XFlush sends but does not wait).
-                let mut sink = X11TypeSink { p: &*self, idx: 0 };
-                glass_core::run_type(&mut sink, text, std::time::Duration::from_millis(8))?;
-            }
-            KeyEvent::Chord(chord) => {
-                let (mods, keysym) = glass_core::keys::parse_chord(chord)?;
-                let (keycode, needs_shift) = self.keycode_for(keysym)?;
-                let mut mods = mods;
-                if needs_shift && !mods.contains(&glass_core::keys::Modifier::Shift) {
-                    mods.push(glass_core::keys::Modifier::Shift);
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        run_x11_call_by(deadline, "key input", |dispatch| {
+            match event {
+                KeyEvent::Text(text) => {
+                    // Flush and pace each character because heavy clients can drop a string flushed
+                    // only at the end.
+                    let mut sink = X11TypeSink {
+                        p: &*self,
+                        dispatch,
+                        idx: 0,
+                    };
+                    run_x11_type_by(&mut sink, text, Duration::from_millis(8), deadline)?;
                 }
-                let mut sink = X11ChordSink {
-                    p: &*self,
-                    mods: &mods,
-                    keycode,
-                    kcs: Vec::new(),
-                };
-                glass_core::run_chord(&mut sink)?;
+                KeyEvent::Chord(chord) => {
+                    let (mods, keysym) = glass_core::keys::parse_chord(chord)?;
+                    let (keycode, needs_shift) = self.keycode_for(keysym)?;
+                    let mut mods = mods;
+                    if needs_shift && !mods.contains(&glass_core::keys::Modifier::Shift) {
+                        mods.push(glass_core::keys::Modifier::Shift);
+                    }
+                    let mut sink = X11ChordSink {
+                        p: &*self,
+                        dispatch,
+                        mods: &mods,
+                        keycode,
+                        kcs: Vec::new(),
+                    };
+                    glass_core::run_chord_by(&mut sink, deadline)?;
+                }
             }
-        }
-        self.commit()
+            self.commit()
+        })
     }
 
     fn get_clipboard(&mut self) -> Result<String> {
@@ -1289,67 +1629,99 @@ impl Platform for X11Platform {
         }
     }
 
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
-        let win = self.require_window()?;
-        match *op {
-            WindowOp::Focus => {
-                self.focus_window(win)?;
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        self.run_window_call_by(deadline, "X11 window operation", |platform, dispatch| {
+            let win = platform.require_window()?;
+            dispatch.mark();
+            match *op {
+                WindowOp::Focus => {
+                    platform.focus_window(win)?;
+                }
+                WindowOp::Resize { width, height } => {
+                    platform.configure_active(
+                        win,
+                        &ConfigureWindowAux::new().width(width).height(height),
+                        "resize",
+                    )?;
+                }
+                WindowOp::Move { x, y } => {
+                    platform.configure_active(win, &ConfigureWindowAux::new().x(x).y(y), "move")?;
+                }
+                WindowOp::Geometry => {}
             }
-            WindowOp::Resize { width, height } => {
-                self.configure_active(
-                    win,
-                    &ConfigureWindowAux::new().width(width).height(height),
-                    "resize",
-                )?;
-            }
-            WindowOp::Move { x, y } => {
-                self.configure_active(win, &ConfigureWindowAux::new().x(x).y(y), "move")?;
-            }
-            WindowOp::Geometry => {}
-        }
-        self.commit()?;
-        self.window_geometry()
+            platform.commit()?;
+            platform.window_geometry()
+        })
     }
 
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-        self.require_window()?; // no active app -> WindowNotFound, not an empty list
-        let pids: Vec<u32> = self
-            .child
-            .as_ref()
-            .map(|c| proc_tree_pids(c.id()))
-            .unwrap_or_default();
-        let active = self.window;
-        let mut out = Vec::new();
-        for win in self.scan_all_windows(&pids)? {
-            out.push(WindowInfo {
-                id: WindowId(win as u64),
-                title: self.window_name(win),
-                class: self.window_class(win).map(|(_instance, class)| class),
-                geometry: self.geometry_of(win)?,
-                active: Some(win) == active,
-            });
-        }
-        Ok(out)
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        self.run_window_call_by(deadline, "X11 window list", |platform, dispatch| {
+            platform.require_window()?; // no active app -> WindowNotFound, not an empty list
+            let pids: Vec<u32> = platform
+                .child
+                .as_ref()
+                .map(|c| proc_tree_pids(c.id()))
+                .unwrap_or_default();
+            #[cfg(test)]
+            std::thread::sleep(platform.window_process_tree_delay);
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("X11 window list"));
+            }
+            let active = platform.window;
+            dispatch.mark();
+            let mut out = Vec::new();
+            for win in platform.scan_all_windows(&pids)? {
+                out.push(WindowInfo {
+                    id: WindowId(win as u64),
+                    title: platform.window_name(win),
+                    class: platform.window_class(win).map(|(_instance, class)| class),
+                    geometry: platform.geometry_of(win)?,
+                    active: Some(win) == active,
+                });
+            }
+            Ok(out)
+        })
     }
 
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
-        let pids: Vec<u32> = self
-            .child
-            .as_ref()
-            .map(|c| proc_tree_pids(c.id()))
-            .unwrap_or_default();
-        let target = id.0 as Window;
-        if self.scan_all_windows(&pids)?.contains(&target) {
-            self.window = Some(target);
-            // Move keyboard focus to the selected window so subsequent synthetic
-            // keys reach it. Best-effort: a focus failure must not fail selection.
-            if let Err(e) = self.focus_window(target) {
-                eprintln!("glass: focus-on-select failed (keys may not reach the window): {e}");
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        self.run_window_call_by(deadline, "X11 window selection", |platform, dispatch| {
+            let pids: Vec<u32> = platform
+                .child
+                .as_ref()
+                .map(|c| proc_tree_pids(c.id()))
+                .unwrap_or_default();
+            #[cfg(test)]
+            std::thread::sleep(platform.window_process_tree_delay);
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("X11 window selection"));
             }
-            self.geometry_of(target)
-        } else {
-            Err(GlassError::WindowNotFound)
-        }
+            let target = id.0 as Window;
+            dispatch.mark();
+            if !platform.scan_all_windows(&pids)?.contains(&target) {
+                return Err(GlassError::WindowNotFound);
+            }
+            let previous = platform.window;
+            platform.window = Some(target);
+            if let Err(error) = platform.focus_window(target) {
+                if legacy_window_selection(deadline) {
+                    eprintln!(
+                        "glass: focus-on-select failed (keys may not reach the window): {error}"
+                    );
+                } else {
+                    platform.window = previous;
+                    return Err(error.after_dispatch());
+                }
+            }
+            match platform.geometry_of(target) {
+                Ok(geometry) => Ok(geometry),
+                Err(error) => {
+                    if rollback_bounded_window_selection(&mut platform.window, previous, deadline) {
+                        return Err(error.after_dispatch());
+                    }
+                    Err(error)
+                }
+            }
+        })
     }
 
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
@@ -1464,8 +1836,291 @@ fn button_number(button: glass_core::MouseButton) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::hint_matches;
-    use glass_core::WindowHint;
+    use super::{
+        X11DeadlineWatch, X11Dispatch, hint_matches, legacy_window_selection,
+        modifier_keycodes_dispatched, rollback_bounded_window_selection, run_clicks_by,
+        run_scroll_buttons_by, run_x11_call_by, run_x11_type_by,
+    };
+    use glass_core::{
+        BoundDispatch, BoundKind, Deadline, GlassError, Result, TypeSink, Whose, WindowHint,
+    };
+    use std::cell::{Cell, RefCell};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn modifier_and_selection_helpers_distinguish_empty_and_bounded_cases() {
+        assert!(!modifier_keycodes_dispatched(&[]));
+        assert!(modifier_keycodes_dispatched(&[42]));
+        assert!(legacy_window_selection(Deadline::UNBOUNDED));
+        assert!(!legacy_window_selection(Deadline::from_millis(1_000)));
+    }
+
+    #[test]
+    fn only_bounded_window_selection_rolls_back_after_dispatch_failure() {
+        let mut bounded = Some(2);
+        assert!(rollback_bounded_window_selection(
+            &mut bounded,
+            Some(1),
+            Deadline::from_millis(1_000),
+        ));
+        assert_eq!(bounded, Some(1));
+
+        let mut legacy = Some(2);
+        assert!(!rollback_bounded_window_selection(
+            &mut legacy,
+            Some(1),
+            Deadline::UNBOUNDED,
+        ));
+        assert_eq!(legacy, Some(2));
+    }
+
+    #[test]
+    fn stopping_a_dispatch_watch_removes_it() {
+        let dispatch = X11Dispatch {
+            sent: Cell::new(false),
+            deadline_watch: RefCell::new(Some(X11DeadlineWatch {
+                deadline: Deadline::UNBOUNDED,
+                socket: None,
+                cancel: None,
+            })),
+        };
+
+        dispatch.stop_watch();
+
+        assert!(dispatch.deadline_watch.borrow().is_none());
+    }
+
+    #[derive(Default)]
+    struct RecordingTypeSink {
+        characters: Vec<char>,
+    }
+
+    impl TypeSink for RecordingTypeSink {
+        fn character(&mut self, character: char) -> Result<()> {
+            self.characters.push(character);
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spent_input_deadline_dispatches_no_backend_events() {
+        let mut recorded_events = Vec::new();
+        let deadline = Deadline::at(Instant::now() - Duration::from_millis(1));
+
+        let error = run_x11_call_by(deadline, "pointer input", |_| {
+            recorded_events.push("motion");
+            Ok(())
+        })
+        .expect_err("spent input must be rejected before dispatch");
+
+        assert!(recorded_events.is_empty());
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn pre_dispatch_caller_deadline_error_stays_not_dispatched() {
+        let error = run_x11_call_by(Deadline::UNBOUNDED, "key input", |_| {
+            Err::<(), _>(GlassError::deadline_not_started("typing"))
+        })
+        .expect_err("typing did not reach XTEST");
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn click_timeout_after_press_releases_and_syncs_before_returning() {
+        let events = RefCell::new(Vec::new());
+        let checks = Cell::new(0);
+
+        let error = run_x11_call_by(Deadline::UNBOUNDED, "pointer input", |dispatch| {
+            run_clicks_by(
+                1,
+                || {
+                    checks.set(checks.get() + 1);
+                    checks.get() == 2
+                },
+                |down| {
+                    events
+                        .borrow_mut()
+                        .push(if down { "press" } else { "release" });
+                    dispatch.mark();
+                    Ok(())
+                },
+                |button_down, failed| {
+                    if button_down {
+                        events.borrow_mut().push("release");
+                    }
+                    if failed {
+                        events.borrow_mut().push("sync");
+                    }
+                    Err(GlassError::Backend("cleanup sync failed".into()))
+                },
+            )
+        })
+        .expect_err("the deadline expires after the press");
+
+        assert_eq!(*events.borrow(), ["press", "release", "sync"]);
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("cleanup sync failed"));
+        let GlassError::InputCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("click cleanup failure must remain structured");
+        };
+        assert_eq!(operation, "releasing X11 pointer input");
+        assert!(matches!(*primary, GlassError::Bounded { .. }));
+        assert!(
+            matches!(*cleanup, GlassError::Backend(message) if message == "cleanup sync failed")
+        );
+    }
+
+    #[test]
+    fn click_cleanup_failure_survives_outer_dispatch_upgrade() {
+        let error = run_x11_call_by(Deadline::UNBOUNDED, "pointer input", |dispatch| {
+            dispatch.mark();
+            run_clicks_by(
+                1,
+                || true,
+                |_| panic!("the spent click must not dispatch a button event"),
+                |_, _| Err(GlassError::Backend("cleanup sync failed".into())),
+            )
+        })
+        .expect_err("the click deadline is spent after earlier modifier dispatch");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(error.to_string().contains("cleanup sync failed"));
+        assert!(matches!(error, GlassError::InputCleanupFailed { .. }));
+    }
+
+    #[test]
+    fn click_work_factor_is_rejected_before_button_or_cleanup_dispatch() {
+        for count in [0, 11, u32::MAX] {
+            let button_calls = Cell::new(0);
+            let cleanup_calls = Cell::new(0);
+            let error = run_clicks_by(
+                count,
+                || true,
+                |_| {
+                    button_calls.set(button_calls.get() + 1);
+                    Ok(())
+                },
+                |_, _| {
+                    cleanup_calls.set(cleanup_calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect_err("invalid click count must be rejected before any event");
+
+            assert!(matches!(error.cause(), GlassError::InvalidPointerInput(_)));
+            assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+            assert_eq!(button_calls.get(), 0);
+            assert_eq!(cleanup_calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn scroll_work_factor_rejects_extreme_magnitudes_without_panicking_or_dispatching() {
+        for delta in [-101, 101, i32::MIN, i32::MAX] {
+            let button_calls = Cell::new(0);
+            let error = run_scroll_buttons_by(
+                5,
+                4,
+                delta,
+                || true,
+                |_, _| {
+                    button_calls.set(button_calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect_err("invalid scroll magnitude must be rejected before any event");
+
+            assert!(matches!(error.cause(), GlassError::InvalidPointerInput(_)));
+            assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+            assert_eq!(button_calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn large_scroll_stops_before_the_first_notch_after_the_deadline() {
+        let events = RefCell::new(Vec::new());
+        let checks = Cell::new(0);
+
+        let error = run_x11_call_by(Deadline::UNBOUNDED, "pointer input", |dispatch| {
+            run_scroll_buttons_by(
+                5,
+                4,
+                100,
+                || {
+                    checks.set(checks.get() + 1);
+                    checks.get() > 1
+                },
+                |down, button| {
+                    events.borrow_mut().push((down, button));
+                    dispatch.mark();
+                    Ok(())
+                },
+            )
+        })
+        .expect_err("the deadline expires before the second notch");
+
+        assert_eq!(
+            (events.borrow().as_slice(), error.bound_dispatch()),
+            (
+                &[(true, 5u8), (false, 5u8)][..],
+                Some(BoundDispatch::MayHaveDispatched),
+            )
+        );
+    }
+
+    #[test]
+    fn short_typing_deadline_stops_before_all_characters() {
+        let requested_text = "abcd";
+        let mut sink = RecordingTypeSink::default();
+
+        let error = run_x11_type_by(
+            &mut sink,
+            requested_text,
+            Duration::ZERO,
+            Deadline::from_millis(5),
+        )
+        .expect_err("typing must stop when the shared deadline expires");
+
+        assert!(sink.characters.len() < requested_text.chars().count());
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn capture_returning_after_the_deadline_is_not_success() {
+        let capture_error = run_x11_call_by(Deadline::from_millis(1), "capture", |dispatch| {
+            dispatch.mark();
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        })
+        .expect_err("a late capture must not return success");
+
+        assert_eq!(capture_error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            capture_error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
 
     // proc_tree_pids / collect_descendants moved to the `glass-proc-linux` crate
     // (tested there).
@@ -1957,7 +2612,8 @@ mod display_tests {
         commit(&plat);
         let _ = x.drain_events(Duration::from_millis(50));
 
-        plat.scroll_button(4, 5, 3).expect("scroll");
+        plat.scroll_button(4, 5, 3, Deadline::UNBOUNDED)
+            .expect("scroll");
         commit(&plat);
         assert_eq!(buttons_pressed(&x), vec![4, 4, 4], "window {win}");
     }
@@ -1978,7 +2634,8 @@ mod display_tests {
         commit(&plat);
         let _ = x.drain_events(Duration::from_millis(50));
 
-        plat.scroll_button(4, 5, -2).expect("scroll");
+        plat.scroll_button(4, 5, -2, Deadline::UNBOUNDED)
+            .expect("scroll");
         commit(&plat);
         assert_eq!(buttons_pressed(&x), vec![5, 5]);
     }
@@ -2204,6 +2861,198 @@ mod display_tests {
         // else, and teardown SIGKILLs an unrelated group.
         cmd.process_group(0);
         cmd.spawn().expect("the stand-in app should spawn")
+    }
+
+    struct ReapedStandIn(std::process::Child);
+
+    impl ReapedStandIn {
+        fn spawn() -> Self {
+            Self(spawn_stand_in())
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for ReapedStandIn {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    const X_SERVER_RESCUE_AFTER: Duration = Duration::from_secs(2);
+
+    #[derive(Debug)]
+    enum RescueControl {
+        Arm(std::sync::mpsc::Sender<()>),
+        Cancel,
+    }
+
+    fn run_x_server_rescue(
+        commands: std::sync::mpsc::Receiver<RescueControl>,
+        rescue_after: Duration,
+        resume: impl FnOnce() -> bool,
+    ) -> bool {
+        match commands.recv() {
+            Ok(RescueControl::Arm(armed)) => {
+                if armed.send(()).is_err() {
+                    return false;
+                }
+            }
+            Ok(RescueControl::Cancel) | Err(_) => return false,
+        }
+
+        match commands.recv_timeout(rescue_after) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => resume(),
+            Ok(RescueControl::Arm(_) | RescueControl::Cancel)
+            | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => false,
+        }
+    }
+
+    fn resume_x_server(pid: rustix::process::Pid) -> bool {
+        rustix::process::kill_process(pid, rustix::process::Signal::CONT).is_ok()
+    }
+
+    struct PausedXServer {
+        pid: rustix::process::Pid,
+        resumed: bool,
+        rescue_control: Option<std::sync::mpsc::Sender<RescueControl>>,
+        rescue: Option<std::thread::JoinHandle<bool>>,
+    }
+
+    impl PausedXServer {
+        fn new(pid: u32) -> Self {
+            Self::new_with_before_stop(pid, X_SERVER_RESCUE_AFTER, || {})
+        }
+
+        fn new_with_before_stop(
+            pid: u32,
+            rescue_after: Duration,
+            before_stop: impl FnOnce(),
+        ) -> Self {
+            let pid = rustix::process::Pid::from_raw(pid as i32).expect("a non-zero X-server pid");
+            let (rescue_control, commands) = std::sync::mpsc::channel();
+            let rescue = std::thread::spawn(move || {
+                run_x_server_rescue(commands, rescue_after, move || resume_x_server(pid))
+            });
+            let mut paused = Self {
+                pid,
+                resumed: false,
+                rescue_control: Some(rescue_control),
+                rescue: Some(rescue),
+            };
+            before_stop();
+            signal_process(pid, rustix::process::Signal::STOP);
+            wait_until_stopped(pid);
+            paused.arm_rescue();
+            paused
+        }
+
+        fn arm_rescue(&mut self) {
+            let (armed, acknowledgement) = std::sync::mpsc::channel();
+            self.rescue_control
+                .as_ref()
+                .expect("an unarmed rescue has a control channel")
+                .send(RescueControl::Arm(armed))
+                .expect("arm the X-server rescue");
+            acknowledgement
+                .recv()
+                .expect("the X-server rescue acknowledged arming");
+        }
+
+        fn resume(mut self) -> bool {
+            signal_process(self.pid, rustix::process::Signal::CONT);
+            self.resumed = true;
+            self.join_rescue()
+        }
+
+        fn join_rescue(&mut self) -> bool {
+            if let Some(control) = self.rescue_control.take() {
+                let _ = control.send(RescueControl::Cancel);
+            }
+            self.rescue
+                .take()
+                .is_none_or(|rescue| rescue.join().unwrap_or(true))
+        }
+    }
+
+    impl Drop for PausedXServer {
+        fn drop(&mut self) {
+            if !self.resumed {
+                let _ = rustix::process::kill_process(self.pid, rustix::process::Signal::CONT);
+                self.resumed = true;
+            }
+            let _ = self.join_rescue();
+        }
+    }
+
+    #[test]
+    #[ignore = "starts a real stand-in process"]
+    fn rescue_countdown_begins_only_after_sigstop_succeeds() {
+        let stand_in = ReapedStandIn::spawn();
+        let paused =
+            PausedXServer::new_with_before_stop(stand_in.pid(), Duration::from_millis(20), || {
+                std::thread::sleep(Duration::from_millis(80))
+            });
+
+        assert!(
+            !paused.resume(),
+            "the rescue deadline was consumed before SIGSTOP completed"
+        );
+    }
+
+    #[test]
+    #[ignore = "exercises the X-server rescue protocol"]
+    fn rescue_cancelled_before_arming_does_not_attempt_sigcont() {
+        let (control, commands) = std::sync::mpsc::channel();
+        control.send(RescueControl::Cancel).expect("cancel rescue");
+
+        let rescued = run_x_server_rescue(commands, Duration::ZERO, || {
+            panic!("a cancelled rescue must not attempt SIGCONT")
+        });
+
+        assert!(!rescued);
+    }
+
+    #[test]
+    #[ignore = "exercises the X-server rescue protocol"]
+    fn rescue_does_not_report_success_when_sigcont_fails() {
+        let (control, commands) = std::sync::mpsc::channel();
+        let (armed, _acknowledgement) = std::sync::mpsc::channel();
+        control.send(RescueControl::Arm(armed)).expect("arm rescue");
+
+        let rescued = run_x_server_rescue(commands, Duration::ZERO, || false);
+
+        assert!(!rescued);
+    }
+
+    #[test]
+    #[ignore = "exercises the direct X-server signal path"]
+    fn direct_rescue_sigcont_failure_is_reported() {
+        let impossible_pid =
+            rustix::process::Pid::from_raw(i32::MAX).expect("i32::MAX is a non-zero pid");
+
+        assert!(!resume_x_server(impossible_pid));
+    }
+
+    fn signal_process(pid: rustix::process::Pid, signal: rustix::process::Signal) {
+        rustix::process::kill_process(pid, signal)
+            .unwrap_or_else(|error| panic!("{signal:?} X server {pid:?}: {error}"));
+    }
+
+    fn wait_until_stopped(pid: rustix::process::Pid) {
+        let stat = format!("/proc/{}/stat", pid.as_raw_nonzero());
+        for _ in 0..1000 {
+            let read = std::fs::read_to_string(&stat).expect("the X server's /proc entry");
+            let after_comm = read.rsplit_once(')').expect("an X-server comm field").1;
+            if after_comm.split_whitespace().next() == Some("T") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("X server {pid:?} never reached the stopped state");
     }
 
     /// The buttons and their positions a watching window saw, as `(detail, x, y)`.
@@ -2613,6 +3462,75 @@ mod display_tests {
 
     #[test]
     #[ignore = "starts a real X server; needs Xvfb"]
+    fn list_expiry_before_x_dispatch_does_not_close_the_connection() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let win = x.window().owned_by(pid).create();
+        plat.window = Some(win);
+        plat.window_process_tree_delay = Duration::from_millis(40);
+
+        let error = plat
+            .list_windows_by(Deadline::from_millis(5))
+            .expect_err("the deadline must expire during local process discovery");
+        plat.window_process_tree_delay = Duration::ZERO;
+        let retry = plat.list_windows_by(Deadline::from_millis(500));
+
+        assert_eq!(
+            (error.bound(), error.bound_owner(), error.bound_dispatch()),
+            (
+                Some(BoundKind::NotStarted),
+                Some(Whose::Caller),
+                Some(BoundDispatch::NotDispatched)
+            ),
+            "no X request was sent before the deadline elapsed: {error:?}"
+        );
+        assert!(
+            retry.is_ok(),
+            "pre-dispatch expiry must leave the X connection reusable: {retry:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn successful_armed_list_watch_is_cancelled_and_the_connection_stays_reusable() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let win = x.window().owned_by(pid).create();
+        plat.window = Some(win);
+
+        for attempt in 1..=8 {
+            let expires = Instant::now() + Duration::from_millis(300);
+            plat.window_process_tree_delay = Duration::from_millis(225);
+            let listed = plat
+                .list_windows_by(Deadline::at(expires))
+                .unwrap_or_else(|error| panic!("near-boundary list {attempt} failed: {error:?}"));
+            plat.window_process_tree_delay = Duration::ZERO;
+            assert!(
+                listed
+                    .iter()
+                    .any(|window| window.id == WindowId(win as u64)),
+                "near-boundary list {attempt} omitted the active window"
+            );
+
+            std::thread::sleep(
+                expires.saturating_duration_since(Instant::now()) + Duration::from_millis(40),
+            );
+            let reuse = plat.list_windows_by(Deadline::from_millis(500));
+            assert!(
+                reuse.is_ok(),
+                "armed watch {attempt} was not cancelled before its deadline: {reuse:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn listing_windows_without_an_active_one_is_an_error_not_an_empty_list() {
         let x = TestX::start();
         let mut plat = x.platform();
@@ -2651,6 +3569,127 @@ mod display_tests {
             plat.window,
             Some(mine),
             "a refused selection must leave the active window where it was"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn select_expiry_before_x_dispatch_does_not_close_the_connection() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let win = x.window().owned_by(pid).create();
+        plat.window = Some(win);
+        plat.window_process_tree_delay = Duration::from_millis(40);
+
+        let error = plat
+            .select_window_by(WindowId(win as u64), Deadline::from_millis(5))
+            .expect_err("the deadline must expire during local process discovery");
+        plat.window_process_tree_delay = Duration::ZERO;
+        let retry = plat.select_window_by(WindowId(win as u64), Deadline::from_millis(500));
+
+        assert_eq!(
+            (error.bound(), error.bound_owner(), error.bound_dispatch()),
+            (
+                Some(BoundKind::NotStarted),
+                Some(Whose::Caller),
+                Some(BoundDispatch::NotDispatched)
+            ),
+            "no X request was sent before the deadline elapsed: {error:?}"
+        );
+        assert!(
+            retry.is_ok(),
+            "pre-dispatch expiry must leave the X connection reusable: {retry:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn in_flight_list_request_is_bounded_and_leaves_the_connection_fail_closed() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let win = x.window().owned_by(pid).create();
+        plat.window = Some(win);
+        let paused = PausedXServer::new(x.server_pid());
+
+        let started = Instant::now();
+        let error = plat
+            .list_windows_by(Deadline::from_millis(200))
+            .expect_err("the watchdog must interrupt an in-flight X request");
+        let elapsed = started.elapsed();
+        let rescue_fired = paused.resume();
+        let reuse = plat.list_windows_by(Deadline::from_millis(500));
+
+        assert!(
+            !rescue_fired,
+            "the independent X-server rescue fired before the watchdog answered"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the stalled X request exceeded its bound: {elapsed:?}"
+        );
+        assert_eq!(
+            (error.bound(), error.bound_owner(), error.bound_dispatch()),
+            (
+                Some(BoundKind::TimedOut),
+                Some(Whose::Caller),
+                Some(BoundDispatch::MayHaveDispatched)
+            ),
+            "the X request was in flight when the deadline elapsed: {error:?}"
+        );
+        assert!(
+            reuse.is_err(),
+            "a connection whose request/reply framing was lost must remain fail-closed"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn in_flight_list_watch_uses_the_remaining_absolute_deadline_after_local_work() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let win = x.window().owned_by(pid).create();
+        plat.window = Some(win);
+        plat.window_process_tree_delay = Duration::from_millis(350);
+        let paused = PausedXServer::new(x.server_pid());
+
+        let started = Instant::now();
+        let error = plat
+            .list_windows_by(Deadline::at(started + Duration::from_millis(600)))
+            .expect_err("the remaining caller deadline must interrupt the stopped X server");
+        let elapsed = started.elapsed();
+        plat.window_process_tree_delay = Duration::ZERO;
+        let rescue_fired = paused.resume();
+
+        assert!(
+            !rescue_fired,
+            "the independent X-server rescue fired before the absolute deadline"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "the request did not remain in flight until near its caller deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "arming started a fresh duration after local work instead of using the caller deadline: \
+             {elapsed:?}"
+        );
+        assert_eq!(
+            (error.bound(), error.bound_owner(), error.bound_dispatch()),
+            (
+                Some(BoundKind::TimedOut),
+                Some(Whose::Caller),
+                Some(BoundDispatch::MayHaveDispatched)
+            ),
+            "the X request was in flight when the absolute deadline elapsed: {error:?}"
         );
     }
 

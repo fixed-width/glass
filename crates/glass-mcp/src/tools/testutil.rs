@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use glass_core::{
     Accessibility, AppSpec, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget,
-    AxTree, Backend, BaselineStore, Frame, Glass, GlassError, KeyEvent, Platform, PlatformFactory,
-    PointerEvent, Region, Result, Stream, Truncation, TruncationLimit, WindowGeometry, WindowId,
-    WindowInfo, WindowOp,
+    AxTree, Backend, BaselineStore, Deadline, Frame, Glass, GlassError, KeyEvent, Platform,
+    PlatformFactory, PointerEvent, Region, Result, Stream, Truncation, TruncationLimit,
+    WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 
 use super::{OutContent, ToolOutput};
@@ -22,12 +22,15 @@ pub struct FakePlatform {
     pub started: bool,
     pub events: Arc<Mutex<Vec<String>>>,
     pub clipboard: String,
+    pub window_frame: Option<(WindowId, Frame)>,
     /// Count of `capture_frame` calls — lets a test assert a settle actually captured
     /// frames (e.g. `return:"snapshot"` settling before it folds the tree).
     pub captures: Arc<Mutex<usize>>,
     /// Specs `start_app` was handed, in order — the only observer of what the tool layer
     /// built from `glass_start`'s arguments.
     pub specs: Arc<Mutex<Vec<AppSpec>>>,
+    pub fail_text_dispatch_after_receiving: bool,
+    pub trailing_toggle: bool,
 }
 
 impl FakePlatform {
@@ -46,6 +49,10 @@ impl FakePlatform {
         self.frames = frames.into();
         self
     }
+    pub fn with_window_frame(mut self, id: WindowId, frame: Frame) -> Self {
+        self.window_frame = Some((id, frame));
+        self
+    }
     pub fn with_logs(mut self, logs: Vec<(Stream, &str)>) -> Self {
         self.pending_logs = logs.into_iter().map(|(s, t)| (s, t.to_string())).collect();
         self
@@ -60,6 +67,14 @@ impl FakePlatform {
     }
     pub fn with_spec_log(mut self, log: Arc<Mutex<Vec<AppSpec>>>) -> Self {
         self.specs = log;
+        self
+    }
+    pub fn fail_text_dispatch_after_receiving(mut self) -> Self {
+        self.fail_text_dispatch_after_receiving = true;
+        self
+    }
+    pub fn with_trailing_toggle(mut self) -> Self {
+        self.trailing_toggle = true;
         self
     }
 }
@@ -87,7 +102,10 @@ impl Platform for FakePlatform {
         self.started = false;
         Ok(())
     }
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
         *self.captures.lock().unwrap() += 1;
         let frame = match self.frames.pop_front() {
             Some(f) => {
@@ -103,7 +121,35 @@ impl Platform for FakePlatform {
             None => Ok(frame),
         }
     }
-    fn send_pointer(&mut self, e: &PointerEvent) -> Result<()> {
+
+    fn capture_window_by(
+        &mut self,
+        id: WindowId,
+        region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        let Some((scripted_id, frame)) = &self.window_frame else {
+            return Err(GlassError::Unsupported(
+                "capture_window is not supported by this backend".into(),
+            ));
+        };
+        if *scripted_id != id {
+            return Err(GlassError::WindowNotFound);
+        }
+        let frame = frame.clone();
+        match region {
+            Some(region) => frame.crop(region),
+            None => Ok(frame),
+        }
+    }
+
+    fn send_pointer_by(&mut self, e: &PointerEvent, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("pointer input"));
+        }
         self.events.lock().unwrap().push(match e {
             PointerEvent::Click { x, y, .. } => format!("click({x},{y})"),
             PointerEvent::Move { x, y } => format!("move({x},{y})"),
@@ -122,15 +168,32 @@ impl Platform for FakePlatform {
         self.pointer_events.push(e.clone());
         Ok(())
     }
-    fn send_key(&mut self, e: &KeyEvent) -> Result<()> {
+    fn send_key_by(&mut self, e: &KeyEvent, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("key input"));
+        }
         self.events.lock().unwrap().push(match e {
             KeyEvent::Text(t) => format!("type({t})"),
             KeyEvent::Chord(c) => format!("key({c})"),
         });
         self.key_events.push(e.clone());
+        if self.fail_text_dispatch_after_receiving
+            && let KeyEvent::Text(text) = e
+        {
+            return Err(GlassError::Backend(format!(
+                "text dispatch rejected debug={text:?} hex={}",
+                text.as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )));
+        }
         Ok(())
     }
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window operation"));
+        }
         match *op {
             WindowOp::Resize { width, height } => {
                 self.geometry.width = width;
@@ -144,7 +207,10 @@ impl Platform for FakePlatform {
         }
         Ok(self.geometry.clone())
     }
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window list"));
+        }
         Ok(vec![WindowInfo {
             id: WindowId(0),
             title: Some("fake".into()),
@@ -153,7 +219,10 @@ impl Platform for FakePlatform {
             active: true,
         }])
     }
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window selection"));
+        }
         if id == WindowId(0) {
             Ok(self.geometry.clone())
         } else {
@@ -169,6 +238,9 @@ impl Platform for FakePlatform {
     fn set_clipboard(&mut self, text: &str) -> Result<()> {
         self.clipboard = text.to_string();
         Ok(())
+    }
+    fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
+        self.trailing_toggle
     }
 }
 
@@ -197,6 +269,7 @@ pub enum SetOutcome {
     Ok,
     NotEditable,
     Changed,
+    EchoText,
 }
 
 /// What `FakeAccessibility::invoke` should do. Default mirrors the trait's own
@@ -210,6 +283,7 @@ pub enum InvokeOutcome {
     Ok,
     /// The native action fired on a different element than the one named.
     OkOnAnother(u32),
+    ErrorWithDetail(&'static str),
 }
 
 pub struct FakeAccessibility {
@@ -229,6 +303,19 @@ impl Accessibility for FakeAccessibility {
                 return Err(GlassError::AxElementNotEditable(target.id.0));
             }
             SetOutcome::Changed => return Err(GlassError::AxElementChanged(target.id.0)),
+            SetOutcome::EchoText => {
+                self.set_log
+                    .lock()
+                    .unwrap()
+                    .push((target.clone(), text.to_string()));
+                return Err(GlassError::Backend(format!(
+                    "set-value rejected debug={text:?} hex={}",
+                    text.as_bytes()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                )));
+            }
             SetOutcome::Ok => {}
         }
         self.set_log
@@ -242,6 +329,7 @@ impl Accessibility for FakeAccessibility {
             InvokeOutcome::Unsupported => Err(GlassError::AxUnsupported),
             InvokeOutcome::Ok => Ok(None),
             InvokeOutcome::OkOnAnother(id) => Ok(Some(AxNodeId(id))),
+            InvokeOutcome::ErrorWithDetail(detail) => Err(GlassError::Backend(detail.into())),
         }
     }
 }
@@ -378,6 +466,20 @@ pub fn glass_with_a11y_invoke_on_another(
         tree,
         SetOutcome::Ok,
         InvokeOutcome::OkOnAnother(actuated),
+    )
+}
+
+/// A backend whose native semantic click path returns the supplied raw detail.
+pub fn glass_with_a11y_invoke_error(
+    platform: FakePlatform,
+    tree: AxTree,
+    detail: &'static str,
+) -> Glass {
+    glass_with_a11y_full(
+        platform,
+        tree,
+        SetOutcome::Ok,
+        InvokeOutcome::ErrorWithDetail(detail),
     )
 }
 

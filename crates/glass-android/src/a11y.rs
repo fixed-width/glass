@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree};
-use glass_core::{Deadline, Whose};
+use glass_core::{BoundDispatch, Deadline, Whose};
 use glass_core::{
     GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, WindowGeometry,
-    read_back_failed, verify_typed_write,
+    verify_typed_write,
 };
 
 use crate::adb::{Adb, AdbOp};
@@ -103,17 +103,20 @@ fn reap_deadline(attempt: Instant) -> Instant {
 /// What a read reports when the caller's deadline, not the device, ended it — naming what the last
 /// attempt saw, where there was one.
 ///
-/// [`GlassError::AccessibilityNotReady`] rather than the timeout adb raised: that is the variant
-/// `wait_for_element` polls through, keeping a spent budget distinguishable from an element that
-/// is genuinely absent (glass#329).
-fn out_of_time(last: Option<&GlassError>) -> GlassError {
+/// The structural caller bound is retained so an outer wait can distinguish a spent sequence
+/// budget from a device failure. `attempted` records whether adb work was dispatched before it.
+fn out_of_time(last: Option<&GlassError>, attempted: bool) -> GlassError {
+    if !attempted {
+        return GlassError::deadline_not_started("Android accessibility snapshot");
+    }
     let seen = match last {
         Some(e) => format!(" (last attempt: {e})"),
         None => String::new(),
     };
-    GlassError::AccessibilityNotReady(format!(
-        "uiautomator served no tree within the time this call allowed{seen}"
-    ))
+    GlassError::caller_deadline_elapsed_with_guidance(
+        "Android accessibility snapshot",
+        &format!("uiautomator served no tree within the time this call allowed{seen}"),
+    )
 }
 
 /// What one dump attempt settled, for a loop deciding whether another would help.
@@ -252,14 +255,16 @@ fn dump_until_ready(
     let mut owed = bound.least.max(1);
     // Kept so a spent caller deadline can name what the device last said, not just the budget.
     let mut unready: Option<GlassError> = None;
+    let mut attempted = false;
     loop {
         // Answered here rather than through the cap below: the runner seam does not promise a
         // spent deadline is refused, and a read that never happened should not have to be
         // inferred from the error it returns.
         if caller.has_passed() {
-            return Err(out_of_time(unready.as_ref()));
+            return Err(out_of_time(unready.as_ref(), attempted));
         }
         let (ends, whose) = caller.resolve(attempt_deadline());
+        attempted = true;
         match dump_once(run, prefix, ends) {
             Attempt::Dumped(xml) => return Ok(xml),
             // An attempt the *caller's* deadline cut short is not a device that failed.
@@ -268,7 +273,7 @@ fn dump_until_ready(
             // here too — it cannot be told apart from a slow one at the moment the budget ends —
             // and its message is the only place glass names the `adb kill-server` remedy.
             Attempt::Fatal(e) if whose == Whose::Caller && bound_fired(&e) => {
-                return Err(out_of_time(Some(&e)));
+                return Err(out_of_time(Some(&e), attempted));
             }
             Attempt::Fatal(e) => return Err(e),
             Attempt::NotReady(e) => {
@@ -278,7 +283,7 @@ fn dump_until_ready(
                     // The caller closing the window is about the budget, not the device — even
                     // with the device's own answer in hand.
                     return Err(if caller.has_passed() {
-                        out_of_time(Some(&e))
+                        out_of_time(Some(&e), attempted)
                     } else {
                         e
                     });
@@ -407,7 +412,7 @@ impl AndroidA11y {
     /// for retries a [`snapshot_bound`] would not give it — immediately after typing, where the
     /// tree is expected to be unreadable for a moment and no deadline says how long to allow.
     fn snapshot_within(&mut self, ctx: &AxContext, bound: RetryBound) -> Result<AxTree> {
-        let adb = self.ensure_adb()?;
+        let adb = self.ensure_adb_within(ctx.deadline)?;
         let tree = snapshot_with_runner(&mut adb_runner(&adb), ctx, bound)?;
         self.warmed = true;
         Ok(tree)
@@ -434,9 +439,19 @@ impl AndroidA11y {
     }
 
     /// Bind the adb client to a device serial on first use (lazy).
+    #[cfg(all(test, unix))]
     fn ensure_adb(&mut self) -> Result<Adb> {
+        self.ensure_adb_within(Deadline::UNBOUNDED)
+    }
+
+    fn ensure_adb_within(&mut self, deadline: Deadline) -> Result<Adb> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "Android accessibility target resolution",
+            ));
+        }
         if !self.resolved {
-            let listing = self.adb.run(["devices"])?;
+            let listing = self.adb.run_until(["devices"], deadline)?;
             let online: Vec<_> = parse_devices(&listing)
                 .into_iter()
                 .filter(|d| d.state == "device")
@@ -534,16 +549,77 @@ fn locate_editable_target(
         .ok_or(GlassError::AxElementNotClickable(target.id.0))
 }
 
+fn write_unconfirmed(target: u32, error: GlassError) -> GlassError {
+    GlassError::write_unconfirmed_because(
+        target,
+        "the Android input value mutation may have run but failed before it could be confirmed",
+        error,
+    )
+}
+
+fn require_time(
+    deadline: Deadline,
+    target: u32,
+    external_dispatched: bool,
+    value_dispatched: bool,
+) -> Result<()> {
+    if !deadline.has_passed() {
+        return Ok(());
+    }
+    Err(if value_dispatched {
+        write_unconfirmed(
+            target,
+            GlassError::caller_deadline_elapsed("Android accessibility set_value"),
+        )
+    } else if external_dispatched {
+        GlassError::caller_deadline_elapsed("Android accessibility set_value")
+    } else {
+        GlassError::deadline_not_started("Android accessibility set_value")
+    })
+}
+
+fn command_error(
+    target: u32,
+    external_dispatched: bool,
+    value_dispatched: bool,
+    mutates_value: bool,
+    error: GlassError,
+) -> GlassError {
+    if value_dispatched
+        || (mutates_value && error.bound_dispatch() != Some(BoundDispatch::NotDispatched))
+    {
+        write_unconfirmed(target, error)
+    } else if external_dispatched && error.bound_dispatch() == Some(BoundDispatch::NotDispatched) {
+        error.after_dispatch()
+    } else {
+        error
+    }
+}
+
+fn verification_phase_owned_by_caller(owner: Whose) -> bool {
+    owner == Whose::Caller
+}
+
 impl Accessibility for AndroidA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         self.snapshot_within(ctx, snapshot_bound(self.warmth(), ctx.deadline))
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+        fn read_back_error(target: &AxTarget, error: GlassError) -> GlassError {
+            GlassError::write_unconfirmed_because(
+                target.id.0,
+                "reading the element back failed",
+                error,
+            )
+        }
+
+        require_time(ctx.deadline, target.id.0, false, false)?;
         let window = ctx.window.clone();
-        let adb = self.ensure_adb()?;
+        let adb = self.ensure_adb_within(ctx.deadline)?;
         // Re-snapshot and number nodes to locate the target by its pre-order id.
         let (cx, cy) = locate_for_write(&mut adb_runner(&adb), ctx, target)?;
+        require_time(ctx.deadline, target.id.0, false, false)?;
         self.warmed = true;
         // Tap to focus, select-all, delete, type — reusing the P2 input builders.
         let tap = PointerEvent::Click {
@@ -553,16 +629,48 @@ impl Accessibility for AndroidA11y {
             count: 1,
             modifiers: vec![],
         };
-        for argv in pointer_commands(&window, &tap) {
-            adb.run(argv.iter().map(String::as_str))?;
+        let mut external_dispatched = false;
+        let mut value_dispatched = false;
+        for argv in pointer_commands(&window, &tap)? {
+            require_time(
+                ctx.deadline,
+                target.id.0,
+                external_dispatched,
+                value_dispatched,
+            )?;
+            adb.run_until(argv.iter().map(String::as_str), ctx.deadline)
+                .map_err(|e| {
+                    command_error(target.id.0, external_dispatched, value_dispatched, false, e)
+                })?;
+            external_dispatched = true;
         }
-        for ev in [
-            KeyEvent::Chord("ctrl+a".into()),
-            KeyEvent::Chord("BackSpace".into()),
-            KeyEvent::Text(text.to_string()),
+        for (ev, mutates_value) in [
+            (KeyEvent::Chord("ctrl+a".into()), false),
+            (KeyEvent::Chord("BackSpace".into()), true),
+            (KeyEvent::Text(text.to_string()), true),
         ] {
-            for argv in key_commands(&ev)? {
-                adb.run(argv.iter().map(String::as_str))?;
+            let commands = key_commands(&ev).map_err(|e| {
+                command_error(target.id.0, external_dispatched, value_dispatched, false, e)
+            })?;
+            for argv in commands {
+                require_time(
+                    ctx.deadline,
+                    target.id.0,
+                    external_dispatched,
+                    value_dispatched,
+                )?;
+                adb.run_until(argv.iter().map(String::as_str), ctx.deadline)
+                    .map_err(|e| {
+                        command_error(
+                            target.id.0,
+                            external_dispatched,
+                            value_dispatched,
+                            mutates_value,
+                            e,
+                        )
+                    })?;
+                external_dispatched = true;
+                value_dispatched |= mutates_value;
             }
         }
 
@@ -573,22 +681,44 @@ impl Accessibility for AndroidA11y {
         // and typed into — so it says so, because a caller that retries blindly types twice. Each
         // read retries a not-ready device even on a warmed reader: the IME and any suggestion strip
         // are still animating, which is exactly when a dump comes back not-ready.
-        let phase_ends = Instant::now() + Duration::from_millis(VERIFY_PHASE_BUDGET_MS);
+        let (phase_ends, phase_owner) = ctx
+            .deadline
+            .resolve(Instant::now() + Duration::from_millis(VERIFY_PHASE_BUDGET_MS));
         let mut last = None;
         for _ in 0..VERIFY_ATTEMPTS {
-            std::thread::sleep(Duration::from_millis(VERIFY_SETTLE_MS));
+            require_time(
+                ctx.deadline,
+                target.id.0,
+                external_dispatched,
+                value_dispatched,
+            )?;
+            let requested = Duration::from_millis(VERIFY_SETTLE_MS)
+                .min(phase_ends.saturating_duration_since(Instant::now()));
+            std::thread::sleep(ctx.deadline.remaining().unwrap_or(requested).min(requested));
+            require_time(
+                ctx.deadline,
+                target.id.0,
+                external_dispatched,
+                value_dispatched,
+            )?;
             let mut after = self
                 .snapshot_within(ctx, VERIFY_BOUND)
-                .map_err(|e| read_back_failed(target, &e))?;
+                .map_err(|e| read_back_error(target, e))?;
             after.assign_ids();
             match verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED) {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later read: drift and truncation are
                 // structural, and re-dumping for them costs seconds to reach the same answer.
                 Err(e @ GlassError::AxValueNotApplied { .. }) => last = Some(e),
-                Err(e) => return Err(e),
+                Err(e) => return Err(read_back_error(target, e)),
             }
             if Instant::now() >= phase_ends {
+                if verification_phase_owned_by_caller(phase_owner) {
+                    let error = GlassError::caller_deadline_elapsed(
+                        "Android accessibility set_value verification",
+                    );
+                    return Err(read_back_error(target, error));
+                }
                 break;
             }
         }
@@ -601,15 +731,16 @@ impl Accessibility for AndroidA11y {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attempt, COLD_BOUND, RetryBound, Warmth, bound_fired, dump_once, dump_until_ready,
-        editable_target, locate_editable_target, locate_for_write, snapshot_bound,
-        snapshot_with_runner,
+        Attempt, COLD_BOUND, RetryBound, Warmth, bound_fired, command_error, dump_once,
+        dump_until_ready, editable_target, locate_editable_target, locate_for_write, require_time,
+        snapshot_bound, snapshot_with_runner, verification_phase_owned_by_caller,
     };
     use crate::adb::{AdbOp, a_failed_call, a_real_spawn_failure, a_real_timeout_hinted};
     use glass_core::Deadline;
     use glass_core::accessibility::{
         AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree, WalkLimits,
     };
+    use glass_core::{BoundDispatch, Whose};
     use glass_core::{BoundKind, GlassError, Result, WindowGeometry};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -617,6 +748,76 @@ mod tests {
     /// A deadline no test reaches, for the cases that are not about the bound.
     fn ample() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn set_value_deadline_classification_tracks_external_and_value_dispatch() {
+        assert!(require_time(Deadline::at(ample()), 7, false, false).is_ok());
+
+        let before = require_time(Deadline::from_millis(0), 7, false, false).unwrap_err();
+        assert_eq!(before.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(before.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(!before.set_value_failed_after_writing());
+
+        let external = require_time(Deadline::from_millis(0), 7, true, false).unwrap_err();
+        assert_eq!(external.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(
+            external.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(!external.set_value_failed_after_writing());
+
+        let value = require_time(Deadline::from_millis(0), 7, true, true).unwrap_err();
+        assert_eq!(value.bound(), Some(BoundKind::TimedOut));
+        assert!(value.set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn command_error_upgrades_only_proven_prior_dispatch_or_ambiguous_value_work() {
+        let not_started = || GlassError::deadline_not_started("scripted command");
+        let untouched = command_error(7, false, false, false, not_started());
+        assert_eq!(
+            untouched.bound_dispatch(),
+            Some(BoundDispatch::NotDispatched)
+        );
+
+        let after_external = command_error(7, true, false, false, not_started());
+        assert_eq!(
+            after_external.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(!after_external.set_value_failed_after_writing());
+
+        let refused_value = command_error(7, false, false, true, not_started());
+        assert_eq!(
+            refused_value.bound_dispatch(),
+            Some(BoundDispatch::NotDispatched)
+        );
+        assert!(!refused_value.set_value_failed_after_writing());
+
+        let ambiguous_value = command_error(
+            7,
+            false,
+            false,
+            true,
+            GlassError::Backend("transport lost".into()),
+        );
+        assert!(ambiguous_value.set_value_failed_after_writing());
+
+        let later_error = command_error(
+            7,
+            true,
+            true,
+            false,
+            GlassError::Backend("later failure".into()),
+        );
+        assert!(later_error.set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn only_the_outer_caller_owns_verification_expiry() {
+        assert!(verification_phase_owned_by_caller(Whose::Caller));
+        assert!(!verification_phase_owned_by_caller(Whose::Callee));
     }
 
     /// A spent-deadline error as `glass_core` really raises one. Nothing is spawned on that path,
@@ -905,7 +1106,13 @@ mod tests {
             !ran,
             "an adb step ran for a caller that had stopped waiting"
         );
-        assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
+        assert_eq!(e.bound(), Some(BoundKind::NotStarted), "{e}");
+        assert_eq!(e.bound_owner(), Some(Whose::Caller), "{e}");
+        assert_eq!(
+            e.bound_dispatch(),
+            Some(BoundDispatch::NotDispatched),
+            "{e}"
+        );
     }
 
     /// glass#338: before the deadline reached the reader, one attempt was the only safe number —
@@ -965,7 +1172,13 @@ mod tests {
         )
         .expect_err("the caller's deadline passed during the attempt");
 
-        assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
+        assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
+        assert_eq!(e.bound_owner(), Some(Whose::Caller), "{e}");
+        assert_eq!(
+            e.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{e}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "slept a retry interval for a caller that had stopped waiting: {:?}",
@@ -1051,6 +1264,77 @@ mod tests {
             limits: WalkLimits::DEFAULT,
             deadline: Deadline::UNBOUNDED,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn semantic_caller_deadline_stops_before_uiautomator_target_resolution() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+        let mut ctx = write_ctx();
+        ctx.deadline = Deadline::from_millis(0);
+        let target = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: None,
+            value: None,
+        };
+
+        let error = reader
+            .set_value(&ctx, &target, "new")
+            .expect_err("a spent semantic deadline stops before target resolution");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::NotDispatched),
+            "{error}"
+        );
+        assert!(!error.invoke_fallback_eligible(), "{error}");
+        assert!(!error.set_value_failed_after_writing(), "{error}");
+        assert!(
+            fake.calls().is_empty(),
+            "a later device phase started after the caller deadline: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_late_target_resolution_failure_preserves_the_error_from_work_that_ran() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let fake = FakeAdb::new(&[("*uiautomator dump*", Answer::Lingers)]);
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+        let mut ctx = write_ctx();
+        ctx.deadline = Deadline::from_millis(100);
+        let target = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: None,
+            value: None,
+        };
+
+        let error = reader
+            .set_value(&ctx, &target, "new")
+            .expect_err("the uiautomator dump outlasts the caller deadline");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "the dump process was started before it timed out: {error}"
+        );
+        assert!(!fake.calls().is_empty(), "target resolution never started");
     }
 
     /// The retry the deadline exists to permit actually happens: a caller still waiting gets its
@@ -1221,6 +1505,13 @@ mod tests {
         .expect_err("the caller's deadline passed during the first attempt");
 
         assert_eq!(dumps, 1, "the owed attempt ran for a caller that had gone");
+        assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
+        assert_eq!(e.bound_owner(), Some(Whose::Caller), "{e}");
+        assert_eq!(
+            e.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{e}"
+        );
         assert!(
             e.to_string().contains("null root node"),
             "the spent-budget error dropped what the device had said: {e}"
@@ -1244,7 +1535,13 @@ mod tests {
             Deadline::from_millis(20),
         )
         .expect_err("the attempt was abandoned");
-        assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
+        assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
+        assert_eq!(e.bound_owner(), Some(Whose::Caller), "{e}");
+        assert_eq!(
+            e.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{e}"
+        );
         // A wedged adb reaches this arm too, and its message is the only place glass names the
         // `adb kill-server` remedy — dropping it leaves an operator reading "the app is slow".
         assert!(
@@ -1957,6 +2254,276 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    fn write_context() -> AxContext {
+        AxContext {
+            pids: vec![],
+            window: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 2400,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(30_000),
+        }
+    }
+
+    #[cfg(unix)]
+    fn field_target(value: Option<&str>) -> AxTarget {
+        AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: Some(AxRect {
+                x: 100,
+                y: 200,
+                width: 400,
+                height: 100,
+            }),
+            value: value.map(str::to_string),
+        }
+    }
+
+    /// Put a self-deleting shim in front of a [`crate::adb::FakeAdb`]. The command matching
+    /// `trigger` runs and succeeds through the real fake; the following command then gets a real
+    /// process-spawn error.
+    #[cfg(unix)]
+    fn fail_next_adb_spawn_after(
+        fake: &crate::adb::FakeAdb,
+        trigger: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let bin = std::path::PathBuf::from(fake.adb().bin());
+        let delegate = bin.with_file_name("adb-delegate");
+        std::fs::rename(&bin, &delegate).expect("move the fake adb behind its shim");
+        let script = format!(
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+real="$dir/adb-delegate"
+case "$*" in
+  *"{trigger}"*)
+    "$real" "$@"
+    status=$?
+    rm -f "$0"
+    exit "$status"
+    ;;
+esac
+exec "$real" "$@"
+"#
+        );
+        let written = fake.alongside("adb", &script);
+        assert_eq!(written, bin);
+        (bin, delegate)
+    }
+
+    #[cfg(unix)]
+    fn restore_fake_adb(bin: &std::path::Path, delegate: &std::path::Path) {
+        let _ = std::fs::remove_file(bin);
+        std::fs::rename(delegate, bin).expect("restore the fake adb executable");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_backspace_spawn_failure_after_focus_and_selection_is_not_a_value_write() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let before = Answer::says(one_field_holding("hello"));
+        let fake = FakeAdb::new(&[("*shell cat*", before), ("*", Answer::Silent)]);
+        fail_next_adb_spawn_after(&fake, "input keycombination");
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+
+        let error = reader
+            .set_value(&write_context(), &field_target(None), "world")
+            .expect_err("Backspace cannot spawn after the shim removes adb");
+
+        assert!(fake.called("input tap 300 250"), "{:?}", fake.calls());
+        assert!(fake.called("input keycombination"), "{:?}", fake.calls());
+        assert!(!fake.called("input keyevent 67"), "{:?}", fake.calls());
+        assert!(matches!(error.cause(), GlassError::Backend(_)), "{error:?}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{error:?}"
+        );
+        assert!(!error.set_value_failed_after_writing(), "{error:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_text_spawn_failure_after_backspace_remains_an_unconfirmed_value_write() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let before = Answer::says(one_field_holding("hello"));
+        let fake = FakeAdb::new(&[("*shell cat*", before), ("*", Answer::Silent)]);
+        fail_next_adb_spawn_after(&fake, "input keyevent 67");
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+
+        let error = reader
+            .set_value(&write_context(), &field_target(None), "world")
+            .expect_err("text cannot spawn after the shim removes adb");
+
+        assert!(fake.called("input keycombination"), "{:?}", fake.calls());
+        assert!(fake.called("input keyevent 67"), "{:?}", fake.calls());
+        assert!(!fake.called("input text"), "{:?}", fake.calls());
+        assert!(matches!(error.cause(), GlassError::Backend(_)), "{error:?}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{error:?}"
+        );
+        assert!(error.set_value_failed_after_writing(), "{error:?}");
+    }
+
+    #[cfg(unix)]
+    struct SessionPlatform;
+
+    #[cfg(unix)]
+    impl glass_core::Platform for SessionPlatform {
+        fn start_app(&mut self, _spec: &glass_core::AppSpec) -> Result<WindowGeometry> {
+            Ok(write_context().window)
+        }
+
+        fn stop_app_by(&mut self, _deadline: Deadline) -> Result<()> {
+            Ok(())
+        }
+
+        fn capture_frame_by(
+            &mut self,
+            _region: Option<&glass_core::Region>,
+            _deadline: Deadline,
+        ) -> Result<glass_core::Frame> {
+            Err(GlassError::CaptureFailed("unused in this test".into()))
+        }
+
+        fn capture_window_by(
+            &mut self,
+            _id: glass_core::WindowId,
+            _region: Option<&glass_core::Region>,
+            _deadline: Deadline,
+        ) -> Result<glass_core::Frame> {
+            Err(GlassError::CaptureFailed("unused in this test".into()))
+        }
+
+        fn send_pointer_by(
+            &mut self,
+            _event: &glass_core::PointerEvent,
+            _deadline: Deadline,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_key_by(
+            &mut self,
+            _event: &glass_core::KeyEvent,
+            _deadline: Deadline,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn window_by(
+            &mut self,
+            _op: &glass_core::WindowOp,
+            _deadline: Deadline,
+        ) -> Result<WindowGeometry> {
+            Ok(write_context().window)
+        }
+
+        fn list_windows_by(&mut self, _deadline: Deadline) -> Result<Vec<glass_core::WindowInfo>> {
+            Ok(vec![])
+        }
+
+        fn select_window_by(
+            &mut self,
+            _id: glass_core::WindowId,
+            _deadline: Deadline,
+        ) -> Result<WindowGeometry> {
+            Ok(write_context().window)
+        }
+
+        fn drain_logs(&mut self) -> Vec<(glass_core::Stream, String)> {
+            vec![]
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_session_retains_the_captured_value_guard_after_backspace_never_spawns() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::{Backend, BaselineStore, Glass, PlatformFactory, SandboxLevel};
+
+        let alice = Answer::says(one_field_holding("Alice"));
+        let zara = Answer::says(one_field_holding("Zara"));
+        let written = Answer::says(one_field_holding("updated"));
+        let fake = FakeAdb::scripted(&[
+            ("*shell cat*", vec![&alice, &alice, &zara, &written]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+        let (bin, delegate) = fail_next_adb_spawn_after(&fake, "input keycombination");
+        let backend = Backend {
+            platform: Box::new(SessionPlatform),
+            accessibility: Some(Box::new(AndroidA11y::for_adb(fake.adb().clone()))),
+        };
+        let mut backend = Some(backend);
+        let factory: PlatformFactory = Box::new(move |_| {
+            backend
+                .take()
+                .ok_or_else(|| GlassError::Backend("test backend constructed twice".into()))
+        });
+        let baseline_root = std::env::temp_dir().join(format!(
+            "glass-android-set-value-guard-{}",
+            std::process::id()
+        ));
+        let mut glass = Glass::new(
+            factory,
+            "android-test".into(),
+            BaselineStore::new(baseline_root),
+            16,
+        );
+        glass
+            .start(&glass_core::AppSpec {
+                build: None,
+                run: vec!["test-app".into()],
+                cwd: None,
+                env: vec![],
+                window_hint: None,
+                timeout_ms: 1_000,
+                sandbox: SandboxLevel::Off,
+                a11y: true,
+            })
+            .expect("start the test session");
+        glass.a11y_snapshot(None).expect("capture Alice");
+
+        let first = glass
+            .set_value(AxNodeId(1), "updated")
+            .expect_err("Backspace cannot spawn");
+        restore_fake_adb(&bin, &delegate);
+        assert!(!first.set_value_failed_after_writing(), "{first:?}");
+
+        let retry = glass
+            .set_value(AxNodeId(1), "updated")
+            .expect_err("the recycled Zara row must still fail the Alice value guard");
+        assert!(
+            matches!(retry, GlassError::AxElementChanged(1)),
+            "{retry:?}"
+        );
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| call.contains("input tap"))
+                .count(),
+            1,
+            "the retry must stop before focusing the recycled row: {:?}",
+            fake.calls()
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn a_write_taps_the_field_clears_it_types_and_waits_for_the_value_to_land() {
@@ -2018,6 +2585,64 @@ mod tests {
             "the field must be cleared first: {:?}",
             fake.calls()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_timeout_during_uiautomator_text_input_is_an_unconfirmed_write() {
+        use super::AndroidA11y;
+        use crate::adb::{Answer, FakeAdb};
+        use glass_core::Accessibility;
+
+        let before = Answer::says(one_field_holding("hello"));
+        let fake = FakeAdb::new(&[
+            ("*input text*", Answer::Lingers),
+            ("*shell cat*", before),
+            ("*", Answer::Silent),
+        ]);
+        let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+        let ctx = AxContext {
+            pids: vec![],
+            window: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 2400,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: Deadline::from_millis(2_000),
+        };
+        let field = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: Some(AxRect {
+                x: 100,
+                y: 200,
+                width: 400,
+                height: 100,
+            }),
+            value: None,
+        };
+
+        let error = reader
+            .set_value(&ctx, &field, "world")
+            .expect_err("the text input process outlives the caller deadline");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::Bounded { .. }),
+            "{error}"
+        );
+        assert!(error.set_value_failed_after_writing(), "{error}");
     }
 
     #[test]

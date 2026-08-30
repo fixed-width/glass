@@ -342,7 +342,8 @@ Click at window-relative coordinates.
 
 - `x`, `y` (integer, **required**) — window-relative target.
 - `button` (string) — `"left"` (default), `"right"`, or `"middle"`.
-- `count` (integer) — click count (e.g. `2` for double-click).
+- `count` (integer, default 1, range 1–10) — consecutive click count (e.g. `2` for
+  double-click). Larger values are rejected before input dispatch.
 - `modifiers` (array of string) — keys held during the click.
 
 ### `glass_type`
@@ -351,8 +352,8 @@ Type a string into the focused window.
 
 - `text` (string, **required**).
 - `return` (string) — `"snapshot"`, `"settle"`, or `"none"` (default), as for
-  `glass_click_element`. Not accepted inside a `glass_do` `type` action — use a `settle`
-  action or the terminal `then` observe there.
+  `glass_click_element`. All three values are also accepted inside a `glass_do` `type` action;
+  the chosen observation is retained in that action step's `result` and sibling `content_blocks`.
 
 Returns `{}` plus `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`,
 exactly as for `glass_click_element`.
@@ -368,10 +369,11 @@ Press a key chord.
 Scroll at window-relative coordinates by wheel notches.
 
 - `x`, `y` (integer, **required**) — window-relative point.
-- `dx`, `dy` (integer) — horizontal/vertical scroll in **wheel notches** (discrete clicks — small
-  integers like 1–5, not pixels). Positive `dy` is wheel-down, negative wheel-up; positive `dx`
-  reveals content to the **right**, negative to the left. glass clicks `|dx|`/`|dy|` times. How an
-  app maps a notch to its view (lines, pixels, zoom) is the app's choice.
+- `dx`, `dy` (integer, range -100–100) — horizontal/vertical scroll in **wheel notches**
+  (discrete clicks — normal usage is small integers like 1–5, not pixels). Positive `dy` is
+  wheel-down, negative wheel-up; positive `dx` reveals content to the **right**, negative to the
+  left. glass clicks `|dx|`/`|dy|` times. Values outside the safe range are rejected before input
+  dispatch. How an app maps a notch to its view (lines, pixels, zoom) is the app's choice.
 - `modifiers` (array of string) — keys held during the scroll.
 
 > **On touch backends (Android, iOS), `glass_scroll` is a real one-finger swipe — it is *input*,
@@ -434,28 +436,61 @@ the event — glass reports the binary and its build info if yours does not. Oth
 
 ### `glass_do`
 
-Run an ordered sequence of input actions in one call (collapsing per-action round-trips), then
-optionally observe.
+Run a bounded, fixed sequence of actions in one call, then optionally observe. The sequence is a
+static list: it cannot use variables, references to earlier results, interpolation, branching,
+loops, retries, or dynamically generated actions.
 
-- `actions` (array, **required**, non-empty) — each item is `{ action: "click"|"move"|"drag"|
-  "scroll"|"type"|"key"|"settle", ...fields }`. Click/move/drag/scroll/type/key take the same
-  fields as their matching tool, except that a `type` action rejects `return` (its observe output
-  would be discarded mid-sequence — use a `settle` action or `then`; an explicit `"none"` is
-  accepted). A `settle` action takes a *subset* of `glass_wait_stable`'s
-  fields — `interval_ms`, `settle_frames`, `tolerance`, `timeout_ms`, `stability_region`, and
-  `ignore` (the same window-relative-rectangles knob) — but no `window_id`, `region`, or
-  `include_image`: it always settles the active window and never returns an image. It waits for
-  the screen to stop changing between steps.
-- `then` (`{ settle?, diff?, screenshot? }`) — a terminal observe after all actions succeed; text-
-  first, returning an image only for `screenshot` (or `diff` with its own `include_image`).
+- `actions` (array, **required**, 1–64 items) — each item uses one discriminator: `click`, `move`,
+  `drag`, `scroll`, `type`, `key`, `settle`, `click_element`, `set_value`, `wait_for_element`, or
+  `scroll_to_element`. Each action reuses the fields of its standalone tool, including per-action
+  `return` where the standalone tool supports it. A `settle` action uses `interval_ms`,
+  `settle_frames`, `tolerance`, `timeout_ms`, `stability_region`, and `ignore`; it targets the active
+  window and does not return an image.
+- Each action has the same backend support, setup requirements, and `Unsupported` behavior as its
+  standalone tool. `glass_do` changes sequencing and outcome reporting, not platform capability.
+- `then` (`{ settle?, diff?, screenshot? }`) — terminal observation after every action succeeds,
+  performed in that order. Images are returned only when requested by `screenshot` or by a `diff`
+  whose `include_image` is true.
+- `timeout_ms` (integer, default 30000, range 1–120000) — one absolute deadline shared by all
+  actions and terminal observations. A blocking operation's own timeout remains a shorter ceiling
+  when it expires first.
 
-Fails fast: if an action errors it reports which index failed and how many ran. Use for **known**
-sequences (login, form-fill, menu→item); if you must see a result to choose the next action, don't
-batch that part.
+The compact UTF-8 JSON encoding of the complete arguments object may be at most 65,536 bytes.
+Preflight validation failures return `invalid_sequence` without action or terminal step outcomes.
+Once execution starts, the sequence is fail-fast. In a batch, `wait_for_element` or
+`scroll_to_element` returning
+`matched:false` fails the sequence; the standalone tools keep their soft `{matched:false}` result.
 
-Returns `{executed}` (the number of actions that ran) plus, when `then` was given, a `then` object
-keyed by whichever of `settle`/`diff`/`screenshot` you asked for — each key holds that sub-tool's
-own `result` shape from its entry above.
+On success, `result` contains `{status, executed, steps, elapsed_ms, then?, terminal_steps?}`.
+`steps` records each action's index, discriminator, `completed` status, trusted result, and any
+zero-based references into the MCP content blocks.
+
+Failed execution remains an MCP error with `is_error:true`. `executed` counts only successfully
+completed actions. The failed step records `attempted`, `side_effects_may_have_occurred`,
+optional `result?` evidence produced before the failure, `error.{code,summary,category?}`, and
+`content_blocks`; later steps use `status:"unexecuted"`. `effects_rolled_back:false` means Glass
+performed no rollback, so landed effects may persist. App-derived names,
+descriptions, values, outlines, and images remain untrusted sibling blocks. Non-secret raw error
+details also remain untrusted siblings. Failures from `type` and `set_value` instead expose only
+sanitized category and summary diagnostics, and submitted text is never echoed in any batch output.
+
+Do not replay a completed action or a failed action with
+`side_effects_may_have_occurred:true`. `attempted:false` proves only that the failed action itself
+was not dispatched. Inspect the outcomes and current app state before deciding what is safe to run.
+
+Example, using element ids obtained before the call:
+
+```json
+{
+  "actions": [
+    {"action":"set_value","id":12,"text":"Alice"},
+    {"action":"wait_for_element","description":"Name","role":"TextField","value":"Alice","timeout_ms":3000},
+    {"action":"click_element","id":16,"return":"snapshot"},
+    {"action":"wait_for_element","name":"Clicked 1","description":"Counter","timeout_ms":3000}
+  ],
+  "timeout_ms":10000
+}
+```
 
 ## Windows
 
@@ -593,19 +628,21 @@ follow as siblings (the legend untrusted-wrapped), per the image ordering above.
 
 ### `glass_click_element`
 
-Click an element by its `#id`. Tries the platform's native accessibility action first, falling back
-to a synthetic pointer click at the center of the element's bounds.
+Address an element by its `#id`. Glass tries the platform's role-appropriate native accessibility
+operation first, falling back to a synthetic pointer click at the center of the element's bounds.
+For a text editor, the native operation may focus and confirm focus rather than activate it.
 
 - `id` (integer, **required**) — the `#id` from the latest snapshot.
 - `return` (string) — `"snapshot"` appends a fresh a11y outline as an untrusted sibling block (and
   refreshes the id cache), `"settle"` folds settle metadata into `result.observed`, or `"none"`
   (default) adds nothing.
 
-Returns `{id, method}` — the `#id` you clicked and which path ran (`native-action`/`pointer`) —
-plus `native_fallback` (why the pointer path was used) when it was, `actuated_id` when the native
-action fired on a different element than the one you named (a control whose label is a separate
-element, as in Jetpack Compose, resolves to the enclosing control), and
-`observed: {settled, saw_motion, observed_ms}` when `return:"settle"`.
+Returns `{id, method}` — the addressed `#id` and which path ran (`native-action`/`pointer`).
+`native-action` is the stable umbrella label for the native path, not proof that an activation verb
+fired. The result also includes `native_fallback` (why the pointer path was used) when it was,
+`actuated_id` when the native operation targeted a different element than the one you named (a
+control whose label is a separate element, as in Jetpack Compose, resolves to the enclosing control),
+and `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`.
 
 ### `glass_set_value`
 

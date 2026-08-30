@@ -9,23 +9,56 @@ use glass_core::{
 use serde_json::json;
 
 use crate::params::*;
-use crate::tools::{OutContent, ToolOutput, ToolResult};
+use crate::tools::{
+    ContextualError, ContextualOutput, ContextualToolResult, OutContent, ToolContext, ToolOutput,
+    ToolResult,
+};
+
+fn standalone(result: ContextualToolResult) -> ToolResult {
+    result.map(|o| o.output).map_err(|e| e.message)
+}
+
+fn standalone_scroll_to_element(result: ContextualToolResult) -> ToolResult {
+    result.map(|o| o.output).map_err(|e| {
+        if e.bound_dispatch == Some(glass_core::BoundDispatch::MayHaveDispatched) {
+            format!(
+                "{}\nRetry safety: one or more earlier steps may already have changed the app. The caller should re-observe before retrying.",
+                e.message
+            )
+        } else {
+            e.message
+        }
+    })
+}
 
 pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult {
+    standalone(wait_for_element_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn wait_for_element_with(
+    glass: &mut Glass,
+    a: &WaitForElementArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     if a.name.is_none() && a.description.is_none() && a.role.is_none() {
-        return Err("specify `name`, `description`, and/or `role` to select an element".into());
+        return Err(ContextualError::validation(
+            "specify `name`, `description`, and/or `role` to select an element".into(),
+        ));
     }
     if a.value.is_some() && a.value_contains.is_some() {
-        return Err("specify `value` for exact matching or `value_contains` for substring matching, not both".into());
+        return Err(ContextualError::validation("specify `value` for exact matching or `value_contains` for substring matching, not both".into()));
     }
     let role = match a.role.as_deref() {
-        Some(r) => Some(AxRole::from_name(r).ok_or_else(|| format!("unknown role '{r}'"))?),
+        Some(r) => Some(
+            AxRole::from_name(r)
+                .ok_or_else(|| ContextualError::validation(format!("unknown role '{r}'")))?,
+        ),
         None => None,
     };
     let condition = match a.condition.as_deref() {
         None => ElementCondition::Appears,
         Some(c) => ElementCondition::from_name(c)
-            .ok_or_else(|| format!("unknown condition '{c}' (appears/disappears/enabled/disabled/checked/unchecked/selected/unselected/expanded/collapsed/focused/visible/hidden)"))?,
+            .ok_or_else(|| ContextualError::validation(format!("unknown condition '{c}' (appears/disappears/enabled/disabled/checked/unchecked/selected/unselected/expanded/collapsed/focused/visible/hidden)")))?,
     };
     let params = WaitElementParams {
         name: a.name.clone(),
@@ -37,15 +70,17 @@ pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult
         interval_ms: a.interval_ms.unwrap_or(200),
         timeout_ms: a.timeout_ms.unwrap_or(10_000),
     };
-    let o = glass.wait_for_element(&params).map_err(|e| e.to_string())?;
+    let o = glass
+        .wait_for_element_by(&params, context.deadline)
+        .map_err(|e| ContextualError::from_core(e, context))?;
+    let timed_out_by = o.timed_out_by;
     // `matched`/`elapsed_ms` are glass-derived and stay trusted; the matched element
     // carries app-controlled name/value, so it rides in an untrusted sibling.
     let result = json!({ "matched": o.matched, "elapsed_ms": o.elapsed_ms });
     let extra = element_sibling(o.element);
-    Ok(ToolOutput::result_with(
-        "glass_wait_for_element",
-        result,
-        extra,
+    Ok(ContextualOutput::with_timeout(
+        ToolOutput::result_with("glass_wait_for_element", result, extra),
+        timed_out_by,
     ))
 }
 
@@ -75,22 +110,32 @@ fn element_sibling(element: Option<glass_core::ElementInfo>) -> Vec<OutContent> 
 }
 
 pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResult {
+    standalone_scroll_to_element(scroll_to_element_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn scroll_to_element_with(
+    glass: &mut Glass,
+    a: &ScrollToElementArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     if a.name.is_none() && a.description.is_none() && a.role.is_none() {
-        return Err(
+        return Err(ContextualError::validation(
             "specify `name`, `description`, and/or `role` to select the element to scroll to"
                 .into(),
-        );
+        ));
     }
     let role = match a.role.as_deref() {
-        Some(r) => Some(AxRole::from_name(r).ok_or_else(|| format!("unknown role '{r}'"))?),
+        Some(r) => Some(
+            AxRole::from_name(r)
+                .ok_or_else(|| ContextualError::validation(format!("unknown role '{r}'")))?,
+        ),
         None => None,
     };
     let direction = match a.direction.as_deref() {
         None => None,
-        Some(d) => Some(
-            ScrollDirection::from_name(d)
-                .ok_or_else(|| format!("unknown direction '{d}' (use up/down/left/right)"))?,
-        ),
+        Some(d) => Some(ScrollDirection::from_name(d).ok_or_else(|| {
+            ContextualError::validation(format!("unknown direction '{d}' (use up/down/left/right)"))
+        })?),
     };
     // Anchor: both x and y, or neither (default: the target's own row/column). One
     // without the other is a caller mistake worth naming rather than silently
@@ -98,7 +143,11 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
     let anchor = match (a.x, a.y) {
         (Some(x), Some(y)) => Some((x, y)),
         (None, None) => None,
-        _ => return Err("specify both `x` and `y` for a scroll anchor, or neither".into()),
+        _ => {
+            return Err(ContextualError::validation(
+                "specify both `x` and `y` for a scroll anchor, or neither".into(),
+            ));
+        }
     };
     let params = ScrollToElementParams {
         name: a.name.clone(),
@@ -111,8 +160,9 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
         timeout_ms: a.timeout_ms.unwrap_or(SCROLL_TO_DEFAULT_TIMEOUT_MS),
     };
     let o = glass
-        .scroll_to_element(&params)
-        .map_err(|e| e.to_string())?;
+        .scroll_to_element_by(&params, context.deadline)
+        .map_err(|e| ContextualError::from_core(e, context))?;
+    let timed_out_by = o.timed_out_by;
     // `matched`/`elapsed_ms`/`scrolled` are glass-computed and stay trusted; the
     // matched element carries app-controlled name/value, so it rides untrusted.
     let result = json!({
@@ -121,10 +171,9 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
         "scrolled": { "steps": o.steps, "reversed": o.reversed, "direction": o.direction.as_str() },
     });
     let extra = element_sibling(o.element);
-    Ok(ToolOutput::result_with(
-        "glass_scroll_to_element",
-        result,
-        extra,
+    Ok(ContextualOutput::with_timeout(
+        ToolOutput::result_with("glass_scroll_to_element", result, extra),
+        timed_out_by,
     ))
 }
 
@@ -228,7 +277,115 @@ pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
 mod tests {
     use super::*;
     use crate::tools::testutil::*;
-    use glass_core::{AppSpec, AxNode, AxNodeId, AxRect, AxStates, AxTree};
+    use glass_core::{
+        Accessibility, AppSpec, AxContext, AxNode, AxNodeId, AxRect, AxStates, AxTree, Backend,
+        BaselineStore, Deadline, Frame, GlassError, KeyEvent, Platform, PlatformFactory,
+        PointerEvent, Region, Result as GlassResult, Stream, WindowGeometry, WindowId, WindowInfo,
+        WindowOp,
+    };
+    use std::sync::{Arc, Mutex};
+
+    struct StaticAccessibility {
+        tree: AxTree,
+    }
+
+    impl Accessibility for StaticAccessibility {
+        fn snapshot(&mut self, _context: &AxContext) -> GlassResult<AxTree> {
+            Ok(self.tree.clone())
+        }
+    }
+
+    struct ResizeAfterFirstScrollPlatform {
+        inner: FakePlatform,
+    }
+
+    impl Platform for ResizeAfterFirstScrollPlatform {
+        fn start_app(&mut self, spec: &AppSpec) -> GlassResult<WindowGeometry> {
+            self.inner.start_app(spec)
+        }
+
+        fn stop_app_by(&mut self, deadline: Deadline) -> GlassResult<()> {
+            self.inner.stop_app_by(deadline)
+        }
+
+        fn capture_frame_by(
+            &mut self,
+            region: Option<&Region>,
+            deadline: Deadline,
+        ) -> GlassResult<Frame> {
+            self.inner.capture_frame_by(region, deadline)
+        }
+
+        fn capture_window_by(
+            &mut self,
+            id: WindowId,
+            region: Option<&Region>,
+            deadline: Deadline,
+        ) -> GlassResult<Frame> {
+            self.inner.capture_window_by(id, region, deadline)
+        }
+
+        fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> GlassResult<()> {
+            self.inner.send_pointer_by(event, deadline)?;
+            if matches!(event, PointerEvent::Scroll { .. }) {
+                self.inner.geometry.width = 50;
+                self.inner.geometry.height = 50;
+            }
+            Ok(())
+        }
+
+        fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> GlassResult<()> {
+            self.inner.send_key_by(event, deadline)
+        }
+
+        fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> GlassResult<WindowGeometry> {
+            self.inner.window_by(op, deadline)
+        }
+
+        fn list_windows_by(&mut self, deadline: Deadline) -> GlassResult<Vec<WindowInfo>> {
+            self.inner.list_windows_by(deadline)
+        }
+
+        fn select_window_by(
+            &mut self,
+            id: WindowId,
+            deadline: Deadline,
+        ) -> GlassResult<WindowGeometry> {
+            self.inner.select_window_by(id, deadline)
+        }
+
+        fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+            self.inner.drain_logs()
+        }
+    }
+
+    fn started_a11y_on(platform: Box<dyn Platform + Send>, tree: AxTree) -> Glass {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("baselines");
+        std::mem::forget(dir);
+        let mut held = Some(Backend {
+            platform,
+            accessibility: Some(Box::new(StaticAccessibility { tree })),
+        });
+        let factory: PlatformFactory = Box::new(move |_| {
+            held.take()
+                .ok_or_else(|| GlassError::Backend("factory called twice".into()))
+        });
+        let mut glass = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+        glass
+            .start(&AppSpec {
+                build: None,
+                run: vec!["x".into()],
+                cwd: None,
+                env: vec![],
+                window_hint: None,
+                timeout_ms: 1,
+                sandbox: glass_core::SandboxLevel::Off,
+                a11y: false,
+            })
+            .unwrap();
+        glass
+    }
 
     #[test]
     fn scroll_to_element_requires_a_selector() {
@@ -278,6 +435,62 @@ mod tests {
         a.direction = Some("sideways".into());
         let err = scroll_to_element(&mut g, &a).unwrap_err();
         assert!(err.contains("up/down/left/right"), "got: {err}");
+    }
+
+    #[test]
+    fn standalone_scroll_to_element_resize_after_first_scroll_preserves_cause_and_warns() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let platform = ResizeAfterFirstScrollPlatform {
+            inner: FakePlatform::new(100, 100).with_event_log(events.clone()),
+        };
+        let mut g = started_a11y_on(Box::new(platform), fake_tree());
+        let mut a = scroll_args();
+        a.name = Some("missing".into());
+        a.direction = Some("down".into());
+        a.timeout_ms = Some(1_000);
+
+        let err = scroll_to_element(&mut g, &a).unwrap_err();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["scroll(50,50,0,3)"],
+            "the first scroll must land before the later coordinate failure"
+        );
+        assert!(
+            err.contains("coordinate (50,50) out of bounds for 50x50 window"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("one or more earlier steps may already have changed the app")
+                && err.contains("re-observe before retrying"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn standalone_scroll_to_element_preflight_coordinate_failure_does_not_warn() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(50, 50).with_event_log(events.clone());
+        let mut g = started_a11y_on(Box::new(platform), fake_tree());
+        let mut a = scroll_args();
+        a.name = Some("missing".into());
+        a.direction = Some("down".into());
+        a.x = Some(50);
+        a.y = Some(50);
+        a.timeout_ms = Some(1_000);
+
+        let err = scroll_to_element(&mut g, &a).unwrap_err();
+
+        assert!(
+            err.contains("coordinate (50,50) out of bounds for 50x50 window"),
+            "got: {err}"
+        );
+        assert!(events.lock().unwrap().is_empty(), "no scroll may dispatch");
+        assert!(
+            !err.contains("may already have changed the app")
+                && !err.contains("re-observe before retrying"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -614,8 +827,6 @@ mod tests {
             _ => panic!("expected text"),
         }
     }
-
-    use glass_core::Frame;
 
     fn started_frames(frames: Vec<Frame>) -> Glass {
         let mut g = glass_with(FakePlatform::new(2, 2).with_frames(frames));

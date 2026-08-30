@@ -43,9 +43,17 @@ pub struct AndroidPlatform {
     agent: Option<Arc<AgentClient>>,
     logs: LogSink,
     app: Option<RunningApp>,
+    #[cfg(all(test, unix))]
+    window_list_parse_delay: Option<Duration>,
 }
 
 impl AndroidPlatform {
+    #[cfg(all(test, unix))]
+    fn with_window_list_parse_delay(mut self, delay: Duration) -> Self {
+        self.window_list_parse_delay = Some(delay);
+        self
+    }
+
     /// Stop the app, under `deadline` when the caller has one to share.
     ///
     /// The logcat reap comes first and is unbounded, measured at 0-1ms — a kill and reap of a
@@ -100,6 +108,8 @@ impl AndroidPlatform {
             agent,
             logs: Arc::new(Mutex::new(Vec::new())),
             app: None,
+            #[cfg(all(test, unix))]
+            window_list_parse_delay: None,
         })
     }
 
@@ -142,15 +152,15 @@ impl AndroidPlatform {
         }
     }
 
-    /// Re-read the active window's current on-screen frame before capturing — a rotation or
-    /// layout change can move/resize it since it was cached. Best-effort: keeps the cached
-    /// geometry if the window isn't currently listed (mirrors `app_pids`' live re-scan).
-    fn refresh_window(&mut self) -> Result<WindowGeometry> {
+    /// Refresh active-window geometry before capture, retaining the cache if the window is absent.
+    fn refresh_window_until(&mut self, deadline: Deadline) -> Result<WindowGeometry> {
         let (package, active_id) = {
             let app = self.running()?;
             (app.package.clone(), app.active_id)
         };
-        let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
+        let dump = self
+            .adb()
+            .run_until(["shell", "dumpsys", "window", "windows"], deadline)?;
         let parsed = parse_app_windows(&dump, &package);
         let fresh = parsed
             .iter()
@@ -175,16 +185,54 @@ impl AndroidPlatform {
         package: &str,
         timeout_ms: u64,
     ) -> Result<(WindowId, WindowGeometry)> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        self.discover_window_by(package, timeout_ms, Deadline::UNBOUNDED)
+    }
+
+    fn discover_window_by(
+        &self,
+        package: &str,
+        timeout_ms: u64,
+        deadline: Deadline,
+    ) -> Result<(WindowId, WindowGeometry)> {
+        let started = Instant::now();
+        let (ends, owner) = deadline.resolve(started + Duration::from_millis(timeout_ms.max(1)));
+        let mut last_dump = String::new();
         loop {
-            let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
+            if Instant::now() >= ends {
+                return Err(discovery_deadline_error(
+                    owner,
+                    last_dump.is_empty(),
+                    &last_dump,
+                    package,
+                    timeout_ms,
+                ));
+            }
+            let dump = self
+                .adb()
+                .run_until(
+                    ["shell", "dumpsys", "window", "windows"],
+                    Deadline::at(ends),
+                )
+                .map_err(|error| {
+                    discovery_call_error(owner, error, &last_dump, package, timeout_ms)
+                })?;
             if let Some(w) = parse_app_windows(&dump, package).into_iter().next() {
                 return Ok((WindowId(w.id), w.frame));
             }
-            if Instant::now() >= deadline {
-                return Err(window_never_appeared(&dump, package, timeout_ms));
+            last_dump = dump;
+            if Instant::now() >= ends {
+                return Err(match owner {
+                    glass_core::Whose::Caller => {
+                        GlassError::caller_deadline_elapsed("Android window discovery")
+                    }
+                    glass_core::Whose::Callee => {
+                        window_never_appeared(&last_dump, package, timeout_ms)
+                    }
+                });
             }
-            std::thread::sleep(Duration::from_millis(150));
+            std::thread::sleep(
+                Duration::from_millis(150).min(ends.saturating_duration_since(Instant::now())),
+            );
         }
     }
 }
@@ -197,6 +245,43 @@ fn window_never_appeared(dump: &str, package: &str, timeout_ms: u64) -> GlassErr
         timeout_ms,
         observed: describe_missing_window(dump, package),
     }
+}
+
+fn discovery_deadline_error(
+    owner: glass_core::Whose,
+    no_attempt: bool,
+    last_dump: &str,
+    package: &str,
+    timeout_ms: u64,
+) -> GlassError {
+    match (owner, no_attempt) {
+        (glass_core::Whose::Caller, true) => {
+            GlassError::deadline_not_started("Android window discovery")
+        }
+        (glass_core::Whose::Caller, false) => {
+            GlassError::caller_deadline_elapsed("Android window discovery")
+        }
+        (glass_core::Whose::Callee, _) => window_never_appeared(last_dump, package, timeout_ms),
+    }
+}
+
+fn discovery_call_error(
+    owner: glass_core::Whose,
+    error: GlassError,
+    last_dump: &str,
+    package: &str,
+    timeout_ms: u64,
+) -> GlassError {
+    if owner == glass_core::Whose::Callee && error.bound_owner() == Some(glass_core::Whose::Caller)
+    {
+        window_never_appeared(last_dump, package, timeout_ms)
+    } else {
+        error
+    }
+}
+
+fn pid_discovery_error_is_bounded(error: &GlassError) -> bool {
+    error.bound().is_some()
 }
 
 /// Intersect the window rect with the captured display, so a window that extends past a
@@ -220,6 +305,26 @@ fn visible_window_region(win: &WindowGeometry, disp_w: u32, disp_h: u32) -> Resu
         width: w as u32,
         height: h as u32,
     })
+}
+
+fn finish_capture(
+    bytes: &[u8],
+    win: &WindowGeometry,
+    region: Option<&Region>,
+    deadline: Deadline,
+) -> Result<Frame> {
+    let display = decode_screencap(bytes)?;
+    let window_region = visible_window_region(win, display.width, display.height)?;
+    let window_frame = display.crop(&window_region)?;
+    let frame = match region {
+        Some(region) => window_frame.crop(region),
+        None => Ok(window_frame),
+    }?;
+    if deadline.has_passed() {
+        Err(GlassError::caller_deadline_elapsed("capture"))
+    } else {
+        Ok(frame)
+    }
 }
 
 /// Force-stop a launch that failed after `am start` had already put the app on the device, and
@@ -279,31 +384,58 @@ impl Platform for AndroidPlatform {
         self.stop_app_until(deadline)
     }
 
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        let win = self.refresh_window()?;
-        let bytes = self.adb().run_bytes(["exec-out", "screencap"])?;
-        let display = decode_screencap(&bytes)?;
-        let window_region = visible_window_region(&win, display.width, display.height)?;
-        let window_frame = display.crop(&window_region)?;
-        match region {
-            Some(r) => window_frame.crop(r),
-            None => Ok(window_frame),
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
         }
+        let win = self.refresh_window_until(deadline)?;
+        let bytes = self
+            .adb()
+            .run_bytes_until(["exec-out", "screencap"], deadline)?;
+        finish_capture(&bytes, &win, region, deadline)
     }
 
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
+    }
+
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
         let origin = self.running()?.window.clone();
-        self.injector.pointer(self.target.adb(), &origin, event)
+        self.injector
+            .pointer_by(self.target.adb(), &origin, event, deadline)
     }
 
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         self.running()?; // require an active session
-        self.injector.key(self.target.adb(), event)
+        self.injector.key_by(self.target.adb(), event, deadline)
     }
 
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("Android window operation"));
+        }
         match op {
-            WindowOp::Geometry => Ok(self.running()?.window.clone()),
+            WindowOp::Geometry => {
+                let geometry = self.running()?.window.clone();
+                if deadline.has_passed() {
+                    Err(GlassError::caller_deadline_elapsed(
+                        "Android window geometry",
+                    ))
+                } else {
+                    Ok(geometry)
+                }
+            }
             WindowOp::Focus => {
                 let (component, package) = {
                     let app = self.running()?;
@@ -311,13 +443,19 @@ impl Platform for AndroidPlatform {
                 };
                 let out = self
                     .adb()
-                    .run(launch_args(&component).iter().map(String::as_str))?;
+                    .run_until(launch_args(&component).iter().map(String::as_str), deadline)?;
                 check_am_start(&out)?;
-                let (active_id, window) = self.discover_window(&package, 5_000)?;
+                let (active_id, window) = self
+                    .discover_window_by(&package, 5_000, deadline)
+                    .map_err(GlassError::after_dispatch)?;
                 let app = self.app.as_mut().ok_or(GlassError::NoActiveSession)?;
                 app.active_id = active_id;
                 app.window = window.clone();
-                Ok(window)
+                if deadline.has_passed() {
+                    Err(GlassError::caller_deadline_elapsed("Android window focus"))
+                } else {
+                    Ok(window)
+                }
             }
             WindowOp::Resize { .. } | WindowOp::Move { .. } => {
                 Err(crate::unsupported_window_move_resize())
@@ -325,15 +463,24 @@ impl Platform for AndroidPlatform {
         }
     }
 
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("Android window list"));
+        }
         let (package, active_id) = {
             let app = self.running()?;
             (app.package.clone(), app.active_id)
         };
-        let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
+        let dump = self
+            .adb()
+            .run_until(["shell", "dumpsys", "window", "windows"], deadline)?;
         let parsed = parse_app_windows(&dump, &package);
+        #[cfg(all(test, unix))]
+        if let Some(delay) = self.window_list_parse_delay {
+            std::thread::sleep(delay);
+        }
         let any_match = parsed.iter().any(|w| WindowId(w.id) == active_id);
-        Ok(parsed
+        let windows = parsed
             .into_iter()
             .enumerate()
             .map(|(i, w)| WindowInfo {
@@ -347,21 +494,42 @@ impl Platform for AndroidPlatform {
                     i == 0
                 },
             })
-            .collect())
+            .collect();
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("Android window list"))
+        } else {
+            Ok(windows)
+        }
     }
 
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("Android window selection"));
+        }
         let package = self.running()?.package.clone();
-        let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
+        let dump = self
+            .adb()
+            .run_until(["shell", "dumpsys", "window", "windows"], deadline)?;
         let found = parse_app_windows(&dump, &package)
             .into_iter()
             .find(|w| WindowId(w.id) == id);
         match found {
             Some(w) => {
+                if deadline.has_passed() {
+                    return Err(GlassError::caller_deadline_elapsed(
+                        "Android window selection",
+                    ));
+                }
                 let app = self.app.as_mut().ok_or(GlassError::NoActiveSession)?;
                 app.active_id = id;
                 app.window = w.frame.clone();
-                Ok(w.frame)
+                if deadline.has_passed() {
+                    Err(GlassError::caller_deadline_elapsed(
+                        "Android window selection",
+                    ))
+                } else {
+                    Ok(w.frame)
+                }
             }
             None => Err(GlassError::WindowNotFound),
         }
@@ -393,18 +561,44 @@ impl Platform for AndroidPlatform {
     }
 
     fn app_pids(&self) -> Vec<u32> {
+        self.app_pids_by(Deadline::UNBOUNDED)
+            .unwrap_or_else(|_| self.app_pid().into_iter().collect())
+    }
+
+    fn app_pids_by(&self, deadline: Deadline) -> Result<Vec<u32>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "Android accessibility process discovery",
+            ));
+        }
         // Best-effort live re-scan; falls back to the single known pid.
         if let Some(app) = &self.app {
-            let out = self
+            match self
                 .adb()
-                .run(["shell", "pidof", &app.package])
-                .unwrap_or_default();
-            let pids = parse_pids(&out);
-            if !pids.is_empty() {
-                return pids;
+                .run_until(["shell", "pidof", &app.package], deadline)
+            {
+                Ok(out) => {
+                    let pids = parse_pids(&out);
+                    if deadline.has_passed() {
+                        return Err(GlassError::caller_deadline_elapsed(
+                            "Android accessibility process discovery",
+                        ));
+                    }
+                    if !pids.is_empty() {
+                        return Ok(pids);
+                    }
+                }
+                Err(error) if pid_discovery_error_is_bounded(&error) => return Err(error),
+                Err(_) => {}
             }
         }
-        self.app_pid().into_iter().collect()
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed(
+                "Android accessibility process discovery",
+            ))
+        } else {
+            Ok(self.app_pid().into_iter().collect())
+        }
     }
 }
 
@@ -468,6 +662,59 @@ mod platform_tests {
         }
     }
 
+    #[test]
+    fn discovery_error_helpers_preserve_attempt_and_owner_distinctions() {
+        let before =
+            discovery_deadline_error(glass_core::Whose::Caller, true, "", "com.example.app", 100);
+        assert_eq!(before.bound(), Some(glass_core::BoundKind::NotStarted));
+
+        let after = discovery_deadline_error(
+            glass_core::Whose::Caller,
+            false,
+            "empty dump",
+            "com.example.app",
+            100,
+        );
+        assert_eq!(after.bound(), Some(glass_core::BoundKind::TimedOut));
+
+        let callee =
+            discovery_deadline_error(glass_core::Whose::Callee, true, "", "com.example.app", 100);
+        assert!(matches!(callee, GlassError::AppWindowNotVisible { .. }));
+
+        let caller_error = || GlassError::caller_deadline_elapsed("dumpsys");
+        let mapped = discovery_call_error(
+            glass_core::Whose::Callee,
+            caller_error(),
+            "last dump",
+            "com.example.app",
+            100,
+        );
+        assert!(matches!(mapped, GlassError::AppWindowNotVisible { .. }));
+
+        let retained = discovery_call_error(
+            glass_core::Whose::Caller,
+            caller_error(),
+            "last dump",
+            "com.example.app",
+            100,
+        );
+        assert_eq!(retained.bound_owner(), Some(glass_core::Whose::Caller));
+
+        let ordinary = discovery_call_error(
+            glass_core::Whose::Callee,
+            GlassError::Backend("dumpsys failed".into()),
+            "last dump",
+            "com.example.app",
+            100,
+        );
+        assert!(matches!(ordinary, GlassError::Backend(_)));
+
+        assert!(pid_discovery_error_is_bounded(&caller_error()));
+        assert!(!pid_discovery_error_is_bounded(&GlassError::Backend(
+            "pidof failed".into()
+        )));
+    }
+
     /// A screencap of `w`x`h` opaque pixels, as `exec-out screencap` returns one.
     fn frame_bytes(w: u32, h: u32) -> Vec<u8> {
         let mut v = Vec::new();
@@ -486,6 +733,7 @@ mod platform_tests {
             agent: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app: None,
+            window_list_parse_delay: None,
         }
     }
 
@@ -550,11 +798,11 @@ mod platform_tests {
         // shows nothing. A deadline computed backwards makes that first look the answer.
         let empty = Answer::says("");
         let windows = Answer::says(WINDOWS);
-        let started = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
         let pid = Answer::says("4321\n");
         let silent = Answer::Silent;
         let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&started]),
+            ("shell am start *", vec![&launch_reply]),
             (
                 "shell dumpsys window windows",
                 vec![&empty, &empty, &windows],
@@ -574,9 +822,9 @@ mod platform_tests {
     #[cfg(unix)]
     fn a_window_that_never_appears_ends_the_launch_rather_than_the_wait_going_on() {
         let empty = Answer::says("");
-        let started = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
         let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&started]),
+            ("shell am start *", vec![&launch_reply]),
             ("shell dumpsys window windows", vec![&empty]),
             ("*", vec![&Answer::Silent]),
         ]);
@@ -620,9 +868,9 @@ mod platform_tests {
     #[cfg(unix)]
     fn a_launch_whose_window_never_appears_does_not_leave_the_app_running() {
         let empty = Answer::says("");
-        let started = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
         let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&started]),
+            ("shell am start *", vec![&launch_reply]),
             ("shell dumpsys window windows", vec![&empty]),
             ("*", vec![&Answer::Silent]),
         ]);
@@ -705,6 +953,122 @@ mod platform_tests {
 
         // The dialog's frame, not the 1080x2400 display behind it.
         assert_eq!((frame.width, frame.height), (800, 800));
+    }
+
+    #[test]
+    fn decode_and_crop_cannot_return_success_after_the_caller_deadline() {
+        let win = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let region = Region {
+            x: 1,
+            y: 1,
+            width: 1,
+            height: 1,
+        };
+
+        let error = finish_capture(
+            &frame_bytes(2, 2),
+            &win,
+            Some(&region),
+            Deadline::at(Instant::now()),
+        )
+        .expect_err("a frame completed after its caller left");
+
+        assert_eq!(
+            error.bound(),
+            Some(glass_core::BoundKind::TimedOut),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn android_screencap_uses_adb_run_bytes_until() {
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let windows = Answer::says(WINDOWS);
+        let pid = Answer::says("4321\n");
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&launch_reply]),
+            ("shell dumpsys window windows", vec![&windows, &windows]),
+            ("shell pidof *", vec![&pid]),
+            ("exec-out screencap", vec![&Answer::Lingers]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+        let mut platform = started(&fake);
+
+        let at = Instant::now();
+        let err = platform
+            .capture_frame_by(None, Deadline::at(Instant::now() + Duration::from_secs(2)))
+            .expect_err("a live caller deadline must bound screencap");
+
+        assert!(
+            at.elapsed() < Duration::from_secs(5),
+            "waited {:?}: {err}",
+            at.elapsed()
+        );
+        assert_eq!(err.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert!(
+            fake.called("exec-out screencap"),
+            "screencap did not reach the deadline-aware runner: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn android_refresh_uses_the_capture_caller_deadline() {
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let windows = Answer::says(WINDOWS);
+        let pid = Answer::says("4321\n");
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&launch_reply]),
+            (
+                "shell dumpsys window windows",
+                vec![&windows, &Answer::Lingers],
+            ),
+            ("shell pidof *", vec![&pid]),
+            (
+                "exec-out screencap",
+                vec![&Answer::says(frame_bytes(1080, 2400))],
+            ),
+            ("*", vec![&Answer::Silent]),
+        ]);
+        let mut platform = started(&fake);
+
+        let at = Instant::now();
+        let err = platform
+            .capture_frame_by(
+                None,
+                Deadline::at(Instant::now() + Duration::from_millis(300)),
+            )
+            .expect_err("a live caller deadline must bound refresh");
+
+        assert!(
+            at.elapsed() < Duration::from_secs(2),
+            "waited {:?}: {err}",
+            at.elapsed()
+        );
+        assert_eq!(err.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert!(fake.called("shell dumpsys window windows"));
+        assert!(
+            !fake.called("exec-out screencap"),
+            "refresh spent the deadline but screencap still started: {:?}",
+            fake.calls()
+        );
     }
 
     #[test]
@@ -825,6 +1189,37 @@ mod platform_tests {
 
     #[test]
     #[cfg(unix)]
+    fn large_window_list_parse_finishing_after_deadline_is_not_late_success() {
+        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let initial_windows = Answer::says(WINDOWS);
+        let large_windows = Answer::says(WINDOWS.repeat(512));
+        let pid = Answer::says("4321\n");
+        let silent = Answer::Silent;
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&launch_reply]),
+            (
+                "shell dumpsys window windows",
+                vec![&initial_windows, &large_windows],
+            ),
+            ("shell pidof *", vec![&pid]),
+            ("*", vec![&silent]),
+        ]);
+        let mut platform = started(&fake).with_window_list_parse_delay(Duration::from_millis(30));
+
+        let error = platform
+            .list_windows_by(Deadline::from_millis(10))
+            .expect_err("a completed parse must not return success after its caller deadline");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_list_whose_selected_window_is_gone_falls_back_to_the_topmost() {
         // The dialog the session was driving has been dismissed. Marking nothing active would
         // leave the caller with a list it cannot act on.
@@ -917,6 +1312,50 @@ mod platform_tests {
 
     #[test]
     #[cfg(unix)]
+    fn accessibility_pid_discovery_kills_a_wedged_pidof_at_the_shared_deadline() {
+        let started_ok = Answer::says("Starting: Intent {...}\nStatus: ok\n");
+        let windows = Answer::says(WINDOWS);
+        let pid = Answer::says("4321\n");
+        let wedged = Answer::Lingers;
+        let silent = Answer::Silent;
+        let fake = FakeAdb::scripted(&[
+            ("shell am start *", vec![&started_ok]),
+            ("shell dumpsys window windows", vec![&windows]),
+            ("shell pidof *", vec![&pid, &wedged]),
+            ("*", vec![&silent]),
+        ]);
+        let platform = started(&fake);
+        let deadline = Deadline::from_millis(25);
+
+        let began = std::time::Instant::now();
+        let error = platform
+            .app_pids_by(deadline)
+            .expect_err("a wedged live pid scan must stop at the semantic caller deadline");
+
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "pidof waited {:?}, which is closer to adb's 10s shell budget than the caller deadline",
+            began.elapsed()
+        );
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            error.to_string().contains("adb:shell")
+                && error.to_string().contains("adb kill-server"),
+            "the bounded runner's operation and remedy were replaced: {error}"
+        );
+        assert!(
+            fake.deadlines().contains(&deadline),
+            "the exact semantic deadline must reach the adb process runner"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn the_app_pids_are_re_read_from_the_device_and_fall_back_to_the_known_one() {
         let fake = launchable();
         let platform = started(&fake);
@@ -928,10 +1367,11 @@ mod platform_tests {
         let one = Answer::says("4321\n");
         let many = Answer::says("4321 4322 4323\n");
         let none = Answer::says("\n");
+        let failed = Answer::fails("device offline");
         let fake = FakeAdb::scripted(&[
             ("shell am start *", vec![&started_ok]),
             ("shell dumpsys window windows", vec![&windows]),
-            ("shell pidof *", vec![&one, &many, &none]),
+            ("shell pidof *", vec![&one, &many, &none, &failed]),
             ("*", vec![&Answer::Silent]),
         ]);
         let mut platform = platform_over(&fake);
@@ -942,6 +1382,11 @@ mod platform_tests {
             platform.app_pids(),
             [4321],
             "a scan that finds nothing falls back to the pid the launch recorded"
+        );
+        assert_eq!(
+            platform.app_pids_by(Deadline::UNBOUNDED).unwrap(),
+            [4321],
+            "an ordinary pidof failure falls back to the pid the launch recorded"
         );
     }
 }

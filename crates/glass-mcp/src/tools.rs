@@ -4,11 +4,13 @@
 //! turns that into an MCP error result. Never a silent success.
 //!
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, AxNodeId, Glass, MarkLabel, MouseButton, WindowGeometry, WindowHint, WindowId,
-    WindowOp, frame_to_webp,
+    AppSpec, AxNodeId, BoundDispatch, Glass, MarkLabel, MouseButton, WindowGeometry, WindowHint,
+    WindowId, WindowOp, frame_to_webp,
 };
+use serde::Serialize;
 use serde_json::json;
 
 use crate::params::*;
@@ -70,6 +72,246 @@ fn envelope(tool: &str, result: serde_json::Value) -> String {
 
 /// Tool result: Ok(content) or Err(agent-readable message).
 pub type ToolResult = Result<ToolOutput, String>;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ToolContext {
+    pub deadline: glass_core::Deadline,
+}
+
+impl ToolContext {
+    pub const UNBOUNDED: Self = Self {
+        deadline: glass_core::Deadline::UNBOUNDED,
+    };
+}
+
+#[derive(Debug)]
+pub(crate) struct ContextualOutput {
+    pub output: ToolOutput,
+    pub timed_out_by: Option<glass_core::Whose>,
+}
+
+impl ContextualOutput {
+    pub fn immediate(output: ToolOutput) -> Self {
+        Self {
+            output,
+            timed_out_by: None,
+        }
+    }
+
+    pub fn with_timeout(output: ToolOutput, timed_out_by: Option<glass_core::Whose>) -> Self {
+        Self {
+            output,
+            timed_out_by,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ContextualError {
+    pub message: String,
+    pub category: SafeErrorCategory,
+    pub safe_summary: &'static str,
+    pub sequence_deadline_exceeded: bool,
+    pub bound_dispatch: Option<BoundDispatch>,
+    post_write: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SafeErrorCategory {
+    NoActiveSession,
+    StaleElement,
+    NotEditable,
+    InvalidValue,
+    OptionNotFound,
+    UnsupportedAccessibility,
+    PermissionDenied,
+    TransportFailure,
+    ActionDeadlineExceeded,
+    SequenceDeadlineExceeded,
+    Other,
+}
+
+impl SafeErrorCategory {
+    fn from_error(error: &glass_core::GlassError) -> Self {
+        if error.bound_owner() == Some(glass_core::Whose::Caller) {
+            return Self::SequenceDeadlineExceeded;
+        }
+
+        match error.cause() {
+            glass_core::GlassError::NoActiveSession => Self::NoActiveSession,
+            glass_core::GlassError::NoAxSnapshot
+            | glass_core::GlassError::AxElementNotFound(_)
+            | glass_core::GlassError::AxElementChanged(_)
+            | glass_core::GlassError::AxElementGone(_) => Self::StaleElement,
+            glass_core::GlassError::AxElementNotEditable(_) => Self::NotEditable,
+            glass_core::GlassError::AxValueNotBoolean(..) => Self::InvalidValue,
+            glass_core::GlassError::AxOptionNotFound(..) => Self::OptionNotFound,
+            glass_core::GlassError::AxUnsupported
+            | glass_core::GlassError::AxActionUnavailable(_) => Self::UnsupportedAccessibility,
+            glass_core::GlassError::PermissionDenied { .. } => Self::PermissionDenied,
+            glass_core::GlassError::CaptureFailed(_)
+            | glass_core::GlassError::AccessibilityUnavailable(_)
+            | glass_core::GlassError::Backend(_)
+            | glass_core::GlassError::ToolFailed { .. }
+            | glass_core::GlassError::Bounded { .. }
+            | glass_core::GlassError::Io(_) => Self::TransportFailure,
+            _ => Self::Other,
+        }
+    }
+
+    fn summary(self) -> &'static str {
+        match self {
+            Self::NoActiveSession => "no active session",
+            Self::StaleElement => "element is stale or missing",
+            Self::NotEditable => "element is not editable",
+            Self::InvalidValue => "element expects a boolean value",
+            Self::OptionNotFound => "requested option was not found",
+            Self::UnsupportedAccessibility => "accessibility operation is unsupported",
+            Self::PermissionDenied => "permission denied",
+            Self::TransportFailure => "backend transport failed",
+            Self::ActionDeadlineExceeded => "action deadline exceeded",
+            Self::SequenceDeadlineExceeded => "sequence deadline exceeded",
+            Self::Other => "action execution failed",
+        }
+    }
+
+    fn post_write_summary(self) -> &'static str {
+        match self {
+            Self::TransportFailure => {
+                "backend transport failed after the value write went out; re-snapshot to see where it landed rather than writing it again"
+            }
+            Self::SequenceDeadlineExceeded => {
+                "sequence deadline exceeded after the value write went out; re-snapshot to see where it landed rather than writing it again"
+            }
+            Self::ActionDeadlineExceeded => {
+                "action deadline exceeded after the value write went out; re-snapshot to see where it landed rather than writing it again"
+            }
+            _ => {
+                "the value write went out but could not be confirmed; re-snapshot to see where it landed rather than writing it again"
+            }
+        }
+    }
+}
+
+impl ContextualError {
+    pub fn validation(message: String) -> Self {
+        Self {
+            message,
+            category: SafeErrorCategory::Other,
+            safe_summary: "action validation failed",
+            sequence_deadline_exceeded: false,
+            bound_dispatch: Some(BoundDispatch::NotDispatched),
+            post_write: false,
+        }
+    }
+
+    fn from_error(error: glass_core::GlassError) -> Self {
+        let post_write = error.set_value_failed_after_writing();
+        let category = SafeErrorCategory::from_error(&error);
+        // These variants are constructed only by core preflight checks before the requested
+        // mutation can dispatch. Keep the allowlist narrow so a new ordinary error remains
+        // conservatively ambiguous.
+        let bound_dispatch = error.bound_dispatch().or_else(|| {
+            matches!(
+                &error,
+                glass_core::GlassError::CoordOutOfBounds { .. }
+                    | glass_core::GlassError::AxValueNotBoolean(..)
+            )
+            .then_some(BoundDispatch::NotDispatched)
+        });
+        Self {
+            message: error.to_string(),
+            category,
+            safe_summary: if post_write {
+                category.post_write_summary()
+            } else {
+                category.summary()
+            },
+            sequence_deadline_exceeded: error.bound_owner() == Some(glass_core::Whose::Caller),
+            bound_dispatch,
+            post_write,
+        }
+    }
+
+    pub fn from_core(error: glass_core::GlassError, _context: ToolContext) -> Self {
+        Self::from_error(error)
+    }
+
+    pub fn from_caller_bound(error: glass_core::GlassError, _context: ToolContext) -> Self {
+        Self::from_error(error)
+    }
+
+    pub fn from_resolved_bound(
+        error: glass_core::GlassError,
+        context: ToolContext,
+        whose: glass_core::Whose,
+    ) -> Self {
+        let bounded = error.bound().is_some();
+        let mut out = Self::from_error(error);
+        if context.deadline.has_passed() {
+            return out.after_sequence_deadline();
+        }
+        if whose == glass_core::Whose::Callee && bounded {
+            out.category = SafeErrorCategory::ActionDeadlineExceeded;
+            out.safe_summary = if out.post_write {
+                SafeErrorCategory::ActionDeadlineExceeded.post_write_summary()
+            } else {
+                SafeErrorCategory::ActionDeadlineExceeded.summary()
+            };
+            out.sequence_deadline_exceeded = false;
+        }
+        out
+    }
+
+    pub fn after_dispatch(mut self) -> Self {
+        self.bound_dispatch = Some(BoundDispatch::MayHaveDispatched);
+        self
+    }
+
+    /// Reclassify an error observed after the enclosing batch deadline without discarding the
+    /// operation's safe detail or its dispatch verdict.
+    pub fn after_sequence_deadline(mut self) -> Self {
+        self.category = SafeErrorCategory::SequenceDeadlineExceeded;
+        self.safe_summary = if self.post_write {
+            SafeErrorCategory::SequenceDeadlineExceeded.post_write_summary()
+        } else {
+            SafeErrorCategory::SequenceDeadlineExceeded.summary()
+        };
+        self.sequence_deadline_exceeded = true;
+        self
+    }
+
+    pub fn annotate(mut self, prefix: &str) -> Self {
+        self.message = format!("{prefix}: {}", self.message);
+        self
+    }
+
+    pub fn sequence_deadline(message: String) -> Self {
+        Self {
+            message,
+            category: SafeErrorCategory::SequenceDeadlineExceeded,
+            safe_summary: SafeErrorCategory::SequenceDeadlineExceeded.summary(),
+            sequence_deadline_exceeded: true,
+            bound_dispatch: None,
+            post_write: false,
+        }
+    }
+}
+
+pub(crate) type ContextualToolResult = Result<ContextualOutput, ContextualError>;
+type ReturnObservation = (
+    Option<serde_json::Value>,
+    Vec<OutContent>,
+    Option<glass_core::Whose>,
+);
+
+fn erase_context(result: ContextualToolResult) -> ToolResult {
+    result.map(|o| o.output).map_err(|e| e.message)
+}
+
+/// Batch tool result: either outcome may carry structured MCP content.
+pub(crate) type BatchToolResult = Result<ToolOutput, ToolOutput>;
 
 fn geometry_value(g: &WindowGeometry) -> serde_json::Value {
     json!({ "x": g.x, "y": g.y, "width": g.width, "height": g.height })
@@ -363,16 +605,22 @@ pub(crate) fn validate_return(ret: Option<&str>) -> Result<(), String> {
 /// → neither. Calls the `Glass` methods directly (not the `a11y_snapshot`/`wait_stable`
 /// tool functions) so a composed observe never nests another envelope. Unknown value
 /// → `Err` (unchanged rejection).
-fn resolve_return(
+fn resolve_return_with(
     glass: &mut Glass,
     ret: Option<&str>,
-) -> Result<(Option<serde_json::Value>, Vec<OutContent>), String> {
+    context: ToolContext,
+) -> Result<ReturnObservation, ContextualError> {
     match ret {
-        None | Some("none") => Ok((None, vec![])),
+        None | Some("none") => Ok((None, vec![], None)),
         Some("settle") => {
+            let (_, whose) = context.deadline.budget(
+                Duration::from_millis(settle_params().timeout_ms),
+                Instant::now(),
+            );
             let o = glass
-                .wait_stable(&settle_params())
-                .map_err(|e| e.to_string())?;
+                .wait_stable_by(&settle_params(), context.deadline)
+                .map_err(|e| ContextualError::from_resolved_bound(e, context, whose))?;
+            let timed_out_by = (!o.settled).then_some(whose);
             Ok((
                 Some(serde_json::json!({
                     "settled": o.settled,
@@ -380,20 +628,34 @@ fn resolve_return(
                     "observed_ms": o.observed_ms,
                 })),
                 vec![],
+                timed_out_by,
             ))
         }
         Some("snapshot") => {
             // Let the UI settle before folding the tree so a screen-changing action (a
-            // navigating click) doesn't fold a mid-transition tree. Best-effort: `wait_stable`
-            // soft-times-out (`settled:false`, not an error) on a non-settling UI, and a rare
-            // real capture failure is swallowed because `a11y_snapshot` reads the accessibility
-            // tree (not pixels) and still returns the freshest tree — the caller asked for it.
-            let _ = glass.wait_stable(&settle_params());
+            // navigating click) doesn't fold a mid-transition tree. `wait_stable` soft-times-out
+            // (`settled:false`, not an error) on a non-settling UI; real capture/backend failures
+            // propagate because the requested observation did not complete reliably.
+            let (_, whose) = context.deadline.budget(
+                Duration::from_millis(settle_params().timeout_ms),
+                Instant::now(),
+            );
+            match glass.wait_stable_by(&settle_params(), context.deadline) {
+                Ok(o) if !o.settled && whose == glass_core::Whose::Caller => {
+                    return Err(ContextualError::sequence_deadline(
+                        "return snapshot settle reached the caller deadline".into(),
+                    ));
+                }
+                Err(error) => {
+                    return Err(ContextualError::from_resolved_bound(error, context, whose));
+                }
+                Ok(_) => {}
+            }
             // Reuse the session's current limits so a fold after a raised/unbounded snapshot
             // isn't silently re-truncated to the default cap.
             let tree = glass
-                .a11y_resnapshot(glass_core::Deadline::UNBOUNDED)
-                .map_err(|e| e.to_string())?;
+                .a11y_resnapshot(context.deadline)
+                .map_err(|e| ContextualError::from_core(e, context))?;
             // Same shape as `a11y_snapshot`: the app-derived outline stays untrusted-wrapped;
             // glass's own steers are separate trusted blocks, not baked into that body.
             let mut extra = vec![OutContent::Text(crate::untrusted::wrap_untrusted(
@@ -403,19 +665,30 @@ fn resolve_return(
                 extra.push(OutContent::Text(hint.to_string()));
             }
             extra.extend(a11y_steers(&tree).into_iter().map(OutContent::Text));
-            Ok((None, extra))
+            Ok((None, extra, None))
         }
-        Some(o) => Err(format!("unknown return '{o}' (use none/settle/snapshot)")),
+        Some(o) => Err(ContextualError::validation(format!(
+            "unknown return '{o}' (use none/settle/snapshot)"
+        ))),
     }
 }
 
 pub fn click_element(glass: &mut Glass, a: &ClickElementArgs) -> ToolResult {
+    erase_context(click_element_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn click_element_with(
+    glass: &mut Glass,
+    a: &ClickElementArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     // Bad `return` value → reject before the click lands (see `validate_return`).
-    validate_return(a.return_.as_deref())?;
+    validate_return(a.return_.as_deref()).map_err(ContextualError::validation)?;
     let method = glass
-        .click_element(AxNodeId(a.id))
-        .map_err(|e| e.to_string())?;
-    let (observed, extra) = resolve_return(glass, a.return_.as_deref())?;
+        .click_element_by(AxNodeId(a.id), context.deadline)
+        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+    let (observed, extra, timed_out_by) = resolve_return_with(glass, a.return_.as_deref(), context)
+        .map_err(ContextualError::after_dispatch)?;
     let mut result = serde_json::json!({ "id": a.id, "method": method.label() });
     if let Some(reason) = method.native_fallback() {
         result["native_fallback"] = serde_json::json!(reason);
@@ -426,25 +699,36 @@ pub fn click_element(glass: &mut Glass, a: &ClickElementArgs) -> ToolResult {
     if let Some(o) = observed {
         result["observed"] = o;
     }
-    Ok(ToolOutput::result_with(
-        "glass_click_element",
-        result,
-        extra,
+    Ok(ContextualOutput::with_timeout(
+        ToolOutput::result_with("glass_click_element", result, extra),
+        timed_out_by,
     ))
 }
 
 pub fn set_value(glass: &mut Glass, a: &SetValueArgs) -> ToolResult {
+    erase_context(set_value_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn set_value_with(
+    glass: &mut Glass,
+    a: &SetValueArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
     // Bad `return` value → reject before the value is written (see `validate_return`).
-    validate_return(a.return_.as_deref())?;
+    validate_return(a.return_.as_deref()).map_err(ContextualError::validation)?;
     glass
-        .set_value(AxNodeId(a.id), &a.text)
-        .map_err(|e| e.to_string())?;
-    let (observed, extra) = resolve_return(glass, a.return_.as_deref())?;
+        .set_value_by(AxNodeId(a.id), &a.text, context.deadline)
+        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+    let (observed, extra, timed_out_by) = resolve_return_with(glass, a.return_.as_deref(), context)
+        .map_err(ContextualError::after_dispatch)?;
     let mut result = serde_json::json!({ "id": a.id });
     if let Some(o) = observed {
         result["observed"] = o;
     }
-    Ok(ToolOutput::result_with("glass_set_value", result, extra))
+    Ok(ContextualOutput::with_timeout(
+        ToolOutput::result_with("glass_set_value", result, extra),
+        timed_out_by,
+    ))
 }
 
 pub fn a11y_marks(glass: &mut Glass) -> ToolResult {

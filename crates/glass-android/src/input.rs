@@ -7,7 +7,9 @@ use std::sync::Arc;
 use crate::adb::Adb;
 use crate::agent::{AgentClient, Pt};
 use glass_core::keys::parse_chord;
-use glass_core::{GlassError, KeyEvent, Modifier, PointerEvent, Result, Segment, WindowGeometry};
+use glass_core::{
+    Deadline, GlassError, KeyEvent, Modifier, PointerEvent, Result, Segment, WindowGeometry,
+};
 
 /// Pixels of swipe travel per scroll "click" (`Scroll.dx/dy` are wheel clicks —
 /// X11 clicks the wheel `|delta|` times). Tunable.
@@ -20,13 +22,14 @@ const SWIPE_MS: u64 = 300;
 /// command; an empty vec means "nothing to inject" (a touch `Move` has no hover
 /// equivalent). Mouse button and keyboard modifiers are ignored — a touch
 /// contact is single-button and can't carry modifiers.
-pub fn pointer_commands(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Vec<String>> {
+pub fn pointer_commands(origin: &WindowGeometry, event: &PointerEvent) -> Result<Vec<Vec<String>>> {
+    glass_core::validate_pointer_input(event)?;
     let abs = |x: i32, y: i32| (origin.x + x, origin.y + y);
-    match *event {
+    Ok(match *event {
         PointerEvent::Move { .. } => vec![],
         PointerEvent::Click { x, y, count, .. } => {
             let (ax, ay) = abs(x, y);
-            (0..count.max(1)).map(|_| tap(ax, ay)).collect()
+            (0..count).map(|_| tap(ax, ay)).collect()
         }
         PointerEvent::Drag {
             from_x,
@@ -63,7 +66,7 @@ pub fn pointer_commands(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Ve
             vec![swipe(cx, cy, ex, ey, SWIPE_MS)]
         }
         PointerEvent::Gesture { .. } => vec![], // adb has no multi-touch; ShellInjector refuses
-    }
+    })
 }
 
 fn tap(x: i32, y: i32) -> Vec<String> {
@@ -244,7 +247,7 @@ pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Ve
         PointerEvent::Move { .. } => vec![],
         PointerEvent::Click { x, y, count, .. } => {
             let (ax, ay) = abs(x, y);
-            (0..count.max(1))
+            (0..count)
                 .map(|_| {
                     vec![Pt {
                         x: ax,
@@ -289,6 +292,26 @@ pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Ve
     }
 }
 
+fn run_compound<T>(
+    steps: impl IntoIterator<Item = T>,
+    mut dispatch: impl FnMut(T) -> Result<()>,
+) -> Result<()> {
+    let mut dispatched = false;
+    for step in steps {
+        match dispatch(step) {
+            Ok(()) => dispatched = true,
+            Err(error) => {
+                return Err(if dispatched {
+                    error.after_dispatch()
+                } else {
+                    error
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Injects via the on-device agent (real MotionEvents + faithful keys/Unicode). The `Adb`
 /// argument of the `Injector` methods is unused — the agent is reached over its socket.
 pub(crate) struct AgentInjector {
@@ -296,26 +319,32 @@ pub(crate) struct AgentInjector {
 }
 
 impl Injector for AgentInjector {
-    fn pointer(&self, _adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()> {
+    fn pointer_by(
+        &self,
+        _adb: &Adb,
+        origin: &WindowGeometry,
+        event: &PointerEvent,
+        deadline: Deadline,
+    ) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
         if let PointerEvent::Gesture {
             pointers,
             duration_ms,
         } = event
         {
             let paths = agent_gesture_paths(origin, pointers, *duration_ms);
-            return self.agent.gesture(&paths);
+            return self.agent.gesture_by(&paths, deadline);
         }
         // One agent request per gesture: a Click{count:N} sends N sequential taps.
-        for gesture in agent_pointer(origin, event) {
-            self.agent.pointer(&gesture, "left")?;
-        }
-        Ok(())
+        run_compound(agent_pointer(origin, event), |gesture| {
+            self.agent.pointer_by(&gesture, "left", deadline)
+        })
     }
-    fn key(&self, _adb: &Adb, event: &KeyEvent) -> Result<()> {
+    fn key_by(&self, _adb: &Adb, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         match event {
             KeyEvent::Text(s) if s.is_empty() => Ok(()),
-            KeyEvent::Text(s) => self.agent.text(s),
-            KeyEvent::Chord(c) => self.agent.key(c),
+            KeyEvent::Text(s) => self.agent.text_by(s, deadline),
+            KeyEvent::Chord(c) => self.agent.key_by(c, deadline),
         }
     }
 }
@@ -323,31 +352,44 @@ impl Injector for AgentInjector {
 /// Pointer/key injection seam. `ShellInjector` shells out via `adb input`; a
 /// future on-device agent can implement this for lower-latency injection.
 pub trait Injector {
-    fn pointer(&self, adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()>;
-    fn key(&self, adb: &Adb, event: &KeyEvent) -> Result<()>;
+    fn pointer_by(
+        &self,
+        adb: &Adb,
+        origin: &WindowGeometry,
+        event: &PointerEvent,
+        deadline: Deadline,
+    ) -> Result<()>;
+    fn key_by(&self, adb: &Adb, event: &KeyEvent, deadline: Deadline) -> Result<()>;
 }
 
 /// Injects by running `adb shell input …` commands.
 pub struct ShellInjector;
 
 impl Injector for ShellInjector {
-    fn pointer(&self, adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()> {
+    fn pointer_by(
+        &self,
+        adb: &Adb,
+        origin: &WindowGeometry,
+        event: &PointerEvent,
+        deadline: Deadline,
+    ) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
         if let PointerEvent::Gesture { .. } = event {
             return Err(GlassError::Unsupported(
                 "multi-touch requires the on-device agent (not yet wired)".into(),
             ));
         }
-        for argv in pointer_commands(origin, event) {
-            adb.run(argv.iter().map(String::as_str))?;
-        }
-        Ok(())
+        run_compound(pointer_commands(origin, event)?, |argv| {
+            adb.run_until(argv.iter().map(String::as_str), deadline)
+                .map(|_| ())
+        })
     }
 
-    fn key(&self, adb: &Adb, event: &KeyEvent) -> Result<()> {
-        for argv in key_commands(event)? {
-            adb.run(argv.iter().map(String::as_str))?;
-        }
-        Ok(())
+    fn key_by(&self, adb: &Adb, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        run_compound(key_commands(event)?, |argv| {
+            adb.run_until(argv.iter().map(String::as_str), deadline)
+                .map(|_| ())
+        })
     }
 }
 
@@ -550,7 +592,7 @@ mod agent_inject_tests {
             count: 1,
             modifiers: vec![],
         };
-        let argv = pointer_commands(&o, &click);
+        let argv = pointer_commands(&o, &click).unwrap();
         let path = agent_pointer(&o, &click);
         assert_eq!(
             argv[0],
@@ -574,7 +616,7 @@ mod agent_inject_tests {
             dy: 1,
             modifiers: vec![],
         };
-        let sargv = pointer_commands(&o, &scroll);
+        let sargv = pointer_commands(&o, &scroll).unwrap();
         let spath = agent_pointer(&o, &scroll);
         assert_eq!((sargv[0][3].as_str(), sargv[0][4].as_str()), ("350", "600"));
         assert_eq!(
@@ -603,7 +645,7 @@ mod agent_inject_tests {
             modifiers: vec![],
         };
 
-        let argv = pointer_commands(&o, &up_and_left);
+        let argv = pointer_commands(&o, &up_and_left).unwrap();
         assert_eq!((argv[0][5].as_str(), argv[0][6].as_str()), ("599", "999"));
 
         let path = agent_pointer(&o, &up_and_left);
@@ -746,12 +788,22 @@ mod injector_tests {
         // and a real client would send taps to whatever device the developer has attached.
         let fake = FakeAdb::new(&[("*", Answer::Silent)]);
 
-        injector.pointer(fake.adb(), &origin(), &click()).unwrap();
         injector
-            .key(fake.adb(), &KeyEvent::Text("hi".into()))
+            .pointer_by(fake.adb(), &origin(), &click(), Deadline::UNBOUNDED)
             .unwrap();
         injector
-            .key(fake.adb(), &KeyEvent::Text(String::new()))
+            .key_by(
+                fake.adb(),
+                &KeyEvent::Text("hi".into()),
+                Deadline::UNBOUNDED,
+            )
+            .unwrap();
+        injector
+            .key_by(
+                fake.adb(),
+                &KeyEvent::Text(String::new()),
+                Deadline::UNBOUNDED,
+            )
             .unwrap();
 
         assert_eq!(ops_seen(&seen), ["pointer", "text"]);
@@ -773,7 +825,7 @@ mod injector_tests {
         };
         let fake = FakeAdb::new(&[("*", Answer::Silent)]);
         let err = ShellInjector
-            .pointer(fake.adb(), &origin(), &gesture)
+            .pointer_by(fake.adb(), &origin(), &gesture, Deadline::UNBOUNDED)
             .unwrap_err();
         assert!(matches!(err, GlassError::Unsupported(_)), "{err}");
         // Refused BEFORE anything reached the device — otherwise this "unsupported" gesture
@@ -785,10 +837,182 @@ mod injector_tests {
     fn the_shell_injector_reports_a_chord_it_cannot_map() {
         let fake = FakeAdb::new(&[("*", Answer::Silent)]);
         let err = ShellInjector
-            .key(fake.adb(), &KeyEvent::Chord("ctrl+/".into()))
+            .key_by(
+                fake.adb(),
+                &KeyEvent::Chord("ctrl+/".into()),
+                Deadline::UNBOUNDED,
+            )
             .unwrap_err();
         assert!(matches!(err, GlassError::InvalidKey(_)), "{err}");
         assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn shell_injector_passes_one_deadline_to_every_adb_command() {
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let deadline = Deadline::from_millis(1_000);
+        let repeated_click = PointerEvent::Click {
+            x: 10,
+            y: 20,
+            button: MouseButton::Left,
+            count: 3,
+            modifiers: vec![],
+        };
+        ShellInjector
+            .pointer_by(fake.adb(), &origin(), &repeated_click, deadline)
+            .unwrap();
+        assert_eq!(fake.calls().len(), 3);
+        assert_eq!(fake.deadlines(), vec![deadline; 3]);
+    }
+
+    #[test]
+    fn shell_injector_rejects_invalid_pointer_work_before_adb_dispatch() {
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let events = [
+            PointerEvent::Click {
+                x: 10,
+                y: 20,
+                button: MouseButton::Left,
+                count: 0,
+                modifiers: vec![],
+            },
+            PointerEvent::Click {
+                x: 10,
+                y: 20,
+                button: MouseButton::Left,
+                count: 11,
+                modifiers: vec![],
+            },
+            PointerEvent::Click {
+                x: 10,
+                y: 20,
+                button: MouseButton::Left,
+                count: u32::MAX,
+                modifiers: vec![],
+            },
+            PointerEvent::Scroll {
+                x: 10,
+                y: 20,
+                dx: i32::MIN,
+                dy: i32::MAX,
+                modifiers: vec![],
+            },
+        ];
+
+        for event in events {
+            let error = ShellInjector
+                .pointer_by(fake.adb(), &origin(), &event, Deadline::UNBOUNDED)
+                .expect_err("invalid pointer work must not reach adb");
+            assert!(matches!(error.cause(), GlassError::InvalidPointerInput(_)));
+            assert_eq!(
+                error.bound_dispatch(),
+                Some(glass_core::BoundDispatch::NotDispatched)
+            );
+        }
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn first_tap_success_plus_later_not_dispatched_is_may_have_dispatched() {
+        let mut tap = 0;
+
+        let error = run_compound([(), ()], |_| {
+            tap += 1;
+            if tap == 1 {
+                Ok(())
+            } else {
+                Err(GlassError::deadline_not_started("tap"))
+            }
+        })
+        .expect_err("the second tap did not dispatch");
+
+        assert_eq!(tap, 2);
+        assert_eq!(
+            error.bound_owner(),
+            Some(glass_core::Whose::Caller),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "the first tap already succeeded: {error}"
+        );
+    }
+
+    #[test]
+    fn earlier_success_upgrades_a_wrapped_before_dispatch_failure() {
+        let error = run_compound([0, 1], |step| {
+            if step == 0 {
+                Ok(())
+            } else {
+                Err(GlassError::Backend("second tap could not start".into()).before_dispatch())
+            }
+        })
+        .expect_err("the second tap fails before its own dispatch");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "the successful first tap is part of the compound result: {error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "second tap could not start"),
+            "the later failure remains the cause: {error}"
+        );
+    }
+
+    #[test]
+    fn earlier_success_preserves_a_nested_caused_failure() {
+        let mut later = Some(GlassError::write_unconfirmed_because(
+            7,
+            "a nested confirmation failed",
+            GlassError::ToolFailed {
+                call: "adb shell input".into(),
+                said: " device disconnected \n".into(),
+            }
+            .before_dispatch(),
+        ));
+        let error = run_compound([0, 1], |step| {
+            if step == 0 {
+                Ok(())
+            } else {
+                Err(later.take().expect("the failing step runs once"))
+            }
+        })
+        .expect_err("the second compound step fails");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "the compound operation retains its earlier delivery evidence: {error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::ToolFailed { call, .. } if call == "adb shell input"),
+            "the nested tool failure remains the cause: {error}"
+        );
+        assert_eq!(error.tool_said(), Some("device disconnected"), "{error}");
+    }
+
+    #[test]
+    fn earlier_success_does_not_weaken_existing_after_dispatch_evidence() {
+        let error = run_compound([0, 1], |step| {
+            if step == 0 {
+                Ok(())
+            } else {
+                Err(GlassError::Backend("answer lost".into()).after_dispatch())
+            }
+        })
+        .expect_err("the second compound step loses its answer");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "existing delivery evidence must not be erased: {error}"
+        );
+        assert!(
+            matches!(error.cause(), GlassError::Backend(message) if message == "answer lost"),
+            "the original failure remains the cause: {error}"
+        );
     }
 }
 
@@ -808,7 +1032,11 @@ mod pointer_tests {
 
     #[test]
     fn move_injects_nothing() {
-        assert!(pointer_commands(&win(), &PointerEvent::Move { x: 5, y: 5 }).is_empty());
+        assert!(
+            pointer_commands(&win(), &PointerEvent::Move { x: 5, y: 5 })
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -821,7 +1049,7 @@ mod pointer_tests {
             modifiers: vec![],
         };
         assert_eq!(
-            pointer_commands(&win(), &ev),
+            pointer_commands(&win(), &ev).unwrap(),
             vec![vec![
                 "shell".to_string(),
                 "input".into(),
@@ -841,7 +1069,7 @@ mod pointer_tests {
             count: 2,
             modifiers: vec![],
         };
-        assert_eq!(pointer_commands(&win(), &ev).len(), 2);
+        assert_eq!(pointer_commands(&win(), &ev).unwrap().len(), 2);
     }
 
     #[test]
@@ -856,7 +1084,7 @@ mod pointer_tests {
             duration_ms: 250,
         };
         assert_eq!(
-            pointer_commands(&win(), &ev),
+            pointer_commands(&win(), &ev).unwrap(),
             vec![vec![
                 "shell".to_string(),
                 "input".into(),
@@ -879,7 +1107,7 @@ mod pointer_tests {
             dy: 1,
             modifiers: vec![],
         };
-        let got = pointer_commands(&win(), &ev);
+        let got = pointer_commands(&win(), &ev).unwrap();
         assert_eq!(
             got,
             vec![vec![
@@ -904,7 +1132,7 @@ mod pointer_tests {
             dy: 100,
             modifiers: vec![],
         };
-        let got = pointer_commands(&win(), &ev);
+        let got = pointer_commands(&win(), &ev).unwrap();
         let end_y = &got[0][6];
         assert_eq!(end_y, "63");
     }

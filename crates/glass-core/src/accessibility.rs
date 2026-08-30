@@ -1198,76 +1198,39 @@ pub enum ChangeWait {
 /// trait). Distinct from `Platform`: accessibility varies per-OS, not per-
 /// display-server.
 pub trait Accessibility {
-    /// Snapshot the active window's accessibility subtree, normalized and in
-    /// window-relative coordinates. Node ids are assigned by the caller
-    /// afterward via [`AxTree::assign_ids`]; the backend need not set them.
+    /// Snapshot the active window's accessibility subtree in window-relative coordinates; the
+    /// caller assigns node ids with [`AxTree::assign_ids`].
     ///
-    /// **Cap every budget of your own by [`AxContext::deadline`]**, and report a read it ended as
-    /// [`crate::GlassError::AccessibilityNotReady`] — the variant
-    /// [`crate::Glass::wait_for_element`] polls through rather than failing on. Honouring it is
-    /// per-reader: the Android, Linux and Windows readers do, so a wait's timeout does not yet
-    /// bind on macOS or iOS.
+    /// Cap backend work by [`AxContext::deadline`]. Return
+    /// [`crate::GlassError::deadline_not_started`] before dispatch and a caller-owned bounded error
+    /// after dispatch; enclosing waits reinterpret this reader-relative caller.
+    ///
+    /// Use [`crate::GlassError::AccessibilityNotReady`] only when the app has not published a usable
+    /// tree before the deadline.
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree>;
 
-    /// Subscribe to change notifications for the app described by `ctx`.
-    ///
-    /// `None` — the default — means this reader has no event stream and its callers keep polling.
-    /// Two readers cannot have one as built: Android's `uiautomator` reader is a dump per call,
-    /// and iOS's is an `idb describe` per call.
-    ///
-    /// Subscribe before the first read, not after: a change that lands after a read but before the
-    /// subscription is announced to nobody, and the caller then waits out its *entire* budget on a
-    /// condition that already holds. (A change between subscribing and reading is safe — the read
-    /// sees it.)
+    /// Subscribe before the first snapshot so changes between subscription and read remain
+    /// observable; `None` means this reader has no event stream.
     fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
         None
     }
 
-    /// Set the editable element identified by `target` to `text`. The backend
-    /// re-walks pre-order to `target.id`, verifies role+name, then sets via the
-    /// native editable interface. Default: unsupported.
+    /// Set the editable `target` after rewalking and verifying its fingerprint; default:
+    /// unsupported.
     ///
-    /// # Error contract
-    ///
-    /// Every failure raised once the write has gone out MUST be a verdict
-    /// [`GlassError::set_value_failed_after_writing`] accepts —
-    /// [`GlassError::AxValueNotApplied`] where the element was read back, and
-    /// [`GlassError::AxWriteUnconfirmed`] where it could not be. That is what drops the value the
-    /// session cached for the element; keeping it makes a field that settled *after* the failure
-    /// look like drift, and the caller's retry is refused for a write that succeeded (glass#405).
-    ///
-    /// A transport failure counts as having written whenever the request may have reached the
-    /// device. Classify at the point that knows — do not flatten it into a generic error on the way
-    /// out, which is how three exits of the Android on-device reader came to be misclassified.
+    /// After dispatch, failures must be [`GlassError::AxValueNotApplied`] or
+    /// [`GlassError::AxWriteUnconfirmed`] so the session drops its stale cached value. Classify
+    /// ambiguous transport failures where the backend knows the write may have reached the device.
     fn set_value(&mut self, _ctx: &AxContext, _target: &AxTarget, _text: &str) -> Result<()> {
         Err(crate::error::GlassError::AxUnsupported)
     }
 
-    /// Actuate the element identified by `target` via the platform's native
-    /// accessibility action (the OS-level "press this control" verb). The
-    /// backend re-walks pre-order to `target.id`, verifies the fingerprint
-    /// (role+name, and bounds where its `set_value` does), then fires the
-    /// action.
+    /// Actuate `target` after rewalking and verifying its fingerprint, returning a substituted
+    /// ancestor id or `None` for `target`.
     ///
-    /// Returns the element the action actually fired on, when that is **not**
-    /// `target.id` — a backend whose toolkit carries a control's activation on an
-    /// ancestor of the node that carries its label actuates that ancestor, and the
-    /// caller reports the substitution. `None` means the target itself was actuated.
-    ///
-    /// **Error contract.** The caller falls back to a synthetic pointer click for
-    /// exactly two outcomes, both meaning *nothing was dispatched*:
-    /// [`crate::GlassError::AxUnsupported`] (this backend has no invoke) and
-    /// [`crate::GlassError::AxActionUnavailable`] (the element exposes no activation
-    /// action). Every other error propagates to the agent. So an implementation MUST
-    /// report anything that may have dispatched — an action the toolkit ran but
-    /// reported failed, a transport error whose answer was lost, a timeout — as
-    /// `AxActionFailed`/`AccessibilityUnavailable`, and MUST NOT flatten such a case
-    /// into `AxActionUnavailable`: a pointer click layered on top of a native action
-    /// that still lands actuates the control twice. `AxElementChanged` (fingerprint
-    /// mismatch) likewise propagates — a drifted tree would mis-click by stale
-    /// coordinates too.
-    ///
-    /// Default: unsupported.
+    /// Only [`crate::GlassError::AxUnsupported`] and
+    /// [`crate::GlassError::AxActionUnavailable`] permit pointer fallback; possibly dispatched or
+    /// stale-target failures propagate. Default: unsupported.
     fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
         Err(crate::error::GlassError::AxUnsupported)
     }
@@ -1276,9 +1239,8 @@ pub trait Accessibility {
 /// How `click_element` actuated the target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClickMethod {
-    /// The platform's native accessibility action fired; no pointer was synthesized.
-    /// `actuated` names the element the action fired on when it is not the one the
-    /// caller asked for, and is `None` when they are the same element.
+    /// Native accessibility actuated the target without a pointer, with `actuated` naming a
+    /// substituted element or `None` for `target`.
     NativeAction { actuated: Option<AxNodeId> },
     /// The synthetic pointer path ran; `native_fallback` says why the native
     /// action was not used (there is always a reason — invoke is attempted first).

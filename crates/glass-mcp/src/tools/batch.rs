@@ -1,13 +1,33 @@
 //! `glass_do`: run an ordered input sequence server-side, then optionally observe.
 
-use glass_core::Glass;
+use glass_core::{Deadline, Glass, Whose};
 use serde_json::json;
+use std::time::{Duration, Instant};
 
 use crate::params::*;
 use crate::tools::{
-    OutContent, ToolOutput, ToolResult, click, diff, drag, key, mouse_move, screenshot, scroll,
-    type_text, wait_stable,
+    BatchToolResult, ContextualError, ContextualToolResult, OutContent, SafeErrorCategory,
+    ToolContext, ToolOutput, click_element_with, click_with, diff_with, drag_with, key_with,
+    mouse_move_with, screenshot_with, scroll_to_element_with, scroll_with, set_value_with,
+    type_text_with, wait_for_element_with, wait_stable_with,
 };
+
+mod model;
+
+use model::{StepError, StepOutcome, TerminalOutcome};
+
+const MAX_ACTIONS: usize = 64;
+const MAX_ARGUMENT_BYTES: usize = 65_536;
+const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const MAX_TIMEOUT_MS: u64 = 120_000;
+
+fn checked_sequence_deadline(started: Instant, timeout: Duration) -> Option<Deadline> {
+    started.checked_add(timeout).map(Deadline::at)
+}
+
+fn caller_deadline_won(timed_out_by: Option<Whose>, deadline: Deadline) -> bool {
+    timed_out_by == Some(Whose::Caller) || deadline.has_passed()
+}
 
 /// Split a sub-tool's enveloped output into (its `result` payload, its non-envelope
 /// sibling blocks — images and the IMAGE_NOTE). The envelope text block itself is consumed.
@@ -55,554 +75,507 @@ fn settle_args(s: &SettleArgs) -> WaitStableArgs {
 
 /// Run an ordered action sequence, then the optional terminal observe.
 /// Fail-fast: the first failing action aborts with its index/kind/message and
-/// the count that ran. A `then` failure is reported distinctly (the actions
-/// already executed).
-pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> ToolResult {
+/// the count of prior completed actions; the failed step separately records
+/// whether it was attempted. A `then` failure is reported distinctly after all
+/// actions completed.
+pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
     if a.actions.is_empty() {
-        return Err("`actions` must contain at least one action".into());
+        return Err(validation_error(
+            "`actions` must contain at least one action",
+        ));
     }
-    // Pre-flight: a `type` action's `return` observe would have its output discarded
-    // mid-sequence, so it's rejected — and the rejection is decidable from the argument
-    // list alone, so it happens BEFORE any input is injected (never a half-applied
-    // sequence for a pure argument-shape error). An explicit `"none"` is the documented
-    // no-observe default and passes.
+    if a.actions.len() > MAX_ACTIONS {
+        return Err(validation_error(&format!(
+            "`actions` must contain at most {MAX_ACTIONS} actions"
+        )));
+    }
+    if a.encoded_argument_bytes > MAX_ARGUMENT_BYTES {
+        return Err(validation_error(&format!(
+            "encoded arguments exceed the {MAX_ARGUMENT_BYTES}-byte limit"
+        )));
+    }
+    let timeout_ms = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
+        return Err(validation_error(&format!(
+            "`timeout_ms` must be between 1 and {MAX_TIMEOUT_MS}"
+        )));
+    }
+    let started = Instant::now();
+    let Some(deadline) = checked_sequence_deadline(started, Duration::from_millis(timeout_ms))
+    else {
+        return Err(validation_error(
+            "`timeout_ms` is outside this platform's monotonic clock range",
+        ));
+    };
+    let context = ToolContext { deadline };
+    let n = a.actions.len();
+    let mut steps = Vec::with_capacity(n);
+    let mut siblings = Vec::new();
     for (i, action) in a.actions.iter().enumerate() {
-        if let Action::Type(args) = action
-            && matches!(args.return_.as_deref(), Some(r) if r != "none")
-        {
-            return Err(format!(
-                "action[{i}] (type): `return` is not accepted inside glass_do — use a \
-                     `settle` action or the terminal `then` observe"
+        let kind = action.kind();
+        if context.deadline.has_passed() {
+            return Err(step_failure(
+                &a.actions,
+                i,
+                kind,
+                false,
+                false,
+                Some(SafeErrorCategory::SequenceDeadlineExceeded),
+                "sequence deadline exceeded before action started",
+                None,
+                true,
+                steps,
+                siblings,
+                started.elapsed().as_millis(),
             ));
         }
-    }
-    let n = a.actions.len();
-    for (i, action) in a.actions.iter().enumerate() {
-        let (kind, result): (&str, ToolResult) = match action {
-            Action::Click(args) => ("click", click(glass, args)),
-            Action::Move(args) => ("move", mouse_move(glass, args)),
-            Action::Drag(args) => ("drag", drag(glass, args)),
-            Action::Scroll(args) => ("scroll", scroll(glass, args)),
-            Action::Type(args) => ("type", type_text(glass, args)),
-            Action::Key(args) => ("key", key(glass, args)),
-            // A settle's text-only output is discarded mid-sequence; only its
-            // Err (bad region / capture failure) aborts. A non-settle (timeout)
-            // is Ok and proceeds.
-            Action::Settle(args) => ("settle", wait_stable(glass, &settle_args(args))),
+        let result: ContextualToolResult = match action {
+            Action::Click(args) => click_with(glass, args, context),
+            Action::Move(args) => mouse_move_with(glass, args, context),
+            Action::Drag(args) => drag_with(glass, args, context),
+            Action::Scroll(args) => scroll_with(glass, args, context),
+            Action::Type(args) => type_text_with(glass, args, context),
+            Action::Key(args) => key_with(glass, args, context),
+            // A settle's result is retained in the step outcome. `settled:false`
+            // under its own timeout is completed; only an error or the enclosing
+            // sequence deadline aborts.
+            Action::Settle(args) => wait_stable_with(glass, &settle_args(args), context),
+            Action::ClickElement(args) => click_element_with(glass, args, context),
+            Action::SetValue(args) => set_value_with(glass, args, context),
+            Action::WaitForElement(args) => wait_for_element_with(glass, args, context),
+            Action::ScrollToElement(args) => scroll_to_element_with(glass, args, context),
         };
-        if let Err(msg) = result {
-            return Err(format!(
-                "action[{i}] ({kind}) failed: {msg} — {i} of {n} actions executed before the failure"
-            ));
+        match result {
+            Ok(out) => {
+                let timed_out_by = out.timed_out_by;
+                let (result, mut extra) = split_sub(out.output);
+                let start = siblings.len() + 1;
+                let content_blocks = (start..start + extra.len()).collect();
+                siblings.append(&mut extra);
+                if caller_deadline_won(timed_out_by, context.deadline) {
+                    return Err(predicate_failure(
+                        &a.actions,
+                        i,
+                        kind,
+                        action.is_side_effecting(),
+                        true,
+                        result,
+                        content_blocks,
+                        steps,
+                        siblings,
+                        started.elapsed().as_millis(),
+                    ));
+                }
+                let predicate_failed =
+                    matches!(
+                        action,
+                        Action::WaitForElement(_) | Action::ScrollToElement(_)
+                    ) && result.get("matched").and_then(serde_json::Value::as_bool) == Some(false);
+                if predicate_failed {
+                    return Err(predicate_failure(
+                        &a.actions,
+                        i,
+                        kind,
+                        action.is_side_effecting(),
+                        false,
+                        result,
+                        content_blocks,
+                        steps,
+                        siblings,
+                        started.elapsed().as_millis(),
+                    ));
+                }
+                steps.push(StepOutcome::Completed {
+                    index: i,
+                    action: kind,
+                    result,
+                    content_blocks,
+                });
+            }
+            Err(error) => {
+                let error = if context.deadline.has_passed() {
+                    error.after_sequence_deadline()
+                } else {
+                    error
+                };
+                let detail = redacted_error_detail(action, &error);
+                let attempted =
+                    error.bound_dispatch != Some(glass_core::BoundDispatch::NotDispatched);
+                let summary = matches!(
+                    error.category,
+                    SafeErrorCategory::InvalidValue | SafeErrorCategory::OptionNotFound
+                )
+                .then_some(error.safe_summary);
+                return Err(step_failure(
+                    &a.actions,
+                    i,
+                    kind,
+                    attempted,
+                    attempted && action.is_side_effecting(),
+                    Some(error.category),
+                    detail,
+                    summary,
+                    error.sequence_deadline_exceeded,
+                    steps,
+                    siblings,
+                    started.elapsed().as_millis(),
+                ));
+            }
         }
     }
 
-    let mut result = json!({ "executed": n });
-    let mut siblings = Vec::new();
+    let mut result = json!({ "status": "completed", "executed": n, "steps": steps });
     if let Some(then) = &a.then {
-        let (meta, sib) = run_then(glass, then)
-            .map_err(|msg| format!("all {n} actions executed; terminal observe failed: {msg}"))?;
-        result["then"] = meta;
-        siblings = sib;
+        match run_then(glass, then, context, siblings.len() + 1) {
+            Ok(mut terminal) => {
+                result["then"] = terminal.meta;
+                result["terminal_steps"] = json!(terminal.outcomes);
+                siblings.append(&mut terminal.siblings);
+            }
+            Err(mut terminal) => {
+                siblings.append(&mut terminal.siblings);
+                let mut outcome = failure_outcome(steps, n, started.elapsed().as_millis());
+                outcome["then"] = terminal.meta;
+                outcome["terminal_steps"] = json!(terminal.outcomes);
+                let (code, summary) = if terminal.sequence_deadline_exceeded {
+                    (
+                        "sequence_deadline_exceeded",
+                        "sequence deadline exceeded after actions completed; do not replay actions",
+                    )
+                } else {
+                    (
+                        "terminal_observe_failed",
+                        "terminal observation failed after actions completed; do not replay actions",
+                    )
+                };
+                return Err(error_output(
+                    json!({
+                    "ok": false,
+                    "tool": "glass_do",
+                    "error": { "code": code, "summary": summary },
+                    "outcome": outcome,
+                    }),
+                    siblings,
+                ));
+            }
+        }
     }
+    result["elapsed_ms"] = json!(started.elapsed().as_millis());
     Ok(ToolOutput::result_with("glass_do", result, siblings))
 }
 
-/// Run the terminal observe in fixed order: settle → diff → screenshot. Returns
-/// the `then` metadata object (each ran sub-tool's `result` payload keyed by
-/// name) and the collected image/IMAGE_NOTE sibling blocks, in run order.
+#[allow(clippy::too_many_arguments)]
+fn predicate_failure(
+    actions: &[Action],
+    index: usize,
+    action: &'static str,
+    side_effects_may_have_occurred: bool,
+    sequence_deadline_exceeded: bool,
+    result: serde_json::Value,
+    content_blocks: Vec<usize>,
+    mut steps: Vec<StepOutcome>,
+    siblings: Vec<OutContent>,
+    elapsed_ms: u128,
+) -> ToolOutput {
+    let (code, summary) = if sequence_deadline_exceeded {
+        ("sequence_deadline_exceeded", "sequence deadline exceeded")
+    } else {
+        ("predicate_not_matched", "element predicate did not match")
+    };
+    steps.push(StepOutcome::Failed {
+        index,
+        action,
+        attempted: true,
+        result: Some(result),
+        error: StepError {
+            code,
+            summary: summary.into(),
+            category: sequence_deadline_exceeded
+                .then_some(SafeErrorCategory::SequenceDeadlineExceeded),
+        },
+        side_effects_may_have_occurred,
+        content_blocks,
+    });
+    steps.extend(
+        actions[index + 1..]
+            .iter()
+            .enumerate()
+            .map(|(offset, action)| StepOutcome::Unexecuted {
+                index: index + offset + 1,
+                action: action.kind(),
+            }),
+    );
+    error_output(
+        json!({
+            "ok": false,
+            "tool": "glass_do",
+            "error": {
+                "code": code,
+                "step": index,
+                "summary": summary,
+            },
+            "outcome": failure_outcome(steps, index, elapsed_ms),
+        }),
+        siblings,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_failure(
+    actions: &[Action],
+    index: usize,
+    action: &'static str,
+    attempted: bool,
+    side_effects_may_have_occurred: bool,
+    category: Option<SafeErrorCategory>,
+    detail: &str,
+    summary: Option<&str>,
+    sequence_deadline_exceeded: bool,
+    mut steps: Vec<StepOutcome>,
+    mut siblings: Vec<OutContent>,
+    elapsed_ms: u128,
+) -> ToolOutput {
+    let (code, default_summary) = if sequence_deadline_exceeded {
+        ("sequence_deadline_exceeded", "sequence deadline exceeded")
+    } else {
+        ("action_failed", "action execution failed")
+    };
+    let summary = summary.unwrap_or(default_summary);
+    let content_block = siblings.len() + 1;
+    siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(detail)));
+    steps.push(StepOutcome::Failed {
+        index,
+        action,
+        attempted,
+        result: None,
+        error: StepError {
+            code,
+            summary: summary.into(),
+            category,
+        },
+        side_effects_may_have_occurred,
+        content_blocks: vec![content_block],
+    });
+    steps.extend(
+        actions[index + 1..]
+            .iter()
+            .enumerate()
+            .map(|(offset, action)| StepOutcome::Unexecuted {
+                index: index + offset + 1,
+                action: action.kind(),
+            }),
+    );
+    error_output(
+        json!({
+            "ok": false,
+            "tool": "glass_do",
+            "error": { "code": code, "step": index, "summary": summary },
+            "outcome": failure_outcome(steps, index, elapsed_ms),
+        }),
+        siblings,
+    )
+}
+
+fn redacted_error_detail<'a>(action: &Action, error: &'a ContextualError) -> &'a str {
+    match action {
+        Action::Type(_) | Action::SetValue(_) => error.safe_summary,
+        _ => &error.message,
+    }
+}
+
+fn validation_error(summary: &str) -> ToolOutput {
+    error_output(
+        json!({
+            "ok": false,
+            "tool": "glass_do",
+            "error": { "code": "invalid_sequence", "summary": summary },
+        }),
+        Vec::new(),
+    )
+}
+
+fn error_output(envelope: serde_json::Value, mut siblings: Vec<OutContent>) -> ToolOutput {
+    let mut content = vec![OutContent::Text(envelope.to_string())];
+    content.append(&mut siblings);
+    ToolOutput(content)
+}
+
+fn failure_outcome(
+    steps: Vec<StepOutcome>,
+    executed: usize,
+    elapsed_ms: u128,
+) -> serde_json::Value {
+    json!({
+        "status": "failed",
+        "executed": executed,
+        "steps": steps,
+        "effects_rolled_back": false,
+        "elapsed_ms": elapsed_ms,
+    })
+}
+
+impl Action {
+    fn kind(&self) -> &'static str {
+        match self {
+            Action::Click(_) => "click",
+            Action::Move(_) => "move",
+            Action::Drag(_) => "drag",
+            Action::Scroll(_) => "scroll",
+            Action::Type(_) => "type",
+            Action::Key(_) => "key",
+            Action::Settle(_) => "settle",
+            Action::ClickElement(args) => {
+                let _ = args;
+                "click_element"
+            }
+            Action::SetValue(args) => {
+                let _ = args;
+                "set_value"
+            }
+            Action::WaitForElement(args) => {
+                let _ = args;
+                "wait_for_element"
+            }
+            Action::ScrollToElement(args) => {
+                let _ = args;
+                "scroll_to_element"
+            }
+        }
+    }
+
+    fn is_side_effecting(&self) -> bool {
+        !matches!(self, Action::Settle(_) | Action::WaitForElement(_))
+    }
+}
+
+struct ThenRun {
+    meta: serde_json::Value,
+    outcomes: Vec<TerminalOutcome>,
+    siblings: Vec<OutContent>,
+    sequence_deadline_exceeded: bool,
+}
+
+/// Run terminal observation in fixed order under the sequence's one deadline.
 fn run_then(
     glass: &mut Glass,
     then: &ThenArgs,
-) -> Result<(serde_json::Value, Vec<OutContent>), String> {
-    let mut meta = json!({});
-    let mut siblings = Vec::new();
+    context: ToolContext,
+    sibling_base: usize,
+) -> Result<ThenRun, ThenRun> {
+    let mut run = ThenRun {
+        meta: json!({}),
+        outcomes: Vec::new(),
+        siblings: Vec::new(),
+        sequence_deadline_exceeded: false,
+    };
+
+    macro_rules! terminal_operation {
+        ($operation:literal, $call:expr, [$($later:literal),* $(,)?]) => {{
+            if context.deadline.has_passed() {
+                run.sequence_deadline_exceeded = true;
+                run.outcomes.push(TerminalOutcome::Failed {
+                    operation: $operation,
+                    error: StepError {
+                        code: "sequence_deadline_exceeded",
+                        summary: "sequence deadline exceeded".into(),
+                        category: Some(SafeErrorCategory::SequenceDeadlineExceeded),
+                    },
+                    content_blocks: Vec::new(),
+                });
+                $(run.outcomes.push(TerminalOutcome::Unexecuted { operation: $later });)*
+                return Err(run);
+            }
+            match $call {
+                Ok(out) if !caller_deadline_won(out.timed_out_by, context.deadline) => {
+                    let (result, mut extra) = split_sub(out.output);
+                    let start = sibling_base + run.siblings.len();
+                    let content_blocks = (start..start + extra.len()).collect();
+                    run.siblings.append(&mut extra);
+                    run.meta[$operation] = result.clone();
+                    run.outcomes.push(TerminalOutcome::Completed { operation: $operation, result, content_blocks });
+                }
+                Ok(_) => {
+                    run.sequence_deadline_exceeded = true;
+                    run.outcomes.push(TerminalOutcome::Failed {
+                        operation: $operation,
+                        error: StepError {
+                            code: "sequence_deadline_exceeded",
+                            summary: "sequence deadline exceeded".into(),
+                            category: Some(SafeErrorCategory::SequenceDeadlineExceeded),
+                        },
+                        content_blocks: Vec::new(),
+                    });
+                    $(run.outcomes.push(TerminalOutcome::Unexecuted { operation: $later });)*
+                    return Err(run);
+                }
+                Err(error) => {
+                    let error = if context.deadline.has_passed() {
+                        error.after_sequence_deadline()
+                    } else {
+                        error
+                    };
+                    run.sequence_deadline_exceeded = error.sequence_deadline_exceeded;
+                    let code = if error.sequence_deadline_exceeded { "sequence_deadline_exceeded" } else { "action_failed" };
+                    let summary = if error.sequence_deadline_exceeded { "sequence deadline exceeded" } else { "terminal observation failed" };
+                    let content_blocks = if error.message.is_empty() { Vec::new() } else {
+                        let index = sibling_base + run.siblings.len();
+                        run.siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(&error.message)));
+                        vec![index]
+                    };
+                    run.outcomes.push(TerminalOutcome::Failed {
+                        operation: $operation,
+                        error: StepError {
+                            code,
+                            summary: summary.into(),
+                            category: Some(error.category),
+                        },
+                        content_blocks,
+                    });
+                    $(run.outcomes.push(TerminalOutcome::Unexecuted { operation: $later });)*
+                    return Err(run);
+                }
+            }
+        }};
+    }
     if let Some(s) = &then.settle {
-        let (r, mut sib) = split_sub(wait_stable(glass, &settle_args(s))?);
-        meta["settle"] = r;
-        siblings.append(&mut sib);
+        if then.diff.is_some() && then.screenshot.is_some() {
+            terminal_operation!(
+                "settle",
+                wait_stable_with(glass, &settle_args(s), context),
+                ["diff", "screenshot"]
+            );
+        } else if then.diff.is_some() {
+            terminal_operation!(
+                "settle",
+                wait_stable_with(glass, &settle_args(s), context),
+                ["diff"]
+            );
+        } else if then.screenshot.is_some() {
+            terminal_operation!(
+                "settle",
+                wait_stable_with(glass, &settle_args(s), context),
+                ["screenshot"]
+            );
+        } else {
+            terminal_operation!(
+                "settle",
+                wait_stable_with(glass, &settle_args(s), context),
+                []
+            );
+        }
     }
     if let Some(d) = &then.diff {
-        let (r, mut sib) = split_sub(diff(glass, d)?);
-        meta["diff"] = r;
-        siblings.append(&mut sib);
+        if then.screenshot.is_some() {
+            terminal_operation!("diff", diff_with(glass, d, context), ["screenshot"]);
+        } else {
+            terminal_operation!("diff", diff_with(glass, d, context), []);
+        }
     }
     if let Some(sc) = &then.screenshot {
-        let (r, mut sib) = split_sub(screenshot(glass, sc)?);
-        meta["screenshot"] = r;
-        siblings.append(&mut sib);
+        terminal_operation!("screenshot", screenshot_with(glass, sc, context), []);
     }
-    Ok((meta, siblings))
+    Ok(run)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tools::start as start_tool;
-    use crate::tools::testutil::*;
-    use crate::tools::{OutContent, baseline_save};
-    use glass_core::Frame;
-    use std::sync::{Arc, Mutex};
-
-    fn started(platform: FakePlatform) -> Glass {
-        let mut g = glass_with(platform);
-        let a = StartArgs {
-            build: None,
-            run: vec!["app".into()],
-            backend: None,
-            sandbox: None,
-            cwd: None,
-            env: std::collections::BTreeMap::new(),
-            window_hint: None,
-            timeout_ms: None,
-            a11y: None,
-        };
-        start_tool(&mut g, &a).unwrap();
-        g
-    }
-
-    fn click(x: i32, y: i32) -> Action {
-        Action::Click(ClickArgs {
-            x,
-            y,
-            button: None,
-            count: None,
-            modifiers: None,
-        })
-    }
-
-    #[test]
-    fn runs_actions_in_order() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![
-                    click(10, 20),
-                    Action::Type(TypeArgs {
-                        text: "alice".into(),
-                        return_: None,
-                    }),
-                    Action::Key(KeyArgs {
-                        chord: "Tab".into(),
-                    }),
-                ],
-                then: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            *log.lock().unwrap(),
-            vec!["click(10,20)", "type(alice)", "key(Tab)"]
-        );
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["executed"], json!(3));
-    }
-
-    #[test]
-    fn type_action_with_return_is_rejected_before_any_action_runs() {
-        // The rejection is decidable from the argument list alone, so it must
-        // pre-flight: no earlier action may be injected before the batch errors.
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
-        let err = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![
-                    click(10, 10),
-                    Action::Type(TypeArgs {
-                        text: "hi".into(),
-                        return_: Some("settle".into()),
-                    }),
-                ],
-                then: None,
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("action[1]"), "got: {err}");
-        assert!(err.contains("`return`"), "got: {err}");
-        assert!(err.contains("terminal `then` observe"), "got: {err}");
-        assert!(
-            log.lock().unwrap().is_empty(),
-            "pre-flight must reject before any input is injected: {:?}",
-            log.lock().unwrap()
-        );
-    }
-
-    #[test]
-    fn type_action_with_return_none_is_allowed() {
-        // "none" is the documented no-observe default — an explicit `"return":"none"`
-        // is semantically identical to omitting the field and must not be rejected.
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![Action::Type(TypeArgs {
-                    text: "hi".into(),
-                    return_: Some("none".into()),
-                })],
-                then: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(*log.lock().unwrap(), vec!["type(hi)"]);
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["executed"], json!(1));
-    }
-
-    #[test]
-    fn fail_fast_reports_index_and_stops() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
-        let err = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![
-                    click(10, 10),  // ok
-                    click(100, 10), // out of bounds (valid 0..=99) -> fails
-                    Action::Key(KeyArgs {
-                        chord: "Return".into(),
-                    }), // never runs
-                ],
-                then: None,
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("action[1]"), "got: {err}");
-        assert!(err.contains("click"), "got: {err}");
-        assert!(err.contains("1 of 3"), "got: {err}");
-        assert_eq!(
-            *log.lock().unwrap(),
-            vec!["click(10,10)"],
-            "only the first action executed"
-        );
-    }
-
-    #[test]
-    fn empty_actions_rejected() {
-        let mut g = started(FakePlatform::new(10, 10));
-        let err = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![],
-                then: None,
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("at least one"), "got: {err}");
-    }
-
-    #[test]
-    fn then_settle_is_text_only() {
-        let f = Frame::solid(2, 2, [5, 5, 5, 255]);
-        let mut g = started(FakePlatform::new(2, 2).with_frames(vec![f.clone(), f]));
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: Some(SettleArgs {
-                        interval_ms: Some(0),
-                        settle_frames: Some(2),
-                        tolerance: None,
-                        timeout_ms: Some(200),
-                        stability_region: None,
-                        ignore: None,
-                    }),
-                    diff: None,
-                    screenshot: None,
-                }),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            out.0.len(),
-            1,
-            "settle folded into the envelope, no separate/image block"
-        );
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["then"]["settle"]["settled"], json!(true));
-    }
-
-    #[test]
-    fn then_settle_ignore_masks_a_blinking_pixel_so_it_settles() {
-        // `settle_args()` must forward `SettleArgs.ignore` into `WaitStableParams.ignore`:
-        // with no `#[serde(deny_unknown_fields)]` in this crate, a dropped field still parses
-        // and just does nothing. Pixel (1,1) blinks across the three scripted frames while
-        // the rest of the 2x2 stays constant, so only masking it settles within
-        // `settle_frames`.
-        //
-        // Pinning the capture count to 3 rules out settling by outlasting the frames into
-        // `FakePlatform`'s repeat-forever fallback.
-        let log = Arc::new(Mutex::new(0usize));
-        let mut f0 = Frame::solid(2, 2, [10, 10, 10, 255]);
-        let mut f1 = f0.clone();
-        let mut f2 = f0.clone();
-        let idx = 3 * 4; // pixel (1,1): row 1 * width 2 + col 1 = 3, 4 bytes/pixel
-        f0.pixels[idx] = 10;
-        f1.pixels[idx] = 20;
-        f2.pixels[idx] = 30;
-        let mut g = started(
-            FakePlatform::new(2, 2)
-                .with_frames(vec![f0, f1, f2])
-                .with_capture_log(log.clone()),
-        );
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: Some(SettleArgs {
-                        interval_ms: Some(0),
-                        settle_frames: Some(2),
-                        tolerance: None,
-                        timeout_ms: Some(1000),
-                        stability_region: None,
-                        ignore: Some(vec![RegionArgs {
-                            x: 1,
-                            y: 1,
-                            width: 1,
-                            height: 1,
-                        }]),
-                    }),
-                    diff: None,
-                    screenshot: None,
-                }),
-            },
-        )
-        .unwrap();
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(
-            result["then"]["settle"]["settled"],
-            json!(true),
-            "the blinking pixel is masked, so the stream is stable: {result}"
-        );
-        assert_eq!(
-            result["then"]["settle"]["saw_motion"],
-            json!(false),
-            "masked motion must never set saw_motion: {result}"
-        );
-        assert_eq!(
-            *log.lock().unwrap(),
-            3,
-            "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
-        );
-    }
-
-    #[test]
-    fn then_screenshot_appends_image() {
-        let mut g =
-            started(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [1, 2, 3, 255])]));
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(1, 1)],
-                then: Some(ThenArgs {
-                    settle: None,
-                    diff: None,
-                    screenshot: Some(ScreenshotArgs {
-                        region: None,
-                        window_id: None,
-                    }),
-                }),
-            },
-        )
-        .unwrap();
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["executed"], json!(1));
-        assert_eq!(result["then"]["screenshot"]["width"], json!(4));
-        assert!(
-            matches!(out.0[1], OutContent::Image(_)),
-            "screenshot image appended"
-        );
-        assert_eq!(
-            out.0.len(),
-            3,
-            "envelope + screenshot image + IMAGE_NOTE (dims folded into result.then.screenshot)"
-        );
-        assert!(
-            matches!(&out.0[2], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
-            "IMAGE_NOTE last"
-        );
-    }
-
-    #[test]
-    fn then_settle_timeout_still_succeeds() {
-        // settle_frames=2 but timeout_ms=0 -> one tick, never settles -> settled:false,
-        // yet do_actions returns Ok (a settle timeout is not a batch failure).
-        let mut g =
-            started(FakePlatform::new(2, 2).with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]));
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: Some(SettleArgs {
-                        interval_ms: Some(0),
-                        settle_frames: Some(2),
-                        tolerance: None,
-                        timeout_ms: Some(0),
-                        stability_region: None,
-                        ignore: None,
-                    }),
-                    diff: None,
-                    screenshot: None,
-                }),
-            },
-        )
-        .unwrap();
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["then"]["settle"]["settled"], json!(false));
-    }
-
-    #[test]
-    fn then_diff_reports_change_text_only() {
-        let base = Frame::solid(2, 2, [0, 0, 0, 255]);
-        let mut changed = base.clone();
-        changed.pixels[0] = 255;
-        let mut g = started(FakePlatform::new(2, 2).with_frames(vec![base, changed]));
-        baseline_save(&mut g, &BaselineSaveArgs { name: "m".into() }).unwrap();
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: None,
-                    diff: Some(DiffArgs {
-                        region: None,
-                        name: "m".into(),
-                        mode: None,
-                        threshold: None,
-                        tolerance: None,
-                        include_image: Some(false),
-                        ignore: None,
-                    }),
-                    screenshot: None,
-                }),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            out.0.len(),
-            1,
-            "no image -> the envelope alone, no nested envelope"
-        );
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["then"]["diff"]["changed_pixels"], json!(1));
-    }
-
-    #[test]
-    fn then_diff_with_image_appends_image_sibling() {
-        let base = Frame::solid(2, 2, [0, 0, 0, 255]);
-        let mut changed = base.clone();
-        changed.pixels[0] = 255;
-        let mut g = started(FakePlatform::new(2, 2).with_frames(vec![base, changed]));
-        baseline_save(&mut g, &BaselineSaveArgs { name: "m".into() }).unwrap();
-        let out = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: None,
-                    diff: Some(DiffArgs {
-                        region: None,
-                        name: "m".into(),
-                        mode: None,
-                        threshold: None,
-                        tolerance: None,
-                        include_image: Some(true),
-                        ignore: None,
-                    }),
-                    screenshot: None,
-                }),
-            },
-        )
-        .unwrap();
-        let result = assert_envelope(&out, "glass_do");
-        assert_eq!(result["then"]["diff"]["changed_pixels"], json!(1));
-        assert_eq!(
-            out.0.len(),
-            3,
-            "envelope + diff image + IMAGE_NOTE (metrics folded into result.then.diff)"
-        );
-        assert!(
-            matches!(out.0[1], OutContent::Image(_)),
-            "diff's changed-region image rides alongside as a sibling"
-        );
-        assert!(
-            matches!(&out.0[2], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
-            "IMAGE_NOTE follows the image"
-        );
-    }
-
-    #[test]
-    fn terminal_observe_failure_is_distinct() {
-        let mut g =
-            started(FakePlatform::new(2, 2).with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]));
-        let err = do_actions(
-            &mut g,
-            &DoArgs {
-                actions: vec![click(0, 0)],
-                then: Some(ThenArgs {
-                    settle: None,
-                    diff: Some(DiffArgs {
-                        region: None,
-                        name: "absent".into(),
-                        mode: None,
-                        threshold: None,
-                        tolerance: None,
-                        include_image: None,
-                        ignore: None,
-                    }),
-                    screenshot: None,
-                }),
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("all 1 actions executed"), "got: {err}");
-        assert!(err.contains("terminal observe failed"), "got: {err}");
-        assert!(err.contains("baseline"), "got: {err}");
-    }
-
-    #[test]
-    fn split_sub_requires_ok_and_tool_and_keeps_siblings() {
-        // A well-formed sub-tool output (screenshot's shape): [Image, envelope, IMAGE_NOTE].
-        // The envelope carries a `result` key alongside `ok`/`tool`; a bare JSON object
-        // with only a `result` key (no `ok`/`tool`) must NOT match the tightened
-        // predicate — it's included here as a leading sibling to prove that.
-        let out = ToolOutput(vec![
-            OutContent::Text(json!({ "result": "not the real envelope" }).to_string()),
-            OutContent::Image(vec![1, 2, 3]),
-            OutContent::Text(
-                json!({ "ok": true, "tool": "glass_screenshot", "result": { "width": 4 } })
-                    .to_string(),
-            ),
-            OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
-        ]);
-        let (result, siblings) = split_sub(out);
-        assert_eq!(
-            result,
-            json!({ "width": 4 }),
-            "real envelope's result extracted"
-        );
-        assert_eq!(
-            siblings.len(),
-            3,
-            "the fake-envelope text, image, and IMAGE_NOTE all ride as siblings"
-        );
-        assert!(
-            matches!(&siblings[0], OutContent::Text(t) if t.contains("not the real envelope")),
-            "JSON with `result` but no ok/tool is not misclassified as the envelope"
-        );
-        assert!(
-            matches!(siblings[1], OutContent::Image(_)),
-            "image sibling preserved"
-        );
-        assert!(
-            matches!(&siblings[2], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE),
-            "IMAGE_NOTE sibling preserved"
-        );
-    }
-}
+mod tests;

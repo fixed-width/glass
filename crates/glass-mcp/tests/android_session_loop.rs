@@ -7,15 +7,144 @@
 //!   GLASS_ANDROID_FIXTURE_APK=/path/to/fixture-compose-debug.apk \
 //!     cargo test -p glass-mcp --test android_session_loop -- --ignored --nocapture
 
+mod common;
+
+use std::time::Duration;
+
+use common::mcp_http::{InProcessMcpHarness, await_cleanup, call};
 use glass_android::{A11yServiceRegistry, AgentRegistry, AndroidPlatform, EmulatorRegistry};
 use glass_core::Deadline;
 use glass_core::accessibility::{AxNode, AxTree, ClickMethod};
 use glass_core::{AppSpec, BaselineStore, Glass, PlatformFactory, SandboxLevel};
+use rmcp::{Peer, RoleClient};
+use serde_json::json;
 
 /// Ceiling on the wait for the fixture's counter to reflect the click — the poll returns as soon
 /// as it changes.
 const AWAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const AWAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+static ANDROID_DEVICE_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Build `glass_mcp::boot`'s session factory with registries owned by the cleanup guard.
+fn session_glass(device: &Companions) -> Glass {
+    // On macOS, `make_platform` also captures the iOS registry whose cloned handle lets `device`
+    // shut down shared state.
+    #[cfg(target_os = "macos")]
+    let sim = glass_ios::SimulatorRegistry::new();
+    #[cfg(target_os = "macos")]
+    let factory: PlatformFactory = {
+        let (emulators, agents, a11y) = (
+            device.emulators.clone(),
+            device.agents.clone(),
+            device.a11y.clone(),
+        );
+        Box::new(move |b| glass_mcp::make_platform(b, &emulators, &agents, &a11y, &sim))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let factory: PlatformFactory = {
+        let (emulators, agents, a11y) = (
+            device.emulators.clone(),
+            device.agents.clone(),
+            device.a11y.clone(),
+        );
+        Box::new(move |b| glass_mcp::make_platform(b, &emulators, &agents, &a11y))
+    };
+
+    let baselines = tempfile::tempdir()
+        .expect("a temp dir for the baseline store")
+        .keep();
+    Glass::new(
+        factory,
+        "android".to_string(),
+        BaselineStore::new(&baselines),
+        10_000,
+    )
+}
+
+#[tokio::test]
+async fn harness_cleanup_wait_is_bounded() {
+    let result: Result<(), String> = await_cleanup(
+        "persistent test future",
+        Duration::ZERO,
+        std::future::pending(),
+    )
+    .await;
+    let error = result.unwrap_err();
+    assert!(error.contains("persistent test future"));
+}
+
+#[derive(Debug)]
+struct OutlineNode<'a> {
+    id: u32,
+    indent: usize,
+    shape: &'a str,
+}
+
+fn outline_nodes(outline: &str) -> Vec<OutlineNode<'_>> {
+    outline
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let id_and_shape = trimmed.strip_prefix('#')?;
+            let (id, shape) = id_and_shape.split_once(char::is_whitespace)?;
+            Some(OutlineNode {
+                id: id.parse().ok()?,
+                indent: line.len() - trimmed.len(),
+                shape: shape.trim_start(),
+            })
+        })
+        .collect()
+}
+
+fn unique_outline_id(
+    outline: &str,
+    label: &str,
+    candidates: impl Iterator<Item = u32>,
+) -> Result<u32, String> {
+    let candidates = candidates.collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [id] => Ok(*id),
+        _ => Err(format!(
+            "expected exactly one {label} candidate, found {}:\n{outline}",
+            candidates.len()
+        )),
+    }
+}
+
+fn name_id_from_outline_result(outline: &str) -> Result<u32, String> {
+    let nodes = outline_nodes(outline);
+    unique_outline_id(
+        outline,
+        "TextField \"Name\"",
+        nodes
+            .iter()
+            .filter(|node| node.shape.starts_with("TextField \"Name\" value="))
+            .map(|node| node.id),
+    )
+}
+
+fn name_id_from_outline(outline: &str) -> u32 {
+    name_id_from_outline_result(outline).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn save_button_id_from_outline_result(outline: &str) -> Result<u32, String> {
+    let nodes = outline_nodes(outline);
+    unique_outline_id(
+        outline,
+        "Save Button",
+        nodes.iter().enumerate().filter_map(|(index, node)| {
+            let previous = index.checked_sub(1).and_then(|index| nodes.get(index))?;
+            (node.shape.starts_with("Button (")
+                && previous.indent == node.indent
+                && previous.shape.starts_with("Label \"Save\" ("))
+            .then_some(node.id)
+        }),
+    )
+}
+
+fn save_button_id_from_outline(outline: &str) -> u32 {
+    save_button_id_from_outline_result(outline).unwrap_or_else(|error| panic!("{error}"))
+}
 
 /// The registries whose `ensure` switches something on for the whole device, put back when this
 /// goes out of scope — a trailing `shutdown()` is skipped by a panic. Only `shutdown` restores
@@ -47,6 +176,7 @@ impl Drop for Companions {
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ADB + GLASS_ANDROID_A11Y_APK + GLASS_ANDROID_FIXTURE_APK"]
 fn a_session_click_reports_the_native_accessibility_action() {
+    let _device_lock = ANDROID_DEVICE_TEST.blocking_lock();
     // An unset APK path is itself the degradation this test detects, so it has to fail as
     // misconfiguration rather than as a verdict.
     std::env::var("GLASS_ANDROID_A11Y_APK").expect("set GLASS_ANDROID_A11Y_APK");
@@ -70,37 +200,7 @@ fn a_session_click_reports_the_native_accessibility_action() {
             .expect("install the fixture APK");
     }
 
-    // The two shapes of `boot`'s own factory closure — `make_platform` takes the iOS Simulator
-    // registry on macOS only. The registries are handles to shared state, so the closure's
-    // clones are the ones `device` shuts down.
-    #[cfg(target_os = "macos")]
-    let sim = glass_ios::SimulatorRegistry::new();
-    #[cfg(target_os = "macos")]
-    let factory: PlatformFactory = {
-        let (emulators, agents, a11y) = (
-            device.emulators.clone(),
-            device.agents.clone(),
-            device.a11y.clone(),
-        );
-        Box::new(move |b| glass_mcp::make_platform(b, &emulators, &agents, &a11y, &sim))
-    };
-    #[cfg(not(target_os = "macos"))]
-    let factory: PlatformFactory = {
-        let (emulators, agents, a11y) = (
-            device.emulators.clone(),
-            device.agents.clone(),
-            device.a11y.clone(),
-        );
-        Box::new(move |b| glass_mcp::make_platform(b, &emulators, &agents, &a11y))
-    };
-
-    let baselines = tempfile::tempdir().expect("a temp dir for the baseline store");
-    let mut glass = Glass::new(
-        factory,
-        "android".to_string(),
-        BaselineStore::new(baselines.path()),
-        10_000,
-    );
+    let mut glass = session_glass(&device);
     glass
         .start(&AppSpec {
             build: None,
@@ -134,6 +234,126 @@ fn a_session_click_reports_the_native_accessibility_action() {
     // The user's own path; a panic above skips it and the drops do the same work —
     // `AndroidPlatform` force-stops the app, `Companions` puts the settings back.
     glass.stop().expect("stop the session");
+}
+
+/// Prove one batch survives IME relayout across the unique Name field, Save button, and Counter
+/// `"Clicked 1"` state.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a booted AVD + GLASS_ADB + GLASS_ANDROID_A11Y_APK + GLASS_ANDROID_FIXTURE_APK"]
+async fn glass_do_android_ime_form_is_confirmed_end_to_end() {
+    let _device_lock = ANDROID_DEVICE_TEST.lock().await;
+    std::env::var("GLASS_ANDROID_A11Y_APK").expect("set GLASS_ANDROID_A11Y_APK");
+    let fixture =
+        std::env::var("GLASS_ANDROID_FIXTURE_APK").expect("set GLASS_ANDROID_FIXTURE_APK");
+    let device = Companions {
+        agents: AgentRegistry::new(),
+        a11y: A11yServiceRegistry::new(),
+        emulators: EmulatorRegistry::new(),
+    };
+    let mcp = InProcessMcpHarness::boot(session_glass(&device), "android-loop").await;
+    let peer = mcp.peer();
+    let proof = tokio::spawn(async move { ime_form_proof(peer, fixture).await });
+    let proof = proof.await;
+    let cleanup = mcp.shutdown().await;
+    match proof {
+        Ok(()) => cleanup.expect("Android MCP cleanup failed"),
+        Err(proof) => {
+            if let Err(cleanup) = cleanup {
+                eprintln!("Android MCP cleanup failed after proof panic: {cleanup}");
+            }
+            std::panic::resume_unwind(proof.into_panic());
+        }
+    }
+}
+
+async fn ime_form_proof(client: Peer<RoleClient>, fixture: String) {
+    call(
+        &client,
+        "glass_start",
+        json!({
+            "run": [fixture, "com.fixedwidth.glassfixture/.MainActivity"],
+            "backend": "android",
+            "timeout_ms": 10_000,
+        }),
+    )
+    .await;
+    let (_metadata, outline) = call(&client, "glass_a11y_snapshot", json!({})).await;
+    let name_id = name_id_from_outline(&outline);
+    let save_id = save_button_id_from_outline(&outline);
+
+    let (result, all_text) = call(
+        &client,
+        "glass_do",
+        json!({
+            "timeout_ms": 20_000,
+            "actions": [
+                {"action": "set_value", "id": name_id, "text": "viaBatch"},
+                {"action": "wait_for_element", "name": "Name", "value": "viaBatch", "timeout_ms": 5_000},
+                {"action": "click_element", "id": save_id},
+                {"action": "wait_for_element", "name": "Clicked 1", "description": "Counter", "timeout_ms": 5_000}
+            ]
+        }),
+    )
+    .await;
+
+    assert_eq!(result["status"], json!("completed"), "{all_text}");
+    assert_eq!(result["executed"], json!(4), "{all_text}");
+    assert!(result["elapsed_ms"].is_number(), "{all_text}");
+    let steps = result["steps"].as_array().expect("four batch steps");
+    assert_eq!(steps.len(), 4, "{all_text}");
+    for (index, (step, action)) in steps
+        .iter()
+        .zip([
+            "set_value",
+            "wait_for_element",
+            "click_element",
+            "wait_for_element",
+        ])
+        .enumerate()
+    {
+        assert_eq!(step["index"], json!(index), "{all_text}");
+        assert_eq!(step["status"], json!("completed"), "{all_text}");
+        assert_eq!(step["action"], json!(action), "{all_text}");
+    }
+    assert_eq!(
+        steps[2]["result"]["method"],
+        json!("native-action"),
+        "{all_text}"
+    );
+
+    call(&client, "glass_stop", json!({})).await;
+}
+
+#[test]
+fn outline_selectors_require_the_observed_unique_control_shapes() {
+    let outline = r#"
+  #3 TextField "Name" value="" (63,338 735x147) [focusable,enabled,visible,editable]
+    #5 Label "Save" (126,522 80x53) [enabled,visible]
+    #6 Button (63,496 206x105) [enabled,visible]
+"#;
+    assert_eq!(name_id_from_outline(outline), 3);
+    assert_eq!(save_button_id_from_outline(outline), 6);
+}
+
+#[test]
+fn outline_selectors_reject_ambiguous_controls() {
+    let outline = r#"
+  #3 TextField "Name" value="" (63,338 735x147) [focusable,enabled,visible,editable]
+  #4 TextField "Name" value="" (63,338 735x147) [focusable,enabled,visible,editable]
+"#;
+    let error = name_id_from_outline_result(outline).unwrap_err();
+    assert!(error.contains("expected exactly one TextField \"Name\""));
+    assert!(error.contains(outline.trim()));
+
+    let outline = r#"
+    #5 Label "Save" (126,522 80x53) [enabled,visible]
+    #6 Button (63,496 206x105) [enabled,visible]
+    #7 Label "Save" (126,622 80x53) [enabled,visible]
+    #8 Button (63,596 206x105) [enabled,visible]
+"#;
+    let error = save_button_id_from_outline_result(outline).unwrap_err();
+    assert!(error.contains("expected exactly one Save Button"));
+    assert!(error.contains(outline.trim()));
 }
 
 /// The fixture's click counter, as the a11y tree reports it.

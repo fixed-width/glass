@@ -12,13 +12,18 @@ use tokio::sync::Mutex;
 
 use crate::audit::AuditReport;
 use crate::params::*;
-use crate::tools::{self, OutContent, ToolOutput, ToolResult};
+use crate::tools::{self, BatchToolResult, OutContent, ToolOutput, ToolResult};
+
+enum ToolCallOutcome {
+    Success(ToolOutput),
+    Error(ToolOutput),
+}
 
 /// A synchronous tool body plus where to send its result — run on the dedicated
 /// `glass-platform` thread (see [`GlassServer::new`]).
 type Job = (
-    Box<dyn FnOnce(&mut Glass) -> ToolResult + Send>,
-    tokio::sync::oneshot::Sender<ToolResult>,
+    Box<dyn FnOnce(&mut Glass) -> ToolCallOutcome + Send>,
+    tokio::sync::oneshot::Sender<ToolCallOutcome>,
 );
 
 #[derive(Clone)]
@@ -31,9 +36,8 @@ pub struct GlassServer {
     tool_router: ToolRouter<GlassServer>,
 }
 
-fn to_call_result(out: ToolOutput) -> CallToolResult {
-    let contents = out
-        .0
+fn to_contents(out: ToolOutput) -> Vec<ContentBlock> {
+    out.0
         .into_iter()
         .map(|c| match c {
             OutContent::Text(t) => ContentBlock::text(t),
@@ -42,8 +46,14 @@ fn to_call_result(out: ToolOutput) -> CallToolResult {
                 ContentBlock::image(b64, "image/webp")
             }
         })
-        .collect();
-    CallToolResult::success(contents)
+        .collect()
+}
+
+fn map_call_outcome(outcome: ToolCallOutcome) -> CallToolResult {
+    match outcome {
+        ToolCallOutcome::Success(out) => CallToolResult::success(to_contents(out)),
+        ToolCallOutcome::Error(out) => CallToolResult::error(to_contents(out)),
+    }
 }
 
 /// Map a tool-logic result into an MCP call result. An `Err` becomes an MCP
@@ -52,10 +62,10 @@ fn to_call_result(out: ToolOutput) -> CallToolResult {
 /// call — the "no silent fallback" invariant at the protocol boundary. Kept pure
 /// (no async / no lock) so this contract is unit-testable.
 fn map_tool_result(result: ToolResult) -> CallToolResult {
-    match result {
-        Ok(out) => to_call_result(out),
-        Err(msg) => CallToolResult::error(vec![ContentBlock::text(msg)]),
-    }
+    map_call_outcome(match result {
+        Ok(out) => ToolCallOutcome::Success(out),
+        Err(msg) => ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(msg)])),
+    })
 }
 
 /// The `glass_doctor` result payload: the rendered report humans and existing
@@ -92,10 +102,14 @@ impl GlassServer {
                     let mut g = worker_glass.blocking_lock();
                     // A panicking tool becomes a loud error AND the thread survives — so it
                     // keeps serving calls and keeps parenting any still-running sandbox.
-                    let result =
+                    let outcome =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut g)))
-                            .unwrap_or_else(|_| Err("tool handler panicked".to_string()));
-                    let _ = reply.send(result);
+                            .unwrap_or_else(|_| {
+                                ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(
+                                    "tool handler panicked".to_string(),
+                                )]))
+                            });
+                    let _ = reply.send(outcome);
                 }
             })
             .expect("spawn glass-platform thread");
@@ -117,6 +131,28 @@ impl GlassServer {
     where
         F: FnOnce(&mut Glass) -> ToolResult + Send + 'static,
     {
+        self.run_outcome(move |g| match f(g) {
+            Ok(out) => ToolCallOutcome::Success(out),
+            Err(msg) => ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(msg)])),
+        })
+        .await
+    }
+
+    async fn run_batch<F>(&self, f: F) -> Result<CallToolResult, McpError>
+    where
+        F: FnOnce(&mut Glass) -> BatchToolResult + Send + 'static,
+    {
+        self.run_outcome(move |g| match f(g) {
+            Ok(out) => ToolCallOutcome::Success(out),
+            Err(out) => ToolCallOutcome::Error(out),
+        })
+        .await
+    }
+
+    async fn run_outcome<F>(&self, f: F) -> Result<CallToolResult, McpError>
+    where
+        F: FnOnce(&mut Glass) -> ToolCallOutcome + Send + 'static,
+    {
         // Hand the (synchronous, possibly slow) tool body to the dedicated glass-platform
         // thread and await its result: that thread, not an ephemeral blocking-pool thread,
         // parents any process the body spawns, so a sandboxed app's `--die-with-parent` only
@@ -124,14 +160,16 @@ impl GlassServer {
         // unanswered request.
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self.jobs.send((Box::new(f), reply_tx)).is_err() {
-            return Ok(map_tool_result(Err(
-                "glass-platform thread is gone".to_string()
-            )));
+            return Ok(map_call_outcome(ToolCallOutcome::Error(ToolOutput(vec![
+                OutContent::Text("glass-platform thread is gone".to_string()),
+            ]))));
         }
-        let outcome = reply_rx
-            .await
-            .unwrap_or_else(|_| Err("glass-platform thread dropped the job".to_string()));
-        Ok(map_tool_result(outcome))
+        let outcome = reply_rx.await.unwrap_or_else(|_| {
+            ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(
+                "glass-platform thread dropped the job".to_string(),
+            )]))
+        });
+        Ok(map_call_outcome(outcome))
     }
 
     #[tool(
@@ -439,9 +477,8 @@ impl GlassServer {
             tokio::task::spawn_blocking(move || crate::doctor::diagnose_with_audit(deep, &report))
                 .await
                 .expect("doctor task panicked");
-        Ok(to_call_result(ToolOutput::result(
-            "glass_doctor",
-            doctor_result(&diag, backend),
+        Ok(map_call_outcome(ToolCallOutcome::Success(
+            ToolOutput::result("glass_doctor", doctor_result(&diag, backend)),
         )))
     }
 
@@ -726,23 +763,25 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Run an ordered sequence of input actions in ONE call (collapsing per-action \
-                       round-trips), then optionally observe. `actions` is a list of \
-                       {\"action\":\"click|move|drag|scroll|type|key|settle\", …same fields as the \
-                       matching tool — except `type`'s `return` observe, rejected here (use a \
-                       settle action or `then`)}; `settle` waits for the screen to stop changing \
-                       between steps. \
-                       Optional `then` runs after all actions succeed: {settle?, diff?, screenshot?} \
-                       (text-only unless screenshot/diff image). Fails fast: if an action errors it \
-                       reports which index failed and how many ran. Use for KNOWN sequences (login, \
-                       form-fill, menu→item); if you must see a result to choose the next action, \
-                       don't batch that part."
+        description = "Run fixed static ordered actions in one call: click, move, drag, scroll, type, \
+                       key, settle, click_element, set_value, wait_for_element, scroll_to_element. \
+                       At most 64 actions and 65536 compact argument bytes. Optional absolute sequence \
+                       timeout_ms defaults to 30000ms, is valid from 1 through 120000ms, and uses one absolute deadline shared by all actions and \
+                       terminal settle/diff/screenshot. Fail-fast on action errors, sequence deadline, \
+                       and unmatched batched wait_for_element/scroll_to_element predicates; standalone \
+                       predicates remain soft. Successful calls return a structured completed outcome for every \
+                       action. Once execution starts, action failures return completed, failed, and unexecuted action \
+                       outcomes in the MCP error; terminal-observation failures return completed action outcomes plus \
+                       terminal_steps. Preflight validation failures return an invalid_sequence error without step \
+                       outcomes. Optional terminal settle, diff, screenshot adds corresponding terminal_steps outcomes. \
+                       type retains return:\"none|settle|snapshot\" support. No variables, \
+                       result bindings, interpolation, branching, loops, retries, or dynamic action generation."
     )]
     async fn glass_do(
         &self,
         Parameters(a): Parameters<DoArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::do_actions(g, &a)).await
+        self.run_batch(move |g| tools::do_actions(g, &a)).await
     }
 }
 
@@ -774,10 +813,19 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      appears. Successful input dispatch does not prove runtime state; verify the expected outcome \
      with the strongest matching wait. Waits return text only and time out softly with {matched:false} — branch on \
      that rather than retrying blindly.\n\n\
-     Batch a known input sequence into one call with glass_do (actions: click/type/key/\
-     move/drag/scroll/settle), with an optional text-first `then` observe \
-     (settle/diff/screenshot) — fewer round-trips, and it fails fast naming the action \
-     that broke.\n\n\
+     Batch fixed static ordered actions into one glass_do call: click, move, drag, scroll, type, key, \
+     settle, click_element, set_value, wait_for_element, scroll_to_element. It accepts at most 64 \
+     actions and 65536 compact argument bytes. Its optional absolute sequence timeout_ms defaults to \
+     30000ms, is valid from 1 through 120000ms, and uses one absolute deadline shared by all actions and terminal settle/diff/screenshot work. \
+     Fail-fast on action errors, sequence deadline, and unmatched batched wait_for_element/\
+     scroll_to_element predicates; standalone predicates remain soft. Successful calls return a structured \
+     completed outcome for every action. Once execution starts, action failures return completed, failed, and \
+     unexecuted action outcomes in the MCP error; terminal-observation failures return completed action outcomes \
+     plus terminal_steps. Preflight validation failures return an invalid_sequence error without step outcomes. \
+     Optional terminal settle, diff, screenshot adds corresponding terminal_steps outcomes. \
+     type retains return:\"none|settle|snapshot\" support. \
+     No variables, result bindings, interpolation, branching, loops, retries, or dynamic action \
+     generation.\n\n\
      Multiple windows: glass_list_windows and glass_select_window. Errors are real — a \
      failed capture or input returns a message, never a blank or stale frame; fix the \
      cause instead of retrying blindly.";
@@ -823,8 +871,202 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
+    #[test]
+    fn glass_do_schema_and_description_advertise_the_bounded_static_contract() {
+        let tool = GlassServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "glass_do")
+            .expect("glass_do is registered");
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        let defs = schema["$defs"].as_object().expect("schema definitions");
+        let alternatives = defs["Action"]["oneOf"]
+            .as_array()
+            .expect("Action alternatives");
+        let discriminators: BTreeSet<&str> = alternatives
+            .iter()
+            .map(|alternative| {
+                alternative["properties"]["action"]["const"]
+                    .as_str()
+                    .expect("action discriminator const")
+            })
+            .collect();
+        let expected: BTreeSet<&str> = [
+            "click",
+            "move",
+            "drag",
+            "scroll",
+            "type",
+            "key",
+            "settle",
+            "click_element",
+            "set_value",
+            "wait_for_element",
+            "scroll_to_element",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(discriminators, expected);
+        assert!(schema["properties"].get("timeout_ms").is_some(), "{schema}");
+        let sequence_timeout = schema["properties"]["timeout_ms"]["description"]
+            .as_str()
+            .expect("glass_do timeout description");
+        assert!(sequence_timeout.contains("Overall sequence budget"));
+        assert!(sequence_timeout.contains("1..=120000"));
+        assert!(sequence_timeout.contains("One absolute deadline"));
+
+        let settle_timeout = defs["SettleArgs"]["properties"]["timeout_ms"]["description"]
+            .as_str()
+            .expect("settle timeout description");
+        assert!(settle_timeout.contains("settled:false and completes the step"));
+        assert!(settle_timeout.contains("enclosing glass_do"));
+        assert!(settle_timeout.contains("deadline fails the sequence"));
+
+        fn integer_keyword(value: &serde_json::Value, keyword: &str) -> Option<i64> {
+            value
+                .get(keyword)
+                .and_then(serde_json::Value::as_i64)
+                .or_else(|| {
+                    value.as_object().and_then(|object| {
+                        object
+                            .values()
+                            .find_map(|child| integer_keyword(child, keyword))
+                    })
+                })
+                .or_else(|| {
+                    value.as_array().and_then(|items| {
+                        items
+                            .iter()
+                            .find_map(|child| integer_keyword(child, keyword))
+                    })
+                })
+        }
+
+        let click_count = &defs["ClickArgs"]["properties"]["count"];
+        assert_eq!(integer_keyword(click_count, "minimum"), Some(1));
+        assert_eq!(integer_keyword(click_count, "maximum"), Some(10));
+        assert!(
+            click_count["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("1 through 10")),
+            "{click_count}"
+        );
+
+        for axis in ["dx", "dy"] {
+            let magnitude = &defs["ScrollArgs"]["properties"][axis];
+            assert_eq!(integer_keyword(magnitude, "minimum"), Some(-100));
+            assert_eq!(integer_keyword(magnitude, "maximum"), Some(100));
+            assert!(
+                magnitude["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("-100 through 100")),
+                "{axis}: {magnitude}"
+            );
+        }
+
+        let click_element_id = defs["ClickElementArgs"]["properties"]["id"]["description"]
+            .as_str()
+            .expect("click_element id description");
+        assert!(click_element_id.contains("role-appropriate native accessibility operation"));
+        let click_element_id_lower = click_element_id.to_ascii_lowercase();
+        assert!(click_element_id_lower.contains("text editors"));
+        assert!(click_element_id_lower.contains("may receive focus"));
+        fn has_property(value: &serde_json::Value, name: &str) -> bool {
+            value.as_object().is_some_and(|object| {
+                object
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|properties| properties.contains_key(name))
+                    || object.values().any(|child| has_property(child, name))
+            }) || value
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| has_property(item, name)))
+        }
+        assert!(!has_property(&schema, "encoded_argument_bytes"), "{schema}");
+
+        let description = tool.description.as_deref().expect("description");
+        for required in [
+            "fixed static ordered actions",
+            "64 actions",
+            "65536 compact argument bytes",
+            "timeout_ms",
+            "30000",
+            "1 through 120000",
+            "120000",
+            "click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element",
+            "Fail-fast",
+            "action errors, sequence deadline, and unmatched batched wait_for_element/scroll_to_element predicates",
+            "standalone predicates remain soft",
+            "Successful calls return a structured completed outcome for every action",
+            "Once execution starts, action failures return completed, failed, and unexecuted action outcomes in the MCP error",
+            "terminal-observation failures return completed action outcomes plus terminal_steps",
+            "Preflight validation failures return an invalid_sequence error without step outcomes",
+            "wait_for_element",
+            "scroll_to_element",
+            "Optional terminal settle, diff, screenshot",
+            "type retains return:\"none|settle|snapshot\"",
+            "No variables, result bindings, interpolation, branching, loops, retries, or dynamic action generation",
+        ] {
+            assert!(
+                description.contains(required),
+                "description missing {required:?}: {description}"
+            );
+        }
+        assert!(
+            !description.contains("type.return is rejected"),
+            "{description}"
+        );
+
+        for required in [
+            "fixed static ordered actions",
+            "64 actions",
+            "65536 compact argument bytes",
+            "timeout_ms",
+            "30000",
+            "1 through 120000",
+            "120000",
+            "click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element",
+            "standalone predicates remain soft",
+            "Fail-fast on action errors, sequence deadline, and unmatched batched wait_for_element/scroll_to_element predicates",
+            "Successful calls return a structured completed outcome for every action",
+            "Once execution starts, action failures return completed, failed, and unexecuted action outcomes in the MCP error",
+            "terminal-observation failures return completed action outcomes plus terminal_steps",
+            "Preflight validation failures return an invalid_sequence error without step outcomes",
+            "Optional terminal settle, diff, screenshot",
+            "type retains return:\"none|settle|snapshot\"",
+            "No variables, result bindings, interpolation, branching, loops, retries, or dynamic action generation",
+        ] {
+            assert!(
+                SERVER_INSTRUCTIONS.contains(required),
+                "instructions missing {required:?}"
+            );
+        }
+    }
+
     fn first_text(r: &CallToolResult) -> String {
         r.content[0].as_text().expect("text content").text.clone()
+    }
+
+    #[test]
+    fn structured_error_preserves_every_content_block_and_sets_is_error() {
+        let out = ToolOutput(vec![
+            OutContent::Text(
+                r#"{"ok":false,"tool":"glass_do","error":{"code":"step_failed"}}"#.into(),
+            ),
+            OutContent::Text("detail".into()),
+        ]);
+        let r = map_call_outcome(ToolCallOutcome::Error(out));
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(r.content.len(), 2);
+        assert!(first_text(&r).contains("step_failed"));
+    }
+
+    #[test]
+    fn ordinary_string_error_keeps_its_one_block_wire_shape() {
+        let r = map_tool_result(Err("capture failed".to_string()));
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(r.content.len(), 1);
+        assert!(first_text(&r).contains("capture failed"));
     }
 
     #[test]

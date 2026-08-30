@@ -10,7 +10,7 @@ use glass_core::{
     WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 
-use crate::capture::screenshot;
+use crate::capture::{crop_frame_by, screenshot, screenshot_by};
 use crate::idb::client::IdbClient;
 use crate::idb::companion::IdbCompanion;
 use crate::injector::IdbInjector;
@@ -612,28 +612,52 @@ impl Platform for IosPlatform {
         self.stop_app_until(deadline)
     }
 
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        self.running()?;
-        let frame = screenshot(self.target.simctl(), self.target.udid())?;
-        match region {
-            None => Ok(frame),
-            Some(r) => frame.crop(r),
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
         }
+        self.running()?;
+        let frame = screenshot_by(self.target.simctl(), self.target.udid(), deadline)?;
+        crop_frame_by(frame, region, deadline)
     }
 
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
+    }
+
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("iOS pointer input"));
+        }
         let (driver, injector) = self.input()?;
         let events = injector.pointer_events(event)?;
         if events.is_empty() {
             // A `Move` has no touch equivalent, so there is nothing to inject.
+            if deadline.has_passed() {
+                return Err(GlassError::deadline_not_started("iOS pointer input"));
+            }
             return Ok(());
         }
-        driver.client.hid(events)
+        driver.client.hid_by(events, deadline)
     }
 
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("iOS key input"));
+        }
         let (driver, injector) = self.input()?;
-        driver.client.hid(injector.key_events(event)?)
+        driver.client.hid_by(injector.key_events(event)?, deadline)
     }
 
     fn get_clipboard(&mut self) -> Result<String> {
@@ -668,34 +692,58 @@ impl Platform for IosPlatform {
         }
     }
 
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("iOS window operation"));
+        }
         let geometry = self.running()?.geometry.clone();
-        match op {
+        let result = match op {
             WindowOp::Geometry | WindowOp::Focus => Ok(geometry),
             WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::unsupported(
                 "window_move_resize",
                 crate::BACKEND,
                 crate::capabilities().window_move_resize.note,
             )),
+        };
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("iOS window operation"))
+        } else {
+            result
         }
     }
 
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("iOS window list"));
+        }
         let app = self.running()?;
-        Ok(vec![WindowInfo {
+        let windows = vec![WindowInfo {
             id: IOS_WINDOW_ID,
             title: Some(app.bundle_id.clone()),
             class: None,
             geometry: app.geometry.clone(),
             active: true,
-        }])
+        }];
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("iOS window list"))
+        } else {
+            Ok(windows)
+        }
     }
 
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
-        if id == IOS_WINDOW_ID {
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("iOS window selection"));
+        }
+        let result = if id == IOS_WINDOW_ID {
             Ok(self.running()?.geometry.clone())
         } else {
             Err(GlassError::WindowNotFound)
+        };
+        if deadline.has_passed() {
+            Err(GlassError::caller_deadline_elapsed("iOS window selection"))
+        } else {
+            result
         }
     }
 
@@ -864,6 +912,36 @@ mod state_machine_tests {
     }
 
     #[test]
+    fn send_pointer_move_with_a_spent_deadline_is_not_a_successful_noop() {
+        let mut p = running_platform();
+
+        let error = p
+            .send_pointer_by(&PointerEvent::Move { x: 1, y: 1 }, Deadline::from_millis(0))
+            .expect_err("an already-spent Move must fail before the no-op shortcut");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn capture_with_a_spent_deadline_precedes_the_session_lookup() {
+        let mut p = idle_platform();
+
+        let error = p
+            .capture_frame_by(None, Deadline::from_millis(0))
+            .expect_err("a spent capture must stop before resolving the running app");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
     fn send_pointer_with_no_active_session_errors() {
         // A driver is present, so the `running()` guard is what fires: even a real tap is
         // rejected with no active app.
@@ -907,6 +985,21 @@ mod state_machine_tests {
             p.send_key(&KeyEvent::Chord("hyper+x".into())).unwrap_err(),
             GlassError::InvalidKey(_)
         ));
+    }
+
+    #[test]
+    fn send_key_with_a_spent_deadline_starts_no_hid_or_key_building() {
+        let mut p = running_platform();
+
+        let error = p
+            .send_key_by(&KeyEvent::Chord("hyper+x".into()), Deadline::from_millis(0))
+            .expect_err("the deadline must win before even an invalid key is built");
+
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
     }
 
     #[test]

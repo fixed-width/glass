@@ -13,7 +13,7 @@ use glass_core::platform::{
     AppSpec, KeyEvent, Platform, PointerEvent, SandboxLevel, WindowGeometry, WindowId, WindowInfo,
     WindowOp,
 };
-use glass_core::{GlassError, Result};
+use glass_core::{Deadline, GlassError, Result};
 
 use crate::adoption_log::adoption_line;
 use crate::axwindow;
@@ -317,10 +317,18 @@ impl MacosPlatform {
     ///
     /// Scoped to `&[pid]` so a stale or foreign id can never silently resolve to another app's
     /// window — it surfaces `GlassError::WindowNotFound` instead.
-    fn resolve_active_window(&self, pid: i32) -> Result<crate::scwindow::WindowMatch> {
+    fn resolve_active_window(
+        &self,
+        pid: i32,
+        deadline: Deadline,
+    ) -> Result<crate::scwindow::WindowMatch> {
         match self.active_window {
-            Some(id) => crate::scwindow::find_window_by_id(id, &[pid], WINDOW_RESOLVE_TIMEOUT),
-            None => crate::scwindow::find_window_for_pids(&[pid], WINDOW_RESOLVE_TIMEOUT),
+            Some(id) => {
+                crate::scwindow::find_window_by_id_by(id, &[pid], WINDOW_RESOLVE_TIMEOUT, deadline)
+            }
+            None => {
+                crate::scwindow::find_window_for_pids_by(&[pid], WINDOW_RESOLVE_TIMEOUT, deadline)
+            }
         }
     }
 
@@ -579,9 +587,13 @@ fn window_info_from(w: crate::scwindow::AppWindow, active_window: Option<u32>) -
 /// step after `Focus`/`Move`/`Resize`'s mutation, and the sole step for `Geometry`. Reuses
 /// `coords::pixel_geometry_from_content_rect`'s point->pixel scaling so this crate keeps one
 /// scaling implementation, not two.
-fn read_ax_geometry(el: &AXUIElement, scale: f64) -> Result<WindowGeometry> {
-    let (x, y) = axwindow::ax_position(el)?;
-    let (width, height) = axwindow::ax_size(el)?;
+fn read_ax_geometry(
+    scope: &mut axwindow::AxMessageScope<'_, '_>,
+    el: &AXUIElement,
+    scale: f64,
+) -> Result<WindowGeometry> {
+    let (x, y) = axwindow::ax_position(scope, el)?;
+    let (width, height) = axwindow::ax_size(scope, el)?;
     Ok(coords::pixel_geometry_from_content_rect(
         x, y, width, height, scale,
     ))
@@ -745,14 +757,34 @@ impl Platform for MacosPlatform {
     ///
     /// **Main-thread affinity:** like `start_app`, this reaches `ffi::app_kit_init()` and must
     /// run on the true main thread.
-    fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+    fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("capture"));
+        }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
         match self.active_window {
-            Some(id) => crate::capture::capture_window_by_id(id, &[pid as i32], region),
-            None => crate::capture::capture_window(&[pid as i32], region),
+            Some(id) => {
+                crate::capture::capture_window_by_id_by(id, &[pid as i32], region, deadline)
+            }
+            None => crate::capture::capture_window_by(&[pid as i32], region, deadline),
         }
     }
+
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&Region>,
+        deadline: Deadline,
+    ) -> Result<Frame> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("window capture"));
+        }
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
+    }
+
     /// Map the active window into `input::send_pointer` — see `input.rs`'s module doc for the
     /// CGEvent details and its main-thread-affinity note.
     ///
@@ -763,12 +795,19 @@ impl Platform for MacosPlatform {
     /// CGEvent focus target is the resolved window's own owning pid (`m.pid`), not
     /// `self.app_pid` — the same pid today, but `m.pid` is the one tied to the window being
     /// clicked.
-    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+    fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
+        glass_core::validate_pointer_input(event)?;
+        if deadline
+            .remaining()
+            .is_some_and(|left| left < Duration::from_millis(300))
+        {
+            return Err(GlassError::deadline_not_started("macOS input focus"));
+        }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
-        let m = self.resolve_active_window(pid as i32)?;
+        let m = self.resolve_active_window(pid as i32, deadline)?;
         check_pointer_bounds(event, &m.geometry)?;
-        crate::input::send_pointer(event, m.pid, m.scale, m.origin_pt)
+        crate::input::send_pointer_by(event, m.pid, m.scale, m.origin_pt, deadline)
     }
     /// Map the active window into `input::send_key` — see `input.rs`'s module doc for the
     /// CGEvent keyboard details.
@@ -779,11 +818,17 @@ impl Platform for MacosPlatform {
     /// keyboard targeting. The resolution still matters — if `active_window` is set but that
     /// window has closed, this surfaces `GlassError::WindowNotFound` instead of silently posting
     /// keys to whatever else is focused.
-    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        if deadline
+            .remaining()
+            .is_some_and(|left| left < Duration::from_millis(300))
+        {
+            return Err(GlassError::deadline_not_started("macOS input focus"));
+        }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
-        let m = self.resolve_active_window(pid as i32)?;
-        crate::input::send_key(event, m.pid)
+        let m = self.resolve_active_window(pid as i32, deadline)?;
+        crate::input::send_key_by(event, m.pid, deadline)
     }
     /// Resolve the active window's `AXUIElement` (fresh every call, same rationale as
     /// `resolve_active_window`) and dispatch `op` onto it:
@@ -804,7 +849,10 @@ impl Platform for MacosPlatform {
     /// read-back reflects the request ([`move_took_effect`]/[`resize_was_refused`]), returning
     /// `GlassError::Backend` naming what didn't take rather than reporting success on a window
     /// that refused the change.
-    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+    fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("macOS window operation"));
+        }
         permissions::preflight()?;
         let id = self.active_window.ok_or(GlassError::NoActiveSession)?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
@@ -812,45 +860,86 @@ impl Platform for MacosPlatform {
         // `&[pid as i32]`-scoped (final-review fix 1): `id` came from this backend's own
         // `active_window`, but scoping the lookup here too means a stale/foreign id can
         // never resolve to another app's window.
-        let m = crate::scwindow::find_window_by_id(id, &[pid as i32], WINDOW_RESOLVE_TIMEOUT)?;
-        let el = axwindow::ax_window_for_cgwindowid(pid as i32, id, m.geometry.clone(), m.scale)?;
+        let mut mutation_dispatched = false;
+        let result = axwindow::with_window_query_by(
+            &axwindow::SystemWideAxMessaging,
+            deadline,
+            || {
+                crate::scwindow::find_window_by_id_by(
+                    id,
+                    &[pid as i32],
+                    WINDOW_RESOLVE_TIMEOUT,
+                    deadline,
+                )
+                .map_err(|error| {
+                    if error.bound_owner() == Some(glass_core::Whose::Caller)
+                        && error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched)
+                    {
+                        GlassError::caller_deadline_elapsed("macOS window query")
+                    } else {
+                        error
+                    }
+                })
+            },
+            |m, scope| {
+                let el = axwindow::ax_window_for_cgwindowid(
+                    scope,
+                    pid as i32,
+                    id,
+                    m.geometry.clone(),
+                    m.scale,
+                )?;
 
-        match *op {
-            WindowOp::Focus => {
-                crate::input::focus(pid as i32)?;
-                axwindow::ax_raise(&el)?;
-                axwindow::ax_set_main(&el)?;
-                read_ax_geometry(&el, m.scale)
-            }
-            WindowOp::Move { x, y } => {
-                let target_pt = coords::global_pixel_to_point((x, y), m.scale);
-                axwindow::ax_set_position(&el, target_pt)?;
-                let geom = read_ax_geometry(&el, m.scale)?;
-                if !move_took_effect(&m.geometry, &geom, x, y) {
-                    return Err(GlassError::Backend(format!(
-                        "window move to ({x},{y}) px did not take; window is at ({},{})",
-                        geom.x, geom.y
-                    )));
+                match *op {
+                    WindowOp::Focus => {
+                        if deadline.has_passed() {
+                            return Err(GlassError::caller_deadline_elapsed("macOS window focus"));
+                        }
+                        mutation_dispatched = true;
+                        crate::input::focus(pid as i32)?;
+                        axwindow::ax_raise(scope, &el)?;
+                        axwindow::ax_set_main(scope, &el)?;
+                        read_ax_geometry(scope, &el, m.scale)
+                    }
+                    WindowOp::Move { x, y } => {
+                        let target_pt = coords::global_pixel_to_point((x, y), m.scale);
+                        mutation_dispatched = true;
+                        axwindow::ax_set_position(scope, &el, target_pt)?;
+                        let geom = read_ax_geometry(scope, &el, m.scale)?;
+                        if !move_took_effect(&m.geometry, &geom, x, y) {
+                            return Err(GlassError::Backend(format!(
+                                "window move to ({x},{y}) px did not take; window is at ({},{})",
+                                geom.x, geom.y
+                            )));
+                        }
+                        Ok(geom)
+                    }
+                    WindowOp::Resize { width, height } => {
+                        let target_size_pt = (width as f64 / m.scale, height as f64 / m.scale);
+                        mutation_dispatched = true;
+                        axwindow::ax_set_size(scope, &el, target_size_pt)?;
+                        let pos = axwindow::ax_position(scope, &el)?;
+                        axwindow::ax_set_position(scope, &el, pos)?;
+                        axwindow::ax_set_size(scope, &el, target_size_pt)?;
+                        let geom = read_ax_geometry(scope, &el, m.scale)?;
+                        if resize_was_refused(&m.geometry, &geom, width, height) {
+                            return Err(GlassError::Backend(format!(
+                                "window resize to {width}x{height} px was refused; window remains {}x{}",
+                                geom.width, geom.height
+                            )));
+                        }
+                        Ok(geom)
+                    }
+                    WindowOp::Geometry => read_ax_geometry(scope, &el, m.scale),
                 }
-                Ok(geom)
-            }
-            WindowOp::Resize { width, height } => {
-                let target_size_pt = (width as f64 / m.scale, height as f64 / m.scale);
-                axwindow::ax_set_size(&el, target_size_pt)?;
-                let pos = axwindow::ax_position(&el)?;
-                axwindow::ax_set_position(&el, pos)?;
-                axwindow::ax_set_size(&el, target_size_pt)?;
-                let geom = read_ax_geometry(&el, m.scale)?;
-                if resize_was_refused(&m.geometry, &geom, width, height) {
-                    return Err(GlassError::Backend(format!(
-                        "window resize to {width}x{height} px was refused; window remains {}x{}",
-                        geom.width, geom.height
-                    )));
-                }
-                Ok(geom)
-            }
-            WindowOp::Geometry => read_ax_geometry(&el, m.scale),
-        }
+            },
+        );
+        let result = if mutation_dispatched {
+            result.map_err(GlassError::after_dispatch)
+        } else {
+            result
+        };
+        crate::ax_timeout::finish_window_operation_by(deadline, result)
     }
     /// Enumerate every on-screen window owned by the launched app's pid via
     /// `scwindow::list_app_windows` (one `SCShareableContent` query, all matches), mapping each
@@ -858,10 +947,13 @@ impl Platform for MacosPlatform {
     ///
     /// **Main-thread affinity:** reaches `ffi::app_kit_init()` and must run on the true main
     /// thread.
-    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+    fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("macOS window list"));
+        }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
-        let windows = crate::scwindow::list_app_windows(&[pid as i32])?;
+        let windows = crate::scwindow::list_app_windows_by(&[pid as i32], deadline)?;
         Ok(windows
             .into_iter()
             .map(|w| window_info_from(w, self.active_window))
@@ -886,13 +978,30 @@ impl Platform for MacosPlatform {
     /// window closed in the gap between the check and the `AXRaise`/`AXMain` calls —
     /// `active_window` is rolled back rather than left pointing at a window this call never
     /// confirmed glass can operate on.
-    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+    fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("macOS window selection"));
+        }
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
         let previous = self.active_window;
-        crate::scwindow::find_window_by_id(id.0 as u32, &[pid as i32], WINDOW_RESOLVE_TIMEOUT)?;
+        crate::scwindow::find_window_by_id_by(
+            id.0 as u32,
+            &[pid as i32],
+            WINDOW_RESOLVE_TIMEOUT,
+            deadline,
+        )
+        .map_err(|error| {
+            if error.bound_owner() == Some(glass_core::Whose::Caller)
+                && error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched)
+            {
+                GlassError::caller_deadline_elapsed("macOS window selection query")
+            } else {
+                error
+            }
+        })?;
         self.active_window = Some(id.0 as u32);
-        self.window(&WindowOp::Focus)
+        self.window_by(&WindowOp::Focus, deadline)
             .inspect_err(|_| self.active_window = previous)
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
