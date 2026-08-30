@@ -3390,6 +3390,10 @@ mod tests {
         ops.lock().unwrap().clone()
     }
 
+    fn retire_current_connection_before_dispatch(a11y: &mut ServiceA11y) {
+        a11y.client.conn.lock().expect("lock").poison();
+    }
+
     /// Break the current connection after its guard tree is served but before `set_text` starts.
     /// `before_set_text_delay` makes the ordering deterministic rather than scheduler-dependent.
     fn break_set_text_write_after_guard(
@@ -4475,13 +4479,6 @@ mod tests {
 
     #[test]
     fn invokes_call_site_uses_its_configured_package_for_the_fresh_tree() {
-        // Mirrors the `set_value` test above, for `invoke`'s fallback to `self.package` when the
-        // plan's tree carries no subject. `click`'s fresh-tree retry fires only on a real
-        // `CallFailure::NotSent`, never `AnswerLost`, and that failure only arises strictly
-        // BETWEEN `invoke`'s snapshot/plan step and its click — a window `invoke`'s own single
-        // call never exposes to a caller. So this drives `invoke`'s own two halves directly —
-        // snapshot/plan, then `dispatch_click` (split out for exactly this seam) — with a real
-        // `shutdown(Write)` between them.
         let clickable = json!({
             "class": "android.widget.FrameLayout",
             "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
@@ -4504,19 +4501,9 @@ mod tests {
         let t = built(&clickable);
         let target = target_for(&t, AxNodeId(1));
 
-        // `invoke`'s own first half, called directly: snapshot + resolve the plan.
         let rt = a.snapshot_with_refs(&ctx()).expect("snapshot");
         let plan = invoke_plan(&rt.tree, &target).expect("plan resolves");
-
-        // Break the connection's write half — deterministic, not raced: this line has already
-        // returned before `dispatch_click` is called below.
-        a.client
-            .conn
-            .lock()
-            .expect("lock")
-            .writer
-            .shutdown(std::net::Shutdown::Write)
-            .expect("shutdown");
+        retire_current_connection_before_dispatch(&mut a);
 
         a.dispatch_click(&ctx(), &target, &plan, &rt)
             .expect("the caller's configured package must match the fresh tree's fixed reply");
@@ -4556,13 +4543,7 @@ mod tests {
         let rt = a.snapshot_with_refs(&ctx()).expect("snapshot");
         let plan = invoke_plan(&rt.tree, &target).expect("plan resolves");
 
-        a.client
-            .conn
-            .lock()
-            .expect("lock")
-            .writer
-            .shutdown(std::net::Shutdown::Write)
-            .expect("shutdown");
+        retire_current_connection_before_dispatch(&mut a);
 
         a.dispatch_click(&ctx(), &target, &plan, &rt)
             .expect("a provably unsent click may be re-resolved once");
@@ -4579,13 +4560,6 @@ mod tests {
 
     #[test]
     fn dispatch_clicks_fresh_tree_must_match_the_acting_app_not_the_asked_about_one() {
-        // Sibling of the test above, on the same `shutdown(Write)` seam, but with a subject:
-        // the served tree answered for `com.other.app`, not the configured
-        // `com.example.app` — `target`'s ref is numbered from THAT tree. The fresh reply names
-        // the ASKED app instead. Comparing against the asked app (the bug) would match by
-        // construction and replay the click against whatever unrelated node ref 1 resolves to in
-        // the real app; comparing against the acting app (`com.other.app`) sees the mismatch and
-        // refuses.
         let clickable = json!({
             "class": "android.widget.FrameLayout",
             "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
@@ -4611,13 +4585,7 @@ mod tests {
         let rt = a.snapshot_with_refs(&ctx()).expect("snapshot");
         let plan = invoke_plan(&rt.tree, &target).expect("plan resolves");
 
-        a.client
-            .conn
-            .lock()
-            .expect("lock")
-            .writer
-            .shutdown(std::net::Shutdown::Write)
-            .expect("shutdown");
+        retire_current_connection_before_dispatch(&mut a);
 
         let e = a
             .dispatch_click(&ctx(), &target, &plan, &rt)
