@@ -260,7 +260,9 @@ mod tests {
             return;
         };
         if let Ok(path) = std::env::var("GLASS_LISTPIDS_TEST_PID_FILE") {
-            std::fs::write(path, std::process::id().to_string()).unwrap();
+            let pending = format!("{path}.pending");
+            std::fs::write(&pending, std::process::id().to_string()).unwrap();
+            std::fs::rename(pending, path).unwrap();
         }
         std::thread::sleep(Duration::from_millis(delay_ms.parse().unwrap()));
         if std::env::var_os("GLASS_LISTPIDS_TEST_OUTPUT").is_some() {
@@ -290,13 +292,13 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn windows_production_runner_kills_a_wedged_listpids_child() {
-        let pid_file =
-            std::env::temp_dir().join(format!("glass-listpids-wedge-{}", std::process::id()));
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pid");
         let mut command = windows_helper(30_000, false, Some(&pid_file));
 
         let error = list_pids_command_by_with_budget(
             &mut command,
-            Deadline::from_millis(100),
+            Deadline::from_millis(2_000),
             Duration::from_secs(5),
         )
         .expect_err("the Windows-target command runner must kill a wedged child");
@@ -334,7 +336,6 @@ mod tests {
             !still_active,
             "the timed-out listpids child {pid} is still active"
         );
-        let _ = std::fs::remove_file(pid_file);
     }
 
     #[test]
