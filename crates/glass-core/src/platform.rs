@@ -855,11 +855,23 @@ mod tests {
     #[test]
     fn default_app_pids_is_the_one_pid_the_backend_knows() {
         assert_eq!(PidPlatform(4242).app_pids(), vec![4242]);
+        assert_eq!(
+            PidPlatform(4242)
+                .app_pids_by(crate::Deadline::UNBOUNDED)
+                .unwrap(),
+            vec![4242]
+        );
     }
 
     #[test]
     fn default_app_pids_is_empty_when_the_pid_is_unknown() {
         assert!(MinimalPlatform.app_pids().is_empty());
+        assert!(
+            MinimalPlatform
+                .app_pids_by(crate::Deadline::UNBOUNDED)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

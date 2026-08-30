@@ -680,6 +680,8 @@ mod tests {
             .unwrap_err();
         assert!(e.to_string().contains("panicked"), "{e}");
         assert!(!e.to_string().contains("timed out"), "{e}");
+        assert!(!e.set_value_failed_after_writing(), "{e}");
+        assert_eq!(e.bound_dispatch(), None, "{e}");
     }
 
     #[test]

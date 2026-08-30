@@ -137,7 +137,14 @@ mod tests {
     #[test]
     fn an_unbounded_deadline_is_never_spent() {
         assert_eq!(Deadline::UNBOUNDED.remaining(), None);
+        assert_eq!(Deadline::UNBOUNDED.instant(), None);
         assert!(!Deadline::UNBOUNDED.has_passed());
+    }
+
+    #[test]
+    fn a_bounded_deadline_exposes_the_exact_absolute_instant() {
+        let instant = Instant::now() + Duration::from_secs(60);
+        assert_eq!(Deadline::at(instant).instant(), Some(instant));
     }
 
     /// Both halves agree at every ordering, the tie included.

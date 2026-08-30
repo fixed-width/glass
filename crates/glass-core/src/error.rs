@@ -928,6 +928,46 @@ mod tests {
         assert!(matches!(tool.cause(), GlassError::ToolFailed { .. }));
     }
 
+    fn window_restore_failed(primary: GlassError, restore: GlassError) -> GlassError {
+        GlassError::WindowRestoreFailed {
+            primary: Box::new(primary),
+            restore: Box::new(restore),
+        }
+    }
+
+    #[test]
+    fn compound_failures_preserve_a_value_write_from_either_branch() {
+        let write = || GlassError::value_not_applied(7, "new", Some("old"));
+        let plain = || GlassError::Backend("plain failure".into());
+
+        for error in [
+            window_restore_failed(write(), plain()),
+            window_restore_failed(plain(), write()),
+            GlassError::input_cleanup_failed("cleanup", write(), plain()),
+            GlassError::input_cleanup_failed("cleanup", plain(), write()),
+        ] {
+            assert!(error.set_value_failed_after_writing(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn window_restore_failure_combines_dispatch_and_tool_details() {
+        let error = window_restore_failed(
+            GlassError::Backend("primary".into()).before_dispatch(),
+            GlassError::ToolFailed {
+                call: "restore helper".into(),
+                said: " restore failed \n".into(),
+            }
+            .after_dispatch(),
+        );
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(error.tool_said(), Some("restore failed"));
+    }
+
     #[test]
     fn display_messages_are_actionable() {
         assert_eq!(
