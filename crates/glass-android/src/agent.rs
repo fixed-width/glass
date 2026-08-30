@@ -703,7 +703,7 @@ mod tests {
 
     /// Queue a wrong-id and then correct conn1 answer to expose reuse one exchange behind.
     fn agent_with_stale_wrong_id_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
-        use std::io::{BufRead, BufReader};
+        use std::io::{BufRead, BufReader, Write};
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
@@ -724,10 +724,14 @@ mod tests {
             let request: Value = serde_json::from_str(&line).expect("conn1 request json");
             let first_id = request["id"].clone();
             request_log.lock().expect("request log").push((1, request));
-            writeln!(first_writer, "{}", json!({"id": 999, "ok": true}))
-                .expect("write stale conn1 answer");
-            writeln!(first_writer, "{}", json!({"id": first_id, "ok": true}))
-                .expect("queue the actual conn1 answer");
+            let replies = format!(
+                "{}\n{}\n",
+                json!({"id": 999, "ok": true}),
+                json!({"id": first_id, "ok": true})
+            );
+            first_writer
+                .write_all(replies.as_bytes())
+                .expect("queue both conn1 answers");
             first_writer.flush().expect("flush conn1 answers");
 
             line.clear();
