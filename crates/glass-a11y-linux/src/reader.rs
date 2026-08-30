@@ -196,6 +196,13 @@ fn writes_value_only(role: glass_core::AxRole, text: &str) -> bool {
     matches!(role, Slider | SpinButton | ScrollBar) && text.parse::<f64>().is_ok()
 }
 
+fn writes_editable_text(role: glass_core::AxRole) -> bool {
+    matches!(
+        role,
+        glass_core::AxRole::TextField | glass_core::AxRole::TextArea
+    )
+}
+
 /// Poll bound for confirming a write or toggle landed — the toolkit applies it on a later
 /// main-loop pass, so the first read after dispatch is expected to be stale. [`confirm_write`]
 /// reads first and stops early once its `deadline` passes; [`set_toggle`] and
@@ -254,7 +261,7 @@ async fn set_value_async(
     // also exposes EditableText, but writing its entry buffer doesn't commit to the adjustment.
     // Text widgets prefer EditableText, falling back to Value for anything numeric that lacks it.
     // The builder `.ok()` chaining mirrors the working ComponentProxy build in `extents`.
-    if !writes_value_only(role, text) {
+    if writes_editable_text(role) {
         let editable = atspi::proxy::editable_text::EditableTextProxy::builder(&conn)
             .destination(dest.clone())
             .ok()
@@ -287,7 +294,9 @@ async fn set_value_async(
             }
         }
     }
-    if let Ok(v) = text.parse::<f64>() {
+    if writes_value_only(role, text)
+        && let Ok(v) = text.parse::<f64>()
+    {
         let value_proxy = atspi::proxy::value::ValueProxy::builder(&conn)
             .destination(dest)
             .ok()
@@ -1464,5 +1473,14 @@ mod tests {
         // A non-numeric target isn't the value path.
         assert!(!writes_value_only(SpinButton, "abc"));
         assert!(!writes_value_only(Button, "x"));
+    }
+
+    #[test]
+    fn editable_text_writes_are_limited_to_text_roles() {
+        use glass_core::AxRole::*;
+        assert!(writes_editable_text(TextField));
+        assert!(writes_editable_text(TextArea));
+        assert!(!writes_editable_text(Button));
+        assert!(!writes_editable_text(SpinButton));
     }
 }

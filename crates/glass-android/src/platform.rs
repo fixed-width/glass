@@ -43,12 +43,12 @@ pub struct AndroidPlatform {
     agent: Option<Arc<AgentClient>>,
     logs: LogSink,
     app: Option<RunningApp>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     window_list_parse_delay: Option<Duration>,
 }
 
 impl AndroidPlatform {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_window_list_parse_delay(mut self, delay: Duration) -> Self {
         self.window_list_parse_delay = Some(delay);
         self
@@ -108,7 +108,7 @@ impl AndroidPlatform {
             agent,
             logs: Arc::new(Mutex::new(Vec::new())),
             app: None,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             window_list_parse_delay: None,
         })
     }
@@ -448,7 +448,7 @@ impl Platform for AndroidPlatform {
             .adb()
             .run_until(["shell", "dumpsys", "window", "windows"], deadline)?;
         let parsed = parse_app_windows(&dump, &package);
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(delay) = self.window_list_parse_delay {
             std::thread::sleep(delay);
         }
