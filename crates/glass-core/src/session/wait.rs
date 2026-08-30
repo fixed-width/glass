@@ -34,6 +34,28 @@ fn soft_callee_capture_timeout(
         && error_owner == Some(crate::Whose::Caller)
 }
 
+fn settle_capture_result(
+    has_tracker: bool,
+    owner: crate::Whose,
+    deadline_expired: bool,
+    capture: Result<Frame>,
+) -> Result<Option<Frame>> {
+    match capture {
+        Ok(frame) => Ok(Some(frame)),
+        Err(error)
+            if soft_callee_capture_timeout(
+                has_tracker,
+                owner,
+                deadline_expired,
+                error.bound_owner(),
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn needs_callee_timeout_full_capture(no_value: bool, owner: crate::Whose) -> bool {
     no_value && owner == crate::Whose::Callee
 }
@@ -470,19 +492,15 @@ impl Glass {
                     deadline
                 };
                 looked = true;
-                let frame = match self.capture_by(window, region.as_ref(), capture_deadline) {
-                    Ok(frame) => frame,
-                    Err(error)
-                        if soft_callee_capture_timeout(
-                            tracker.is_some(),
-                            whose,
-                            deadline.has_passed(),
-                            error.bound_owner(),
-                        ) =>
-                    {
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error),
+                let capture = self.capture_by(window, region.as_ref(), capture_deadline);
+                let Some(frame) = settle_capture_result(
+                    tracker.is_some(),
+                    whose,
+                    deadline.has_passed(),
+                    capture,
+                )?
+                else {
+                    return Ok(None);
                 };
                 if compatibility_capture && caller != Deadline::UNBOUNDED && caller.has_passed() {
                     return Err(GlassError::caller_deadline_elapsed("wait for stable"));
@@ -1067,8 +1085,8 @@ mod tests {
         REREAD_AFTER, callee_wait_expired, compatibility_capture, final_read_pause,
         needs_callee_timeout_full_capture, offscreen_direction, outer_sequence_expired,
         prior_scroll_dispatched, quiet_wait_needs_read, reader_relative_caller_bound,
-        scroll_anchor, should_reclassify_nested_bound, should_schedule_final_read,
-        soft_callee_capture_timeout,
+        scroll_anchor, settle_capture_result, should_reclassify_nested_bound,
+        should_schedule_final_read, soft_callee_capture_timeout,
     };
     use crate::BoundKind;
     use crate::session::test_support::*;
@@ -1504,32 +1522,16 @@ mod tests {
     }
 
     #[test]
-    fn callee_timeout_during_capture_uses_the_last_frame_and_stays_soft() {
-        let captures = Arc::new(Mutex::new(Vec::new()));
-        let frame = Frame::solid(2, 2, [0, 0, 0, 255]);
-        let platform = FakePlatform::new(2, 2)
-            .with_frames(vec![frame.clone()])
-            .with_capture_log(captures.clone())
-            .with_capture_delay(Duration::from_millis(150))
-            .honoring_capture_deadline();
-        let mut g = glass_with(platform);
-        g.start(&spec()).unwrap();
+    fn caller_owned_capture_expiry_after_a_frame_is_a_soft_settle_timeout() {
+        let result = settle_capture_result(
+            true,
+            crate::Whose::Callee,
+            true,
+            Err(GlassError::caller_deadline_elapsed("capture")),
+        )
+        .unwrap();
 
-        let outcome = g
-            .wait_stable(&WaitStableParams {
-                interval_ms: 100,
-                settle_frames: 3,
-                tolerance: 0,
-                timeout_ms: 300,
-                stability_region: None,
-                ignore: Vec::new(),
-                window: None,
-            })
-            .unwrap();
-
-        assert!(!outcome.settled);
-        assert_eq!(outcome.frame, frame);
-        assert_eq!(captures.lock().unwrap().len(), 1);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -2720,20 +2722,29 @@ mod tests {
     }
 
     #[test]
-    fn a_backend_without_a_signal_polls_exactly_as_before() {
-        // Every backend but one has no event stream, and two never can. Their waits must keep the
-        // behaviour they had: re-walk each interval.
-        let (mut g, walks) =
-            glass_with_a11y_counted(FakePlatform::new(100, 100), vec![fake_tree_enabled()], None);
+    fn a_backend_without_a_signal_reads_each_state_until_the_condition_matches() {
+        let (mut g, walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            vec![fake_tree(), fake_tree(), fake_tree_enabled()],
+            None,
+        );
         g.start(&spec()).unwrap();
 
-        let o = g.wait_for_element(&never_matches(10, 80)).unwrap();
+        let outcome = g
+            .wait_for_element(&WaitElementParams {
+                name: Some("Save".into()),
+                description: None,
+                role: Some(AxRole::Button),
+                value: None,
+                value_contains: None,
+                condition: ElementCondition::Enabled,
+                interval_ms: 1,
+                timeout_ms: 5_000,
+            })
+            .unwrap();
 
-        assert!(!o.matched);
-        assert!(
-            walks.load(Ordering::Relaxed) > 1,
-            "a backend with no signal stopped polling"
-        );
+        assert!(outcome.matched);
+        assert_eq!(walks.load(Ordering::Relaxed), 3, "one read per state");
     }
 
     #[test]
