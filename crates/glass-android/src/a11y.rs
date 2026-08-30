@@ -549,67 +549,69 @@ fn locate_editable_target(
         .ok_or(GlassError::AxElementNotClickable(target.id.0))
 }
 
+fn write_unconfirmed(target: u32, error: GlassError) -> GlassError {
+    GlassError::write_unconfirmed_because(
+        target,
+        "the Android input value mutation may have run but failed before it could be confirmed",
+        error,
+    )
+}
+
+fn require_time(
+    deadline: Deadline,
+    target: u32,
+    external_dispatched: bool,
+    value_dispatched: bool,
+) -> Result<()> {
+    if !deadline.has_passed() {
+        return Ok(());
+    }
+    Err(if value_dispatched {
+        write_unconfirmed(
+            target,
+            GlassError::caller_deadline_elapsed("Android accessibility set_value"),
+        )
+    } else if external_dispatched {
+        GlassError::caller_deadline_elapsed("Android accessibility set_value")
+    } else {
+        GlassError::deadline_not_started("Android accessibility set_value")
+    })
+}
+
+fn command_error(
+    target: u32,
+    external_dispatched: bool,
+    value_dispatched: bool,
+    mutates_value: bool,
+    error: GlassError,
+) -> GlassError {
+    if value_dispatched
+        || (mutates_value && error.bound_dispatch() != Some(BoundDispatch::NotDispatched))
+    {
+        write_unconfirmed(target, error)
+    } else if external_dispatched && error.bound_dispatch() == Some(BoundDispatch::NotDispatched) {
+        error.after_dispatch()
+    } else {
+        error
+    }
+}
+
+fn verification_phase_owned_by_caller(owner: Whose) -> bool {
+    owner == Whose::Caller
+}
+
 impl Accessibility for AndroidA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         self.snapshot_within(ctx, snapshot_bound(self.warmth(), ctx.deadline))
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
-        fn write_unconfirmed(target: u32, error: GlassError) -> GlassError {
-            GlassError::write_unconfirmed_because(
-                target,
-                "the Android input value mutation may have run but failed before it could be confirmed",
-                error,
-            )
-        }
-
         fn read_back_error(target: &AxTarget, error: GlassError) -> GlassError {
             GlassError::write_unconfirmed_because(
                 target.id.0,
                 "reading the element back failed",
                 error,
             )
-        }
-
-        fn require_time(
-            deadline: Deadline,
-            target: u32,
-            external_dispatched: bool,
-            value_dispatched: bool,
-        ) -> Result<()> {
-            if !deadline.has_passed() {
-                return Ok(());
-            }
-            Err(if value_dispatched {
-                write_unconfirmed(
-                    target,
-                    GlassError::caller_deadline_elapsed("Android accessibility set_value"),
-                )
-            } else if external_dispatched {
-                GlassError::caller_deadline_elapsed("Android accessibility set_value")
-            } else {
-                GlassError::deadline_not_started("Android accessibility set_value")
-            })
-        }
-
-        fn command_error(
-            target: u32,
-            external_dispatched: bool,
-            value_dispatched: bool,
-            mutates_value: bool,
-            error: GlassError,
-        ) -> GlassError {
-            if value_dispatched
-                || (mutates_value && error.bound_dispatch() != Some(BoundDispatch::NotDispatched))
-            {
-                write_unconfirmed(target, error)
-            } else if external_dispatched
-                && error.bound_dispatch() == Some(BoundDispatch::NotDispatched)
-            {
-                error.after_dispatch()
-            } else {
-                error
-            }
         }
 
         require_time(ctx.deadline, target.id.0, false, false)?;
@@ -711,7 +713,7 @@ impl Accessibility for AndroidA11y {
                 Err(e) => return Err(read_back_error(target, e)),
             }
             if Instant::now() >= phase_ends {
-                if phase_owner == Whose::Caller {
+                if verification_phase_owned_by_caller(phase_owner) {
                     let error = GlassError::caller_deadline_elapsed(
                         "Android accessibility set_value verification",
                     );
@@ -729,9 +731,9 @@ impl Accessibility for AndroidA11y {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attempt, COLD_BOUND, RetryBound, Warmth, bound_fired, dump_once, dump_until_ready,
-        editable_target, locate_editable_target, locate_for_write, snapshot_bound,
-        snapshot_with_runner,
+        Attempt, COLD_BOUND, RetryBound, Warmth, bound_fired, command_error, dump_once,
+        dump_until_ready, editable_target, locate_editable_target, locate_for_write, require_time,
+        snapshot_bound, snapshot_with_runner, verification_phase_owned_by_caller,
     };
     use crate::adb::{AdbOp, a_failed_call, a_real_spawn_failure, a_real_timeout_hinted};
     use glass_core::Deadline;
@@ -746,6 +748,76 @@ mod tests {
     /// A deadline no test reaches, for the cases that are not about the bound.
     fn ample() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn set_value_deadline_classification_tracks_external_and_value_dispatch() {
+        assert!(require_time(Deadline::at(ample()), 7, false, false).is_ok());
+
+        let before = require_time(Deadline::from_millis(0), 7, false, false).unwrap_err();
+        assert_eq!(before.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(before.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(!before.set_value_failed_after_writing());
+
+        let external = require_time(Deadline::from_millis(0), 7, true, false).unwrap_err();
+        assert_eq!(external.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(
+            external.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(!external.set_value_failed_after_writing());
+
+        let value = require_time(Deadline::from_millis(0), 7, true, true).unwrap_err();
+        assert_eq!(value.bound(), Some(BoundKind::TimedOut));
+        assert!(value.set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn command_error_upgrades_only_proven_prior_dispatch_or_ambiguous_value_work() {
+        let not_started = || GlassError::deadline_not_started("scripted command");
+        let untouched = command_error(7, false, false, false, not_started());
+        assert_eq!(
+            untouched.bound_dispatch(),
+            Some(BoundDispatch::NotDispatched)
+        );
+
+        let after_external = command_error(7, true, false, false, not_started());
+        assert_eq!(
+            after_external.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(!after_external.set_value_failed_after_writing());
+
+        let refused_value = command_error(7, false, false, true, not_started());
+        assert_eq!(
+            refused_value.bound_dispatch(),
+            Some(BoundDispatch::NotDispatched)
+        );
+        assert!(!refused_value.set_value_failed_after_writing());
+
+        let ambiguous_value = command_error(
+            7,
+            false,
+            false,
+            true,
+            GlassError::Backend("transport lost".into()),
+        );
+        assert!(ambiguous_value.set_value_failed_after_writing());
+
+        let later_error = command_error(
+            7,
+            true,
+            true,
+            false,
+            GlassError::Backend("later failure".into()),
+        );
+        assert!(later_error.set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn only_the_outer_caller_owns_verification_expiry() {
+        assert!(verification_phase_owned_by_caller(Whose::Caller));
+        assert!(!verification_phase_owned_by_caller(Whose::Callee));
     }
 
     /// A spent-deadline error as `glass_core` really raises one. Nothing is spawned on that path,

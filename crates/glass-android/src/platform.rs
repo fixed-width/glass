@@ -199,17 +199,13 @@ impl AndroidPlatform {
         let mut last_dump = String::new();
         loop {
             if Instant::now() >= ends {
-                return Err(match owner {
-                    glass_core::Whose::Caller if last_dump.is_empty() => {
-                        GlassError::deadline_not_started("Android window discovery")
-                    }
-                    glass_core::Whose::Caller => {
-                        GlassError::caller_deadline_elapsed("Android window discovery")
-                    }
-                    glass_core::Whose::Callee => {
-                        window_never_appeared(&last_dump, package, timeout_ms)
-                    }
-                });
+                return Err(discovery_deadline_error(
+                    owner,
+                    last_dump.is_empty(),
+                    &last_dump,
+                    package,
+                    timeout_ms,
+                ));
             }
             let dump = self
                 .adb()
@@ -218,13 +214,7 @@ impl AndroidPlatform {
                     Deadline::at(ends),
                 )
                 .map_err(|error| {
-                    if owner == glass_core::Whose::Callee
-                        && error.bound_owner() == Some(glass_core::Whose::Caller)
-                    {
-                        window_never_appeared(&last_dump, package, timeout_ms)
-                    } else {
-                        error
-                    }
+                    discovery_call_error(owner, error, &last_dump, package, timeout_ms)
                 })?;
             if let Some(w) = parse_app_windows(&dump, package).into_iter().next() {
                 return Ok((WindowId(w.id), w.frame));
@@ -255,6 +245,43 @@ fn window_never_appeared(dump: &str, package: &str, timeout_ms: u64) -> GlassErr
         timeout_ms,
         observed: describe_missing_window(dump, package),
     }
+}
+
+fn discovery_deadline_error(
+    owner: glass_core::Whose,
+    no_attempt: bool,
+    last_dump: &str,
+    package: &str,
+    timeout_ms: u64,
+) -> GlassError {
+    match (owner, no_attempt) {
+        (glass_core::Whose::Caller, true) => {
+            GlassError::deadline_not_started("Android window discovery")
+        }
+        (glass_core::Whose::Caller, false) => {
+            GlassError::caller_deadline_elapsed("Android window discovery")
+        }
+        (glass_core::Whose::Callee, _) => window_never_appeared(last_dump, package, timeout_ms),
+    }
+}
+
+fn discovery_call_error(
+    owner: glass_core::Whose,
+    error: GlassError,
+    last_dump: &str,
+    package: &str,
+    timeout_ms: u64,
+) -> GlassError {
+    if owner == glass_core::Whose::Callee && error.bound_owner() == Some(glass_core::Whose::Caller)
+    {
+        window_never_appeared(last_dump, package, timeout_ms)
+    } else {
+        error
+    }
+}
+
+fn pid_discovery_error_is_bounded(error: &GlassError) -> bool {
+    error.bound().is_some()
 }
 
 /// Intersect the window rect with the captured display, so a window that extends past a
@@ -561,7 +588,7 @@ impl Platform for AndroidPlatform {
                         return Ok(pids);
                     }
                 }
-                Err(error) if error.bound().is_some() => return Err(error),
+                Err(error) if pid_discovery_error_is_bounded(&error) => return Err(error),
                 Err(_) => {}
             }
         }
@@ -633,6 +660,59 @@ mod platform_tests {
             sandbox: SandboxLevel::Off,
             a11y: false,
         }
+    }
+
+    #[test]
+    fn discovery_error_helpers_preserve_attempt_and_owner_distinctions() {
+        let before =
+            discovery_deadline_error(glass_core::Whose::Caller, true, "", "com.example.app", 100);
+        assert_eq!(before.bound(), Some(glass_core::BoundKind::NotStarted));
+
+        let after = discovery_deadline_error(
+            glass_core::Whose::Caller,
+            false,
+            "empty dump",
+            "com.example.app",
+            100,
+        );
+        assert_eq!(after.bound(), Some(glass_core::BoundKind::TimedOut));
+
+        let callee =
+            discovery_deadline_error(glass_core::Whose::Callee, true, "", "com.example.app", 100);
+        assert!(matches!(callee, GlassError::AppWindowNotVisible { .. }));
+
+        let caller_error = || GlassError::caller_deadline_elapsed("dumpsys");
+        let mapped = discovery_call_error(
+            glass_core::Whose::Callee,
+            caller_error(),
+            "last dump",
+            "com.example.app",
+            100,
+        );
+        assert!(matches!(mapped, GlassError::AppWindowNotVisible { .. }));
+
+        let retained = discovery_call_error(
+            glass_core::Whose::Caller,
+            caller_error(),
+            "last dump",
+            "com.example.app",
+            100,
+        );
+        assert_eq!(retained.bound_owner(), Some(glass_core::Whose::Caller));
+
+        let ordinary = discovery_call_error(
+            glass_core::Whose::Callee,
+            GlassError::Backend("dumpsys failed".into()),
+            "last dump",
+            "com.example.app",
+            100,
+        );
+        assert!(matches!(ordinary, GlassError::Backend(_)));
+
+        assert!(pid_discovery_error_is_bounded(&caller_error()));
+        assert!(!pid_discovery_error_is_bounded(&GlassError::Backend(
+            "pidof failed".into()
+        )));
     }
 
     /// A screencap of `w`x`h` opaque pixels, as `exec-out screencap` returns one.
@@ -1264,6 +1344,11 @@ mod platform_tests {
             Some(glass_core::BoundDispatch::MayHaveDispatched)
         );
         assert!(
+            error.to_string().contains("adb:shell")
+                && error.to_string().contains("adb kill-server"),
+            "the bounded runner's operation and remedy were replaced: {error}"
+        );
+        assert!(
             fake.deadlines().contains(&deadline),
             "the exact semantic deadline must reach the adb process runner"
         );
@@ -1282,10 +1367,11 @@ mod platform_tests {
         let one = Answer::says("4321\n");
         let many = Answer::says("4321 4322 4323\n");
         let none = Answer::says("\n");
+        let failed = Answer::fails("device offline");
         let fake = FakeAdb::scripted(&[
             ("shell am start *", vec![&started_ok]),
             ("shell dumpsys window windows", vec![&windows]),
-            ("shell pidof *", vec![&one, &many, &none]),
+            ("shell pidof *", vec![&one, &many, &none, &failed]),
             ("*", vec![&Answer::Silent]),
         ]);
         let mut platform = platform_over(&fake);
@@ -1296,6 +1382,11 @@ mod platform_tests {
             platform.app_pids(),
             [4321],
             "a scan that finds nothing falls back to the pid the launch recorded"
+        );
+        assert_eq!(
+            platform.app_pids_by(Deadline::UNBOUNDED).unwrap(),
+            [4321],
+            "an ordinary pidof failure falls back to the pid the launch recorded"
         );
     }
 }

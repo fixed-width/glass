@@ -94,9 +94,33 @@ pub(crate) enum TimeoutFault {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteFault {
     Short(usize),
+    Interrupted,
     Timeout,
     Zero,
     Error,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadFault {
+    Interrupted,
+    TimedOut,
+}
+
+#[cfg(test)]
+fn short_write_count(limit: usize, len: usize) -> usize {
+    limit.min(len - 1)
+}
+
+fn interrupted(kind: std::io::ErrorKind) -> bool {
+    kind == std::io::ErrorKind::Interrupted
+}
+
+fn retryable_bounded_read_timeout(kind: std::io::ErrorKind, bounded: bool) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) && bounded
 }
 
 pub(crate) struct Conn {
@@ -108,6 +132,8 @@ pub(crate) struct Conn {
     timeout_faults: std::collections::VecDeque<TimeoutFault>,
     #[cfg(test)]
     write_faults: std::collections::VecDeque<WriteFault>,
+    #[cfg(test)]
+    read_faults: std::collections::VecDeque<ReadFault>,
 }
 
 impl Conn {
@@ -159,6 +185,8 @@ impl Conn {
             timeout_faults: Default::default(),
             #[cfg(test)]
             write_faults: Default::default(),
+            #[cfg(test)]
+            read_faults: Default::default(),
         };
         let hello = c
             .read_line_by(deadline, "agent hello")
@@ -270,6 +298,25 @@ impl Conn {
         self.write_faults.extend(faults);
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_read_faults(&mut self, faults: impl IntoIterator<Item = ReadFault>) {
+        self.read_faults.extend(faults);
+    }
+
+    #[cfg(test)]
+    fn fill_buf_with_fault(&mut self) -> std::io::Result<&[u8]> {
+        if let Some(fault) = self.read_faults.pop_front() {
+            return Err(std::io::Error::new(
+                match fault {
+                    ReadFault::Interrupted => std::io::ErrorKind::Interrupted,
+                    ReadFault::TimedOut => std::io::ErrorKind::TimedOut,
+                },
+                format!("injected {fault:?} read"),
+            ));
+        }
+        self.reader.fill_buf()
+    }
+
     fn write_chunk(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         #[cfg(test)]
         if let Some(fault) = self.write_faults.pop_front() {
@@ -277,13 +324,17 @@ impl Conn {
                 WriteFault::Short(limit) => {
                     assert!(limit > 0, "an injected short write must write something");
                     assert!(bytes.len() > 1, "an injected short write needs a remainder");
-                    let count = limit.min(bytes.len() - 1);
+                    let count = short_write_count(limit, bytes.len());
                     self.writer.write_all(&bytes[..count])?;
                     Ok(count)
                 }
                 WriteFault::Timeout => Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "injected write timeout",
+                )),
+                WriteFault::Interrupted => Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected interrupted write",
                 )),
                 WriteFault::Zero => Ok(0),
                 WriteFault::Error => Err(std::io::Error::new(
@@ -370,7 +421,7 @@ impl Conn {
                     ));
                 }
                 Ok(count) => written += count,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if interrupted(error.kind()) => {}
                 Err(error) => {
                     return Err(Self::transport_failure(
                         dispatched,
@@ -391,7 +442,11 @@ impl Conn {
         loop {
             let wait = Self::phase_wait(deadline, op, true)?;
             self.read_within(wait).map_err(CallFailure::AnswerLost)?;
-            let (consumed, complete) = match self.reader.fill_buf() {
+            #[cfg(test)]
+            let filled = self.fill_buf_with_fault();
+            #[cfg(not(test))]
+            let filled = self.reader.fill_buf();
+            let (consumed, complete) = match filled {
                 Ok([]) => {
                     return Err(CallFailure::AnswerLost(GlassError::Backend(
                         "agent closed the connection".into(),
@@ -406,14 +461,14 @@ impl Conn {
                     (consumed, available[consumed - 1] == b'\n')
                 }
                 Err(error)
-                    if matches!(
+                    if retryable_bounded_read_timeout(
                         error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) && deadline.remaining().is_some() =>
+                        deadline.remaining().is_some(),
+                    ) =>
                 {
                     continue;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if interrupted(error.kind()) => continue,
                 Err(error) => {
                     return Err(CallFailure::AnswerLost(GlassError::Backend(format!(
                         "agent read: {error}"
@@ -574,6 +629,79 @@ mod tests {
 
     const HELLO: &str = r#"{"hello":{"proto":1}}"#;
     const OK: &str = r#"{"ok":true}"#;
+
+    #[test]
+    fn connection_retry_helpers_keep_short_writes_partial_and_retry_only_expected_errors() {
+        assert_eq!(short_write_count(3, 8), 3);
+        assert_eq!(short_write_count(usize::MAX, 8), 7);
+
+        assert!(interrupted(std::io::ErrorKind::Interrupted));
+        assert!(!interrupted(std::io::ErrorKind::TimedOut));
+
+        assert!(retryable_bounded_read_timeout(
+            std::io::ErrorKind::WouldBlock,
+            true
+        ));
+        assert!(retryable_bounded_read_timeout(
+            std::io::ErrorKind::TimedOut,
+            true
+        ));
+        assert!(!retryable_bounded_read_timeout(
+            std::io::ErrorKind::TimedOut,
+            false
+        ));
+        assert!(!retryable_bounded_read_timeout(
+            std::io::ErrorKind::Interrupted,
+            true
+        ));
+    }
+
+    #[test]
+    fn interrupted_request_write_retries_without_changing_delivery_classification() {
+        let (port, _) = fake_agent(HELLO, vec![OK]);
+        let mut conn = Conn::open(port).unwrap();
+        conn.inject_write_faults([WriteFault::Interrupted]);
+
+        let reply = match conn.call(json!({"op": "ping"})) {
+            Ok(reply) => reply,
+            Err(failure) => panic!(
+                "interrupted write was not retried: {}",
+                failure.into_error()
+            ),
+        };
+
+        assert_eq!(reply["ok"], true);
+    }
+
+    #[test]
+    fn bounded_timeout_and_interrupted_reads_retry_but_unbounded_timeout_does_not() {
+        for fault in [ReadFault::TimedOut, ReadFault::Interrupted] {
+            let (port, _) = fake_agent(HELLO, vec![OK]);
+            let mut conn = Conn::open(port).unwrap();
+            conn.inject_read_faults([fault]);
+
+            let outcome = conn
+                .call_within(
+                    json!({"op": "ping"}),
+                    Deadline::from_millis(1_000),
+                    "agent request",
+                )
+                .unwrap_or_else(|error| panic!("{fault:?}: timeout setup failed: {error}"));
+            let reply = match outcome {
+                Ok(reply) => reply,
+                Err(failure) => panic!("{fault:?}: read was not retried: {}", failure.into_error()),
+            };
+            assert_eq!(reply["ok"], true, "{fault:?}");
+        }
+
+        let (port, _) = fake_agent(HELLO, vec![OK]);
+        let mut conn = Conn::open(port).unwrap();
+        conn.inject_read_faults([ReadFault::TimedOut]);
+        let failure = conn
+            .call(json!({"op": "ping"}))
+            .expect_err("an unbounded call uses the standing timeout as a transport failure");
+        assert!(matches!(failure, CallFailure::AnswerLost(_)));
+    }
 
     fn delayed_hello(delay: Duration) -> u16 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");

@@ -3446,6 +3446,28 @@ mod tests {
     }
 
     #[test]
+    fn only_caller_owned_not_sent_write_errors_pass_through_unchanged() {
+        let caller = write_error(
+            7,
+            CallFailure::NotSent(GlassError::deadline_not_started("service write")),
+        );
+        assert_eq!(caller.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            caller.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+
+        let ordinary = write_error(
+            7,
+            CallFailure::NotSent(GlassError::Backend("connection refused".into())),
+        );
+        assert!(
+            matches!(ordinary, GlassError::AccessibilityUnavailable(_)),
+            "{ordinary}"
+        );
+    }
+
+    #[test]
     fn an_answer_lost_write_preserves_its_tool_source() {
         let error = write_error(
             7,
