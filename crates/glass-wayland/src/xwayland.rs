@@ -56,20 +56,20 @@ impl DeadlineStream {
     fn scope(&self, deadline: Deadline) -> StreamDeadline<'_> {
         let previous = self.deadline.replace(deadline.instant());
         StreamDeadline {
-            stream: self,
+            deadline: &self.deadline,
             previous,
         }
     }
 }
 
 struct StreamDeadline<'a> {
-    stream: &'a DeadlineStream,
+    deadline: &'a Cell<Option<Instant>>,
     previous: Option<Instant>,
 }
 
 impl Drop for StreamDeadline<'_> {
     fn drop(&mut self) {
-        self.stream.deadline.set(self.previous);
+        self.deadline.set(self.previous);
     }
 }
 
@@ -150,6 +150,50 @@ fn reply_error(deadline: Deadline, operation: &str, error: ReplyError) -> GlassE
     }
 }
 
+fn visibility_request_may_have_applied(error: &GlassError) -> bool {
+    error.bound_dispatch() == Some(glass_core::BoundDispatch::MayHaveDispatched)
+}
+
+fn caller_owned(error: &GlassError) -> bool {
+    error.bound_owner() == Some(glass_core::Whose::Caller)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryRemapFailure {
+    Caller,
+    PartialVisibility,
+    BestEffort,
+}
+
+fn recovery_remap_failure(error: &GlassError) -> RecoveryRemapFailure {
+    if caller_owned(error) {
+        RecoveryRemapFailure::Caller
+    } else if visibility_request_may_have_applied(error) {
+        RecoveryRemapFailure::PartialVisibility
+    } else {
+        RecoveryRemapFailure::BestEffort
+    }
+}
+
+fn unconfirmed_transport_failure(transport_failed: bool, owner: Option<glass_core::Whose>) -> bool {
+    transport_failed && owner.is_none()
+}
+
+fn remap_retry_failure(first: GlassError, second: GlassError) -> GlassError {
+    if caller_owned(&second) {
+        GlassError::caller_deadline_elapsed_with_guidance(
+            "re-map Xwayland window",
+            "the window was unmapped and its re-map request was not confirmed; window visibility is uncertain, so restart the app if it is hidden",
+        )
+    } else {
+        GlassError::Backend(format!(
+            "the window was unmapped, then both re-map confirmations failed (first: {first}; \
+             retry: {second}); window visibility is uncertain, so restart the app if it is hidden"
+        ))
+        .after_dispatch()
+    }
+}
+
 fn require_time(deadline: Deadline, operation: &str) -> Result<()> {
     if deadline.has_passed() {
         Err(GlassError::deadline_not_started(operation))
@@ -226,7 +270,6 @@ impl DiscoveryWorker {
                 Ok(answer) => DiscoveryWait::Answer(answer),
                 Err(_) => DiscoveryWait::Disconnected,
             },
-            Some(wait) if wait.is_zero() => DiscoveryWait::Pending,
             Some(wait) => match self.answer.recv_timeout(wait) {
                 Ok(answer) => DiscoveryWait::Answer(answer),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => DiscoveryWait::Pending,
@@ -510,22 +553,19 @@ impl Recovery {
             self.attempted.insert(win);
             match probe.remap_by(win, deadline) {
                 Ok(()) => count += 1,
-                Err(e) if e.bound_owner() == Some(glass_core::Whose::Caller) => {
-                    self.probe = Some(probe);
-                    return Err(e);
-                }
-                Err(e)
-                    if e.bound_dispatch() == Some(glass_core::BoundDispatch::MayHaveDispatched) =>
-                {
-                    return Err(partial_visibility_failure(win, count, e));
-                }
-                // The unmap half may already have applied, which would leave a window the user
-                // can see hidden — so this is reported as a failure of glass's own machinery,
-                // not as a best-effort miss.
-                Err(e) => eprintln!(
-                    "glass: could not re-map Xwayland window {win:#x}: {e}. The window may now \
-                     be hidden; restart the app to get it back."
-                ),
+                Err(e) => match recovery_remap_failure(&e) {
+                    RecoveryRemapFailure::Caller => {
+                        self.probe = Some(probe);
+                        return Err(e);
+                    }
+                    RecoveryRemapFailure::PartialVisibility => {
+                        return Err(partial_visibility_failure(win, count, e));
+                    }
+                    RecoveryRemapFailure::BestEffort => eprintln!(
+                        "glass: could not re-map Xwayland window {win:#x}: {e}. The window may now \
+                         be hidden; restart the app to get it back."
+                    ),
+                },
             }
         }
         self.probe = Some(probe);
@@ -721,16 +761,14 @@ impl XProbe {
                     "Xwayland window attributes",
                 ));
             }
-            let attrs = match self
+            let attrs_reply = self
                 .conn
                 .get_window_attributes(win)
                 .map_err(|e| connection_error(deadline, "Xwayland window attributes", e))?
-                .reply()
-            {
-                Ok(a) => a,
-                Err(e) if window_is_gone(&e) => continue,
-                Err(e) => return Err(reply_error(deadline, "Xwayland window attributes", e)),
-            };
+                .reply();
+            let attrs = window_attribute_reply(attrs_reply)
+                .map_err(|e| reply_error(deadline, "Xwayland window attributes", e))?;
+            let Some(attrs) = attrs else { continue };
             if WindowFacts::from_attrs(&attrs).owed_a_view() {
                 out.push(win);
             }
@@ -757,11 +795,11 @@ impl XProbe {
                 connection_error(deadline, "Xwayland window generation events", error)
             })?;
             match event {
-                Some(Event::CreateNotify(event)) if event.parent == self.root => {
-                    changed.insert(event.window);
+                Some(Event::CreateNotify(event)) => {
+                    changed.extend(created_generation(event.parent, event.window, self.root));
                 }
-                Some(Event::DestroyNotify(event)) if event.event == self.root => {
-                    changed.insert(event.window);
+                Some(Event::DestroyNotify(event)) => {
+                    changed.extend(destroyed_generation(event.event, event.window, self.root));
                 }
                 Some(_) => {}
                 None => break,
@@ -829,18 +867,7 @@ impl XProbe {
             }
             Err(first) => match self.map_by(win, deadline) {
                 Ok(()) => Ok(()),
-                Err(second) if second.bound_owner() == Some(glass_core::Whose::Caller) => {
-                    Err(GlassError::caller_deadline_elapsed_with_guidance(
-                        "re-map Xwayland window",
-                        "the window was unmapped and its re-map request was not confirmed; window visibility is uncertain, so restart the app if it is hidden",
-                    ))
-                }
-                Err(second) => Err(GlassError::Backend(format!(
-                    "the window was unmapped, then both re-map confirmations failed (first: \
-                     {first}; retry: {second}); window visibility is uncertain, so restart the \
-                     app if it is hidden"
-                ))
-                .after_dispatch()),
+                Err(second) => Err(remap_retry_failure(first, second)),
             },
         }
     }
@@ -855,7 +882,7 @@ impl XProbe {
         if let Err(raw) = mapped {
             let transport_failed = matches!(&raw, ReplyError::ConnectionError(_));
             let error = reply_error(deadline, "re-map Xwayland window", raw);
-            return if transport_failed && error.bound_owner().is_none() {
+            return if unconfirmed_transport_failure(transport_failed, error.bound_owner()) {
                 Err(error.after_dispatch())
             } else {
                 Err(error)
@@ -877,6 +904,24 @@ impl XProbe {
 /// error: a scan returning fewer windows reads as "nothing was lost".
 fn window_is_gone(e: &ReplyError) -> bool {
     matches!(e, ReplyError::X11Error(x) if x.error_kind == ErrorKind::Window)
+}
+
+fn window_attribute_reply<T>(
+    reply: std::result::Result<T, ReplyError>,
+) -> std::result::Result<Option<T>, ReplyError> {
+    match reply {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if window_is_gone(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn created_generation(parent: u32, window: u32, root: u32) -> Option<u32> {
+    (parent == root).then_some(window)
+}
+
+fn destroyed_generation(event: u32, window: u32, root: u32) -> Option<u32> {
+    (event == root).then_some(window)
 }
 
 /// The display served by *this session's* Xwayland, or `Ok(None)` when the session has no X11
@@ -1736,6 +1781,7 @@ mod session_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// glass#380: this is what tells a teardown whether what it started is really gone.
     #[test]
@@ -1791,6 +1837,159 @@ mod tests {
             extension_name: None,
             request_name: None,
         })
+    }
+
+    fn timed_out_connection() -> ConnectionError {
+        ConnectionError::IoError(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "scripted timeout",
+        ))
+    }
+
+    #[test]
+    fn stream_deadline_restores_the_previous_scope_on_drop() {
+        let previous = Instant::now() + Duration::from_secs(1);
+        let nested = previous + Duration::from_secs(1);
+        let deadline = Cell::new(Some(nested));
+        {
+            let _scope = StreamDeadline {
+                deadline: &deadline,
+                previous: Some(previous),
+            };
+            assert_eq!(deadline.get(), Some(nested));
+        }
+        assert_eq!(deadline.get(), Some(previous));
+    }
+
+    #[test]
+    fn timeout_classification_requires_a_bounded_deadline_and_timeout_evidence() {
+        assert!(connection_timed_out(&timed_out_connection()));
+        assert!(!connection_timed_out(&ConnectionError::UnknownError));
+        assert!(reply_timed_out(&ReplyError::ConnectionError(
+            timed_out_connection()
+        )));
+        assert!(!reply_timed_out(&x11_error(ErrorKind::Value)));
+
+        let live = Deadline::from_millis(60_000);
+        let expired = Deadline::from_millis(0);
+        let timeout = connection_error(live, "query", timed_out_connection());
+        assert_eq!(timeout.bound_owner(), Some(glass_core::Whose::Caller));
+        let expired_unknown = connection_error(expired, "query", ConnectionError::UnknownError);
+        assert_eq!(
+            expired_unknown.bound_owner(),
+            Some(glass_core::Whose::Caller)
+        );
+        assert!(matches!(
+            connection_error(Deadline::UNBOUNDED, "query", timed_out_connection()),
+            GlassError::Backend(_)
+        ));
+        assert!(matches!(
+            connection_error(live, "query", ConnectionError::UnknownError),
+            GlassError::Backend(_)
+        ));
+
+        let reply_timeout = reply_error(
+            live,
+            "reply",
+            ReplyError::ConnectionError(timed_out_connection()),
+        );
+        assert_eq!(reply_timeout.bound_owner(), Some(glass_core::Whose::Caller));
+        assert!(matches!(
+            reply_error(live, "reply", x11_error(ErrorKind::Value)),
+            GlassError::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn recovery_and_map_provenance_helpers_distinguish_every_case() {
+        let before = GlassError::deadline_not_started("visibility");
+        let after = before.after_dispatch();
+        assert!(!visibility_request_may_have_applied(
+            &GlassError::deadline_not_started("visibility")
+        ));
+        assert!(visibility_request_may_have_applied(&after));
+
+        assert!(caller_owned(&GlassError::deadline_not_started("map")));
+        assert!(!caller_owned(&GlassError::Backend("map failed".into())));
+
+        assert!(unconfirmed_transport_failure(true, None));
+        assert!(!unconfirmed_transport_failure(false, None));
+        assert!(!unconfirmed_transport_failure(
+            true,
+            Some(glass_core::Whose::Caller)
+        ));
+
+        assert_eq!(
+            recovery_remap_failure(&GlassError::deadline_not_started("recover")),
+            RecoveryRemapFailure::Caller
+        );
+        assert_eq!(
+            recovery_remap_failure(
+                &GlassError::Backend("visibility uncertain".into()).after_dispatch()
+            ),
+            RecoveryRemapFailure::PartialVisibility
+        );
+        assert_eq!(
+            recovery_remap_failure(&GlassError::Backend("request rejected".into())),
+            RecoveryRemapFailure::BestEffort
+        );
+
+        let caller_retry = remap_retry_failure(
+            GlassError::Backend("first map failed".into()),
+            GlassError::deadline_not_started("retry map"),
+        );
+        assert_eq!(caller_retry.bound_owner(), Some(glass_core::Whose::Caller));
+        let backend_retry = remap_retry_failure(
+            GlassError::Backend("first map failed".into()),
+            GlassError::Backend("second map failed".into()),
+        );
+        assert_eq!(
+            backend_retry.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(backend_retry.to_string().contains("first map failed"));
+        assert!(backend_retry.to_string().contains("second map failed"));
+    }
+
+    #[test]
+    fn window_attribute_and_generation_helpers_filter_only_the_root_window() {
+        assert_eq!(window_attribute_reply::<u8>(Ok(7)).unwrap(), Some(7));
+        assert_eq!(
+            window_attribute_reply::<u8>(Err(x11_error(ErrorKind::Window))).unwrap(),
+            None
+        );
+        assert!(window_attribute_reply::<u8>(Err(x11_error(ErrorKind::Value))).is_err());
+
+        assert_eq!(created_generation(1, 7, 1), Some(7));
+        assert_eq!(created_generation(2, 7, 1), None);
+        assert_eq!(destroyed_generation(1, 8, 1), Some(8));
+        assert_eq!(destroyed_generation(2, 8, 1), None);
+    }
+
+    #[test]
+    fn discovery_worker_join_reports_a_panicking_worker() {
+        let (_sender, answer) = std::sync::mpsc::channel();
+        let worker = DiscoveryWorker {
+            answer,
+            thread: std::thread::spawn(|| panic!("scripted discovery panic")),
+        };
+        let error = worker
+            .join()
+            .expect_err("the worker panic must remain visible");
+        assert!(error.to_string().contains("worker panicked"), "{error}");
+    }
+
+    #[test]
+    fn xwayland_wrapper_reads_the_fake_process_table() {
+        let proc = super::session_tests::FakeProc::new();
+        proc.process(
+            41,
+            "Xwayland",
+            Path::new("/tmp/glass-wl.wrapper"),
+            &["Xwayland", ":41"],
+        );
+        assert!(is_xwayland_in(proc.path(), 41));
+        assert!(!is_xwayland_in(proc.path(), 42));
     }
 
     #[test]
