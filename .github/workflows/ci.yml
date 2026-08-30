@@ -160,9 +160,10 @@ jobs:
       # `-p glass-macos --lib` run is repeated by the workspace step below — kept because this
       # script is the standalone entry point on a dev box, where nothing else runs them.
       - run: ./scripts/test-macos.sh
-      # `--lib` rather than plain `--workspace`: it excludes the harness = false integration
-      # targets, which need the TCC grants this runner lacks.
-      - run: cargo test --workspace --lib --locked
+      # `--lib` excludes the harness = false integration targets that need TCC grants.
+      - run: cargo test --workspace --exclude glass-core --lib --locked
+      # glass-core's deadline-ordering tests need deterministic scheduling on the shared runner.
+      - run: cargo test -p glass-core --lib --locked -- --test-threads=1
       # Builds the Swift fixture (crates/glass-macos/fixture/a11y_fixture.swift) — the one
       # thing `cargo build --workspace --all-targets` above doesn't reach — and re-links the
       # harness=false `a11y` integration test (crates/glass-macos/tests/a11y.rs) as a belt-
