@@ -43,9 +43,13 @@ fn require_time(deadline: Deadline, started: bool) -> crate::Result<()> {
 
 fn sleep_by(deadline: Deadline, requested: Duration) -> crate::Result<()> {
     require_time(deadline, true)?;
-    let sleep_for = deadline.remaining().unwrap_or(requested).min(requested);
+    let sleep_for = sleep_duration(deadline.remaining(), requested);
     std::thread::sleep(sleep_for);
     require_time(deadline, true)
+}
+
+fn sleep_duration(remaining: Option<Duration>, requested: Duration) -> Duration {
+    remaining.unwrap_or(requested).min(requested)
 }
 
 fn attach_cleanup_failure(primary: GlassError, cleanup: GlassError) -> GlassError {
@@ -113,7 +117,7 @@ pub fn run_scroll_by<S: ScrollSink>(
 
 #[cfg(test)]
 mod tests {
-    use super::{SCROLL_DWELL, ScrollSink, run_scroll, run_scroll_by};
+    use super::{SCROLL_DWELL, ScrollSink, run_scroll, run_scroll_by, sleep_duration};
     use crate::{BoundDispatch, BoundKind, Deadline, GlassError, Result};
     use std::time::{Duration, Instant};
 
@@ -193,20 +197,24 @@ mod tests {
         let full_sequence = full_sink.calls;
 
         let mut sink = RecordingSink::default();
-        let started = Instant::now();
         let error = run_scroll_by(&mut sink, true, Deadline::from_millis(10)).unwrap_err();
 
         assert!(sink.calls.len() < full_sequence.len());
         assert_eq!(sink.calls, vec![Mods(true), Mods(false)]);
-        assert!(
-            started.elapsed() < SCROLL_DWELL,
-            "the modifier dwell must be capped by the deadline"
-        );
         assert_eq!(error.bound(), Some(BoundKind::TimedOut));
         assert_eq!(
             error.bound_dispatch(),
             Some(BoundDispatch::MayHaveDispatched)
         );
+    }
+
+    #[test]
+    fn a_bounded_dwell_uses_only_the_remaining_time() {
+        assert_eq!(
+            sleep_duration(Some(Duration::from_millis(10)), SCROLL_DWELL),
+            Duration::from_millis(10)
+        );
+        assert_eq!(sleep_duration(None, SCROLL_DWELL), SCROLL_DWELL);
     }
 
     #[test]

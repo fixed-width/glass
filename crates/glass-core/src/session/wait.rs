@@ -42,6 +42,10 @@ fn final_read_pause(left: std::time::Duration) -> std::time::Duration {
     left.saturating_sub(FINAL_READ_HEADROOM.min(left / 4))
 }
 
+fn quiet_wait_needs_read(final_read: bool, since_last: std::time::Duration) -> bool {
+    final_read || since_last >= REREAD_AFTER
+}
+
 fn reader_relative_caller_bound(error: &GlassError) -> bool {
     error.bound_owner() == Some(crate::Whose::Caller)
 }
@@ -586,7 +590,7 @@ impl Glass {
                     Some(s) => match s.wait(pause_budget) {
                         ChangeWait::Changed => true,
                         // Read anyway now and then — see `REREAD_AFTER`.
-                        ChangeWait::Quiet => final_read || last_read.elapsed() >= REREAD_AFTER,
+                        ChangeWait::Quiet => quiet_wait_needs_read(final_read, last_read.elapsed()),
                         // See `ChangeWait`: an unusable signal must not read as a quiet one.
                         ChangeWait::Unusable => {
                             signal = None;
@@ -1052,10 +1056,10 @@ impl Glass {
 #[cfg(test)]
 mod tests {
     use super::{
-        callee_wait_expired, compatibility_capture, final_read_pause,
+        REREAD_AFTER, callee_wait_expired, compatibility_capture, final_read_pause,
         needs_callee_timeout_full_capture, offscreen_direction, outer_sequence_expired,
-        prior_scroll_dispatched, reader_relative_caller_bound, scroll_anchor,
-        should_reclassify_nested_bound, soft_callee_capture_timeout,
+        prior_scroll_dispatched, quiet_wait_needs_read, reader_relative_caller_bound,
+        scroll_anchor, should_reclassify_nested_bound, soft_callee_capture_timeout,
     };
     use crate::BoundKind;
     use crate::session::test_support::*;
@@ -1158,6 +1162,16 @@ mod tests {
             final_read_pause(Duration::from_millis(4)),
             Duration::from_millis(3)
         );
+    }
+
+    #[test]
+    fn a_quiet_signal_reads_only_for_a_safety_or_periodic_refresh() {
+        assert!(!quiet_wait_needs_read(
+            false,
+            REREAD_AFTER - Duration::from_millis(1)
+        ));
+        assert!(quiet_wait_needs_read(false, REREAD_AFTER));
+        assert!(quiet_wait_needs_read(true, Duration::ZERO));
     }
 
     #[test]
@@ -1502,17 +1516,16 @@ mod tests {
         let platform = FakePlatform::new(2, 2)
             .with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])])
             .with_capture_log(captures.clone())
-            .with_capture_delay(Duration::from_millis(150))
-            .capture_deadline_error_owned_by(crate::Whose::Callee);
+            .with_capture_error_owners(vec![None, Some(crate::Whose::Callee)]);
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
 
         let error = g
             .wait_stable(&WaitStableParams {
-                interval_ms: 100,
+                interval_ms: 0,
                 settle_frames: 3,
                 tolerance: 0,
-                timeout_ms: 300,
+                timeout_ms: 1_000,
                 stability_region: None,
                 ignore: Vec::new(),
                 window: None,
@@ -2408,18 +2421,18 @@ mod tests {
         }
     }
 
-    struct ChangesWithoutSignalAfter {
-        first_read: Option<std::time::Instant>,
-        after: Duration,
-        starts: Arc<Mutex<Vec<(std::time::Instant, Deadline)>>>,
+    struct QuietThenChanges {
+        changed: Arc<std::sync::atomic::AtomicBool>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        waits: Arc<std::sync::atomic::AtomicUsize>,
+        deadlines: Arc<Mutex<Vec<Deadline>>>,
     }
 
-    impl Accessibility for ChangesWithoutSignalAfter {
+    impl Accessibility for QuietThenChanges {
         fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-            let now = std::time::Instant::now();
-            let first_read = *self.first_read.get_or_insert(now);
-            self.starts.lock().unwrap().push((now, ctx.deadline));
-            Ok(if now.duration_since(first_read) >= self.after {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.deadlines.lock().unwrap().push(ctx.deadline);
+            Ok(if self.changed.load(Ordering::SeqCst) {
                 fake_tree_checked()
             } else {
                 fake_tree_enabled()
@@ -2427,67 +2440,54 @@ mod tests {
         }
 
         fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
-            Some(Box::new(NeverSignals))
+            Some(Box::new(QuietThenChangeSignal {
+                changed: self.changed.clone(),
+                waits: self.waits.clone(),
+            }))
+        }
+    }
+
+    struct QuietThenChangeSignal {
+        changed: Arc<std::sync::atomic::AtomicBool>,
+        waits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ChangeSignal for QuietThenChangeSignal {
+        fn wait(&mut self, _timeout: Duration) -> ChangeWait {
+            if self.waits.fetch_add(1, Ordering::SeqCst) == 0 {
+                return ChangeWait::Quiet;
+            }
+            self.changed.store(true, Ordering::SeqCst);
+            ChangeWait::Changed
         }
     }
 
     #[test]
-    fn a_quiet_wait_walks_once_and_looks_again_at_the_deadline() {
-        // The point of the change: told nothing changed, the wait must not re-read on the
-        // interval. The second walk is the deadline read — see `poll_until_with_pause`.
-        let (mut g, walks) = glass_with_a11y_counted(
-            FakePlatform::new(100, 100),
-            vec![fake_tree_enabled()],
-            Some(|| Box::new(NeverSignals) as Box<dyn ChangeSignal>),
-        );
-        g.start(&spec()).unwrap();
-
-        let o = g.wait_for_element(&never_matches(100, 500)).unwrap();
-
-        assert!(!o.matched);
-        assert_eq!(
-            walks.load(Ordering::Relaxed),
-            2,
-            "a quiet wait re-walked on the interval"
-        );
-    }
-
-    #[test]
-    fn a_quiet_wait_defers_its_safety_read_until_after_an_unannounced_change() {
-        let starts = Arc::new(Mutex::new(Vec::new()));
+    fn a_quiet_signal_skips_one_read_before_a_change_wakes_the_wait() {
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
         let mut g = glass_with_backend(
             FakePlatform::new(100, 100),
-            Box::new(ChangesWithoutSignalAfter {
-                first_read: None,
-                after: Duration::from_millis(200),
-                starts: starts.clone(),
+            Box::new(QuietThenChanges {
+                changed,
+                reads: reads.clone(),
+                waits: waits.clone(),
+                deadlines: deadlines.clone(),
             }),
         );
         g.start(&spec()).unwrap();
-        let deadline_at = std::time::Instant::now() + Duration::from_millis(1_000);
-        let deadline = Deadline::at(deadline_at);
 
-        let outcome = g
-            .wait_for_element_by(&never_matches(500, 5_000), deadline)
-            .unwrap();
+        let outcome = g.wait_for_element(&never_matches(1, 10_000)).unwrap();
 
-        assert!(
-            outcome.matched,
-            "the safety read happened before the unannounced state change"
-        );
-        let starts = starts.lock().unwrap();
-        assert_eq!(starts.len(), 2, "one initial read and one safety read");
-        assert!(
-            starts[1].0.duration_since(starts[0].0) >= Duration::from_millis(200),
-            "the safety read followed the initial read by only {:?}",
-            starts[1].0.duration_since(starts[0].0)
-        );
-        assert!(
-            starts
-                .iter()
-                .all(|(started, received)| *started < deadline_at && *received == deadline),
-            "a reader call started at or after expiry, or received a different deadline: {starts:?}"
-        );
+        assert!(outcome.matched);
+        assert_eq!(waits.load(Ordering::SeqCst), 2);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        let deadlines = deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), 2);
+        assert_ne!(deadlines[0], Deadline::UNBOUNDED);
+        assert_eq!(deadlines[0], deadlines[1]);
     }
 
     #[test]

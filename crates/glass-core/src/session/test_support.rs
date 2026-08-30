@@ -46,6 +46,7 @@ pub(crate) struct FakePlatform {
     pid_deadline_log: Option<PidDeadlineLog>,
     capture_delay: Option<Duration>,
     capture_deadline_error_owner: Option<crate::Whose>,
+    capture_error_owners: VecDeque<Option<crate::Whose>>,
     geometry_delay: Option<Duration>,
     fail_geometry_before_dispatch: bool,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
@@ -141,9 +142,23 @@ impl FakePlatform {
         self.capture_deadline_error_owner = Some(crate::Whose::Caller);
         self
     }
-    pub(crate) fn capture_deadline_error_owned_by(mut self, whose: crate::Whose) -> Self {
-        self.capture_deadline_error_owner = Some(whose);
+    pub(crate) fn with_capture_error_owners(mut self, owners: Vec<Option<crate::Whose>>) -> Self {
+        self.capture_error_owners = owners.into();
         self
+    }
+    fn scripted_capture_error(&mut self, operation: &'static str) -> Option<GlassError> {
+        self.capture_error_owners
+            .pop_front()
+            .flatten()
+            .map(|whose| match whose {
+                crate::Whose::Caller => GlassError::caller_deadline_elapsed(operation),
+                crate::Whose::Callee => GlassError::Bounded {
+                    kind: crate::BoundKind::TimedOut,
+                    whose,
+                    dispatch: crate::BoundDispatch::MayHaveDispatched,
+                    message: format!("{operation}: the backend capture budget elapsed"),
+                },
+            })
     }
     pub(crate) fn with_geometry_delay(mut self, delay: Duration) -> Self {
         self.geometry_delay = Some(delay);
@@ -279,6 +294,9 @@ impl Platform for FakePlatform {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("capture"));
         }
+        if let Some(error) = self.scripted_capture_error("capture") {
+            return Err(error);
+        }
         if let Some(delay) = self.capture_delay {
             std::thread::sleep(delay);
         }
@@ -321,6 +339,9 @@ impl Platform for FakePlatform {
         }
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("window capture"));
+        }
+        if let Some(error) = self.scripted_capture_error("window capture") {
+            return Err(error);
         }
         if let Some(delay) = self.capture_delay {
             std::thread::sleep(delay);

@@ -54,13 +54,15 @@ const MUTATION_CANCELLED: u8 = 2;
 pub struct A11yMutationDispatch {
     state: Arc<AtomicU8>,
     operation: &'static str,
+    ends: Instant,
 }
 
 impl A11yMutationDispatch {
-    fn new(operation: &'static str) -> Self {
+    fn new(operation: &'static str, ends: Instant) -> Self {
         Self {
             state: Arc::new(AtomicU8::new(MUTATION_PENDING)),
             operation,
+            ends,
         }
     }
 
@@ -68,10 +70,35 @@ impl A11yMutationDispatch {
         Self {
             state: Arc::clone(&self.state),
             operation: self.operation,
+            ends: self.ends,
         }
     }
 
     fn begin(&self) -> Result<()> {
+        self.begin_at(Instant::now())
+    }
+
+    fn begin_at(&self, now: Instant) -> Result<()> {
+        if now >= self.ends {
+            return match self.state.compare_exchange(
+                MUTATION_PENDING,
+                MUTATION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) | Err(MUTATION_CANCELLED) => Err(GlassError::deadline_not_started(&format!(
+                    "native accessibility {} mutation",
+                    self.operation
+                ))),
+                Err(MUTATION_DISPATCHED) => Err(GlassError::Backend(format!(
+                    "native accessibility {} mutation was already dispatched",
+                    self.operation
+                ))),
+                Err(other) => {
+                    unreachable!("unknown accessibility mutation dispatch state {other}")
+                }
+            };
+        }
         match self.state.compare_exchange(
             MUTATION_PENDING,
             MUTATION_DISPATCHED,
@@ -229,7 +256,7 @@ impl A11yThread {
             ));
         }
         let (ends, ended_by) = self.bounded_wait(deadline);
-        let dispatch = A11yMutationDispatch::new("set_value");
+        let dispatch = A11yMutationDispatch::new("set_value", ends);
         let worker_dispatch = dispatch.duplicate();
         let timeout_dispatch = dispatch.duplicate();
         let panic_dispatch = dispatch.duplicate();
@@ -266,7 +293,7 @@ impl A11yThread {
             ));
         }
         let (ends, ended_by) = self.bounded_wait(deadline);
-        let dispatch = A11yMutationDispatch::new("invoke");
+        let dispatch = A11yMutationDispatch::new("invoke", ends);
         let worker_dispatch = dispatch.duplicate();
         let timeout_dispatch = dispatch.duplicate();
         let panic_dispatch = dispatch.duplicate();
@@ -857,7 +884,7 @@ mod tests {
 
     #[test]
     fn racing_async_dispatch_attempts_poll_only_the_winning_mutation_future() {
-        let dispatch = A11yMutationDispatch::new("set_value");
+        let dispatch = A11yMutationDispatch::new("set_value", Instant::now() + CEILING);
         let first = dispatch.duplicate();
         let second = dispatch.duplicate();
         let winner_polls = Arc::new(AtomicUsize::new(0));
@@ -877,7 +904,7 @@ mod tests {
 
     #[test]
     fn cancelled_async_dispatch_never_polls_the_mutation_future() {
-        let dispatch = A11yMutationDispatch::new("set_value");
+        let dispatch = A11yMutationDispatch::new("set_value", Instant::now() + CEILING);
         assert!(!dispatch.cancel_or_dispatched());
         let polls = Arc::new(AtomicUsize::new(0));
         let mut cancelled = Box::pin(dispatch.dispatch_async(CountedReady {
@@ -889,6 +916,20 @@ mod tests {
         };
         assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
         assert_eq!(polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn mutation_dispatch_at_or_after_its_absolute_bound_is_refused() {
+        let ends = Instant::now() + Duration::from_secs(1);
+        for observed in [ends, ends + Duration::from_millis(1)] {
+            let dispatch = A11yMutationDispatch::new("invoke", ends);
+
+            let error = dispatch.begin_at(observed).unwrap_err();
+
+            assert_eq!(error.bound(), Some(BoundKind::NotStarted), "{observed:?}");
+            assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+            assert!(!dispatch.was_dispatched());
+        }
     }
 
     #[test]
@@ -941,7 +982,7 @@ mod tests {
 
     #[test]
     fn worker_completion_seals_a_pending_noop_before_returning_its_result() {
-        let dispatch = A11yMutationDispatch::new("set_value");
+        let dispatch = A11yMutationDispatch::new("set_value", Instant::now() + CEILING);
         let escaped = dispatch.duplicate();
 
         let result = run_mutation_job(dispatch, |_| Ok(()));
@@ -955,7 +996,7 @@ mod tests {
 
     #[test]
     fn worker_completion_seals_a_pending_pre_write_error_before_returning_it() {
-        let dispatch = A11yMutationDispatch::new("set_value");
+        let dispatch = A11yMutationDispatch::new("set_value", Instant::now() + CEILING);
         let escaped = dispatch.duplicate();
 
         let result = run_mutation_job(dispatch, |_| Err(GlassError::AxUnsupported));
@@ -972,7 +1013,7 @@ mod tests {
 
     #[test]
     fn worker_completion_seals_a_pending_token_before_unwinding() {
-        let dispatch = A11yMutationDispatch::new("set_value");
+        let dispatch = A11yMutationDispatch::new("set_value", Instant::now() + CEILING);
         let escaped = dispatch.duplicate();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
