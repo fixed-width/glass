@@ -53,6 +53,19 @@ fn legacy_window_selection(deadline: Deadline) -> bool {
     deadline == Deadline::UNBOUNDED
 }
 
+fn rollback_bounded_window_selection(
+    selected: &mut Option<Window>,
+    previous: Option<Window>,
+    deadline: Deadline,
+) -> bool {
+    if legacy_window_selection(deadline) {
+        false
+    } else {
+        *selected = previous;
+        true
+    }
+}
+
 #[derive(Default)]
 struct X11Dispatch {
     sent: Cell<bool>,
@@ -1702,8 +1715,7 @@ impl Platform for X11Platform {
             match platform.geometry_of(target) {
                 Ok(geometry) => Ok(geometry),
                 Err(error) => {
-                    if !legacy_window_selection(deadline) {
-                        platform.window = previous;
+                    if rollback_bounded_window_selection(&mut platform.window, previous, deadline) {
                         return Err(error.after_dispatch());
                     }
                     Err(error)
@@ -1826,8 +1838,8 @@ fn button_number(button: glass_core::MouseButton) -> u8 {
 mod tests {
     use super::{
         X11DeadlineWatch, X11Dispatch, hint_matches, legacy_window_selection,
-        modifier_keycodes_dispatched, run_clicks_by, run_scroll_buttons_by, run_x11_call_by,
-        run_x11_type_by,
+        modifier_keycodes_dispatched, rollback_bounded_window_selection, run_clicks_by,
+        run_scroll_buttons_by, run_x11_call_by, run_x11_type_by,
     };
     use glass_core::{
         BoundDispatch, BoundKind, Deadline, GlassError, Result, TypeSink, Whose, WindowHint,
@@ -1841,6 +1853,25 @@ mod tests {
         assert!(modifier_keycodes_dispatched(&[42]));
         assert!(legacy_window_selection(Deadline::UNBOUNDED));
         assert!(!legacy_window_selection(Deadline::from_millis(1_000)));
+    }
+
+    #[test]
+    fn only_bounded_window_selection_rolls_back_after_dispatch_failure() {
+        let mut bounded = Some(2);
+        assert!(rollback_bounded_window_selection(
+            &mut bounded,
+            Some(1),
+            Deadline::from_millis(1_000),
+        ));
+        assert_eq!(bounded, Some(1));
+
+        let mut legacy = Some(2);
+        assert!(!rollback_bounded_window_selection(
+            &mut legacy,
+            Some(1),
+            Deadline::UNBOUNDED,
+        ));
+        assert_eq!(legacy, Some(2));
     }
 
     #[test]
