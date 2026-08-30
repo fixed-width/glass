@@ -137,9 +137,14 @@ pub struct ClickElementArgs {
     /// window and the previously-active window is restored afterward — no extra step
     /// needed.
     ///
-    /// Prefer native role-based actuation, including occluded targets, then fall back to a center
-    /// click. Text editors may only focus and labels may actuate `actuated_id`.
-    /// `method:"native-action"` covers every native path; `native_fallback` explains pointer use.
+    /// Uses the platform's role-appropriate native accessibility operation when one is
+    /// available (works even when the element is occluded or scrolled off-screen),
+    /// falling back to a synthetic pointer click at the element's center. Text editors
+    /// may receive focus instead of an activation. The result's `method:"native-action"`
+    /// is the stable umbrella label for the native path, not proof that an activation
+    /// verb fired; `native_fallback` says why the pointer path was used. Where a
+    /// control's label is separate from the control, the native operation targets the
+    /// enclosing control and `actuated_id` identifies that element.
     pub id: u32,
     /// Terminal observation: "snapshot" settles and refreshes/folds a11y, "settle" waits for
     /// visual stability and returns text-only metadata, and "none" skips observation (default).
@@ -248,11 +253,15 @@ pub struct ScrollArgs {
     pub x: i32,
     /// Pointer y the wheel is aimed at, window-relative. See `x`.
     pub y: i32,
-    /// Horizontal wheel notches (-100..=100, usually 1–5); positive is right and emits `|dx|`
-    /// clicks.
+    /// Horizontal scroll in **wheel notches** (valid range -100 through 100; normal usage is small
+    /// integers like 1–5, NOT pixels). Positive `dx` sends wheel-right, negative wheel-left; glass
+    /// clicks `|dx|` times.
     #[schemars(range(min = -100, max = 100))]
     pub dx: Option<i32>,
-    /// Vertical wheel notches (-100..=100, usually 1–5); positive is down and emits `|dy|` clicks.
+    /// Vertical scroll in **wheel notches** (valid range -100 through 100; normal usage is small
+    /// integers like 1–5, NOT pixels). Positive `dy` sends wheel-down, negative wheel-up; glass
+    /// clicks `|dy|` times. How an app maps a wheel notch to its view (lines, pixels, zoom) is the
+    /// app's choice.
     #[schemars(range(min = -100, max = 100))]
     pub dy: Option<i32>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
@@ -527,7 +536,8 @@ pub struct SettleArgs {
     /// Per-channel difference (0–255) two frames may have and still count as
     /// unchanged (default 0, exact match).
     pub tolerance: Option<u8>,
-    /// Settle timeout in milliseconds; its expiry completes with `settled:false`, while the batch
+    /// Give up after this long (default 5000ms). Expiry of this settle's own timeout
+    /// returns settled:false and completes the step; expiry of the enclosing glass_do
     /// deadline fails the sequence.
     pub timeout_ms: Option<u64>,
     /// Window-relative sub-rectangle to watch for settling; when set, changes outside
