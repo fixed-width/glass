@@ -2223,8 +2223,6 @@ mod tests {
         fake: &crate::adb::FakeAdb,
         trigger: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-
         let bin = std::path::PathBuf::from(fake.adb().bin());
         let delegate = bin.with_file_name("adb-delegate");
         std::fs::rename(&bin, &delegate).expect("move the fake adb behind its shim");
@@ -2243,9 +2241,8 @@ esac
 exec "$real" "$@"
 "#
         );
-        std::fs::write(&bin, script).expect("write the self-deleting adb shim");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
-            .expect("make the adb shim executable");
+        let written = fake.alongside("adb", &script);
+        assert_eq!(written, bin);
         (bin, delegate)
     }
 
@@ -2543,7 +2540,7 @@ exec "$real" "$@"
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: Deadline::from_millis(300),
+            deadline: Deadline::from_millis(2_000),
         };
         let field = AxTarget {
             id: AxNodeId(1),

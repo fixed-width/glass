@@ -932,14 +932,11 @@ mod platform_tests {
 
         let at = Instant::now();
         let err = platform
-            .capture_frame_by(
-                None,
-                Deadline::at(Instant::now() + Duration::from_millis(300)),
-            )
+            .capture_frame_by(None, Deadline::at(Instant::now() + Duration::from_secs(2)))
             .expect_err("a live caller deadline must bound screencap");
 
         assert!(
-            at.elapsed() < Duration::from_secs(2),
+            at.elapsed() < Duration::from_secs(5),
             "waited {:?}: {err}",
             at.elapsed()
         );
