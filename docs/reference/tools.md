@@ -436,9 +436,14 @@ the event — glass reports the binary and its build info if yours does not. Oth
 
 ### `glass_do`
 
-Run a bounded, fixed sequence of actions in one call, then optionally observe. The sequence is a
-static list: it cannot use variables, references to earlier results, interpolation, branching,
-loops, retries, or dynamically generated actions.
+Prefer `glass_do` whenever at least two upcoming actions or verification waits are already known.
+For a semantic form, take one fresh accessibility snapshot, retain the required ids, then put the
+mutations and `wait_for_element` confirmations in one call. Use standalone tools only when the next
+step depends on newly observed state, and inspect the structured outcomes before recovery.
+
+The call runs a bounded, fixed sequence, then optionally observes. The sequence is a static list: it
+cannot use variables, references to earlier results, interpolation, branching, loops, retries, or
+dynamically generated actions.
 
 - `actions` (array, **required**, 1–64 items) — each item uses one discriminator: `click`, `move`,
   `drag`, `scroll`, `type`, `key`, `settle`, `click_element`, `set_value`, `wait_for_element`, or
