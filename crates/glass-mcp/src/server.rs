@@ -235,7 +235,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Wait for visual quiescence: consecutive frames stop changing, then return the last frame. This proves stability, not that an expected semantic state or pixel design was reached; use glass_wait_for_element for a semantic condition/value or glass_wait_for_region with a baseline for expected pixels. Optional `stability_region` watches only that sub-rectangle; optional `region` crops the returned frame. Set `include_image:false` for text-only metadata."
+        description = "Wait for visual quiescence: consecutive frames stop changing, then return the last frame. This proves stability, not that an expected semantic state or pixel design was reached; use glass_wait_for_element for a semantic condition/value or glass_wait_for_region with a baseline for expected pixels. Optional `stability_region` watches only that sub-rectangle; optional `region` crops the returned frame. Set `include_image:false` for text-only metadata. If at least two next actions or waits are known, use glass_do instead of separate calls."
     )]
     async fn glass_wait_stable(
         &self,
@@ -250,7 +250,7 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Click at window-relative coordinates. button: left|right|middle; count for multi-click. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select."
+        description = "Click at window-relative coordinates. button: left|right|middle; count for multi-click. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select. If at least two next actions or waits are known, use glass_do instead of separate calls."
     )]
     async fn glass_click(
         &self,
@@ -265,7 +265,7 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Move the pointer to window-relative coordinates."
+        description = "Move the pointer to window-relative coordinates. If at least two next actions or waits are known, use glass_do instead of separate calls."
     )]
     async fn glass_move(
         &self,
@@ -289,7 +289,9 @@ impl GlassServer {
                        error giving the window size, so a drag never lands somewhere you did not \
                        aim. Use this for a single pointer — selecting text, moving an item, \
                        resizing a pane; glass_gesture is the multi-touch equivalent (2+ pointers, \
-                       for pinch/rotate), and glass_click is the press-and-release-in-place case."
+                       for pinch/rotate), and glass_click is the press-and-release-in-place case. \
+                       If at least two next actions or waits are known, use glass_do instead of \
+                       separate calls."
     )]
     async fn glass_drag(
         &self,
@@ -304,7 +306,7 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Scroll at window-relative coordinates by (dx,dy) wheel steps. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select."
+        description = "Scroll at window-relative coordinates by (dx,dy) wheel steps. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select. If at least two next actions or waits are known, use glass_do instead of separate calls."
     )]
     async fn glass_scroll(
         &self,
@@ -351,7 +353,8 @@ impl GlassServer {
                        Optional `return`: \"snapshot\" settles the UI then folds a fresh a11y \
                        tree into the result (and refreshes the snapshot cache); \"settle\" waits \
                        for the UI to stop changing (text-only); omit or \"none\" for no observe \
-                       (default)."
+                       (default). If at least two next actions or waits are known, use glass_do \
+                       instead of separate calls."
     )]
     async fn glass_type(
         &self,
@@ -375,7 +378,8 @@ impl GlassServer {
                        key name is rejected with an error naming the token, so nothing is \
                        half-pressed; modifiers are released again when the chord completes. Use \
                        this for shortcuts and named keys — glass_type is for literal text and \
-                       cannot express either."
+                       cannot express either. If at least two next actions or waits are known, use \
+                       glass_do instead of separate calls."
     )]
     async fn glass_key(
         &self,
@@ -584,7 +588,8 @@ impl GlassServer {
                        settles the UI then folds a fresh a11y tree into the result (and \
                        refreshes the snapshot \
                        cache); \"settle\" waits for the UI to stop changing (text-only); omit or \
-                       \"none\" for no observe (default)."
+                       \"none\" for no observe (default). If at least two next actions or waits are \
+                       known, use glass_do instead of separate calls."
     )]
     async fn glass_click_element(
         &self,
@@ -620,7 +625,8 @@ impl GlassServer {
                        Optional `return`: \"snapshot\" settles the UI then folds a fresh a11y \
                        tree into the result (and refreshes the snapshot cache); \"settle\" waits \
                        for the UI to stop \
-                       changing (text-only); omit or \"none\" for no observe (default)."
+                       changing (text-only); omit or \"none\" for no observe (default). If at least \
+                       two next actions or waits are known, use glass_do instead of separate calls."
     )]
     async fn glass_set_value(
         &self,
@@ -683,7 +689,8 @@ impl GlassServer {
                        with glass_click_element. On timeout returns {matched:false}. Waits through a \
                        just-launched app that has not published its accessibility tree yet, and \
                        errors if none appeared before the timeout. Collapses screenshot poll-loops \
-                       into one call."
+                       into one call. If at least two next actions or waits are known, use glass_do \
+                       instead of separate calls."
     )]
     async fn glass_wait_for_element(
         &self,
@@ -713,7 +720,8 @@ impl GlassServer {
                        scrolled{steps,reversed,direction}} — the id is usable with \
                        glass_click_element. Returns {matched:false} if it never becomes visible \
                        after sweeping both ends or `timeout_ms` (default 20000). Errors if the app \
-                       exposes no accessibility tree."
+                       exposes no accessibility tree. If at least two next actions or waits are \
+                       known, use glass_do instead of separate calls."
     )]
     async fn glass_scroll_to_element(
         &self,
@@ -763,7 +771,12 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Run fixed static ordered actions in one call: click, move, drag, scroll, type, \
+        description = "Prefer glass_do whenever at least two upcoming actions or verification waits \
+                       are already known. Typical form flow: take one fresh glass_a11y_snapshot, \
+                       retain the needed ids, then run set_value, wait_for_element, click_element, \
+                       and wait_for_element here in one ordered call. Use standalone tools only when \
+                       the next step depends on newly observed state. Inspect the structured outcomes \
+                       before recovery. Run fixed static ordered actions in one call: click, move, drag, scroll, type, \
                        key, settle, click_element, set_value, wait_for_element, scroll_to_element. \
                        At most 64 actions and 65536 compact argument bytes. Optional absolute sequence \
                        timeout_ms defaults to 30000ms, is valid from 1 through 120000ms, and uses one absolute deadline shared by all actions and \
@@ -792,6 +805,11 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      app — no app integration needed. One active session; tools target it implicitly; \
      choose a backend at glass_start (defaults to the host; see the `backend` param). \
      glass_start launches the app and captures its logs (glass_logs for stdout/stderr).\n\n\
+     BATCH KNOWN WORK: Prefer glass_do whenever at least two upcoming actions or verification waits \
+     are already known. Typical form flow: take one fresh glass_a11y_snapshot, retain the needed ids, \
+     then run set_value, wait_for_element, click_element, and wait_for_element in one ordered call. \
+     Use standalone tools only when the next step depends on newly observed state. Inspect the \
+     structured outcomes before recovery.\n\n\
      SEE AND ADDRESS THE UI CHEAPLY FIRST — the low-token default. When the app exposes \
      an accessibility tree, glass_a11y_snapshot returns its elements as TEXT (#id, role, \
      name, window-relative bounds, and a description where the element carries a second \
@@ -813,19 +831,6 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      appears. Successful input dispatch does not prove runtime state; verify the expected outcome \
      with the strongest matching wait. Waits return text only and time out softly with {matched:false} — branch on \
      that rather than retrying blindly.\n\n\
-     Batch fixed static ordered actions into one glass_do call: click, move, drag, scroll, type, key, \
-     settle, click_element, set_value, wait_for_element, scroll_to_element. It accepts at most 64 \
-     actions and 65536 compact argument bytes. Its optional absolute sequence timeout_ms defaults to \
-     30000ms, is valid from 1 through 120000ms, and uses one absolute deadline shared by all actions and terminal settle/diff/screenshot work. \
-     Fail-fast on action errors, sequence deadline, and unmatched batched wait_for_element/\
-     scroll_to_element predicates; standalone predicates remain soft. Successful calls return a structured \
-     completed outcome for every action. Once execution starts, action failures return completed, failed, and \
-     unexecuted action outcomes in the MCP error; terminal-observation failures return completed action outcomes \
-     plus terminal_steps. Preflight validation failures return an invalid_sequence error without step outcomes. \
-     Optional terminal settle, diff, screenshot adds corresponding terminal_steps outcomes. \
-     type retains return:\"none|settle|snapshot\" support. \
-     No variables, result bindings, interpolation, branching, loops, retries, or dynamic action \
-     generation.\n\n\
      Multiple windows: glass_list_windows and glass_select_window. Errors are real — a \
      failed capture or input returns a message, never a blank or stale frame; fix the \
      cause instead of retrying blindly.";
@@ -1016,29 +1021,80 @@ mod tests {
             !description.contains("type.return is rejected"),
             "{description}"
         );
+    }
 
+    #[test]
+    fn glass_do_guidance_leads_with_the_selection_rule() {
+        let description = GlassServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "glass_do")
+            .expect("glass_do is registered")
+            .description
+            .expect("glass_do has a description");
+        let selection_rule = "Prefer glass_do whenever at least two upcoming actions or verification waits are already known";
+        assert!(
+            description.starts_with(selection_rule),
+            "glass_do must lead with when to choose it: {description}"
+        );
         for required in [
-            "fixed static ordered actions",
-            "64 actions",
-            "65536 compact argument bytes",
-            "timeout_ms",
-            "30000",
-            "1 through 120000",
-            "120000",
-            "click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element",
-            "standalone predicates remain soft",
-            "Fail-fast on action errors, sequence deadline, and unmatched batched wait_for_element/scroll_to_element predicates",
-            "Successful calls return a structured completed outcome for every action",
-            "Once execution starts, action failures return completed, failed, and unexecuted action outcomes in the MCP error",
-            "terminal-observation failures return completed action outcomes plus terminal_steps",
-            "Preflight validation failures return an invalid_sequence error without step outcomes",
-            "Optional terminal settle, diff, screenshot",
-            "type retains return:\"none|settle|snapshot\"",
-            "No variables, result bindings, interpolation, branching, loops, retries, or dynamic action generation",
+            "one fresh glass_a11y_snapshot",
+            "set_value, wait_for_element, click_element, and wait_for_element",
+            "Use standalone tools only when the next step depends on newly observed state",
+            "Inspect the structured outcomes before recovery",
         ] {
             assert!(
+                description.contains(required),
+                "glass_do description missing {required:?}: {description}"
+            );
+            assert!(
                 SERVER_INSTRUCTIONS.contains(required),
-                "instructions missing {required:?}"
+                "server instructions missing {required:?}"
+            );
+        }
+
+        let batch = SERVER_INSTRUCTIONS
+            .find(selection_rule)
+            .expect("server instructions lead agents toward glass_do");
+        let standalone = SERVER_INSTRUCTIONS
+            .find("glass_click_element clicks one")
+            .expect("server instructions describe standalone semantic tools");
+        assert!(
+            batch < standalone,
+            "the batching decision rule must appear before standalone action guidance"
+        );
+    }
+
+    #[test]
+    fn batch_eligible_standalone_descriptions_redirect_known_sequences() {
+        let descriptions: BTreeMap<String, String> = GlassServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                (
+                    tool.name.to_string(),
+                    tool.description.unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let redirect = "If at least two next actions or waits are known, use glass_do instead of separate calls.";
+        for name in [
+            "glass_click",
+            "glass_move",
+            "glass_drag",
+            "glass_scroll",
+            "glass_type",
+            "glass_key",
+            "glass_wait_stable",
+            "glass_click_element",
+            "glass_set_value",
+            "glass_wait_for_element",
+            "glass_scroll_to_element",
+        ] {
+            assert!(
+                descriptions[name].contains(redirect),
+                "{name} must redirect known multi-step work to glass_do: {}",
+                descriptions[name]
             );
         }
     }
