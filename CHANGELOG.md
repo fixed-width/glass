@@ -19,6 +19,8 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-08-31
+
 ### Added
 - `glass_do` can now batch semantic element clicks, confirmed value writes, element waits and scroll-to-element operations, returns a structured result for every completed/failed/unexecuted step, and bounds the whole sequence with fixed request limits and one caller deadline.
 
@@ -1221,7 +1223,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/fixed-width/glass/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/fixed-width/glass/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/fixed-width/glass/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/fixed-width/glass/compare/v1.3.0...v1.4.0
