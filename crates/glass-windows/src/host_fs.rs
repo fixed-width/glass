@@ -19,9 +19,10 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetAce,
-    GetFileSecurityW, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, IsValidAcl,
-    IsValidSid, IsWellKnownSid, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SE_DACL_DEFAULTED, SE_DACL_PROTECTED, SetFileSecurityW,
+    GetFileSecurityW, GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    IsValidAcl, IsValidSecurityDescriptor, IsValidSid, IsWellKnownSid, OBJECT_INHERIT_ACE,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_DEFAULTED,
+    SE_DACL_PROTECTED, SE_SELF_RELATIVE, SECURITY_DESCRIPTOR_RELATIVE, SetFileSecurityW,
     WinCreatorOwnerRightsSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
@@ -607,34 +608,156 @@ pub fn path_has_private_dacl(path: &Path) -> glass_core::Result<bool> {
         .ok()
         .map_err(|error| backend_error("read private DACL", error))?;
     }
-    Ok(descriptor_has_private_dacl(descriptor))
+    let initialized = usize::try_from(needed)
+        .map_err(|_| GlassError::Backend("invalid private DACL size returned".into()))?;
+    if initialized > bytes.len() {
+        return Err(GlassError::Backend(
+            "invalid private DACL size returned".into(),
+        ));
+    }
+    bytes.truncate(initialized);
+    Ok(descriptor_has_private_dacl(&bytes))
 }
 
-fn descriptor_has_private_dacl(descriptor: PSECURITY_DESCRIPTOR) -> bool {
+#[derive(Clone, Copy)]
+struct DescriptorLayout {
+    dacl_offset: usize,
+    dacl_end: usize,
+}
+
+fn read_u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    Some(u16::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?))
+}
+
+fn read_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    Some(u32::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?))
+}
+
+fn bounded_sid_end(bytes: &[u8], offset: usize) -> Option<usize> {
+    let prefix_end = offset.checked_add(8)?;
+    let prefix = bytes.get(offset..prefix_end)?;
+    if prefix[0] != 1 {
+        return None;
+    }
+    let sid_size = usize::from(prefix[1]).checked_mul(4)?.checked_add(8)?;
+    let end = offset.checked_add(sid_size)?;
+    (end <= bytes.len()).then_some(end)
+}
+
+fn bounded_acl_end(bytes: &[u8], offset: usize) -> Option<usize> {
+    let header_end = offset.checked_add(std::mem::size_of::<ACL>())?;
+    bytes.get(offset..header_end)?;
+    let size_offset = offset.checked_add(std::mem::offset_of!(ACL, AclSize))?;
+    let acl_size = usize::from(read_u16_at(bytes, size_offset)?);
+    if acl_size < std::mem::size_of::<ACL>() {
+        return None;
+    }
+    let end = offset.checked_add(acl_size)?;
+    (end <= bytes.len()).then_some(end)
+}
+
+fn descriptor_layout(bytes: &[u8]) -> Option<DescriptorLayout> {
+    if bytes.len() < std::mem::size_of::<SECURITY_DESCRIPTOR_RELATIVE>()
+        || bytes[std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Revision)] != 1
+    {
+        return None;
+    }
+    let control = read_u16_at(
+        bytes,
+        std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Control),
+    )?;
+    if control & SE_SELF_RELATIVE.0 == 0 {
+        return None;
+    }
+
+    for field in [
+        std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Owner),
+        std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Group),
+    ] {
+        let offset = usize::try_from(read_u32_at(bytes, field)?).ok()?;
+        if offset != 0 {
+            bounded_sid_end(bytes, offset)?;
+        }
+    }
+    let sacl_offset = usize::try_from(read_u32_at(
+        bytes,
+        std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Sacl),
+    )?)
+    .ok()?;
+    if sacl_offset != 0 {
+        bounded_acl_end(bytes, sacl_offset)?;
+    }
+    let dacl_offset = usize::try_from(read_u32_at(
+        bytes,
+        std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Dacl),
+    )?)
+    .ok()?;
+    if dacl_offset == 0 {
+        return None;
+    }
+    let dacl_end = bounded_acl_end(bytes, dacl_offset)?;
+    let ace_count_offset = dacl_offset.checked_add(std::mem::offset_of!(ACL, AceCount))?;
+    let ace_count = usize::from(read_u16_at(bytes, ace_count_offset)?);
+    let mut cursor = dacl_offset.checked_add(std::mem::size_of::<ACL>())?;
+    for _ in 0..ace_count {
+        let header_end = cursor.checked_add(std::mem::size_of::<ACE_HEADER>())?;
+        if header_end > dacl_end {
+            return None;
+        }
+        let size_offset = cursor.checked_add(std::mem::offset_of!(ACE_HEADER, AceSize))?;
+        let ace_size = usize::from(read_u16_at(bytes, size_offset)?);
+        if ace_size < std::mem::size_of::<ACE_HEADER>() {
+            return None;
+        }
+        cursor = cursor.checked_add(ace_size)?;
+        if cursor > dacl_end {
+            return None;
+        }
+    }
+    Some(DescriptorLayout {
+        dacl_offset,
+        dacl_end,
+    })
+}
+
+fn descriptor_has_private_dacl(bytes: &[u8]) -> bool {
+    let Some(layout) = descriptor_layout(bytes) else {
+        return false;
+    };
+    let descriptor = PSECURITY_DESCRIPTOR(bytes.as_ptr().cast_mut().cast());
+    // SAFETY: Every nonzero self-relative component was bounded within `bytes` above.
+    if !unsafe { IsValidSecurityDescriptor(descriptor).as_bool() } {
+        return false;
+    }
     let mut control = 0_u16;
     let mut revision = 0_u32;
     let mut present = windows::core::BOOL::default();
     let mut defaulted = windows::core::BOOL::default();
     let mut dacl = std::ptr::null_mut::<ACL>();
-    // SAFETY: `descriptor` points to a live descriptor buffer and all output pointers are valid.
+    // SAFETY: Win32 validated the bounded descriptor and all output pointers are valid.
     let valid_descriptor = unsafe {
         GetSecurityDescriptorControl(descriptor, &mut control, &mut revision).is_ok()
             && GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
                 .is_ok()
     };
+    let bounded_dacl = bytes.as_ptr().wrapping_add(layout.dacl_offset);
     if !valid_descriptor
+        || revision != 1
         || !present.as_bool()
         || defaulted.as_bool()
         || control & SE_DACL_DEFAULTED.0 != 0
         || control & SE_DACL_PROTECTED.0 == 0
         || dacl.is_null()
-        // SAFETY: `dacl` is non-null and was returned from the validated descriptor above.
+        || dacl.cast_const().cast::<u8>() != bounded_dacl
+        // SAFETY: The DACL pointer and declared extent were bounded within `bytes` above.
         || !unsafe { IsValidAcl(dacl).as_bool() }
     {
         return false;
     }
 
-    // SAFETY: `dacl` is a valid ACL for the lifetime of the descriptor buffer.
+    // SAFETY: The DACL header is bounded and IsValidAcl succeeded.
     let ace_count = unsafe { (*dacl).AceCount };
     if ace_count != 2 {
         return false;
@@ -642,15 +765,25 @@ fn descriptor_has_private_dacl(descriptor: PSECURITY_DESCRIPTOR) -> bool {
 
     let mut owner_rights = false;
     let mut local_system = false;
+    let Some(mut expected_ace) = layout.dacl_offset.checked_add(std::mem::size_of::<ACL>()) else {
+        return false;
+    };
     for index in 0..u32::from(ace_count) {
         let mut raw_ace = std::ptr::null_mut();
-        // SAFETY: `dacl` is valid and `index` is within its declared ACE count.
+        // SAFETY: IsValidAcl succeeded and `index` is within the bounded ACL's ACE count.
         if unsafe { GetAce(dacl, index, &mut raw_ace) }.is_err() || raw_ace.is_null() {
             return false;
         }
-        // SAFETY: GetAce returned a pointer into a valid ACL; the header is readable for every ACE.
+        if raw_ace.cast_const().cast::<u8>() != bytes.as_ptr().wrapping_add(expected_ace) {
+            return false;
+        }
+        // SAFETY: The pre-scan bounded this ACE header within the validated ACL allocation.
         let header = unsafe { *raw_ace.cast::<ACE_HEADER>() };
-        if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+        let Some(ace_end) = expected_ace.checked_add(usize::from(header.AceSize)) else {
+            return false;
+        };
+        if ace_end > layout.dacl_end
+            || header.AceType != ACCESS_ALLOWED_ACE_TYPE
             || header.AceFlags != (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE).0 as u8
             || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
         {
@@ -658,31 +791,44 @@ fn descriptor_has_private_dacl(descriptor: PSECURITY_DESCRIPTOR) -> bool {
         }
         let ace = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
         let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
-        let sid_bytes = usize::from(header.AceSize) - sid_offset;
-        // SAFETY: The ACE size check above makes the SID revision and count bytes readable.
-        let sid_subauthorities = unsafe { *raw_ace.cast::<u8>().add(sid_offset + 1) };
-        if sid_bytes < 8 + usize::from(sid_subauthorities) * 4 {
+        let Some(sid_start) = expected_ace.checked_add(sid_offset) else {
             return false;
-        }
-        // SAFETY: The ACE bounds contain the complete SID and mask established above.
+        };
+        let Some(sid_end) = bounded_sid_end(&bytes[..ace_end], sid_start) else {
+            return false;
+        };
+        // SAFETY: The ACE body and complete SID were bounded within the ACL allocation.
         let (mask, sid) = unsafe {
             (
                 (*ace).Mask,
                 PSID(raw_ace.cast::<u8>().add(sid_offset).cast()),
             )
         };
+        // SAFETY: `bounded_sid_end` proved the complete SID representation is readable.
         if mask != FILE_ALL_ACCESS.0 || !unsafe { IsValidSid(sid).as_bool() } {
             return false;
         }
-        // SAFETY: `sid` was validated and remains within the live descriptor buffer.
+        // SAFETY: IsValidSid succeeded for the SID bounded within this ACE.
+        let sid_length = unsafe { GetLengthSid(sid) } as usize;
+        let Some(exact_sid_end) = sid_start.checked_add(sid_length) else {
+            return false;
+        };
+        let Some(exact_ace_size) = sid_offset.checked_add(sid_length) else {
+            return false;
+        };
+        if sid_end != exact_sid_end || usize::from(header.AceSize) != exact_ace_size {
+            return false;
+        }
+        // SAFETY: `sid` was validated and remains within the bounded ACE allocation.
         let is_owner_rights = unsafe { IsWellKnownSid(sid, WinCreatorOwnerRightsSid).as_bool() };
-        // SAFETY: `sid` was validated and remains within the live descriptor buffer.
+        // SAFETY: `sid` was validated and remains within the bounded ACE allocation.
         let is_local_system = unsafe { IsWellKnownSid(sid, WinLocalSystemSid).as_bool() };
         match (is_owner_rights, is_local_system) {
             (true, false) if !owner_rights => owner_rights = true,
             (false, true) if !local_system => local_system = true,
             _ => return false,
         }
+        expected_ace = ace_end;
     }
     owner_rights && local_system
 }
@@ -704,6 +850,149 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    fn descriptor_bytes(sddl: &str) -> Vec<u8> {
+        let sddl = wide_text(sddl);
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let mut size = 0_u32;
+        // SAFETY: The UTF-16 SDDL is NUL-terminated and both output pointers are valid.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                Some(&mut size),
+            )
+            .unwrap();
+        }
+        // SAFETY: The conversion API initialized `size` bytes at the returned allocation.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(descriptor.0.cast(), size as usize) }.to_vec();
+        // SAFETY: The conversion API returned this descriptor allocation.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        }
+        bytes
+    }
+
+    fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn private_dacl_matching_rejects_truncated_descriptor() {
+        let bytes = vec![0_u8; std::mem::size_of::<SECURITY_DESCRIPTOR_RELATIVE>() - 1];
+        assert!(!descriptor_has_private_dacl(&bytes));
+    }
+
+    #[test]
+    fn private_dacl_matching_rejects_out_of_range_dacl_offset() {
+        let mut bytes = descriptor_bytes(PRIVATE_DACL);
+        write_u32(
+            &mut bytes,
+            std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Dacl),
+            u32::MAX,
+        );
+        assert!(!descriptor_has_private_dacl(&bytes));
+    }
+
+    #[test]
+    fn private_dacl_matching_rejects_truncated_acl_header() {
+        let mut bytes = descriptor_bytes(PRIVATE_DACL);
+        let dacl_offset = bytes.len() - std::mem::size_of::<ACL>() + 1;
+        write_u32(
+            &mut bytes,
+            std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Dacl),
+            u32::try_from(dacl_offset).unwrap(),
+        );
+        assert!(!descriptor_has_private_dacl(&bytes));
+    }
+
+    #[test]
+    fn private_dacl_matching_rejects_acl_size_beyond_descriptor() {
+        let mut bytes = descriptor_bytes(PRIVATE_DACL);
+        let dacl_offset = read_u32(
+            &bytes,
+            std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Dacl),
+        ) as usize;
+        write_u16(
+            &mut bytes,
+            dacl_offset + std::mem::offset_of!(ACL, AclSize),
+            u16::MAX,
+        );
+        assert!(!descriptor_has_private_dacl(&bytes));
+    }
+
+    #[test]
+    fn private_dacl_matching_rejects_ace_extent_beyond_acl() {
+        let mut bytes = descriptor_bytes(PRIVATE_DACL);
+        let dacl_offset = read_u32(
+            &bytes,
+            std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Dacl),
+        ) as usize;
+        let first_ace = dacl_offset + std::mem::size_of::<ACL>();
+        write_u16(
+            &mut bytes,
+            first_ace + std::mem::offset_of!(ACE_HEADER, AceSize),
+            u16::MAX,
+        );
+        assert!(!descriptor_has_private_dacl(&bytes));
+    }
+
+    #[test]
+    fn private_dacl_matching_rejects_padded_ace() {
+        let mut bytes = descriptor_bytes(PRIVATE_DACL);
+        let dacl_offset = read_u32(
+            &bytes,
+            std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Dacl),
+        ) as usize;
+        let first_ace = dacl_offset + std::mem::size_of::<ACL>();
+        let ace_size = read_u16(
+            &bytes,
+            first_ace + std::mem::offset_of!(ACE_HEADER, AceSize),
+        );
+        let acl_size_offset = dacl_offset + std::mem::offset_of!(ACL, AclSize);
+        let acl_size = read_u16(&bytes, acl_size_offset);
+        bytes.splice(
+            first_ace + usize::from(ace_size)..first_ace + usize::from(ace_size),
+            [0_u8; 4],
+        );
+        write_u16(
+            &mut bytes,
+            first_ace + std::mem::offset_of!(ACE_HEADER, AceSize),
+            ace_size + 4,
+        );
+        write_u16(&mut bytes, acl_size_offset, acl_size + 4);
+        assert!(!descriptor_has_private_dacl(&bytes));
+    }
+
+    #[test]
+    fn private_dacl_matching_rejects_invalid_sid_shape() {
+        for (relative_offset, value) in [(0_usize, 2_u8), (1, u8::MAX)] {
+            let mut bytes = descriptor_bytes(PRIVATE_DACL);
+            let dacl_offset = read_u32(
+                &bytes,
+                std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Dacl),
+            ) as usize;
+            let sid_offset = dacl_offset
+                + std::mem::size_of::<ACL>()
+                + std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+            bytes[sid_offset + relative_offset] = value;
+            assert!(!descriptor_has_private_dacl(&bytes));
+        }
+    }
+
     #[test]
     fn private_dacl_matching_accepts_reordered_intended_aces() {
         assert!(sddl_has_private_dacl("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)"));
@@ -723,14 +1012,11 @@ mod tests {
 
     #[test]
     fn private_dacl_matching_rejects_defaulted_dacl() {
-        let matches = with_sddl_descriptor(PRIVATE_DACL, |descriptor| {
-            // SAFETY: A self-relative descriptor stores its two-byte control field at byte offset two.
-            unsafe {
-                let control = descriptor.0.cast::<u8>().add(2).cast::<u16>();
-                control.write_unaligned(control.read_unaligned() | SE_DACL_DEFAULTED.0);
-            }
-            descriptor_has_private_dacl(descriptor)
-        });
+        let mut bytes = descriptor_bytes(PRIVATE_DACL);
+        let offset = std::mem::offset_of!(SECURITY_DESCRIPTOR_RELATIVE, Control);
+        let control = read_u16(&bytes, offset);
+        write_u16(&mut bytes, offset, control | SE_DACL_DEFAULTED.0);
+        let matches = descriptor_has_private_dacl(&bytes);
 
         assert!(!matches);
     }
@@ -752,28 +1038,7 @@ mod tests {
     }
 
     fn sddl_has_private_dacl(sddl: &str) -> bool {
-        with_sddl_descriptor(sddl, descriptor_has_private_dacl)
-    }
-
-    fn with_sddl_descriptor<T>(sddl: &str, inspect: impl FnOnce(PSECURITY_DESCRIPTOR) -> T) -> T {
-        let sddl = wide_text(sddl);
-        let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: The UTF-16 SDDL is NUL-terminated and the output pointer is valid.
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                PCWSTR(sddl.as_ptr()),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                None,
-            )
-            .unwrap();
-        }
-        let result = inspect(descriptor);
-        // SAFETY: The conversion API returned this descriptor allocation.
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
-        }
-        result
+        descriptor_has_private_dacl(&descriptor_bytes(sddl))
     }
 
     #[test]
