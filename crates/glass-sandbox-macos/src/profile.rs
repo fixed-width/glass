@@ -77,6 +77,7 @@ pub fn validate_protected_paths(paths: &[ProtectedHostPath]) -> Result<()> {
 
 /// Build the deny-default SBPL profile for `level`. Never called with `SandboxLevel::Off`.
 pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> Result<String> {
+    validate_protected_paths(&opts.protected_paths)?;
     let mut p = String::new();
     p.push_str("(version 1)\n(deny default)\n");
     p.push_str("(allow process-fork)\n(allow process-exec*)\n(allow sysctl-read)\n");
@@ -287,6 +288,40 @@ fn sbpl_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
+
+    struct ProtectedPathFixture {
+        root: PathBuf,
+        directory: PathBuf,
+        file: PathBuf,
+    }
+
+    impl ProtectedPathFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "glass-macos-profile-{}-{}",
+                std::process::id(),
+                FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            let directory = root.join("server-a");
+            let file = root.join("server-a.lease");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(&file, "lease").unwrap();
+            Self {
+                root,
+                directory,
+                file,
+            }
+        }
+    }
+
+    impl Drop for ProtectedPathFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
 
     fn profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
         build_profile(level, opts).unwrap()
@@ -307,25 +342,92 @@ mod tests {
 
     #[test]
     fn protected_directory_and_lease_denies_are_last() {
+        let fixture = ProtectedPathFixture::new();
         let mut o = opts();
         o.protected_paths = vec![
-            ProtectedHostPath::directory("/Users/u/project/.artifacts/server-a"),
-            ProtectedHostPath::file("/Users/u/project/.artifacts/server-a.lease"),
+            ProtectedHostPath::directory(&fixture.directory),
+            ProtectedHostPath::file(&fixture.file),
         ];
 
         let profile = build_profile(SandboxLevel::Default, &o).unwrap();
+        let directory = fixture.directory.to_str().unwrap();
+        let lease = fixture.file.to_str().unwrap();
+        let directory_read = format!(
+            r#"(deny file-read* file-read-metadata (literal "{directory}") (subpath "{directory}"))"#
+        );
+        let directory_write =
+            format!(r#"(deny file-write* (literal "{directory}") (subpath "{directory}"))"#);
+        let lease_read = format!(r#"(deny file-read* file-read-metadata (literal "{lease}"))"#);
+        let lease_write = format!(r#"(deny file-write* (literal "{lease}"))"#);
         let last_allow = profile.rfind("(allow file-").unwrap();
-        let directory_deny = profile
-            .rfind(r#"(deny file-write* (literal "/Users/u/project/.artifacts/server-a") (subpath "/Users/u/project/.artifacts/server-a"))"#)
-            .unwrap();
-        let lease_deny = profile
-            .rfind(r#"(deny file-write* (literal "/Users/u/project/.artifacts/server-a.lease"))"#)
-            .unwrap();
+        let directory_deny = profile.find(&directory_read).unwrap();
+        let lease_deny = profile.find(&lease_read).unwrap();
 
         assert!(directory_deny > last_allow, "{profile}");
         assert!(lease_deny > last_allow, "{profile}");
-        assert!(profile.contains(r#"(deny file-read* file-read-metadata (literal "/Users/u/project/.artifacts/server-a") (subpath "/Users/u/project/.artifacts/server-a"))"#));
-        assert!(profile.contains(r#"(deny file-read* file-read-metadata (literal "/Users/u/project/.artifacts/server-a.lease"))"#));
+        assert!(profile.contains(&directory_write), "{profile}");
+        assert!(profile.contains(&lease_write), "{profile}");
+    }
+
+    #[test]
+    fn build_profile_rejects_missing_protected_path() {
+        let fixture = ProtectedPathFixture::new();
+        let mut o = opts();
+        o.protected_paths = vec![ProtectedHostPath::file(fixture.root.join("missing"))];
+
+        assert!(build_profile(SandboxLevel::Default, &o).is_err());
+    }
+
+    #[test]
+    fn build_profile_rejects_unstatable_protected_path() {
+        let fixture = ProtectedPathFixture::new();
+        let loop_path = fixture.root.join("self-loop");
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        let mut o = opts();
+        o.protected_paths = vec![ProtectedHostPath::file(loop_path)];
+
+        assert!(build_profile(SandboxLevel::Default, &o).is_err());
+    }
+
+    #[test]
+    fn build_profile_rejects_directory_declared_as_file() {
+        let fixture = ProtectedPathFixture::new();
+        let mut o = opts();
+        o.protected_paths = vec![ProtectedHostPath::file(&fixture.directory)];
+
+        assert!(build_profile(SandboxLevel::Default, &o).is_err());
+    }
+
+    #[test]
+    fn build_profile_rejects_file_declared_as_directory() {
+        let fixture = ProtectedPathFixture::new();
+        let mut o = opts();
+        o.protected_paths = vec![ProtectedHostPath::directory(&fixture.file)];
+
+        assert!(build_profile(SandboxLevel::Default, &o).is_err());
+    }
+
+    #[test]
+    fn protected_path_with_quote_and_backslash_is_escaped() {
+        let fixture = ProtectedPathFixture::new();
+        let protected = fixture.root.join("protected\"dir\\name");
+        std::fs::create_dir(&protected).unwrap();
+        let mut o = opts();
+        o.protected_paths = vec![ProtectedHostPath::directory(&protected)];
+
+        let profile = build_profile(SandboxLevel::Default, &o).unwrap();
+        let root = fixture.root.to_str().unwrap();
+        let expected_read = format!(
+            r#"(deny file-read* file-read-metadata (literal "{root}/protected\"dir\\name") (subpath "{root}/protected\"dir\\name"))"#
+        );
+        let expected_write = format!(
+            r#"(deny file-write* (literal "{root}/protected\"dir\\name") (subpath "{root}/protected\"dir\\name"))"#
+        );
+        let raw_terminator = format!(r#"(literal "{}")"#, protected.to_str().unwrap());
+
+        assert!(profile.contains(&expected_read), "{profile}");
+        assert!(profile.contains(&expected_write), "{profile}");
+        assert!(!profile.contains(&raw_terminator), "{profile}");
     }
 
     #[test]
@@ -337,8 +439,11 @@ mod tests {
     }
 
     #[test]
-    fn invalid_protected_root_path_is_rejected() {
-        assert!(validate_protected_paths(&[ProtectedHostPath::directory("/")]).is_err());
+    fn build_profile_rejects_root_protected_path() {
+        let mut o = opts();
+        o.protected_paths = vec![ProtectedHostPath::directory("/")];
+
+        assert!(build_profile(SandboxLevel::Default, &o).is_err());
     }
 
     #[test]
