@@ -305,8 +305,16 @@ fn wayland_host_tree(child: &Child, ownership_root: u32) -> Vec<u32> {
 }
 
 fn reap_pending(pending: &mut PendingWaylandSession) {
-    let root = pending.ownership_root.unwrap_or_else(|| pending.child.id());
-    let tree = wayland_host_tree(&pending.child, root);
+    // The status may have been buffered while discovery failed or while sway was exiting. Read it
+    // before the authoritative snapshot so its host PID remains a reaping root after reparenting.
+    // A malformed status still falls through to reap sway's known host tree.
+    let _ = pending.poll_status();
+    let mut tree = glass_proc_linux::proc_tree_pids(pending.child.id());
+    if let Some(root) = pending.ownership_root {
+        tree.extend(ProcessIdentitySet::from_host_root(root).host_pids());
+    }
+    tree.sort_unstable();
+    tree.dedup();
     let _ = glass_proc_linux::reap_launch(&mut pending.child, &tree, glass_proc_linux::REAP_GRACE);
 }
 
@@ -1071,25 +1079,6 @@ where
     }
 }
 
-/// [`roundtrip_until`] with the standard budget, for the callers with no deadline of their own.
-pub(crate) fn roundtrip<S>(
-    conn: &Connection,
-    queue: &mut EventQueue<S>,
-    state: &mut S,
-    who: &str,
-) -> Result<()>
-where
-    S: Dispatch<wl_callback::WlCallback, SyncDone> + 'static,
-{
-    roundtrip_until(
-        conn,
-        queue,
-        state,
-        Instant::now() + COMPOSITOR_SYNC_BUDGET,
-        who,
-    )
-}
-
 fn roundtrip_by<S>(
     conn: &Connection,
     queue: &mut EventQueue<S>,
@@ -1354,7 +1343,7 @@ impl Dispatch<ZwpVirtualKeyboardV1, ()> for State {
 fn open_session(
     socket: &Path,
     runtime_dir: &Path,
-    setup_budget: Duration,
+    deadline: Instant,
 ) -> Result<(
     Connection,
     EventQueue<State>,
@@ -1366,8 +1355,11 @@ fn open_session(
     Ipc,
     (u32, u32),
 )> {
-    let (conn, globals, mut queue): (_, _, EventQueue<State>) =
-        connect_bounded(socket, setup_budget, "session bring-up")?;
+    let (conn, globals, mut queue): (_, _, EventQueue<State>) = connect_bounded(
+        socket,
+        deadline.saturating_duration_since(Instant::now()),
+        "session bring-up",
+    )?;
 
     let advertised: Vec<String> = globals
         .contents()
@@ -1400,7 +1392,7 @@ fn open_session(
         .bind(&qh, 1..=1, ())
         .map_err(|e| GlassError::Backend(format!("bind virtual keyboard: {e}")))?;
 
-    roundtrip(&conn, &mut queue, &mut state, "session bring-up")?;
+    roundtrip_until(&conn, &mut queue, &mut state, deadline, "session bring-up")?;
 
     let output = state
         .output
@@ -1423,11 +1415,15 @@ fn open_session(
 
     // The sway IPC socket appears in the private runtime dir alongside the wayland
     // socket; retry briefly in case it lands a moment later.
-    let deadline = Instant::now() + Duration::from_millis(2000);
     let ipc = loop {
         match Ipc::connect(runtime_dir) {
             Ok(c) => break c,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(40)),
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    Duration::from_millis(40)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
             Err(e) => return Err(e),
         }
     };
@@ -1592,17 +1588,21 @@ fn bring_up_session(
                 spec.sandbox,
             ));
         }
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(
+            Duration::from_millis(40).min(deadline.saturating_duration_since(Instant::now())),
+        );
     };
 
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+    if Instant::now() >= deadline {
         return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
     }
     let (conn, mut queue, mut state, manager, output, pointer, keyboard, mut ipc, output_size) =
-        match open_session(&socket, runtime_dir.path(), remaining) {
+        match open_session(&socket, runtime_dir.path(), deadline) {
             Ok(v) => v,
             Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
+                }
                 reap_pending(&mut pending);
                 return Err(e);
             }
@@ -1685,7 +1685,9 @@ fn bring_up_session(
                     spec.sandbox,
                 ));
             }
-            std::thread::sleep(Duration::from_millis(40));
+            std::thread::sleep(
+                Duration::from_millis(40).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     };
     // The caller's first enumeration must cross-check rather than fall inside the interval this
@@ -6141,14 +6143,95 @@ mod session_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{launch_ready, nudge_x, parse_sway_version, start_recovery_after};
+    use super::{
+        BwrapStatusPipe, PendingWaylandSession, launch_ready, nudge_x, parse_sway_version,
+        reap_pending, start_recovery_after,
+    };
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    struct PendingCleanup<'a>(&'a mut PendingWaylandSession);
+
+    impl Drop for PendingCleanup<'_> {
+        fn drop(&mut self) {
+            reap_pending(self.0);
+        }
+    }
 
     #[test]
-    fn launch_ready_rejects_status_and_window_observed_after_deadline() {
-        let deadline = std::time::Instant::now();
-        let observed_at = deadline + std::time::Duration::from_millis(1);
+    fn reap_pending_reaps_a_late_reported_separate_session_tree() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let target_pid = dir.path().join("target-pid");
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("setsid sh -c 'sleep 30 & wait' & echo $! > \"$1\"")
+            .arg("sh")
+            .arg(&target_pid)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn compositor fixture");
+        let pipe = BwrapStatusPipe::new().expect("status pipe");
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", pipe.writer_fd()))
+            .expect("duplicate status writer");
+        let target = (0..100)
+            .find_map(|_| {
+                std::fs::read_to_string(&target_pid)
+                    .ok()
+                    .and_then(|pid| pid.trim().parse().ok())
+                    .or_else(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        None
+                    })
+            })
+            .expect("separate-session target pid");
+        writer
+            .write_all(format!("{{\"child-pid\":{target}}}\n").as_bytes())
+            .expect("buffer status");
+        drop(writer);
+        let mut pending = PendingWaylandSession {
+            child,
+            status: Some(pipe.into_reader()),
+            ownership_root: None,
+        };
+        let cleanup = PendingCleanup(&mut pending);
 
-        assert!(!launch_ready(true, true, deadline, observed_at));
+        reap_pending(cleanup.0);
+
+        assert!(
+            !glass_proc_linux::any_alive(&glass_proc_linux::proc_tree_pids(target)),
+            "late-reported target tree survived cleanup from root {target}"
+        );
+    }
+
+    #[test]
+    fn launch_ready_accepts_status_and_window_just_before_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1);
+
+        assert!(launch_ready(
+            true,
+            true,
+            deadline,
+            deadline - std::time::Duration::from_nanos(1)
+        ));
+    }
+
+    #[test]
+    fn launch_ready_rejects_status_and_window_observed_at_deadline() {
+        let deadline = std::time::Instant::now();
+
+        assert!(!launch_ready(true, true, deadline, deadline));
+    }
+
+    #[test]
+    fn launch_ready_rejects_a_missing_status_or_window() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1);
+        let observed_at = deadline - std::time::Duration::from_nanos(1);
+
+        assert!(!launch_ready(false, true, deadline, observed_at));
+        assert!(!launch_ready(true, false, deadline, observed_at));
     }
 
     /// A launch spends half its budget waiting for the compositor before suspecting a window was
