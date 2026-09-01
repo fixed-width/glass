@@ -370,11 +370,12 @@ fn require_contained_root(child: &mut ContainedChild, deadline: Instant) -> Resu
 
 fn dispatch_launch<T, C>(
     timeout_ms: u64,
+    origin: Instant,
     context: &mut C,
     dispatch: impl FnOnce(&mut C, Instant) -> Result<T>,
     cleanup: impl FnOnce(&mut C),
 ) -> Result<T> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    let deadline = origin + Duration::from_millis(timeout_ms.max(1));
     dispatch(context, deadline).inspect_err(|_| cleanup(context))
 }
 
@@ -1497,8 +1498,10 @@ impl Platform for X11Platform {
         } else {
             None
         };
+        let launch_origin = Instant::now();
         let deadline = dispatch_launch(
             spec.timeout_ms,
+            launch_origin,
             self,
             |platform, deadline| {
                 platform.spawn(spec, deadline)?;
@@ -2082,18 +2085,16 @@ mod tests {
 
     #[test]
     fn a_zero_timeout_reaches_launch_dispatch_before_timeout_cleanup() {
-        let observed_before_dispatch = Instant::now();
+        let origin = Instant::now();
         let events = RefCell::new(Vec::new());
 
         let error = dispatch_launch(
             0,
+            origin,
             &mut (),
             |(), deadline| {
                 events.borrow_mut().push("dispatch");
-                assert!(
-                    deadline > observed_before_dispatch,
-                    "zero-timeout dispatch received an already-expired deadline"
-                );
+                assert_eq!(deadline, origin + Duration::from_millis(1));
                 Err::<(), _>(GlassError::Timeout(0))
             },
             |()| events.borrow_mut().push("cleanup"),
@@ -2106,15 +2107,64 @@ mod tests {
 
     #[test]
     fn later_identity_snapshot_discovers_a_descendant_created_after_launch() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let readiness = std::env::temp_dir().join(format!(
+            "glass-x11-delayed-descendant-{}-{unique}",
+            std::process::id()
+        ));
         let child = std::process::Command::new("sh")
-            .args(["-c", "sleep 0.8; sleep 5 & wait"])
+            .args([
+                "-c",
+                "sleep 5 & original=$!; sleep 0.8 & delay=$!; printf '%s %s\n' \"$original\" \"$delay\" > \"${READY_FILE}.tmp\"; mv \"${READY_FILE}.tmp\" \"$READY_FILE\"; wait \"$delay\"; kill \"$original\"; wait \"$original\" 2>/dev/null; sleep 5 & wait",
+            ])
+            .env("READY_FILE", &readiness)
             .process_group(0)
             .spawn()
             .expect("spawn delayed-descendant fixture");
         let launched = LaunchedCleanup(LaunchedChild::Direct(child));
         let root = launched.0.ownership_root();
-        let initial = glass_proc_linux::ProcessIdentitySet::from_host_root(root);
-        let poll_deadline = Instant::now() + Duration::from_secs(3);
+        let readiness_deadline = Instant::now() + Duration::from_secs(3);
+        let ready_pids = loop {
+            if let Ok(contents) = std::fs::read_to_string(&readiness) {
+                break contents
+                    .split_whitespace()
+                    .map(|pid| pid.parse::<u32>().expect("readiness PID is numeric"))
+                    .collect::<Vec<_>>();
+            }
+            assert!(
+                Instant::now() < readiness_deadline,
+                "fixture did not publish readiness within 3s at {}",
+                readiness.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            ready_pids.len(),
+            2,
+            "readiness must name both pre-delay children"
+        );
+
+        let baseline_deadline = Instant::now() + Duration::from_secs(3);
+        let initial = loop {
+            let identities = glass_proc_linux::ProcessIdentitySet::from_host_root(root);
+            if ready_pids
+                .iter()
+                .all(|pid| identities.host_pids().contains(pid))
+            {
+                break identities;
+            }
+            assert!(
+                Instant::now() < baseline_deadline,
+                "pre-delay children did not enter the baseline within 3s; ready PIDs: {ready_pids:?}, latest identities: {:?}",
+                identities.host_pids()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let replacement_deadline = Instant::now() + Duration::from_secs(3);
         let refreshed = loop {
             let identities = glass_proc_linux::ProcessIdentitySet::from_host_root(root);
             if identities
@@ -2125,7 +2175,7 @@ mod tests {
                 break identities;
             }
             assert!(
-                Instant::now() < poll_deadline,
+                Instant::now() < replacement_deadline,
                 "no new descendant appeared within 3s; initial identities: {:?}, latest identities: {:?}",
                 initial.host_pids(),
                 identities.host_pids()
@@ -2139,6 +2189,7 @@ mod tests {
                 .any(|pid| !initial.host_pids().contains(pid)),
             "refreshed identities did not include a newly created descendant"
         );
+        std::fs::remove_file(readiness).expect("remove readiness file");
     }
 
     #[test]
