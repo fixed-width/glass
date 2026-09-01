@@ -163,6 +163,39 @@ pub struct SetValueArgs {
     pub return_: Option<String>,
 }
 
+/// Arguments for `glass_find_elements` selector fields.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+pub struct FindSelectorArgs {
+    /// Case-insensitive substring searched across accessible name, description and non-secure value.
+    pub query: Option<String>,
+    /// Normalized accessibility role, e.g. "Button" or "Document".
+    pub role: Option<String>,
+    /// State predicates combined with AND, e.g. ["visible", "enabled"].
+    pub states: Option<Vec<String>>,
+}
+
+/// Arguments for `glass_find_elements`.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+pub struct FindElementsArgs {
+    /// Approximate case-insensitive semantic text. Optional when role or states are supplied.
+    pub query: Option<String>,
+    /// Normalized target role.
+    pub role: Option<String>,
+    /// Target state predicates combined with AND.
+    pub states: Option<Vec<String>>,
+    /// Optional unique semantic scope resolved in the same fresh tree.
+    pub within: Option<FindSelectorArgs>,
+    /// Maximum ranked matches before the byte budget; default 10, range 1 through 20.
+    #[schemars(range(min = 1, max = 20))]
+    pub max_results: Option<u32>,
+    /// Existing accessibility walk limit semantics; 0 removes the node-count limit.
+    pub max_nodes: Option<u32>,
+    /// Optional wait for at least one match; default 0 performs one fresh read.
+    pub timeout_ms: Option<u64>,
+}
+
 /// Arguments for `glass_a11y_snapshot`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct A11ySnapshotArgs {
@@ -817,6 +850,35 @@ mod tests {
         assert!(none.window_id.is_none());
         let some: WaitStableArgs = serde_json::from_str(r#"{"window_id":7}"#).unwrap();
         assert_eq!(some.window_id, Some(7));
+    }
+
+    #[test]
+    fn find_elements_args_parse_flat_target_and_nested_scope() {
+        let args: FindElementsArgs = serde_json::from_str(
+            r#"{
+            "query":"save",
+            "role":"Button",
+            "states":["visible","enabled"],
+            "within":{"role":"Document","states":["visible"]},
+            "max_results":10,
+            "max_nodes":500,
+            "timeout_ms":3000
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(args.query.as_deref(), Some("save"));
+        assert_eq!(
+            args.within.as_ref().and_then(|scope| scope.role.as_deref()),
+            Some("Document")
+        );
+        assert_eq!(args.max_results, Some(10));
+    }
+
+    #[test]
+    fn find_elements_args_allow_filter_only_queries() {
+        let args: FindElementsArgs = serde_json::from_str(r#"{"role":"Button"}"#).unwrap();
+        assert!(args.query.is_none());
+        assert_eq!(args.role.as_deref(), Some("Button"));
     }
 
     #[test]

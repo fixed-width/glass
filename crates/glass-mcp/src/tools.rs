@@ -771,12 +771,16 @@ pub(crate) fn parse_button(s: Option<&str>) -> Result<MouseButton, String> {
 pub use self::batch::*;
 pub use self::capture::*;
 pub use self::clipboard::*;
+#[allow(unused_imports)]
+pub use self::find::*;
 pub use self::input::*;
 pub use self::wait::*;
 
 mod batch;
 mod capture; // filled in Task 6
 mod clipboard;
+#[allow(dead_code)]
+mod find;
 mod input; // filled in Task 5
 mod wait;
 

@@ -59,14 +59,18 @@ impl ActiveSession {
 }
 
 impl Glass {
+    /// Install caller-selected accessibility walk limits for operations that begin with a fresh
+    /// tree read. Internal re-snapshots reuse these limits.
+    pub(crate) fn set_a11y_limits(&mut self, max_nodes: Option<usize>) -> Result<()> {
+        self.active_mut()?.a11y_limits = WalkLimits::from_max_nodes(max_nodes);
+        Ok(())
+    }
+
     /// Snapshot the active window's accessibility tree (normalized, window-
     /// relative, ids assigned by the core). Caches it for `click_element`.
     /// `AxUnsupported` if the backend has no accessibility reader.
     pub fn a11y_snapshot(&mut self, max_nodes: Option<usize>) -> Result<AxTree> {
-        // The ONLY place `a11y_limits` changes from a caller's `max_nodes` — every other walk
-        // reuses them.
-        self.active_mut()?.a11y_limits =
-            crate::accessibility::WalkLimits::from_max_nodes(max_nodes);
+        self.set_a11y_limits(max_nodes)?;
         // The tool takes no timeout, so the reader keeps its own budget. Inventing one here would
         // cap a plain snapshot at a number no caller asked for.
         self.snapshot_at_current_limits(Deadline::UNBOUNDED)
@@ -113,8 +117,8 @@ impl Glass {
     }
 
     /// The snapshot worker: walks the active window's tree bounded by the session's current
-    /// `a11y_limits` and caches it. Callers set `a11y_limits` first (or reuse it) — see
-    /// [`Glass::a11y_snapshot`] / [`Glass::a11y_resnapshot`].
+    /// `a11y_limits` and caches it. Callers install user-selected limits through
+    /// [`Glass::set_a11y_limits`] first (or reuse them).
     fn snapshot_at_current_limits(&mut self, deadline: Deadline) -> Result<AxTree> {
         self.snapshot_at_current_limits_with_wait_fallback(deadline, false)
     }

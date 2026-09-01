@@ -28,6 +28,23 @@ the readers glass already runs, with no extra lever pulled to get there.
 
 ## What an agent sees
 
+When the likely target is known, an agent can search within the published page:
+
+```json
+{
+  "query": "save",
+  "role": "Button",
+  "within": {
+    "role": "Document",
+    "states": ["visible"]
+  },
+  "timeout_ms": 5000
+}
+```
+
+`glass_find_elements` resolves the scope and targets from the same fresh accessibility read. The
+scope must identify one observed `Document`; a positive timeout can wait for delayed publication.
+
 Web content shows up in a `glass_a11y_snapshot` outline as one of three shapes, plus a fourth,
 older case that isn't specific to web content at all:
 

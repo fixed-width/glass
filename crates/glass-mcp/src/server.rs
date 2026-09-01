@@ -535,6 +535,17 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
+        description = "Find a bounded ranked set of accessibility elements from one fresh read. Use this when the target text is approximate, duplicated, or not yet identified; use glass_wait_for_element for one precise runtime condition and glass_a11y_snapshot for broad tree inspection. `query` is a deterministic case-insensitive substring over accessible name, description and non-secure value; optional `role`/`states` narrow targets, optional `within` must match one semantic scope, `max_results` defaults to 10 and is capped at 20, `max_nodes` uses snapshot walk-limit semantics, and positive `timeout_ms` waits for a match. Returns trusted counts plus one untrusted match array with actionable ids and compact context. Complete success and error text is capped at 8 KiB."
+    )]
+    async fn glass_find_elements(
+        &self,
+        Parameters(a): Parameters<FindElementsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(move |glass| tools::find_elements(glass, &a)).await
+    }
+
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Capture the active window's current semantic state as a compact \
                        accessibility tree (role, name, description, bounded editable value, \
                        window-relative bounds and states). This is one observation, not proof of \
@@ -805,18 +816,20 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      app — no app integration needed. One active session; tools target it implicitly; \
      choose a backend at glass_start (defaults to the host; see the `backend` param). \
      glass_start launches the app and captures its logs (glass_logs for stdout/stderr).\n\n\
+     SEE AND ADDRESS THE UI CHEAPLY FIRST — the low-token default. When the target is approximate, \
+     duplicated, or not yet identified, call glass_find_elements first: it returns a small ranked \
+     set of actionable ids and context from a fresh accessibility read. Use glass_a11y_snapshot for \
+     broad structural inspection, and glass_wait_for_element when one precise known condition must \
+     become true. Retain returned ids only until the UI changes. Prefer this semantic path over \
+     screenshots and pixel-hunting whenever it works.\n\n\
      BATCH KNOWN WORK: Prefer glass_do whenever at least two upcoming actions or verification waits \
      are already known. Typical form flow: take one fresh glass_a11y_snapshot, retain the needed ids, \
      then run set_value, wait_for_element, click_element, and wait_for_element in one ordered call. \
      Use standalone tools only when the next step depends on newly observed state. Inspect the \
      structured outcomes before recovery.\n\n\
-     SEE AND ADDRESS THE UI CHEAPLY FIRST — the low-token default. When the app exposes \
-     an accessibility tree, glass_a11y_snapshot returns its elements as TEXT (#id, role, \
-     name, window-relative bounds, and a description where the element carries a second \
-     label distinct from its name) — deterministic, no image tokens. Address \
-     elements by #id: glass_click_element clicks one, glass_set_value writes an editable element's \
-     value, and glass_wait_for_element verifies semantic transition completion, including exact \
-     editable text with value. Prefer this over screenshots and pixel-hunting whenever it works.\n\n\
+     ADDRESS RETURNED IDS DIRECTLY: glass_click_element clicks one, glass_set_value writes an \
+     editable element's value, and glass_wait_for_element verifies semantic transition completion, \
+     including exact editable text with value.\n\n\
      PIXELS ARE THE FALLBACK — for a canvas/black-box app with no tree (glass_a11y_snapshot \
      errors there): glass_screenshot to see it, then glass_click / glass_type / glass_key / \
      glass_scroll / glass_drag (glass_gesture for multi-touch where supported) to interact. \
@@ -1154,6 +1167,67 @@ mod tests {
         assert!(first_text(&r).contains("done"), "got {:?}", first_text(&r));
     }
 
+    fn find_args() -> FindElementsArgs {
+        FindElementsArgs {
+            query: Some("save".into()),
+            role: None,
+            states: None,
+            within: None,
+            max_results: None,
+            max_nodes: None,
+            timeout_ms: None,
+        }
+    }
+
+    fn assert_bounded_find_error(result: ToolResult, category: &str, guidance: &str) {
+        let mapped = map_tool_result(result);
+        assert_eq!(mapped.is_error, Some(true));
+        let text = first_text(&mapped);
+        assert!(text.contains(category), "{text}");
+        assert!(text.contains(guidance), "{text}");
+        assert!(text.len() <= crate::tools::FIND_RESPONSE_MAX_BYTES);
+    }
+
+    #[test]
+    fn find_mcp_error_preserves_no_session_category_and_guidance() {
+        let mut glass =
+            crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform::new(100, 100));
+        assert_bounded_find_error(
+            crate::tools::find_elements(&mut glass, &find_args()),
+            "no_active_session",
+            "Call glass_start",
+        );
+    }
+
+    #[test]
+    fn find_mcp_error_preserves_unsupported_accessibility_category_and_guidance() {
+        let mut glass = crate::tools::testutil::started_without_a11y();
+        assert_bounded_find_error(
+            crate::tools::find_elements(&mut glass, &find_args()),
+            "unsupported_accessibility",
+            "Use glass_screenshot",
+        );
+    }
+
+    #[test]
+    fn find_mcp_transport_error_is_bounded_and_does_not_echo_backend_detail() {
+        let sentinel = "backend-secret-sentinel";
+        let mut glass = crate::tools::testutil::started_failing_a11y(
+            glass_core::GlassError::Backend(format!("{sentinel} {}", "x".repeat(20_000))),
+        );
+        let result = crate::tools::find_elements(&mut glass, &find_args());
+        let mapped = map_tool_result(result);
+        let text = first_text(&mapped);
+        assert_eq!(mapped.is_error, Some(true));
+        assert!(text.contains("transport_failure"), "{text}");
+        assert!(
+            text.contains("Retry after checking the backend connection"),
+            "{text}"
+        );
+        assert!(!text.contains(sentinel), "{text}");
+        assert!(text.len() <= crate::tools::FIND_RESPONSE_MAX_BYTES);
+    }
+
     /// android is always compiled in (host-OS-agnostic), so it's a stable choice for
     /// exercising the registered handler end to end without depending on the host OS.
     #[tokio::test]
@@ -1474,6 +1548,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn find_elements_is_registered_read_only_and_semantic_first() {
+        let tools = GlassServer::tool_router().list_all();
+        let find = tools
+            .iter()
+            .find(|tool| tool.name == "glass_find_elements")
+            .expect("registered");
+        assert_eq!(
+            find.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(true)
+        );
+        assert_eq!(
+            find.annotations.as_ref().and_then(|a| a.open_world_hint),
+            Some(false)
+        );
+        let find_pos = SERVER_INSTRUCTIONS.find("glass_find_elements").unwrap();
+        let snapshot_pos = SERVER_INSTRUCTIONS.find("glass_a11y_snapshot").unwrap();
+        let screenshot_pos = SERVER_INSTRUCTIONS.find("glass_screenshot").unwrap();
+        assert!(find_pos < snapshot_pos);
+        assert!(snapshot_pos < screenshot_pos);
+    }
+
     /// `destructive_hint` and `open_world_hint` default to `true` in the MCP spec, so a tool
     /// shipping without annotations reads to a host as destructive and open-world.
     #[test]
@@ -1492,6 +1588,7 @@ mod tests {
             ("glass_do", false),
             ("glass_doctor", false),
             ("glass_drag", false),
+            ("glass_find_elements", true),
             ("glass_gesture", false),
             ("glass_key", false),
             ("glass_list_windows", true),
@@ -1601,6 +1698,22 @@ mod tests {
                 )
             })
             .collect();
+
+        let find = &descriptions["glass_find_elements"];
+        for required in [
+            "approximate, duplicated, or not yet identified",
+            "fresh read",
+            "defaults to 10",
+            "capped at 20",
+            "within` must match one semantic scope",
+            "timeout_ms",
+            "8 KiB",
+        ] {
+            assert!(
+                find.contains(required),
+                "glass_find_elements description missing {required:?}: {find}"
+            );
+        }
 
         let element = &descriptions["glass_wait_for_element"];
         assert!(element.contains("semantic transition completion"));
@@ -1741,6 +1854,41 @@ mod tests {
                 (tool.name.into_owned(), params)
             })
             .collect()
+    }
+
+    #[test]
+    fn find_elements_reference_documents_public_contract() {
+        let heading = "### `glass_find_elements`";
+        let start = TOOLS_MD.find(heading).expect("canonical reference heading");
+        let snapshot = TOOLS_MD
+            .find("### `glass_a11y_snapshot`")
+            .expect("snapshot reference heading");
+        assert!(
+            start < snapshot,
+            "find-elements reference must precede snapshot"
+        );
+        let section = &TOOLS_MD[start..snapshot];
+        for required in [
+            "`query` (string)",
+            "`role` (string)",
+            "`states` (array of string)",
+            "`within` (object)",
+            "`max_results` (integer, default 10, range 1 through 20)",
+            "`max_nodes` (integer)",
+            "`timeout_ms` (integer, default 0)",
+            "Ranking",
+            "context",
+            "soft timeout",
+            "ambiguous",
+            "Secure values",
+            "untrusted",
+            "8 KiB",
+        ] {
+            assert!(
+                section.contains(required),
+                "glass_find_elements reference missing {required:?}"
+            );
+        }
     }
 
     #[test]

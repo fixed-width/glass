@@ -288,6 +288,7 @@ pub enum InvokeOutcome {
 
 pub struct FakeAccessibility {
     pub tree: AxTree,
+    pub reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub set_log: std::sync::Arc<std::sync::Mutex<Vec<(AxTarget, String)>>>,
     pub set_outcome: SetOutcome,
     pub invoke_outcome: InvokeOutcome,
@@ -295,6 +296,8 @@ pub struct FakeAccessibility {
 
 impl Accessibility for FakeAccessibility {
     fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self.tree.clone())
     }
     fn set_value(&mut self, _ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -489,6 +492,22 @@ fn glass_with_a11y_full(
     set_outcome: SetOutcome,
     invoke_outcome: InvokeOutcome,
 ) -> Glass {
+    glass_with_a11y_full_and_reads(
+        platform,
+        tree,
+        set_outcome,
+        invoke_outcome,
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    )
+}
+
+fn glass_with_a11y_full_and_reads(
+    platform: FakePlatform,
+    tree: AxTree,
+    set_outcome: SetOutcome,
+    invoke_outcome: InvokeOutcome,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Glass {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("baselines");
     std::mem::forget(dir);
@@ -496,6 +515,7 @@ fn glass_with_a11y_full(
         platform: Box::new(platform),
         accessibility: Some(Box::new(FakeAccessibility {
             tree,
+            reads,
             set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             set_outcome,
             invoke_outcome,
@@ -506,6 +526,104 @@ fn glass_with_a11y_full(
             .ok_or_else(|| GlassError::Backend("test factory called twice".into()))
     });
     Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
+}
+
+pub fn started_a11y_with(tree: AxTree) -> Glass {
+    let mut glass = glass_with_a11y(FakePlatform::new(100, 100), tree);
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["app".into()],
+            cwd: None,
+            env: Vec::new(),
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        })
+        .unwrap();
+    glass
+}
+
+pub fn started_counted_a11y(
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tree: AxTree,
+) -> Glass {
+    let mut glass = glass_with_a11y_full_and_reads(
+        FakePlatform::new(100, 100),
+        tree,
+        SetOutcome::Ok,
+        InvokeOutcome::Unsupported,
+        reads,
+    );
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["app".into()],
+            cwd: None,
+            env: Vec::new(),
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        })
+        .unwrap();
+    glass
+}
+
+pub fn started_without_a11y() -> Glass {
+    let mut glass = glass_with(FakePlatform::new(100, 100));
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["app".into()],
+            cwd: None,
+            env: Vec::new(),
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+    glass
+}
+
+struct FailingAccessibility {
+    error: Option<GlassError>,
+}
+
+impl Accessibility for FailingAccessibility {
+    fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+        Err(self.error.take().expect("scripted accessibility error"))
+    }
+}
+
+pub fn started_failing_a11y(error: GlassError) -> Glass {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    let mut held = Some(Backend {
+        platform: Box::new(FakePlatform::new(100, 100)),
+        accessibility: Some(Box::new(FailingAccessibility { error: Some(error) })),
+    });
+    let factory: PlatformFactory = Box::new(move |_backend| {
+        held.take()
+            .ok_or_else(|| GlassError::Backend("test factory called twice".into()))
+    });
+    let mut glass = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["app".into()],
+            cwd: None,
+            env: Vec::new(),
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        })
+        .unwrap();
+    glass
 }
 
 /// Parse content block `i` as the `{ok,tool,result}` envelope.

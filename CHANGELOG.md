@@ -19,6 +19,9 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Added
+- `glass_find_elements` performs a fresh bounded accessibility search across native and published web content, returning up to 20 ranked actionable matches with semantic scope, optional publication waiting, compact context, explicit incompleteness, secure-value exclusion, and an 8 KiB total response ceiling.
+
 ## [1.7.0] - 2026-08-31
 
 ### Added
