@@ -500,9 +500,12 @@ fn accounting_does_not_follow_a_nested_directory_substituted_after_enumeration()
     fs::create_dir(&nested).unwrap();
     fs::write(nested.join("owned"), "owned").unwrap();
     let replacement = nested.clone();
+    let hook_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_fired_in_hook = std::sync::Arc::clone(&hook_fired);
     #[cfg(unix)]
     let outside_path = outside.path().to_path_buf();
     set_fs_test_hook(TestHookPoint::AfterAccountingEnumeration, move || {
+        hook_fired_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
         fs::rename(&replacement, &detached).unwrap();
         #[cfg(unix)]
         symlink(outside_path, replacement).unwrap();
@@ -513,7 +516,8 @@ fn accounting_does_not_follow_a_nested_directory_substituted_after_enumeration()
     #[cfg(unix)]
     assert_eq!(store.total_file_bytes().unwrap(), 0);
     #[cfg(windows)]
-    assert_eq!(store.total_file_bytes().unwrap(), 5);
+    assert!(store.total_file_bytes().is_err());
+    assert!(hook_fired.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(fs::metadata(&sentinel).unwrap().len(), 4096);
     #[cfg(windows)]
     assert_eq!(fs::metadata(nested.join("sentinel")).unwrap().len(), 4096);
@@ -582,9 +586,12 @@ fn shutdown_does_not_follow_a_nested_substitution_after_enumeration() {
     fs::create_dir(&nested).unwrap();
     fs::write(nested.join("owned"), "owned").unwrap();
     let replacement = nested.clone();
+    let hook_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_fired_in_hook = std::sync::Arc::clone(&hook_fired);
     #[cfg(unix)]
     let outside_path = outside.path().to_path_buf();
     set_fs_test_hook(TestHookPoint::AfterCleanupEnumeration, move || {
+        hook_fired_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
         fs::rename(&replacement, &detached_for_hook).unwrap();
         #[cfg(unix)]
         symlink(outside_path, replacement).unwrap();
@@ -596,6 +603,7 @@ fn shutdown_does_not_follow_a_nested_substitution_after_enumeration() {
     store.shutdown().unwrap();
     #[cfg(windows)]
     assert!(store.shutdown().is_err());
+    assert!(hook_fired.load(std::sync::atomic::Ordering::SeqCst));
 
     assert_eq!(fs::read_to_string(sentinel).unwrap(), "outside");
     #[cfg(unix)]
@@ -632,9 +640,12 @@ fn scavenging_does_not_open_a_process_directory_substituted_after_enumeration() 
     fs::write(process.join("owned"), "owned").unwrap();
     fs::write(&lease, "").unwrap();
     let replacement = process.clone();
+    let hook_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_fired_in_hook = std::sync::Arc::clone(&hook_fired);
     #[cfg(unix)]
     let outside_path = outside.path().to_path_buf();
     set_fs_test_hook(TestHookPoint::AfterScavengeEnumeration, move || {
+        hook_fired_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
         fs::rename(&replacement, &detached).unwrap();
         #[cfg(unix)]
         symlink(outside_path, replacement).unwrap();
@@ -644,11 +655,12 @@ fn scavenging_does_not_open_a_process_directory_substituted_after_enumeration() 
 
     let current = ArtifactStore::for_test(root.path(), 1024).unwrap();
 
+    assert!(hook_fired.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(fs::read_to_string(sentinel).unwrap(), "outside");
     #[cfg(unix)]
     assert!(lease.exists());
     #[cfg(windows)]
-    assert!(!lease.exists());
+    assert!(lease.exists());
     #[cfg(windows)]
     assert_eq!(
         fs::read_to_string(process.join("sentinel")).unwrap(),
@@ -739,6 +751,132 @@ fn startup_recovers_strict_quarantine_with_stale_process_directory() {
     assert!(!process.exists());
     assert!(!quarantine.exists());
     drop(next);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_preserves_replacement_installed_before_recovery_reservation() {
+    use std::fs::OpenOptions;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let process = root.path().join(format!("server-{id}"));
+    let detached = root.path().join("detached-stale-process");
+    let canonical = root.path().join(format!("server-{id}.lease"));
+    let quarantine = root.path().join(format!(
+        "server-{id}.lease-cleanup-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ));
+    fs::create_dir(&process).unwrap();
+    fs::write(process.join("stale"), "stale").unwrap();
+    fs::write(&quarantine, "quarantine").unwrap();
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_hook = Arc::clone(&fired);
+    let process_hook = process.clone();
+    let canonical_hook = canonical.clone();
+    let locked = Arc::new(std::sync::Mutex::new(None));
+    let locked_hook = Arc::clone(&locked);
+    set_fs_test_hook(TestHookPoint::AfterQuarantineCanonicalAbsent, move || {
+        fired_hook.store(true, Ordering::SeqCst);
+        fs::rename(&process_hook, &detached).unwrap();
+        fs::create_dir(&process_hook).unwrap();
+        fs::write(process_hook.join("replacement-sentinel"), "active").unwrap();
+        let lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(canonical_hook)
+            .unwrap();
+        lease.lock().unwrap();
+        *locked_hook.lock().unwrap() = Some(lease);
+    });
+
+    let next = ArtifactStore::for_test(root.path(), 1024).unwrap();
+
+    assert!(fired.load(Ordering::SeqCst));
+    assert_eq!(
+        fs::read_to_string(process.join("replacement-sentinel")).unwrap(),
+        "active"
+    );
+    assert!(canonical.exists());
+    assert!(quarantine.exists());
+    drop(next);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_reservation_blocks_replacement_and_removes_only_stale_process() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let process = root.path().join(format!("server-{id}"));
+    let canonical = root.path().join(format!("server-{id}.lease"));
+    let quarantine = root.path().join(format!(
+        "server-{id}.lease-cleanup-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ));
+    fs::create_dir(&process).unwrap();
+    fs::write(process.join("stale"), "stale").unwrap();
+    fs::write(&quarantine, "quarantine").unwrap();
+    let fired = Arc::new(AtomicBool::new(false));
+    let blocked = Arc::new(AtomicBool::new(false));
+    let fired_hook = Arc::clone(&fired);
+    let blocked_hook = Arc::clone(&blocked);
+    set_fs_test_hook(TestHookPoint::AfterRecoveryReservation, move || {
+        fired_hook.store(true, Ordering::SeqCst);
+        blocked_hook.store(
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&canonical)
+                .is_err(),
+            Ordering::SeqCst,
+        );
+    });
+
+    let next = ArtifactStore::for_test(root.path(), 1024).unwrap();
+
+    assert!(fired.load(Ordering::SeqCst));
+    assert!(blocked.load(Ordering::SeqCst));
+    assert!(!process.exists());
+    assert!(!quarantine.exists());
+    drop(next);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_resumes_each_recovery_crash_state() {
+    for point in [
+        TestHookPoint::AfterRecoveryReservation,
+        TestHookPoint::AfterRecoveryProcessRemoval,
+        TestHookPoint::AfterRecoveryGuardRemoval,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let id = "0123456789abcdef0123456789abcdef";
+        let process = root.path().join(format!("server-{id}"));
+        let canonical = root.path().join(format!("server-{id}.lease"));
+        let quarantine = root.path().join(format!(
+            "server-{id}.lease-cleanup-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        fs::create_dir(&process).unwrap();
+        fs::write(process.join("stale"), "stale").unwrap();
+        fs::write(&quarantine, "quarantine").unwrap();
+        set_fs_test_hook(point, || panic!("simulated recovery interruption"));
+
+        assert!(std::panic::catch_unwind(|| ArtifactStore::for_test(root.path(), 1024)).is_err());
+
+        let next = ArtifactStore::for_test(root.path(), 1024).unwrap();
+        assert!(!process.exists(), "process remained after {point:?}");
+        assert!(!canonical.exists(), "guard remained after {point:?}");
+        assert!(!quarantine.exists(), "quarantine remained after {point:?}");
+        drop(next);
+    }
 }
 
 #[cfg(unix)]

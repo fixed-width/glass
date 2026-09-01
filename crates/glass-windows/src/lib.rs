@@ -31,9 +31,10 @@ pub mod vkmap; // pure named-keysym->VK map — cross-platform, host-tested
 
 #[cfg(windows)]
 pub use host_fs::{
-    DirectoryEntryHandle, HostFsError, directory_entry_handles, directory_entry_names,
-    file_matches_path_no_reparse, open_directory_beneath, open_directory_no_reparse,
-    open_entry_child, open_file_beneath, open_file_child, path_has_private_dacl, remove_by_handle,
+    DirectoryEntryHandle, DirectoryEntryRecord, HostFsError, directory_entry_handles,
+    directory_entry_names, directory_entry_records, file_matches_path_no_reparse,
+    open_directory_beneath, open_directory_entry, open_directory_no_reparse, open_entry_child,
+    open_file_beneath, open_file_child, path_has_private_dacl, remove_by_handle,
     restrict_path_to_current_user, same_file_object,
 };
 

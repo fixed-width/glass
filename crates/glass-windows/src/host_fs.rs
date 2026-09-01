@@ -48,6 +48,19 @@ pub struct DirectoryEntryHandle {
     pub file: File,
 }
 
+#[doc(hidden)]
+pub struct DirectoryEntryRecord {
+    name: std::ffi::OsString,
+    volume: u32,
+    file_id: u64,
+}
+
+impl DirectoryEntryRecord {
+    pub fn name(&self) -> &OsStr {
+        &self.name
+    }
+}
+
 /// Opens a directory itself, rather than a reparse target, and retains rename-compatible sharing.
 pub fn open_directory_no_reparse(path: &Path) -> Result<File, HostFsError> {
     let file = OpenOptions::new()
@@ -107,8 +120,20 @@ pub fn open_entry_child(directory: &File, filename: &OsStr) -> Result<File, Host
 
 /// Enumerates names from a retained directory handle without consulting its pathname.
 pub fn directory_entry_names(directory: &File) -> Result<Vec<std::ffi::OsString>, HostFsError> {
+    Ok(directory_entry_records(directory)?
+        .into_iter()
+        .map(|record| record.name)
+        .collect())
+}
+
+#[doc(hidden)]
+pub fn directory_entry_records(directory: &File) -> Result<Vec<DirectoryEntryRecord>, HostFsError> {
     let mut names = Vec::new();
     let mut name_bytes = 0_usize;
+    let (volume, parent_id) = file_identity(directory)?;
+    if volume == 0 || parent_id == 0 {
+        return Err(HostFsError::Integrity);
+    }
     let mut buffer = vec![0_u8; DIRECTORY_QUERY_BYTES];
     let mut restart = true;
     loop {
@@ -142,7 +167,7 @@ pub fn directory_entry_names(directory: &File) -> Result<Vec<std::ffi::OsString>
         if used == 0 || used > buffer.len() {
             return Err(HostFsError::Integrity);
         }
-        let batch = parse_directory_names(&buffer[..used])?;
+        let batch = parse_directory_records(&buffer[..used], volume)?;
         append_directory_batch(
             &mut names,
             &mut name_bytes,
@@ -155,13 +180,29 @@ pub fn directory_entry_names(directory: &File) -> Result<Vec<std::ffi::OsString>
 
 /// Enumerates and opens each exact child before returning, retaining identity across renames.
 pub fn directory_entry_handles(directory: &File) -> Result<Vec<DirectoryEntryHandle>, HostFsError> {
-    directory_entry_names(directory)?
+    directory_entry_records(directory)?
         .into_iter()
-        .map(|name| {
-            let file = open_entry_child(directory, &name)?;
-            Ok(DirectoryEntryHandle { name, file })
+        .map(|record| {
+            let file = open_directory_entry(directory, &record)?;
+            Ok(DirectoryEntryHandle {
+                name: record.name,
+                file,
+            })
         })
         .collect()
+}
+
+#[doc(hidden)]
+pub fn open_directory_entry(
+    directory: &File,
+    record: &DirectoryEntryRecord,
+) -> Result<File, HostFsError> {
+    let file = open_entry_child(directory, &record.name)?;
+    let identity = file_identity(&file)?;
+    if record.file_id == 0 || identity != (record.volume, record.file_id) {
+        return Err(HostFsError::Integrity);
+    }
+    Ok(file)
 }
 
 /// Marks the exact retained filesystem object for deletion, without reopening a pathname.
@@ -181,17 +222,22 @@ pub fn remove_by_handle(file: &File) -> Result<(), HostFsError> {
     }
 }
 
-fn parse_directory_names(bytes: &[u8]) -> Result<Vec<std::ffi::OsString>, HostFsError> {
+fn parse_directory_records(
+    bytes: &[u8],
+    volume: u32,
+) -> Result<Vec<DirectoryEntryRecord>, HostFsError> {
     let mut names = Vec::new();
     let mut offset = 0_usize;
     let fixed = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
     let name_len_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength);
+    let file_id_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileId);
     loop {
         if bytes.len().saturating_sub(offset) < fixed {
             return Err(HostFsError::Integrity);
         }
         let next = read_u32(bytes, offset)?;
         let name_bytes = read_u32(bytes, offset + name_len_offset)? as usize;
+        let file_id = read_u64(bytes, offset + file_id_offset)?;
         if !name_bytes.is_multiple_of(2) {
             return Err(HostFsError::Integrity);
         }
@@ -210,7 +256,14 @@ fn parse_directory_names(bytes: &[u8]) -> Result<Vec<std::ffi::OsString>, HostFs
         } else if !valid_child_name(&name) {
             return Err(HostFsError::Integrity);
         } else {
-            names.push(name);
+            if file_id == 0 || volume == 0 {
+                return Err(HostFsError::Integrity);
+            }
+            names.push(DirectoryEntryRecord {
+                name,
+                volume,
+                file_id,
+            });
         }
         if next == 0 {
             if bytes[end..].len() >= 8 || bytes[end..].iter().any(|byte| *byte != 0) {
@@ -229,10 +282,28 @@ fn parse_directory_names(bytes: &[u8]) -> Result<Vec<std::ffi::OsString>, HostFs
     }
 }
 
+#[cfg(test)]
+fn parse_directory_names(bytes: &[u8]) -> Result<Vec<std::ffi::OsString>, HostFsError> {
+    Ok(parse_directory_records(bytes, 1)?
+        .into_iter()
+        .map(|record| record.name)
+        .collect())
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, HostFsError> {
     let end = offset.checked_add(4).ok_or(HostFsError::Integrity)?;
     let value = bytes.get(offset..end).ok_or(HostFsError::Integrity)?;
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, HostFsError> {
+    let end = offset.checked_add(8).ok_or(HostFsError::Integrity)?;
+    let value: [u8; 8] = bytes
+        .get(offset..end)
+        .ok_or(HostFsError::Integrity)?
+        .try_into()
+        .map_err(|_| HostFsError::Integrity)?;
+    Ok(u64::from_le_bytes(value))
 }
 
 fn valid_child_name(name: &std::ffi::OsStr) -> bool {
@@ -272,9 +343,9 @@ fn windows_device_digit(unit: u16) -> bool {
 }
 
 fn append_directory_batch(
-    names: &mut Vec<std::ffi::OsString>,
+    names: &mut Vec<DirectoryEntryRecord>,
     name_bytes: &mut usize,
-    batch: &[std::ffi::OsString],
+    batch: &[DirectoryEntryRecord],
     count_limit: usize,
     byte_limit: usize,
 ) -> Result<(), HostFsError> {
@@ -287,6 +358,7 @@ fn append_directory_batch(
     }
     let batch_bytes = batch.iter().try_fold(0_usize, |total, name| {
         let bytes = name
+            .name
             .encode_wide()
             .count()
             .checked_mul(std::mem::size_of::<u16>())
@@ -294,7 +366,11 @@ fn append_directory_batch(
         total.checked_add(bytes).ok_or(HostFsError::Integrity)
     })?;
     *name_bytes = checked_name_byte_total(*name_bytes, batch_bytes, byte_limit)?;
-    names.extend(batch.iter().cloned());
+    names.extend(batch.iter().map(|record| DirectoryEntryRecord {
+        name: record.name.clone(),
+        volume: record.volume,
+        file_id: record.file_id,
+    }));
     Ok(())
 }
 
@@ -315,12 +391,30 @@ fn collect_directory_batches_for_test<'a>(
     count_limit: usize,
     byte_limit: usize,
 ) -> Result<Vec<std::ffi::OsString>, HostFsError> {
-    let mut names = Vec::new();
+    let mut records = Vec::new();
     let mut name_bytes = 0;
     for batch in batches {
-        append_directory_batch(&mut names, &mut name_bytes, batch?, count_limit, byte_limit)?;
+        let batch = batch?;
+        let batch = batch
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                Ok(DirectoryEntryRecord {
+                    name: name.clone(),
+                    volume: 1,
+                    file_id: u64::try_from(index + 1).map_err(|_| HostFsError::Integrity)?,
+                })
+            })
+            .collect::<Result<Vec<_>, HostFsError>>()?;
+        append_directory_batch(
+            &mut records,
+            &mut name_bytes,
+            &batch,
+            count_limit,
+            byte_limit,
+        )?;
     }
-    Ok(names)
+    Ok(records.into_iter().map(|record| record.name).collect())
 }
 
 #[derive(Clone, Copy)]
@@ -569,11 +663,63 @@ mod tests {
         let name_len = u32::try_from(name.len() * 2).unwrap();
         let name_len_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength);
         bytes[name_len_offset..name_len_offset + 4].copy_from_slice(&name_len.to_le_bytes());
+        let file_id_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileId);
+        bytes[file_id_offset..file_id_offset + 8]
+            .copy_from_slice(&0x1122334455667788_u64.to_le_bytes());
         for (index, unit) in name.iter().enumerate() {
             let start = fixed + index * 2;
             bytes[start..start + 2].copy_from_slice(&unit.to_le_bytes());
         }
         bytes
+    }
+
+    #[test]
+    fn parser_captures_exact_file_identity() {
+        let fixed = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+        let bytes = directory_record(&['a' as u16], 0, fixed + 2);
+
+        let records = parse_directory_records(&bytes, 0xAABBCCDD).unwrap();
+
+        assert_eq!(records[0].file_id, 0x1122334455667788);
+        assert_eq!(records[0].volume, 0xAABBCCDD);
+        assert_eq!(records[0].name, OsStr::new("a"));
+    }
+
+    #[test]
+    fn parser_rejects_zero_file_identity() {
+        let fixed = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+        let mut bytes = directory_record(&['a' as u16], 0, fixed + 2);
+        let file_id_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileId);
+        bytes[file_id_offset..file_id_offset + 8].fill(0);
+
+        assert!(matches!(
+            parse_directory_records(&bytes, 1),
+            Err(HostFsError::Integrity)
+        ));
+    }
+
+    #[test]
+    fn enumerated_identity_accepts_match_and_rejects_same_name_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("child");
+        let detached = root.path().join("detached");
+        std::fs::write(&child, "original").unwrap();
+        let directory = open_directory_no_reparse(root.path()).unwrap();
+        let records = directory_entry_records(&directory).unwrap();
+        let record = records
+            .iter()
+            .find(|record| record.name() == "child")
+            .unwrap();
+
+        assert!(open_directory_entry(&directory, record).is_ok());
+        std::fs::rename(&child, &detached).unwrap();
+        std::fs::write(&child, "replacement").unwrap();
+
+        assert!(matches!(
+            open_directory_entry(&directory, record),
+            Err(HostFsError::Integrity)
+        ));
+        assert_eq!(std::fs::read_to_string(child).unwrap(), "replacement");
     }
 
     #[test]
