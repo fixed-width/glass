@@ -14,13 +14,6 @@ const READ_RECOVERY: &str =
 const MUTATE_RECOVERY: &str = "Correct artifact storage, then use a read-only inspection tool. Do not repeat the action solely to recover this observation.";
 
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Reserved for crate-internal response integration."
-    )
-)]
 pub(crate) struct ToolCallOutcome {
     pub tool: &'static str,
     pub effect: ToolEffect,
@@ -124,13 +117,6 @@ impl OmissionRanges {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Reserved for crate-internal response integration."
-    )
-)]
 pub(crate) struct AppliedOutcome {
     pub output: ToolOutput,
     pub is_error: bool,
@@ -138,26 +124,41 @@ pub(crate) struct AppliedOutcome {
     response_pin: Option<ResponsePin>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Reserved for crate-internal response integration."
-    )
-)]
 pub(crate) struct OutputPolicy {
     store: Option<ArtifactStore>,
     permanently_disabled: AtomicBool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Reserved for crate-internal response integration."
-    )
-)]
 impl OutputPolicy {
+    pub(crate) fn validate_store_paths(store: &ArtifactStore) -> Result<(), ArtifactError> {
+        let path = store
+            .process_dir()
+            .join("artifact-18446744073709551615.txt");
+        let uri = format!(
+            "glass-artifact://{}/artifact-18446744073709551615",
+            store.server_id()
+        );
+        let descriptor = ArtifactDescriptor::new(
+            crate::output::ArtifactKind::ContentBlock,
+            Some(usize::MAX),
+            &uri,
+            &path,
+            "application/vnd.glass.output-manifest+json; charset=utf-8",
+            u64::MAX,
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            true,
+            &[usize::MAX],
+        )
+        .map_err(|_| ArtifactError::PathRepresentationFailed)?;
+        let resource = descriptor.to_resource(TargetAccess::HostFilesystemUnreachable);
+        let rendered =
+            serde_json::to_vec(&resource).map_err(|_| ArtifactError::PathRepresentationFailed)?;
+        if rendered.len() > MAX_TEXT_BYTES {
+            return Err(ArtifactError::PathRepresentationFailed);
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(store: ArtifactStore) -> Self {
         Self {
             store: Some(store),
@@ -341,14 +342,11 @@ impl OutputPolicy {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Reserved for crate-internal response integration."
-    )
-)]
 impl AppliedOutcome {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Used by output policy contract tests.")
+    )]
     pub(crate) fn output_metadata(&self) -> Option<&OutputMetadata> {
         self.metadata.as_ref()
     }

@@ -175,6 +175,7 @@ pub async fn run_on_until(
 ) -> anyhow::Result<()> {
     let server = GlassServer::new(glass, report);
     let sessions = server.sessions();
+    let artifacts = server.artifact_store();
     let cancel = CancellationToken::new();
     let app = build_router(&cfg, server, &cancel);
 
@@ -182,15 +183,16 @@ pub async fn run_on_until(
     let serving = axum::serve(listener, app).with_graceful_shutdown(async move {
         server_cancel.cancelled().await;
     });
-    match run_server_then_teardown(
+    let transport_result = run_server_then_teardown(
         async move { serving.await },
         shutdown,
         &cancel,
         HTTP_GRACEFUL_DRAIN_BUDGET,
         crate::shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET),
     )
-    .await
-    {
+    .await;
+    crate::cleanup_artifacts(artifacts).await;
+    match transport_result {
         Ok(result) => result.context("serving MCP over HTTP"),
         Err(()) => Err(anyhow::anyhow!(
             "MCP HTTP graceful drain exceeded {HTTP_GRACEFUL_DRAIN_BUDGET:?}"

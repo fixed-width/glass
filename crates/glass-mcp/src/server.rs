@@ -3,26 +3,29 @@
 use std::sync::Arc;
 
 use base64::Engine;
-use glass_core::Glass;
+use glass_core::{Glass, HostPathAccess, ProtectedHostPath};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, ErrorCode, ListResourceTemplatesResult, ListResourcesResult,
+    Meta, ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+    ServerInfo,
+};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
+use crate::artifacts::{ArtifactReadError, ArtifactStore};
 use crate::audit::AuditReport;
-use crate::output::TargetAccess;
+use crate::output::{OutContent, TargetAccess, ToolEffect, ToolOutput};
+use crate::output_policy::{AppliedOutcome, OutputPolicy, ToolCallOutcome};
 use crate::params::*;
-use crate::tools::{self, BatchToolResult, OutContent, ToolOutput, ToolResult};
-
-enum ToolCallOutcome {
-    Success(ToolOutput),
-    Error(ToolOutput),
-}
+use crate::tools::{self, BatchToolResult, ToolResult};
 
 /// A synchronous tool body plus where to send its result — run on the dedicated
 /// `glass-platform` thread (see [`GlassServer::new`]).
 type Job = (
+    &'static str,
+    ToolEffect,
     Box<dyn FnOnce(&mut Glass) -> ToolCallOutcome + Send>,
     tokio::sync::oneshot::Sender<ToolCallOutcome>,
 );
@@ -34,46 +37,65 @@ pub struct GlassServer {
     jobs: std::sync::mpsc::Sender<Job>,
     /// Audit-log posture, carried for `glass_doctor` display.
     report: AuditReport,
+    artifacts: Option<ArtifactStore>,
+    output_policy: Arc<OutputPolicy>,
     tool_router: ToolRouter<GlassServer>,
 }
 
-fn to_contents(out: ToolOutput, target_access: TargetAccess) -> Vec<ContentBlock> {
-    out.0
-        .into_iter()
-        .map(|c| match c {
-            OutContent::Envelope(envelope) => ContentBlock::text(envelope.render()),
-            OutContent::Text(text) => ContentBlock::text(text.body),
-            OutContent::Image(bytes) => {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-                ContentBlock::image(b64, "image/webp")
-            }
-            OutContent::ResourceLink(link) => {
-                ContentBlock::ResourceLink(link.to_resource(target_access))
-            }
-        })
-        .collect()
-}
-
-fn map_call_outcome(outcome: ToolCallOutcome) -> CallToolResult {
-    match outcome {
-        ToolCallOutcome::Success(out) => {
-            CallToolResult::success(to_contents(out, TargetAccess::NoActiveTarget))
-        }
-        ToolCallOutcome::Error(out) => {
-            CallToolResult::error(to_contents(out, TargetAccess::NoActiveTarget))
-        }
+fn target_access(access: HostPathAccess) -> TargetAccess {
+    match access {
+        HostPathAccess::DeniedBySandbox => TargetAccess::DeniedBySandbox,
+        HostPathAccess::NotGuaranteedSandboxOff => TargetAccess::NotGuaranteedSandboxOff,
+        HostPathAccess::HostFilesystemUnreachable => TargetAccess::HostFilesystemUnreachable,
+        HostPathAccess::NoActiveTarget => TargetAccess::NoActiveTarget,
     }
 }
 
-/// Map a tool-logic result into an MCP call result. An `Err` becomes an MCP
-/// *error* result (`is_error == true`) carrying the message, so a failed backend
-/// op is surfaced to the agent as a failure rather than read as a successful
-/// call — the "no silent fallback" invariant at the protocol boundary. Kept pure
-/// (no async / no lock) so this contract is unit-testable.
+fn applied_to_call_result(applied: AppliedOutcome, target_access: TargetAccess) -> CallToolResult {
+    let (output, is_error, _metadata, response_pin) = applied.into_parts();
+    let content = output
+        .0
+        .into_iter()
+        .map(|item| match item {
+            OutContent::Envelope(envelope) => ContentBlock::text(envelope.render()),
+            OutContent::Text(text) => ContentBlock::text(text.body),
+            OutContent::Image(bytes) => ContentBlock::image(
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+                "image/webp",
+            ),
+            OutContent::ResourceLink(descriptor) => {
+                ContentBlock::ResourceLink(descriptor.to_resource(target_access))
+            }
+        })
+        .collect();
+    let result = if is_error {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    };
+    // The pin must cover descriptor rendering and allocation of every rmcp content block.
+    drop(response_pin);
+    result
+}
+
+#[cfg(test)]
+fn map_call_outcome(outcome: ToolCallOutcome) -> CallToolResult {
+    let access = outcome.target_access;
+    applied_to_call_result(OutputPolicy::unavailable().apply(outcome), access)
+}
+
+#[cfg(test)]
 fn map_tool_result(result: ToolResult) -> CallToolResult {
-    map_call_outcome(match result {
-        Ok(out) => ToolCallOutcome::Success(out),
-        Err(msg) => ToolCallOutcome::Error(ToolOutput(vec![OutContent::trusted_error(msg)])),
+    let (is_error, output) = match result {
+        Ok(output) => (false, output),
+        Err(message) => (true, ToolOutput(vec![OutContent::trusted_error(message)])),
+    };
+    map_call_outcome(ToolCallOutcome {
+        tool: "glass_test",
+        effect: ToolEffect::ReadOnly,
+        is_error,
+        target_access: TargetAccess::NoActiveTarget,
+        output,
     })
 }
 
@@ -92,32 +114,79 @@ fn doctor_result(diag: &glass_core::Diagnosis, backend: &str) -> serde_json::Val
 
 #[tool_router]
 impl GlassServer {
-    pub fn new(glass: Glass, report: AuditReport) -> Self {
+    pub fn new(mut glass: Glass, report: AuditReport) -> Self {
+        const ARTIFACT_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+        let store = match ArtifactStore::new(ARTIFACT_LIMIT_BYTES) {
+            Ok(store) => {
+                let registration = OutputPolicy::validate_store_paths(&store).and_then(|()| {
+                    glass
+                        .set_protected_host_paths(vec![
+                            ProtectedHostPath::directory(store.process_dir()),
+                            ProtectedHostPath::file(store.lease_path()),
+                        ])
+                        .map_err(|_| crate::artifacts::ArtifactError::ProtectionRegistrationFailed)
+                });
+                if registration.is_ok() {
+                    Some(store)
+                } else {
+                    if store.shutdown().is_err() {
+                        eprintln!("glass: artifact storage cleanup failed during startup");
+                    }
+                    None
+                }
+            }
+            Err(_) => None,
+        };
+        if store.is_none() {
+            eprintln!(
+                "glass: artifact storage unavailable; oversized responses will be bounded and incomplete"
+            );
+        }
+        Self::new_with_state(glass, report, store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_store(
+        mut glass: Glass,
+        report: AuditReport,
+        store: ArtifactStore,
+    ) -> Result<Self, crate::artifacts::ArtifactError> {
+        OutputPolicy::validate_store_paths(&store)?;
+        glass
+            .set_protected_host_paths(vec![
+                ProtectedHostPath::directory(store.process_dir()),
+                ProtectedHostPath::file(store.lease_path()),
+            ])
+            .map_err(|_| crate::artifacts::ArtifactError::ProtectionRegistrationFailed)?;
+        Ok(Self::new_with_state(glass, report, Some(store)))
+    }
+
+    fn new_with_state(glass: Glass, report: AuditReport, artifacts: Option<ArtifactStore>) -> Self {
+        let output_policy = Arc::new(match artifacts.clone() {
+            Some(store) => OutputPolicy::new(store),
+            None => OutputPolicy::unavailable(),
+        });
         let glass = Arc::new(Mutex::new(glass));
         let (jobs, rx) = std::sync::mpsc::channel::<Job>();
-        // One long-lived OS thread runs EVERY tool body. Tool bodies that spawn a
-        // long-lived child — a sandboxed app under `bwrap --die-with-parent`, which SIGKILLs
-        // the sandbox on the death of its parent *thread* (PR_SET_PDEATHSIG is thread-scoped
-        // on Linux) — must be parented to a thread that lives for the whole process, NOT an
-        // ephemeral tokio blocking-pool thread. A pool thread, recycled after the launch
-        // call returns, would trigger that kill and the app would vanish right after launch.
-        // Running here also keeps blocking build/launch/wait work off the async executor and
-        // serializes tools (glass has one active session).
         let worker_glass = glass.clone();
+        // This long-lived thread parents contained targets and serializes the one active session.
         std::thread::Builder::new()
             .name("glass-platform".into())
             .spawn(move || {
-                while let Ok((job, reply)) = rx.recv() {
+                while let Ok((tool, effect, job, reply)) = rx.recv() {
                     let mut g = worker_glass.blocking_lock();
-                    // A panicking tool becomes a loud error AND the thread survives — so it
-                    // keeps serving calls and keeps parenting any still-running sandbox.
-                    let outcome =
+                    let mut outcome =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut g)))
-                            .unwrap_or_else(|_| {
-                                ToolCallOutcome::Error(ToolOutput(vec![OutContent::trusted_error(
+                            .unwrap_or_else(|_| ToolCallOutcome {
+                                tool,
+                                effect,
+                                is_error: true,
+                                target_access: target_access(g.host_path_access()),
+                                output: ToolOutput(vec![OutContent::trusted_error(
                                     "tool handler panicked",
-                                )]))
+                                )]),
                             });
+                    outcome.target_access = target_access(g.host_path_access());
                     let _ = reply.send(outcome);
                 }
             })
@@ -126,59 +195,100 @@ impl GlassServer {
             glass,
             jobs,
             report,
+            artifacts,
+            output_policy,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// A clone of the shared session registry, for the process-exit teardown path in
-    /// `main`. Taken before `serve()` consumes the server.
     pub fn sessions(&self) -> Arc<Mutex<Glass>> {
         self.glass.clone()
     }
 
-    async fn run<F>(&self, f: F) -> Result<CallToolResult, McpError>
+    pub(crate) fn artifact_store(&self) -> Option<ArtifactStore> {
+        self.artifacts.clone()
+    }
+
+    async fn run<F>(
+        &self,
+        tool: &'static str,
+        effect: ToolEffect,
+        f: F,
+    ) -> Result<CallToolResult, McpError>
     where
         F: FnOnce(&mut Glass) -> ToolResult + Send + 'static,
     {
-        self.run_outcome(move |g| match f(g) {
-            Ok(out) => ToolCallOutcome::Success(out),
-            Err(msg) => ToolCallOutcome::Error(ToolOutput(vec![OutContent::trusted_error(msg)])),
+        self.run_outcome(tool, effect, move |g| match f(g) {
+            Ok(output) => (false, output),
+            Err(message) => (true, ToolOutput(vec![OutContent::trusted_error(message)])),
         })
         .await
     }
 
-    async fn run_batch<F>(&self, f: F) -> Result<CallToolResult, McpError>
+    async fn run_batch<F>(
+        &self,
+        tool: &'static str,
+        effect: ToolEffect,
+        f: F,
+    ) -> Result<CallToolResult, McpError>
     where
         F: FnOnce(&mut Glass) -> BatchToolResult + Send + 'static,
     {
-        self.run_outcome(move |g| match f(g) {
-            Ok(out) => ToolCallOutcome::Success(out),
-            Err(out) => ToolCallOutcome::Error(out),
+        self.run_outcome(tool, effect, move |g| match f(g) {
+            Ok(output) => (false, output),
+            Err(output) => (true, output),
         })
         .await
     }
 
-    async fn run_outcome<F>(&self, f: F) -> Result<CallToolResult, McpError>
+    async fn run_outcome<F>(
+        &self,
+        tool: &'static str,
+        effect: ToolEffect,
+        f: F,
+    ) -> Result<CallToolResult, McpError>
     where
-        F: FnOnce(&mut Glass) -> ToolCallOutcome + Send + 'static,
+        F: FnOnce(&mut Glass) -> (bool, ToolOutput) + Send + 'static,
     {
-        // Hand the (synchronous, possibly slow) tool body to the dedicated glass-platform
-        // thread and await its result: that thread, not an ephemeral blocking-pool thread,
-        // parents any process the body spawns, so a sandboxed app's `--die-with-parent` only
-        // fires when glass itself exits. A handler panic comes back as a loud error, never an
-        // unanswered request.
+        let job = move |g: &mut Glass| {
+            let (is_error, output) = f(g);
+            ToolCallOutcome {
+                tool,
+                effect,
+                is_error,
+                target_access: target_access(g.host_path_access()),
+                output,
+            }
+        };
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if self.jobs.send((Box::new(f), reply_tx)).is_err() {
-            return Ok(map_call_outcome(ToolCallOutcome::Error(ToolOutput(vec![
-                OutContent::trusted_error("glass-platform thread is gone"),
-            ]))));
+        let fallback = || ToolCallOutcome {
+            tool,
+            effect,
+            is_error: true,
+            target_access: TargetAccess::NoActiveTarget,
+            output: ToolOutput(vec![OutContent::trusted_error(
+                "glass platform worker unavailable",
+            )]),
+        };
+        if self
+            .jobs
+            .send((tool, effect, Box::new(job), reply_tx))
+            .is_err()
+        {
+            return Ok(applied_to_call_result(
+                self.output_policy.apply(fallback()),
+                TargetAccess::NoActiveTarget,
+            ));
         }
-        let outcome = reply_rx.await.unwrap_or_else(|_| {
-            ToolCallOutcome::Error(ToolOutput(vec![OutContent::trusted_error(
-                "glass-platform thread dropped the job",
-            )]))
-        });
-        Ok(map_call_outcome(outcome))
+        let outcome = reply_rx.await.unwrap_or_else(|_| fallback());
+        let access = outcome.target_access;
+        let policy = self.output_policy.clone();
+        let applied = tokio::task::spawn_blocking(move || policy.apply(outcome))
+            .await
+            .map_err(|_| {
+                McpError::new(ErrorCode::INTERNAL_ERROR, "output processing failed", None)
+            })?;
+        Ok(applied_to_call_result(applied, access))
     }
 
     #[tool(
@@ -193,7 +303,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<StartArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::start(g, &a)).await
+        self.run("glass_start", ToolEffect::MayMutate, move |g| {
+            tools::start(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -213,7 +326,8 @@ impl GlassServer {
                        you need it, and errors if no session is running."
     )]
     async fn glass_stop(&self) -> Result<CallToolResult, McpError> {
-        self.run(tools::stop).await
+        self.run("glass_stop", ToolEffect::MayMutate, tools::stop)
+            .await
     }
 
     #[tool(
@@ -228,7 +342,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<WindowArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::window(g, &a)).await
+        self.run("glass_window", ToolEffect::MayMutate, move |g| {
+            tools::window(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -239,7 +356,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ScreenshotArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::screenshot(g, &a)).await
+        self.run("glass_screenshot", ToolEffect::ReadOnly, move |g| {
+            tools::screenshot(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -250,7 +370,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<WaitStableArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::wait_stable(g, &a)).await
+        self.run("glass_wait_stable", ToolEffect::ReadOnly, move |g| {
+            tools::wait_stable(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -265,7 +388,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ClickArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::click(g, &a)).await
+        self.run("glass_click", ToolEffect::MayMutate, move |g| {
+            tools::click(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -280,7 +406,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<MoveArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::mouse_move(g, &a)).await
+        self.run("glass_move", ToolEffect::MayMutate, move |g| {
+            tools::mouse_move(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -306,7 +435,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<DragArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::drag(g, &a)).await
+        self.run("glass_drag", ToolEffect::MayMutate, move |g| {
+            tools::drag(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -321,7 +453,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ScrollArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::scroll(g, &a)).await
+        self.run("glass_scroll", ToolEffect::MayMutate, move |g| {
+            tools::scroll(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -341,7 +476,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<GestureArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::gesture(g, &a)).await
+        self.run("glass_gesture", ToolEffect::MayMutate, move |g| {
+            tools::gesture(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -369,7 +507,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<TypeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::type_text(g, &a)).await
+        self.run("glass_type", ToolEffect::MayMutate, move |g| {
+            tools::type_text(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -394,7 +535,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<KeyArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::key(g, &a)).await
+        self.run("glass_key", ToolEffect::MayMutate, move |g| {
+            tools::key(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -405,7 +549,12 @@ impl GlassServer {
                        can't provide clipboard access."
     )]
     async fn glass_clipboard_get(&self) -> Result<CallToolResult, McpError> {
-        self.run(tools::clipboard_get).await
+        self.run(
+            "glass_clipboard_get",
+            ToolEffect::ReadOnly,
+            tools::clipboard_get,
+        )
+        .await
     }
 
     #[tool(
@@ -421,7 +570,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ClipboardSetArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::clipboard_set(g, &a)).await
+        self.run("glass_clipboard_set", ToolEffect::MayMutate, move |g| {
+            tools::clipboard_set(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -444,7 +596,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<BaselineSaveArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::baseline_save(g, &a)).await
+        self.run("glass_baseline_save", ToolEffect::MayMutate, move |g| {
+            tools::baseline_save(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -455,7 +610,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<DiffArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::diff(g, &a)).await
+        self.run("glass_diff", ToolEffect::ReadOnly, move |g| {
+            tools::diff(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -483,16 +641,15 @@ impl GlassServer {
     ) -> Result<CallToolResult, McpError> {
         let backend = crate::default_backend(std::env::var("GLASS_BACKEND").ok().as_deref());
         let deep = a.deep.unwrap_or(false);
-        // The probes are blocking (and `deep` spawns a display), so keep them off the
-        // stdio reactor thread.
         let report = self.report.clone();
-        let diag =
-            tokio::task::spawn_blocking(move || crate::doctor::diagnose_with_audit(deep, &report))
-                .await
-                .expect("doctor task panicked");
-        Ok(map_call_outcome(ToolCallOutcome::Success(
-            ToolOutput::result("glass_doctor", doctor_result(&diag, backend)),
-        )))
+        self.run("glass_doctor", ToolEffect::MayMutate, move |_| {
+            let diag = crate::doctor::diagnose_with_audit(deep, &report);
+            Ok(ToolOutput::result(
+                "glass_doctor",
+                doctor_result(&diag, backend),
+            ))
+        })
+        .await
     }
 
     #[tool(
@@ -512,10 +669,11 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<CapabilitiesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(map_tool_result(
+        self.run("glass_capabilities", ToolEffect::ReadOnly, move |_| {
             crate::capabilities::render_value(a.backend.as_deref())
-                .map(|v| ToolOutput::result("glass_capabilities", v)),
-        ))
+                .map(|value| ToolOutput::result("glass_capabilities", value))
+        })
+        .await
     }
 
     #[tool(
@@ -523,7 +681,12 @@ impl GlassServer {
         description = "List the app's top-level windows: id, title, class, geometry, and which is active. Returns a JSON array. Window ids are not stable across calls — re-list after windows open/close instead of caching ids."
     )]
     async fn glass_list_windows(&self) -> Result<CallToolResult, McpError> {
-        self.run(tools::list_windows).await
+        self.run(
+            "glass_list_windows",
+            ToolEffect::ReadOnly,
+            tools::list_windows,
+        )
+        .await
     }
 
     #[tool(
@@ -539,7 +702,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<SelectWindowArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::select_window(g, &a)).await
+        self.run("glass_select_window", ToolEffect::MayMutate, move |g| {
+            tools::select_window(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -550,7 +716,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<FindElementsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |glass| tools::find_elements(glass, &a)).await
+        self.run("glass_find_elements", ToolEffect::ReadOnly, move |glass| {
+            tools::find_elements(glass, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -583,7 +752,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<A11ySnapshotArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::a11y_snapshot(g, &a)).await
+        self.run("glass_a11y_snapshot", ToolEffect::ReadOnly, move |g| {
+            tools::a11y_snapshot(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -615,7 +787,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ClickElementArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::click_element(g, &a)).await
+        self.run("glass_click_element", ToolEffect::MayMutate, move |g| {
+            tools::click_element(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -652,7 +827,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<SetValueArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::set_value(g, &a)).await
+        self.run("glass_set_value", ToolEffect::MayMutate, move |g| {
+            tools::set_value(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -671,7 +849,8 @@ impl GlassServer {
                        accessibility tree is available — use glass_screenshot then."
     )]
     async fn glass_a11y_marks(&self) -> Result<CallToolResult, McpError> {
-        self.run(tools::a11y_marks).await
+        self.run("glass_a11y_marks", ToolEffect::ReadOnly, tools::a11y_marks)
+            .await
     }
 
     #[tool(
@@ -691,7 +870,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<LogsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::logs(g, &a)).await
+        self.run("glass_logs", ToolEffect::ReadOnly, move |g| {
+            tools::logs(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -716,7 +898,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<WaitForElementArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::wait_for_element(g, &a)).await
+        self.run("glass_wait_for_element", ToolEffect::ReadOnly, move |g| {
+            tools::wait_for_element(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -747,7 +932,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ScrollToElementArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::scroll_to_element(g, &a)).await
+        self.run("glass_scroll_to_element", ToolEffect::MayMutate, move |g| {
+            tools::scroll_to_element(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -767,7 +955,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<WaitForRegionArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::wait_for_region(g, &a)).await
+        self.run("glass_wait_for_region", ToolEffect::ReadOnly, move |g| {
+            tools::wait_for_region(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -782,7 +973,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<WaitForLogArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |g| tools::wait_for_log(g, &a)).await
+        self.run("glass_wait_for_log", ToolEffect::ReadOnly, move |g| {
+            tools::wait_for_log(g, &a)
+        })
+        .await
     }
 
     #[tool(
@@ -814,7 +1008,10 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<DoArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run_batch(move |g| tools::do_actions(g, &a)).await
+        self.run_batch("glass_do", ToolEffect::MayMutate, move |g| {
+            tools::do_actions(g, &a)
+        })
+        .await
     }
 }
 
@@ -860,8 +1057,13 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for GlassServer {
     fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(SERVER_INSTRUCTIONS);
+        let mut info = ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_instructions(SERVER_INSTRUCTIONS);
         // Identify the server as glass in the MCP `initialize` handshake. The rmcp default
         // (`Implementation::from_build_env`) reports the transport crate's own name and version
         // (`rmcp` / its crate version), not glass's — so every connecting client would see the wrong
@@ -876,6 +1078,90 @@ impl ServerHandler for GlassServer {
         info.server_info.description = Some(crate::DESCRIPTION.to_string());
         info.server_info.website_url = crate::WEBSITE_URL.map(str::to_string);
         info
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        std::future::ready(Ok(ListResourcesResult::default()))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+        std::future::ready(Ok(ListResourceTemplatesResult::default()))
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+        let store = self.artifacts.clone();
+        async move {
+            let uri = request.uri;
+            let requested_uri = uri.clone();
+            let Some(store) = store else {
+                return Err(resource_error(
+                    ArtifactReadError::ExpiredOrUnavailable,
+                    "artifact_expired_or_unavailable",
+                ));
+            };
+            let read = tokio::task::spawn_blocking(move || store.read(&uri))
+                .await
+                .map_err(|_| resource_error(ArtifactReadError::ReadFailed, "artifact_read_failed"))?
+                .map_err(|error| match error {
+                    ArtifactReadError::ResourceNotFound => {
+                        resource_error(error, "resource_not_found")
+                    }
+                    ArtifactReadError::ExpiredOrUnavailable => {
+                        resource_error(error, "artifact_expired_or_unavailable")
+                    }
+                    ArtifactReadError::ReadFailed => resource_error(error, "artifact_read_failed"),
+                    ArtifactReadError::IntegrityFailed => {
+                        resource_error(error, "artifact_integrity_failed")
+                    }
+                })?;
+            let meta = Meta(serde_json::Map::from_iter([(
+                "glass".to_string(),
+                serde_json::json!({
+                    "untrusted": read.untrusted,
+                    "sha256": read.sha256,
+                }),
+            )]));
+            let contents = ResourceContents::text(read.text.clone(), requested_uri)
+                .with_mime_type(read.mime_type.clone())
+                .with_meta(meta);
+            let result = ReadResourceResult::new(vec![contents]);
+            // Keep the owning read and its pin alive through complete rmcp result construction.
+            drop(read);
+            Ok(result)
+        }
+    }
+}
+
+fn resource_error(error: ArtifactReadError, category: &'static str) -> McpError {
+    let data = Some(serde_json::json!({ "category": category }));
+    match error {
+        ArtifactReadError::ResourceNotFound => {
+            McpError::resource_not_found("resource not found", data)
+        }
+        ArtifactReadError::ExpiredOrUnavailable => McpError::resource_not_found(
+            "artifact expired or unavailable; rerun the producing read-only operation if safe",
+            data,
+        ),
+        ArtifactReadError::ReadFailed => {
+            McpError::new(ErrorCode::INTERNAL_ERROR, "artifact read failed", data)
+        }
+        ArtifactReadError::IntegrityFailed => McpError::new(
+            ErrorCode::INTERNAL_ERROR,
+            "artifact integrity check failed",
+            data,
+        ),
     }
 }
 
@@ -896,7 +1182,97 @@ pub(crate) fn registered_tools() -> std::collections::BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glass_core::HostPathAccess;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn resources_are_advertised_without_subscription_or_list_changed_capabilities() {
+        let server = GlassServer::new(
+            crate::boot(None),
+            crate::audit::report_from_config(None, |_| None),
+        );
+        let resources = server
+            .get_info()
+            .capabilities
+            .resources
+            .expect("resources capability");
+        assert_ne!(resources.subscribe, Some(true));
+        assert_ne!(resources.list_changed, Some(true));
+    }
+
+    #[test]
+    fn every_host_path_access_maps_exactly_to_target_access() {
+        let cases = [
+            (
+                HostPathAccess::DeniedBySandbox,
+                TargetAccess::DeniedBySandbox,
+            ),
+            (
+                HostPathAccess::NotGuaranteedSandboxOff,
+                TargetAccess::NotGuaranteedSandboxOff,
+            ),
+            (
+                HostPathAccess::HostFilesystemUnreachable,
+                TargetAccess::HostFilesystemUnreachable,
+            ),
+            (HostPathAccess::NoActiveTarget, TargetAccess::NoActiveTarget),
+        ];
+        for (host, expected) in cases {
+            assert_eq!(target_access(host), expected);
+        }
+    }
+
+    #[test]
+    fn oversized_read_only_outcome_is_bounded_and_link_reads_exact_full_text() {
+        let root = tempfile::tempdir().expect("temporary artifact root");
+        let store = ArtifactStore::for_test(root.path(), 64 * 1024 * 1024).expect("artifact store");
+        let body = "application-output-".repeat(700);
+        let observation = OutContent::untrusted_observation(&body);
+        let expected = observation.render_text().expect("wrapped observation");
+        let output =
+            ToolOutput::result_with("glass_logs", serde_json::json!({}), vec![observation]);
+        let applied = OutputPolicy::new(store.clone()).apply(ToolCallOutcome {
+            tool: "glass_logs",
+            effect: ToolEffect::ReadOnly,
+            is_error: false,
+            target_access: TargetAccess::DeniedBySandbox,
+            output,
+        });
+        assert!(applied.output.text_bytes() <= crate::output_policy::MAX_TEXT_BYTES);
+        let descriptor = applied
+            .output
+            .0
+            .iter()
+            .find_map(|content| match content {
+                OutContent::ResourceLink(descriptor) => Some(descriptor),
+                _ => None,
+            })
+            .expect("resource link");
+        let read = store
+            .read(descriptor.uri())
+            .expect("complete artifact read");
+        assert_eq!(read.text, expected);
+        assert!(read.untrusted);
+        assert_eq!(read.sha256, descriptor.sha256());
+    }
+
+    #[test]
+    fn server_clones_share_policy_and_artifact_registry() {
+        let root = tempfile::tempdir().expect("temporary artifact root");
+        let store = ArtifactStore::for_test(root.path(), 64 * 1024 * 1024).expect("artifact store");
+        let server = GlassServer::new_with_store(
+            crate::boot(None),
+            crate::audit::report_from_config(None, |_| None),
+            store,
+        )
+        .expect("server with store");
+        let clone = server.clone();
+        assert!(Arc::ptr_eq(&server.output_policy, &clone.output_policy));
+        assert_eq!(
+            server.artifact_store().map(|store| store.server_id()),
+            clone.artifact_store().map(|store| store.server_id())
+        );
+    }
 
     #[test]
     fn glass_do_schema_and_description_advertise_the_bounded_static_contract() {
@@ -1133,7 +1509,13 @@ mod tests {
             ),
             OutContent::trusted_error("detail"),
         ]);
-        let r = map_call_outcome(ToolCallOutcome::Error(out));
+        let r = map_call_outcome(ToolCallOutcome {
+            tool: "glass_test",
+            effect: ToolEffect::ReadOnly,
+            is_error: true,
+            target_access: TargetAccess::NoActiveTarget,
+            output: out,
+        });
         assert_eq!(r.is_error, Some(true));
         assert_eq!(r.content.len(), 2);
         assert!(first_text(&r).contains("step_failed"));

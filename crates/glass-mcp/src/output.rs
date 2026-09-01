@@ -72,24 +72,12 @@ impl EnvelopeBlock {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolEffect {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Reserved for output classification.")
-    )]
     ReadOnly,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Reserved for output classification.")
-    )]
     MayMutate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Target access describes resource availability.")
-)]
 pub(crate) enum TargetAccess {
     DeniedBySandbox,
     NotGuaranteedSandboxOff,
@@ -121,30 +109,24 @@ pub(crate) struct ArtifactDescriptor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Descriptor construction validates resource metadata before rendering."
-    )
-)]
 pub(crate) enum ArtifactDescriptorError {
     RelativePath,
     NonUtf8Path,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Descriptor accessors support artifact publication and verified reads."
-    )
-)]
 impl ArtifactDescriptor {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Used by artifact verification tests.")
+    )]
     pub(crate) fn uri(&self) -> &str {
         &self.uri
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Used by artifact verification tests.")
+    )]
     pub(crate) fn local_path(&self) -> &Path {
         Path::new(&self.local_path)
     }
@@ -164,13 +146,6 @@ impl ArtifactDescriptor {
     #[expect(
         clippy::too_many_arguments,
         reason = "Each argument is immutable metadata for one artifact descriptor."
-    )]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Descriptor construction validates resource metadata before rendering."
-        )
     )]
     pub(crate) fn new(
         kind: ArtifactKind,
@@ -250,13 +225,6 @@ impl ArtifactDescriptor {
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Resource links are a supported MCP output content variant."
-    )
-)]
 pub(crate) enum OutContent {
     Envelope(EnvelopeBlock),
     Text(TextBlock),
@@ -265,13 +233,6 @@ pub(crate) enum OutContent {
 }
 
 impl OutContent {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Individual text rendering supports MCP content conversion."
-        )
-    )]
     pub(crate) fn render_text(&self) -> Option<String> {
         match self {
             Self::Envelope(envelope) => Some(envelope.render()),
@@ -370,10 +331,7 @@ impl ToolOutput {
 
     #[cfg_attr(
         not(test),
-        expect(
-            dead_code,
-            reason = "Text blocks preserve response order for MCP conversion."
-        )
+        expect(dead_code, reason = "Used by output wire-shape tests.")
     )]
     pub(crate) fn render_text_blocks(&self) -> Vec<String> {
         self.0.iter().filter_map(OutContent::render_text).collect()
@@ -381,10 +339,7 @@ impl ToolOutput {
 
     #[cfg_attr(
         not(test),
-        expect(
-            dead_code,
-            reason = "Typed text access preserves trust and role metadata."
-        )
+        expect(dead_code, reason = "Used by output metadata tests.")
     )]
     pub(crate) fn text_block(&self, index: usize) -> Option<&TextBlock> {
         match self.0.get(index) {

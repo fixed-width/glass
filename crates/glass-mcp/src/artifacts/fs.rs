@@ -923,7 +923,6 @@ impl ArtifactStore {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn server_id(&self) -> String {
         self.inner.state.lock().map_or_else(
             |poisoned| poisoned.into_inner().server_id.clone(),

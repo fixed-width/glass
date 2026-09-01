@@ -402,10 +402,22 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
     glass
 }
 
+pub(crate) async fn cleanup_artifacts(store: Option<crate::artifacts::ArtifactStore>) {
+    let Some(store) = store else {
+        return;
+    };
+    match tokio::task::spawn_blocking(move || store.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => eprintln!("glass: artifact cleanup failed"),
+        Err(_) => eprintln!("glass: artifact cleanup worker failed"),
+    }
+}
+
 /// Serve MCP over stdio (the default transport) and tear down on EOF or signal.
 pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyhow::Result<()> {
     let server = GlassServer::new(glass, report);
     let sessions = server.sessions();
+    let artifacts = server.artifact_store();
     let service = server
         .serve(stdio())
         .await
@@ -419,6 +431,7 @@ pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyho
         }
     };
     shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET).await;
+    cleanup_artifacts(artifacts).await;
     if via_signal {
         std::process::exit(0);
     }
