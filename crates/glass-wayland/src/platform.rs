@@ -5454,14 +5454,23 @@ mod session_tests {
             .expect("chord");
         // An app reads ctrl+a as ctrl+a only if control is already down when the key arrives, so
         // the ordering is the claim: down, key, released.
-        let lines = s.wait_for_log("input: mods 0");
-        let at = |needle: &str| {
-            lines
-                .iter()
-                .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("no {needle:?} in {lines:#?}"))
-        };
-        let (down, key, up) = (at("input: mods 4"), at("input: key"), at("input: mods 0"));
+        let lines = s.wait_for_log_sequence(&["input: mods 4", "input: key", "input: mods 0"]);
+        let down = lines
+            .iter()
+            .position(|line| line.contains("input: mods 4"))
+            .expect("control down");
+        let key = lines
+            .iter()
+            .enumerate()
+            .skip(down + 1)
+            .find_map(|(index, line)| line.contains("input: key").then_some(index))
+            .expect("key after control down");
+        let up = lines
+            .iter()
+            .enumerate()
+            .skip(key + 1)
+            .find_map(|(index, line)| line.contains("input: mods 0").then_some(index))
+            .expect("control up after key");
         assert!(
             down < key && key < up,
             "control must be held before the key and released after it: {lines:#?}"
@@ -5650,7 +5659,7 @@ mod session_tests {
             sink.modifiers(true).expect("hold chord modifier");
             sink.key(true).expect("hold chord key");
         }
-        let chord = s.wait_for_log("input: mods 0");
+        let chord = s.wait_for_log_sequence(&["input: key", "input: mods 0"]);
         assert!(
             chord
                 .iter()
@@ -5681,7 +5690,7 @@ mod session_tests {
             };
             sink.modifiers(true).expect("hold scroll modifier");
         }
-        let scroll = s.wait_for_log("input: mods 0");
+        let scroll = s.wait_for_log_sequence(&["input: mods 4", "input: mods 0"]);
         assert!(
             scroll.iter().any(|line| line.ends_with("input: mods 4")),
             "the scroll modifier was held before drop: {scroll:#?}"
@@ -6120,7 +6129,7 @@ mod session_tests {
             .expect("scroll");
         // Waits for the *release*, which the sink emits after the wheel — waiting for the axis
         // would assert on a line that had not arrived yet.
-        let lines = s.wait_for_log("mods 0");
+        let lines = s.wait_for_log_sequence(&["input: mods 4", "input: axis", "input: mods 0"]);
         let mods: Vec<&String> = lines.iter().filter(|l| l.contains("input: mods")).collect();
         assert!(
             mods.iter().any(|l| l.ends_with("mods 4")),
