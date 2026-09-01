@@ -1321,3 +1321,175 @@ fn result_with_puts_envelope_first_then_extra() {
     );
     assert!(matches!(out.0[1], OutContent::Image(_)), "extra follows");
 }
+
+#[test]
+fn production_application_text_conduits_have_explicit_trust_roles() {
+    use glass_core::Stream;
+
+    fn start(glass: &mut Glass) {
+        glass
+            .start(&AppSpec {
+                build: None,
+                run: vec!["app".into()],
+                cwd: None,
+                env: vec![],
+                window_hint: None,
+                timeout_ms: 1,
+                sandbox: SandboxLevel::Off,
+                a11y: true,
+            })
+            .unwrap();
+    }
+
+    fn text_roles(output: &ToolOutput) -> Vec<(crate::output::TextTrust, crate::output::TextRole)> {
+        output
+            .0
+            .iter()
+            .filter_map(|content| match content {
+                OutContent::Text(text) => Some((text.trust, text.role)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let stable = vec![Frame::solid(100, 100, [0, 0, 0, 255]); 5];
+    let mut semantic =
+        glass_with_a11y(FakePlatform::new(100, 100).with_frames(stable), fake_tree());
+    start(&mut semantic);
+    let snapshot = a11y_snapshot(&mut semantic, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+    let automatic = click_element(
+        &mut semantic,
+        &ClickElementArgs {
+            id: 1,
+            return_: Some("snapshot".into()),
+        },
+    )
+    .unwrap();
+    let find = find_elements(
+        &mut semantic,
+        &FindElementsArgs {
+            query: Some("Save".into()),
+            role: None,
+            states: None,
+            within: None,
+            max_results: None,
+            max_nodes: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+    let marks = a11y_marks(&mut semantic).unwrap();
+    let wait_element = wait_for_element(
+        &mut semantic,
+        &WaitForElementArgs {
+            name: Some("Save".into()),
+            description: None,
+            role: None,
+            condition: None,
+            value: None,
+            value_contains: None,
+            interval_ms: Some(0),
+            timeout_ms: Some(1000),
+        },
+    )
+    .unwrap();
+
+    let mut ordinary = glass_with(
+        FakePlatform::new(100, 100).with_logs(vec![(Stream::Stdout, "application log")]),
+    );
+    start(&mut ordinary);
+    let logs = logs(
+        &mut ordinary,
+        &LogsArgs {
+            cursor: None,
+            max_lines: None,
+            stream: None,
+            contains: None,
+        },
+    )
+    .unwrap();
+    clipboard_set(
+        &mut ordinary,
+        &ClipboardSetArgs {
+            text: "application clipboard".into(),
+        },
+    )
+    .unwrap();
+    let clipboard = clipboard_get(&mut ordinary).unwrap();
+    let windows = list_windows(&mut ordinary).unwrap();
+    let mut waiting = glass_with(
+        FakePlatform::new(100, 100).with_logs(vec![(Stream::Stdout, "application wait log")]),
+    );
+    start(&mut waiting);
+    let wait_log = wait_for_log(
+        &mut waiting,
+        &WaitForLogArgs {
+            contains: "application".into(),
+            stream: None,
+            cursor: Some(0),
+            interval_ms: Some(0),
+            timeout_ms: Some(1000),
+        },
+    )
+    .unwrap();
+
+    let mut failed = glass_with_a11y_invoke_error(
+        FakePlatform::new(100, 100),
+        fake_tree(),
+        "application batch detail",
+    );
+    start(&mut failed);
+    a11y_snapshot(&mut failed, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+    let batch_error = do_actions(
+        &mut failed,
+        &DoArgs {
+            actions: vec![Action::ClickElement(ClickElementArgs {
+                id: 1,
+                return_: None,
+            })],
+            then: None,
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+
+    use crate::output::{TextRole, TextTrust};
+    let untrusted_observation = vec![(TextTrust::UntrustedApplication, TextRole::Observation)];
+    for (name, output, expected) in [
+        (
+            "explicit accessibility snapshot",
+            snapshot,
+            untrusted_observation.clone(),
+        ),
+        (
+            "automatic return snapshot",
+            automatic,
+            untrusted_observation.clone(),
+        ),
+        ("find", find, untrusted_observation.clone()),
+        ("logs", logs, untrusted_observation.clone()),
+        ("clipboard get", clipboard, untrusted_observation.clone()),
+        ("list windows", windows, untrusted_observation.clone()),
+        (
+            "accessibility marks",
+            marks,
+            vec![
+                (TextTrust::UntrustedApplication, TextRole::Observation),
+                (TextTrust::Trusted, TextRole::Guidance),
+            ],
+        ),
+        ("wait element", wait_element, untrusted_observation.clone()),
+        ("wait log", wait_log, untrusted_observation),
+        (
+            "batch error detail",
+            batch_error,
+            vec![
+                (TextTrust::Trusted, TextRole::ErrorDetail),
+                (TextTrust::UntrustedApplication, TextRole::Observation),
+            ],
+        ),
+    ] {
+        assert_eq!(text_roles(&output), expected, "{name}");
+    }
+}

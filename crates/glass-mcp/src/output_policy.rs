@@ -128,7 +128,7 @@ pub(crate) struct AppliedOutcome {
 pub(crate) struct OutputPolicy {
     store: Option<ArtifactStore>,
     permanently_disabled: AtomicBool,
-    diagnostic: Arc<dyn Fn(OutputDiagnostic) + Send + Sync>,
+    diagnostic: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -137,11 +137,15 @@ struct OutputDiagnostic {
     transition: &'static str,
 }
 
-fn stderr_diagnostic(diagnostic: OutputDiagnostic) {
-    eprintln!(
+fn render_diagnostic(diagnostic: OutputDiagnostic) -> String {
+    format!(
         "glass: output externalization {} ({})",
         diagnostic.transition, diagnostic.category
-    );
+    )
+}
+
+fn stderr_diagnostic(rendered: &str) {
+    eprintln!("{rendered}");
 }
 
 impl OutputPolicy {
@@ -197,19 +201,16 @@ impl OutputPolicy {
     }
 
     #[cfg(test)]
-    fn with_diagnostic_for_test(
+    pub(crate) fn with_diagnostic_for_test(
         store: ArtifactStore,
         diagnostics: Arc<std::sync::Mutex<Vec<String>>>,
     ) -> Self {
         Self {
             store: Some(store),
             permanently_disabled: AtomicBool::new(false),
-            diagnostic: Arc::new(move |diagnostic| {
+            diagnostic: Arc::new(move |rendered| {
                 if let Ok(mut captured) = diagnostics.lock() {
-                    captured.push(format!(
-                        "glass: output externalization {} ({})",
-                        diagnostic.transition, diagnostic.category
-                    ));
+                    captured.push(rendered.to_owned());
                 }
             }),
         }
@@ -242,6 +243,9 @@ impl OutputPolicy {
         {
             if let Some(applied) = self.try_content_blocks(store, &outcome, original_text_bytes) {
                 return applied;
+            }
+            if self.permanently_disabled.load(Ordering::Acquire) {
+                return incomplete(&outcome, original_text_bytes);
             }
             if let Some(applied) = self.try_manifest(store, &outcome, original_text_bytes) {
                 return applied;
@@ -296,7 +300,7 @@ impl OutputPolicy {
             let item = match store.prepare(draft) {
                 Ok(item) => item,
                 Err(error) => {
-                    self.disable_for_invariant(store, error);
+                    self.report_failure(store, error);
                     return None;
                 }
             };
@@ -319,7 +323,7 @@ impl OutputPolicy {
                 let published = match store.publish(prepared) {
                     Ok(batch) => batch,
                     Err(error) => {
-                        self.disable_for_invariant(store, error);
+                        self.report_failure(store, error);
                         return Some(incomplete(outcome, original_text_bytes));
                     }
                 };
@@ -345,7 +349,7 @@ impl OutputPolicy {
         let prepared = match store.prepare(ArtifactDraft::response_manifest(manifest, indices)) {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.disable_for_invariant(store, error);
+                self.report_failure(store, error);
                 return None;
             }
         };
@@ -359,14 +363,13 @@ impl OutputPolicy {
         let candidate = manifest_candidate(outcome, descriptor, &metadata);
         let (candidate, metadata) = stabilize(candidate, metadata, 0)?;
         if candidate.text_bytes() > MAX_TEXT_BYTES {
-            self.permanently_disabled.store(true, Ordering::Release);
-            store.mark_unavailable(ArtifactError::InvalidOutputState);
+            self.report_failure(store, ArtifactError::InvalidOutputState);
             return None;
         }
         let published = match store.publish(vec![prepared]) {
             Ok(batch) => batch,
             Err(error) => {
-                self.disable_for_invariant(store, error);
+                self.report_failure(store, error);
                 return Some(incomplete(outcome, original_text_bytes));
             }
         };
@@ -378,13 +381,27 @@ impl OutputPolicy {
         })
     }
 
-    fn disable_for_invariant(&self, store: &ArtifactStore, error: ArtifactError) {
-        self.permanently_disabled.store(true, Ordering::Release);
-        (self.diagnostic)(OutputDiagnostic {
+    fn report_failure(&self, store: &ArtifactStore, error: ArtifactError) {
+        let permanent = matches!(
+            error,
+            ArtifactError::RollbackFailed
+                | ArtifactError::PathRepresentationFailed
+                | ArtifactError::InvalidOutputState
+                | ArtifactError::MetadataDidNotStabilize
+        );
+        if permanent {
+            self.permanently_disabled.store(true, Ordering::Release);
+            store.mark_unavailable(error);
+        }
+        let rendered = render_diagnostic(OutputDiagnostic {
             category: artifact_error_category(error),
-            transition: "disabled",
+            transition: if permanent {
+                "permanently_disabled"
+            } else {
+                "retry_available"
+            },
         });
-        store.mark_unavailable(error);
+        (self.diagnostic)(&rendered);
     }
 }
 
@@ -775,6 +792,7 @@ mod tests {
     use super::*;
     use crate::artifacts::FaultStage;
     use crate::output::{TextBlock, TextRole, TextTrust};
+    use crate::params::{Action, DoArgs, WaitForElementArgs};
     use proptest::prelude::*;
     use serde_json::{Value, json};
 
@@ -806,6 +824,62 @@ mod tests {
             OutContent::ResourceLink(descriptor) => serde_json::to_value(descriptor).ok(),
             _ => None,
         }
+    }
+
+    fn real_batch_output(names: &[String]) -> ToolOutput {
+        use glass_core::{AxNode, AxNodeId, AxRect, AxRole, AxStates};
+
+        let mut tree = crate::tools::testutil::fake_tree();
+        tree.root.children = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| AxNode {
+                id: AxNodeId(0),
+                role: AxRole::Button,
+                raw_role: "button".into(),
+                name: Some(name.clone()),
+                description: None,
+                value: None,
+                states: AxStates {
+                    enabled: true,
+                    ..AxStates::default()
+                },
+                bounds: Some(AxRect {
+                    x: 0,
+                    y: index as i32,
+                    width: 10,
+                    height: 1,
+                }),
+                children: vec![],
+            })
+            .collect();
+        tree.assign_ids();
+        let mut glass = crate::tools::testutil::started_a11y_with(tree);
+        let actions = names
+            .iter()
+            .map(|name| {
+                Action::WaitForElement(WaitForElementArgs {
+                    name: Some(name.clone()),
+                    description: None,
+                    role: None,
+                    condition: None,
+                    value: None,
+                    value_contains: None,
+                    interval_ms: Some(0),
+                    timeout_ms: Some(1000),
+                })
+            })
+            .collect();
+        crate::tools::do_actions(
+            &mut glass,
+            &DoArgs {
+                actions,
+                then: None,
+                timeout_ms: None,
+                encoded_argument_bytes: 0,
+            },
+        )
+        .expect("real glass_do output")
     }
 
     #[test]
@@ -1156,6 +1230,74 @@ mod tests {
     }
 
     #[test]
+    fn whole_blocks_externalize_at_original_sibling_indices_without_reordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_root, store) = store()?;
+        let policy = OutputPolicy::new(store);
+        let output = real_batch_output(&[
+            format!("alpha-{}", "a".repeat(5_000)),
+            format!("beta-{}", "b".repeat(4_000)),
+            format!("gamma-{}", "g".repeat(5_000)),
+        ]);
+
+        let applied = policy.apply(policy_outcome(output));
+        let indices = applied
+            .output
+            .0
+            .iter()
+            .filter_map(|content| match content {
+                OutContent::ResourceLink(_) => {
+                    descriptor_value(content).and_then(|value| value["content_block"].as_u64())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(indices, vec![1, 3]);
+        assert!(matches!(applied.output.0[0], OutContent::Envelope(_)));
+        assert!(matches!(applied.output.0[1], OutContent::ResourceLink(_)));
+        assert!(matches!(applied.output.0[2], OutContent::Text(_)));
+        assert!(matches!(applied.output.0[3], OutContent::ResourceLink(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn whole_manifest_retains_every_original_index_mapping()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_root, store) = store()?;
+        let policy = OutputPolicy::new(store.clone());
+        let names = (0..64)
+            .map(|index| format!("sibling-{index}-{}", "x".repeat(120)))
+            .collect::<Vec<_>>();
+        let output = real_batch_output(&names);
+
+        let applied = policy.apply(policy_outcome(output));
+        let descriptor = applied
+            .output
+            .0
+            .iter()
+            .find_map(|content| match content {
+                OutContent::ResourceLink(descriptor) => Some(descriptor),
+                _ => None,
+            })
+            .expect("manifest resource link");
+        let manifest = store
+            .read(descriptor.uri())
+            .map_err(|error| format!("read: {error:?}"))?;
+        let value: serde_json::Value = serde_json::from_str(&manifest.text)?;
+        let indices = value["blocks"]
+            .as_array()
+            .expect("manifest blocks")
+            .iter()
+            .map(|block| block["index"].as_u64().expect("original index"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(value["schema"], "glass.output-manifest.v1");
+        assert_eq!(indices, (0..=64).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
     fn rollback_failure_disables_externalization_but_not_under_budget_output()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
@@ -1320,7 +1462,7 @@ mod tests {
         )
         .map_err(|error| format!("store setup: {error:?}"))?;
         let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let policy = OutputPolicy::with_diagnostic_for_test(store, diagnostics.clone());
+        let policy = OutputPolicy::with_diagnostic_for_test(store.clone(), diagnostics.clone());
         let marker = "artifact-body-secret-marker".repeat(512);
 
         let _ = policy.apply(policy_outcome(ToolOutput::result_with(
@@ -1337,6 +1479,100 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert!(!diagnostics[0].contains(&marker));
         assert!(diagnostics[0].contains("storage_failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn transient_publication_failure_does_not_disable_later_externalization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let store = ArtifactStore::for_test_with_fault(
+            root.path(),
+            TEST_STORE_BYTES,
+            FaultStage::TempWritten(0),
+        )
+        .map_err(|error| format!("store setup: {error:?}"))?;
+        let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let policy = OutputPolicy::with_diagnostic_for_test(store.clone(), diagnostics.clone());
+        let large_output = || {
+            policy_outcome(ToolOutput::result_with(
+                "glass_test",
+                json!({}),
+                vec![text(
+                    "x".repeat(8_300),
+                    TextTrust::UntrustedApplication,
+                    TextRole::Observation,
+                )],
+            ))
+        };
+
+        let first = policy.apply(large_output());
+        let second = policy.apply(large_output());
+
+        assert!(
+            first
+                .output_metadata()
+                .is_some_and(|metadata| !metadata.complete)
+        );
+        assert!(
+            second
+                .output_metadata()
+                .is_some_and(|metadata| metadata.complete)
+        );
+        assert!(
+            second
+                .output
+                .0
+                .iter()
+                .any(|item| matches!(item, OutContent::ResourceLink(_)))
+        );
+        let diagnostics = diagnostics.lock().map_err(|_| "diagnostics poisoned")?;
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("retry_available"));
+        Ok(())
+    }
+
+    #[test]
+    fn invariant_failure_disables_later_externalization() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempfile::tempdir()?;
+        let store = ArtifactStore::for_test_with_fault(
+            root.path(),
+            TEST_STORE_BYTES,
+            FaultStage::PreparePathRepresentationFails,
+        )
+        .map_err(|error| format!("store setup: {error:?}"))?;
+        let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let policy = OutputPolicy::with_diagnostic_for_test(store.clone(), diagnostics.clone());
+        let large_output = || {
+            policy_outcome(ToolOutput::result_with(
+                "glass_test",
+                json!({}),
+                vec![text(
+                    "x".repeat(8_300),
+                    TextTrust::UntrustedApplication,
+                    TextRole::Observation,
+                )],
+            ))
+        };
+
+        let first = policy.apply(large_output());
+        let second = policy.apply(large_output());
+
+        assert!(
+            first
+                .output_metadata()
+                .is_some_and(|metadata| !metadata.complete)
+        );
+        assert!(
+            second
+                .output_metadata()
+                .is_some_and(|metadata| !metadata.complete)
+        );
+        assert_eq!(store.registry_len(), 0);
+        let diagnostics = diagnostics.lock().map_err(|_| "diagnostics poisoned")?;
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("permanently_disabled"));
         Ok(())
     }
 

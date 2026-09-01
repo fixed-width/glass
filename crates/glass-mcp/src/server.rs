@@ -1301,7 +1301,7 @@ pub(crate) fn registered_tools() -> std::collections::BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::HostPathAccess;
+    use glass_core::{AxNode, AxRole, AxStates, HostPathAccess};
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
@@ -1801,6 +1801,92 @@ mod tests {
 
     fn first_text(r: &CallToolResult) -> String {
         r.content[0].as_text().expect("text content").text.clone()
+    }
+
+    fn assert_complete_externalized_result(result: &CallToolResult) {
+        let text_bytes = result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text())
+            .map(|text| text.text.len())
+            .sum::<usize>();
+        let envelope: serde_json::Value = result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text())
+            .find_map(|text| serde_json::from_str(&text.text).ok())
+            .unwrap_or_else(|| panic!("result envelope missing: {result:?}"));
+        let rendered = serde_json::to_string(result).expect("serialized MCP result");
+        assert!(text_bytes <= crate::output_policy::MAX_TEXT_BYTES);
+        assert!(rendered.contains("glass-artifact://"), "{rendered}");
+        assert_eq!(envelope["result"]["output"]["complete"], true);
+    }
+
+    fn large_server_tree() -> glass_core::AxTree {
+        let mut tree = crate::tools::testutil::fake_tree();
+        tree.root.children.extend((0..240).map(|index| AxNode {
+            id: glass_core::AxNodeId(0),
+            role: AxRole::Other,
+            raw_role: "static_text".into(),
+            name: Some(format!("application row {index} {}", "x".repeat(80))),
+            description: None,
+            value: None,
+            states: AxStates::default(),
+            bounds: None,
+            children: vec![],
+        }));
+        tree.assign_ids();
+        tree
+    }
+
+    #[tokio::test]
+    async fn explicit_and_automatic_snapshots_share_complete_server_output_policy() {
+        let root = tempfile::tempdir().expect("artifact root");
+        let store = ArtifactStore::for_test(root.path(), 64 * 1024 * 1024).expect("artifact store");
+        let glass = crate::tools::testutil::glass_with_a11y(
+            crate::tools::testutil::FakePlatform::new(100, 100)
+                .with_frames(vec![glass_core::Frame::solid(100, 100, [0, 0, 0, 255]); 4]),
+            large_server_tree(),
+        );
+        let server = GlassServer::new_with_store(
+            glass,
+            crate::audit::report_from_config(None, |_| None),
+            store,
+        )
+        .expect("server with store");
+        let sessions = server.sessions();
+        let mut glass = sessions.lock().await;
+        glass
+            .set_protected_host_paths(vec![])
+            .expect("clear fake-backend-only protection paths");
+        glass
+            .start(&glass_core::AppSpec {
+                build: None,
+                run: vec!["app".into()],
+                cwd: None,
+                env: vec![],
+                window_hint: None,
+                timeout_ms: 1,
+                sandbox: glass_core::SandboxLevel::Off,
+                a11y: true,
+            })
+            .expect("start target");
+        drop(glass);
+
+        let explicit = server
+            .glass_a11y_snapshot(Parameters(A11ySnapshotArgs { max_nodes: Some(0) }))
+            .await
+            .expect("explicit snapshot");
+        let automatic = server
+            .glass_click_element(Parameters(ClickElementArgs {
+                id: 1,
+                return_: Some("snapshot".into()),
+            }))
+            .await
+            .expect("automatic snapshot");
+
+        assert_complete_externalized_result(&explicit);
+        assert_complete_externalized_result(&automatic);
     }
 
     #[test]

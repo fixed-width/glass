@@ -242,6 +242,8 @@ pub(crate) enum FaultStage {
     RetentionAfterRegistryInsertion,
     #[cfg(test)]
     CommittedBatchRollbackCleanupFails,
+    #[cfg(test)]
+    PreparePathRepresentationFails,
     ShutdownRemoveContents,
     ShutdownRemoveDirectory,
     ShutdownCloseHandles,
@@ -393,6 +395,12 @@ impl ArtifactStore {
     }
 
     pub(crate) fn prepare(&self, draft: ArtifactDraft) -> Result<PreparedArtifact, ArtifactError> {
+        #[cfg(test)]
+        if self.inner.fault == Some(FaultStage::PreparePathRepresentationFails)
+            && !self.inner.fault_fired.swap(true, Ordering::AcqRel)
+        {
+            return Err(ArtifactError::PathRepresentationFailed);
+        }
         let (server_id, process_dir, available) = {
             let state = self
                 .inner
@@ -502,6 +510,8 @@ impl ArtifactStore {
             #[cfg(test)]
             Some(FaultStage::RetentionAfterRegistryInsertion)
             | Some(FaultStage::CommittedBatchRollbackCleanupFails) => true,
+            #[cfg(test)]
+            Some(FaultStage::PreparePathRepresentationFails) => false,
             Some(
                 FaultStage::TempCreated(_)
                 | FaultStage::TempWritten(_)
