@@ -6594,7 +6594,6 @@ mod tests {
             deadline,
             deadline,
         );
-        cleanup.disarm();
 
         assert!(
             matches!(error, glass_core::GlassError::Timeout(20)),
@@ -6604,6 +6603,7 @@ mod tests {
             !glass_proc_linux::any_alive(&[child_pid]),
             "session failure cleanup left child {child_pid} alive"
         );
+        cleanup.disarm();
     }
 
     #[test]
@@ -6631,7 +6631,6 @@ mod tests {
             deadline - std::time::Duration::from_nanos(1),
             deadline,
         );
-        cleanup.disarm();
 
         assert!(matches!(
             error,
@@ -6641,6 +6640,7 @@ mod tests {
             !glass_proc_linux::any_alive(&[child_pid]),
             "session failure cleanup left child {child_pid} alive"
         );
+        cleanup.disarm();
     }
 
     #[test]
