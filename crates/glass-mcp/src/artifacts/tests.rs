@@ -62,6 +62,15 @@ fn store_preserves_existing_operator_root_dacl_posture() {
     assert_eq!(fs::read_to_string(&unrelated).unwrap(), "leave me alone");
 }
 
+#[cfg(windows)]
+#[test]
+fn host_integrity_cleanup_is_not_collapsed_to_other() {
+    assert_eq!(
+        map_host_cleanup(glass_windows::HostFsError::Integrity),
+        ArtifactError::CleanupFailed(std::io::ErrorKind::InvalidData)
+    );
+}
+
 fn draft(text: &str) -> ArtifactDraft {
     ArtifactDraft::content_block(text, "text/plain; charset=utf-8", true, 1)
 }
@@ -1053,18 +1062,21 @@ fn shutdown_uses_the_retained_root_after_ancestor_replacement() {
 #[cfg(windows)]
 #[test]
 fn shutdown_uses_retained_root_when_ancestor_is_substituted_before_directory_removal() {
-    let parent = tempfile::tempdir().unwrap();
-    let root = parent.path().join("root");
-    fs::create_dir(&root).unwrap();
+    let grandparent = tempfile::tempdir().unwrap();
+    let parent = grandparent.path().join("parent");
+    let root = parent.join("root");
+    fs::create_dir_all(&root).unwrap();
     let store = ArtifactStore::for_test(&root, 1024).unwrap();
-    let detached = parent.path().join("detached-root");
-    let replacement_root = root.clone();
+    let detached = grandparent.path().join("detached-parent");
+    let replacement_parent = grandparent.path().join("replacement-parent");
+    let replacement_root = replacement_parent.join("root");
     let sentinel = replacement_root.join("sentinel");
     let sentinel_for_hook = sentinel.clone();
     set_fs_test_hook(TestHookPoint::BeforeProcessDirectoryRemove, move || {
-        fs::rename(&replacement_root, &detached).unwrap();
-        fs::create_dir(&replacement_root).unwrap();
+        fs::rename(&parent, &detached).unwrap();
+        fs::create_dir_all(&replacement_root).unwrap();
         fs::write(sentinel_for_hook, "replacement").unwrap();
+        fs::rename(replacement_parent, &parent).unwrap();
     });
 
     store.shutdown().unwrap();
@@ -1468,9 +1480,10 @@ fn replacing_process_directory_cannot_redirect_read() {
 #[cfg(windows)]
 #[test]
 fn replacing_root_ancestor_cannot_redirect_read() {
-    let parent = tempfile::tempdir().unwrap();
-    let root = parent.path().join("root");
-    fs::create_dir(&root).unwrap();
+    let grandparent = tempfile::tempdir().unwrap();
+    let parent = grandparent.path().join("parent");
+    let root = parent.join("root");
+    fs::create_dir_all(&root).unwrap();
     let outside = tempfile::tempdir().unwrap();
     let sentinel = outside.path().join("sentinel");
     fs::write(&sentinel, "keep").unwrap();
@@ -1484,12 +1497,13 @@ fn replacing_root_ancestor_cannot_redirect_read() {
         .local_path()
         .strip_prefix(&canonical_root)
         .unwrap();
-    let replacement_root = parent.path().join("replacement-root");
+    let replacement_parent = grandparent.path().join("replacement-parent");
+    let replacement_root = replacement_parent.join("root");
     let redirected = replacement_root.join(relative);
     fs::create_dir_all(redirected.parent().unwrap()).unwrap();
     fs::write(&redirected, "known").unwrap();
-    fs::rename(&root, parent.path().join("detached-root")).unwrap();
-    fs::rename(replacement_root, &root).unwrap();
+    fs::rename(&parent, grandparent.path().join("detached-parent")).unwrap();
+    fs::rename(replacement_parent, &parent).unwrap();
 
     assert_eq!(
         store.read(descriptor.uri()).unwrap_err(),

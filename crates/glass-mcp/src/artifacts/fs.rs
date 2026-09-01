@@ -881,16 +881,34 @@ impl ArtifactStore {
                 FaultStage::ShutdownRemoveDirectory,
                 ArtifactError::CleanupFailed(std::io::ErrorKind::PermissionDenied),
             )?;
-            let root_handle = state
-                .root_handle
-                .as_ref()
-                .ok_or(ArtifactError::InvalidOutputState)?;
-            let process_name = state
-                .process_dir
-                .file_name()
-                .ok_or(ArtifactError::InvalidOutputState)?;
             fire_fs_test_hook(TestHookPoint::BeforeProcessDirectoryRemove);
-            match remove_directory_from_handle(root_handle, &state.root, process_name) {
+            #[cfg(unix)]
+            let result = {
+                let root_handle = state
+                    .root_handle
+                    .as_ref()
+                    .ok_or(ArtifactError::InvalidOutputState)?;
+                let process_name = state
+                    .process_dir
+                    .file_name()
+                    .ok_or(ArtifactError::InvalidOutputState)?;
+                remove_directory_from_handle(root_handle, &state.root, process_name)
+            };
+            #[cfg(windows)]
+            let result = match state.process_dir_handle.take() {
+                Some(handle) => match glass_windows::remove_by_handle(&handle) {
+                    Ok(()) => {
+                        drop(handle);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        state.process_dir_handle = Some(handle);
+                        Err(map_host_cleanup(error))
+                    }
+                },
+                None => Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)),
+            };
+            match result {
                 Ok(()) => {}
                 Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)) => {}
                 Err(error) => return Err(error),
@@ -914,14 +932,15 @@ impl ArtifactStore {
                 .file_name()
                 .ok_or(ArtifactError::InvalidOutputState)?
                 .to_os_string();
+            #[cfg(unix)]
+            let server_id = state.server_id.clone();
+            #[cfg(unix)]
             let lease = state
                 .lease
                 .as_ref()
                 .ok_or(ArtifactError::InvalidOutputState)?
                 .try_clone()
                 .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
-            #[cfg(unix)]
-            let server_id = state.server_id.clone();
             fire_fs_test_hook(TestHookPoint::BeforeLeaseRemove);
             #[cfg(unix)]
             let result = remove_locked_lease_for_shutdown(
@@ -933,8 +952,27 @@ impl ArtifactStore {
                 || self.fire_test_hook(TestHookPoint::AfterLeaseQuarantine),
             );
             #[cfg(windows)]
-            let result =
-                remove_locked_lease_from_handle(&root_handle, &state.root, &lease_name, &lease);
+            let result = match state.lease.take() {
+                Some(lease) => {
+                    let result = remove_locked_lease_from_handle(
+                        &root_handle,
+                        &state.root,
+                        &lease_name,
+                        &lease,
+                    );
+                    match result {
+                        Ok(()) => {
+                            drop(lease);
+                            Ok(())
+                        }
+                        Err(error) => {
+                            state.lease = Some(lease);
+                            Err(error)
+                        }
+                    }
+                }
+                None => Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)),
+            };
             match result {
                 Ok(()) => {}
                 Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)) => {}
@@ -1514,6 +1552,10 @@ fn remove_owned_contents_from_handle(handle: &File, _path: &Path) -> Result<(), 
 }
 
 #[cfg(windows)]
+#[expect(
+    dead_code,
+    reason = "Retained local adapter for handle-safe cleanup tests."
+)]
 fn remove_directory_from_handle(
     parent: &File,
     _path: &Path,
@@ -1575,8 +1617,12 @@ fn process_file_bytes_from_handle(handle: &File, _path: &Path) -> Result<u64, Ar
 }
 
 #[cfg(windows)]
-fn map_host_cleanup(_error: glass_windows::HostFsError) -> ArtifactError {
-    ArtifactError::CleanupFailed(std::io::ErrorKind::Other)
+pub(crate) fn map_host_cleanup(error: glass_windows::HostFsError) -> ArtifactError {
+    let kind = match error {
+        glass_windows::HostFsError::Open => std::io::ErrorKind::Other,
+        glass_windows::HostFsError::Integrity => std::io::ErrorKind::InvalidData,
+    };
+    ArtifactError::CleanupFailed(kind)
 }
 
 #[cfg(test)]
@@ -1824,6 +1870,7 @@ fn remove_locked_lease_from_handle(
             std::io::ErrorKind::InvalidInput,
         ));
     }
+    drop(current);
     glass_windows::remove_by_handle(retained).map_err(map_host_cleanup)
 }
 

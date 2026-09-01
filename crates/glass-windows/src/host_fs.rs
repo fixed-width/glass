@@ -217,6 +217,13 @@ pub fn remove_by_handle(file: &File) -> Result<(), HostFsError> {
     }
 }
 
+#[cfg(test)]
+fn remove_retained(file: File) -> Result<(), HostFsError> {
+    remove_by_handle(&file)?;
+    drop(file);
+    Ok(())
+}
+
 fn parse_directory_records(
     bytes: &[u8],
     volume: u32,
@@ -621,7 +628,11 @@ pub fn path_has_private_dacl(path: &Path) -> glass_core::Result<bool> {
     unsafe {
         let _ = LocalFree(Some(HLOCAL(rendered.0.cast())));
     }
-    Ok(value == PRIVATE_DACL)
+    Ok(rendered_private_dacl_matches(&value))
+}
+
+fn rendered_private_dacl_matches(value: &str) -> bool {
+    value == PRIVATE_DACL || value.strip_suffix('\0') == Some(PRIVATE_DACL)
 }
 
 fn wide(path: &Path) -> Vec<u16> {
@@ -640,6 +651,69 @@ fn backend_error(operation: &str, error: windows::core::Error) -> GlassError {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn private_dacl_renderer_accepts_only_the_api_terminator_normalization() {
+        assert!(rendered_private_dacl_matches(&format!("{PRIVATE_DACL}\0")));
+        assert!(!rendered_private_dacl_matches(&format!(
+            "{PRIVATE_DACL}(A;;FA;;;WD)\0"
+        )));
+    }
+
+    #[test]
+    fn restricted_file_reports_private_dacl_after_round_trip() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private-file");
+        std::fs::write(&path, "private").unwrap();
+
+        restrict_path_to_current_user(&path).unwrap();
+
+        assert!(path_has_private_dacl(&path).unwrap());
+    }
+
+    #[test]
+    fn restricted_directory_reports_private_dacl_after_round_trip() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private-directory");
+        std::fs::create_dir(&path).unwrap();
+
+        restrict_path_to_current_user(&path).unwrap();
+
+        assert!(path_has_private_dacl(&path).unwrap());
+    }
+
+    #[test]
+    fn ordinary_temp_directory_does_not_report_private_dacl() {
+        let root = tempfile::tempdir().unwrap();
+
+        assert!(!path_has_private_dacl(root.path()).unwrap());
+    }
+
+    #[test]
+    fn remove_retained_file_is_absent_when_the_call_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("retained-file");
+        std::fs::write(&path, "retained").unwrap();
+        let directory = open_directory_no_reparse(root.path()).unwrap();
+        let file = open_file_child(&directory, OsStr::new("retained-file")).unwrap();
+
+        remove_retained(file).unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_retained_directory_is_absent_when_the_call_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("retained-directory");
+        std::fs::create_dir(&path).unwrap();
+        let parent = open_directory_no_reparse(root.path()).unwrap();
+        let directory = open_directory_beneath(&parent, OsStr::new("retained-directory")).unwrap();
+
+        remove_retained(directory).unwrap();
+
+        assert!(!path.exists());
+    }
 
     fn directory_record(name: &[u16], next: u32, record_len: usize) -> Vec<u8> {
         let fixed = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
