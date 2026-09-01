@@ -156,6 +156,7 @@ if ($Tests -ne "") {
         $tag = [System.IO.Path]::GetFileNameWithoutExtension($exe)
         $r = Invoke-Interactive $exe $tag "--ignored --test-threads=1 $Tests"
         Write-Host $r.text
+        $r.text | Out-File -Encoding ascii (Join-Path $artifacts "$tag-$Tests.log")
         if (-not ($r.ran -and $r.result -eq "0")) { $anyFail = $true }
       }
       if ($anyFail) { Write-Host "tests($Tests): FAIL"; $failures++ } else { Write-Host "tests($Tests): PASS" }

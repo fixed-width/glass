@@ -173,8 +173,8 @@ mod backend {
     use glass_core::frame::{Frame, Region};
     use glass_core::logbuf::Stream;
     use glass_core::platform::{
-        AppSpec, KeyEvent, Platform, PointerEvent, WindowGeometry, WindowHint, WindowId,
-        WindowInfo, WindowOp,
+        AppSpec, HostPathProtectionMode, KeyEvent, Platform, PointerEvent, ProtectedHostPath,
+        WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
     };
     use glass_core::{GlassError, Result};
 
@@ -201,6 +201,7 @@ mod backend {
         /// [`crate::util::raw_to_hwnd`] at the point of use. `None` until window
         /// discovery or `select_window` sets it.
         active_hwnd: Option<isize>,
+        protected_host_paths: Vec<ProtectedHostPath>,
     }
 
     impl WindowsPlatform {
@@ -210,6 +211,7 @@ mod backend {
                 app: None,
                 logs: Arc::new(Mutex::new(Vec::new())),
                 active_hwnd: None,
+                protected_host_paths: Vec::new(),
             })
         }
 
@@ -288,11 +290,20 @@ mod backend {
     }
 
     impl Platform for WindowsPlatform {
+        fn configure_protected_host_paths(
+            &mut self,
+            paths: &[ProtectedHostPath],
+        ) -> Result<HostPathProtectionMode> {
+            self.protected_host_paths = crate::containment::validate_protected_host_paths(paths)?;
+            Ok(HostPathProtectionMode::SandboxRules)
+        }
+
         fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
             // Resolve the containment provider before doing any work. `off` → Unconfined
             // (today's direct spawn); `default`/`strict` require an in-OS provider and
             // fail closed while Sandboxie availability is stubbed false (a later task).
-            let containment = crate::containment::resolve_containment(spec)?;
+            let containment =
+                crate::containment::resolve_containment(spec, &self.protected_host_paths)?;
             containment.run_build(spec)?;
             // Validate a usable display before launching — reject a degenerate 0x0
             // (headless / Session-0) where no window can ever appear.

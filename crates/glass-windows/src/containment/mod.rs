@@ -22,6 +22,9 @@ mod clip_onbox;
 #[cfg(all(test, windows))]
 mod build_onbox;
 
+#[cfg(all(test, windows))]
+mod artifact_onbox;
+
 #[cfg(windows)]
 pub(crate) use imp::{ClipboardRoute, Launched, LogSink, resolve_containment};
 
@@ -29,6 +32,9 @@ pub(crate) use imp::{ClipboardRoute, Launched, LogSink, resolve_containment};
 // without reaching into the private `sandboxie` module path.
 #[cfg(windows)]
 pub(crate) use sandboxie::{available, sandboxie_dir};
+
+#[cfg(windows)]
+pub(crate) use sandboxie::validate_protected_host_paths;
 
 /// Resolve the clip shim DLL path the way the launcher does (env > exe dir > None), for doctor.
 #[cfg(windows)]
@@ -39,6 +45,7 @@ pub(crate) fn config_shim_dll_path(exe_dir: Option<&str>) -> Option<String> {
 
 #[cfg(windows)]
 mod imp {
+    use glass_core::platform::ProtectedHostPath;
     use glass_core::{AppSpec, Deadline, GlassError, Result};
 
     /// Log lines captured from the app, tagged by stream. One alias, defined with the readers
@@ -62,7 +69,10 @@ mod imp {
     }
 
     /// Resolve which provider to use, or fail closed.
-    pub(crate) fn resolve_containment(spec: &AppSpec) -> Result<Containment> {
+    pub(crate) fn resolve_containment(
+        spec: &AppSpec,
+        protected_paths: &[ProtectedHostPath],
+    ) -> Result<Containment> {
         let choice = provider_choice()?;
         let dir = super::sandboxie::sandboxie_dir();
         match decide(spec.sandbox, choice, super::sandboxie::available(&dir)) {
@@ -70,7 +80,7 @@ mod imp {
             Decision::Sandboxie => {
                 let s =
                     super::sandboxie::Sandboxie::new(dir, format!("glass_{}", std::process::id()));
-                s.configure(spec.sandbox)?;
+                s.configure_with_paths(spec.sandbox, protected_paths)?;
                 Ok(Containment::Sandboxie(s))
             }
             Decision::FailClosed(msg) => Err(GlassError::SandboxUnavailable(msg)),

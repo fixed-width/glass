@@ -19,7 +19,9 @@
 //! - Teardown is `Start.exe /box:<box> /terminate`, then the wrapper is reaped, tailers
 //!   stopped, and the log dir removed.
 
+use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -28,6 +30,7 @@ use std::time::Duration;
 
 use glass_clip_shim_windows::store::PrivateClipboard;
 use glass_core::logbuf::Stream;
+use glass_core::platform::{ProtectedHostPath, ProtectedHostPathKind};
 use glass_core::{AppSpec, Deadline, GlassError, Result, SandboxLevel};
 
 use super::clip_server::ClipServer;
@@ -37,6 +40,28 @@ use super::imp::LogSink;
 /// Compat templates appended to every glass box. REQUIRED — without these, common host
 /// programs (PowerShell, etc.) fail to run inside the box.
 pub(crate) const COMPAT_TEMPLATES: &[&str] = &["SkipHook", "FileCopy", "qWave", "LingerPrograms"];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BoxAppend {
+    Template(OsString),
+    ClosedFilePath(OsString),
+}
+
+fn box_appends(level: SandboxLevel, protected_paths: &[ProtectedHostPath]) -> Vec<BoxAppend> {
+    let mut appends = COMPAT_TEMPLATES
+        .iter()
+        .map(|template| BoxAppend::Template(OsString::from(template)))
+        .collect::<Vec<_>>();
+    if config::box_net(level).close_afd {
+        appends.push(BoxAppend::ClosedFilePath(OsString::from(r"\Device\Afd*")));
+    }
+    appends.extend(
+        closed_file_paths(level, protected_paths)
+            .into_iter()
+            .map(|path| BoxAppend::ClosedFilePath(path.into_os_string())),
+    );
+    appends
+}
 
 /// Resolve the Sandboxie install directory: explicit (none) > env `GLASS_SANDBOXIE_DIR` >
 /// registry probe > the Classic default install path.
@@ -190,7 +215,16 @@ impl Sandboxie {
 
     /// Configure the box for `level`: strict global gate first, then the policy `set` pairs,
     /// the compat templates, the strict AFD device close, and a `/reload`.
+    #[cfg(test)]
     pub(crate) fn configure(&self, level: SandboxLevel) -> Result<()> {
+        self.configure_with_paths(level, &[])
+    }
+
+    pub(crate) fn configure_with_paths(
+        &self,
+        level: SandboxLevel,
+        protected_paths: &[ProtectedHostPath],
+    ) -> Result<()> {
         // This box's persistent ini section is about to exist; arm the guard so
         // any failure before a successful launch() clears it (see the struct doc).
         self.section_armed.store(true, Ordering::Relaxed);
@@ -224,21 +258,42 @@ impl Sandboxie {
             self.run_sbie(&sbieini, &["set", &self.box_name, key, value])?;
         }
 
-        // 3. compat templates.
-        for tmpl in COMPAT_TEMPLATES {
-            self.run_sbie(&sbieini, &["append", &self.box_name, "Template", tmpl])?;
+        // 3-5. Compatibility templates, strict AFD closure, then protected host paths.
+        for append in box_appends(level, protected_paths) {
+            let (key, value) = match append {
+                BoxAppend::Template(value) => ("Template", value),
+                BoxAppend::ClosedFilePath(value) => ("ClosedFilePath", value),
+            };
+            let status = Command::new(&sbieini)
+                .arg("append")
+                .arg(&self.box_name)
+                .arg(key)
+                .arg(&value)
+                .status()
+                .map_err(|e| {
+                    clear_box_section(&self.dir, &self.box_name);
+                    self.section_armed.store(false, Ordering::Relaxed);
+                    GlassError::SandboxUnavailable(format!(
+                        "installing protected host path in Sandboxie: {e}"
+                    ))
+                })?;
+            if !status.success() {
+                clear_box_section(&self.dir, &self.box_name);
+                self.section_armed.store(false, Ordering::Relaxed);
+                return Err(GlassError::SandboxUnavailable(format!(
+                    "installing protected host path in Sandboxie failed with status {status}"
+                )));
+            }
         }
 
-        // 4. strict: belt the no-network policy by closing the AFD socket device.
-        if config::box_net(level).close_afd {
-            self.run_sbie(
-                &sbieini,
-                &["append", &self.box_name, "ClosedFilePath", r"\Device\Afd*"],
-            )?;
+        // 6. Reload only after every closed path has been installed.
+        if let Err(error) = self.run_sbie(&start_exe(&dir), &["/reload"]) {
+            clear_box_section(&self.dir, &self.box_name);
+            self.section_armed.store(false, Ordering::Relaxed);
+            return Err(GlassError::SandboxUnavailable(format!(
+                "reloading protected Sandboxie policy: {error}"
+            )));
         }
-
-        // 5. reload so the service picks up the new box config.
-        self.run_sbie(&start_exe(&dir), &["/reload"])?;
         Ok(())
     }
 
@@ -309,6 +364,53 @@ impl Sandboxie {
             clip: clip.map(|(store, server, _)| (store, server)),
         })
     }
+}
+
+pub(crate) fn closed_file_paths(
+    level: SandboxLevel,
+    protected_paths: &[ProtectedHostPath],
+) -> Vec<PathBuf> {
+    if level == SandboxLevel::Off {
+        return Vec::new();
+    }
+    protected_paths
+        .iter()
+        .map(|path| path.path.clone())
+        .collect()
+}
+
+pub(crate) fn validate_protected_host_paths(
+    paths: &[ProtectedHostPath],
+) -> Result<Vec<ProtectedHostPath>> {
+    paths
+        .iter()
+        .map(|protected| {
+            validate_closed_path(&protected.path)?;
+            let valid_kind = match protected.kind {
+                ProtectedHostPathKind::Directory => {
+                    crate::open_directory_no_reparse(&protected.path).is_ok()
+                }
+                ProtectedHostPathKind::File => std::fs::symlink_metadata(&protected.path)
+                    .map(|metadata| metadata.is_file() && metadata.file_attributes() & 0x400 == 0)
+                    .unwrap_or(false),
+            };
+            if !valid_kind {
+                return Err(GlassError::SandboxUnavailable(
+                    "protected host path is missing, substituted, or has the wrong kind".into(),
+                ));
+            }
+            Ok(protected.clone())
+        })
+        .collect()
+}
+
+pub(crate) fn validate_closed_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() || path.parent().is_none() {
+        return Err(GlassError::SandboxUnavailable(
+            "protected host path must be an absolute non-root Windows path".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Tail `path` from a byte offset, ~100ms poll, splitting complete CRLF/LF lines and pushing
@@ -464,5 +566,81 @@ impl SandboxieApp {
         // process; until then a contained app records an unclean exit the same way every
         // teardown did before this path existed.
         crate::process::Closed::TerminatedUnasked { refused: 0 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    use glass_core::SandboxLevel;
+    use glass_core::platform::ProtectedHostPath;
+
+    use super::{BoxAppend, box_appends, closed_file_paths, validate_closed_path};
+
+    fn protected_paths() -> Vec<ProtectedHostPath> {
+        vec![
+            ProtectedHostPath::directory(PathBuf::from(
+                r"C:\Users\u\AppData\Local\glass\artifacts\server-a",
+            )),
+            ProtectedHostPath::file(PathBuf::from(
+                r"C:\Users\u\AppData\Local\glass\artifacts\server-a.lease",
+            )),
+        ]
+    }
+
+    #[test]
+    fn protected_paths_become_closed_file_path_entries_for_default_and_strict() {
+        let paths = protected_paths();
+        let expected = vec![
+            PathBuf::from(r"C:\Users\u\AppData\Local\glass\artifacts\server-a"),
+            PathBuf::from(r"C:\Users\u\AppData\Local\glass\artifacts\server-a.lease"),
+        ];
+
+        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
+            assert_eq!(closed_file_paths(level, &paths), expected);
+        }
+    }
+
+    #[test]
+    fn relative_windows_closed_path_fails_closed() {
+        assert!(validate_closed_path(Path::new(r"relative\artifact")).is_err());
+    }
+
+    #[test]
+    fn windows_root_closed_path_fails_closed() {
+        assert!(validate_closed_path(Path::new(r"C:\")).is_err());
+    }
+
+    #[test]
+    fn protected_closed_paths_follow_templates_and_strict_afd_closure() {
+        let paths = protected_paths();
+        let default = box_appends(SandboxLevel::Default, &paths);
+        let strict = box_appends(SandboxLevel::Strict, &paths);
+        let templates = ["SkipHook", "FileCopy", "qWave", "LingerPrograms"]
+            .map(|value| BoxAppend::Template(OsString::from(value)));
+        let protected = [
+            r"C:\Users\u\AppData\Local\glass\artifacts\server-a",
+            r"C:\Users\u\AppData\Local\glass\artifacts\server-a.lease",
+        ]
+        .map(|value| BoxAppend::ClosedFilePath(OsString::from(value)));
+
+        assert_eq!(
+            default,
+            templates
+                .clone()
+                .into_iter()
+                .chain(protected.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            strict,
+            templates
+                .into_iter()
+                .chain([BoxAppend::ClosedFilePath(OsString::from(r"\Device\Afd*"))])
+                .chain(protected)
+                .collect::<Vec<_>>()
+        );
     }
 }
