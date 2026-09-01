@@ -719,7 +719,7 @@ impl SandboxieApp {
     /// `/terminate` (stop the box producing output) → signal stop → **join** the tailers
     /// (each does a final `drain()` of the real log files) → kill+reap the wrapper → stop
     /// the clipboard pipe server → remove the log dir (only now that the tailers have exited
-    /// and read everything) → clear the box's config section so per-attempt `glass_<pid>_<attempt>`
+    /// and read everything) → clear the box's config section so per-attempt `glass_<process><attempt>`
     /// boxes don't accumulate in `Sandboxie.ini` (`SbieIni set <box> * ""` — the
     /// maintainer's documented box-clear).
     pub(crate) fn kill(mut self) -> crate::process::Closed {
