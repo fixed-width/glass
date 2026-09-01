@@ -3,7 +3,7 @@
 //! Drives Sandboxie via its CLI (`Start.exe` / `SbieIni.exe`) as subprocesses — no FFI,
 //! no linking against Sandboxie. The recipe is the on-box-validated one:
 //!
-//! - Per-attempt box `glass_<pid>_<attempt>` configured via `SbieIni.exe set/append` from the pure
+//! - Per-attempt box `glass_<pid>_<nonce>_<attempt>` configured via `SbieIni.exe set/append` from the pure
 //!   policy in [`super::config`], plus the compat templates (without which PowerShell etc.
 //!   break inside the box) and, for `strict`, a `ClosedFilePath \Device\Afd*` to belt the
 //!   `AllowNetworkAccess=n` policy.
@@ -20,12 +20,13 @@
 //!   stopped, and the log dir removed.
 
 use std::ffi::{OsStr, OsString};
+use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use glass_clip_shim_windows::store::PrivateClipboard;
@@ -124,12 +125,21 @@ fn require_success(
     }
 }
 
+fn box_name_for(pid: u32, process_nonce: u64, attempt: u64) -> String {
+    format!("glass_{pid}_{process_nonce:016x}_{attempt}")
+}
+
 pub(crate) fn unique_box_name() -> String {
     static ATTEMPT: AtomicU64 = AtomicU64::new(0);
-    format!(
-        "glass_{}_{}",
+    static PROCESS_NONCE: OnceLock<u64> = OnceLock::new();
+    let nonce = *PROCESS_NONCE.get_or_init(|| {
+        let state = std::collections::hash_map::RandomState::new();
+        state.build_hasher().finish()
+    });
+    box_name_for(
         std::process::id(),
-        ATTEMPT.fetch_add(1, Ordering::Relaxed)
+        nonce,
+        ATTEMPT.fetch_add(1, Ordering::Relaxed),
     )
 }
 
@@ -198,7 +208,7 @@ pub(crate) struct Sandboxie {
     /// section; disarmed by a successful `launch()` (which hands the clear to
     /// [`SandboxieApp::kill`]). While armed, dropping `Sandboxie` clears the
     /// section, so a failure anywhere between `configure()` and a successful
-    /// `launch()` never orphans a per-attempt `glass_<pid>_<attempt>` section in the
+    /// `launch()` never orphans a per-attempt Glass section in the
     /// shared `Sandboxie.ini`.
     section_armed: AtomicBool,
 }
@@ -351,6 +361,7 @@ impl Sandboxie {
             }
         }
 
+        clear_box_section_with(&self.dir, &self.box_name, &mut runner)?;
         self.section_armed.store(true, Ordering::Relaxed);
 
         for (key, value) in config::box_settings(level) {
@@ -417,6 +428,28 @@ impl Sandboxie {
         self.section_armed.load(Ordering::Relaxed)
     }
 
+    fn configure_logdir_with_runner(
+        &self,
+        logdir: &Path,
+        mut runner: impl FnMut(&OsStr, &[OsString]) -> std::io::Result<CommandOutcome>,
+    ) -> Result<()> {
+        let args = [
+            OsString::from("set"),
+            OsString::from(&self.box_name),
+            OsString::from("OpenFilePath"),
+            logdir.as_os_str().to_owned(),
+        ];
+        if let Err(error) = require_success(&mut runner, OsStr::new(&sbieini(&self.dir)), &args) {
+            return Err(self.configuration_failed(error, &mut runner));
+        }
+
+        let args = [OsString::from("/reload")];
+        if let Err(error) = require_success(&mut runner, OsStr::new(&start_exe(&self.dir)), &args) {
+            return Err(self.configuration_failed(error, &mut runner));
+        }
+        Ok(())
+    }
+
     /// Launch the app contained, redirecting its stdio to files in a per-session log dir and
     /// tailing those files into `logs`. Returns the live handle.
     pub(crate) fn launch(&self, spec: &AppSpec, logs: LogSink) -> Result<SandboxieApp> {
@@ -432,12 +465,10 @@ impl Sandboxie {
         })?;
 
         // Allow the box to write to the log dir on the host, then reload.
-        let logdir_str = logdir.to_string_lossy().into_owned();
-        self.run_sbie(
-            &sbieini(&self.dir),
-            &["set", &self.box_name, "OpenFilePath", &logdir_str],
-        )?;
-        self.run_sbie(&start_exe(&self.dir), &["/reload"])?;
+        if let Err(error) = self.configure_logdir_with_runner(&logdir, run_command) {
+            let _ = std::fs::remove_dir_all(&logdir);
+            return Err(error);
+        }
 
         let out_log = logdir.join("out.log");
         let err_log = logdir.join("err.log");
@@ -703,35 +734,68 @@ mod tests {
     use glass_core::platform::ProtectedHostPath;
 
     use super::{
-        BoxAppend, CommandOutcome, Sandboxie, box_appends, closed_file_paths, unique_box_name,
-        validate_closed_path,
+        BoxAppend, CommandOutcome, Sandboxie, box_appends, box_name_for, closed_file_paths,
+        unique_box_name, validate_closed_path,
     };
+
+    #[derive(Clone, Copy)]
+    enum FailureKind {
+        Spawn(io::ErrorKind),
+        Status,
+    }
+
+    #[derive(Clone)]
+    struct CommandFailure {
+        exe: OsString,
+        args: Vec<OsString>,
+        kind: FailureKind,
+        skip_matches: usize,
+        remaining: usize,
+    }
 
     #[derive(Default)]
     struct FakeRunner {
         commands: Vec<(OsString, Vec<OsString>)>,
-        fail_at: Option<(usize, io::ErrorKind)>,
-        nonzero_at: Option<usize>,
-        clear_failures: usize,
+        failures: Vec<CommandFailure>,
     }
 
     impl FakeRunner {
+        fn fail(&mut self, exe: &str, args: &[&str], kind: FailureKind) {
+            self.failures.push(CommandFailure {
+                exe: OsString::from(exe),
+                args: args.iter().map(OsString::from).collect(),
+                kind,
+                skip_matches: 0,
+                remaining: 1,
+            });
+        }
+
+        fn fail_after_match(&mut self, exe: &str, args: &[&str], kind: FailureKind) {
+            self.failures.push(CommandFailure {
+                exe: OsString::from(exe),
+                args: args.iter().map(OsString::from).collect(),
+                kind,
+                skip_matches: 1,
+                remaining: 1,
+            });
+        }
+
         fn run(&mut self, exe: &OsStr, args: &[OsString]) -> io::Result<CommandOutcome> {
-            let index = self.commands.len();
             self.commands.push((exe.to_owned(), args.to_vec()));
-            if self.fail_at.is_some_and(|(at, _)| at == index) {
-                return Err(io::Error::new(
-                    self.fail_at.expect("failure configured").1,
-                    "injected",
-                ));
-            }
-            let clear = args.get(2).is_some_and(|arg| arg == "*");
-            if clear && self.clear_failures > 0 {
-                self.clear_failures -= 1;
-                return Ok(CommandOutcome::failure(b"clear failed"));
-            }
-            if self.nonzero_at == Some(index) {
-                return Ok(CommandOutcome::failure(b"injected status"));
+            if let Some(failure) = self
+                .failures
+                .iter_mut()
+                .find(|failure| failure.remaining > 0 && failure.exe == exe && failure.args == args)
+            {
+                if failure.skip_matches > 0 {
+                    failure.skip_matches -= 1;
+                    return Ok(CommandOutcome::success(b""));
+                }
+                failure.remaining -= 1;
+                return match failure.kind {
+                    FailureKind::Spawn(kind) => Err(io::Error::new(kind, "injected")),
+                    FailureKind::Status => Ok(CommandOutcome::failure(b"injected status")),
+                };
             }
             Ok(CommandOutcome::success(
                 if args.first().is_some_and(|arg| arg == "query") {
@@ -741,6 +805,54 @@ mod tests {
                 },
             ))
         }
+
+        fn arguments(&self) -> Vec<Vec<String>> {
+            self.commands
+                .iter()
+                .map(|(_, args)| {
+                    args.iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    fn clear_command() -> Vec<String> {
+        vec!["set", "box", "*", ""]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn default_policy_prefix() -> Vec<Vec<String>> {
+        vec![
+            clear_command(),
+            vec!["set", "box", "Enabled", "y"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            vec!["set", "box", "KeepTokenIntegrity", "y"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            vec!["set", "box", "NotifyInternetAccessDenied", "n"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            vec!["set", "box", "NotifyStartRunAccessDenied", "n"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            vec!["set", "box", "AllowNetworkAccess", "y"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            vec!["set", "box", "OpenClipboard", "n"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        ]
     }
 
     fn protected_paths() -> Vec<ProtectedHostPath> {
@@ -811,10 +923,12 @@ mod tests {
     #[test]
     fn strict_query_nonzero_fails_before_any_box_mutation() {
         let sandboxie = Sandboxie::new("S".into(), "box".into());
-        let mut runner = FakeRunner {
-            nonzero_at: Some(0),
-            ..FakeRunner::default()
-        };
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["query", "GlobalSettings", "PromptForInternetAccess"],
+            FailureKind::Status,
+        );
 
         let error = sandboxie
             .configure_with_runner(SandboxLevel::Strict, &[], |exe, args| runner.run(exe, args))
@@ -830,10 +944,12 @@ mod tests {
     #[test]
     fn strict_query_spawn_failure_fails_before_any_box_mutation() {
         let sandboxie = Sandboxie::new("S".into(), "box".into());
-        let mut runner = FakeRunner {
-            fail_at: Some((0, io::ErrorKind::NotFound)),
-            ..FakeRunner::default()
-        };
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["query", "GlobalSettings", "PromptForInternetAccess"],
+            FailureKind::Spawn(io::ErrorKind::NotFound),
+        );
 
         let error = sandboxie
             .configure_with_runner(SandboxLevel::Strict, &[], |exe, args| runner.run(exe, args))
@@ -850,10 +966,12 @@ mod tests {
     #[test]
     fn append_spawn_failure_clears_and_stops_commands() {
         let sandboxie = Sandboxie::new("S".into(), "box".into());
-        let mut runner = FakeRunner {
-            fail_at: Some((6, io::ErrorKind::NotFound)),
-            ..FakeRunner::default()
-        };
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["append", "box", "Template", "SkipHook"],
+            FailureKind::Spawn(io::ErrorKind::NotFound),
+        );
 
         let error = sandboxie
             .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
@@ -865,18 +983,27 @@ mod tests {
             error,
             glass_core::GlassError::SandboxUnavailable(_)
         ));
-        assert_eq!(runner.commands.len(), 8);
-        assert_eq!(runner.commands.last().unwrap().1[2], "*");
+        let mut expected = default_policy_prefix();
+        expected.push(
+            vec!["append", "box", "Template", "SkipHook"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        expected.push(clear_command());
+        assert_eq!(runner.arguments(), expected);
         assert!(!sandboxie.section_is_armed());
     }
 
     #[test]
     fn append_nonzero_clears_and_stops_commands() {
         let sandboxie = Sandboxie::new("S".into(), "box".into());
-        let mut runner = FakeRunner {
-            nonzero_at: Some(6),
-            ..FakeRunner::default()
-        };
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["append", "box", "Template", "SkipHook"],
+            FailureKind::Status,
+        );
 
         let error = sandboxie
             .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
@@ -888,17 +1015,26 @@ mod tests {
             error,
             glass_core::GlassError::SandboxUnavailable(_)
         ));
-        assert_eq!(runner.commands.len(), 8);
-        assert_eq!(runner.commands.last().unwrap().1[2], "*");
+        let mut expected = default_policy_prefix();
+        expected.push(
+            vec!["append", "box", "Template", "SkipHook"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        expected.push(clear_command());
+        assert_eq!(runner.arguments(), expected);
     }
 
     #[test]
     fn reload_spawn_failure_clears_and_stops_commands() {
         let sandboxie = Sandboxie::new("S".into(), "box".into());
-        let mut runner = FakeRunner {
-            fail_at: Some((10, io::ErrorKind::NotFound)),
-            ..FakeRunner::default()
-        };
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\Start.exe",
+            &["/reload"],
+            FailureKind::Spawn(io::ErrorKind::NotFound),
+        );
 
         let error = sandboxie
             .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
@@ -910,8 +1046,18 @@ mod tests {
             error,
             glass_core::GlassError::SandboxUnavailable(_)
         ));
-        assert_eq!(runner.commands.len(), 12);
-        assert_eq!(runner.commands.last().unwrap().1[2], "*");
+        let mut expected = default_policy_prefix();
+        for template in ["SkipHook", "FileCopy", "qWave", "LingerPrograms"] {
+            expected.push(
+                vec!["append", "box", "Template", template]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            );
+        }
+        expected.push(vec!["/reload"].into_iter().map(str::to_owned).collect());
+        expected.push(clear_command());
+        assert_eq!(runner.arguments(), expected);
     }
 
     #[test]
@@ -925,18 +1071,11 @@ mod tests {
             })
             .unwrap();
 
-        let arguments = runner
-            .commands
-            .iter()
-            .map(|(_, args)| {
-                args.iter()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect()
-            })
-            .collect::<Vec<Vec<String>>>();
+        let arguments = runner.arguments();
         assert_eq!(
             arguments,
             vec![
+                vec!["set", "box", "*", ""],
                 vec!["set", "box", "Enabled", "y"],
                 vec!["set", "box", "KeepTokenIntegrity", "y"],
                 vec!["set", "box", "NotifyInternetAccessDenied", "n"],
@@ -953,13 +1092,40 @@ mod tests {
     }
 
     #[test]
+    fn successful_strict_configuration_queries_then_preclears_before_policy() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        let mut runner = FakeRunner::default();
+
+        sandboxie
+            .configure_with_runner(SandboxLevel::Strict, &[], |exe, args| runner.run(exe, args))
+            .unwrap();
+
+        assert_eq!(
+            &runner.arguments()[..3],
+            &[
+                vec!["query", "GlobalSettings", "PromptForInternetAccess"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                clear_command(),
+                vec!["set", "box", "Enabled", "y"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            ]
+        );
+    }
+
+    #[test]
     fn reload_nonzero_and_failed_clear_leave_armed_for_retry() {
         let sandboxie = Sandboxie::new("S".into(), "box".into());
-        let mut runner = FakeRunner {
-            nonzero_at: Some(10),
-            clear_failures: 1,
-            ..FakeRunner::default()
-        };
+        let mut runner = FakeRunner::default();
+        runner.fail(r"S\Start.exe", &["/reload"], FailureKind::Status);
+        runner.fail_after_match(
+            r"S\SbieIni.exe",
+            &["set", "box", "*", ""],
+            FailureKind::Status,
+        );
 
         let error = sandboxie
             .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
@@ -976,12 +1142,233 @@ mod tests {
             .retry_clear_with_runner(|exe, args| runner.run(exe, args))
             .unwrap();
         assert!(!sandboxie.section_is_armed());
-        assert_eq!(runner.commands.last().unwrap().1[2], "*");
+        assert_eq!(runner.arguments().last(), Some(&clear_command()));
     }
 
     #[test]
     fn box_names_are_unique_per_attempt() {
         assert_ne!(unique_box_name(), unique_box_name());
+    }
+
+    #[test]
+    fn box_names_differ_across_process_generators_with_reused_pid_and_attempt() {
+        let first = box_name_for(412, 0x1234, 0);
+        let second = box_name_for(412, 0x5678, 0);
+
+        assert_ne!(first, second);
+        assert!(first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        assert!(
+            second
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        );
+    }
+
+    #[test]
+    fn preclear_spawn_failure_stops_before_policy_mutation() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["set", "box", "*", ""],
+            FailureKind::Spawn(io::ErrorKind::NotFound),
+        );
+
+        let error = sandboxie
+            .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
+                runner.run(exe, args)
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::SandboxUnavailable(_)
+        ));
+        assert_eq!(runner.arguments(), vec![clear_command()]);
+        assert!(!sandboxie.section_is_armed());
+    }
+
+    #[test]
+    fn preclear_nonzero_stops_before_policy_mutation() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["set", "box", "*", ""],
+            FailureKind::Status,
+        );
+
+        let error = sandboxie
+            .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
+                runner.run(exe, args)
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::SandboxUnavailable(_)
+        ));
+        assert_eq!(runner.arguments(), vec![clear_command()]);
+        assert!(!sandboxie.section_is_armed());
+    }
+
+    #[test]
+    fn logdir_set_spawn_failure_clears_and_stops_before_reload() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        sandboxie
+            .section_armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["set", "box", "OpenFilePath", r"C:\logs"],
+            FailureKind::Spawn(io::ErrorKind::NotFound),
+        );
+
+        let error = sandboxie
+            .configure_logdir_with_runner(Path::new(r"C:\logs"), |exe, args| runner.run(exe, args))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::SandboxUnavailable(_)
+        ));
+        assert_eq!(
+            runner.arguments(),
+            vec![
+                vec!["set", "box", "OpenFilePath", r"C:\logs"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                clear_command(),
+            ]
+        );
+        assert!(!sandboxie.section_is_armed());
+    }
+
+    #[test]
+    fn logdir_set_nonzero_clears_and_stops_before_reload() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        sandboxie
+            .section_armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["set", "box", "OpenFilePath", r"C:\logs"],
+            FailureKind::Status,
+        );
+
+        let error = sandboxie
+            .configure_logdir_with_runner(Path::new(r"C:\logs"), |exe, args| runner.run(exe, args))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::SandboxUnavailable(_)
+        ));
+        assert_eq!(
+            runner.arguments(),
+            vec![
+                vec!["set", "box", "OpenFilePath", r"C:\logs"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                clear_command(),
+            ]
+        );
+    }
+
+    #[test]
+    fn logdir_reload_spawn_failure_clears_and_stops() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        sandboxie
+            .section_armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\Start.exe",
+            &["/reload"],
+            FailureKind::Spawn(io::ErrorKind::NotFound),
+        );
+
+        let error = sandboxie
+            .configure_logdir_with_runner(Path::new(r"C:\logs"), |exe, args| runner.run(exe, args))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::SandboxUnavailable(_)
+        ));
+        assert_eq!(
+            runner.arguments(),
+            vec![
+                vec!["set", "box", "OpenFilePath", r"C:\logs"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                vec!["/reload"].into_iter().map(str::to_owned).collect(),
+                clear_command(),
+            ]
+        );
+    }
+
+    #[test]
+    fn logdir_reload_nonzero_clears_and_stops() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        sandboxie
+            .section_armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut runner = FakeRunner::default();
+        runner.fail(r"S\Start.exe", &["/reload"], FailureKind::Status);
+
+        let error = sandboxie
+            .configure_logdir_with_runner(Path::new(r"C:\logs"), |exe, args| runner.run(exe, args))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::SandboxUnavailable(_)
+        ));
+        assert_eq!(
+            runner.arguments(),
+            vec![
+                vec!["set", "box", "OpenFilePath", r"C:\logs"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                vec!["/reload"].into_iter().map(str::to_owned).collect(),
+                clear_command(),
+            ]
+        );
+    }
+
+    #[test]
+    fn successful_logdir_configuration_sets_path_then_reloads() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        sandboxie
+            .section_armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut runner = FakeRunner::default();
+
+        sandboxie
+            .configure_logdir_with_runner(Path::new(r"C:\logs"), |exe, args| runner.run(exe, args))
+            .unwrap();
+
+        assert_eq!(
+            runner.arguments(),
+            vec![
+                vec!["set", "box", "OpenFilePath", r"C:\logs"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+                vec!["/reload"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            ]
+        );
+        assert!(sandboxie.section_is_armed());
     }
 
     #[test]
