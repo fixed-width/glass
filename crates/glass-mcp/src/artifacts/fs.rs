@@ -79,7 +79,37 @@ struct StoreState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TestHookPoint {
+    AfterAccountingEnumeration,
+    BeforeEvictionRemove,
+    AfterCleanupEnumeration,
+    BeforeCleanupRemove,
+    AfterScavengeEnumeration,
+    BeforeProcessDirectoryRemove,
+    BeforeLeaseRemove,
     AfterLeaseQuarantine,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FS_TEST_HOOK: std::cell::RefCell<Option<TestHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_fs_test_hook(point: TestHookPoint, hook: impl FnOnce() + Send + 'static) {
+    FS_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
+}
+
+fn fire_fs_test_hook(point: TestHookPoint) {
+    #[cfg(test)]
+    FS_TEST_HOOK.with(|slot| {
+        let scheduled = slot.borrow_mut().take();
+        match scheduled {
+            Some((scheduled, hook)) if scheduled == point => hook(),
+            other => *slot.borrow_mut() = other,
+        }
+    });
+    #[cfg(not(test))]
+    let _ = point;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -677,6 +707,7 @@ impl ArtifactStore {
                 return Ok(());
             };
             let filename = path.file_name().ok_or(ArtifactError::InvalidOutputState)?;
+            fire_fs_test_hook(TestHookPoint::BeforeEvictionRemove);
             remove_regular_file_from_handle(process_handle, &state.process_dir, filename)?;
             state.entries.remove(&id);
         }
@@ -739,6 +770,7 @@ impl ArtifactStore {
                 .process_dir
                 .file_name()
                 .ok_or(ArtifactError::InvalidOutputState)?;
+            fire_fs_test_hook(TestHookPoint::BeforeProcessDirectoryRemove);
             match remove_directory_from_handle(root_handle, &state.root, process_name) {
                 Ok(()) => {}
                 Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)) => {}
@@ -769,6 +801,7 @@ impl ArtifactStore {
                 .ok_or(ArtifactError::InvalidOutputState)?
                 .try_clone()
                 .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+            fire_fs_test_hook(TestHookPoint::BeforeLeaseRemove);
             #[cfg(unix)]
             let result = remove_locked_lease_for_shutdown(
                 &root_handle,
@@ -1205,11 +1238,14 @@ fn open_directory_from_handle(parent: &File, name: &OsStr) -> Result<File, Artif
 
 #[cfg(unix)]
 fn remove_owned_contents_from_handle(handle: &File, _path: &Path) -> Result<(), ArtifactError> {
-    for name in handle_directory_entries(handle)? {
+    let entries = handle_directory_entries(handle)?;
+    fire_fs_test_hook(TestHookPoint::AfterCleanupEnumeration);
+    for name in entries {
         match open_directory_from_handle(handle, &name) {
             Ok(child) => {
                 remove_owned_contents_from_handle(&child, Path::new("."))?;
                 drop(child);
+                fire_fs_test_hook(TestHookPoint::BeforeCleanupRemove);
                 remove_directory_from_handle(handle, Path::new("."), &name)?;
             }
             Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)) => {}
@@ -1269,7 +1305,9 @@ fn remove_regular_file_from_handle(
 #[cfg(unix)]
 fn process_file_bytes_from_handle(handle: &File, _path: &Path) -> Result<u64, ArtifactError> {
     let mut total = 0_u64;
-    for name in handle_directory_entries(handle)? {
+    let entries = handle_directory_entries(handle)?;
+    fire_fs_test_hook(TestHookPoint::AfterAccountingEnumeration);
+    for name in entries {
         if let Ok(child) = open_directory_from_handle(handle, &name) {
             total = total
                 .checked_add(process_file_bytes_from_handle(&child, Path::new("."))?)
@@ -1302,10 +1340,13 @@ fn process_file_bytes_from_handle(handle: &File, _path: &Path) -> Result<u64, Ar
 
 #[cfg(windows)]
 fn remove_owned_contents_from_handle(handle: &File, _path: &Path) -> Result<(), ArtifactError> {
-    for name in glass_windows::directory_entry_names(handle).map_err(map_host_cleanup)? {
+    let entries = glass_windows::directory_entry_names(handle).map_err(map_host_cleanup)?;
+    fire_fs_test_hook(TestHookPoint::AfterCleanupEnumeration);
+    for name in entries {
         match glass_windows::open_directory_beneath(handle, &name) {
             Ok(child) => {
                 remove_owned_contents_from_handle(&child, Path::new("."))?;
+                fire_fs_test_hook(TestHookPoint::BeforeCleanupRemove);
                 glass_windows::remove_by_handle(&child).map_err(map_host_cleanup)?;
             }
             Err(_) => {
@@ -1351,7 +1392,9 @@ fn remove_regular_file_from_handle(
 #[cfg(windows)]
 fn process_file_bytes_from_handle(handle: &File, _path: &Path) -> Result<u64, ArtifactError> {
     let mut total = 0_u64;
-    for name in glass_windows::directory_entry_names(handle).map_err(map_host_cleanup)? {
+    let entries = glass_windows::directory_entry_names(handle).map_err(map_host_cleanup)?;
+    fire_fs_test_hook(TestHookPoint::AfterAccountingEnumeration);
+    for name in entries {
         if let Ok(child) = glass_windows::open_directory_beneath(handle, &name) {
             total = total
                 .checked_add(process_file_bytes_from_handle(&child, Path::new("."))?)
@@ -1386,7 +1429,9 @@ fn scavenge_root_from_handle(
     root_handle: &File,
     lease_open_fault: Option<&Path>,
 ) -> Result<(), ArtifactError> {
-    for name in handle_directory_entries(root_handle)? {
+    let entries = handle_directory_entries(root_handle)?;
+    fire_fs_test_hook(TestHookPoint::AfterScavengeEnumeration);
+    for name in entries {
         let Some(name_text) = name.to_str() else {
             continue;
         };
@@ -1533,7 +1578,9 @@ fn scavenge_root_from_handle(
     root_handle: &File,
     lease_open_fault: Option<&Path>,
 ) -> Result<(), ArtifactError> {
-    for name in glass_windows::directory_entry_names(root_handle).map_err(map_host_cleanup)? {
+    let entries = glass_windows::directory_entry_names(root_handle).map_err(map_host_cleanup)?;
+    fire_fs_test_hook(TestHookPoint::AfterScavengeEnumeration);
+    for name in entries {
         let Some(name_text) = name.to_str() else {
             continue;
         };

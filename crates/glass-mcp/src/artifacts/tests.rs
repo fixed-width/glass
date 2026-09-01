@@ -480,6 +480,133 @@ fn retention_and_shutdown_do_not_follow_a_replaced_process_path() {
     assert_eq!(fs::read_to_string(&sentinel).unwrap(), "outside");
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn accounting_does_not_follow_a_nested_directory_substituted_after_enumeration() {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_dir as symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, vec![0_u8; 4096]).unwrap();
+    let store = ArtifactStore::for_test(root.path(), 8192).unwrap();
+    let nested = store.process_dir().join("nested");
+    let detached = root.path().join("detached-nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("owned"), "owned").unwrap();
+    let replacement = nested.clone();
+    let outside_path = outside.path().to_path_buf();
+    set_fs_test_hook(TestHookPoint::AfterAccountingEnumeration, move || {
+        fs::rename(&replacement, &detached).unwrap();
+        symlink(outside_path, replacement).unwrap();
+    });
+
+    assert_eq!(store.total_file_bytes().unwrap(), 0);
+    assert_eq!(fs::metadata(&sentinel).unwrap().len(), 4096);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn eviction_does_not_unlink_a_substitution_made_before_removal() {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "outside").unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1).unwrap();
+    let batch = publish_text(&store, "artifact");
+    let artifact = fs::read_dir(store.process_dir())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let detached = root.path().join("detached-artifact");
+    let detached_for_hook = detached.clone();
+    let replacement = artifact.clone();
+    let target = sentinel.clone();
+    set_fs_test_hook(TestHookPoint::BeforeEvictionRemove, move || {
+        fs::rename(&replacement, &detached_for_hook).unwrap();
+        symlink(target, replacement).unwrap();
+    });
+
+    drop(batch);
+
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "outside");
+    assert_eq!(fs::read_to_string(detached).unwrap(), "artifact");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn shutdown_does_not_follow_a_nested_substitution_after_enumeration() {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_dir as symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "outside").unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let nested = store.process_dir().join("nested");
+    let detached = root.path().join("detached-cleanup");
+    let detached_for_hook = detached.clone();
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("owned"), "owned").unwrap();
+    let replacement = nested.clone();
+    let outside_path = outside.path().to_path_buf();
+    set_fs_test_hook(TestHookPoint::AfterCleanupEnumeration, move || {
+        fs::rename(&replacement, &detached_for_hook).unwrap();
+        symlink(outside_path, replacement).unwrap();
+    });
+
+    store.shutdown().unwrap();
+
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "outside");
+    assert_eq!(fs::read_to_string(detached.join("owned")).unwrap(), "owned");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn scavenging_does_not_open_a_process_directory_substituted_after_enumeration() {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_dir as symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "outside").unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let process = root.path().join(format!("server-{id}"));
+    let detached = root.path().join("detached-stale");
+    let lease = root.path().join(format!("server-{id}.lease"));
+    fs::create_dir(&process).unwrap();
+    fs::write(process.join("owned"), "owned").unwrap();
+    fs::write(&lease, "").unwrap();
+    let replacement = process.clone();
+    let outside_path = outside.path().to_path_buf();
+    set_fs_test_hook(TestHookPoint::AfterScavengeEnumeration, move || {
+        fs::rename(&replacement, &detached).unwrap();
+        symlink(outside_path, replacement).unwrap();
+    });
+
+    let current = ArtifactStore::for_test(root.path(), 1024).unwrap();
+
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "outside");
+    assert!(lease.exists());
+    drop(current);
+}
+
 #[cfg(unix)]
 #[test]
 fn shutdown_preserves_a_replacement_lease() {
@@ -530,6 +657,46 @@ fn shutdown_uses_the_retained_root_after_ancestor_replacement() {
     store.shutdown().unwrap();
 
     assert_eq!(fs::read_to_string(&sentinel).unwrap(), "replacement");
+}
+
+#[cfg(windows)]
+#[test]
+fn shutdown_uses_retained_root_when_ancestor_is_substituted_before_directory_removal() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let store = ArtifactStore::for_test(&root, 1024).unwrap();
+    let detached = parent.path().join("detached-root");
+    let replacement_root = root.clone();
+    let sentinel = replacement_root.join("sentinel");
+    let sentinel_for_hook = sentinel.clone();
+    set_fs_test_hook(TestHookPoint::BeforeProcessDirectoryRemove, move || {
+        fs::rename(&replacement_root, &detached).unwrap();
+        fs::create_dir(&replacement_root).unwrap();
+        fs::write(sentinel_for_hook, "replacement").unwrap();
+    });
+
+    store.shutdown().unwrap();
+
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "replacement");
+}
+
+#[cfg(windows)]
+#[test]
+fn shutdown_preserves_lease_substituted_immediately_before_removal() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let lease = store.lease_path();
+    let retained = root.path().join("retained-lease");
+    let canonical = lease.clone();
+    let canonical_for_hook = canonical.clone();
+    set_fs_test_hook(TestHookPoint::BeforeLeaseRemove, move || {
+        fs::rename(&canonical_for_hook, retained).unwrap();
+        fs::write(canonical_for_hook, "replacement").unwrap();
+    });
+
+    assert!(store.shutdown().is_err());
+    assert_eq!(fs::read_to_string(canonical).unwrap(), "replacement");
 }
 
 #[test]
