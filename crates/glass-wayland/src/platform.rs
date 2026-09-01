@@ -440,6 +440,20 @@ fn launch_deadline_error(
     )
 }
 
+fn open_session_failure(
+    pending: &mut PendingWaylandSession,
+    error: GlassError,
+    timeout_ms: u64,
+    observed_at: Instant,
+    deadline: Instant,
+) -> GlassError {
+    if !time_remains(observed_at, deadline) {
+        launch_deadline_error(pending, timeout_ms, 0)
+    } else {
+        failed_launch_error(pending, error)
+    }
+}
+
 #[cfg(test)]
 impl WaylandPlatform {
     /// The active session's private runtime dir — where sway put both its wayland socket and its
@@ -1689,10 +1703,13 @@ fn bring_up_session(
         match open_session(&socket, runtime_dir.path(), deadline) {
             Ok(v) => v,
             Err(e) => {
-                if !time_remains(Instant::now(), deadline) {
-                    return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
-                }
-                return Err(failed_launch_error(&mut pending, e));
+                return Err(open_session_failure(
+                    &mut pending,
+                    e,
+                    spec.timeout_ms,
+                    Instant::now(),
+                    deadline,
+                ));
             }
         };
     if Instant::now() >= deadline {
@@ -6225,8 +6242,8 @@ mod tests {
         BwrapStatusPipe, LaunchCleanupOutcome, PendingWaylandSession, WaylandPlatform,
         compositor_service_deadline, failed_launch_error, find_wayland_socket,
         launch_cleanup_error, launch_deadline_error, launch_ready, launch_with_retry, nudge_x,
-        open_session, parse_sway_version, reap_pending, recover_after_grace, start_recovery_after,
-        time_remains, wayland_host_tree,
+        open_session, open_session_failure, parse_sway_version, reap_pending, recover_after_grace,
+        start_recovery_after, time_remains, wayland_host_tree,
     };
     use crate::command::{build_sway_command, sway_config};
     use glass_core::{
@@ -6550,6 +6567,80 @@ mod tests {
             error,
             glass_core::GlassError::Backend(ref message) if message == "primary launch failure"
         ));
+    }
+
+    #[test]
+    fn open_session_failure_reports_the_shared_deadline_when_observed_at_deadline() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded cleanup fixture");
+        let child_pid = child.id();
+        let mut pending = PendingWaylandSession {
+            child,
+            status: None,
+            ownership_root: Some(child_pid),
+        };
+        let mut cleanup = PendingCleanup(Some(&mut pending));
+        let deadline = std::time::Instant::now();
+
+        let error = open_session_failure(
+            cleanup.0.as_deref_mut().expect("armed cleanup guard"),
+            glass_core::GlassError::Backend("open session failed".into()),
+            20,
+            deadline,
+            deadline,
+        );
+        cleanup.disarm();
+
+        assert!(
+            matches!(error, glass_core::GlassError::Timeout(20)),
+            "{error}"
+        );
+        assert!(
+            !glass_proc_linux::any_alive(&[child_pid]),
+            "session failure cleanup left child {child_pid} alive"
+        );
+    }
+
+    #[test]
+    fn open_session_failure_preserves_the_cause_just_before_deadline() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded cleanup fixture");
+        let child_pid = child.id();
+        let mut pending = PendingWaylandSession {
+            child,
+            status: None,
+            ownership_root: Some(child_pid),
+        };
+        let mut cleanup = PendingCleanup(Some(&mut pending));
+        let deadline = std::time::Instant::now();
+
+        let error = open_session_failure(
+            cleanup.0.as_deref_mut().expect("armed cleanup guard"),
+            glass_core::GlassError::Backend("open session failed".into()),
+            20,
+            deadline - std::time::Duration::from_nanos(1),
+            deadline,
+        );
+        cleanup.disarm();
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::Backend(ref message) if message == "open session failed"
+        ));
+        assert!(
+            !glass_proc_linux::any_alive(&[child_pid]),
+            "session failure cleanup left child {child_pid} alive"
+        );
     }
 
     #[test]
