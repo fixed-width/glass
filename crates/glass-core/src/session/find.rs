@@ -39,6 +39,9 @@ impl Glass {
                     || matches!(result.scope, ScopeResolution::Ambiguous { .. })
             },
         )?;
+        if poll.timed_out_by == Some(crate::Whose::Caller) {
+            return Err(GlassError::caller_deadline_elapsed("find elements"));
+        }
         let matched = !poll.observation.matches.is_empty();
         Ok(FindElementsOutcome {
             result: poll.observation,
@@ -149,6 +152,26 @@ mod tests {
             .unwrap();
         assert!(!out.matched);
         assert!(out.timed_out);
+    }
+
+    #[test]
+    fn caller_deadline_after_a_fresh_read_is_an_error() {
+        let mut glass = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
+        glass.start(&spec()).unwrap();
+
+        let error = glass
+            .find_elements_by(
+                &FindElementsParams {
+                    query: query("absent"),
+                    max_nodes: None,
+                    timeout_ms: 500,
+                },
+                Deadline::from_millis(25),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.bound_owner(), Some(crate::Whose::Caller), "{error}");
+        assert!(error.to_string().contains("find elements:"), "{error}");
     }
 
     #[test]
