@@ -483,6 +483,86 @@ mod tests {
     }
 
     #[test]
+    fn every_semantic_state_parses_renders_and_matches_its_predicate() {
+        let cases = [
+            (
+                "enabled",
+                SemanticState::Enabled,
+                AxStates {
+                    enabled: true,
+                    ..Default::default()
+                },
+            ),
+            ("disabled", SemanticState::Disabled, AxStates::default()),
+            (
+                "checked",
+                SemanticState::Checked,
+                AxStates {
+                    checked: true,
+                    checkable: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "unchecked",
+                SemanticState::Unchecked,
+                AxStates {
+                    checkable: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "selected",
+                SemanticState::Selected,
+                AxStates {
+                    selected: true,
+                    ..Default::default()
+                },
+            ),
+            ("unselected", SemanticState::Unselected, AxStates::default()),
+            (
+                "expanded",
+                SemanticState::Expanded,
+                AxStates {
+                    expanded: true,
+                    ..Default::default()
+                },
+            ),
+            ("collapsed", SemanticState::Collapsed, AxStates::default()),
+            (
+                "focused",
+                SemanticState::Focused,
+                AxStates {
+                    focused: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "visible",
+                SemanticState::Visible,
+                AxStates {
+                    visible: true,
+                    ..Default::default()
+                },
+            ),
+            ("hidden", SemanticState::Hidden, AxStates::default()),
+        ];
+
+        for (name, expected, states) in cases {
+            let parsed = SemanticState::from_name(&name.to_ascii_uppercase());
+            assert_eq!(parsed, Some(expected), "failed to parse {name}");
+            assert_eq!(expected.as_str(), name);
+            assert!(expected.matches(&states), "failed to match {name}");
+        }
+        assert_eq!(SemanticState::from_name("unknown"), None);
+        assert!(!SemanticState::Enabled.matches(&AxStates::default()));
+        assert!(!SemanticState::Disabled.matches(&AxStates {
+            enabled: true,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
     fn semantic_query_ranks_exact_name_before_other_substrings() {
         let exact = node(AxRole::Button, Some("save"));
         let name = node(AxRole::Button, Some("Save account"));
@@ -696,5 +776,42 @@ mod tests {
             assert!(context.contains(name));
         }
         assert!(!context.contains("child 4"));
+    }
+
+    #[test]
+    fn scoped_context_starts_at_the_scope_and_keeps_exactly_four_ancestors_without_omission() {
+        let target = node(AxRole::Button, Some("Save target"));
+        let nested = (1..=3).rev().fold(target, |child, index| {
+            let mut parent = node(AxRole::Group, Some(&format!("inside {index}")));
+            parent.children.push(child);
+            parent
+        });
+        let mut scope = node(AxRole::Document, Some("Chosen scope"));
+        scope.children.push(nested);
+        let mut outside = node(AxRole::Group, Some("outside scope"));
+        outside.children.push(scope);
+        let tree = tree(vec![outside]);
+        let query = SemanticQuery::new(
+            SemanticSelector::new(Some("save target".into()), Some(AxRole::Button), Vec::new())
+                .unwrap(),
+            Some(
+                SemanticSelector::new(
+                    Some("chosen scope".into()),
+                    Some(AxRole::Document),
+                    Vec::new(),
+                )
+                .unwrap(),
+            ),
+            10,
+        )
+        .unwrap();
+
+        let context = &tree.semantic_query(&query).matches[0].context;
+        assert!(context.contains("Chosen scope"));
+        for name in ["inside 1", "inside 2", "inside 3"] {
+            assert!(context.contains(name));
+        }
+        assert!(!context.contains("outside scope"));
+        assert!(!context.contains("higher ancestors omitted"));
     }
 }
