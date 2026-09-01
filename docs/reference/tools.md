@@ -539,6 +539,37 @@ reads the Simulator's accessibility tree over `idb_companion` (install it — se
 [setup-ios.md](../how-to/setup-ios.md#input--accessibility)). See
 [reference/platforms.md](platforms.md) for per-OS backends (AT-SPI / UI Automation / uiautomator / AX / idb).
 
+### `glass_find_elements`
+
+Find a small ranked set of accessibility elements from one fresh bounded read. Use this when target
+text is approximate, duplicated, or not yet identified. Returned ids are actionable with the element
+tools and remain valid only until the UI changes.
+
+- `query` (string) — case-insensitive substring over accessible name, description and non-secure
+  value; optional when `role` or `states` is present.
+- `role` (string) — normalized target role.
+- `states` (array of string) — target predicates combined with AND.
+- `within` (object) — unique semantic scope with its own `query`, `role`, and `states`.
+- `max_results` (integer, default 10, range 1 through 20) — ranked result ceiling before the byte
+  budget.
+- `max_nodes` (integer) — the same walk-limit control as `glass_a11y_snapshot`.
+- `timeout_ms` (integer, default 0) — one read at zero; a positive value waits for at least one
+  match.
+
+Ranking is deterministic: exact name, name substring, description substring, value substring, then
+filter-only matches, with tree order breaking ties. Every match includes fixed compact context from
+up to four ancestors, the adjacent siblings, and up to three children. Target fields and the
+`within` fields each combine with AND. A `within` selector that matches more than one element is an
+ambiguous-scope error rather than a guessed scope.
+
+A positive soft timeout performs fresh bounded accessibility reads until a match arrives or the
+timeout expires, then returns trusted `matched`, `timed_out`, elapsed, scope, completeness,
+truncation, and omission counts. Secure values are never searched, ranked, returned, or copied into
+context. Application-derived match fields and context are contained in one nonce-delimited
+untrusted match block. Complete success and error text is limited to 8 KiB; lower-ranked context and
+fields may be shortened, then lower-ranked matches omitted, with the trusted counters reporting
+those omissions.
+
 ### `glass_a11y_snapshot`
 
 Capture the active window's accessibility tree as compact text. Returns `{}`; the tree itself
@@ -837,8 +868,8 @@ from:
   `glass_move`, `glass_do`
 - **multi_touch** → `glass_gesture`
 - **clipboard** → `glass_clipboard_get`, `glass_clipboard_set`
-- **accessibility** → `glass_a11y_snapshot`, `glass_a11y_marks`, `glass_click_element`,
-  `glass_set_value`, `glass_wait_for_element`, `glass_scroll_to_element`
+- **accessibility** → `glass_find_elements`, `glass_a11y_snapshot`, `glass_a11y_marks`,
+  `glass_click_element`, `glass_set_value`, `glass_wait_for_element`, `glass_scroll_to_element`
 - **window_move_resize** → `glass_window`
 
 For a valid backend **not** built into the running binary:

@@ -28,6 +28,7 @@ pub(crate) const OPERATION_TOOLS: &[(&str, &[&str])] = &[
     (
         "accessibility",
         &[
+            "glass_find_elements",
             "glass_a11y_snapshot",
             "glass_a11y_marks",
             "glass_click_element",
@@ -180,6 +181,14 @@ fn render_value_resolved(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accessibility_reports_find_elements() {
+        assert!(
+            tools_for("accessibility").contains(&"glass_find_elements"),
+            "accessibility capability must report glass_find_elements"
+        );
+    }
 
     #[test]
     fn available_only_for_compiled_in_backends() {
