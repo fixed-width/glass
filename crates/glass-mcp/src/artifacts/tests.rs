@@ -5,6 +5,393 @@ fn draft(text: &str) -> ArtifactDraft {
     ArtifactDraft::content_block(text, "text/plain; charset=utf-8", true, 1)
 }
 
+fn publish_text(store: &ArtifactStore, text: &str) -> PublishedBatch {
+    store
+        .publish(vec![store.prepare(draft(text)).unwrap()])
+        .unwrap()
+}
+
+#[test]
+fn oldest_unpinned_artifact_is_evicted_and_reads_do_not_refresh_age() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 12).unwrap();
+    let first = publish_text(&store, "aaaaaa");
+    let first_uri = first.descriptors()[0].uri().to_owned();
+    drop(first);
+    let second = publish_text(&store, "bbbbbb");
+    let second_uri = second.descriptors()[0].uri().to_owned();
+    drop(second);
+    assert_eq!(store.read(&first_uri).unwrap().text, "aaaaaa");
+
+    let third = publish_text(&store, "cccccc");
+    let third_uri = third.descriptors()[0].uri().to_owned();
+
+    assert_eq!(
+        store.read(&first_uri).unwrap_err(),
+        ArtifactReadError::ExpiredOrUnavailable
+    );
+    assert_eq!(store.read(&second_uri).unwrap().text, "bbbbbb");
+    assert_eq!(store.read(&third_uri).unwrap().text, "cccccc");
+}
+
+#[test]
+fn current_response_pin_can_temporarily_exceed_the_limit_then_evicts_on_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 4).unwrap();
+    let batch = publish_text(&store, "123456");
+    let uri = batch.descriptors()[0].uri().to_owned();
+
+    assert!(store.total_file_bytes().unwrap() >= 6);
+    assert!(store.read(&uri).is_ok());
+    drop(batch);
+
+    assert_eq!(
+        store.read(&uri).unwrap_err(),
+        ArtifactReadError::ExpiredOrUnavailable
+    );
+}
+
+#[test]
+fn read_pin_held_across_retention_keeps_artifact_until_read_drops() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 5).unwrap();
+    let first = publish_text(&store, "first!");
+    let first_uri = first.descriptors()[0].uri().to_owned();
+    let held_read = store.read(&first_uri).unwrap();
+    drop(first);
+
+    let second = publish_text(&store, "second");
+    let second_uri = second.descriptors()[0].uri().to_owned();
+    drop(second);
+
+    assert_eq!(held_read.text, "first!");
+    assert!(store.total_file_bytes().unwrap() >= 6);
+    assert_eq!(
+        store.read(&second_uri).unwrap_err(),
+        ArtifactReadError::ExpiredOrUnavailable
+    );
+    drop(held_read);
+    assert_eq!(
+        store.read(&first_uri).unwrap_err(),
+        ArtifactReadError::ExpiredOrUnavailable
+    );
+}
+
+#[test]
+fn retention_leaves_overage_when_every_registered_artifact_is_pinned() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 4).unwrap();
+    let batch = publish_text(&store, "123456");
+
+    store.enforce_retention().unwrap();
+
+    assert!(store.total_file_bytes().unwrap() >= 6);
+    assert!(store.read(batch.descriptors()[0].uri()).is_ok());
+}
+
+#[test]
+fn retention_counts_nested_unregistered_residue_without_refreshing_artifact_age() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 10).unwrap();
+    let batch = publish_text(&store, "123456");
+    let uri = batch.descriptors()[0].uri().to_owned();
+    let residue_dir = store.process_dir().join("residue");
+    fs::create_dir(&residue_dir).unwrap();
+    fs::write(residue_dir.join("temporary"), "abcdef").unwrap();
+    drop(batch);
+
+    store.enforce_retention().unwrap();
+
+    assert_eq!(
+        store.read(&uri).unwrap_err(),
+        ArtifactReadError::ExpiredOrUnavailable
+    );
+    assert_eq!(
+        fs::read_to_string(residue_dir.join("temporary")).unwrap(),
+        "abcdef"
+    );
+}
+
+#[test]
+fn failed_eviction_keeps_the_registry_entry_available_for_diagnostics() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 5).unwrap();
+    let batch = publish_text(&store, "123456");
+    let path = batch.descriptors()[0].local_path().to_path_buf();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("residue"), "123456").unwrap();
+    drop(batch);
+
+    assert!(store.enforce_retention().is_err());
+    assert_eq!(store.registry_len(), 1);
+}
+
+#[test]
+fn pin_drop_does_not_panic_when_the_registry_lock_is_poisoned() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let batch = publish_text(&store, "artifact");
+    store.poison_state_for_test();
+
+    assert!(std::panic::catch_unwind(|| drop(batch)).is_ok());
+}
+
+#[test]
+fn failed_publication_rollback_disables_later_publication_but_preserves_existing_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test_with_fault(
+        root.path(),
+        1024,
+        FaultStage::PublicationRollbackCleanupFails,
+    )
+    .unwrap();
+    let existing = publish_text(&store, "existing");
+    let uri = existing.descriptors()[0].uri().to_owned();
+
+    assert!(matches!(
+        store.publish(vec![store.prepare(draft("trigger")).unwrap()]),
+        Err(ArtifactError::RollbackFailed)
+    ));
+
+    assert_eq!(
+        store.availability_error(),
+        Some(ArtifactError::RollbackFailed)
+    );
+    assert_eq!(store.read(&uri).unwrap().text, "existing");
+    assert!(matches!(
+        store.prepare(draft("later")),
+        Err(ArtifactError::InvalidOutputState)
+    ));
+}
+
+fn make_stale_pair(root: &std::path::Path, id: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let process_dir = root.join(format!("server-{id}"));
+    let lease_path = root.join(format!("server-{id}.lease"));
+    fs::create_dir(&process_dir).unwrap();
+    fs::write(process_dir.join("residue"), "stale").unwrap();
+    fs::File::create(&lease_path).unwrap();
+    (process_dir, lease_path)
+}
+
+#[test]
+fn scavenger_removes_stale_pair_and_preserves_active_store() {
+    let root = tempfile::tempdir().unwrap();
+    let active = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let (stale_dir, stale_lease) = make_stale_pair(root.path(), "11111111111111111111111111111111");
+
+    ArtifactStore::scavenge_for_test(root.path()).unwrap();
+
+    assert!(active.process_dir().exists());
+    assert!(active.lease_path().exists());
+    assert!(!stale_dir.exists());
+    assert!(!stale_lease.exists());
+}
+
+#[test]
+fn scavenger_removes_nested_stale_contents_without_leaving_the_pair() {
+    let root = tempfile::tempdir().unwrap();
+    let (stale_dir, stale_lease) = make_stale_pair(root.path(), "66666666666666666666666666666666");
+    let nested = stale_dir.join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("residue"), "stale").unwrap();
+
+    ArtifactStore::scavenge_for_test(root.path()).unwrap();
+
+    assert!(!stale_dir.exists());
+    assert!(!stale_lease.exists());
+}
+
+#[test]
+fn scavenger_preserves_malformed_unpaired_and_lease_open_uncertainty() {
+    let root = tempfile::tempdir().unwrap();
+    let malformed = root.path().join("server-not-hex");
+    fs::create_dir(&malformed).unwrap();
+    let unpaired = root.path().join("server-22222222222222222222222222222222");
+    fs::create_dir(&unpaired).unwrap();
+    let (uncertain_dir, uncertain_lease) =
+        make_stale_pair(root.path(), "33333333333333333333333333333333");
+
+    ArtifactStore::scavenge_with_lease_open_fault_for_test(root.path(), &uncertain_lease).unwrap();
+
+    assert!(malformed.exists());
+    assert!(unpaired.exists());
+    assert!(uncertain_dir.exists());
+    assert!(uncertain_lease.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn scavenger_does_not_follow_symlink_candidate() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let link = root.path().join("server-44444444444444444444444444444444");
+    let lease = root
+        .path()
+        .join("server-44444444444444444444444444444444.lease");
+    symlink(outside.path(), &link).unwrap();
+    fs::File::create(&lease).unwrap();
+
+    ArtifactStore::scavenge_for_test(root.path()).unwrap();
+
+    assert!(fs::symlink_metadata(&link).is_ok());
+    assert!(lease.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn scavenger_unlinks_nested_symlink_without_touching_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "keep").unwrap();
+    let (stale_dir, stale_lease) = make_stale_pair(root.path(), "77777777777777777777777777777777");
+    symlink(&sentinel, stale_dir.join("link")).unwrap();
+
+    ArtifactStore::scavenge_for_test(root.path()).unwrap();
+
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep");
+    assert!(!stale_dir.exists());
+    assert!(!stale_lease.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn scavenger_does_not_follow_directory_reparse_candidate() {
+    use std::os::windows::fs::symlink_dir;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let link = root.path().join("server-55555555555555555555555555555555");
+    let lease = root
+        .path()
+        .join("server-55555555555555555555555555555555.lease");
+    symlink_dir(outside.path(), &link).unwrap();
+    fs::File::create(&lease).unwrap();
+
+    ArtifactStore::scavenge_for_test(root.path()).unwrap();
+
+    assert!(fs::symlink_metadata(&link).is_ok());
+    assert!(lease.exists());
+}
+
+#[test]
+fn shutdown_removes_registered_and_unregistered_files_and_is_idempotent() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let batch = publish_text(&store, "artifact");
+    let process_dir = store.process_dir();
+    let lease_path = store.lease_path();
+    let residue_dir = process_dir.join("residue");
+    fs::create_dir(&residue_dir).unwrap();
+    fs::write(residue_dir.join("temporary"), "temporary").unwrap();
+
+    store.shutdown().unwrap();
+    store.shutdown().unwrap();
+
+    assert!(!process_dir.exists());
+    assert!(!lease_path.exists());
+    drop(batch);
+}
+
+#[test]
+fn shutdown_closing_state_rejects_reads_and_publication_until_retry_succeeds() {
+    let root = tempfile::tempdir().unwrap();
+    let store =
+        ArtifactStore::for_test_with_fault(root.path(), 1024, FaultStage::ShutdownRemoveContents)
+            .unwrap();
+    let batch = publish_text(&store, "artifact");
+    let uri = batch.descriptors()[0].uri().to_owned();
+
+    assert!(store.shutdown().is_err());
+    assert_eq!(
+        store.read(&uri).unwrap_err(),
+        ArtifactReadError::ExpiredOrUnavailable
+    );
+    assert!(matches!(
+        store.prepare(draft("later")),
+        Err(ArtifactError::InvalidOutputState)
+    ));
+    store.shutdown().unwrap();
+}
+
+#[test]
+fn shutdown_retries_each_incomplete_cleanup_phase() {
+    for fault in [
+        FaultStage::ShutdownRemoveContents,
+        FaultStage::ShutdownRemoveDirectory,
+        FaultStage::ShutdownCloseHandles,
+        FaultStage::ShutdownRemoveLease,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::for_test_with_fault(root.path(), 1024, fault).unwrap();
+        let batch = publish_text(&store, "artifact");
+        let process_dir = store.process_dir();
+        let lease_path = store.lease_path();
+
+        assert!(store.shutdown().is_err(), "fault {fault:?} did not fail");
+        store.shutdown().unwrap();
+
+        assert!(!process_dir.exists());
+        assert!(!lease_path.exists());
+        drop(batch);
+    }
+}
+
+#[test]
+fn concurrent_shutdown_calls_are_serialized_and_finish_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let process_dir = store.process_dir();
+    let lease_path = store.lease_path();
+    let other = store.clone();
+
+    let thread = std::thread::spawn(move || other.shutdown());
+    store.shutdown().unwrap();
+    thread.join().unwrap().unwrap();
+
+    assert!(!process_dir.exists());
+    assert!(!lease_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_unlinks_symlink_without_touching_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "keep").unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    symlink(&sentinel, store.process_dir().join("link")).unwrap();
+
+    store.shutdown().unwrap();
+
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep");
+}
+
+#[cfg(windows)]
+#[test]
+fn shutdown_unlinks_directory_reparse_without_touching_its_target() {
+    use std::os::windows::fs::symlink_dir;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "keep").unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    symlink_dir(outside.path(), store.process_dir().join("link")).unwrap();
+
+    store.shutdown().unwrap();
+
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep");
+}
+
 #[test]
 fn store_creates_random_private_child_and_holds_lease() {
     let root = tempfile::tempdir().unwrap();

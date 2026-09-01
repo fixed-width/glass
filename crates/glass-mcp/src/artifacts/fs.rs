@@ -7,10 +7,11 @@ use crate::output::{ArtifactDescriptor, ArtifactKind};
 use fs4::FileExt;
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +50,7 @@ pub(crate) struct ArtifactStore {
 struct ArtifactStoreInner {
     state: Mutex<StoreState>,
     fault: Option<FaultStage>,
+    fault_fired: AtomicBool,
 }
 
 struct StoreState {
@@ -59,11 +61,26 @@ struct StoreState {
     process_dir_handle: Option<File>,
     server_id: String,
     entries: HashMap<String, RegistryEntry>,
+    expired_ids: HashSet<String>,
     next_seq: u64,
     limit_bytes: u64,
     availability_error: Option<ArtifactError>,
-    closing: bool,
-    closed: bool,
+    lifecycle: Lifecycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lifecycle {
+    Open,
+    Closing(CleanupProgress),
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CleanupProgress {
+    contents_removed: bool,
+    directory_removed: bool,
+    handles_closed: bool,
+    lease_removed: bool,
 }
 
 struct RegistryEntry {
@@ -170,6 +187,11 @@ pub(crate) enum FaultStage {
     ReadBodyFails,
     ProcessProtectionThenDirectoryCleanupFails,
     DirectoryCreateThenLeaseCleanupFails,
+    PublicationRollbackCleanupFails,
+    ShutdownRemoveContents,
+    ShutdownRemoveDirectory,
+    ShutdownCloseHandles,
+    ShutdownRemoveLease,
 }
 
 impl FaultStage {
@@ -233,6 +255,19 @@ impl ArtifactStore {
         Self::open(root, limit_bytes, random_id(), Some(fault))
     }
 
+    #[cfg(test)]
+    pub(crate) fn scavenge_for_test(root: &Path) -> Result<(), ArtifactError> {
+        scavenge_root(root, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scavenge_with_lease_open_fault_for_test(
+        root: &Path,
+        lease_path: &Path,
+    ) -> Result<(), ArtifactError> {
+        scavenge_root(root, Some(lease_path))
+    }
+
     fn open(
         root: &Path,
         limit_bytes: u64,
@@ -243,6 +278,7 @@ impl ArtifactStore {
         set_dir_private(root)?;
         let root = fs::canonicalize(root).map_err(|_| ArtifactError::RootCanonicalizeFailed)?;
         require_absolute_utf8(&root)?;
+        scavenge_root(&root, None)?;
         let process_dir = root.join(format!("server-{server_id}"));
         let lease_path = root.join(format!("server-{server_id}.lease"));
         require_immediate_child(&root, &process_dir)?;
@@ -285,13 +321,14 @@ impl ArtifactStore {
                     process_dir_handle: Some(process_dir_handle),
                     server_id,
                     entries: HashMap::new(),
+                    expired_ids: HashSet::new(),
                     next_seq: 0,
                     limit_bytes,
                     availability_error: None,
-                    closing: false,
-                    closed: false,
+                    lifecycle: Lifecycle::Open,
                 }),
                 fault,
+                fault_fired: AtomicBool::new(false),
             }),
         })
     }
@@ -306,7 +343,7 @@ impl ArtifactStore {
             (
                 state.server_id.clone(),
                 state.process_dir.clone(),
-                !state.closing && !state.closed && state.availability_error.is_none(),
+                state.lifecycle == Lifecycle::Open && state.availability_error.is_none(),
             )
         };
         if !available {
@@ -353,25 +390,21 @@ impl ArtifactStore {
                 .state
                 .lock()
                 .map_err(|_| ArtifactError::StatePoisoned)?;
-            if state.closing || state.closed || state.availability_error.is_some() {
+            if state.lifecycle != Lifecycle::Open || state.availability_error.is_some() {
                 return Err(ArtifactError::InvalidOutputState);
             }
-            let batch_bytes = prepared.iter().try_fold(0_u64, |sum, item| {
-                sum.checked_add(item.draft.text.len() as u64)
-                    .ok_or(ArtifactError::InvalidOutputState)
-            })?;
-            if batch_bytes > state.limit_bytes {
-                return Err(ArtifactError::InvalidOutputState);
-            }
+            let count =
+                u64::try_from(prepared.len()).map_err(|_| ArtifactError::InvalidOutputState)?;
+            state
+                .next_seq
+                .checked_add(count)
+                .ok_or(ArtifactError::InvalidOutputState)?;
         }
 
         let mut created = Vec::with_capacity(prepared.len() * 2);
         let result = self.write_and_rename(&prepared, &mut created);
         if let Err(error) = result {
-            return match rollback_paths(&created) {
-                Ok(()) => Err(error),
-                Err(()) => Err(ArtifactError::RollbackFailed),
-            };
+            return self.rollback_publication(&created, error);
         }
 
         let descriptors = prepared
@@ -385,22 +418,16 @@ impl ArtifactStore {
         let mut state = match self.inner.state.lock() {
             Ok(state) => state,
             Err(_) => {
-                return match rollback_paths(&created) {
-                    Ok(()) => Err(ArtifactError::StatePoisoned),
-                    Err(()) => Err(ArtifactError::RollbackFailed),
-                };
+                return self.rollback_publication(&created, ArtifactError::StatePoisoned);
             }
         };
-        if state.closing || state.closed || state.availability_error.is_some() {
+        if state.lifecycle != Lifecycle::Open || state.availability_error.is_some() {
             drop(state);
-            return match rollback_paths(&created) {
-                Ok(()) => Err(ArtifactError::InvalidOutputState),
-                Err(()) => Err(ArtifactError::RollbackFailed),
-            };
+            return self.rollback_publication(&created, ArtifactError::InvalidOutputState);
         }
         for item in prepared {
             let seq = state.next_seq;
-            state.next_seq = state.next_seq.saturating_add(1);
+            state.next_seq += 1;
             state.entries.insert(
                 item.id,
                 RegistryEntry {
@@ -413,13 +440,15 @@ impl ArtifactStore {
             );
         }
         drop(state);
-        Ok(PublishedBatch {
+        let batch = PublishedBatch {
             descriptors,
             pin: PinGuard {
                 store: Arc::downgrade(&self.inner),
                 artifact_ids: ids,
             },
-        })
+        };
+        self.enforce_retention()?;
+        Ok(batch)
     }
 
     fn write_and_rename(
@@ -430,6 +459,16 @@ impl ArtifactStore {
         for (index, item) in prepared.iter().enumerate() {
             let mut file = create_private_file(&item.temp_path)?;
             created.push(item.temp_path.clone());
+            let fail_rollback = self.inner.fault
+                == Some(FaultStage::PublicationRollbackCleanupFails)
+                && self
+                    .inner
+                    .state
+                    .lock()
+                    .is_ok_and(|state| !state.entries.is_empty());
+            if fail_rollback {
+                return Err(ArtifactError::WriteFailed);
+            }
             self.fail_at(FaultStage::TempCreated(index), ArtifactError::WriteFailed)?;
             file.write_all(item.draft.text.as_bytes())
                 .and_then(|()| file.sync_all())
@@ -449,11 +488,38 @@ impl ArtifactStore {
     }
 
     fn fail_at(&self, stage: FaultStage, error: ArtifactError) -> Result<(), ArtifactError> {
-        if self.inner.fault == Some(stage) {
+        if self.inner.fault == Some(stage)
+            && self
+                .inner
+                .fault_fired
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
             Err(error)
         } else {
             Ok(())
         }
+    }
+
+    fn rollback_publication(
+        &self,
+        paths: &[PathBuf],
+        original: ArtifactError,
+    ) -> Result<PublishedBatch, ArtifactError> {
+        let injected_failure = self.inner.fault
+            == Some(FaultStage::PublicationRollbackCleanupFails)
+            && self
+                .inner
+                .fault_fired
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        if !injected_failure && rollback_paths(paths).is_ok() {
+            return Err(original);
+        }
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.availability_error = Some(ArtifactError::RollbackFailed);
+        }
+        Err(ArtifactError::RollbackFailed)
     }
 
     pub(crate) fn read(&self, uri: &str) -> Result<ReadArtifact, ArtifactReadError> {
@@ -463,6 +529,9 @@ impl ArtifactStore {
                 .state
                 .lock()
                 .map_err(|_| ArtifactReadError::ExpiredOrUnavailable)?;
+            if state.lifecycle != Lifecycle::Open {
+                return Err(ArtifactReadError::ExpiredOrUnavailable);
+            }
             let id = parse_uri(uri, &state.server_id)?;
             let process_dir = state.process_dir.clone();
             let process_handle = state
@@ -471,10 +540,16 @@ impl ArtifactStore {
                 .ok_or(ArtifactReadError::ExpiredOrUnavailable)?
                 .try_clone()
                 .map_err(|_| ArtifactReadError::ReadFailed)?;
-            let entry = state
-                .entries
-                .get_mut(id)
-                .ok_or(ArtifactReadError::ResourceNotFound)?;
+            if !state.entries.contains_key(id) {
+                return if state.expired_ids.contains(id) {
+                    Err(ArtifactReadError::ExpiredOrUnavailable)
+                } else {
+                    Err(ArtifactReadError::ResourceNotFound)
+                };
+            }
+            let Some(entry) = state.entries.get_mut(id) else {
+                return Err(ArtifactReadError::ExpiredOrUnavailable);
+            };
             entry.pin_count = entry.pin_count.saturating_add(1);
             (
                 id.to_owned(),
@@ -559,32 +634,105 @@ impl ArtifactStore {
             })
     }
 
-    pub(crate) fn shutdown(&self) -> Result<(), ArtifactError> {
-        let (process_dir, lease_path, process_dir_handle, lease) = {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .map_err(|_| ArtifactError::StatePoisoned)?;
-            state.closing = true;
-            (
-                state.process_dir.clone(),
-                state.lease_path.clone(),
-                state.process_dir_handle.take(),
-                state.lease.take(),
-            )
-        };
-        drop(process_dir_handle);
-        remove_owned_dir(&process_dir)?;
-        drop(lease);
-        fs::remove_file(&lease_path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+    pub(crate) fn enforce_retention(&self) -> Result<(), ArtifactError> {
         let mut state = self
             .inner
             .state
             .lock()
             .map_err(|_| ArtifactError::StatePoisoned)?;
+        if state.lifecycle != Lifecycle::Open {
+            return Ok(());
+        }
+        loop {
+            if process_file_bytes_no_follow(&state.process_dir)? <= state.limit_bytes {
+                return Ok(());
+            }
+            let candidate = state
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.pin_count == 0)
+                .min_by_key(|(_, entry)| entry.creation_seq)
+                .map(|(id, entry)| (id.clone(), entry.path.clone()));
+            let Some((id, path)) = candidate else {
+                return Ok(());
+            };
+            remove_regular_file_no_follow(&path)?;
+            state.entries.remove(&id);
+            state.expired_ids.insert(id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total_file_bytes(&self) -> Result<u64, ArtifactError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ArtifactError::StatePoisoned)?;
+        process_file_bytes_no_follow(&state.process_dir)
+    }
+
+    pub(crate) fn shutdown(&self) -> Result<(), ArtifactError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ArtifactError::StatePoisoned)?;
+        let mut progress = match state.lifecycle {
+            Lifecycle::Open => CleanupProgress::default(),
+            Lifecycle::Closing(progress) => progress,
+            Lifecycle::Closed => return Ok(()),
+        };
+        state.lifecycle = Lifecycle::Closing(progress);
+
+        if !progress.contents_removed {
+            self.fail_at(
+                FaultStage::ShutdownRemoveContents,
+                ArtifactError::CleanupFailed(std::io::ErrorKind::PermissionDenied),
+            )?;
+            remove_owned_contents(&state.process_dir)?;
+            progress.contents_removed = true;
+            state.lifecycle = Lifecycle::Closing(progress);
+        }
+        if !progress.directory_removed {
+            self.fail_at(
+                FaultStage::ShutdownRemoveDirectory,
+                ArtifactError::CleanupFailed(std::io::ErrorKind::PermissionDenied),
+            )?;
+            match fs::remove_dir(&state.process_dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ArtifactError::CleanupFailed(error.kind())),
+            }
+            progress.directory_removed = true;
+            state.lifecycle = Lifecycle::Closing(progress);
+        }
+        if !progress.handles_closed {
+            self.fail_at(
+                FaultStage::ShutdownCloseHandles,
+                ArtifactError::CleanupFailed(std::io::ErrorKind::PermissionDenied),
+            )?;
+            drop(state.process_dir_handle.take());
+            drop(state.lease.take());
+            progress.handles_closed = true;
+            state.lifecycle = Lifecycle::Closing(progress);
+        }
+        if !progress.lease_removed {
+            self.fail_at(
+                FaultStage::ShutdownRemoveLease,
+                ArtifactError::CleanupFailed(std::io::ErrorKind::PermissionDenied),
+            )?;
+            match fs::remove_file(&state.lease_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ArtifactError::CleanupFailed(error.kind())),
+            }
+            progress.lease_removed = true;
+            state.lifecycle = Lifecycle::Closing(progress);
+        }
         state.entries.clear();
-        state.closed = true;
+        state.expired_ids.clear();
+        state.lifecycle = Lifecycle::Closed;
         Ok(())
     }
 
@@ -603,6 +751,15 @@ impl ArtifactStore {
             |state| state.entries.len(),
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn poison_state_for_test(&self) {
+        let inner = Arc::clone(&self.inner);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = inner.state.lock().unwrap();
+            panic!("poison artifact state for drop coverage");
+        });
+    }
 }
 
 impl Drop for PinGuard {
@@ -610,14 +767,18 @@ impl Drop for PinGuard {
         let Some(store) = self.store.upgrade() else {
             return;
         };
-        let Ok(mut state) = store.state.lock() else {
-            return;
-        };
-        for id in &self.artifact_ids {
-            if let Some(entry) = state.entries.get_mut(id) {
-                entry.pin_count = entry.pin_count.saturating_sub(1);
+        {
+            let Ok(mut state) = store.state.lock() else {
+                return;
+            };
+            for id in &self.artifact_ids {
+                if let Some(entry) = state.entries.get_mut(id) {
+                    entry.pin_count = entry.pin_count.saturating_sub(1);
+                }
             }
         }
+        let store = ArtifactStore { inner: store };
+        let _ = store.enforce_retention();
     }
 }
 
@@ -800,25 +961,226 @@ fn rollback_paths(paths: &[PathBuf]) -> Result<(), ()> {
 fn remove_owned_dir(path: &Path) -> Result<(), ArtifactError> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if !safe_directory_metadata(&metadata) {
+        return Err(ArtifactError::CleanupFailed(
+            std::io::ErrorKind::InvalidInput,
+        ));
+    }
+    remove_owned_contents(path)?;
+    fs::remove_dir(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))
+}
+
+fn remove_owned_contents(path: &Path) -> Result<(), ArtifactError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+    if !safe_directory_metadata(&metadata) {
         return Err(ArtifactError::CleanupFailed(
             std::io::ErrorKind::InvalidInput,
         ));
     }
     for child in fs::read_dir(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))? {
         let child = child.map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
-        let metadata = child
-            .file_type()
-            .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
-        if metadata.is_dir() && !metadata.is_symlink() {
-            return Err(ArtifactError::CleanupFailed(
-                std::io::ErrorKind::InvalidInput,
-            ));
-        }
-        fs::remove_file(child.path())
-            .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+        remove_owned_entry(&child.path())?;
     }
-    fs::remove_dir(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))
+    Ok(())
+}
+
+fn remove_owned_entry(path: &Path) -> Result<(), ArtifactError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return remove_link_no_follow(path, &metadata);
+    }
+    if metadata.is_dir() {
+        remove_owned_contents(path)?;
+        return fs::remove_dir(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()));
+    }
+    if metadata.is_file() {
+        return fs::remove_file(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()));
+    }
+    Err(ArtifactError::CleanupFailed(
+        std::io::ErrorKind::InvalidInput,
+    ))
+}
+
+#[cfg(unix)]
+fn remove_link_no_follow(path: &Path, _metadata: &fs::Metadata) -> Result<(), ArtifactError> {
+    fs::remove_file(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))
+}
+
+#[cfg(windows)]
+fn remove_link_no_follow(path: &Path, metadata: &fs::Metadata) -> Result<(), ArtifactError> {
+    use std::os::windows::fs::MetadataExt;
+    let result = if metadata.file_attributes() & 0x10 != 0 {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|error| ArtifactError::CleanupFailed(error.kind()))
+}
+
+fn process_file_bytes_no_follow(path: &Path) -> Result<u64, ArtifactError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+    if !safe_directory_metadata(&metadata) {
+        return Err(ArtifactError::CleanupFailed(
+            std::io::ErrorKind::InvalidInput,
+        ));
+    }
+    let mut total = 0_u64;
+    for child in fs::read_dir(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))? {
+        let child = child.map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+        let metadata = fs::symlink_metadata(child.path())
+            .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            continue;
+        }
+        if metadata.is_dir() {
+            total = total
+                .checked_add(process_file_bytes_no_follow(&child.path())?)
+                .ok_or(ArtifactError::InvalidOutputState)?;
+        } else if metadata.is_file() {
+            total = total
+                .checked_add(metadata.len())
+                .ok_or(ArtifactError::InvalidOutputState)?;
+        }
+    }
+    Ok(total)
+}
+
+fn remove_regular_file_no_follow(path: &Path) -> Result<(), ArtifactError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ArtifactError::CleanupFailed(
+            std::io::ErrorKind::InvalidInput,
+        ));
+    }
+    fs::remove_file(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))
+}
+
+fn scavenge_root(root: &Path, lease_open_fault: Option<&Path>) -> Result<(), ArtifactError> {
+    for child in fs::read_dir(root).map_err(|error| ArtifactError::CleanupFailed(error.kind()))? {
+        let child = child.map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+        let name = child.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(id) = exact_server_id(name) else {
+            continue;
+        };
+        let process_dir = root.join(name);
+        let lease_path = root.join(format!("server-{id}.lease"));
+        if lease_open_fault == Some(lease_path.as_path()) {
+            continue;
+        }
+        let Ok(process_metadata) = fs::symlink_metadata(&process_dir) else {
+            continue;
+        };
+        let Ok(lease_metadata) = fs::symlink_metadata(&lease_path) else {
+            continue;
+        };
+        if !safe_directory_metadata(&process_metadata) || !safe_file_metadata(&lease_metadata) {
+            continue;
+        }
+        let Ok(lease) = open_existing_lease_no_follow(&lease_path) else {
+            continue;
+        };
+        match FileExt::try_lock(&lease) {
+            Ok(()) => {}
+            Err(fs4::TryLockError::WouldBlock | fs4::TryLockError::Error(_)) => continue,
+        }
+        if !lease_handle_matches_path(&lease, &lease_path) {
+            continue;
+        }
+        if remove_owned_dir(&process_dir).is_err() {
+            continue;
+        }
+        drop(lease);
+        if let Err(error) = fs::remove_file(&lease_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(ArtifactError::CleanupFailed(error.kind()));
+        }
+    }
+    Ok(())
+}
+
+fn exact_server_id(name: &str) -> Option<&str> {
+    let id = name.strip_prefix("server-")?;
+    (id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(id)
+}
+
+fn safe_directory_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir() && !metadata.file_type().is_symlink() && !is_reparse_point(metadata)
+}
+
+fn safe_file_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && !metadata.file_type().is_symlink() && !is_reparse_point(metadata)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn open_existing_lease_no_follow(path: &Path) -> std::io::Result<File> {
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let file = File::from(fd);
+    if !safe_file_metadata(&file.metadata()?) {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_existing_lease_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(0x0020_0000)
+        .open(path)?;
+    if !safe_file_metadata(&file.metadata()?) {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn lease_handle_matches_path(handle: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(retained) = handle.metadata() else {
+        return false;
+    };
+    let Ok(current) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    safe_file_metadata(&current)
+        && retained.dev() == current.dev()
+        && retained.ino() == current.ino()
+}
+
+#[cfg(windows)]
+fn lease_handle_matches_path(handle: &File, path: &Path) -> bool {
+    glass_windows::file_matches_path_no_reparse(handle, path).unwrap_or(false)
 }
 
 fn parse_uri<'a>(uri: &'a str, server_id: &str) -> Result<&'a str, ArtifactReadError> {

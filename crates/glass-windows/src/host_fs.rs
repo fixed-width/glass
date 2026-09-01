@@ -53,6 +53,21 @@ pub fn open_directory_no_reparse(path: &Path) -> Result<File, HostFsError> {
     Ok(file)
 }
 
+/// Verifies that a retained regular-file handle still names the no-reparse object at `path`.
+pub fn file_matches_path_no_reparse(file: &File, path: &Path) -> Result<bool, HostFsError> {
+    let current = OpenOptions::new()
+        .read(true)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)
+        .map_err(|_| HostFsError::Open)?;
+    let metadata = current.metadata().map_err(|_| HostFsError::Open)?;
+    if !metadata.is_file() || is_reparse(&metadata) {
+        return Err(HostFsError::Integrity);
+    }
+    Ok(file_identity(file)? == file_identity(&current)?)
+}
+
 /// Opens one generated single-component regular-file child relative to a retained directory handle.
 ///
 /// The pathname is consulted only to reject an already-substituted directory before the native
