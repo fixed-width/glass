@@ -595,12 +595,13 @@ fn discover_account_controls(glass: &mut Glass, label: &str, failures: &mut Vec<
     let field = &account.result.matches[0].element;
     if field.name.as_deref() != Some("Account name")
         || field.role != AxRole::TextField
+        || !field.states.visible
         || field.states.secure
     {
         failures.push(format!(
-            "{label}: targeted Account name discovery returned the wrong or secure element: \
-             name={:?} role={:?} secure={} value={:?}",
-            field.name, field.role, field.states.secure, field.value
+            "{label}: targeted Account name discovery returned the wrong, hidden, or secure element: \
+             name={:?} role={:?} visible={} secure={} value={:?}",
+            field.name, field.role, field.states.visible, field.states.secure, field.value
         ));
         return;
     }
@@ -654,12 +655,13 @@ fn discover_account_controls(glass: &mut Glass, label: &str, failures: &mut Vec<
     let button = &save.result.matches[0].element;
     if button.name.as_deref() != Some("Save account")
         || button.role != AxRole::Button
+        || !button.states.visible
         || button.states.secure
     {
         failures.push(format!(
-            "{label}: zero-timeout Save account discovery returned the wrong or secure element: \
-             name={:?} role={:?} secure={} value={:?}",
-            button.name, button.role, button.states.secure, button.value
+            "{label}: zero-timeout Save account discovery returned the wrong, hidden, or secure \
+             element: name={:?} role={:?} visible={} secure={} value={:?}",
+            button.name, button.role, button.states.visible, button.states.secure, button.value
         ));
         return;
     }
