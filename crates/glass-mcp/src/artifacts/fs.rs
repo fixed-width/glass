@@ -283,12 +283,12 @@ fn configured_root() -> Result<PathBuf, ArtifactError> {
 
 impl ArtifactStore {
     pub(crate) fn new(limit_bytes: u64) -> Result<Self, ArtifactError> {
-        Self::open(&configured_root()?, limit_bytes, random_id(), None)
+        Self::open(&configured_root()?, limit_bytes, new_server_id(), None)
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(root: &Path, limit_bytes: u64) -> Result<Self, ArtifactError> {
-        Self::open(root, limit_bytes, random_id(), None)
+        Self::open(root, limit_bytes, new_server_id(), None)
     }
 
     #[cfg(test)]
@@ -306,7 +306,7 @@ impl ArtifactStore {
         limit_bytes: u64,
         fault: FaultStage,
     ) -> Result<Self, ArtifactError> {
-        Self::open(root, limit_bytes, random_id(), Some(fault))
+        Self::open(root, limit_bytes, new_server_id(), Some(fault))
     }
 
     #[cfg(test)]
@@ -408,7 +408,7 @@ impl ArtifactStore {
         if !available {
             return Err(ArtifactError::InvalidOutputState);
         }
-        let id = random_id();
+        let id = new_server_id();
         let final_path = process_dir.join(format!("artifact-{id}.txt"));
         let temp_path = process_dir.join(format!(".artifact-{id}.tmp"));
         require_immediate_child(&process_dir, &final_path)?;
@@ -650,7 +650,7 @@ impl ArtifactStore {
             if state.lifecycle != Lifecycle::Open {
                 return Err(ArtifactReadError::ExpiredOrUnavailable);
             }
-            let id = parse_uri(uri, &state.server_id)?;
+            let id = classify_uri(uri, &state.server_id)?;
             let process_dir = state.process_dir.clone();
             let process_handle = state
                 .process_dir_handle
@@ -1025,7 +1025,7 @@ impl std::fmt::Debug for PinGuard {
     }
 }
 
-fn random_id() -> String {
+pub(crate) fn new_server_id() -> String {
     let mut bytes = [0_u8; 16];
     rand::rng().fill_bytes(&mut bytes);
     let mut id = String::with_capacity(32);
@@ -1698,7 +1698,10 @@ fn remove_locked_lease_for_shutdown(
                 std::io::ErrorKind::InvalidInput,
             ));
         }
-        let candidate = OsString::from(format!("server-{server_id}.lease-cleanup-{}", random_id()));
+        let candidate = OsString::from(format!(
+            "server-{server_id}.lease-cleanup-{}",
+            new_server_id()
+        ));
         rustix::fs::renameat(parent, Path::new(name), parent, Path::new(&candidate))
             .map_err(|error| ArtifactError::CleanupFailed(std::io::Error::from(error).kind()))?;
         *quarantine = Some(candidate);
@@ -1895,7 +1898,10 @@ fn lease_handle_matches_path(handle: &File, path: &Path) -> bool {
     glass_windows::file_matches_path_no_reparse(handle, path).unwrap_or(false)
 }
 
-fn parse_uri<'a>(uri: &'a str, server_id: &str) -> Result<&'a str, ArtifactReadError> {
+pub(crate) fn classify_uri<'a>(
+    uri: &'a str,
+    server_id: &str,
+) -> Result<&'a str, ArtifactReadError> {
     let prefix = format!("glass-artifact://{server_id}/");
     let id = uri
         .strip_prefix(&prefix)

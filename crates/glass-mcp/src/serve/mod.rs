@@ -189,9 +189,9 @@ pub async fn run_on_until(
         &cancel,
         HTTP_GRACEFUL_DRAIN_BUDGET,
         crate::shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET),
+        crate::cleanup_artifacts(artifacts),
     )
     .await;
-    crate::cleanup_artifacts(artifacts).await;
     match transport_result {
         Ok(result) => result.context("serving MCP over HTTP"),
         Err(()) => Err(anyhow::anyhow!(
@@ -207,9 +207,11 @@ async fn run_server_then_teardown<T>(
     cancel: &CancellationToken,
     drain_budget: Duration,
     teardown: impl Future<Output = ()>,
+    cleanup: impl Future<Output = ()>,
 ) -> Result<T, ()> {
     let result = wait_for_server_or_shutdown(server, shutdown, cancel, drain_budget).await;
     teardown.await;
+    cleanup.await;
     result
 }
 
@@ -271,6 +273,54 @@ fn write_token_file(path: &str, token: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn record_event(events: Arc<std::sync::Mutex<Vec<&'static str>>>, event: &'static str) {
+        events.lock().unwrap().push(event);
+    }
+
+    #[tokio::test]
+    async fn http_timeout_preserves_transport_error_and_cleans_up_after_teardown() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        let result = run_server_then_teardown(
+            std::future::pending::<()>(),
+            async {},
+            &cancel,
+            Duration::ZERO,
+            record_event(events.clone(), "target_teardown"),
+            record_event(events.clone(), "artifact_cleanup"),
+        )
+        .await;
+        assert_eq!(result, Err(()));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["target_teardown", "artifact_cleanup"]
+        );
+    }
+
+    #[tokio::test]
+    async fn http_normal_completion_precedes_teardown_and_cleanup() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport_events = events.clone();
+        let cancel = CancellationToken::new();
+        let result = run_server_then_teardown(
+            async move {
+                transport_events.lock().unwrap().push("transport_complete");
+                "complete"
+            },
+            std::future::pending(),
+            &cancel,
+            Duration::from_secs(1),
+            record_event(events.clone(), "target_teardown"),
+            record_event(events.clone(), "artifact_cleanup"),
+        )
+        .await;
+        assert_eq!(result, Ok("complete"));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["transport_complete", "target_teardown", "artifact_cleanup"]
+        );
+    }
 
     fn cfg(addr: &str, token: Option<&str>) -> ServeConfig {
         ServeConfig {
@@ -379,6 +429,7 @@ mod tests {
             &cancel,
             std::time::Duration::ZERO,
             async move { observed.store(true, Ordering::SeqCst) },
+            async {},
         )
         .await;
         assert!(result.is_err(), "a stalled drain must time out");

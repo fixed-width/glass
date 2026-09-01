@@ -413,6 +413,16 @@ pub(crate) async fn cleanup_artifacts(store: Option<crate::artifacts::ArtifactSt
     }
 }
 
+pub(crate) async fn finish_transport_lifecycle<T>(
+    transport_result: T,
+    teardown: impl std::future::Future<Output = ()>,
+    cleanup: impl std::future::Future<Output = ()>,
+) -> T {
+    teardown.await;
+    cleanup.await;
+    transport_result
+}
+
 /// Serve MCP over stdio (the default transport) and tear down on EOF or signal.
 pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyhow::Result<()> {
     let server = GlassServer::new(glass, report);
@@ -423,15 +433,28 @@ pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyho
         .await
         .context("starting the MCP stdio service")?;
 
-    let via_signal = tokio::select! {
-        r = service.waiting() => { r.context("serving MCP")?; false }
+    let cancel = service.cancellation_token();
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+    let transport_result = tokio::select! {
+        r = &mut waiting => r.context("serving MCP").map(|_| false),
         _ = shutdown::shutdown_signal() => {
             eprintln!("glass: received shutdown signal; tearing down sessions");
-            true
+            cancel.cancel();
+            tokio::time::timeout(glass_core::TEARDOWN_BUDGET, &mut waiting)
+                .await
+                .context("closing the MCP stdio service")
+                .and_then(|result| result.context("closing the MCP stdio service"))
+                .map(|_| true)
         }
     };
-    shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET).await;
-    cleanup_artifacts(artifacts).await;
+    let transport_result = finish_transport_lifecycle(
+        transport_result,
+        shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET),
+        cleanup_artifacts(artifacts),
+    )
+    .await;
+    let via_signal = transport_result?;
     if via_signal {
         std::process::exit(0);
     }
@@ -441,6 +464,72 @@ pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyho
 #[cfg(test)]
 mod tests {
     use super::default_backend;
+
+    async fn record_event(
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        event: &'static str,
+    ) {
+        events.lock().unwrap().push(event);
+    }
+
+    async fn run_stdio_lifecycle_for_test<T, E>(
+        transport: impl std::future::Future<Output = Result<T, E>>,
+        signal: impl std::future::Future<Output = ()>,
+        close: impl std::future::Future<Output = Result<T, E>>,
+        teardown: impl std::future::Future<Output = ()>,
+        cleanup: impl std::future::Future<Output = ()>,
+    ) -> Result<T, E> {
+        tokio::pin!(transport);
+        tokio::pin!(signal);
+        let result = tokio::select! {
+            result = &mut transport => result,
+            () = &mut signal => close.await,
+        };
+        super::finish_transport_lifecycle(result, teardown, cleanup).await
+    }
+
+    #[tokio::test]
+    async fn stdio_signal_waits_for_close_before_teardown_and_cleanup() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = run_stdio_lifecycle_for_test(
+            std::future::pending::<Result<&'static str, ()>>(),
+            std::future::ready(()),
+            async {
+                record_event(events.clone(), "transport_close").await;
+                Err(())
+            },
+            record_event(events.clone(), "target_teardown"),
+            record_event(events.clone(), "artifact_cleanup"),
+        )
+        .await;
+        assert_eq!(result, Err(()));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["transport_close", "target_teardown", "artifact_cleanup"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_normal_completion_precedes_teardown_and_cleanup() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport_events = events.clone();
+        let result = run_stdio_lifecycle_for_test(
+            async move {
+                transport_events.lock().unwrap().push("transport_complete");
+                Ok::<_, ()>("complete")
+            },
+            std::future::pending(),
+            std::future::pending(),
+            record_event(events.clone(), "target_teardown"),
+            record_event(events.clone(), "artifact_cleanup"),
+        )
+        .await;
+        assert_eq!(result, Ok("complete"));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["transport_complete", "target_teardown", "artifact_cleanup"]
+        );
+    }
 
     #[test]
     fn android_backend_is_selectable_by_name() {

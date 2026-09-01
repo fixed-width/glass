@@ -131,12 +131,17 @@ pub(crate) struct OutputPolicy {
 
 impl OutputPolicy {
     pub(crate) fn validate_store_paths(store: &ArtifactStore) -> Result<(), ArtifactError> {
-        let path = store
-            .process_dir()
-            .join("artifact-18446744073709551615.txt");
+        Self::validate_process_path(&store.server_id(), &store.process_dir())
+    }
+
+    fn validate_process_path(
+        server_id: &str,
+        process_dir: &std::path::Path,
+    ) -> Result<(), ArtifactError> {
+        let path = process_dir.join("artifact-18446744073709551615.txt");
         let uri = format!(
             "glass-artifact://{}/artifact-18446744073709551615",
-            store.server_id()
+            server_id
         );
         let descriptor = ArtifactDescriptor::new(
             crate::output::ArtifactKind::ContentBlock,
@@ -150,10 +155,19 @@ impl OutputPolicy {
             &[usize::MAX],
         )
         .map_err(|_| ArtifactError::PathRepresentationFailed)?;
-        let resource = descriptor.to_resource(TargetAccess::HostFilesystemUnreachable);
-        let rendered =
-            serde_json::to_vec(&resource).map_err(|_| ArtifactError::PathRepresentationFailed)?;
-        if rendered.len() > MAX_TEXT_BYTES {
+        let _resource = descriptor.to_resource(TargetAccess::HostFilesystemUnreachable);
+        let metadata = complete_metadata(
+            OutputMode::ContentBlocks,
+            usize::MAX,
+            TargetAccess::HostFilesystemUnreachable,
+            vec![descriptor],
+        );
+        let mut output = ToolOutput::result("glass_output_validation", serde_json::json!({}));
+        set_envelope_metadata(&mut output.0, 0, &metadata)
+            .ok_or(ArtifactError::PathRepresentationFailed)?;
+        let (output, _) =
+            stabilize(output, metadata, 0).ok_or(ArtifactError::MetadataDidNotStabilize)?;
+        if output.text_bytes() > MAX_TEXT_BYTES {
             return Err(ArtifactError::PathRepresentationFailed);
         }
         Ok(())
@@ -750,6 +764,43 @@ mod tests {
             OutContent::ResourceLink(descriptor) => serde_json::to_value(descriptor).ok(),
             _ => None,
         }
+    }
+
+    #[test]
+    fn store_path_validation_measures_the_final_metadata_envelope_without_publishing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_root, store) = store()?;
+        let before = store.registry_len();
+        let rejected = (100..900).find(|segments| {
+            let process_dir = std::path::PathBuf::from("/").join("long-segment".repeat(*segments));
+            let descriptor = ArtifactDescriptor::new(
+                crate::output::ArtifactKind::ContentBlock,
+                Some(usize::MAX),
+                &format!(
+                    "glass-artifact://{}/artifact-18446744073709551615",
+                    store.server_id()
+                ),
+                &process_dir.join("artifact-18446744073709551615.txt"),
+                "application/vnd.glass.output-manifest+json; charset=utf-8",
+                u64::MAX,
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                true,
+                &[usize::MAX],
+            )
+            .expect("absolute UTF-8 path");
+            let resource_bytes = serde_json::to_vec(
+                &descriptor.to_resource(TargetAccess::HostFilesystemUnreachable),
+            )
+            .expect("resource serialization")
+            .len();
+            resource_bytes <= MAX_TEXT_BYTES
+                && OutputPolicy::validate_process_path(&store.server_id(), &process_dir)
+                    == Err(ArtifactError::PathRepresentationFailed)
+        });
+
+        assert!(rejected.is_some());
+        assert_eq!(store.registry_len(), before);
+        Ok(())
     }
 
     #[test]
