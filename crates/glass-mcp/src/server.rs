@@ -1878,7 +1878,7 @@ mod tests {
         let text = first_text(&mapped);
         assert!(text.contains(category), "{text}");
         assert!(text.contains(guidance), "{text}");
-        assert!(text.len() <= crate::tools::FIND_RESPONSE_MAX_BYTES);
+        assert!(text.len() <= crate::output_policy::MAX_TEXT_BYTES);
     }
 
     #[test]
@@ -1918,7 +1918,7 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(sentinel), "{text}");
-        assert!(text.len() <= crate::tools::FIND_RESPONSE_MAX_BYTES);
+        assert!(text.len() <= crate::output_policy::MAX_TEXT_BYTES);
     }
 
     /// android is always compiled in (host-OS-agnostic), so it's a stable choice for

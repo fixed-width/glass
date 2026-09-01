@@ -8,9 +8,7 @@ use crate::params::{FindElementsArgs, FindSelectorArgs};
 use crate::tools::{OutContent, ToolOutput, ToolResult};
 
 const DEFAULT_MAX_RESULTS: usize = 10;
-pub(crate) const FIND_RESPONSE_MAX_BYTES: usize = 8_192;
 
-#[derive(Clone)]
 struct RenderedMatch {
     id: u32,
     role: String,
@@ -22,18 +20,6 @@ struct RenderedMatch {
     matched_field: Option<&'static str>,
     match_tier: &'static str,
     context: String,
-    context_stage: usize,
-    field_stages: [usize; 3],
-    fields_counted: [bool; 3],
-    context_counted: bool,
-    query: Option<String>,
-}
-
-#[derive(Default)]
-struct FitCounters {
-    omitted_by_budget: usize,
-    fields_truncated: usize,
-    contexts_truncated: usize,
 }
 
 struct Metadata {
@@ -93,13 +79,13 @@ pub fn find_elements(glass: &mut Glass, a: &FindElementsArgs) -> ToolResult {
         unreadable_subtrees: outcome.result.unreadable_subtrees,
         unexposed_placeholders: outcome.result.unexposed_placeholders,
     };
-    let mut rendered = outcome
+    let rendered = outcome
         .result
         .matches
         .iter()
-        .map(|matched| render_match(matched, query.target.query()))
+        .map(render_match)
         .collect::<Vec<_>>();
-    fit_output(&metadata, &mut rendered)
+    Ok(build_output(&metadata, &rendered))
 }
 
 fn selector_args(args: &FindSelectorArgs) -> Result<SemanticSelector, String> {
@@ -133,7 +119,7 @@ fn selector(
     SemanticSelector::new(query, role, states).map_err(|error| bounded_error(error.to_string()))
 }
 
-fn render_match(matched: &SemanticMatch, query: Option<&str>) -> RenderedMatch {
+fn render_match(matched: &SemanticMatch) -> RenderedMatch {
     RenderedMatch {
         id: matched.element.id.0,
         role: format!("{:?}", matched.element.role),
@@ -156,49 +142,10 @@ fn render_match(matched: &SemanticMatch, query: Option<&str>) -> RenderedMatch {
         matched_field: matched.field.map(match_field_name),
         match_tier: match_tier_name(matched.tier),
         context: matched.context.clone(),
-        context_stage: 0,
-        field_stages: [0; 3],
-        fields_counted: [false; 3],
-        context_counted: false,
-        query: query.map(str::to_owned),
     }
 }
 
-fn fit_output(metadata: &Metadata, rendered: &mut Vec<RenderedMatch>) -> ToolResult {
-    let mut counters = FitCounters::default();
-    let mut output = build_output(metadata, rendered, &counters);
-    while output.text_bytes() > FIND_RESPONSE_MAX_BYTES {
-        if shorten_lowest_ranked_context(rendered, &mut counters) {
-            output = build_output(metadata, rendered, &counters);
-            continue;
-        }
-        if shorten_lowest_ranked_field(rendered, &mut counters) {
-            output = build_output(metadata, rendered, &counters);
-            continue;
-        }
-        if let Some(omitted) = rendered.pop() {
-            counters.contexts_truncated -= usize::from(omitted.context_counted);
-            counters.fields_truncated -= omitted
-                .fields_counted
-                .into_iter()
-                .filter(|counted| *counted)
-                .count();
-            counters.omitted_by_budget += 1;
-            output = build_output(metadata, rendered, &counters);
-            continue;
-        }
-        return Err(bounded_error(
-            "glass_find_elements could not fit mandatory metadata within 8192 bytes",
-        ));
-    }
-    Ok(output)
-}
-
-fn build_output(
-    metadata: &Metadata,
-    rendered: &[RenderedMatch],
-    counters: &FitCounters,
-) -> ToolOutput {
+fn build_output(metadata: &Metadata, rendered: &[RenderedMatch]) -> ToolOutput {
     let matches = rendered.iter().map(match_json).collect::<Vec<_>>();
     let mut result = json!({
         "matched": metadata.matched,
@@ -208,9 +155,9 @@ fn build_output(
         "matches_in_walk": metadata.matches_in_walk,
         "returned": rendered.len(),
         "omitted_by_max_results": metadata.omitted_by_max_results,
-        "omitted_by_budget": counters.omitted_by_budget,
-        "fields_truncated": counters.fields_truncated,
-        "contexts_truncated": counters.contexts_truncated,
+        "omitted_by_budget": 0,
+        "fields_truncated": 0,
+        "contexts_truncated": 0,
         "search_complete": metadata.search_complete,
         "tree_truncated": metadata.tree_truncated,
         "unreadable_subtrees": metadata.unreadable_subtrees,
@@ -240,169 +187,6 @@ fn match_json(matched: &RenderedMatch) -> Value {
         "match_tier": matched.match_tier,
         "context": matched.context,
     })
-}
-
-fn shorten_lowest_ranked_context(
-    rendered: &mut [RenderedMatch],
-    counters: &mut FitCounters,
-) -> bool {
-    for matched in rendered.iter_mut().rev() {
-        if matched.context_stage >= 3 {
-            continue;
-        }
-        matched.context_stage += 1;
-        let limit = [usize::MAX, 512, 128, 0][matched.context_stage];
-        let shortened = if limit == 0 && !matched.context.is_empty() {
-            "<context omitted>".to_owned()
-        } else {
-            truncate_text(&matched.context, limit, None)
-        };
-        let changed = shortened != matched.context;
-        matched.context = shortened;
-        if changed && !matched.context_counted {
-            matched.context_counted = true;
-            counters.contexts_truncated += 1;
-        }
-        return true;
-    }
-    false
-}
-
-fn shorten_lowest_ranked_field(rendered: &mut [RenderedMatch], counters: &mut FitCounters) -> bool {
-    for matched in rendered.iter_mut().rev() {
-        for index in (0..3).rev() {
-            if matched.field_stages[index] >= 3 || field(matched, index).is_none() {
-                continue;
-            }
-            matched.field_stages[index] += 1;
-            let limit = [usize::MAX, 256, 96, 0][matched.field_stages[index]];
-            let preserve = (matched.matched_field == Some(field_name(index)))
-                .then_some(matched.query.as_deref())
-                .flatten();
-            let shortened = truncate_text(
-                field(matched, index).as_deref().unwrap_or(""),
-                limit,
-                preserve,
-            );
-            let changed = field(matched, index).as_deref() != Some(shortened.as_str());
-            *field_mut(matched, index) = Some(shortened);
-            if changed && !matched.fields_counted[index] {
-                matched.fields_counted[index] = true;
-                counters.fields_truncated += 1;
-            }
-            return true;
-        }
-    }
-    false
-}
-
-fn field(matched: &RenderedMatch, index: usize) -> &Option<String> {
-    match index {
-        0 => &matched.name,
-        1 => &matched.description,
-        _ => &matched.value,
-    }
-}
-
-fn field_mut(matched: &mut RenderedMatch, index: usize) -> &mut Option<String> {
-    match index {
-        0 => &mut matched.name,
-        1 => &mut matched.description,
-        _ => &mut matched.value,
-    }
-}
-
-fn field_name(index: usize) -> &'static str {
-    match index {
-        0 => "name",
-        1 => "description",
-        _ => "value",
-    }
-}
-
-fn truncate_text(text: &str, max_bytes: usize, preserve: Option<&str>) -> String {
-    if text.len() <= max_bytes {
-        return text.to_owned();
-    }
-    if max_bytes == 0 {
-        return String::new();
-    }
-    let ellipsis = "…";
-    if max_bytes < ellipsis.len() {
-        return String::new();
-    }
-    let matched = preserve
-        .filter(|needle| !needle.is_empty())
-        .and_then(|needle| case_insensitive_match_range(text, needle));
-    let leading_ellipsis = matched.as_ref().is_some_and(|range| range.start > 0);
-    let trailing_ellipsis = matched.as_ref().is_none_or(|range| range.end < text.len());
-    let content_bytes = max_bytes
-        .saturating_sub(usize::from(leading_ellipsis) * ellipsis.len())
-        .saturating_sub(usize::from(trailing_ellipsis) * ellipsis.len());
-    let (start, end) = if let Some(matched) = matched {
-        let retained_match_end =
-            floor_char_boundary(text, (matched.start + content_bytes).min(matched.end));
-        let retained_match_len = retained_match_end - matched.start;
-        let surrounding = content_bytes.saturating_sub(retained_match_len);
-        let start = floor_char_boundary(text, matched.start.saturating_sub(surrounding / 3));
-        let end = floor_char_boundary(text, (start + content_bytes).min(text.len()));
-        if end < retained_match_end {
-            let start = floor_char_boundary(text, retained_match_end.saturating_sub(content_bytes));
-            (start, retained_match_end)
-        } else {
-            (start, end)
-        }
-    } else {
-        (0, floor_char_boundary(text, content_bytes.min(text.len())))
-    };
-    let mut output = String::new();
-    if start > 0 {
-        output.push('…');
-    }
-    output.push_str(&text[start..end]);
-    if end < text.len() {
-        output.push('…');
-    }
-    while output.len() > max_bytes {
-        let end = floor_char_boundary(&output, output.len().saturating_sub(1));
-        output.truncate(end);
-    }
-    output
-}
-
-fn case_insensitive_match_range(text: &str, needle: &str) -> Option<std::ops::Range<usize>> {
-    let folded_needle = needle.to_lowercase();
-    let mut folded_text = String::new();
-    let mut spans = Vec::new();
-    for (start, character) in text.char_indices() {
-        let folded_start = folded_text.len();
-        folded_text.extend(character.to_lowercase());
-        spans.push((
-            folded_start,
-            folded_text.len(),
-            start,
-            start + character.len_utf8(),
-        ));
-    }
-
-    let folded_start = folded_text.find(&folded_needle)?;
-    let folded_end = folded_start + folded_needle.len();
-    let start = spans
-        .iter()
-        .find(|(_, end, _, _)| *end > folded_start)
-        .map(|(_, _, start, _)| *start)?;
-    let end = spans
-        .iter()
-        .find(|(start, end, _, _)| *start < folded_end && *end >= folded_end)
-        .map(|(_, _, _, end)| *end)?;
-    Some(start..end)
-}
-
-fn floor_char_boundary(text: &str, mut index: usize) -> usize {
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 fn match_field_name(field: MatchField) -> &'static str {
@@ -438,7 +222,7 @@ pub(crate) fn bounded_error(error: impl AsRef<str>) -> String {
     } else {
         "glass_find_elements failed"
     };
-    truncate_text(safe, FIND_RESPONSE_MAX_BYTES, None)
+    safe.to_owned()
 }
 
 fn safe_operational_error(error: glass_core::GlassError) -> String {
@@ -475,7 +259,6 @@ fn safe_operational_error(error: glass_core::GlassError) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::needless_as_bytes)]
 mod tests {
     use super::*;
     use crate::tools::testutil::*;
@@ -489,6 +272,47 @@ mod tests {
         let body = after_open.rsplit_once('\n').unwrap().0;
         let value: serde_json::Value = serde_json::from_str(body).unwrap();
         assert!(value["matches"].is_array());
+    }
+
+    fn glass_with_twenty_long_matches() -> Glass {
+        let mut tree = fake_tree();
+        tree.root.children.truncate(1);
+        tree.root.children[0].name = Some(format!("Save 0 {}", "x".repeat(1_000)));
+        tree.root.children[0].description = Some("y".repeat(1_000));
+        for index in 1..20 {
+            let mut node = tree.root.children[0].clone();
+            node.name = Some(format!("Save {index} {}", "x".repeat(1_000)));
+            tree.root.children.push(node);
+        }
+        tree.assign_ids();
+        started_a11y_with(tree)
+    }
+
+    fn args_with_max_results(max_results: u32) -> FindElementsArgs {
+        FindElementsArgs {
+            query: Some("save".into()),
+            role: None,
+            states: None,
+            within: None,
+            max_results: Some(max_results),
+            max_nodes: Some(0),
+            timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn find_keeps_all_selected_records_and_zeroes_legacy_budget_counters() {
+        let mut glass = glass_with_twenty_long_matches();
+        let output = find_elements(&mut glass, &args_with_max_results(20)).unwrap();
+        let envelope = envelope_at(&output, 0);
+        assert_eq!(envelope["result"]["returned"], 20);
+        assert_eq!(envelope["result"]["omitted_by_budget"], 0);
+        assert_eq!(envelope["result"]["fields_truncated"], 0);
+        assert_eq!(envelope["result"]["contexts_truncated"], 0);
+        assert!(
+            output.text_bytes() > 8_192,
+            "central server policy owns this bound"
+        );
     }
 
     #[test]
@@ -676,59 +500,6 @@ mod tests {
     }
 
     #[test]
-    fn truncation_preserves_a_long_match_near_the_end() {
-        let matched = "target-region-".repeat(5);
-        let text = format!("{}{}{}", "before-".repeat(40), matched, "after-".repeat(40));
-
-        let truncated = truncate_text(&text, 96, Some(&matched));
-
-        assert!(truncated.contains(&matched), "{truncated:?}");
-        assert!(truncated.len() <= 96);
-    }
-
-    #[test]
-    fn truncation_preserves_match_offsets_across_unicode_lowercase_expansion() {
-        let matched = "target-region-".repeat(5);
-        let text = format!("{}{}{}", "İ".repeat(80), matched, "after-".repeat(40));
-
-        let truncated = truncate_text(&text, 96, Some(&matched.to_uppercase()));
-
-        assert!(truncated.contains(&matched), "{truncated:?}");
-        assert!(truncated.len() <= 96);
-        assert!(truncated.is_char_boundary(truncated.len()));
-    }
-
-    #[test]
-    fn final_context_reduction_retains_an_explicit_omission_marker() {
-        let mut matched = RenderedMatch {
-            id: 1,
-            role: "Button".into(),
-            name: Some("Save".into()),
-            description: None,
-            value: None,
-            bounds: None,
-            states: Vec::new(),
-            matched_field: Some("name"),
-            match_tier: "exact_name",
-            context: "context detail ".repeat(100),
-            context_stage: 0,
-            field_stages: [0; 3],
-            fields_counted: [false; 3],
-            context_counted: false,
-            query: Some("save".into()),
-        };
-        let mut counters = FitCounters::default();
-        for _ in 0..3 {
-            assert!(shorten_lowest_ranked_context(
-                std::slice::from_mut(&mut matched),
-                &mut counters
-            ));
-        }
-        assert_eq!(matched.context, "<context omitted>");
-        assert_eq!(counters.contexts_truncated, 1);
-    }
-
-    #[test]
     fn find_redacts_secure_neighbor_values_from_successful_match_context() {
         let mut tree = fake_tree();
         let mut secure_neighbor = tree.root.children[0].clone();
@@ -763,37 +534,6 @@ mod tests {
     }
 
     #[test]
-    fn find_success_and_error_responses_never_exceed_8192_bytes() {
-        let mut tree = fake_tree();
-        for index in 0..20 {
-            let mut node = tree.root.children[0].clone();
-            node.name = Some(format!("Save {index} {}", "x".repeat(20_000)));
-            node.description = Some("y".repeat(20_000));
-            node.value = Some("z".repeat(20_000));
-            tree.root.children.push(node);
-        }
-        tree.assign_ids();
-        let mut glass = started_a11y_with(tree);
-        let output = find_elements(
-            &mut glass,
-            &FindElementsArgs {
-                query: Some("save".into()),
-                role: None,
-                states: None,
-                within: None,
-                max_results: Some(20),
-                max_nodes: Some(0),
-                timeout_ms: None,
-            },
-        )
-        .unwrap();
-        assert!(output.text_bytes() <= FIND_RESPONSE_MAX_BYTES);
-        assert_valid_wrapped_match_json(&output);
-        let error = bounded_error("e".repeat(20_000));
-        assert!(error.as_bytes().len() <= FIND_RESPONSE_MAX_BYTES);
-    }
-
-    #[test]
     fn permission_denial_keeps_a_safe_actionable_category() {
         let error = safe_operational_error(glass_core::GlassError::PermissionDenied {
             which: "accessibility".into(),
@@ -802,6 +542,5 @@ mod tests {
         assert!(error.contains("permission_denied"), "{error}");
         assert!(error.contains("Grant the platform accessibility permission"));
         assert!(!error.contains("backend-controlled-secret"));
-        assert!(error.len() <= FIND_RESPONSE_MAX_BYTES);
     }
 }
