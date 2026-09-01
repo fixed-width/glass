@@ -8,6 +8,14 @@
 <body>
 <h1>Glass web fixture</h1>
 <p id="intro">One page of plain HTML controls, read back through each platform's accessibility API.</p>
+<section aria-labelledby="account-heading">
+  <h2 id="account-heading">Account</h2>
+  <label for="account-name">Account name</label>
+  <input id="account-name" type="text" value="">
+  <button id="save-account" type="button">Save account</button>
+  <p id="account-status" aria-live="polite">Not saved</p>
+</section>
+<div id="large-page" aria-label="Large page sections"></div>
 <section>
   <a id="link" href="#intro">a link</a>
 </section>
@@ -40,6 +48,15 @@
   <iframe id="frame" title="nested document" srcdoc="<h2>inside the frame</h2><button type='button'>frame button</button>"></iframe>
 </section>
 <script>
+document.getElementById('save-account').addEventListener('click', function () {
+  document.getElementById('account-status').textContent = 'Saved';
+});
+const largePage = document.getElementById('large-page');
+for (let index = 0; index < 200; index += 1) {
+  const section = document.createElement('section');
+  section.innerHTML = `<h2>Repeated section ${index}</h2><p>Repeated account documentation ${index}</p>`;
+  largePage.appendChild(section);
+}
 document.getElementById('button').addEventListener('click', function () {
   document.getElementById('result').textContent = 'clicked';
 });

@@ -1183,6 +1183,41 @@ fn raised_cap_snapshot_stops_at_the_requested_count() {
     );
 }
 
+/// Targeted discovery finds an early button in the real over-cap AT-SPI tree while preserving
+/// explicit metadata that the default-bounded search could not prove absence elsewhere.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn targeted_discovery_finds_a_button_in_a_truncated_large_native_tree() {
+    let mut glass = launch_bench();
+    let query = glass_core::SemanticQuery::new(
+        glass_core::SemanticSelector::new(
+            Some("btn 00-00".into()),
+            Some(glass_core::AxRole::Button),
+            vec![glass_core::SemanticState::Visible],
+        )
+        .unwrap(),
+        None,
+        10,
+    )
+    .unwrap();
+    let out = glass
+        .find_elements(&glass_core::FindElementsParams {
+            query,
+            max_nodes: None,
+            timeout_ms: 0,
+        })
+        .expect("targeted discovery");
+    glass.stop().expect("stop");
+    assert!(out.matched);
+    assert_eq!(out.result.matches.len(), 1);
+    assert_eq!(
+        out.result.matches[0].element.name.as_deref(),
+        Some("Btn 00-00")
+    );
+    assert!(!out.result.search_complete);
+    assert!(out.result.tree_truncated.is_some());
+}
+
 /// Lockstep across a raised cap: an id assigned PAST the old cap by an unbounded snapshot is still
 /// resolvable by set_value — find_nth re-walks with the session's stored (unbounded) limits. If
 /// the limits weren't reused, find_nth would truncate at the default cap and fail to resolve the id

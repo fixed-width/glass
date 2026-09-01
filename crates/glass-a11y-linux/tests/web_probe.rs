@@ -32,8 +32,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, AxNode, AxRole, AxTree, Backend, BaselineStore, Glass, GlassError, KeyEvent,
-    PlatformFactory, SandboxLevel, WindowHint, read_back_confirms, role_histogram,
+    AppSpec, AxNode, AxRole, AxTree, Backend, BaselineStore, FindElementsParams, Glass, GlassError,
+    KeyEvent, PlatformFactory, SandboxLevel, ScopeResolution, SemanticQuery, SemanticSelector,
+    SemanticState, WindowHint, read_back_confirms, role_histogram,
 };
 
 const BROWSERS_VAR: &str = "GLASS_WEB_PROBE_BROWSERS";
@@ -514,6 +515,160 @@ fn exercise(glass: &mut Glass, label: &str, failures: &mut Vec<String>) {
     }
 }
 
+/// Discover the large fixture's account controls before any explicit unbounded diagnostic
+/// snapshot. Browser non-publication remains evidence-only, while malformed published content is
+/// recorded as a probe failure.
+fn discover_account_controls(glass: &mut Glass, label: &str, failures: &mut Vec<String>) {
+    let within = SemanticSelector::new(
+        Some("Glass web fixture".into()),
+        Some(AxRole::Document),
+        vec![SemanticState::Visible],
+    )
+    .expect("document scope");
+    let account = SemanticQuery::new(
+        SemanticSelector::new(
+            Some("account name".into()),
+            Some(AxRole::TextField),
+            vec![SemanticState::Visible],
+        )
+        .expect("account selector"),
+        Some(within.clone()),
+        10,
+    )
+    .expect("account query");
+    let found = glass.find_elements(&FindElementsParams {
+        query: account,
+        max_nodes: None,
+        timeout_ms: SETTLE.as_millis() as u64,
+    });
+
+    let account = match found {
+        Err(GlassError::AccessibilityNotReady(message)) => {
+            println!(
+                "targeted discovery: page accessibility remained not ready for {SETTLE:?}: \
+                 {message}"
+            );
+            return;
+        }
+        Err(e) => {
+            failures.push(format!(
+                "{label}: targeted Account name discovery failed: {e}"
+            ));
+            return;
+        }
+        Ok(out) => out,
+    };
+
+    if let ScopeResolution::Ambiguous { observed } = account.result.scope {
+        failures.push(format!(
+            "{label}: targeted Account name discovery found {observed} visible Documents named \
+             \"Glass web fixture\""
+        ));
+        return;
+    }
+    if !account.matched && account.result.unexposed_placeholders > 0 {
+        println!(
+            "targeted discovery: browser withheld {} placeholder(s); preserving evidence-only \
+             behavior",
+            account.result.unexposed_placeholders
+        );
+        return;
+    }
+    if !matches!(account.result.scope, ScopeResolution::Resolved(_)) {
+        failures.push(format!(
+            "{label}: targeted Account name discovery did not uniquely resolve the visible \
+             Document scope: {:?}",
+            account.result.scope
+        ));
+        return;
+    }
+    if account.timed_out || account.result.matches.len() != 1 {
+        failures.push(format!(
+            "{label}: targeted Account name discovery expected one match before any unbounded \
+             diagnostic snapshot, got matched={} timed_out={} matches={}",
+            account.matched,
+            account.timed_out,
+            account.result.matches.len()
+        ));
+        return;
+    }
+    let field = &account.result.matches[0].element;
+    if field.name.as_deref() != Some("Account name")
+        || field.role != AxRole::TextField
+        || field.states.secure
+    {
+        failures.push(format!(
+            "{label}: targeted Account name discovery returned the wrong or secure element: \
+             name={:?} role={:?} secure={} value={:?}",
+            field.name, field.role, field.states.secure, field.value
+        ));
+        return;
+    }
+    println!(
+        "targeted discovery before any unbounded diagnostic snapshot: Account name → #{} \
+         {:?}",
+        field.id.0, field.role
+    );
+
+    let save = SemanticQuery::new(
+        SemanticSelector::new(
+            Some("save account".into()),
+            Some(AxRole::Button),
+            vec![SemanticState::Visible],
+        )
+        .expect("save selector"),
+        Some(within),
+        10,
+    )
+    .expect("save query");
+    let save = match glass.find_elements(&FindElementsParams {
+        query: save,
+        max_nodes: None,
+        timeout_ms: 0,
+    }) {
+        Ok(out) => out,
+        Err(e) => {
+            failures.push(format!(
+                "{label}: targeted Save account discovery failed: {e}"
+            ));
+            return;
+        }
+    };
+    if let ScopeResolution::Ambiguous { observed } = save.result.scope {
+        failures.push(format!(
+            "{label}: zero-timeout Save account discovery found {observed} visible Documents named \
+             \"Glass web fixture\""
+        ));
+        return;
+    }
+    if !matches!(save.result.scope, ScopeResolution::Resolved(_)) || save.result.matches.len() != 1
+    {
+        failures.push(format!(
+            "{label}: zero-timeout Save account discovery expected one match in the resolved \
+             Document scope, got scope={:?} matches={}",
+            save.result.scope,
+            save.result.matches.len()
+        ));
+        return;
+    }
+    let button = &save.result.matches[0].element;
+    if button.name.as_deref() != Some("Save account")
+        || button.role != AxRole::Button
+        || button.states.secure
+    {
+        failures.push(format!(
+            "{label}: zero-timeout Save account discovery returned the wrong or secure element: \
+             name={:?} role={:?} secure={} value={:?}",
+            button.name, button.role, button.states.secure, button.value
+        ));
+        return;
+    }
+    println!(
+        "zero-timeout targeted discovery: Save account → #{} {:?}",
+        button.id.0, button.role
+    );
+}
+
 /// One backend/browser/lever combination. Failures that mean the a11y bus itself broke — a
 /// launch that never happened, or a snapshot channel that never answered — are appended to
 /// `failures` rather than panicking, so the rest of the requested browsers still get their turn
@@ -541,6 +696,7 @@ fn probe(backend: &str, browser: &str, lever: Lever, failures: &mut Vec<String>)
     }
     println!("window mapped after {:?}", started.elapsed());
 
+    discover_account_controls(&mut glass, &label, failures);
     let (tree, settle, arrived) = snapshot_until_page(&mut glass, &label, failures);
     println!("page content arrived: {arrived} after {settle:?}");
     match tree {
