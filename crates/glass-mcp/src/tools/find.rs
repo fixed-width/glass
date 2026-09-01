@@ -66,7 +66,7 @@ pub fn find_elements(glass: &mut Glass, a: &FindElementsArgs) -> ToolResult {
             max_nodes: a.max_nodes.map(|value| value as usize),
             timeout_ms: a.timeout_ms.unwrap_or(0),
         })
-        .map_err(|_| bounded_error("glass_find_elements failed"))?;
+        .map_err(safe_operational_error)?;
 
     if let ScopeResolution::Ambiguous { observed } = outcome.result.scope {
         return Err(bounded_error(format!(
@@ -252,7 +252,11 @@ fn shorten_lowest_ranked_context(
         }
         matched.context_stage += 1;
         let limit = [usize::MAX, 512, 128, 0][matched.context_stage];
-        let shortened = truncate_text(&matched.context, limit, None);
+        let shortened = if limit == 0 && !matched.context.is_empty() {
+            "<context omitted>".to_owned()
+        } else {
+            truncate_text(&matched.context, limit, None)
+        };
         let changed = shortened != matched.context;
         matched.context = shortened;
         if changed && !matched.context_counted {
@@ -448,6 +452,39 @@ pub(crate) fn bounded_error(error: impl AsRef<str>) -> String {
     truncate_text(safe, FIND_RESPONSE_MAX_BYTES, None)
 }
 
+fn safe_operational_error(error: glass_core::GlassError) -> String {
+    let (category, guidance) = match error.cause() {
+        glass_core::GlassError::NoActiveSession => (
+            "no_active_session",
+            "Call glass_start before glass_find_elements.",
+        ),
+        glass_core::GlassError::AxUnsupported
+        | glass_core::GlassError::AccessibilityUnavailable(_) => (
+            "unsupported_accessibility",
+            "Use glass_screenshot for pixel-based inspection, or start with accessibility enabled.",
+        ),
+        glass_core::GlassError::PermissionDenied { .. } => (
+            "permission_denied",
+            "Grant the platform accessibility permission, then retry.",
+        ),
+        glass_core::GlassError::CaptureFailed(_)
+        | glass_core::GlassError::Backend(_)
+        | glass_core::GlassError::ToolFailed { .. }
+        | glass_core::GlassError::Bounded { .. }
+        | glass_core::GlassError::Io(_) => (
+            "transport_failure",
+            "Retry after checking the backend connection and app session.",
+        ),
+        _ => (
+            "other",
+            "Check the active session and accessibility setup before retrying.",
+        ),
+    };
+    bounded_error(format!(
+        "glass_find_elements failed [{category}]. {guidance}"
+    ))
+}
+
 #[cfg(test)]
 #[allow(clippy::needless_as_bytes)]
 mod tests {
@@ -484,6 +521,65 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("specify query, role, and/or states"));
         assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn find_rejects_whitespace_only_target_and_within_queries_before_snapshotting() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut glass = started_counted_a11y(reads.clone(), fake_tree());
+        let target_error = find_elements(
+            &mut glass,
+            &FindElementsArgs {
+                query: Some(" \t ".into()),
+                role: None,
+                states: None,
+                within: None,
+                max_results: None,
+                max_nodes: None,
+                timeout_ms: None,
+            },
+        )
+        .unwrap_err();
+        assert!(target_error.contains("query must not be empty"));
+
+        let within_error = find_elements(
+            &mut glass,
+            &FindElementsArgs {
+                query: Some("save".into()),
+                role: None,
+                states: None,
+                within: Some(FindSelectorArgs {
+                    query: Some(" \n ".into()),
+                    role: None,
+                    states: None,
+                }),
+                max_results: None,
+                max_nodes: None,
+                timeout_ms: None,
+            },
+        )
+        .unwrap_err();
+        assert!(within_error.contains("query must not be empty"));
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn find_matches_queries_with_surrounding_whitespace() {
+        let mut glass = started_a11y_with(fake_tree());
+        let output = find_elements(
+            &mut glass,
+            &FindElementsArgs {
+                query: Some("  save  ".into()),
+                role: None,
+                states: None,
+                within: None,
+                max_results: None,
+                max_nodes: None,
+                timeout_ms: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(envelope_at(&output, 0)["result"]["matched"], json!(true));
     }
 
     #[test]
@@ -614,6 +710,36 @@ mod tests {
     }
 
     #[test]
+    fn final_context_reduction_retains_an_explicit_omission_marker() {
+        let mut matched = RenderedMatch {
+            id: 1,
+            role: "Button".into(),
+            name: Some("Save".into()),
+            description: None,
+            value: None,
+            bounds: None,
+            states: Vec::new(),
+            matched_field: Some("name"),
+            match_tier: "exact_name",
+            context: "context detail ".repeat(100),
+            context_stage: 0,
+            field_stages: [0; 3],
+            fields_counted: [false; 3],
+            context_counted: false,
+            query: Some("save".into()),
+        };
+        let mut counters = FitCounters::default();
+        for _ in 0..3 {
+            assert!(shorten_lowest_ranked_context(
+                std::slice::from_mut(&mut matched),
+                &mut counters
+            ));
+        }
+        assert_eq!(matched.context, "<context omitted>");
+        assert_eq!(counters.contexts_truncated, 1);
+    }
+
+    #[test]
     fn find_redacts_secure_neighbor_values_from_successful_match_context() {
         let mut tree = fake_tree();
         let mut secure_neighbor = tree.root.children[0].clone();
@@ -676,5 +802,17 @@ mod tests {
         assert_valid_wrapped_match_json(&output);
         let error = bounded_error("e".repeat(20_000));
         assert!(error.as_bytes().len() <= FIND_RESPONSE_MAX_BYTES);
+    }
+
+    #[test]
+    fn permission_denial_keeps_a_safe_actionable_category() {
+        let error = safe_operational_error(glass_core::GlassError::PermissionDenied {
+            which: "accessibility".into(),
+            remedy: "backend-controlled-secret".into(),
+        });
+        assert!(error.contains("permission_denied"), "{error}");
+        assert!(error.contains("Grant the platform accessibility permission"));
+        assert!(!error.contains("backend-controlled-secret"));
+        assert!(error.len() <= FIND_RESPONSE_MAX_BYTES);
     }
 }

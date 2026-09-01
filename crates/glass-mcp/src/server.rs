@@ -1167,6 +1167,67 @@ mod tests {
         assert!(first_text(&r).contains("done"), "got {:?}", first_text(&r));
     }
 
+    fn find_args() -> FindElementsArgs {
+        FindElementsArgs {
+            query: Some("save".into()),
+            role: None,
+            states: None,
+            within: None,
+            max_results: None,
+            max_nodes: None,
+            timeout_ms: None,
+        }
+    }
+
+    fn assert_bounded_find_error(result: ToolResult, category: &str, guidance: &str) {
+        let mapped = map_tool_result(result);
+        assert_eq!(mapped.is_error, Some(true));
+        let text = first_text(&mapped);
+        assert!(text.contains(category), "{text}");
+        assert!(text.contains(guidance), "{text}");
+        assert!(text.len() <= crate::tools::FIND_RESPONSE_MAX_BYTES);
+    }
+
+    #[test]
+    fn find_mcp_error_preserves_no_session_category_and_guidance() {
+        let mut glass =
+            crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform::new(100, 100));
+        assert_bounded_find_error(
+            crate::tools::find_elements(&mut glass, &find_args()),
+            "no_active_session",
+            "Call glass_start",
+        );
+    }
+
+    #[test]
+    fn find_mcp_error_preserves_unsupported_accessibility_category_and_guidance() {
+        let mut glass = crate::tools::testutil::started_without_a11y();
+        assert_bounded_find_error(
+            crate::tools::find_elements(&mut glass, &find_args()),
+            "unsupported_accessibility",
+            "Use glass_screenshot",
+        );
+    }
+
+    #[test]
+    fn find_mcp_transport_error_is_bounded_and_does_not_echo_backend_detail() {
+        let sentinel = "backend-secret-sentinel";
+        let mut glass = crate::tools::testutil::started_failing_a11y(
+            glass_core::GlassError::Backend(format!("{sentinel} {}", "x".repeat(20_000))),
+        );
+        let result = crate::tools::find_elements(&mut glass, &find_args());
+        let mapped = map_tool_result(result);
+        let text = first_text(&mapped);
+        assert_eq!(mapped.is_error, Some(true));
+        assert!(text.contains("transport_failure"), "{text}");
+        assert!(
+            text.contains("Retry after checking the backend connection"),
+            "{text}"
+        );
+        assert!(!text.contains(sentinel), "{text}");
+        assert!(text.len() <= crate::tools::FIND_RESPONSE_MAX_BYTES);
+    }
+
     /// android is always compiled in (host-OS-agnostic), so it's a stable choice for
     /// exercising the registered handler end to end without depending on the host OS.
     #[tokio::test]

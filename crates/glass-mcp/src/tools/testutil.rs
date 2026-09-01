@@ -571,6 +571,61 @@ pub fn started_counted_a11y(
     glass
 }
 
+pub fn started_without_a11y() -> Glass {
+    let mut glass = glass_with(FakePlatform::new(100, 100));
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["app".into()],
+            cwd: None,
+            env: Vec::new(),
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+    glass
+}
+
+struct FailingAccessibility {
+    error: Option<GlassError>,
+}
+
+impl Accessibility for FailingAccessibility {
+    fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+        Err(self.error.take().expect("scripted accessibility error"))
+    }
+}
+
+pub fn started_failing_a11y(error: GlassError) -> Glass {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    let mut held = Some(Backend {
+        platform: Box::new(FakePlatform::new(100, 100)),
+        accessibility: Some(Box::new(FailingAccessibility { error: Some(error) })),
+    });
+    let factory: PlatformFactory = Box::new(move |_backend| {
+        held.take()
+            .ok_or_else(|| GlassError::Backend("test factory called twice".into()))
+    });
+    let mut glass = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["app".into()],
+            cwd: None,
+            env: Vec::new(),
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        })
+        .unwrap();
+    glass
+}
+
 /// Parse content block `i` as the `{ok,tool,result}` envelope.
 pub(crate) fn envelope_at(out: &ToolOutput, i: usize) -> serde_json::Value {
     let OutContent::Text(t) = &out.0[i] else {

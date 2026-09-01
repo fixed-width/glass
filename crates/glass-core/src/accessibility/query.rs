@@ -115,8 +115,14 @@ impl SemanticSelector {
         states: Vec<SemanticState>,
     ) -> Result<Self, SemanticQueryError> {
         let query = match query {
-            Some(query) if query.is_empty() => return Err(SemanticQueryError::EmptyQuery),
-            value => value,
+            Some(query) => {
+                let trimmed = query.trim();
+                if trimmed.is_empty() {
+                    return Err(SemanticQueryError::EmptyQuery);
+                }
+                Some(trimmed.to_owned())
+            }
+            None => None,
         };
         if query.is_none() && role.is_none() && states.is_empty() {
             return Err(SemanticQueryError::EmptySelector);
@@ -459,6 +465,24 @@ mod tests {
     }
 
     #[test]
+    fn semantic_selector_trims_query_before_storing_and_matching() {
+        let selector = SemanticSelector::new(Some("  SaVe  ".into()), None, Vec::new()).unwrap();
+        assert_eq!(selector.query(), Some("SaVe"));
+
+        let query = SemanticQuery::new(selector, None, 10).unwrap();
+        let result = tree(vec![node(AxRole::Button, Some("Save account"))]).semantic_query(&query);
+        assert_eq!(result.matches.len(), 1);
+    }
+
+    #[test]
+    fn semantic_selector_rejects_whitespace_only_query() {
+        assert_eq!(
+            SemanticSelector::new(Some(" \t\n ".into()), None, Vec::new()),
+            Err(SemanticQueryError::EmptyQuery)
+        );
+    }
+
+    #[test]
     fn semantic_query_ranks_exact_name_before_other_substrings() {
         let exact = node(AxRole::Button, Some("save"));
         let name = node(AxRole::Button, Some("Save account"));
@@ -504,6 +528,30 @@ mod tests {
         )
         .unwrap();
         assert!(tree.semantic_query(&query).matches.is_empty());
+    }
+
+    #[test]
+    fn secure_node_returned_by_role_has_no_value_or_context_secret() {
+        let mut secure = node(AxRole::TextField, Some("Password"));
+        secure.value = Some("returned-secret-sentinel".into());
+        secure.states.secure = true;
+        secure.states.editable = true;
+        let tree = tree(vec![secure]);
+        let query = SemanticQuery::new(
+            SemanticSelector::new(None, Some(AxRole::TextField), Vec::new()).unwrap(),
+            None,
+            10,
+        )
+        .unwrap();
+
+        let result = tree.semantic_query(&query);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].element.value, None);
+        assert!(
+            !result.matches[0]
+                .context
+                .contains("returned-secret-sentinel")
+        );
     }
 
     #[test]
