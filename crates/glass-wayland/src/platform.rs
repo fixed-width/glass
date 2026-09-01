@@ -285,14 +285,17 @@ impl PendingWaylandSession {
                 Ok(())
             }
             Ok(None) => Ok(()),
-            Err(error) => Err(GlassError::SandboxUnavailable(format!(
-                "could not read Bubblewrap child status: {error}"
-            ))),
+            Err(error) => {
+                self.status = None;
+                Err(GlassError::SandboxUnavailable(format!(
+                    "could not read Bubblewrap child status: {error}"
+                )))
+            }
         }
     }
 
     fn status_confirmed(&self) -> bool {
-        self.status.is_none()
+        self.status.is_none() && self.ownership_root.is_some()
     }
 }
 
@@ -304,18 +307,60 @@ fn wayland_host_tree(child: &Child, ownership_root: u32) -> Vec<u32> {
     tree
 }
 
-fn reap_pending(pending: &mut PendingWaylandSession) {
+struct LaunchCleanupOutcome {
+    status_error: Option<GlassError>,
+    survivors: Vec<u32>,
+}
+
+fn reap_pending(pending: &mut PendingWaylandSession) -> LaunchCleanupOutcome {
     // The status may have been buffered while discovery failed or while sway was exiting. Read it
     // before the authoritative snapshot so its host PID remains a reaping root after reparenting.
     // A malformed status still falls through to reap sway's known host tree.
-    let _ = pending.poll_status();
+    let status_error = pending.poll_status().err();
     let mut tree = glass_proc_linux::proc_tree_pids(pending.child.id());
     if let Some(root) = pending.ownership_root {
         tree.extend(ProcessIdentitySet::from_host_root(root).host_pids());
     }
     tree.sort_unstable();
     tree.dedup();
-    let _ = glass_proc_linux::reap_launch(&mut pending.child, &tree, glass_proc_linux::REAP_GRACE);
+    let survivors =
+        glass_proc_linux::reap_launch(&mut pending.child, &tree, glass_proc_linux::REAP_GRACE);
+    LaunchCleanupOutcome {
+        status_error,
+        survivors,
+    }
+}
+
+fn launch_cleanup_error(outcome: LaunchCleanupOutcome) -> Option<GlassError> {
+    let survivor_error = (!outcome.survivors.is_empty()).then(|| {
+        GlassError::Backend(format!(
+            "failed-launch cleanup left surviving host PIDs: {}",
+            outcome
+                .survivors
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    });
+    match (outcome.status_error, survivor_error) {
+        (None, None) => None,
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (Some(status), Some(survivors)) => Some(GlassError::cleanup_failed(
+            "reaping a failed Wayland launch",
+            status,
+            survivors,
+        )),
+    }
+}
+
+fn failed_launch_error(pending: &mut PendingWaylandSession, primary: GlassError) -> GlassError {
+    match launch_cleanup_error(reap_pending(pending)) {
+        Some(cleanup) => {
+            GlassError::cleanup_failed("stopping a failed Wayland launch", primary, cleanup)
+        }
+        None => primary,
+    }
 }
 
 fn launch_ready(
@@ -357,20 +402,18 @@ fn launch_deadline_error(
     unrecovered_x11_windows: usize,
 ) -> GlassError {
     let status_confirmed = pending.status_confirmed();
-    reap_pending(pending);
-    if !status_confirmed {
-        return GlassError::SandboxUnavailable(
-            "Bubblewrap did not report a contained child PID".into(),
-        );
-    }
-    if unrecovered_x11_windows > 0 {
-        return GlassError::Backend(format!(
+    let primary = if !status_confirmed {
+        GlassError::SandboxUnavailable("Bubblewrap did not report a contained child PID".into())
+    } else if unrecovered_x11_windows > 0 {
+        GlassError::Backend(format!(
             "the app mapped {unrecovered_x11_windows} X11 window(s) the compositor never \
              surfaced; glass re-mapped them and they still did not appear within {timeout_ms}ms. \
              The session's Xwayland may be wedged — retry the launch."
-        ));
-    }
-    GlassError::Timeout(timeout_ms)
+        ))
+    } else {
+        GlassError::Timeout(timeout_ms)
+    };
+    failed_launch_error(pending, primary)
 }
 
 #[cfg(test)]
@@ -1569,8 +1612,7 @@ fn bring_up_session(
     ) {
         Ok(tap) => tap,
         Err(error) => {
-            reap_pending(&mut pending);
-            return Err(error);
+            return Err(failed_launch_error(&mut pending, error));
         }
     };
     let stderr_tap = match tap_or_reap(
@@ -1582,8 +1624,7 @@ fn bring_up_session(
     ) {
         Ok(tap) => tap,
         Err(error) => {
-            reap_pending(&mut pending);
-            return Err(error);
+            return Err(failed_launch_error(&mut pending, error));
         }
     };
     let taps = vec![stdout_tap, stderr_tap];
@@ -1593,8 +1634,7 @@ fn bring_up_session(
             return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
         }
         if let Err(error) = pending.poll_status() {
-            reap_pending(&mut pending);
-            return Err(error);
+            return Err(failed_launch_error(&mut pending, error));
         }
         if let Some(s) = find_wayland_socket(runtime_dir.path())
             && Instant::now() < deadline
@@ -1606,11 +1646,8 @@ fn bring_up_session(
             // group, can outlive it and hold the X display in the global namespace, breaking the
             // next session. (The app sway `exec`s is `setsid`ed out of that group — see
             // `kill_session` — and is covered by the `reap_launch` tree walk there.)
-            reap_pending(&mut pending);
-            return Err(GlassError::app_exited_during_discovery(
-                status.code(),
-                spec.sandbox,
-            ));
+            let primary = GlassError::app_exited_during_discovery(status.code(), spec.sandbox);
+            return Err(failed_launch_error(&mut pending, primary));
         }
         std::thread::sleep(
             Duration::from_millis(40).min(deadline.saturating_duration_since(Instant::now())),
@@ -1627,8 +1664,7 @@ fn bring_up_session(
                 if Instant::now() >= deadline {
                     return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
                 }
-                reap_pending(&mut pending);
-                return Err(e);
+                return Err(failed_launch_error(&mut pending, e));
             }
         };
     if Instant::now() >= deadline {
@@ -1663,8 +1699,7 @@ fn bring_up_session(
                 ));
             }
             if let Err(error) = pending.poll_status() {
-                reap_pending(&mut pending);
-                return Err(error);
+                return Err(failed_launch_error(&mut pending, error));
             }
             // A slice per pass, not the launch's whole budget: this loop is also watching for
             // sway exiting and for a window Xwayland lost. The error is dropped because a slice
@@ -1703,11 +1738,8 @@ fn bring_up_session(
             if let Ok(Some(status)) = pending.child.try_wait() {
                 // Reap the whole group (see the socket-wait loop above): an
                 // unclean sway exit can orphan Xwayland + the app otherwise.
-                reap_pending(&mut pending);
-                return Err(GlassError::app_exited_during_discovery(
-                    status.code(),
-                    spec.sandbox,
-                ));
+                let primary = GlassError::app_exited_during_discovery(status.code(), spec.sandbox);
+                return Err(failed_launch_error(&mut pending, primary));
             }
             std::thread::sleep(
                 Duration::from_millis(40).min(deadline.saturating_duration_since(Instant::now())),
@@ -1719,10 +1751,10 @@ fn bring_up_session(
     recovery.rearm();
     let geometry = active_rect.clone();
     let Some(ownership_root) = pending.ownership_root else {
-        reap_pending(&mut pending);
-        return Err(GlassError::SandboxUnavailable(
+        let primary = GlassError::SandboxUnavailable(
             "Bubblewrap status channel closed without a contained child PID".into(),
-        ));
+        );
+        return Err(failed_launch_error(&mut pending, primary));
     };
     let session = ActiveSession {
         child: pending.child,
@@ -6162,7 +6194,8 @@ mod session_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        BwrapStatusPipe, PendingWaylandSession, WaylandPlatform, find_wayland_socket, launch_ready,
+        BwrapStatusPipe, LaunchCleanupOutcome, PendingWaylandSession, WaylandPlatform,
+        failed_launch_error, find_wayland_socket, launch_cleanup_error, launch_ready,
         launch_with_retry, nudge_x, open_session, parse_sway_version, reap_pending,
         start_recovery_after,
     };
@@ -6174,8 +6207,8 @@ mod tests {
     struct PendingCleanup<'a>(Option<&'a mut PendingWaylandSession>);
 
     impl PendingCleanup<'_> {
-        fn reap(&mut self) {
-            reap_pending(self.0.as_deref_mut().expect("armed cleanup guard"));
+        fn reap(&mut self) -> LaunchCleanupOutcome {
+            reap_pending(self.0.as_deref_mut().expect("armed cleanup guard"))
         }
 
         fn disarm(&mut self) {
@@ -6186,7 +6219,7 @@ mod tests {
     impl Drop for PendingCleanup<'_> {
         fn drop(&mut self) {
             if let Some(pending) = self.0.as_deref_mut() {
-                reap_pending(pending);
+                let _ = reap_pending(pending);
             }
         }
     }
@@ -6224,6 +6257,93 @@ mod tests {
 
         assert_eq!(value, 42);
         assert_eq!(attempts, [deadline, deadline]);
+    }
+
+    #[test]
+    fn failed_launch_reports_primary_and_final_status_read_failure() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded cleanup fixture");
+        let pipe = BwrapStatusPipe::new().expect("status pipe");
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", pipe.writer_fd()))
+            .expect("duplicate status writer");
+        let mut pending = PendingWaylandSession {
+            child,
+            status: Some(pipe.into_reader()),
+            ownership_root: None,
+        };
+        for _ in 0..16 {
+            writer
+                .write_all(&[b'x'; 4096])
+                .expect("fill malformed status");
+            pending
+                .poll_status()
+                .expect("status remains below its parser bound");
+        }
+        writer.write_all(b"x").expect("exceed parser bound");
+        drop(writer);
+
+        let error = failed_launch_error(
+            &mut pending,
+            glass_core::GlassError::Backend("primary launch failure".into()),
+        );
+
+        assert!(
+            error.to_string().contains("primary launch failure"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("could not read Bubblewrap child status"),
+            "{error}"
+        );
+        assert!(!pending.status_confirmed());
+    }
+
+    #[test]
+    fn launch_cleanup_error_lists_every_surviving_host_pid() {
+        let outcome = LaunchCleanupOutcome {
+            status_error: None,
+            survivors: vec![41, 73],
+        };
+
+        let error = launch_cleanup_error(outcome).expect("survivors are a cleanup failure");
+
+        assert!(error.to_string().contains("41, 73"), "{error}");
+    }
+
+    #[test]
+    fn successful_failed_launch_cleanup_preserves_the_primary_error_unchanged() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded cleanup fixture");
+        let child_pid = child.id();
+        let mut pending = PendingWaylandSession {
+            child,
+            status: None,
+            ownership_root: Some(child_pid),
+        };
+
+        let error = failed_launch_error(
+            &mut pending,
+            glass_core::GlassError::Backend("primary launch failure".into()),
+        );
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::Backend(ref message) if message == "primary launch failure"
+        ));
     }
 
     #[test]
@@ -6271,9 +6391,10 @@ mod tests {
         );
         let mut cleanup = PendingCleanup(Some(&mut pending));
 
-        cleanup.reap();
+        let outcome = cleanup.reap();
         cleanup.disarm();
 
+        assert!(launch_cleanup_error(outcome).is_none());
         assert!(
             !glass_proc_linux::any_alive(&target_tree),
             "late-reported target tree survived cleanup: {target_tree:?}"

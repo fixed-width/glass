@@ -318,6 +318,16 @@ pub enum GlassError {
         cleanup: Box<GlassError>,
     },
 
+    /// Both an operation and its mandatory cleanup failed; each structured cause remains
+    /// inspectable without assigning the cleanup to a more specific error domain.
+    #[error("{primary}; cleanup failed while {operation}: {cleanup}")]
+    CleanupFailed {
+        operation: &'static str,
+        #[source]
+        primary: Box<GlassError>,
+        cleanup: Box<GlassError>,
+    },
+
     /// An unchanged failure from work proven not to have dispatched.
     #[error(transparent)]
     BeforeDispatch(Box<GlassError>),
@@ -382,7 +392,8 @@ impl GlassError {
             GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => error.cause(),
             GlassError::AxWriteUnconfirmedCaused { source, .. } => source.cause(),
             GlassError::WindowRestoreFailed { primary, .. } => primary.cause(),
-            GlassError::InputCleanupFailed { primary, .. } => primary.cause(),
+            GlassError::InputCleanupFailed { primary, .. }
+            | GlassError::CleanupFailed { primary, .. } => primary.cause(),
             error => error,
         }
     }
@@ -405,6 +416,9 @@ impl GlassError {
             }
             GlassError::InputCleanupFailed {
                 primary, cleanup, ..
+            }
+            | GlassError::CleanupFailed {
+                primary, cleanup, ..
             } => {
                 primary.set_value_failed_after_writing() || cleanup.set_value_failed_after_writing()
             }
@@ -419,7 +433,8 @@ impl GlassError {
             error @ (GlassError::BeforeDispatch(_)
             | GlassError::AfterDispatch(_)
             | GlassError::Bounded { .. }
-            | GlassError::InputCleanupFailed { .. }) => error,
+            | GlassError::InputCleanupFailed { .. }
+            | GlassError::CleanupFailed { .. }) => error,
             error => GlassError::BeforeDispatch(Box::new(error)),
         }
     }
@@ -427,7 +442,9 @@ impl GlassError {
     /// Preserve earlier dispatch when a later compound-operation step fails.
     pub fn after_dispatch(self) -> Self {
         match self {
-            error @ (GlassError::AfterDispatch(_) | GlassError::InputCleanupFailed { .. }) => error,
+            error @ (GlassError::AfterDispatch(_)
+            | GlassError::InputCleanupFailed { .. }
+            | GlassError::CleanupFailed { .. }) => error,
             error @ GlassError::Bounded {
                 dispatch: BoundDispatch::MayHaveDispatched,
                 ..
@@ -505,6 +522,19 @@ impl GlassError {
         }
     }
 
+    /// Preserve both a primary operation failure and a mandatory cleanup failure.
+    pub fn cleanup_failed(
+        operation: &'static str,
+        primary: GlassError,
+        cleanup: GlassError,
+    ) -> GlassError {
+        GlassError::CleanupFailed {
+            operation,
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        }
+    }
+
     /// Which of glass's own bounds ended this call, if one did rather than the tool answering.
     ///
     /// The question a backend asks before retrying, before offering a wedged-tool remedy, and
@@ -522,6 +552,9 @@ impl GlassError {
             }
             GlassError::InputCleanupFailed {
                 primary, cleanup, ..
+            }
+            | GlassError::CleanupFailed {
+                primary, cleanup, ..
             } => primary.bound().or_else(|| cleanup.bound()),
             _ => None,
         }
@@ -538,6 +571,9 @@ impl GlassError {
                 primary.bound_owner().or_else(|| restore.bound_owner())
             }
             GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            }
+            | GlassError::CleanupFailed {
                 primary, cleanup, ..
             } => primary.bound_owner().or_else(|| cleanup.bound_owner()),
             _ => None,
@@ -570,6 +606,17 @@ impl GlassError {
                 }
             }
             GlassError::InputCleanupFailed { .. } => Some(BoundDispatch::MayHaveDispatched),
+            GlassError::CleanupFailed {
+                primary, cleanup, ..
+            } => match (primary.bound_dispatch(), cleanup.bound_dispatch()) {
+                (Some(BoundDispatch::MayHaveDispatched), _)
+                | (_, Some(BoundDispatch::MayHaveDispatched)) => {
+                    Some(BoundDispatch::MayHaveDispatched)
+                }
+                (Some(BoundDispatch::NotDispatched), _)
+                | (_, Some(BoundDispatch::NotDispatched)) => Some(BoundDispatch::NotDispatched),
+                (None, None) => None,
+            },
             _ => None,
         }
     }
@@ -592,6 +639,9 @@ impl GlassError {
                 primary.tool_said().or_else(|| restore.tool_said())
             }
             GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            }
+            | GlassError::CleanupFailed {
                 primary, cleanup, ..
             } => primary.tool_said().or_else(|| cleanup.tool_said()),
             _ => None,
@@ -652,6 +702,22 @@ mod tests {
     #[test]
     fn ordinary_backend_errors_have_no_bound_owner() {
         assert_eq!(GlassError::Backend("down".into()).bound_owner(), None);
+    }
+
+    #[test]
+    fn cleanup_failure_preserves_primary_and_cleanup_metadata() {
+        let error = GlassError::cleanup_failed(
+            "stopping failed launch",
+            GlassError::caller_deadline_elapsed("launch"),
+            GlassError::ToolFailed {
+                call: "reap".into(),
+                said: "survivors".into(),
+            },
+        );
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.tool_said(), Some("survivors"));
     }
 
     #[test]
