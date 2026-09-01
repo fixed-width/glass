@@ -181,10 +181,13 @@ fn parse_directory_names(bytes: &[u8]) -> Result<Vec<std::ffi::OsString>, HostFs
             units.push(u16::from_le_bytes([pair[0], pair[1]]));
         }
         let name = std::ffi::OsString::from_wide(&units);
-        if !valid_child_name(&name) {
+        if name == "." || name == ".." {
+            // Directory queries may include navigation records. They are never exposed as children.
+        } else if !valid_child_name(&name) {
             return Err(HostFsError::Integrity);
+        } else {
+            names.push(name);
         }
-        names.push(name);
         if next == 0 {
             if bytes[end..].len() >= 8 || bytes[end..].iter().any(|byte| *byte != 0) {
                 return Err(HostFsError::Integrity);
@@ -548,7 +551,7 @@ mod tests {
 
     #[test]
     fn parser_rejects_names_that_are_not_one_child_component() {
-        for name in [".", "..", "a/b", "a\\b", "a\0b"] {
+        for name in ["a/b", "a\\b", "a\0b"] {
             let encoded = name.encode_utf16().collect::<Vec<_>>();
             let bytes = directory_record(
                 &encoded,
@@ -556,6 +559,19 @@ mod tests {
                 std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName) + encoded.len() * 2,
             );
             assert_eq!(parse_directory_names(&bytes), Err(HostFsError::Integrity));
+        }
+    }
+
+    #[test]
+    fn parser_omits_navigation_records() {
+        for name in [".", ".."] {
+            let encoded = name.encode_utf16().collect::<Vec<_>>();
+            let bytes = directory_record(
+                &encoded,
+                0,
+                std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName) + encoded.len() * 2,
+            );
+            assert_eq!(parse_directory_names(&bytes), Ok(Vec::new()));
         }
     }
 
