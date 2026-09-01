@@ -459,6 +459,16 @@ mod identity_tests {
         assert_eq!(set.host_pids(), &[7, 4242, 4243]);
         assert_eq!(set.matching_pids(), &[2, 3, 7, 4242, 4243]);
     }
+
+    #[test]
+    fn identity_set_from_a_live_root_contains_that_process() {
+        let root = std::process::id();
+
+        let set = ProcessIdentitySet::from_host_root(root);
+
+        assert!(set.host_pids().contains(&root));
+        assert!(set.matching_pids().contains(&root));
+    }
 }
 
 #[cfg(test)]

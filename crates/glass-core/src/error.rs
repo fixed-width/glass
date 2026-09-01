@@ -769,6 +769,17 @@ mod tests {
     }
 
     #[test]
+    fn generic_cleanup_failure_preserves_dispatch_provenance() {
+        let error = GlassError::cleanup_failed(
+            "stopping launch",
+            GlassError::deadline_not_started("launch"),
+            GlassError::Backend("reap failed".into()),
+        );
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
     fn before_dispatch_preserves_an_ordinary_cause_and_marks_no_dispatch() {
         let error = GlassError::Backend("could not spawn helper".into()).before_dispatch();
 
