@@ -965,6 +965,36 @@ impl ArtifactStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn expire_for_test(&self, uri: &str) {
+        let id = uri.rsplit('/').next().expect("artifact URI id");
+        let entry = self
+            .inner
+            .state
+            .lock()
+            .expect("artifact state")
+            .entries
+            .remove(id)
+            .expect("registered artifact");
+        fs::remove_file(entry.path).expect("remove expired artifact body");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_for_test(&self, uri: &str) {
+        let id = uri.rsplit('/').next().expect("artifact URI id");
+        let path = self
+            .inner
+            .state
+            .lock()
+            .expect("artifact state")
+            .entries
+            .get(id)
+            .expect("registered artifact")
+            .path
+            .clone();
+        fs::write(path, b"corrupt").expect("corrupt artifact body");
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_test_hook(&self, point: TestHookPoint, hook: impl FnOnce() + Send + 'static) {
         if let Ok(mut slot) = self.inner.test_hook.lock() {
             *slot = Some((point, Box::new(hook)));

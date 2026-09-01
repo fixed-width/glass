@@ -372,6 +372,19 @@ impl GlassServer {
         Ok(applied_to_call_result(applied, access))
     }
 
+    #[cfg(test)]
+    pub(crate) async fn run_test_outcome(
+        &self,
+        outcome: ToolCallOutcome,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = outcome.tool;
+        let effect = outcome.effect;
+        let is_error = outcome.is_error;
+        let output = outcome.output;
+        self.run_outcome(tool, effect, move |_| (is_error, output))
+            .await
+    }
+
     #[tool(
         annotations(
             read_only_hint = false,

@@ -200,6 +200,38 @@ pub async fn run_on_until(
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn run_server_on_until(
+    listener: tokio::net::TcpListener,
+    cfg: ServeConfig,
+    server: GlassServer,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let sessions = server.sessions();
+    let artifacts = server.artifact_store();
+    let cancel = CancellationToken::new();
+    let app = build_router(&cfg, server, &cancel);
+    let server_cancel = cancel.clone();
+    let serving = axum::serve(listener, app).with_graceful_shutdown(async move {
+        server_cancel.cancelled().await;
+    });
+    let transport_result = run_server_then_teardown(
+        async move { serving.await },
+        shutdown,
+        &cancel,
+        HTTP_GRACEFUL_DRAIN_BUDGET,
+        crate::shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET),
+        crate::cleanup_artifacts(artifacts),
+    )
+    .await;
+    match transport_result {
+        Ok(result) => result.context("serving MCP over HTTP"),
+        Err(()) => Err(anyhow::anyhow!(
+            "MCP HTTP graceful drain exceeded {HTTP_GRACEFUL_DRAIN_BUDGET:?}"
+        )),
+    }
+}
+
 /// Complete bounded session teardown even if graceful HTTP drain times out.
 async fn run_server_then_teardown<T>(
     server: impl Future<Output = T>,
