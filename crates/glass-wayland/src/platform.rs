@@ -310,6 +310,37 @@ fn reap_pending(pending: &mut PendingWaylandSession) {
     let _ = glass_proc_linux::reap_launch(&mut pending.child, &tree, glass_proc_linux::REAP_GRACE);
 }
 
+fn launch_ready(
+    status_confirmed: bool,
+    window_discovered: bool,
+    deadline: Instant,
+    observed_at: Instant,
+) -> bool {
+    status_confirmed && window_discovered && observed_at < deadline
+}
+
+fn launch_deadline_error(
+    pending: &mut PendingWaylandSession,
+    timeout_ms: u64,
+    unrecovered_x11_windows: usize,
+) -> GlassError {
+    let status_confirmed = pending.status_confirmed();
+    reap_pending(pending);
+    if !status_confirmed {
+        return GlassError::SandboxUnavailable(
+            "Bubblewrap did not report a contained child PID".into(),
+        );
+    }
+    if unrecovered_x11_windows > 0 {
+        return GlassError::Backend(format!(
+            "the app mapped {unrecovered_x11_windows} X11 window(s) the compositor never \
+             surfaced; glass re-mapped them and they still did not appear within {timeout_ms}ms. \
+             The session's Xwayland may be wedged — retry the launch."
+        ));
+    }
+    GlassError::Timeout(timeout_ms)
+}
+
 #[cfg(test)]
 impl WaylandPlatform {
     /// The active session's private runtime dir — where sway put both its wayland socket and its
@@ -1538,11 +1569,16 @@ fn bring_up_session(
 
     let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
     let socket = loop {
+        if Instant::now() >= deadline {
+            return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
+        }
         if let Err(error) = pending.poll_status() {
             reap_pending(&mut pending);
             return Err(error);
         }
-        if let Some(s) = find_wayland_socket(runtime_dir.path()) {
+        if let Some(s) = find_wayland_socket(runtime_dir.path())
+            && Instant::now() < deadline
+        {
             break s;
         }
         if let Ok(Some(status)) = pending.child.try_wait() {
@@ -1556,38 +1592,24 @@ fn bring_up_session(
                 spec.sandbox,
             ));
         }
-        if Instant::now() >= deadline {
-            let status_confirmed = pending.status_confirmed();
-            reap_pending(&mut pending);
-            return if status_confirmed {
-                Err(GlassError::Timeout(spec.timeout_ms))
-            } else {
-                Err(GlassError::SandboxUnavailable(
-                    "Bubblewrap did not report a contained child PID".into(),
-                ))
-            };
-        }
         std::thread::sleep(Duration::from_millis(40));
     };
 
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
+    }
     let (conn, mut queue, mut state, manager, output, pointer, keyboard, mut ipc, output_size) =
-        // What is left of the launch the caller asked for — `timeout_ms` is the knob for a slow
-        // machine — but never less than one sync's worth: the socket wait above shares this
-        // deadline, so a compositor slow to create its socket would otherwise leave the setup
-        // that follows a few milliseconds and fail a launch that was merely late.
-        match open_session(
-            &socket,
-            runtime_dir.path(),
-            deadline
-                .saturating_duration_since(Instant::now())
-                .max(COMPOSITOR_SYNC_BUDGET),
-        ) {
+        match open_session(&socket, runtime_dir.path(), remaining) {
             Ok(v) => v,
             Err(e) => {
                 reap_pending(&mut pending);
                 return Err(e);
             }
         };
+    if Instant::now() >= deadline {
+        return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
+    }
     let socket_path = socket;
 
     // Discover the initially-focused window (the app's first toplevel), so
@@ -1608,6 +1630,14 @@ fn bring_up_session(
         let start_grace = Instant::now() + start_recovery_after(spec.timeout_ms);
         let mut discovered = None;
         loop {
+            if Instant::now() >= deadline {
+                let unrecovered = recovery.unrecovered();
+                return Err(launch_deadline_error(
+                    &mut pending,
+                    spec.timeout_ms,
+                    unrecovered,
+                ));
+            }
             if let Err(error) = pending.poll_status() {
                 reap_pending(&mut pending);
                 return Err(error);
@@ -1619,7 +1649,7 @@ fn bring_up_session(
                 &conn,
                 &mut queue,
                 &mut state,
-                Instant::now() + COMPOSITOR_SERVICE_SLICE,
+                deadline.min(Instant::now() + COMPOSITOR_SERVICE_SLICE),
                 "launch",
             );
             // Distinguish "sway says no windows" from "sway did not answer": an unanswered
@@ -1633,8 +1663,12 @@ fn bring_up_session(
                 mint_id(&mut ids, &mut next_id, &w.identifier);
                 discovered = Some((Some(w.identifier.clone()), rect_to_geom(&w.rect)));
             }
-            if pending.status_confirmed()
-                && let Some(window) = discovered.take()
+            if launch_ready(
+                pending.status_confirmed(),
+                discovered.is_some(),
+                deadline,
+                Instant::now(),
+            ) && let Some(window) = discovered.take()
             {
                 break window;
             }
@@ -1650,28 +1684,6 @@ fn bring_up_session(
                     status.code(),
                     spec.sandbox,
                 ));
-            }
-            if Instant::now() >= deadline {
-                let status_confirmed = pending.status_confirmed();
-                let unrecovered = recovery.unrecovered();
-                reap_pending(&mut pending);
-                if !status_confirmed {
-                    return Err(GlassError::SandboxUnavailable(
-                        "Bubblewrap did not report a contained child PID".into(),
-                    ));
-                }
-                // Say what glass saw. A launch that gives up after re-mapping a window the app
-                // really had is a different problem from an app that never opened one, and a
-                // bare timeout would send the reader looking at the app.
-                if unrecovered > 0 {
-                    return Err(GlassError::Backend(format!(
-                        "the app mapped {unrecovered} X11 window(s) the compositor never \
-                         surfaced; glass re-mapped them and they still did not appear within \
-                         {}ms. The session's Xwayland may be wedged — retry the launch.",
-                        spec.timeout_ms
-                    )));
-                }
-                return Err(GlassError::Timeout(spec.timeout_ms));
             }
             std::thread::sleep(Duration::from_millis(40));
         }
@@ -6129,7 +6141,15 @@ mod session_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{nudge_x, parse_sway_version, start_recovery_after};
+    use super::{launch_ready, nudge_x, parse_sway_version, start_recovery_after};
+
+    #[test]
+    fn launch_ready_rejects_status_and_window_observed_after_deadline() {
+        let deadline = std::time::Instant::now();
+        let observed_at = deadline + std::time::Duration::from_millis(1);
+
+        assert!(!launch_ready(true, true, deadline, observed_at));
+    }
 
     /// A launch spends half its budget waiting for the compositor before suspecting a window was
     /// lost, so a slow app that is merely still starting is not interfered with.
