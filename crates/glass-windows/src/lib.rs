@@ -30,7 +30,10 @@ pub mod teardown; // pure graceful-close decisions — cross-platform, unit-test
 pub mod vkmap; // pure named-keysym->VK map — cross-platform, host-tested
 
 #[cfg(windows)]
-pub use host_fs::{path_has_private_dacl, restrict_path_to_current_user};
+pub use host_fs::{
+    HostFsError, open_directory_no_reparse, open_file_beneath, path_has_private_dacl,
+    restrict_path_to_current_user,
+};
 
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
 pub const BACKEND: &str = "windows";

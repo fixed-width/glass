@@ -56,6 +56,7 @@ struct StoreState {
     process_dir: PathBuf,
     lease_path: PathBuf,
     lease: Option<File>,
+    process_dir_handle: Option<File>,
     server_id: String,
     entries: HashMap<String, RegistryEntry>,
     next_seq: u64,
@@ -165,6 +166,10 @@ pub(crate) enum FaultStage {
     TempCreated(usize),
     TempWritten(usize),
     FinalRenamed(usize),
+    GrowDuringRead,
+    ReadBodyFails,
+    ProcessProtectionThenDirectoryCleanupFails,
+    DirectoryCreateThenLeaseCleanupFails,
 }
 
 impl FaultStage {
@@ -244,15 +249,31 @@ impl ArtifactStore {
         require_immediate_child(&root, &lease_path)?;
 
         let lease = open_lease(&lease_path)?;
-        if let Err(error) = create_private_dir(&process_dir) {
-            let _ = fs::remove_file(&lease_path);
-            return Err(error);
+        let create_result = if fault == Some(FaultStage::DirectoryCreateThenLeaseCleanupFails) {
+            Err(ArtifactError::RootCreateFailed)
+        } else {
+            create_private_dir(&process_dir)
+        };
+        if let Err(error) = create_result {
+            return rollback_initialization(None, &lease_path, lease, fault)
+                .map_or_else(Err, |()| Err(error));
         }
-        if let Err(error) = protect_path(&process_dir) {
-            let cleanup = remove_owned_dir(&process_dir);
-            let _ = fs::remove_file(&lease_path);
-            return cleanup.map_or(Err(error), |_| Err(error));
+        let protection = if fault == Some(FaultStage::ProcessProtectionThenDirectoryCleanupFails) {
+            Err(ArtifactError::ProtectionRegistrationFailed)
+        } else {
+            protect_path(&process_dir)
+        };
+        if let Err(error) = protection {
+            return rollback_initialization(Some(&process_dir), &lease_path, lease, fault)
+                .map_or_else(Err, |()| Err(error));
         }
+        let process_dir_handle = match open_process_directory(&process_dir) {
+            Ok(handle) => handle,
+            Err(error) => {
+                return rollback_initialization(Some(&process_dir), &lease_path, lease, fault)
+                    .map_or_else(Err, |()| Err(error));
+            }
+        };
 
         Ok(Self {
             inner: Arc::new(ArtifactStoreInner {
@@ -261,6 +282,7 @@ impl ArtifactStore {
                     process_dir,
                     lease_path,
                     lease: Some(lease),
+                    process_dir_handle: Some(process_dir_handle),
                     server_id,
                     entries: HashMap::new(),
                     next_seq: 0,
@@ -435,7 +457,7 @@ impl ArtifactStore {
     }
 
     pub(crate) fn read(&self, uri: &str) -> Result<ReadArtifact, ArtifactReadError> {
-        let (id, entry_path, size, sha256, mime_type, untrusted, process_dir) = {
+        let (id, entry_path, size, sha256, mime_type, untrusted, process_dir, process_handle) = {
             let mut state = self
                 .inner
                 .state
@@ -443,6 +465,12 @@ impl ArtifactStore {
                 .map_err(|_| ArtifactReadError::ExpiredOrUnavailable)?;
             let id = parse_uri(uri, &state.server_id)?;
             let process_dir = state.process_dir.clone();
+            let process_handle = state
+                .process_dir_handle
+                .as_ref()
+                .ok_or(ArtifactReadError::ExpiredOrUnavailable)?
+                .try_clone()
+                .map_err(|_| ArtifactReadError::ReadFailed)?;
             let entry = state
                 .entries
                 .get_mut(id)
@@ -456,6 +484,7 @@ impl ArtifactStore {
                 entry.descriptor.mime_type().to_owned(),
                 entry.descriptor.untrusted(),
                 process_dir,
+                process_handle,
             )
         };
         let pin = PinGuard {
@@ -465,13 +494,34 @@ impl ArtifactStore {
         if entry_path.parent() != Some(process_dir.as_path()) {
             return Err(ArtifactReadError::IntegrityFailed);
         }
-        let mut file = open_read_no_follow(&entry_path)?;
+        let filename = entry_path
+            .file_name()
+            .ok_or(ArtifactReadError::IntegrityFailed)?;
+        let mut file = open_read_no_follow(&process_handle, &process_dir, filename)?;
         let metadata = file.metadata().map_err(|_| ArtifactReadError::ReadFailed)?;
-        if !metadata.file_type().is_file() {
+        if !metadata.file_type().is_file() || metadata.len() != size {
             return Err(ArtifactReadError::IntegrityFailed);
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
+        if self.inner.fault == Some(FaultStage::ReadBodyFails) {
+            return Err(ArtifactReadError::ReadFailed);
+        }
+        if self.inner.fault == Some(FaultStage::GrowDuringRead) {
+            let mut writer = OpenOptions::new()
+                .append(true)
+                .open(&entry_path)
+                .map_err(|_| ArtifactReadError::ReadFailed)?;
+            writer
+                .write_all(b"x")
+                .map_err(|_| ArtifactReadError::ReadFailed)?;
+        }
+        let capacity = usize::try_from(size).map_err(|_| ArtifactReadError::IntegrityFailed)?;
+        let read_limit = size
+            .checked_add(1)
+            .ok_or(ArtifactReadError::IntegrityFailed)?;
+        let mut bytes = Vec::with_capacity(capacity);
+        Read::by_ref(&mut file)
+            .take(read_limit)
+            .read_to_end(&mut bytes)
             .map_err(|_| ArtifactReadError::ReadFailed)?;
         if bytes.len() as u64 != size || hash(&bytes) != sha256 {
             return Err(ArtifactReadError::IntegrityFailed);
@@ -510,23 +560,29 @@ impl ArtifactStore {
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), ArtifactError> {
-        let (process_dir, lease_path) = {
+        let (process_dir, lease_path, process_dir_handle, lease) = {
             let mut state = self
                 .inner
                 .state
                 .lock()
                 .map_err(|_| ArtifactError::StatePoisoned)?;
             state.closing = true;
-            (state.process_dir.clone(), state.lease_path.clone())
+            (
+                state.process_dir.clone(),
+                state.lease_path.clone(),
+                state.process_dir_handle.take(),
+                state.lease.take(),
+            )
         };
+        drop(process_dir_handle);
         remove_owned_dir(&process_dir)?;
+        drop(lease);
         fs::remove_file(&lease_path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
         let mut state = self
             .inner
             .state
             .lock()
             .map_err(|_| ArtifactError::StatePoisoned)?;
-        state.lease.take();
         state.entries.clear();
         state.closed = true;
         Ok(())
@@ -698,6 +754,39 @@ fn protect_path(path: &Path) -> Result<(), ArtifactError> {
     Ok(())
 }
 
+fn rollback_initialization(
+    process_dir: Option<&Path>,
+    lease_path: &Path,
+    lease: File,
+    fault: Option<FaultStage>,
+) -> Result<(), ArtifactError> {
+    drop(lease);
+    let mut failure = None;
+    if let Some(path) = process_dir {
+        let result = if fault == Some(FaultStage::ProcessProtectionThenDirectoryCleanupFails) {
+            Err(ArtifactError::CleanupFailed(
+                std::io::ErrorKind::PermissionDenied,
+            ))
+        } else {
+            remove_owned_dir(path)
+        };
+        if let Err(error) = result {
+            failure = Some(error);
+        }
+    }
+    let lease_result = if fault == Some(FaultStage::DirectoryCreateThenLeaseCleanupFails) {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    } else {
+        fs::remove_file(lease_path)
+    };
+    if let Err(error) = lease_result
+        && failure.is_none()
+    {
+        failure = Some(ArtifactError::CleanupFailed(error.kind()));
+    }
+    failure.map_or(Ok(()), Err)
+}
+
 fn rollback_paths(paths: &[PathBuf]) -> Result<(), ()> {
     let mut failed = false;
     for path in paths.iter().rev() {
@@ -749,30 +838,73 @@ fn parse_uri<'a>(uri: &'a str, server_id: &str) -> Result<&'a str, ArtifactReadE
 }
 
 #[cfg(unix)]
-fn open_read_no_follow(path: &Path) -> Result<File, ArtifactReadError> {
+fn open_process_directory(path: &Path) -> Result<File, ArtifactError> {
     let fd = rustix::fs::open(
         path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|_| ArtifactError::RootCanonicalizeFailed)?;
+    Ok(File::from(fd))
+}
+
+#[cfg(unix)]
+fn open_read_no_follow(
+    process_handle: &File,
+    process_dir: &Path,
+    filename: &std::ffi::OsStr,
+) -> Result<File, ArtifactReadError> {
+    if !directory_handle_matches_path(process_handle, process_dir)? {
+        return Err(ArtifactReadError::IntegrityFailed);
+    }
+    let fd = rustix::fs::openat(
+        process_handle,
+        Path::new(filename),
         rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     )
     .map_err(|_| ArtifactReadError::ReadFailed)?;
-    Ok(File::from(fd))
-}
-
-#[cfg(windows)]
-fn open_read_no_follow(path: &Path) -> Result<File, ArtifactReadError> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-    };
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(path)
-        .map_err(|_| ArtifactReadError::ReadFailed)?;
-    let metadata = file.metadata().map_err(|_| ArtifactReadError::ReadFailed)?;
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    let file = File::from(fd);
+    if !directory_handle_matches_path(process_handle, process_dir)? {
         return Err(ArtifactReadError::IntegrityFailed);
     }
     Ok(file)
+}
+
+#[cfg(unix)]
+fn directory_handle_matches_path(handle: &File, path: &Path) -> Result<bool, ArtifactReadError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let retained = handle
+        .metadata()
+        .map_err(|_| ArtifactReadError::ReadFailed)?;
+    let current = fs::symlink_metadata(path).map_err(|_| ArtifactReadError::IntegrityFailed)?;
+    Ok(current.is_dir()
+        && !current.file_type().is_symlink()
+        && retained.dev() == current.dev()
+        && retained.ino() == current.ino())
+}
+
+#[cfg(windows)]
+fn open_process_directory(path: &Path) -> Result<File, ArtifactError> {
+    glass_windows::open_directory_no_reparse(path)
+        .map_err(|_| ArtifactError::RootCanonicalizeFailed)
+}
+
+#[cfg(windows)]
+fn open_read_no_follow(
+    process_handle: &File,
+    process_dir: &Path,
+    filename: &std::ffi::OsStr,
+) -> Result<File, ArtifactReadError> {
+    glass_windows::open_file_beneath(process_handle, process_dir, filename).map_err(|error| {
+        if error == glass_windows::HostFsError::Integrity {
+            ArtifactReadError::IntegrityFailed
+        } else {
+            ArtifactReadError::ReadFailed
+        }
+    })
 }

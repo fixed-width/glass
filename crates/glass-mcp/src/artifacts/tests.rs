@@ -164,6 +164,206 @@ fn tampered_artifact_never_returns_partial_or_unverified_text() {
 }
 
 #[test]
+fn oversized_replacement_is_rejected_before_body_allocation() {
+    let root = tempfile::tempdir().unwrap();
+    let store =
+        ArtifactStore::for_test_with_fault(root.path(), 1024, FaultStage::ReadBodyFails).unwrap();
+    let published = store
+        .publish(vec![store.prepare(draft("small")).unwrap()])
+        .unwrap();
+    let descriptor = &published.descriptors()[0];
+    fs::write(descriptor.local_path(), vec![b'x'; 1024 * 1024]).unwrap();
+
+    assert_eq!(
+        store.read(descriptor.uri()).unwrap_err(),
+        ArtifactReadError::IntegrityFailed
+    );
+}
+
+#[test]
+fn registered_size_read_reaches_the_body_read_stage() {
+    let root = tempfile::tempdir().unwrap();
+    let store =
+        ArtifactStore::for_test_with_fault(root.path(), 1024, FaultStage::ReadBodyFails).unwrap();
+    let published = store
+        .publish(vec![store.prepare(draft("small")).unwrap()])
+        .unwrap();
+
+    assert_eq!(
+        store.read(published.descriptors()[0].uri()).unwrap_err(),
+        ArtifactReadError::ReadFailed
+    );
+}
+
+#[test]
+fn file_growth_during_read_is_rejected_without_partial_text() {
+    let root = tempfile::tempdir().unwrap();
+    let store =
+        ArtifactStore::for_test_with_fault(root.path(), 1024, FaultStage::GrowDuringRead).unwrap();
+    let published = store
+        .publish(vec![store.prepare(draft("stable")).unwrap()])
+        .unwrap();
+
+    assert_eq!(
+        store.read(published.descriptors()[0].uri()).unwrap_err(),
+        ArtifactReadError::IntegrityFailed
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_process_directory_after_publication_cannot_redirect_read() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "keep").unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let published = store
+        .publish(vec![store.prepare(draft("known")).unwrap()])
+        .unwrap();
+    let descriptor = &published.descriptors()[0];
+    let filename = descriptor.local_path().file_name().unwrap();
+    fs::write(outside.path().join(filename), "known").unwrap();
+    fs::rename(
+        store.process_dir(),
+        root.path().join("detached-process-dir"),
+    )
+    .unwrap();
+    symlink(outside.path(), store.process_dir()).unwrap();
+
+    assert_eq!(
+        store.read(descriptor.uri()).unwrap_err(),
+        ArtifactReadError::IntegrityFailed
+    );
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep");
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_root_ancestor_after_publication_cannot_redirect_read() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "keep").unwrap();
+    let store = ArtifactStore::for_test(&root, 1024).unwrap();
+    let published = store
+        .publish(vec![store.prepare(draft("known")).unwrap()])
+        .unwrap();
+    let descriptor = &published.descriptors()[0];
+    let relative = descriptor.local_path().strip_prefix(&root).unwrap();
+    let redirected = outside.path().join(relative);
+    fs::create_dir_all(redirected.parent().unwrap()).unwrap();
+    fs::write(&redirected, "known").unwrap();
+    fs::rename(&root, parent.path().join("detached-root")).unwrap();
+    symlink(outside.path(), &root).unwrap();
+
+    assert_eq!(
+        store.read(descriptor.uri()).unwrap_err(),
+        ArtifactReadError::IntegrityFailed
+    );
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep");
+}
+
+#[test]
+fn process_directory_cleanup_failure_overrides_initialization_error() {
+    let root = tempfile::tempdir().unwrap();
+    assert_eq!(
+        ArtifactStore::for_test_with_fault(
+            root.path(),
+            1024,
+            FaultStage::ProcessProtectionThenDirectoryCleanupFails,
+        )
+        .unwrap_err(),
+        ArtifactError::CleanupFailed(std::io::ErrorKind::PermissionDenied)
+    );
+}
+
+#[test]
+fn lease_cleanup_failure_overrides_initialization_error() {
+    let root = tempfile::tempdir().unwrap();
+    assert_eq!(
+        ArtifactStore::for_test_with_fault(
+            root.path(),
+            1024,
+            FaultStage::DirectoryCreateThenLeaseCleanupFails,
+        )
+        .unwrap_err(),
+        ArtifactError::CleanupFailed(std::io::ErrorKind::PermissionDenied)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn replacing_process_directory_with_reparse_target_cannot_redirect_read() {
+    use std::os::windows::fs::symlink_dir;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "keep").unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let published = store
+        .publish(vec![store.prepare(draft("known")).unwrap()])
+        .unwrap();
+    let descriptor = &published.descriptors()[0];
+    fs::write(
+        outside
+            .path()
+            .join(descriptor.local_path().file_name().unwrap()),
+        "known",
+    )
+    .unwrap();
+    fs::rename(
+        store.process_dir(),
+        root.path().join("detached-process-dir"),
+    )
+    .unwrap();
+    symlink_dir(outside.path(), store.process_dir()).unwrap();
+
+    assert_eq!(
+        store.read(descriptor.uri()).unwrap_err(),
+        ArtifactReadError::IntegrityFailed
+    );
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep");
+}
+
+#[cfg(windows)]
+#[test]
+fn replacing_root_ancestor_with_reparse_target_cannot_redirect_read() {
+    use std::os::windows::fs::symlink_dir;
+
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "keep").unwrap();
+    let store = ArtifactStore::for_test(&root, 1024).unwrap();
+    let published = store
+        .publish(vec![store.prepare(draft("known")).unwrap()])
+        .unwrap();
+    let descriptor = &published.descriptors()[0];
+    let relative = descriptor.local_path().strip_prefix(&root).unwrap();
+    let redirected = outside.path().join(relative);
+    fs::create_dir_all(redirected.parent().unwrap()).unwrap();
+    fs::write(&redirected, "known").unwrap();
+    fs::rename(&root, parent.path().join("detached-root")).unwrap();
+    symlink_dir(outside.path(), &root).unwrap();
+
+    assert_eq!(
+        store.read(descriptor.uri()).unwrap_err(),
+        ArtifactReadError::IntegrityFailed
+    );
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep");
+}
+
+#[test]
 fn every_publication_stage_rolls_back_the_entire_batch() {
     for stage in FaultStage::publication_stages(2) {
         let root = tempfile::tempdir().unwrap();
