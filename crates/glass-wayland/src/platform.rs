@@ -327,6 +327,30 @@ fn launch_ready(
     status_confirmed && window_discovered && observed_at < deadline
 }
 
+fn launch_with_retry<T>(
+    deadline: Instant,
+    timeout_ms: u64,
+    mut attempt: impl FnMut(Instant) -> Result<T>,
+) -> Result<T> {
+    const ATTEMPTS: u32 = 2;
+    let mut last_error = GlassError::Timeout(timeout_ms);
+    for attempt_number in 0..ATTEMPTS {
+        if Instant::now() >= deadline {
+            return Err(GlassError::Timeout(timeout_ms));
+        }
+        match attempt(deadline) {
+            Ok(value) => return Ok(value),
+            Err(error @ (GlassError::Timeout(_) | GlassError::Backend(_)))
+                if attempt_number + 1 < ATTEMPTS =>
+            {
+                last_error = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error)
+}
+
 fn launch_deadline_error(
     pending: &mut PendingWaylandSession,
     timeout_ms: u64,
@@ -1478,6 +1502,7 @@ fn bring_up_session(
     spec: &AppSpec,
     a11y: Option<glass_core::A11yBind>,
     protected_host_paths: &[ProtectedHostPath],
+    deadline: Instant,
 ) -> Result<(ActiveSession, WindowGeometry)> {
     let runtime_dir = tempfile::Builder::new()
         .prefix("glass-wl.")
@@ -1563,7 +1588,6 @@ fn bring_up_session(
     };
     let taps = vec![stdout_tap, stderr_tap];
 
-    let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
     let socket = loop {
         if Instant::now() >= deadline {
             return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
@@ -2295,37 +2319,31 @@ impl Platform for WaylandPlatform {
             None
         };
 
-        const ATTEMPTS: u32 = 2;
-        let mut last_err = GlassError::Timeout(spec.timeout_ms);
-        for attempt in 0..ATTEMPTS {
+        let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
+        let result = launch_with_retry(deadline, spec.timeout_ms, |deadline| {
             let a11y = self.dbus.as_ref().map(|b| glass_core::A11yBind {
                 addr: b.session_bus_address(),
                 dir: b.runtime_dir(),
             });
-            match bring_up_session(
+            bring_up_session(
                 &self.sway,
                 &self.logs,
                 spec,
                 a11y,
                 &self.protected_host_paths,
-            ) {
-                Ok((session, geometry)) => {
-                    self.active = Some(session);
-                    return Ok(geometry);
-                }
-                Err(e @ (GlassError::Timeout(_) | GlassError::Backend(_)))
-                    if attempt + 1 < ATTEMPTS =>
-                {
-                    last_err = e;
-                }
-                Err(e) => {
-                    self.dbus = None; // reap the private bus on a hard failure
-                    return Err(e);
-                }
+                deadline,
+            )
+        });
+        match result {
+            Ok((session, geometry)) => {
+                self.active = Some(session);
+                Ok(geometry)
+            }
+            Err(error) => {
+                self.dbus = None;
+                Err(error)
             }
         }
-        self.dbus = None; // reap the private bus after exhausted retries
-        Err(last_err)
     }
 
     /// Ignores the deadline — the close-then-reap ladder above is asserted against
@@ -6145,7 +6163,8 @@ mod session_tests {
 mod tests {
     use super::{
         BwrapStatusPipe, PendingWaylandSession, WaylandPlatform, find_wayland_socket, launch_ready,
-        nudge_x, open_session, parse_sway_version, reap_pending, start_recovery_after,
+        launch_with_retry, nudge_x, open_session, parse_sway_version, reap_pending,
+        start_recovery_after,
     };
     use crate::command::{build_sway_command, sway_config};
     use glass_core::{AppSpec, SandboxLevel};
@@ -6170,6 +6189,41 @@ mod tests {
                 reap_pending(pending);
             }
         }
+    }
+
+    #[test]
+    fn launch_retry_does_not_start_after_the_operation_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let mut attempts = Vec::new();
+
+        let error = launch_with_retry(deadline, 20, |attempt_deadline| {
+            attempts.push(attempt_deadline);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            Err::<(), _>(glass_core::GlassError::Backend("retryable".into()))
+        })
+        .expect_err("an expired launch budget cannot be retried");
+
+        assert!(matches!(error, glass_core::GlassError::Timeout(20)));
+        assert_eq!(attempts, [deadline]);
+    }
+
+    #[test]
+    fn launch_retry_can_succeed_within_the_operation_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut attempts = Vec::new();
+
+        let value = launch_with_retry(deadline, 1_000, |attempt_deadline| {
+            attempts.push(attempt_deadline);
+            if attempts.len() == 1 {
+                Err(glass_core::GlassError::Backend("retryable".into()))
+            } else {
+                Ok(42)
+            }
+        })
+        .expect("a retry within the shared budget succeeds");
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts, [deadline, deadline]);
     }
 
     #[test]
