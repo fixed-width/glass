@@ -29,7 +29,21 @@ impl Glass {
             mut platform,
             accessibility,
         } = (self.factory)(backend)?;
+        let protection_mode =
+            platform.configure_protected_host_paths(&self.protected_host_paths)?;
         let geometry = platform.start_app(spec)?;
+        let host_path_access = match (protection_mode, spec.sandbox) {
+            (HostPathProtectionMode::SeparateFilesystem, _) => {
+                HostPathAccess::HostFilesystemUnreachable
+            }
+            (HostPathProtectionMode::SandboxRules, SandboxLevel::Off) => {
+                HostPathAccess::NotGuaranteedSandboxOff
+            }
+            (
+                HostPathProtectionMode::SandboxRules,
+                SandboxLevel::Default | SandboxLevel::Strict,
+            ) => HostPathAccess::DeniedBySandbox,
+        };
         let mut session = ActiveSession {
             platform,
             accessibility,
@@ -38,6 +52,7 @@ impl Glass {
             geometry: geometry.clone(),
             logs: LogBuffer::new(self.log_capacity),
             active_window: None,
+            host_path_access,
         };
         session.pump();
         session.active_window = session
@@ -108,7 +123,273 @@ impl Glass {
 
 #[cfg(test)]
 mod tests {
+    use crate::ProtectedHostPathKind;
     use crate::session::test_support::*;
+    use std::path::PathBuf;
+
+    struct UnawarePlatform {
+        starts: Arc<AtomicUsize>,
+    }
+
+    impl Platform for UnawarePlatform {
+        fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            })
+        }
+        fn stop_app_by(&mut self, _deadline: Deadline) -> Result<()> {
+            Ok(())
+        }
+        fn capture_frame_by(
+            &mut self,
+            _region: Option<&Region>,
+            _deadline: Deadline,
+        ) -> Result<Frame> {
+            unimplemented!()
+        }
+        fn capture_window_by(
+            &mut self,
+            _id: WindowId,
+            _region: Option<&Region>,
+            _deadline: Deadline,
+        ) -> Result<Frame> {
+            unimplemented!()
+        }
+        fn send_pointer_by(&mut self, _event: &PointerEvent, _deadline: Deadline) -> Result<()> {
+            unimplemented!()
+        }
+        fn send_key_by(&mut self, _event: &KeyEvent, _deadline: Deadline) -> Result<()> {
+            unimplemented!()
+        }
+        fn window_by(&mut self, _op: &WindowOp, _deadline: Deadline) -> Result<WindowGeometry> {
+            unimplemented!()
+        }
+        fn list_windows_by(&mut self, _deadline: Deadline) -> Result<Vec<WindowInfo>> {
+            Ok(Vec::new())
+        }
+        fn select_window_by(
+            &mut self,
+            _id: WindowId,
+            _deadline: Deadline,
+        ) -> Result<WindowGeometry> {
+            unimplemented!()
+        }
+        fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+            Vec::new()
+        }
+    }
+
+    fn glass_with_unaware(starts: Arc<AtomicUsize>) -> Glass {
+        glass_with_factory(Box::new(move |_| {
+            Ok(Backend::display_only(Box::new(UnawarePlatform {
+                starts: starts.clone(),
+            })))
+        }))
+    }
+
+    #[test]
+    fn protected_host_path_constructors_preserve_paths_and_kinds() {
+        let directory_path = PathBuf::from("relative/../directory");
+        let file_path = PathBuf::from("file-with-non-normalized/../name");
+
+        assert_eq!(
+            ProtectedHostPath::directory(directory_path.clone()),
+            ProtectedHostPath {
+                path: directory_path,
+                kind: ProtectedHostPathKind::Directory
+            }
+        );
+        assert_eq!(
+            ProtectedHostPath::file(file_path.clone()),
+            ProtectedHostPath {
+                path: file_path,
+                kind: ProtectedHostPathKind::File
+            }
+        );
+    }
+
+    #[test]
+    fn nonempty_protected_paths_fail_closed_for_unaware_backend() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut g = glass_with_unaware(starts.clone());
+        g.set_protected_host_paths(vec![ProtectedHostPath::directory("secret")])
+            .unwrap();
+
+        let error = g.start(&spec()).unwrap_err();
+        assert!(matches!(&error, GlassError::SandboxUnavailable(_)));
+        assert!(!error.to_string().contains("secret"));
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(g.host_path_access(), HostPathAccess::NoActiveTarget);
+    }
+
+    #[test]
+    fn empty_protected_paths_remain_compatible_with_unaware_backend() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut g = glass_with_unaware(starts.clone());
+
+        g.start(&spec()).unwrap();
+
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sandbox_rules_report_access_from_successful_launch_sandbox_level() {
+        for (sandbox, expected) in [
+            (SandboxLevel::Default, HostPathAccess::DeniedBySandbox),
+            (SandboxLevel::Strict, HostPathAccess::DeniedBySandbox),
+            (SandboxLevel::Off, HostPathAccess::NotGuaranteedSandboxOff),
+        ] {
+            let mut launch = spec();
+            launch.sandbox = sandbox;
+            let mut g = glass_with(FakePlatform::new(10, 10));
+            assert_eq!(g.host_path_access(), HostPathAccess::NoActiveTarget);
+            g.start(&launch).unwrap();
+            assert_eq!(g.host_path_access(), expected);
+        }
+    }
+
+    #[test]
+    fn separate_filesystem_reports_unreachable_for_contained_and_off_launches() {
+        for sandbox in [SandboxLevel::Default, SandboxLevel::Off] {
+            let mut launch = spec();
+            launch.sandbox = sandbox;
+            let mut g = glass_with(
+                FakePlatform::new(10, 10)
+                    .with_protection_mode(HostPathProtectionMode::SeparateFilesystem),
+            );
+            g.start(&launch).unwrap();
+            assert_eq!(
+                g.host_path_access(),
+                HostPathAccess::HostFilesystemUnreachable
+            );
+        }
+    }
+
+    #[test]
+    fn protected_paths_cannot_change_during_active_session() {
+        let stops = Arc::new(Mutex::new(0));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let configured = Arc::new(Mutex::new(Vec::new()));
+        let factory_stops = stops.clone();
+        let factory_log = log.clone();
+        let factory_configured = configured.clone();
+        let factory: PlatformFactory = Box::new(move |_| {
+            Ok(Backend::display_only(Box::new(
+                FakePlatform::new(10, 10)
+                    .counting_stops(factory_stops.clone())
+                    .with_lifecycle_log(factory_log.clone())
+                    .with_protected_paths_log(factory_configured.clone()),
+            )))
+        });
+        let mut g = glass_with_factory(factory);
+        let original = vec![ProtectedHostPath::directory("original")];
+        g.set_protected_host_paths(original.clone()).unwrap();
+        g.start(&spec()).unwrap();
+
+        assert!(matches!(
+            g.set_protected_host_paths(vec![ProtectedHostPath::file("replacement")])
+                .unwrap_err(),
+            GlassError::ProtectedPathsWhileActive
+        ));
+        assert_eq!(*stops.lock().unwrap(), 0);
+        assert_eq!(*log.lock().unwrap(), vec!["configure", "start"]);
+
+        g.stop().unwrap();
+        g.start(&spec()).unwrap();
+        assert_eq!(
+            *configured.lock().unwrap(),
+            vec![original.clone(), original]
+        );
+    }
+
+    #[test]
+    fn stop_and_failed_stop_reset_host_path_access() {
+        let mut stopped = glass_with(FakePlatform::new(10, 10));
+        stopped.start(&spec()).unwrap();
+        stopped.stop().unwrap();
+        assert_eq!(stopped.host_path_access(), HostPathAccess::NoActiveTarget);
+
+        let mut failed = glass_with(FakePlatform::new(10, 10).failing_stop());
+        failed.start(&spec()).unwrap();
+        assert!(failed.stop().is_err());
+        assert_eq!(failed.host_path_access(), HostPathAccess::NoActiveTarget);
+    }
+
+    #[test]
+    fn shutdown_resets_host_path_access() {
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        g.start(&spec()).unwrap();
+        g.shutdown(soon());
+        assert_eq!(g.host_path_access(), HostPathAccess::NoActiveTarget);
+    }
+
+    #[test]
+    fn failed_configure_and_start_leave_no_stale_access_and_allow_reconfiguration() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_factory = calls.clone();
+        let factory: PlatformFactory = Box::new(move |_| {
+            let call = calls_for_factory.fetch_add(1, Ordering::SeqCst);
+            let platform = match call {
+                0 => FakePlatform::new(10, 10),
+                1 => FakePlatform::new(10, 10).failing_protected_path_configuration(),
+                2 => FakePlatform::new(10, 10).failing_start(),
+                _ => FakePlatform::new(10, 10),
+            };
+            Ok(Backend::display_only(Box::new(platform)))
+        });
+        let mut g = glass_with_factory(factory);
+        g.start(&spec()).unwrap();
+        assert_eq!(
+            g.host_path_access(),
+            HostPathAccess::NotGuaranteedSandboxOff
+        );
+
+        g.set_protected_host_paths(vec![ProtectedHostPath::directory("first")])
+            .unwrap_err();
+        assert!(g.start(&spec()).is_err());
+        assert_eq!(g.host_path_access(), HostPathAccess::NoActiveTarget);
+        g.set_protected_host_paths(vec![ProtectedHostPath::file("second")])
+            .unwrap();
+        assert!(g.start(&spec()).is_err());
+        assert_eq!(g.host_path_access(), HostPathAccess::NoActiveTarget);
+        g.set_protected_host_paths(vec![ProtectedHostPath::directory("third")])
+            .unwrap();
+        g.start(&spec()).unwrap();
+        assert_eq!(
+            g.host_path_access(),
+            HostPathAccess::NotGuaranteedSandboxOff
+        );
+    }
+
+    #[test]
+    fn protected_path_configuration_runs_before_every_start_and_failure_prevents_launch() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_log = log.clone();
+        let factory_calls = calls.clone();
+        let factory: PlatformFactory = Box::new(move |_| {
+            let call = factory_calls.fetch_add(1, Ordering::SeqCst);
+            let platform = FakePlatform::new(10, 10).with_lifecycle_log(factory_log.clone());
+            let platform = if call == 1 {
+                platform.failing_protected_path_configuration()
+            } else {
+                platform
+            };
+            Ok(Backend::display_only(Box::new(platform)))
+        });
+        let mut g = glass_with_factory(factory);
+        g.start(&spec()).unwrap();
+        assert!(g.start(&spec()).is_err());
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["configure", "start", "configure"]
+        );
+        assert_eq!(g.host_path_access(), HostPathAccess::NoActiveTarget);
+    }
 
     #[test]
     fn operations_require_an_active_session() {

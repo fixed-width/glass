@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use glass_core::Deadline;
 use glass_core::{
-    AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
-    WindowGeometry, WindowId, WindowInfo, WindowOp,
+    AppSpec, Frame, GlassError, HostPathProtectionMode, KeyEvent, Platform, PointerEvent,
+    ProtectedHostPath, Region, Result, Stream, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 
 use crate::capture::{crop_frame_by, screenshot, screenshot_by};
@@ -417,6 +417,13 @@ pub(crate) fn checked_scale(density: f64) -> Result<f64> {
 }
 
 impl Platform for IosPlatform {
+    fn configure_protected_host_paths(
+        &mut self,
+        _paths: &[ProtectedHostPath],
+    ) -> Result<HostPathProtectionMode> {
+        Ok(HostPathProtectionMode::SeparateFilesystem)
+    }
+
     /// idb reports a `UISwitch` in a grouped table cell with the whole cell as its frame and
     /// the control at the trailing edge, so a centered `click_element` tap lands on the inert
     /// label. Opt into the trailing-aim (see the trait default's rationale).
@@ -1376,6 +1383,19 @@ mod teardown_tests {
             .into_iter()
             .filter(|c| c.starts_with("simctl terminate "))
             .collect()
+    }
+
+    #[test]
+    fn protected_host_paths_use_separate_filesystem_without_simctl_commands() {
+        let fake = FakeSimctl::new();
+        let mut platform = platform(&fake, false);
+
+        let mode = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory("host-only-marker")])
+            .unwrap();
+
+        assert_eq!(mode, HostPathProtectionMode::SeparateFilesystem);
+        assert!(fake.calls().is_empty());
     }
 
     #[test]

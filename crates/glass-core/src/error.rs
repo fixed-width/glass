@@ -53,6 +53,9 @@ pub enum GlassError {
     #[error("no active session — call glass_start to launch an app first")]
     NoActiveSession,
 
+    #[error("cannot change protected host paths while a session is active")]
+    ProtectedPathsWhileActive,
+
     #[error("app failed to start: {0}")]
     AppNotStarted(String),
 

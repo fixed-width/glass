@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use glass_core::Deadline;
 use glass_core::Platform;
 use glass_core::{
-    AppSpec, Frame, GlassError, KeyEvent, PointerEvent, Region, Result, Stream, WindowGeometry,
-    WindowId, WindowInfo, WindowOp,
+    AppSpec, Frame, GlassError, HostPathProtectionMode, KeyEvent, PointerEvent, ProtectedHostPath,
+    Region, Result, Stream, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 
 use crate::a11y::AndroidA11y;
@@ -335,6 +335,13 @@ fn reap_failed_launch(adb: &Adb, package: &str, e: GlassError) -> GlassError {
 }
 
 impl Platform for AndroidPlatform {
+    fn configure_protected_host_paths(
+        &mut self,
+        _paths: &[ProtectedHostPath],
+    ) -> Result<HostPathProtectionMode> {
+        Ok(HostPathProtectionMode::SeparateFilesystem)
+    }
+
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         run_build(spec, &self.logs)?;
         let target = parse_launch(&spec.run)?;
@@ -638,6 +645,19 @@ mod platform_tests {
         "    mOwnerUid=1000 showForAllUsers=false package=com.example.app appop=NONE\n",
         "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
     );
+
+    #[test]
+    fn protected_host_paths_use_separate_filesystem_without_adb_commands() {
+        let fake = FakeAdb::new(&[]);
+        let mut platform = platform_over(&fake);
+
+        let mode = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::file("host-only-marker")])
+            .unwrap();
+
+        assert_eq!(mode, HostPathProtectionMode::SeparateFilesystem);
+        assert!(fake.calls().is_empty());
+    }
 
     /// The same dump with the dialog gone — the app's window list after it is dismissed.
     const WINDOWS_WITHOUT_THE_DIALOG: &str = concat!(
