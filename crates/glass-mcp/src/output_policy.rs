@@ -6,6 +6,7 @@ use crate::output::{
     ToolOutput,
 };
 use serde::Serialize;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const MAX_TEXT_BYTES: usize = 8_192;
@@ -127,6 +128,20 @@ pub(crate) struct AppliedOutcome {
 pub(crate) struct OutputPolicy {
     store: Option<ArtifactStore>,
     permanently_disabled: AtomicBool,
+    diagnostic: Arc<dyn Fn(OutputDiagnostic) + Send + Sync>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputDiagnostic {
+    category: &'static str,
+    transition: &'static str,
+}
+
+fn stderr_diagnostic(diagnostic: OutputDiagnostic) {
+    eprintln!(
+        "glass: output externalization {} ({})",
+        diagnostic.transition, diagnostic.category
+    );
 }
 
 impl OutputPolicy {
@@ -177,6 +192,26 @@ impl OutputPolicy {
         Self {
             store: Some(store),
             permanently_disabled: AtomicBool::new(false),
+            diagnostic: Arc::new(stderr_diagnostic),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_diagnostic_for_test(
+        store: ArtifactStore,
+        diagnostics: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            store: Some(store),
+            permanently_disabled: AtomicBool::new(false),
+            diagnostic: Arc::new(move |diagnostic| {
+                if let Ok(mut captured) = diagnostics.lock() {
+                    captured.push(format!(
+                        "glass: output externalization {} ({})",
+                        diagnostic.transition, diagnostic.category
+                    ));
+                }
+            }),
         }
     }
 
@@ -184,6 +219,7 @@ impl OutputPolicy {
         Self {
             store: None,
             permanently_disabled: AtomicBool::new(true),
+            diagnostic: Arc::new(stderr_diagnostic),
         }
     }
 
@@ -343,16 +379,22 @@ impl OutputPolicy {
     }
 
     fn disable_for_invariant(&self, store: &ArtifactStore, error: ArtifactError) {
-        if matches!(
-            error,
-            ArtifactError::RollbackFailed
-                | ArtifactError::PathRepresentationFailed
-                | ArtifactError::InvalidOutputState
-                | ArtifactError::MetadataDidNotStabilize
-        ) {
-            self.permanently_disabled.store(true, Ordering::Release);
-            store.mark_unavailable(error);
-        }
+        self.permanently_disabled.store(true, Ordering::Release);
+        (self.diagnostic)(OutputDiagnostic {
+            category: artifact_error_category(error),
+            transition: "disabled",
+        });
+        store.mark_unavailable(error);
+    }
+}
+
+fn artifact_error_category(error: ArtifactError) -> &'static str {
+    match error {
+        ArtifactError::RollbackFailed => "rollback_failed",
+        ArtifactError::PathRepresentationFailed => "path_representation_failed",
+        ArtifactError::InvalidOutputState => "invalid_output_state",
+        ArtifactError::MetadataDidNotStabilize => "metadata_did_not_stabilize",
+        _ => "storage_failed",
     }
 }
 
@@ -1264,6 +1306,37 @@ mod tests {
             );
             assert_eq!(store.registry_len(), 0);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn publication_failure_diagnostic_excludes_externalized_body()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let store = ArtifactStore::for_test_with_fault(
+            root.path(),
+            TEST_STORE_BYTES,
+            FaultStage::TempWritten(0),
+        )
+        .map_err(|error| format!("store setup: {error:?}"))?;
+        let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let policy = OutputPolicy::with_diagnostic_for_test(store, diagnostics.clone());
+        let marker = "artifact-body-secret-marker".repeat(512);
+
+        let _ = policy.apply(policy_outcome(ToolOutput::result_with(
+            "glass_test",
+            json!({}),
+            vec![text(
+                marker.clone(),
+                TextTrust::UntrustedApplication,
+                TextRole::Observation,
+            )],
+        )));
+
+        let diagnostics = diagnostics.lock().map_err(|_| "diagnostics poisoned")?;
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].contains(&marker));
+        assert!(diagnostics[0].contains("storage_failed"));
         Ok(())
     }
 
