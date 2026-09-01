@@ -42,20 +42,14 @@ fn split_sub(out: ToolOutput) -> (serde_json::Value, Vec<OutContent>) {
     let mut siblings = Vec::new();
     for c in out.0 {
         match c {
-            OutContent::Text(t) => match serde_json::from_str::<serde_json::Value>(&t) {
-                // Require the real envelope shape (`ok` + `tool`), not just any JSON
-                // object that happens to have a `result` key — a future JSON-shaped
-                // untrusted sibling must not be misclassified as the envelope.
-                Ok(v) if v.get("ok").is_some() && v.get("tool").is_some() => {
-                    result = Some(v["result"].clone());
-                }
-                _ => siblings.push(OutContent::Text(t)), // e.g. IMAGE_NOTE (not JSON)
-            },
+            OutContent::Envelope(envelope) => result = Some(envelope.result),
             img => siblings.push(img),
         }
     }
-    let result = result.expect("glass_do sub-tool must emit an {ok,tool,result} envelope");
-    (result, siblings)
+    match result {
+        Some(result) => (result, siblings),
+        None => panic!("glass_do sub-tool must emit an {{ok,tool,result}} envelope"),
+    }
 }
 
 /// Build a text-only `WaitStableArgs` from a `SettleArgs` (no image, no crop).
@@ -342,7 +336,7 @@ fn step_failure(
     };
     let summary = summary.unwrap_or(default_summary);
     let content_block = siblings.len() + 1;
-    siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(detail)));
+    siblings.push(OutContent::untrusted_observation(detail));
     steps.push(StepOutcome::Failed {
         index,
         action,
@@ -395,7 +389,7 @@ fn validation_error(summary: &str) -> ToolOutput {
 }
 
 fn error_output(envelope: serde_json::Value, mut siblings: Vec<OutContent>) -> ToolOutput {
-    let mut content = vec![OutContent::Text(envelope.to_string())];
+    let mut content = vec![OutContent::trusted_error(envelope.to_string())];
     content.append(&mut siblings);
     ToolOutput(content)
 }
@@ -519,7 +513,7 @@ fn run_then(
                     let summary = if error.sequence_deadline_exceeded { "sequence deadline exceeded" } else { "terminal observation failed" };
                     let content_blocks = if error.message.is_empty() { Vec::new() } else {
                         let index = sibling_base + run.siblings.len();
-                        run.siblings.push(OutContent::Text(crate::untrusted::wrap_untrusted(&error.message)));
+                        run.siblings.push(OutContent::untrusted_observation(&error.message));
                         vec![index]
                     };
                     run.outcomes.push(TerminalOutcome::Failed {

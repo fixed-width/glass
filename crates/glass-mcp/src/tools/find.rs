@@ -167,7 +167,7 @@ fn render_match(matched: &SemanticMatch, query: Option<&str>) -> RenderedMatch {
 fn fit_output(metadata: &Metadata, rendered: &mut Vec<RenderedMatch>) -> ToolResult {
     let mut counters = FitCounters::default();
     let mut output = build_output(metadata, rendered, &counters);
-    while text_bytes(&output) > FIND_RESPONSE_MAX_BYTES {
+    while output.text_bytes() > FIND_RESPONSE_MAX_BYTES {
         if shorten_lowest_ranked_context(rendered, &mut counters) {
             output = build_output(metadata, rendered, &counters);
             continue;
@@ -223,7 +223,7 @@ fn build_output(
     ToolOutput::result_with(
         "glass_find_elements",
         result,
-        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))],
+        vec![OutContent::untrusted_observation(&body)],
     )
 }
 
@@ -403,17 +403,6 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
         index -= 1;
     }
     index
-}
-
-fn text_bytes(output: &ToolOutput) -> usize {
-    output
-        .0
-        .iter()
-        .map(|content| match content {
-            OutContent::Text(text) => text.len(),
-            OutContent::Image(_) => 0,
-        })
-        .sum()
 }
 
 fn match_field_name(field: MatchField) -> &'static str {
@@ -798,7 +787,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(text_bytes(&output) <= FIND_RESPONSE_MAX_BYTES);
+        assert!(output.text_bytes() <= FIND_RESPONSE_MAX_BYTES);
         assert_valid_wrapped_match_json(&output);
         let error = bounded_error("e".repeat(20_000));
         assert!(error.as_bytes().len() <= FIND_RESPONSE_MAX_BYTES);

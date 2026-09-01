@@ -74,8 +74,10 @@ fn exact_content_slice(contents: &[OutContent]) -> Vec<ExactContent> {
     contents
         .iter()
         .map(|content| match content {
-            OutContent::Text(text) => ExactContent::Text(canonicalize_untrusted_nonce(text)),
+            OutContent::Envelope(envelope) => ExactContent::Text(envelope.render()),
+            OutContent::Text(text) => ExactContent::Text(canonicalize_untrusted_nonce(&text.body)),
             OutContent::Image(image) => ExactContent::Image(image.clone()),
+            OutContent::ResourceLink(_) => panic!("resource links are not expected"),
         })
         .collect()
 }
@@ -521,11 +523,13 @@ fn sleep_past(deadline: Deadline) {
 }
 
 fn envelope(output: &ToolOutput) -> serde_json::Value {
-    serde_json::from_str(match &output.0[0] {
-        OutContent::Text(text) => text,
-        OutContent::Image(_) => panic!("batch envelope must be text"),
-    })
-    .unwrap()
+    match &output.0[0] {
+        OutContent::Envelope(envelope) => {
+            serde_json::json!({ "ok": true, "tool": envelope.tool, "result": envelope.result })
+        }
+        OutContent::Text(text) => serde_json::from_str(&text.body).unwrap(),
+        OutContent::Image(_) | OutContent::ResourceLink(_) => panic!("batch envelope must be text"),
+    }
 }
 
 fn output_text(output: &ToolOutput) -> String {
@@ -534,7 +538,7 @@ fn output_text(output: &ToolOutput) -> String {
         .iter()
         .map(|block| match block {
             OutContent::Text(text) => text.as_str(),
-            OutContent::Image(_) => "",
+            OutContent::Envelope(_) | OutContent::Image(_) | OutContent::ResourceLink(_) => "",
         })
         .collect()
 }
@@ -1820,8 +1824,10 @@ fn started_a11y_session(mut g: Glass) -> Glass {
 
 fn error_text(out: ToolOutput) -> String {
     match &out.0[0] {
-        OutContent::Text(text) => text.clone(),
-        OutContent::Image(_) => panic!("error envelope must be text"),
+        OutContent::Text(text) => text.body.clone(),
+        OutContent::Envelope(_) | OutContent::Image(_) | OutContent::ResourceLink(_) => {
+            panic!("error envelope must be text")
+        }
     }
 }
 
@@ -2641,7 +2647,7 @@ fn typed_and_set_value_text_are_never_echoed() {
         .iter()
         .map(|block| match block {
             OutContent::Text(text) => text.as_str(),
-            OutContent::Image(_) => "",
+            OutContent::Envelope(_) | OutContent::Image(_) | OutContent::ResourceLink(_) => "",
         })
         .collect::<String>();
     assert!(!success_text.contains(typed_success));
@@ -2684,7 +2690,7 @@ fn typed_and_set_value_text_are_never_echoed() {
             .iter()
             .map(|block| match block {
                 OutContent::Text(text) => text.as_str(),
-                OutContent::Image(_) => "",
+                OutContent::Envelope(_) | OutContent::Image(_) | OutContent::ResourceLink(_) => "",
             })
             .collect::<String>();
         assert!(!all.contains(secret), "secret echoed in {all}");
@@ -2750,7 +2756,7 @@ fn typed_and_set_value_text_are_never_echoed() {
             .iter()
             .map(|block| match block {
                 OutContent::Text(text) => text.as_str(),
-                OutContent::Image(_) => "",
+                OutContent::Envelope(_) | OutContent::Image(_) | OutContent::ResourceLink(_) => "",
             })
             .collect::<String>();
         assert!(
@@ -3214,11 +3220,10 @@ fn terminal_failure_marks_later_observations_unexecuted() {
         },
     )
     .unwrap_err();
-    let envelope: serde_json::Value = serde_json::from_str(match &err.0[0] {
-        OutContent::Text(text) => text,
-        OutContent::Image(_) => panic!("error envelope must be text"),
-    })
-    .unwrap();
+    let OutContent::Text(text) = &err.0[0] else {
+        panic!("error envelope must be text")
+    };
+    let envelope: serde_json::Value = serde_json::from_str(&text.body).unwrap();
     assert_eq!(envelope["outcome"]["executed"], 1);
     assert_eq!(
         envelope["outcome"]["steps"],
@@ -3468,12 +3473,13 @@ fn split_sub_requires_ok_and_tool_and_keeps_siblings() {
     // A leading bare `{"result":...}` sibling must not match the valid
     // `[Image, envelope, IMAGE_NOTE]` shape.
     let out = ToolOutput(vec![
-        OutContent::Text(json!({ "result": "not the real envelope" }).to_string()),
+        OutContent::trusted_guidance(json!({ "result": "not the real envelope" }).to_string()),
         OutContent::Image(vec![1, 2, 3]),
-        OutContent::Text(
-            json!({ "ok": true, "tool": "glass_screenshot", "result": { "width": 4 } }).to_string(),
-        ),
-        OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
+        OutContent::Envelope(crate::output::EnvelopeBlock {
+            tool: "glass_screenshot".to_owned(),
+            result: json!({ "width": 4 }),
+        }),
+        OutContent::trusted_guidance(crate::untrusted::IMAGE_NOTE),
     ]);
     let (result, siblings) = split_sub(out);
     assert_eq!(

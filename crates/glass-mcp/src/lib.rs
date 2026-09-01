@@ -36,6 +36,7 @@ pub mod launch;
 #[cfg(feature = "network")]
 pub mod menubar;
 pub mod onboarding;
+mod output;
 mod params;
 #[cfg(feature = "network")]
 pub mod serve;

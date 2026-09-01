@@ -11,6 +11,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 use tokio::sync::Mutex;
 
 use crate::audit::AuditReport;
+use crate::output::TargetAccess;
 use crate::params::*;
 use crate::tools::{self, BatchToolResult, OutContent, ToolOutput, ToolResult};
 
@@ -36,14 +37,18 @@ pub struct GlassServer {
     tool_router: ToolRouter<GlassServer>,
 }
 
-fn to_contents(out: ToolOutput) -> Vec<ContentBlock> {
+fn to_contents(out: ToolOutput, target_access: TargetAccess) -> Vec<ContentBlock> {
     out.0
         .into_iter()
         .map(|c| match c {
-            OutContent::Text(t) => ContentBlock::text(t),
+            OutContent::Envelope(envelope) => ContentBlock::text(envelope.render()),
+            OutContent::Text(text) => ContentBlock::text(text.body),
             OutContent::Image(bytes) => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
                 ContentBlock::image(b64, "image/webp")
+            }
+            OutContent::ResourceLink(link) => {
+                ContentBlock::ResourceLink(link.to_resource(target_access))
             }
         })
         .collect()
@@ -51,8 +56,12 @@ fn to_contents(out: ToolOutput) -> Vec<ContentBlock> {
 
 fn map_call_outcome(outcome: ToolCallOutcome) -> CallToolResult {
     match outcome {
-        ToolCallOutcome::Success(out) => CallToolResult::success(to_contents(out)),
-        ToolCallOutcome::Error(out) => CallToolResult::error(to_contents(out)),
+        ToolCallOutcome::Success(out) => {
+            CallToolResult::success(to_contents(out, TargetAccess::NoActiveTarget))
+        }
+        ToolCallOutcome::Error(out) => {
+            CallToolResult::error(to_contents(out, TargetAccess::NoActiveTarget))
+        }
     }
 }
 
@@ -64,7 +73,7 @@ fn map_call_outcome(outcome: ToolCallOutcome) -> CallToolResult {
 fn map_tool_result(result: ToolResult) -> CallToolResult {
     map_call_outcome(match result {
         Ok(out) => ToolCallOutcome::Success(out),
-        Err(msg) => ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(msg)])),
+        Err(msg) => ToolCallOutcome::Error(ToolOutput(vec![OutContent::trusted_error(msg)])),
     })
 }
 
@@ -105,8 +114,8 @@ impl GlassServer {
                     let outcome =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut g)))
                             .unwrap_or_else(|_| {
-                                ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(
-                                    "tool handler panicked".to_string(),
+                                ToolCallOutcome::Error(ToolOutput(vec![OutContent::trusted_error(
+                                    "tool handler panicked",
                                 )]))
                             });
                     let _ = reply.send(outcome);
@@ -133,7 +142,7 @@ impl GlassServer {
     {
         self.run_outcome(move |g| match f(g) {
             Ok(out) => ToolCallOutcome::Success(out),
-            Err(msg) => ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(msg)])),
+            Err(msg) => ToolCallOutcome::Error(ToolOutput(vec![OutContent::trusted_error(msg)])),
         })
         .await
     }
@@ -161,12 +170,12 @@ impl GlassServer {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self.jobs.send((Box::new(f), reply_tx)).is_err() {
             return Ok(map_call_outcome(ToolCallOutcome::Error(ToolOutput(vec![
-                OutContent::Text("glass-platform thread is gone".to_string()),
+                OutContent::trusted_error("glass-platform thread is gone"),
             ]))));
         }
         let outcome = reply_rx.await.unwrap_or_else(|_| {
-            ToolCallOutcome::Error(ToolOutput(vec![OutContent::Text(
-                "glass-platform thread dropped the job".to_string(),
+            ToolCallOutcome::Error(ToolOutput(vec![OutContent::trusted_error(
+                "glass-platform thread dropped the job",
             )]))
         });
         Ok(map_call_outcome(outcome))
@@ -1119,10 +1128,10 @@ mod tests {
     #[test]
     fn structured_error_preserves_every_content_block_and_sets_is_error() {
         let out = ToolOutput(vec![
-            OutContent::Text(
-                r#"{"ok":false,"tool":"glass_do","error":{"code":"step_failed"}}"#.into(),
+            OutContent::trusted_error(
+                r#"{"ok":false,"tool":"glass_do","error":{"code":"step_failed"}}"#,
             ),
-            OutContent::Text("detail".into()),
+            OutContent::trusted_error("detail"),
         ]);
         let r = map_call_outcome(ToolCallOutcome::Error(out));
         assert_eq!(r.is_error, Some(true));

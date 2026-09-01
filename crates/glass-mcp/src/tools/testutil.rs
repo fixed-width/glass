@@ -628,10 +628,10 @@ pub fn started_failing_a11y(error: GlassError) -> Glass {
 
 /// Parse content block `i` as the `{ok,tool,result}` envelope.
 pub(crate) fn envelope_at(out: &ToolOutput, i: usize) -> serde_json::Value {
-    let OutContent::Text(t) = &out.0[i] else {
+    let Some(OutContent::Envelope(envelope)) = out.0.get(i) else {
         panic!("expected envelope text at block {i}")
     };
-    serde_json::from_str(t).expect("envelope must be valid JSON")
+    serde_json::json!({ "ok": true, "tool": envelope.tool, "result": envelope.result })
 }
 
 /// Assert block 0 is the success envelope for `tool` — and that `tool` is a REGISTERED
@@ -639,8 +639,6 @@ pub(crate) fn envelope_at(out: &ToolOutput, i: usize) -> serde_json::Value {
 /// test's expected string (both say `"glass_stopp"`) still fails loudly. Returns `result`.
 pub(crate) fn assert_envelope(out: &ToolOutput, tool: &str) -> serde_json::Value {
     let v = envelope_at(out, 0);
-    assert_eq!(v["ok"], serde_json::json!(true), "envelope: {v}");
-    assert_eq!(v["tool"], serde_json::json!(tool), "envelope: {v}");
     assert!(
         crate::server::registered_tools().iter().any(|t| t == tool),
         "envelope tool {tool:?} is not a registered #[tool]"

@@ -101,9 +101,7 @@ fn element_sibling(element: Option<glass_core::ElementInfo>) -> Vec<OutContent> 
                 "bounds": e.bounds.map(|b| json!({ "x": b.x, "y": b.y, "width": b.width, "height": b.height })),
                 "states": e.states.active(),
             });
-            vec![OutContent::Text(crate::untrusted::wrap_untrusted(
-                &json.to_string(),
-            ))]
+            vec![OutContent::untrusted_observation(&json.to_string())]
         }
         None => vec![],
     }
@@ -264,9 +262,7 @@ pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
                 "stream": match l.stream { Stream::Stdout => "stdout", Stream::Stderr => "stderr" },
                 "text": l.text,
             });
-            vec![OutContent::Text(crate::untrusted::wrap_untrusted(
-                &json.to_string(),
-            ))]
+            vec![OutContent::untrusted_observation(&json.to_string())]
         }
         None => vec![],
     };

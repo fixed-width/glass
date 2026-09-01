@@ -981,11 +981,11 @@ fn return_snapshot_discloses_an_unpublished_document_the_same_way_a_snapshot_doe
         },
     )
     .unwrap();
-    let texts: Vec<&String> = out
+    let texts: Vec<&str> = out
         .0
         .iter()
         .filter_map(|c| match c {
-            OutContent::Text(t) => Some(t),
+            OutContent::Text(t) => Some(t.as_str()),
             _ => None,
         })
         .collect();

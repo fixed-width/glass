@@ -10,7 +10,7 @@ pub fn clipboard_get(glass: &mut Glass) -> ToolResult {
     Ok(ToolOutput::result_with(
         "glass_clipboard_get",
         serde_json::json!({}),
-        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&text))],
+        vec![OutContent::untrusted_observation(&text)],
     ))
 }
 

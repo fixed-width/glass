@@ -13,62 +13,8 @@ use glass_core::{
 use serde::Serialize;
 use serde_json::json;
 
+pub(crate) use crate::output::{OutContent, ToolOutput};
 use crate::params::*;
-
-/// A single piece of MCP content the server will emit.
-#[derive(Debug)]
-pub enum OutContent {
-    Text(String),
-    /// Encoded image bytes (lossless WebP); the server base64s and tags these
-    /// as `image/webp` MCP image content.
-    Image(Vec<u8>),
-}
-
-/// What a tool produced. The server converts this into MCP `Content`.
-#[derive(Debug)]
-pub struct ToolOutput(pub Vec<OutContent>);
-
-impl ToolOutput {
-    /// Wrap a tool's trusted result payload in the uniform 1.0 success envelope
-    /// as the sole leading content block.
-    pub fn result(tool: &str, result: serde_json::Value) -> Self {
-        ToolOutput(vec![OutContent::Text(envelope(tool, result))])
-    }
-
-    /// Envelope block first, then app-controlled/image sibling blocks unchanged.
-    pub fn result_with(tool: &str, result: serde_json::Value, mut extra: Vec<OutContent>) -> Self {
-        let mut v = vec![OutContent::Text(envelope(tool, result))];
-        v.append(&mut extra);
-        ToolOutput(v)
-    }
-
-    /// Capture-style result: the image block (when present) leads, then the envelope,
-    /// then any extra sibling blocks, then the trailing IMAGE_NOTE — emitted only when an
-    /// image was attached.
-    pub fn image_result(
-        tool: &str,
-        image: Option<Vec<u8>>,
-        result: serde_json::Value,
-        mut siblings: Vec<OutContent>,
-    ) -> Self {
-        let has_image = image.is_some();
-        let mut v = Vec::new();
-        if let Some(img) = image {
-            v.push(OutContent::Image(img));
-        }
-        v.push(OutContent::Text(envelope(tool, result)));
-        v.append(&mut siblings);
-        if has_image {
-            v.push(OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()));
-        }
-        ToolOutput(v)
-    }
-}
-
-/// Serialize the success envelope. `ok` is always true — errors take the `Err` path.
-fn envelope(tool: &str, result: serde_json::Value) -> String {
-    serde_json::json!({ "ok": true, "tool": tool, "result": result }).to_string()
-}
 
 /// Tool result: Ok(content) or Err(agent-readable message).
 pub type ToolResult = Result<ToolOutput, String>;
@@ -498,7 +444,7 @@ pub fn list_windows(glass: &mut Glass) -> ToolResult {
     Ok(ToolOutput::result_with(
         "glass_list_windows",
         serde_json::json!({ "count": windows.len() }),
-        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))],
+        vec![OutContent::untrusted_observation(&body)],
     ))
 }
 
@@ -563,11 +509,15 @@ pub fn a11y_snapshot(glass: &mut Glass, a: &A11ySnapshotArgs) -> ToolResult {
     // into the untrusted-wrapped body, or an instruction of glass's own ("drive by
     // pixels…") would end up under a directive telling the agent to ignore instructions
     // in that block.
-    let mut contents = vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))];
+    let mut contents = vec![OutContent::untrusted_observation(&body)];
     if let Some(hint) = tree.empty_guidance() {
-        contents.push(OutContent::Text(hint.to_string()));
+        contents.push(OutContent::trusted_guidance(hint));
     }
-    contents.extend(a11y_steers(&tree).into_iter().map(OutContent::Text));
+    contents.extend(
+        a11y_steers(&tree)
+            .into_iter()
+            .map(OutContent::trusted_guidance),
+    );
     Ok(ToolOutput::result_with(
         "glass_a11y_snapshot",
         serde_json::json!({}),
@@ -658,13 +608,16 @@ fn resolve_return_with(
                 .map_err(|e| ContextualError::from_core(e, context))?;
             // Same shape as `a11y_snapshot`: the app-derived outline stays untrusted-wrapped;
             // glass's own steers are separate trusted blocks, not baked into that body.
-            let mut extra = vec![OutContent::Text(crate::untrusted::wrap_untrusted(
-                &glass_core::outline::render_compact(&tree),
-            ))];
+            let body = glass_core::outline::render_compact(&tree);
+            let mut extra = vec![OutContent::untrusted_observation(&body)];
             if let Some(hint) = tree.empty_guidance() {
-                extra.push(OutContent::Text(hint.to_string()));
+                extra.push(OutContent::trusted_guidance(hint));
             }
-            extra.extend(a11y_steers(&tree).into_iter().map(OutContent::Text));
+            extra.extend(
+                a11y_steers(&tree)
+                    .into_iter()
+                    .map(OutContent::trusted_guidance),
+            );
             Ok((None, extra, None))
         }
         Some(o) => Err(ContextualError::validation(format!(
@@ -754,7 +707,7 @@ pub fn a11y_marks(glass: &mut Glass) -> ToolResult {
         "glass_a11y_marks",
         Some(img),
         serde_json::json!({ "count": marks.len() }),
-        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&legend))],
+        vec![OutContent::untrusted_observation(&legend)],
     ))
 }
 

@@ -242,7 +242,7 @@ pub fn logs(glass: &mut Glass, a: &LogsArgs) -> ToolResult {
     Ok(ToolOutput::result_with(
         "glass_logs",
         json!({ "cursor": cursor }),
-        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))],
+        vec![OutContent::untrusted_observation(&body)],
     ))
 }
 
