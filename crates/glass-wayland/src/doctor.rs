@@ -532,7 +532,7 @@ fn probe_sway_within(sway: &Path, budget: Duration) -> SwaySpawn {
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
     };
-    let config_text = match sway_config(&spec, rt.path(), None, None, &[]) {
+    let config_bytes = match sway_config(&spec, rt.path(), None, None, &[]) {
         Ok(config) => config,
         Err(e) => {
             return never_ran(ProbeFailure::NotStarted(format!(
@@ -540,7 +540,7 @@ fn probe_sway_within(sway: &Path, budget: Duration) -> SwaySpawn {
             )));
         }
     };
-    if let Err(e) = std::fs::write(&config, config_text) {
+    if let Err(e) = std::fs::write(&config, config_bytes) {
         return never_ran(ProbeFailure::NotStarted(format!("sway config: {e}")));
     }
     // `NotStarted`, not `Failed`: resolution already proved this path executable, so what is left

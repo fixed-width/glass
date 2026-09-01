@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,7 +38,7 @@ fn output_resolution() -> (u32, u32) {
         .unwrap_or((OUTPUT_WIDTH, OUTPUT_HEIGHT))
 }
 
-/// Render a minimal per-session sway config: one headless output sized by
+/// Render a minimal per-session sway config as exact Unix bytes: one headless output sized by
 /// [`output_resolution`],
 /// no window borders, every window floating (so toplevels keep their natural size
 /// for true per-window capture/geometry), and an `exec` that launches the target
@@ -54,9 +55,9 @@ pub fn sway_config(
     a11y_bind_dir: Option<&Path>,
     status_fd: Option<i32>,
     protected_paths: &[ProtectedHostPath],
-) -> Result<String> {
-    let argv: Vec<String> = match spec.sandbox {
-        SandboxLevel::Off => spec.run.to_vec(),
+) -> Result<Vec<u8>> {
+    let argv: Vec<OsString> = match spec.sandbox {
+        SandboxLevel::Off => spec.run.iter().map(OsString::from).collect(),
         level => {
             let prog = OsString::from(&spec.run[0]);
             let args: Vec<OsString> = spec.run[1..].iter().map(OsString::from).collect();
@@ -102,31 +103,29 @@ pub fn sway_config(
                 status_fd,
                 protected_paths: protected_paths.to_vec(),
             };
-            let wrapped = wrap_argv(&prog, &args, &opts)?;
-            // sway's config is a text file, so argv elements must be Strings.
-            // Every element here is an ASCII bwrap flag, a glass-owned path
-            // (runtime_dir / ephemeral HOME / the program), or spec.run (already
-            // String) — all valid UTF-8 in practice; to_string_lossy is the
-            // pragmatic conversion (a non-UTF-8 path would make bwrap fail
-            // loudly, not escape silently).
-            wrapped
-                .into_iter()
-                .map(|s| s.to_string_lossy().into_owned())
-                .collect()
+            wrap_argv(&prog, &args, &opts)?
         }
     };
-    let exec = argv
-        .iter()
-        .map(|a| shell_quote(a))
-        .collect::<Vec<_>>()
-        .join(" ");
+    Ok(render_sway_config(&argv))
+}
+
+fn render_sway_config(argv: &[OsString]) -> Vec<u8> {
     let (out_w, out_h) = output_resolution();
-    Ok(format!(
+    let mut config = format!(
         "output HEADLESS-1 resolution {out_w}x{out_h}\n\
          default_border none\n\
          for_window [title=\".*\"] floating enable\n\
-         exec {exec}\n"
-    ))
+         exec "
+    )
+    .into_bytes();
+    for (index, argument) in argv.iter().enumerate() {
+        if index > 0 {
+            config.push(b' ');
+        }
+        shell_quote(argument, &mut config);
+    }
+    config.push(b'\n');
+    config
 }
 
 /// Ask the kernel to signal the compositor if the *thread* that launched it dies — this crate's
@@ -159,9 +158,17 @@ fn die_with_launcher(cmd: &mut Command) {
 #[cfg(not(test))]
 fn die_with_launcher(_: &mut Command) {}
 
-/// Single-quote a string for a `/bin/sh` command line (escape embedded quotes).
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+/// Single-quote an OS-native argument for `/bin/sh`, escaping embedded apostrophes.
+fn shell_quote(argument: &std::ffi::OsStr, output: &mut Vec<u8>) {
+    output.push(b'\'');
+    for byte in argument.as_bytes() {
+        if *byte == b'\'' {
+            output.extend_from_slice(b"'\\''");
+        } else {
+            output.push(*byte);
+        }
+    }
+    output.push(b'\'');
 }
 
 /// Build `sway --unsupported-gpu -c <config>` headless, with a private
@@ -218,14 +225,69 @@ pub fn build_sway_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    fn invalid_component(prefix: &[u8]) -> OsString {
+        let mut bytes = prefix.to_vec();
+        bytes.push(0xff);
+        OsString::from_vec(bytes)
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn position_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn rposition_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .rposition(|window| window == needle)
+    }
+
+    #[test]
+    fn shell_quote_preserves_apostrophe_invalid_utf8_whitespace_and_newline() {
+        let argument = OsString::from_vec(b"arg-'\xff space\nnext".to_vec());
+        let mut command = b"printf '%s' ".to_vec();
+        shell_quote(argument.as_os_str(), &mut command);
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(OsString::from_vec(command))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, argument.as_bytes());
+    }
+
+    #[test]
+    fn config_renderer_preserves_non_utf8_home_argument() {
+        let home = OsString::from_vec(b"/home/user-\xff".to_vec());
+        let argv = vec![
+            OsString::from("bwrap"),
+            OsString::from("--setenv"),
+            OsString::from("HOME"),
+            home.clone(),
+            OsString::from("--"),
+            OsString::from("app"),
+        ];
+        let config = render_sway_config(&argv);
+        assert!(contains_bytes(&config, home.as_bytes()));
+    }
 
     fn test_sway_config(
         spec: &AppSpec,
         runtime_dir: &Path,
         a11y_bind_dir: Option<&Path>,
     ) -> String {
-        sway_config(spec, runtime_dir, a11y_bind_dir, None, &[]).unwrap()
+        String::from_utf8(sway_config(spec, runtime_dir, a11y_bind_dir, None, &[]).unwrap())
+            .unwrap()
     }
 
     #[test]
@@ -248,13 +310,58 @@ mod tests {
             &[ProtectedHostPath::directory(&protected)],
         )
         .unwrap();
-        let status = config.find("'--json-status-fd'").unwrap();
-        let runtime_bind = config.rfind(runtime.to_str().unwrap()).unwrap();
-        let a11y_bind = config.rfind(a11y.to_str().unwrap()).unwrap();
-        let mask = config.rfind(protected.to_str().unwrap()).unwrap();
-        assert!(config[status..].contains(&format!("'{}'", pipe.writer_fd())));
+        let status = position_bytes(&config, b"'--json-status-fd'").unwrap();
+        let runtime_bind = rposition_bytes(&config, runtime.as_os_str().as_bytes()).unwrap();
+        let a11y_bind = rposition_bytes(&config, a11y.as_os_str().as_bytes()).unwrap();
+        let mask = rposition_bytes(&config, protected.as_os_str().as_bytes()).unwrap();
+        assert!(contains_bytes(
+            &config[status..],
+            format!("'{}'", pipe.writer_fd()).as_bytes()
+        ));
         assert!(mask > runtime_bind);
         assert!(mask > a11y_bind);
+    }
+
+    #[test]
+    fn sandbox_config_preserves_non_utf8_path_bytes_in_binds_and_final_masks() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join(invalid_component(b"runtime-"));
+        let cwd = temp.path().join(invalid_component(b"cwd-"));
+        let a11y = temp.path().join(invalid_component(b"a11y-"));
+        let protected_dir = temp.path().join(invalid_component(b"protected-dir-"));
+        let protected_file = temp.path().join(invalid_component(b"protected-file-"));
+        for dir in [&runtime, &cwd, &a11y, &protected_dir] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(&protected_file, b"lease").unwrap();
+
+        let alias_dir = temp.path().join("protected-dir-�");
+        let alias_file = temp.path().join("protected-file-�");
+        std::fs::create_dir(&alias_dir).unwrap();
+        std::fs::write(&alias_file, b"alias").unwrap();
+
+        let mut s = spec(&["/bin/app"]);
+        s.sandbox = SandboxLevel::Default;
+        s.cwd = Some(cwd.clone());
+        let config = sway_config(
+            &s,
+            &runtime,
+            Some(&a11y),
+            None,
+            &[
+                ProtectedHostPath::directory(&protected_dir),
+                ProtectedHostPath::file(&protected_file),
+            ],
+        )
+        .unwrap();
+        for path in [&runtime, &cwd, &a11y, &protected_dir, &protected_file] {
+            assert!(
+                contains_bytes(&config, path.as_os_str().as_bytes()),
+                "config changed path bytes for {path:?}"
+            );
+        }
+        assert!(!contains_bytes(&config, alias_dir.as_os_str().as_bytes()));
+        assert!(!contains_bytes(&config, alias_file.as_os_str().as_bytes()));
     }
 
     fn spec(run: &[&str]) -> AppSpec {
