@@ -317,6 +317,13 @@ fn reap_pending(pending: &mut PendingWaylandSession) -> LaunchCleanupOutcome {
     // before the authoritative snapshot so its host PID remains a reaping root after reparenting.
     // A malformed status still falls through to reap sway's known host tree.
     let status_error = pending.poll_status().err();
+    reap_pending_after_status_poll(pending, status_error)
+}
+
+fn reap_pending_after_status_poll(
+    pending: &mut PendingWaylandSession,
+    status_error: Option<GlassError>,
+) -> LaunchCleanupOutcome {
     let mut tree = glass_proc_linux::proc_tree_pids(pending.child.id());
     if let Some(root) = pending.ownership_root {
         tree.extend(ProcessIdentitySet::from_host_root(root).host_pids());
@@ -355,7 +362,14 @@ fn launch_cleanup_error(outcome: LaunchCleanupOutcome) -> Option<GlassError> {
 }
 
 fn failed_launch_error(pending: &mut PendingWaylandSession, primary: GlassError) -> GlassError {
-    match launch_cleanup_error(reap_pending(pending)) {
+    failed_launch_error_from_outcome(primary, reap_pending(pending))
+}
+
+fn failed_launch_error_from_outcome(
+    primary: GlassError,
+    outcome: LaunchCleanupOutcome,
+) -> GlassError {
+    match launch_cleanup_error(outcome) {
         Some(cleanup) => {
             GlassError::cleanup_failed("stopping a failed Wayland launch", primary, cleanup)
         }
@@ -378,22 +392,22 @@ fn launch_with_retry<T>(
     mut attempt: impl FnMut(Instant) -> Result<T>,
 ) -> Result<T> {
     const ATTEMPTS: u32 = 2;
-    let mut last_error = GlassError::Timeout(timeout_ms);
+    let mut last_error = None;
     for attempt_number in 0..ATTEMPTS {
         if Instant::now() >= deadline {
-            return Err(GlassError::Timeout(timeout_ms));
+            return Err(last_error.unwrap_or(GlassError::Timeout(timeout_ms)));
         }
         match attempt(deadline) {
             Ok(value) => return Ok(value),
             Err(error @ (GlassError::Timeout(_) | GlassError::Backend(_)))
                 if attempt_number + 1 < ATTEMPTS =>
             {
-                last_error = error;
+                last_error = Some(error);
             }
             Err(error) => return Err(error),
         }
     }
-    Err(last_error)
+    Err(last_error.unwrap_or(GlassError::Timeout(timeout_ms)))
 }
 
 fn launch_deadline_error(
@@ -401,8 +415,8 @@ fn launch_deadline_error(
     timeout_ms: u64,
     unrecovered_x11_windows: usize,
 ) -> GlassError {
-    let status_confirmed = pending.status_confirmed();
-    let primary = if !status_confirmed {
+    let status_error = pending.poll_status().err();
+    let primary = if !pending.status_confirmed() {
         GlassError::SandboxUnavailable("Bubblewrap did not report a contained child PID".into())
     } else if unrecovered_x11_windows > 0 {
         GlassError::Backend(format!(
@@ -413,7 +427,10 @@ fn launch_deadline_error(
     } else {
         GlassError::Timeout(timeout_ms)
     };
-    failed_launch_error(pending, primary)
+    failed_launch_error_from_outcome(
+        primary,
+        reap_pending_after_status_poll(pending, status_error),
+    )
 }
 
 #[cfg(test)]
@@ -6195,8 +6212,8 @@ mod session_tests {
 mod tests {
     use super::{
         BwrapStatusPipe, LaunchCleanupOutcome, PendingWaylandSession, WaylandPlatform,
-        failed_launch_error, find_wayland_socket, launch_cleanup_error, launch_ready,
-        launch_with_retry, nudge_x, open_session, parse_sway_version, reap_pending,
+        failed_launch_error, find_wayland_socket, launch_cleanup_error, launch_deadline_error,
+        launch_ready, launch_with_retry, nudge_x, open_session, parse_sway_version, reap_pending,
         start_recovery_after,
     };
     use crate::command::{build_sway_command, sway_config};
@@ -6236,7 +6253,10 @@ mod tests {
         })
         .expect_err("an expired launch budget cannot be retried");
 
-        assert!(matches!(error, glass_core::GlassError::Timeout(20)));
+        assert!(matches!(
+            error,
+            glass_core::GlassError::Backend(ref message) if message == "retryable"
+        ));
         assert_eq!(attempts, [deadline]);
     }
 
@@ -6344,6 +6364,49 @@ mod tests {
             error,
             glass_core::GlassError::Backend(ref message) if message == "primary launch failure"
         ));
+    }
+
+    #[test]
+    fn launch_deadline_uses_buffered_valid_status_before_classifying_the_primary() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded cleanup fixture");
+        let child_pid = child.id();
+        let pipe = BwrapStatusPipe::new().expect("status pipe");
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", pipe.writer_fd()))
+            .expect("duplicate status writer");
+        writer
+            .write_all(format!("{{\"child-pid\":{child_pid}}}\n").as_bytes())
+            .expect("buffer valid child status");
+        drop(writer);
+        let mut pending = PendingWaylandSession {
+            child,
+            status: Some(pipe.into_reader()),
+            ownership_root: None,
+        };
+        let mut cleanup = PendingCleanup(Some(&mut pending));
+
+        let error = launch_deadline_error(
+            cleanup.0.as_deref_mut().expect("armed cleanup guard"),
+            20,
+            0,
+        );
+        cleanup.disarm();
+
+        assert!(
+            matches!(error, glass_core::GlassError::Timeout(20)),
+            "{error}"
+        );
+        assert!(
+            !glass_proc_linux::any_alive(&[child_pid]),
+            "deadline cleanup left child {child_pid} alive"
+        );
     }
 
     #[test]

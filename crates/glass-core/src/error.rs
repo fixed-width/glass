@@ -433,8 +433,7 @@ impl GlassError {
             error @ (GlassError::BeforeDispatch(_)
             | GlassError::AfterDispatch(_)
             | GlassError::Bounded { .. }
-            | GlassError::InputCleanupFailed { .. }
-            | GlassError::CleanupFailed { .. }) => error,
+            | GlassError::InputCleanupFailed { .. }) => error,
             error => GlassError::BeforeDispatch(Box::new(error)),
         }
     }
@@ -442,9 +441,7 @@ impl GlassError {
     /// Preserve earlier dispatch when a later compound-operation step fails.
     pub fn after_dispatch(self) -> Self {
         match self {
-            error @ (GlassError::AfterDispatch(_)
-            | GlassError::InputCleanupFailed { .. }
-            | GlassError::CleanupFailed { .. }) => error,
+            error @ (GlassError::AfterDispatch(_) | GlassError::InputCleanupFailed { .. }) => error,
             error @ GlassError::Bounded {
                 dispatch: BoundDispatch::MayHaveDispatched,
                 ..
@@ -784,6 +781,46 @@ mod tests {
     }
 
     #[test]
+    fn before_dispatch_annotates_an_unbounded_generic_cleanup_failure() {
+        let error = GlassError::cleanup_failed(
+            "stopping launch",
+            GlassError::Backend("primary".into()),
+            GlassError::ToolFailed {
+                call: "cleanup".into(),
+                said: " residue ".into(),
+            },
+        )
+        .before_dispatch();
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert_eq!(
+            error.to_string(),
+            "backend error: primary; cleanup failed while stopping launch: backend error: `cleanup` failed:  residue "
+        );
+        assert!(matches!(error.cause(), GlassError::Backend(message) if message == "primary"));
+        assert_eq!(error.tool_said(), Some("residue"));
+        assert_eq!(error.bound(), None);
+        assert_eq!(error.bound_owner(), None);
+        assert!(!error.set_value_failed_after_writing());
+        let GlassError::BeforeDispatch(inner) = error else {
+            panic!("the complete cleanup failure must carry the dispatch annotation");
+        };
+        let GlassError::CleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = *inner
+        else {
+            panic!("the structured cleanup failure must remain intact");
+        };
+        assert_eq!(operation, "stopping launch");
+        assert!(matches!(*primary, GlassError::Backend(message) if message == "primary"));
+        assert!(
+            matches!(*cleanup, GlassError::ToolFailed { call, said } if call == "cleanup" && said == " residue ")
+        );
+    }
+
+    #[test]
     fn before_dispatch_accessors_recurse_through_nested_annotations() {
         let bounded = GlassError::BeforeDispatch(Box::new(GlassError::BeforeDispatch(Box::new(
             GlassError::Bounded {
@@ -845,6 +882,49 @@ mod tests {
         assert_eq!(
             error.bound_dispatch(),
             Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn after_dispatch_annotates_an_unbounded_generic_cleanup_failure() {
+        let error = GlassError::cleanup_failed(
+            "stopping launch",
+            GlassError::Backend("primary".into()),
+            GlassError::ToolFailed {
+                call: "cleanup".into(),
+                said: " residue ".into(),
+            },
+        )
+        .after_dispatch();
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(
+            error.to_string(),
+            "backend error: primary; cleanup failed while stopping launch: backend error: `cleanup` failed:  residue "
+        );
+        assert!(matches!(error.cause(), GlassError::Backend(message) if message == "primary"));
+        assert_eq!(error.tool_said(), Some("residue"));
+        assert_eq!(error.bound(), None);
+        assert_eq!(error.bound_owner(), None);
+        assert!(!error.set_value_failed_after_writing());
+        let GlassError::AfterDispatch(inner) = error else {
+            panic!("the complete cleanup failure must carry the dispatch annotation");
+        };
+        let GlassError::CleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = *inner
+        else {
+            panic!("the structured cleanup failure must remain intact");
+        };
+        assert_eq!(operation, "stopping launch");
+        assert!(matches!(*primary, GlassError::Backend(message) if message == "primary"));
+        assert!(
+            matches!(*cleanup, GlassError::ToolFailed { call, said } if call == "cleanup" && said == " residue ")
         );
     }
 
