@@ -26,11 +26,13 @@ mod a11y_poll;
 mod baseline;
 mod capture;
 mod clipboard;
+mod find;
 mod input;
 mod lifecycle;
 mod wait;
 mod window;
 
+pub use find::{FindElementsOutcome, FindElementsParams};
 pub use wait::{
     SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS, ScrollDirection, ScrollToElementOutcome,
     ScrollToElementParams, WaitElementOutcome, WaitElementParams, WaitLogOutcome, WaitLogParams,

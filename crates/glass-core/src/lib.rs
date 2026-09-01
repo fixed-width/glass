@@ -120,8 +120,8 @@ pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef
 
 pub mod session;
 pub use session::{
-    Backend, Glass, PlatformFactory, SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS,
-    ScrollDirection, ScrollToElementOutcome, ScrollToElementParams, WaitElementOutcome,
-    WaitElementParams, WaitLogOutcome, WaitLogParams, WaitRegionOutcome, WaitRegionParams,
-    WaitStableOutcome, WaitStableParams,
+    Backend, FindElementsOutcome, FindElementsParams, Glass, PlatformFactory,
+    SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS, ScrollDirection, ScrollToElementOutcome,
+    ScrollToElementParams, WaitElementOutcome, WaitElementParams, WaitLogOutcome, WaitLogParams,
+    WaitRegionOutcome, WaitRegionParams, WaitStableOutcome, WaitStableParams,
 };
