@@ -423,6 +423,81 @@ pub(crate) async fn finish_transport_lifecycle<T>(
     transport_result
 }
 
+pub(crate) trait StdioServiceLifecycle {
+    type Error;
+    type QuitReason;
+
+    fn is_transport_closed(&self) -> bool;
+
+    fn close_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<Option<Self::QuitReason>, Self::Error>,
+    > + Send;
+}
+
+impl<R, S> StdioServiceLifecycle for rmcp::service::RunningService<R, S>
+where
+    R: rmcp::service::ServiceRole,
+    S: rmcp::service::Service<R>,
+{
+    type Error = tokio::task::JoinError;
+    type QuitReason = rmcp::service::QuitReason;
+
+    fn is_transport_closed(&self) -> bool {
+        self.peer().is_transport_closed()
+    }
+
+    async fn close_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<Option<Self::QuitReason>, Self::Error> {
+        rmcp::service::RunningService::close_with_timeout(self, timeout).await
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StdioTransportOutcome<Q, E> {
+    Normal(std::result::Result<Option<Q>, E>),
+    Signal(std::result::Result<Option<Q>, E>),
+}
+
+pub(crate) async fn run_stdio_service_lifecycle<S>(
+    mut service: S,
+    signal: impl std::future::Future<Output = ()>,
+    close_timeout: std::time::Duration,
+    teardown: impl std::future::Future<Output = ()>,
+    cleanup: impl std::future::Future<Output = ()>,
+) -> StdioTransportOutcome<S::QuitReason, S::Error>
+where
+    S: StdioServiceLifecycle,
+{
+    tokio::pin!(signal);
+    // Polling keeps the service's join handle owned here so the explicit bounded close below
+    // cannot be bypassed by dropping a competing completion future.
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(25));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let via_signal = loop {
+        tokio::select! {
+            () = &mut signal => break true,
+            _ = poll.tick() => {
+                if service.is_transport_closed() {
+                    break false;
+                }
+            }
+        }
+    };
+
+    let close_result = service.close_with_timeout(close_timeout).await;
+    let outcome = if via_signal {
+        StdioTransportOutcome::Signal(close_result)
+    } else {
+        StdioTransportOutcome::Normal(close_result)
+    };
+    finish_transport_lifecycle(outcome, teardown, cleanup).await
+}
+
 /// Serve MCP over stdio (the default transport) and tear down on EOF or signal.
 pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyhow::Result<()> {
     let server = GlassServer::new(glass, report);
@@ -433,37 +508,81 @@ pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyho
         .await
         .context("starting the MCP stdio service")?;
 
-    let cancel = service.cancellation_token();
-    let waiting = service.waiting();
-    tokio::pin!(waiting);
-    let transport_result = tokio::select! {
-        r = &mut waiting => r.context("serving MCP").map(|_| false),
-        _ = shutdown::shutdown_signal() => {
-            eprintln!("glass: received shutdown signal; tearing down sessions");
-            cancel.cancel();
-            tokio::time::timeout(glass_core::TEARDOWN_BUDGET, &mut waiting)
-                .await
-                .context("closing the MCP stdio service")
-                .and_then(|result| result.context("closing the MCP stdio service"))
-                .map(|_| true)
-        }
+    let signal = async {
+        shutdown::shutdown_signal().await;
+        eprintln!("glass: received shutdown signal; tearing down sessions");
     };
-    let transport_result = finish_transport_lifecycle(
-        transport_result,
+    let transport_outcome = run_stdio_service_lifecycle(
+        service,
+        signal,
+        glass_core::TEARDOWN_BUDGET,
         shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET),
         cleanup_artifacts(artifacts),
     )
     .await;
-    let via_signal = transport_result?;
-    if via_signal {
-        std::process::exit(0);
+    match transport_outcome {
+        StdioTransportOutcome::Normal(Ok(Some(_))) => Ok(()),
+        StdioTransportOutcome::Normal(Ok(None)) => {
+            Err(anyhow::anyhow!("MCP stdio service close timed out"))
+        }
+        StdioTransportOutcome::Normal(Err(_)) => {
+            Err(anyhow::anyhow!("MCP stdio service task failed"))
+        }
+        StdioTransportOutcome::Signal(Ok(_)) => std::process::exit(0),
+        StdioTransportOutcome::Signal(Err(_)) => Err(anyhow::anyhow!(
+            "MCP stdio service task failed during shutdown"
+        )),
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::default_backend;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FakeClose {
+        Completed,
+        TimedOut,
+        JoinError,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct FakeJoinError;
+
+    struct FakeStdioService {
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        transport_closed: bool,
+        close: FakeClose,
+        work_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl super::StdioServiceLifecycle for FakeStdioService {
+        type Error = FakeJoinError;
+        type QuitReason = &'static str;
+
+        fn is_transport_closed(&self) -> bool {
+            self.transport_closed
+        }
+
+        async fn close_with_timeout(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> std::result::Result<Option<Self::QuitReason>, Self::Error> {
+            self.work_active
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let event = match self.close {
+                FakeClose::Completed => "transport_complete",
+                FakeClose::TimedOut => "bounded_close_timeout",
+                FakeClose::JoinError => "close_join_error",
+            };
+            self.events.lock().unwrap().push(event);
+            match self.close {
+                FakeClose::Completed => Ok(Some("closed")),
+                FakeClose::TimedOut => Ok(None),
+                FakeClose::JoinError => Err(FakeJoinError),
+            }
+        }
+    }
 
     async fn record_event(
         events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
@@ -472,62 +591,135 @@ mod tests {
         events.lock().unwrap().push(event);
     }
 
-    async fn run_stdio_lifecycle_for_test<T, E>(
-        transport: impl std::future::Future<Output = Result<T, E>>,
-        signal: impl std::future::Future<Output = ()>,
-        close: impl std::future::Future<Output = Result<T, E>>,
-        teardown: impl std::future::Future<Output = ()>,
-        cleanup: impl std::future::Future<Output = ()>,
-    ) -> Result<T, E> {
-        tokio::pin!(transport);
-        tokio::pin!(signal);
-        let result = tokio::select! {
-            result = &mut transport => result,
-            () = &mut signal => close.await,
-        };
-        super::finish_transport_lifecycle(result, teardown, cleanup).await
-    }
-
-    #[tokio::test]
-    async fn stdio_signal_waits_for_close_before_teardown_and_cleanup() {
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let result = run_stdio_lifecycle_for_test(
-            std::future::pending::<Result<&'static str, ()>>(),
-            std::future::ready(()),
-            async {
-                record_event(events.clone(), "transport_close").await;
-                Err(())
+    fn fake_stdio_service(
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        transport_closed: bool,
+        close: FakeClose,
+    ) -> (
+        FakeStdioService,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let work_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        (
+            FakeStdioService {
+                events,
+                transport_closed,
+                close,
+                work_active: work_active.clone(),
             },
-            record_event(events.clone(), "target_teardown"),
-            record_event(events.clone(), "artifact_cleanup"),
+            work_active,
         )
-        .await;
-        assert_eq!(result, Err(()));
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            ["transport_close", "target_teardown", "artifact_cleanup"]
-        );
     }
 
     #[tokio::test]
     async fn stdio_normal_completion_precedes_teardown_and_cleanup() {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let transport_events = events.clone();
-        let result = run_stdio_lifecycle_for_test(
-            async move {
-                transport_events.lock().unwrap().push("transport_complete");
-                Ok::<_, ()>("complete")
-            },
+        let (service, _) = fake_stdio_service(events.clone(), true, FakeClose::Completed);
+        let result = super::run_stdio_service_lifecycle(
+            service,
             std::future::pending(),
-            std::future::pending(),
+            std::time::Duration::from_secs(1),
             record_event(events.clone(), "target_teardown"),
             record_event(events.clone(), "artifact_cleanup"),
         )
         .await;
-        assert_eq!(result, Ok("complete"));
+        assert_eq!(
+            result,
+            super::StdioTransportOutcome::Normal(Ok(Some("closed")))
+        );
         assert_eq!(
             events.lock().unwrap().as_slice(),
             ["transport_complete", "target_teardown", "artifact_cleanup"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_signal_close_completion_precedes_teardown_and_cleanup() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (service, _) = fake_stdio_service(events.clone(), false, FakeClose::Completed);
+        let result = super::run_stdio_service_lifecycle(
+            service,
+            std::future::ready(()),
+            std::time::Duration::from_secs(1),
+            record_event(events.clone(), "target_teardown"),
+            record_event(events.clone(), "artifact_cleanup"),
+        )
+        .await;
+        assert_eq!(
+            result,
+            super::StdioTransportOutcome::Signal(Ok(Some("closed")))
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["transport_complete", "target_teardown", "artifact_cleanup"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_signal_bounded_close_timeout_remains_observable_after_cleanup() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (service, _) = fake_stdio_service(events.clone(), false, FakeClose::TimedOut);
+        let result = super::run_stdio_service_lifecycle(
+            service,
+            std::future::ready(()),
+            std::time::Duration::from_millis(1),
+            record_event(events.clone(), "target_teardown"),
+            record_event(events.clone(), "artifact_cleanup"),
+        )
+        .await;
+        assert_eq!(result, super::StdioTransportOutcome::Signal(Ok(None)));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [
+                "bounded_close_timeout",
+                "target_teardown",
+                "artifact_cleanup"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_signal_close_join_error_remains_observable_after_cleanup() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (service, _) = fake_stdio_service(events.clone(), false, FakeClose::JoinError);
+        let result = super::run_stdio_service_lifecycle(
+            service,
+            std::future::ready(()),
+            std::time::Duration::from_secs(1),
+            record_event(events.clone(), "target_teardown"),
+            record_event(events.clone(), "artifact_cleanup"),
+        )
+        .await;
+        assert_eq!(
+            result,
+            super::StdioTransportOutcome::Signal(Err(FakeJoinError))
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["close_join_error", "target_teardown", "artifact_cleanup"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_signal_close_stops_service_work_before_target_teardown() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (service, work_active) =
+            fake_stdio_service(events.clone(), false, FakeClose::Completed);
+        let teardown_events = events.clone();
+        let result = super::run_stdio_service_lifecycle(
+            service,
+            std::future::ready(()),
+            std::time::Duration::from_secs(1),
+            async move {
+                assert!(!work_active.load(std::sync::atomic::Ordering::SeqCst));
+                record_event(teardown_events, "target_teardown").await;
+            },
+            record_event(events.clone(), "artifact_cleanup"),
+        )
+        .await;
+        assert_eq!(
+            result,
+            super::StdioTransportOutcome::Signal(Ok(Some("closed")))
         );
     }
 
