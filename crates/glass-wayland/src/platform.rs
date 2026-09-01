@@ -1613,11 +1613,7 @@ fn bring_up_session(
             runtime_dir.path(),
             a11y.map(|a| a.dir),
             status_fd,
-            if spec.sandbox == SandboxLevel::Off {
-                &[]
-            } else {
-                protected_host_paths
-            },
+            protected_host_paths,
         )?,
     )
     .map_err(GlassError::Io)?;
