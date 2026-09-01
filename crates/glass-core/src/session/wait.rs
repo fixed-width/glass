@@ -3,17 +3,6 @@
 use super::*;
 use crate::accessibility::ElementSelector;
 
-/// Maximum wall-clock time a change signal may suppress tree reads.
-const REREAD_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Reader headroom reserved before a quiet wait's deadline, capped at one quarter of the
-/// remaining budget.
-const FINAL_READ_HEADROOM: std::time::Duration = std::time::Duration::from_millis(20);
-
-fn should_reclassify_nested_bound(effective_owner: crate::Whose, sequence_expired: bool) -> bool {
-    effective_owner == crate::Whose::Callee && !sequence_expired
-}
-
 fn callee_wait_expired(looked: bool, owner: crate::Whose, expired: bool) -> bool {
     looked && owner == crate::Whose::Callee && expired
 }
@@ -60,58 +49,8 @@ fn needs_callee_timeout_full_capture(no_value: bool, owner: crate::Whose) -> boo
     no_value && owner == crate::Whose::Callee
 }
 
-fn final_read_pause(left: std::time::Duration) -> std::time::Duration {
-    left.saturating_sub(FINAL_READ_HEADROOM.min(left / 4))
-}
-
-fn quiet_wait_needs_read(final_read: bool, since_last: std::time::Duration) -> bool {
-    final_read || since_last >= REREAD_AFTER
-}
-
-fn should_schedule_final_read(
-    already_scheduled: bool,
-    left: Option<std::time::Duration>,
-    interval: std::time::Duration,
-) -> bool {
-    !already_scheduled && left.is_some_and(|left| left <= interval)
-}
-
-fn reader_relative_caller_bound(error: &GlassError) -> bool {
-    error.bound_owner() == Some(crate::Whose::Caller)
-}
-
-fn outer_sequence_expired(owner: crate::Whose, expired: bool) -> bool {
-    owner == crate::Whose::Caller && expired
-}
-
 fn prior_scroll_dispatched(steps: u32) -> bool {
     steps > 0
-}
-
-/// Reclassify a reader-relative caller bound without overriding an expired outer sequence.
-fn resolve_nested_accessibility_bound(
-    error: GlassError,
-    effective_owner: crate::Whose,
-    sequence_deadline: Deadline,
-) -> GlassError {
-    if should_reclassify_nested_bound(effective_owner, sequence_deadline.has_passed()) {
-        match error {
-            GlassError::Bounded {
-                kind,
-                whose: crate::Whose::Caller,
-                dispatch,
-                message,
-            } => GlassError::Bounded {
-                kind,
-                whose: crate::Whose::Callee,
-                dispatch,
-                message,
-            },
-            error => error,
-        }
-    } else {
-        error
-    }
 }
 
 fn after_scroll_dispatch(error: GlassError) -> GlassError {
@@ -188,6 +127,11 @@ pub struct WaitElementOutcome {
     /// Which timeout ended the wait. `None` when the predicate was satisfied.
     #[doc(hidden)]
     pub timed_out_by: Option<crate::Whose>,
+}
+
+enum WaitElementObservation {
+    Pending,
+    Satisfied(Option<ElementInfo>),
 }
 
 /// Wheel notches per scroll step; chosen so a step realizes at most a few rows
@@ -554,172 +498,35 @@ impl Glass {
         params: &WaitElementParams,
         sequence_deadline: Deadline,
     ) -> Result<WaitElementOutcome> {
-        if sequence_deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("wait for element"));
-        }
-        self.require_active()?; // fail fast; a11y_snapshot rechecks inside the loop
-        let started = std::time::Instant::now();
-        // Every read this wait makes carries when the wait stops: the tick is synchronous, so the
-        // loop cannot take back a read a reader has started (glass#338).
-        let (effective_duration, whose) =
-            sequence_deadline.budget(std::time::Duration::from_millis(params.timeout_ms), started);
-        let action_deadline = Deadline::at(started + effective_duration);
-        // Before the first walk, not after: a change landing in that gap is announced to nobody,
-        // and the wait then burns its whole budget on a condition that already holds.
-        //
-        // An interval of 0 means "re-read as fast as you can", which never pauses — so there is
-        // nothing for a signal to save, and subscribing would only cost a round-trip.
-        let mut signal = (params.interval_ms > 0)
-            .then(|| self.subscribe_a11y_changes(action_deadline))
-            .flatten();
-        // Subscribing spends the caller's budget, so the poll loop gets what is left. That
-        // bounds the polling, not the call: a reader that does not honour `deadline` bounds its
-        // own handshake in seconds, so a wait told to give up after 500ms can return later.
-        let remaining = (effective_duration.as_millis() as u64)
-            .saturating_sub(started.elapsed().as_millis() as u64);
-        // Starts now rather than at the first read: the first tick follows immediately.
-        let mut last_read = std::time::Instant::now();
-        // Only a wait that never saw a tree reports why it saw none. A reader honouring
-        // `deadline` gives up on the tick that ends the wait, so without this every unmatched wait
-        // on such a backend failed instead of answering `{matched:false}` (glass#338).
-        let mut unread: Option<GlassError> = None;
-        let mut unread_owner = whose;
-        let mut saw_a_tree = false;
-        // A zero-timeout compatibility read uses the live sequence deadline; later reads use the
-        // action deadline.
-        let first_read_deadline = if params.timeout_ms == 0 {
-            sequence_deadline
-        } else {
-            action_deadline
+        let selector = ElementSelector {
+            name: params.name.as_deref(),
+            description: params.description.as_deref(),
+            role: params.role,
+            value: params.value.as_deref(),
+            value_contains: params.value_contains.as_deref(),
         };
-        let mut looked = false;
-        let final_read_scheduled = std::cell::Cell::new(false);
-        let outcome = crate::poll::poll_until_with_pause(
+        let poll = self.poll_accessibility_until(
             params.interval_ms,
-            remaining,
-            |d| {
-                // Schedule the skipped-tick safety read before expiry because accessibility
-                // snapshots cannot return late success.
-                let left = action_deadline.remaining();
-                let final_read = should_schedule_final_read(final_read_scheduled.get(), left, d);
-                if final_read {
-                    final_read_scheduled.set(true);
+            params.timeout_ms,
+            sequence_deadline,
+            "wait for element",
+            |tree| match tree.element_match_selector(selector, params.condition) {
+                ElementMatch::Satisfied(node) => {
+                    WaitElementObservation::Satisfied(node.map(ElementInfo::from_node))
                 }
-                let paused_at = std::time::Instant::now();
-                let pause_budget = if final_read {
-                    let left = left.expect("a final read is scheduled only for a bounded wait");
-                    final_read_pause(left)
-                } else {
-                    left.unwrap_or(d).min(d)
-                };
-                let read_now = match signal.as_mut() {
-                    Some(s) => match s.wait(pause_budget) {
-                        ChangeWait::Changed => true,
-                        // Read anyway now and then — see `REREAD_AFTER`.
-                        ChangeWait::Quiet => quiet_wait_needs_read(final_read, last_read.elapsed()),
-                        // See `ChangeWait`: an unusable signal must not read as a quiet one.
-                        ChangeWait::Unusable => {
-                            signal = None;
-                            true
-                        }
-                    },
-                    None => true,
-                };
-                if read_now {
-                    last_read = std::time::Instant::now();
-                }
-                // One interval between reads, whatever woke us. A chatty app (spinner, clock,
-                // progress bar) would otherwise drive back-to-back walks with no gap, hammering the
-                // same bus the app is trying to serve — and a signal that returns early without
-                // blocking, which nothing here can enforce, would spin this loop at full tilt.
-                std::thread::sleep(pause_budget.saturating_sub(paused_at.elapsed()));
-                read_now
+                ElementMatch::Pending => WaitElementObservation::Pending,
             },
-            || {
-                // fresh snapshot; assigns ids, caches, pumps
-                let first_read = !looked;
-                let bound = if first_read {
-                    first_read_deadline
-                } else {
-                    action_deadline
-                };
-                let read_owner = if first_read
-                    && params.timeout_ms == 0
-                    && sequence_deadline.instant().is_some()
-                {
-                    crate::Whose::Caller
-                } else {
-                    whose
-                };
-                // The pause already scheduled the safety read before expiry; skip the poller's
-                // post-timeout bookkeeping tick.
-                if !first_read && bound.has_passed() {
-                    return Ok(None);
-                }
-                looked = true;
-                let tree = match self.a11y_resnapshot_for_wait(bound) {
-                    Ok(t) => {
-                        saw_a_tree = true;
-                        t
-                    }
-                    // Kept so a spent budget can report this instead of "not found" (glass#329).
-                    Err(e @ GlassError::AccessibilityNotReady(_)) => {
-                        unread_owner = read_owner;
-                        unread = Some(e);
-                        return Ok(None);
-                    }
-                    // Resolve this reader-relative `Caller` against the enclosing wait below.
-                    Err(e) if reader_relative_caller_bound(&e) => {
-                        unread_owner = read_owner;
-                        unread = Some(e);
-                        return Ok(None);
-                    }
-                    Err(e) => return Err(e),
-                };
-                Ok(
-                    match tree.element_match_selector(
-                        ElementSelector {
-                            name: params.name.as_deref(),
-                            description: params.description.as_deref(),
-                            role: params.role,
-                            value: params.value.as_deref(),
-                            value_contains: params.value_contains.as_deref(),
-                        },
-                        params.condition,
-                    ) {
-                        ElementMatch::Satisfied(node) => Some(node.map(ElementInfo::from_node)),
-                        ElementMatch::Pending => None,
-                    },
-                )
-            },
+            |observation| matches!(observation, WaitElementObservation::Satisfied(_)),
         )?;
-        if outcome.value.is_none()
-            && !saw_a_tree
-            && let Some(e) = unread
-        {
-            if e.bound_owner() == Some(crate::Whose::Caller) {
-                return Err(resolve_nested_accessibility_bound(
-                    e,
-                    unread_owner,
-                    sequence_deadline,
-                ));
-            }
-            if outer_sequence_expired(unread_owner, sequence_deadline.has_passed()) {
-                return Err(GlassError::caller_deadline_elapsed_with_guidance(
-                    "accessibility wait",
-                    &e.to_string(),
-                ));
-            }
-            return Err(e);
-        }
-        let matched = outcome.value.is_some();
+        let element = match poll.observation {
+            WaitElementObservation::Satisfied(element) => element,
+            WaitElementObservation::Pending => None,
+        };
         Ok(WaitElementOutcome {
-            matched,
-            element: outcome.value.flatten(),
-            // From before the subscription, not from the poll loop: the agent is told how long the
-            // call took, and the subscribe is part of it.
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            timed_out_by: (!matched).then_some(whose),
+            matched: poll.satisfied,
+            element,
+            elapsed_ms: poll.elapsed_ms,
+            timed_out_by: poll.timed_out_by,
         })
     }
 
@@ -1082,21 +889,15 @@ impl Glass {
 #[cfg(test)]
 mod tests {
     use super::{
-        REREAD_AFTER, callee_wait_expired, compatibility_capture, final_read_pause,
-        needs_callee_timeout_full_capture, offscreen_direction, outer_sequence_expired,
-        prior_scroll_dispatched, quiet_wait_needs_read, reader_relative_caller_bound,
-        scroll_anchor, settle_capture_result, should_reclassify_nested_bound,
-        should_schedule_final_read, soft_callee_capture_timeout,
+        callee_wait_expired, compatibility_capture, needs_callee_timeout_full_capture,
+        offscreen_direction, prior_scroll_dispatched, scroll_anchor, settle_capture_result,
+        soft_callee_capture_timeout,
     };
     use crate::BoundKind;
     use crate::session::test_support::*;
 
     #[test]
     fn wait_deadline_helpers_require_every_provenance_clause() {
-        assert!(should_reclassify_nested_bound(crate::Whose::Callee, false));
-        assert!(!should_reclassify_nested_bound(crate::Whose::Caller, false));
-        assert!(!should_reclassify_nested_bound(crate::Whose::Callee, true));
-
         assert!(callee_wait_expired(true, crate::Whose::Callee, true));
         assert!(!callee_wait_expired(false, crate::Whose::Callee, true));
         assert!(!callee_wait_expired(true, crate::Whose::Caller, true));
@@ -1154,64 +955,8 @@ mod tests {
             crate::Whose::Caller
         ));
 
-        assert!(reader_relative_caller_bound(
-            &GlassError::caller_deadline_elapsed("reader")
-        ));
-        assert!(!reader_relative_caller_bound(&GlassError::Bounded {
-            kind: crate::BoundKind::TimedOut,
-            whose: crate::Whose::Callee,
-            dispatch: crate::BoundDispatch::MayHaveDispatched,
-            message: "reader ceiling".into(),
-        }));
-        assert!(!reader_relative_caller_bound(&GlassError::Backend(
-            "reader failed".into()
-        )));
-
-        assert!(outer_sequence_expired(crate::Whose::Caller, true));
-        assert!(!outer_sequence_expired(crate::Whose::Callee, true));
-        assert!(!outer_sequence_expired(crate::Whose::Caller, false));
-
         assert!(!prior_scroll_dispatched(0));
         assert!(prior_scroll_dispatched(1));
-    }
-
-    #[test]
-    fn final_read_pause_reserves_a_quarter_up_to_the_headroom_cap() {
-        assert_eq!(
-            final_read_pause(Duration::from_millis(80)),
-            Duration::from_millis(60)
-        );
-        assert_eq!(
-            final_read_pause(Duration::from_millis(40)),
-            Duration::from_millis(30)
-        );
-        assert_eq!(
-            final_read_pause(Duration::from_millis(4)),
-            Duration::from_millis(3)
-        );
-    }
-
-    #[test]
-    fn a_quiet_signal_reads_only_for_a_safety_or_periodic_refresh() {
-        assert!(!quiet_wait_needs_read(
-            false,
-            REREAD_AFTER - Duration::from_millis(1)
-        ));
-        assert!(quiet_wait_needs_read(false, REREAD_AFTER));
-        assert!(quiet_wait_needs_read(true, Duration::ZERO));
-    }
-
-    #[test]
-    fn a_final_safety_read_is_scheduled_once_when_the_interval_reaches_the_deadline() {
-        let interval = Duration::from_millis(100);
-        assert!(should_schedule_final_read(false, Some(interval), interval));
-        assert!(!should_schedule_final_read(true, Some(interval), interval));
-        assert!(!should_schedule_final_read(false, None, interval));
-        assert!(!should_schedule_final_read(
-            false,
-            Some(interval + Duration::from_millis(1)),
-            interval
-        ));
     }
 
     #[test]

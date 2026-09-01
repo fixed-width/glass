@@ -22,6 +22,7 @@ use crate::platform::{
 use crate::stability::StabilityTracker;
 
 mod a11y;
+mod a11y_poll;
 mod baseline;
 mod capture;
 mod clipboard;
