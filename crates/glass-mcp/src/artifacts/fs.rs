@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+const MAX_OWNED_DIRECTORY_ENTRIES: usize = 16 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ArtifactError {
     CacheRootUnavailable,
@@ -707,8 +709,14 @@ impl ArtifactStore {
                 return Ok(());
             };
             let filename = path.file_name().ok_or(ArtifactError::InvalidOutputState)?;
+            #[cfg(windows)]
+            let retained = glass_windows::open_file_child(process_handle, filename)
+                .map_err(map_host_cleanup)?;
             fire_fs_test_hook(TestHookPoint::BeforeEvictionRemove);
+            #[cfg(unix)]
             remove_regular_file_from_handle(process_handle, &state.process_dir, filename)?;
+            #[cfg(windows)]
+            glass_windows::remove_by_handle(&retained).map_err(map_host_cleanup)?;
             state.entries.remove(&id);
         }
     }
@@ -801,10 +809,13 @@ impl ArtifactStore {
                 .ok_or(ArtifactError::InvalidOutputState)?
                 .try_clone()
                 .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+            #[cfg(unix)]
+            let server_id = state.server_id.clone();
             fire_fs_test_hook(TestHookPoint::BeforeLeaseRemove);
             #[cfg(unix)]
             let result = remove_locked_lease_for_shutdown(
                 &root_handle,
+                &server_id,
                 &lease_name,
                 &lease,
                 &mut state.lease_quarantine,
@@ -1211,14 +1222,20 @@ fn handle_directory_entries(handle: &File) -> Result<Vec<OsString>, ArtifactErro
     let directory = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
     #[cfg(not(target_os = "linux"))]
     let directory = PathBuf::from(format!("/dev/fd/{}", handle.as_raw_fd()));
-    fs::read_dir(directory)
-        .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?
-        .map(|entry| {
+    let mut entries = Vec::new();
+    for entry in
+        fs::read_dir(directory).map_err(|error| ArtifactError::CleanupFailed(error.kind()))?
+    {
+        if entries.len() == MAX_OWNED_DIRECTORY_ENTRIES {
+            return Err(ArtifactError::InvalidOutputState);
+        }
+        entries.push(
             entry
-                .map(|entry| entry.file_name())
-                .map_err(|error| ArtifactError::CleanupFailed(error.kind()))
-        })
-        .collect()
+                .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?
+                .file_name(),
+        );
+    }
+    Ok(entries)
 }
 
 #[cfg(unix)]
@@ -1340,20 +1357,19 @@ fn process_file_bytes_from_handle(handle: &File, _path: &Path) -> Result<u64, Ar
 
 #[cfg(windows)]
 fn remove_owned_contents_from_handle(handle: &File, _path: &Path) -> Result<(), ArtifactError> {
-    let entries = glass_windows::directory_entry_names(handle).map_err(map_host_cleanup)?;
+    let entries = glass_windows::directory_entry_handles(handle).map_err(map_host_cleanup)?;
     fire_fs_test_hook(TestHookPoint::AfterCleanupEnumeration);
-    for name in entries {
-        match glass_windows::open_directory_beneath(handle, &name) {
-            Ok(child) => {
-                remove_owned_contents_from_handle(&child, Path::new("."))?;
-                fire_fs_test_hook(TestHookPoint::BeforeCleanupRemove);
-                glass_windows::remove_by_handle(&child).map_err(map_host_cleanup)?;
-            }
-            Err(_) => {
-                let child =
-                    glass_windows::open_entry_child(handle, &name).map_err(map_host_cleanup)?;
-                glass_windows::remove_by_handle(&child).map_err(map_host_cleanup)?;
-            }
+    for entry in entries {
+        let metadata = entry
+            .file
+            .metadata()
+            .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+        if metadata.is_dir() && !is_reparse_point(&metadata) {
+            remove_owned_contents_from_handle(&entry.file, Path::new("."))?;
+            fire_fs_test_hook(TestHookPoint::BeforeCleanupRemove);
+            glass_windows::remove_by_handle(&entry.file).map_err(map_host_cleanup)?;
+        } else {
+            glass_windows::remove_by_handle(&entry.file).map_err(map_host_cleanup)?;
         }
     }
     Ok(())
@@ -1392,21 +1408,20 @@ fn remove_regular_file_from_handle(
 #[cfg(windows)]
 fn process_file_bytes_from_handle(handle: &File, _path: &Path) -> Result<u64, ArtifactError> {
     let mut total = 0_u64;
-    let entries = glass_windows::directory_entry_names(handle).map_err(map_host_cleanup)?;
+    let entries = glass_windows::directory_entry_handles(handle).map_err(map_host_cleanup)?;
     fire_fs_test_hook(TestHookPoint::AfterAccountingEnumeration);
-    for name in entries {
-        if let Ok(child) = glass_windows::open_directory_beneath(handle, &name) {
+    for entry in entries {
+        let metadata = entry
+            .file
+            .metadata()
+            .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+        if metadata.is_dir() && !is_reparse_point(&metadata) {
             total = total
-                .checked_add(process_file_bytes_from_handle(&child, Path::new("."))?)
+                .checked_add(process_file_bytes_from_handle(&entry.file, Path::new("."))?)
                 .ok_or(ArtifactError::InvalidOutputState)?;
-        } else if let Ok(child) = glass_windows::open_file_child(handle, &name) {
+        } else if metadata.is_file() && !is_reparse_point(&metadata) {
             total = total
-                .checked_add(
-                    child
-                        .metadata()
-                        .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?
-                        .len(),
-                )
+                .checked_add(metadata.len())
                 .ok_or(ArtifactError::InvalidOutputState)?;
         }
     }
@@ -1431,6 +1446,61 @@ fn scavenge_root_from_handle(
 ) -> Result<(), ArtifactError> {
     let entries = handle_directory_entries(root_handle)?;
     fire_fs_test_hook(TestHookPoint::AfterScavengeEnumeration);
+    let mut quarantines: HashMap<&str, Vec<&OsStr>> = HashMap::new();
+    for name in &entries {
+        let Some(text) = name.to_str() else {
+            continue;
+        };
+        if let Some(id) = exact_quarantine_id(text) {
+            let candidates = quarantines.entry(id).or_default();
+            if candidates.len() < 2 {
+                candidates.push(name);
+            }
+        }
+    }
+    for (id, candidates) in quarantines {
+        if candidates.len() != 1 {
+            continue;
+        }
+        let canonical = OsString::from(format!("server-{id}.lease"));
+        match rustix::fs::statat(
+            root_handle,
+            Path::new(&canonical),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(_) => continue,
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(_) => continue,
+        }
+        let quarantine = candidates[0];
+        let Ok(fd) = rustix::fs::openat(
+            root_handle,
+            Path::new(quarantine),
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        ) else {
+            continue;
+        };
+        let lease = File::from(fd);
+        if !lease.metadata().is_ok_and(|metadata| metadata.is_file())
+            || FileExt::try_lock(&lease).is_err()
+        {
+            continue;
+        }
+        let process_name = OsString::from(format!("server-{id}"));
+        if let Ok(process) = open_directory_from_handle(root_handle, &process_name) {
+            if remove_owned_contents_from_handle(&process, Path::new(".")).is_err() {
+                continue;
+            }
+            drop(process);
+            if remove_directory_from_handle(root_handle, root, &process_name).is_err() {
+                continue;
+            }
+        }
+        if relative_file_matches_handle(root_handle, quarantine, &lease) {
+            remove_non_directory_from_handle(root_handle, root, quarantine)?;
+        }
+    }
     for name in entries {
         let Some(name_text) = name.to_str() else {
             continue;
@@ -1469,7 +1539,7 @@ fn scavenge_root_from_handle(
         if remove_directory_from_handle(root_handle, root, &name).is_err() {
             continue;
         }
-        remove_locked_lease_from_handle(root_handle, root, &lease_name, &lease)?;
+        remove_locked_lease_from_handle(root_handle, id, root, &lease_name, &lease)?;
         drop(lease);
     }
     Ok(())
@@ -1497,17 +1567,21 @@ fn relative_file_matches_handle(parent: &File, name: &OsStr, retained: &File) ->
 #[cfg(unix)]
 fn remove_locked_lease_from_handle(
     parent: &File,
+    server_id: &str,
     _path: &Path,
     name: &OsStr,
     retained: &File,
 ) -> Result<(), ArtifactError> {
     let mut quarantine = None;
-    remove_locked_lease_for_shutdown(parent, name, retained, &mut quarantine, || {})
+    remove_locked_lease_for_shutdown(parent, server_id, name, retained, &mut quarantine, || {
+        fire_fs_test_hook(TestHookPoint::AfterLeaseQuarantine);
+    })
 }
 
 #[cfg(unix)]
 fn remove_locked_lease_for_shutdown(
     parent: &File,
+    server_id: &str,
     name: &OsStr,
     retained: &File,
     quarantine: &mut Option<OsString>,
@@ -1519,7 +1593,7 @@ fn remove_locked_lease_for_shutdown(
                 std::io::ErrorKind::InvalidInput,
             ));
         }
-        let candidate = OsString::from(format!(".lease-cleanup-{}", random_id()));
+        let candidate = OsString::from(format!("server-{server_id}.lease-cleanup-{}", random_id()));
         rustix::fs::renameat(parent, Path::new(name), parent, Path::new(&candidate))
             .map_err(|error| ArtifactError::CleanupFailed(std::io::Error::from(error).kind()))?;
         *quarantine = Some(candidate);
@@ -1578,10 +1652,10 @@ fn scavenge_root_from_handle(
     root_handle: &File,
     lease_open_fault: Option<&Path>,
 ) -> Result<(), ArtifactError> {
-    let entries = glass_windows::directory_entry_names(root_handle).map_err(map_host_cleanup)?;
+    let entries = glass_windows::directory_entry_handles(root_handle).map_err(map_host_cleanup)?;
     fire_fs_test_hook(TestHookPoint::AfterScavengeEnumeration);
-    for name in entries {
-        let Some(name_text) = name.to_str() else {
+    for process in &entries {
+        let Some(name_text) = process.name.to_str() else {
             continue;
         };
         let Some(id) = exact_server_id(name_text) else {
@@ -1591,24 +1665,34 @@ fn scavenge_root_from_handle(
         if lease_open_fault == Some(root.join(&lease_name).as_path()) {
             continue;
         }
-        let Ok(process_handle) = glass_windows::open_directory_beneath(root_handle, &name) else {
+        if !process
+            .file
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_dir() && !is_reparse_point(&metadata))
+        {
+            continue;
+        }
+        let Some(lease) = entries.iter().find(|entry| entry.name == lease_name) else {
             continue;
         };
-        let Ok(lease) = glass_windows::open_file_child(root_handle, &lease_name) else {
+        if !lease
+            .file
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && !is_reparse_point(&metadata))
+        {
             continue;
-        };
-        match FileExt::try_lock(&lease) {
+        }
+        match FileExt::try_lock(&lease.file) {
             Ok(()) => {}
             Err(fs4::TryLockError::WouldBlock | fs4::TryLockError::Error(_)) => continue,
         }
-        if remove_owned_contents_from_handle(&process_handle, Path::new(".")).is_err() {
+        if remove_owned_contents_from_handle(&process.file, Path::new(".")).is_err() {
             continue;
         }
-        if glass_windows::remove_by_handle(&process_handle).is_err() {
+        if glass_windows::remove_by_handle(&process.file).is_err() {
             continue;
         }
-        glass_windows::remove_by_handle(&lease).map_err(map_host_cleanup)?;
-        drop(lease);
+        glass_windows::remove_by_handle(&lease.file).map_err(map_host_cleanup)?;
     }
     Ok(())
 }
@@ -1618,6 +1702,18 @@ fn exact_server_id(name: &str) -> Option<&str> {
     (id.len() == 32
         && id
             .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(id)
+}
+
+fn exact_quarantine_id(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("server-")?;
+    let (id, nonce) = rest.split_once(".lease-cleanup-")?;
+    (id.len() == 32
+        && nonce.len() == 32
+        && id
+            .bytes()
+            .chain(nonce.bytes())
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
     .then_some(id)
 }

@@ -335,16 +335,13 @@ fn scavenger_unlinks_nested_symlink_without_touching_its_target() {
 
 #[cfg(windows)]
 #[test]
-fn scavenger_does_not_follow_directory_reparse_candidate() {
-    use std::os::windows::fs::symlink_dir;
-
+fn scavenger_preserves_a_non_directory_process_candidate() {
     let root = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
     let link = root.path().join("server-55555555555555555555555555555555");
     let lease = root
         .path()
         .join("server-55555555555555555555555555555555.lease");
-    symlink_dir(outside.path(), &link).unwrap();
+    fs::write(&link, "uncertain").unwrap();
     fs::File::create(&lease).unwrap();
 
     ArtifactStore::scavenge_for_test(root.path()).unwrap();
@@ -485,8 +482,6 @@ fn retention_and_shutdown_do_not_follow_a_replaced_process_path() {
 fn accounting_does_not_follow_a_nested_directory_substituted_after_enumeration() {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
-    #[cfg(windows)]
-    use std::os::windows::fs::symlink_dir as symlink;
 
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -495,17 +490,33 @@ fn accounting_does_not_follow_a_nested_directory_substituted_after_enumeration()
     let store = ArtifactStore::for_test(root.path(), 8192).unwrap();
     let nested = store.process_dir().join("nested");
     let detached = root.path().join("detached-nested");
+    #[cfg(windows)]
+    let windows_replacement = root.path().join("accounting-replacement");
+    #[cfg(windows)]
+    {
+        fs::create_dir(&windows_replacement).unwrap();
+        fs::write(windows_replacement.join("sentinel"), vec![0_u8; 4096]).unwrap();
+    }
     fs::create_dir(&nested).unwrap();
     fs::write(nested.join("owned"), "owned").unwrap();
     let replacement = nested.clone();
+    #[cfg(unix)]
     let outside_path = outside.path().to_path_buf();
     set_fs_test_hook(TestHookPoint::AfterAccountingEnumeration, move || {
         fs::rename(&replacement, &detached).unwrap();
+        #[cfg(unix)]
         symlink(outside_path, replacement).unwrap();
+        #[cfg(windows)]
+        fs::rename(windows_replacement, replacement).unwrap();
     });
 
+    #[cfg(unix)]
     assert_eq!(store.total_file_bytes().unwrap(), 0);
+    #[cfg(windows)]
+    assert_eq!(store.total_file_bytes().unwrap(), 5);
     assert_eq!(fs::metadata(&sentinel).unwrap().len(), 4096);
+    #[cfg(windows)]
+    assert_eq!(fs::metadata(nested.join("sentinel")).unwrap().len(), 4096);
 }
 
 #[cfg(any(unix, windows))]
@@ -513,8 +524,6 @@ fn accounting_does_not_follow_a_nested_directory_substituted_after_enumeration()
 fn eviction_does_not_unlink_a_substitution_made_before_removal() {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
-    #[cfg(windows)]
-    use std::os::windows::fs::symlink_file as symlink;
 
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -534,13 +543,19 @@ fn eviction_does_not_unlink_a_substitution_made_before_removal() {
     let target = sentinel.clone();
     set_fs_test_hook(TestHookPoint::BeforeEvictionRemove, move || {
         fs::rename(&replacement, &detached_for_hook).unwrap();
+        #[cfg(unix)]
         symlink(target, replacement).unwrap();
+        #[cfg(windows)]
+        fs::hard_link(target, replacement).unwrap();
     });
 
     drop(batch);
 
     assert_eq!(fs::read_to_string(sentinel).unwrap(), "outside");
+    #[cfg(unix)]
     assert_eq!(fs::read_to_string(detached).unwrap(), "artifact");
+    #[cfg(windows)]
+    assert!(!detached.exists());
 }
 
 #[cfg(any(unix, windows))]
@@ -548,8 +563,6 @@ fn eviction_does_not_unlink_a_substitution_made_before_removal() {
 fn shutdown_does_not_follow_a_nested_substitution_after_enumeration() {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
-    #[cfg(windows)]
-    use std::os::windows::fs::symlink_dir as symlink;
 
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -559,19 +572,39 @@ fn shutdown_does_not_follow_a_nested_substitution_after_enumeration() {
     let nested = store.process_dir().join("nested");
     let detached = root.path().join("detached-cleanup");
     let detached_for_hook = detached.clone();
+    #[cfg(windows)]
+    let windows_replacement = root.path().join("shutdown-replacement");
+    #[cfg(windows)]
+    {
+        fs::create_dir(&windows_replacement).unwrap();
+        fs::write(windows_replacement.join("sentinel"), "outside").unwrap();
+    }
     fs::create_dir(&nested).unwrap();
     fs::write(nested.join("owned"), "owned").unwrap();
     let replacement = nested.clone();
+    #[cfg(unix)]
     let outside_path = outside.path().to_path_buf();
     set_fs_test_hook(TestHookPoint::AfterCleanupEnumeration, move || {
         fs::rename(&replacement, &detached_for_hook).unwrap();
+        #[cfg(unix)]
         symlink(outside_path, replacement).unwrap();
+        #[cfg(windows)]
+        fs::rename(windows_replacement, replacement).unwrap();
     });
 
+    #[cfg(unix)]
     store.shutdown().unwrap();
+    #[cfg(windows)]
+    assert!(store.shutdown().is_err());
 
     assert_eq!(fs::read_to_string(sentinel).unwrap(), "outside");
+    #[cfg(unix)]
     assert_eq!(fs::read_to_string(detached.join("owned")).unwrap(), "owned");
+    #[cfg(windows)]
+    assert_eq!(
+        fs::read_to_string(nested.join("sentinel")).unwrap(),
+        "outside"
+    );
 }
 
 #[cfg(any(unix, windows))]
@@ -579,8 +612,6 @@ fn shutdown_does_not_follow_a_nested_substitution_after_enumeration() {
 fn scavenging_does_not_open_a_process_directory_substituted_after_enumeration() {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
-    #[cfg(windows)]
-    use std::os::windows::fs::symlink_dir as symlink;
 
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -590,20 +621,39 @@ fn scavenging_does_not_open_a_process_directory_substituted_after_enumeration() 
     let process = root.path().join(format!("server-{id}"));
     let detached = root.path().join("detached-stale");
     let lease = root.path().join(format!("server-{id}.lease"));
+    #[cfg(windows)]
+    let windows_replacement = root.path().join("scavenge-replacement");
+    #[cfg(windows)]
+    {
+        fs::create_dir(&windows_replacement).unwrap();
+        fs::write(windows_replacement.join("sentinel"), "outside").unwrap();
+    }
     fs::create_dir(&process).unwrap();
     fs::write(process.join("owned"), "owned").unwrap();
     fs::write(&lease, "").unwrap();
     let replacement = process.clone();
+    #[cfg(unix)]
     let outside_path = outside.path().to_path_buf();
     set_fs_test_hook(TestHookPoint::AfterScavengeEnumeration, move || {
         fs::rename(&replacement, &detached).unwrap();
+        #[cfg(unix)]
         symlink(outside_path, replacement).unwrap();
+        #[cfg(windows)]
+        fs::rename(windows_replacement, replacement).unwrap();
     });
 
     let current = ArtifactStore::for_test(root.path(), 1024).unwrap();
 
     assert_eq!(fs::read_to_string(sentinel).unwrap(), "outside");
+    #[cfg(unix)]
     assert!(lease.exists());
+    #[cfg(windows)]
+    assert!(!lease.exists());
+    #[cfg(windows)]
+    assert_eq!(
+        fs::read_to_string(process.join("sentinel")).unwrap(),
+        "outside"
+    );
     drop(current);
 }
 
@@ -639,6 +689,149 @@ fn shutdown_quarantine_never_overwrites_a_replacement_created_mid_cleanup() {
     fs::remove_file(&lease).unwrap();
     store.shutdown().unwrap();
     assert_eq!(store.lease_quarantine_count_for_test(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovers_a_shutdown_quarantine_after_process_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let lease = store.lease_path();
+    let replacement = lease.clone();
+    store.set_test_hook(TestHookPoint::AfterLeaseQuarantine, move || {
+        fs::write(&replacement, "replacement").unwrap();
+    });
+    assert!(store.shutdown().is_err());
+    drop(store);
+    fs::remove_file(&lease).unwrap();
+
+    let next = ArtifactStore::for_test(root.path(), 1024).unwrap();
+
+    let cleanup_entries = fs::read_dir(root.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("lease-cleanup")
+        })
+        .count();
+    assert_eq!(cleanup_entries, 0);
+    drop(next);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovers_strict_quarantine_with_stale_process_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let process = root.path().join(format!("server-{id}"));
+    let quarantine = root.path().join(format!(
+        "server-{id}.lease-cleanup-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ));
+    fs::create_dir(&process).unwrap();
+    fs::write(process.join("residue"), "owned").unwrap();
+    fs::write(&quarantine, "").unwrap();
+
+    let next = ArtifactStore::for_test(root.path(), 1024).unwrap();
+
+    assert!(!process.exists());
+    assert!(!quarantine.exists());
+    drop(next);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_preserves_an_obstructed_quarantine_until_a_later_pass() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let canonical = root.path().join(format!("server-{id}.lease"));
+    let quarantine = root.path().join(format!(
+        "server-{id}.lease-cleanup-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ));
+    fs::write(&canonical, "replacement").unwrap();
+    fs::write(&quarantine, "quarantined").unwrap();
+
+    let first = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    assert_eq!(fs::read_to_string(&canonical).unwrap(), "replacement");
+    assert_eq!(fs::read_to_string(&quarantine).unwrap(), "quarantined");
+    drop(first);
+
+    fs::remove_file(&canonical).unwrap();
+    let second = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    assert!(!quarantine.exists());
+    drop(second);
+}
+
+#[cfg(unix)]
+#[test]
+fn scavenger_quarantine_remains_recoverable_after_a_mid_cleanup_replacement() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let process = root.path().join(format!("server-{id}"));
+    let canonical = root.path().join(format!("server-{id}.lease"));
+    fs::create_dir(&process).unwrap();
+    fs::write(process.join("residue"), "owned").unwrap();
+    fs::write(&canonical, "stale").unwrap();
+    let replacement = canonical.clone();
+    set_fs_test_hook(TestHookPoint::AfterLeaseQuarantine, move || {
+        fs::write(replacement, "replacement").unwrap();
+    });
+
+    assert!(ArtifactStore::for_test(root.path(), 1024).is_err());
+    assert_eq!(fs::read_to_string(&canonical).unwrap(), "replacement");
+    assert_eq!(
+        fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains("lease-cleanup"))
+            .count(),
+        1
+    );
+
+    fs::remove_file(&canonical).unwrap();
+    let next = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    assert!(!process.exists());
+    assert_eq!(
+        fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains("lease-cleanup"))
+            .count(),
+        0
+    );
+    drop(next);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_preserves_obstructed_multiple_and_malformed_quarantines() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let first = root.path().join(format!(
+        "server-{id}.lease-cleanup-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ));
+    let second = root.path().join(format!(
+        "server-{id}.lease-cleanup-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ));
+    let malformed = root.path().join("server-bad.lease-cleanup-not-owned");
+    fs::write(&first, "first").unwrap();
+    fs::write(&second, "second").unwrap();
+    fs::write(&malformed, "malformed").unwrap();
+
+    let next = ArtifactStore::for_test(root.path(), 1024).unwrap();
+
+    assert_eq!(fs::read_to_string(first).unwrap(), "first");
+    assert_eq!(fs::read_to_string(second).unwrap(), "second");
+    assert_eq!(fs::read_to_string(malformed).unwrap(), "malformed");
+    drop(next);
 }
 
 #[cfg(unix)]
@@ -734,15 +927,13 @@ fn shutdown_unlinks_symlink_without_touching_its_target() {
 
 #[cfg(windows)]
 #[test]
-fn shutdown_unlinks_directory_reparse_without_touching_its_target() {
-    use std::os::windows::fs::symlink_dir;
-
+fn shutdown_unlinks_a_hard_link_without_touching_its_other_name() {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let sentinel = outside.path().join("sentinel");
     fs::write(&sentinel, "keep").unwrap();
     let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
-    symlink_dir(outside.path(), store.process_dir().join("link")).unwrap();
+    fs::hard_link(&sentinel, store.process_dir().join("link")).unwrap();
 
     store.shutdown().unwrap();
 
@@ -1044,9 +1235,7 @@ fn lease_cleanup_failure_overrides_initialization_error() {
 
 #[cfg(windows)]
 #[test]
-fn replacing_process_directory_with_reparse_target_cannot_redirect_read() {
-    use std::os::windows::fs::symlink_dir;
-
+fn replacing_process_directory_cannot_redirect_read() {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let sentinel = outside.path().join("sentinel");
@@ -1056,10 +1245,10 @@ fn replacing_process_directory_with_reparse_target_cannot_redirect_read() {
         .publish(vec![store.prepare(draft("known")).unwrap()])
         .unwrap();
     let descriptor = &published.descriptors()[0];
+    let replacement = root.path().join("replacement-process-dir");
+    fs::create_dir(&replacement).unwrap();
     fs::write(
-        outside
-            .path()
-            .join(descriptor.local_path().file_name().unwrap()),
+        replacement.join(descriptor.local_path().file_name().unwrap()),
         "known",
     )
     .unwrap();
@@ -1068,7 +1257,7 @@ fn replacing_process_directory_with_reparse_target_cannot_redirect_read() {
         root.path().join("detached-process-dir"),
     )
     .unwrap();
-    symlink_dir(outside.path(), store.process_dir()).unwrap();
+    fs::rename(replacement, store.process_dir()).unwrap();
 
     assert_eq!(
         store.read(descriptor.uri()).unwrap_err(),
@@ -1079,9 +1268,7 @@ fn replacing_process_directory_with_reparse_target_cannot_redirect_read() {
 
 #[cfg(windows)]
 #[test]
-fn replacing_root_ancestor_with_reparse_target_cannot_redirect_read() {
-    use std::os::windows::fs::symlink_dir;
-
+fn replacing_root_ancestor_cannot_redirect_read() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("root");
     fs::create_dir(&root).unwrap();
@@ -1094,11 +1281,12 @@ fn replacing_root_ancestor_with_reparse_target_cannot_redirect_read() {
         .unwrap();
     let descriptor = &published.descriptors()[0];
     let relative = descriptor.local_path().strip_prefix(&root).unwrap();
-    let redirected = outside.path().join(relative);
+    let replacement_root = parent.path().join("replacement-root");
+    let redirected = replacement_root.join(relative);
     fs::create_dir_all(redirected.parent().unwrap()).unwrap();
     fs::write(&redirected, "known").unwrap();
     fs::rename(&root, parent.path().join("detached-root")).unwrap();
-    symlink_dir(outside.path(), &root).unwrap();
+    fs::rename(replacement_root, &root).unwrap();
 
     assert_eq!(
         store.read(descriptor.uri()).unwrap_err(),

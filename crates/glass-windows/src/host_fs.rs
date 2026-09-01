@@ -35,11 +35,17 @@ use windows::core::{PCWSTR, PWSTR};
 const PRIVATE_DACL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)";
 const DIRECTORY_QUERY_BYTES: usize = 64 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 16 * 1024;
+const MAX_DIRECTORY_NAME_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostFsError {
     Open,
     Integrity,
+}
+
+pub struct DirectoryEntryHandle {
+    pub name: std::ffi::OsString,
+    pub file: File,
 }
 
 /// Opens a directory itself, rather than a reparse target, and retains rename-compatible sharing.
@@ -102,6 +108,7 @@ pub fn open_entry_child(directory: &File, filename: &OsStr) -> Result<File, Host
 /// Enumerates names from a retained directory handle without consulting its pathname.
 pub fn directory_entry_names(directory: &File) -> Result<Vec<std::ffi::OsString>, HostFsError> {
     let mut names = Vec::new();
+    let mut name_bytes = 0_usize;
     let mut buffer = vec![0_u8; DIRECTORY_QUERY_BYTES];
     let mut restart = true;
     loop {
@@ -136,8 +143,25 @@ pub fn directory_entry_names(directory: &File) -> Result<Vec<std::ffi::OsString>
             return Err(HostFsError::Integrity);
         }
         let batch = parse_directory_names(&buffer[..used])?;
-        append_directory_batch(&mut names, &batch, MAX_DIRECTORY_ENTRIES)?;
+        append_directory_batch(
+            &mut names,
+            &mut name_bytes,
+            &batch,
+            MAX_DIRECTORY_ENTRIES,
+            MAX_DIRECTORY_NAME_BYTES,
+        )?;
     }
+}
+
+/// Enumerates and opens each exact child before returning, retaining identity across renames.
+pub fn directory_entry_handles(directory: &File) -> Result<Vec<DirectoryEntryHandle>, HostFsError> {
+    directory_entry_names(directory)?
+        .into_iter()
+        .map(|name| {
+            let file = open_entry_child(directory, &name)?;
+            Ok(DirectoryEntryHandle { name, file })
+        })
+        .collect()
 }
 
 /// Marks the exact retained filesystem object for deletion, without reopening a pathname.
@@ -212,38 +236,89 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, HostFsError> {
 }
 
 fn valid_child_name(name: &std::ffi::OsStr) -> bool {
+    let units = name.encode_wide().collect::<Vec<_>>();
+    if units.is_empty()
+        || matches!(units.last(), Some(unit) if *unit == b'.' as u16 || *unit == b' ' as u16)
+        || units.iter().any(|unit| {
+            *unit == 0
+                || (1..=31).contains(unit)
+                || b"/\\:\"<>|?*".contains(&u8::try_from(*unit).unwrap_or_default())
+        })
+        || reserved_dos_basename(&units)
+    {
+        return false;
+    }
     let mut components = Path::new(name).components();
-    matches!(components.next(), Some(Component::Normal(_)))
-        && components.next().is_none()
-        && !name
-            .encode_wide()
-            .any(|unit| unit == 0 || unit == b'/' as u16 || unit == b'\\' as u16)
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn reserved_dos_basename(units: &[u16]) -> bool {
+    let basename = units
+        .split(|unit| *unit == b'.' as u16)
+        .next()
+        .unwrap_or_default();
+    let upper = basename
+        .iter()
+        .map(|unit| u8::try_from(*unit).map_or(*unit, |value| value.to_ascii_uppercase() as u16))
+        .collect::<Vec<_>>();
+    matches!(
+        upper.as_slice(),
+        [67, 79, 78] | [80, 82, 78] | [65, 85, 88] | [78, 85, 76] | [67, 76, 79, 67, 75, 36]
+    ) || matches!(upper.as_slice(), [67, 79, 77, digit] | [76, 80, 84, digit] if windows_device_digit(*digit))
+}
+
+fn windows_device_digit(unit: u16) -> bool {
+    matches!(unit, 0x31..=0x39 | 0x00B9 | 0x00B2 | 0x00B3)
 }
 
 fn append_directory_batch(
     names: &mut Vec<std::ffi::OsString>,
+    name_bytes: &mut usize,
     batch: &[std::ffi::OsString],
-    limit: usize,
+    count_limit: usize,
+    byte_limit: usize,
 ) -> Result<(), HostFsError> {
     if names
         .len()
         .checked_add(batch.len())
-        .is_none_or(|count| count > limit)
+        .is_none_or(|count| count > count_limit)
     {
         return Err(HostFsError::Integrity);
     }
+    let batch_bytes = batch.iter().try_fold(0_usize, |total, name| {
+        let bytes = name
+            .encode_wide()
+            .count()
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or(HostFsError::Integrity)?;
+        total.checked_add(bytes).ok_or(HostFsError::Integrity)
+    })?;
+    *name_bytes = checked_name_byte_total(*name_bytes, batch_bytes, byte_limit)?;
     names.extend(batch.iter().cloned());
     Ok(())
+}
+
+fn checked_name_byte_total(
+    current: usize,
+    additional: usize,
+    limit: usize,
+) -> Result<usize, HostFsError> {
+    current
+        .checked_add(additional)
+        .filter(|total| *total <= limit)
+        .ok_or(HostFsError::Integrity)
 }
 
 #[cfg(test)]
 fn collect_directory_batches_for_test<'a>(
     batches: impl IntoIterator<Item = Result<&'a [std::ffi::OsString], HostFsError>>,
-    limit: usize,
+    count_limit: usize,
+    byte_limit: usize,
 ) -> Result<Vec<std::ffi::OsString>, HostFsError> {
     let mut names = Vec::new();
+    let mut name_bytes = 0;
     for batch in batches {
-        append_directory_batch(&mut names, batch?, limit)?;
+        append_directory_batch(&mut names, &mut name_bytes, batch?, count_limit, byte_limit)?;
     }
     Ok(names)
 }
@@ -260,11 +335,7 @@ fn open_file_beneath_with_hook(
     filename: &OsStr,
     mut hook: impl FnMut(ChildOpenStage) -> Result<(), HostFsError>,
 ) -> Result<File, HostFsError> {
-    let mut components = Path::new(filename).components();
-    if !matches!(components.next(), Some(Component::Normal(_)))
-        || components.next().is_some()
-        || !directory_matches_path(directory, directory_path)?
-    {
+    if !valid_child_name(filename) || !directory_matches_path(directory, directory_path)? {
         return Err(HostFsError::Integrity);
     }
     hook(ChildOpenStage::BeforeOpen)?;
@@ -286,14 +357,10 @@ fn open_relative(
     filename: &OsStr,
     directory_child: Option<bool>,
 ) -> Result<File, HostFsError> {
-    let mut components = Path::new(filename).components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+    if !valid_child_name(filename) {
         return Err(HostFsError::Integrity);
     }
     let mut name = filename.encode_wide().collect::<Vec<_>>();
-    if name.contains(&0) {
-        return Err(HostFsError::Integrity);
-    }
     let byte_len = name
         .len()
         .checked_mul(std::mem::size_of::<u16>())
@@ -581,14 +648,100 @@ mod tests {
         assert_eq!(
             collect_directory_batches_for_test(
                 [Ok(first.as_slice()), Err(HostFsError::Integrity)],
-                8
+                8,
+                1024,
             ),
             Err(HostFsError::Integrity)
         );
         assert_eq!(
-            collect_directory_batches_for_test([Ok(first.as_slice())], 0),
+            collect_directory_batches_for_test([Ok(first.as_slice())], 0, 1024),
             Err(HostFsError::Integrity)
         );
+    }
+
+    #[test]
+    fn enumeration_byte_budget_is_cumulative_across_batches() {
+        let first = [std::ffi::OsString::from("aa")];
+        let second = [std::ffi::OsString::from("bb")];
+        assert!(collect_directory_batches_for_test(
+            [Ok(first.as_slice()), Ok(second.as_slice())],
+            8,
+            8,
+        )
+        .is_ok());
+        assert_eq!(
+            collect_directory_batches_for_test([Ok(first.as_slice()), Ok(second.as_slice())], 8, 7,),
+            Err(HostFsError::Integrity)
+        );
+    }
+
+    #[test]
+    fn enumeration_byte_budget_checks_exact_boundary_and_overflow() {
+        let names = [std::ffi::OsString::from("abc")];
+        assert!(collect_directory_batches_for_test([Ok(names.as_slice())], 1, 6).is_ok());
+        assert_eq!(
+            collect_directory_batches_for_test([Ok(names.as_slice())], 1, 5),
+            Err(HostFsError::Integrity)
+        );
+        assert_eq!(
+            checked_name_byte_total(usize::MAX, 2, usize::MAX),
+            Err(HostFsError::Integrity)
+        );
+    }
+
+    #[test]
+    fn child_name_validation_rejects_windows_special_forms() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a:b",
+            "C:",
+            "a\0b",
+            "a\u{1}b",
+            "a\"b",
+            "a<b",
+            "a>b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "trail.",
+            "trail ",
+            "CON",
+            "con.txt",
+            "PRN.log",
+            "AUX",
+            "NUL.bin",
+            "CLOCK$",
+            "COM1",
+            "com9.txt",
+            "LPT1",
+            "lpt9.x",
+            "COM¹",
+            "com².txt",
+            "LPT³.log",
+        ] {
+            assert!(!valid_child_name(OsStr::new(name)), "accepted {name:?}");
+        }
+    }
+
+    #[test]
+    fn child_name_validation_accepts_lossless_unusual_names() {
+        for name in [
+            "normal",
+            "résumé",
+            "雪",
+            "COM10",
+            "LPT0",
+            "name..middle",
+            " leading",
+        ] {
+            assert!(valid_child_name(OsStr::new(name)), "rejected {name:?}");
+        }
+        let unpaired = std::ffi::OsString::from_wide(&[0xD800, b'x' as u16]);
+        assert!(valid_child_name(&unpaired));
     }
 
     #[test]
