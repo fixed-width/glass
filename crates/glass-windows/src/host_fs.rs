@@ -767,8 +767,7 @@ fn descriptor_has_private_dacl(bytes: &[u8]) -> bool {
         return false;
     };
     let descriptor = PSECURITY_DESCRIPTOR(bytes.as_ptr().cast_mut().cast());
-    // SAFETY: The descriptor base is DWORD-aligned.
-    // SAFETY: Every component is aligned, disjoint, and bounded within `bytes`.
+    // SAFETY: The DWORD-aligned descriptor has locally validated aligned, disjoint, bounded components.
     if !unsafe { IsValidSecurityDescriptor(descriptor).as_bool() } {
         return false;
     }
@@ -777,8 +776,7 @@ fn descriptor_has_private_dacl(bytes: &[u8]) -> bool {
     let mut present = windows::core::BOOL::default();
     let mut defaulted = windows::core::BOOL::default();
     let mut dacl = std::ptr::null_mut::<ACL>();
-    // SAFETY: Win32 validated the locally bounded descriptor.
-    // SAFETY: Every output pointer is valid for the call.
+    // SAFETY: Win32 validated the locally bounded descriptor and every output pointer is valid.
     let valid_descriptor = unsafe {
         GetSecurityDescriptorControl(descriptor, &mut control, &mut revision).is_ok()
             && GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
@@ -793,8 +791,7 @@ fn descriptor_has_private_dacl(bytes: &[u8]) -> bool {
         || control & SE_DACL_PROTECTED.0 == 0
         || dacl.is_null()
         || dacl.cast_const().cast::<u8>() != bounded_dacl
-        // SAFETY: The DACL pointer is DWORD-aligned and bounded within `bytes`.
-        // SAFETY: Its complete ACE sequence was locally validated.
+        // SAFETY: The DWORD-aligned DACL and its complete ACE sequence are locally bounded and validated.
         || !unsafe { IsValidAcl(dacl).as_bool() }
     {
         return false;
@@ -812,9 +809,7 @@ fn descriptor_has_private_dacl(bytes: &[u8]) -> bool {
     };
     for index in 0..u32::from(ace_count) {
         let mut raw_ace = std::ptr::null_mut();
-        // SAFETY: IsValidAcl succeeded for the locally bounded DACL.
-        // SAFETY: `index` is below its locally parsed ACE count.
-        // SAFETY: `raw_ace` is a valid writable output pointer.
+        // SAFETY: The locally bounded DACL is validated, `index` is locally parsed, and `raw_ace` is writable.
         if unsafe { GetAce(dacl, index, &mut raw_ace) }.is_err() || raw_ace.is_null() {
             return false;
         }
@@ -864,8 +859,7 @@ fn descriptor_has_private_dacl(bytes: &[u8]) -> bool {
             return false;
         };
         let sid = PSID(bytes[sid_start..].as_ptr().cast_mut().cast());
-        // SAFETY: The complete SID representation is bounded within this ACE.
-        // SAFETY: The SID pointer is DWORD-aligned.
+        // SAFETY: The complete DWORD-aligned SID is bounded within this ACE.
         if mask != FILE_ALL_ACCESS.0 || !unsafe { IsValidSid(sid).as_bool() } {
             return false;
         }

@@ -44,13 +44,7 @@ use crate::command::{LogSink, build_sway_command_with_status, sway_config};
 use crate::input::evdev_button;
 use crate::swayipc::{Ipc, Window as SwayWindow};
 
-// glass-mcp gives the whole of teardown `glass_core::TEARDOWN_BUDGET` and then exits regardless, on a
-// `spawn_blocking` thread that cannot be cancelled — so an ask-then-signal ladder that fills the
-// budget would never get to the signal, and sway (plus Xwayland and the app) would outlive glass.
-//
-// This binds the ladder only. The a11y bus teardown that follows it in the same budget still
-// reaps at `REAP_GRACE`, so a helper that ignores SIGTERM can take the whole teardown past the
-// budget; that is pre-existing and not what this assertion is about.
+// Keep the close-request and signal ladder within the non-cancellable teardown budget.
 const _: () = assert!(
     CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis() < TEARDOWN_BUDGET.as_millis(),
     "the close request + compositor reap must finish inside glass_core::TEARDOWN_BUDGET"

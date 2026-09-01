@@ -38,17 +38,7 @@ fn output_resolution() -> (u32, u32) {
         .unwrap_or((OUTPUT_WIDTH, OUTPUT_HEIGHT))
 }
 
-/// Render a minimal per-session sway config as exact Unix bytes: one headless output sized by
-/// [`output_resolution`],
-/// no window borders, every window floating (so toplevels keep their natural size
-/// for true per-window capture/geometry), and an `exec` that launches the target
-/// app. `spec.run` args are shell-quoted because sway runs `exec` through
-/// `/bin/sh -c`.
-///
-/// When `spec.sandbox` is not `Off`, the `exec` argv is wrapped in a `bwrap`
-/// invocation so the launched process runs in a sandboxed user namespace. The
-/// Wayland socket dir (`runtime_dir`) is re-exposed read-write inside the
-/// namespace so the app can still connect to sway.
+/// Renders a per-session sway config with a headless output and target `exec`.
 pub fn sway_config(
     spec: &AppSpec,
     runtime_dir: &Path,
@@ -61,12 +51,7 @@ pub fn sway_config(
         level => {
             let prog = OsString::from(&spec.run[0]);
             let args: Vec<OsString> = spec.run[1..].iter().map(OsString::from).collect();
-            // Default the working directory to glass's own cwd when the spec sets none, so a
-            // contained launch with no `cwd` still gets `--chdir` + a guarded rw bind of that
-            // directory and any relative launch token resolves against it. Computed ONCE and
-            // shared by both consumers verbatim. If `current_dir()` fails, both see `None` —
-            // no `--chdir`/bind, and relative tokens are skipped rather than resolved against
-            // a wrong root.
+            // Compute the fallback cwd once so contained launch paths share one resolution root.
             let effective_cwd = spec.cwd.clone().or_else(|| {
                 std::env::current_dir()
                     .inspect_err(|e| {

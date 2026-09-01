@@ -22,14 +22,7 @@ use glass_core::{
 use glass_exec_unix::{Resolved, resolve_bin, resolve_on_path_in};
 use glass_sandbox_unix::{abs_token, canon, dir_of};
 
-/// App-level environment that makes GUI toolkits present frames without X11 MIT-SHM. glass's
-/// containment breaks shared-memory rendering on the headless display: `wrap_argv` passes
-/// `--unshare-ipc`, which isolates the SysV IPC namespace so MIT-SHM can't attach to the
-/// out-of-sandbox X server. That is the operative cause — GTK4's GL renderer, and even the Mesa
-/// software (llvmpipe) path it falls back to once `--dev /dev` also withholds `/dev/dri`, both need
-/// MIT-SHM to present, so the window stays black. These vars pick a renderer that presents via
-/// plain X instead (GTK4's cairo renderer; Qt's non-SHM / software paths); each is a no-op for a
-/// toolkit that does not read it.
+/// Renderer environment for contained X11 apps because `--unshare-ipc` prevents MIT-SHM display access.
 pub const SOFTWARE_RENDER_ENV: &[(&str, &str)] = &[
     ("GSK_RENDERER", "cairo"),        // GTK4
     ("QT_X11_NO_MITSHM", "1"),        // Qt (X11 widgets)
