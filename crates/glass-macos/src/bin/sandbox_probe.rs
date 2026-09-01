@@ -13,6 +13,7 @@
 //! the `cat ... && echo ... || echo ...` shell one-liner this replaces):
 //! - `--print LINE` — write LINE verbatim.
 //! - `--read-env VAR OK FAIL` — write OK if the path named by env var VAR can be read, else FAIL.
+//! - `--protected-reads MARKER_VAR LEASE_VAR` — succeed only when both named files cannot be read.
 //!
 //! `--read-env` takes an env var NAME, not the path itself: `glass-sandbox-macos::
 //! launch_reallows` re-allows any `run[1..]` argv token that is itself an absolute, existing
@@ -53,6 +54,26 @@ fn main() {
                     println!("{fail}");
                 }
                 i += 4;
+            }
+            "--protected-reads" => {
+                let marker_var = args
+                    .get(i + 1)
+                    .expect("sandbox-probe: --protected-reads needs a MARKER_VAR argument");
+                let lease_var = args
+                    .get(i + 2)
+                    .expect("sandbox-probe: --protected-reads needs a LEASE_VAR argument");
+                let Some(marker) = std::env::var_os(marker_var) else {
+                    eprintln!("sandbox-probe: env var {marker_var} is not set");
+                    std::process::exit(2);
+                };
+                let Some(lease) = std::env::var_os(lease_var) else {
+                    eprintln!("sandbox-probe: env var {lease_var} is not set");
+                    std::process::exit(2);
+                };
+                if std::fs::read(marker).is_ok() || std::fs::read(lease).is_ok() {
+                    std::process::exit(1);
+                }
+                i += 3;
             }
             other => panic!("sandbox-probe: unrecognized argument {other:?}"),
         }

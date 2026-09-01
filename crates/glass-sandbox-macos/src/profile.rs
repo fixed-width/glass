@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use glass_core::SandboxLevel;
+use glass_core::{GlassError, ProtectedHostPath, ProtectedHostPathKind, Result, SandboxLevel};
 
 /// Inputs [`build_profile`] needs. `level` is never `Off` (the caller skips containment).
 #[derive(Debug, Clone)]
@@ -33,6 +33,8 @@ pub struct ProfileOpts {
     pub ro_files: Vec<PathBuf>,
     /// Extra paths re-exposed read-write.
     pub rw_binds: Vec<PathBuf>,
+    /// Host paths that the launched target must not read, inspect, or write.
+    pub protected_paths: Vec<ProtectedHostPath>,
     /// When true (an injectable contained target), ALLOW `com.apple.pasteboard.1` so the shim's
     /// private named pasteboard works; when false (hardened/non-injectable), DENY it (the app
     /// can't reach the real pasteboard). Isolation for injectable targets comes from the shim's
@@ -43,8 +45,38 @@ pub struct ProfileOpts {
 /// Scratch/cache roots a typical app writes to (also readable via the whole-FS read allow).
 const SCRATCH_WRITE_ROOTS: &[&str] = &["/private/var/folders", "/private/tmp", "/tmp", "/dev"];
 
+/// Validate protected destinations before target launch or profile construction.
+pub fn validate_protected_paths(paths: &[ProtectedHostPath]) -> Result<()> {
+    for protected in paths {
+        if !protected.path.is_absolute() || protected.path == Path::new("/") {
+            return Err(GlassError::Backend(format!(
+                "protected host path must be absolute and cannot be the filesystem root: {:?}",
+                protected.path
+            )));
+        }
+        sbpl_quote_path(&protected.path)?;
+        let metadata = std::fs::metadata(&protected.path).map_err(|error| {
+            GlassError::Backend(format!(
+                "cannot inspect protected host path {:?}: {error}",
+                protected.path
+            ))
+        })?;
+        let kind_matches = match protected.kind {
+            ProtectedHostPathKind::Directory => metadata.is_dir(),
+            ProtectedHostPathKind::File => metadata.is_file(),
+        };
+        if !kind_matches {
+            return Err(GlassError::Backend(format!(
+                "protected host path has the wrong type: {:?}",
+                protected.path
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Build the deny-default SBPL profile for `level`. Never called with `SandboxLevel::Off`.
-pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
+pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> Result<String> {
     let mut p = String::new();
     p.push_str("(version 1)\n(deny default)\n");
     p.push_str("(allow process-fork)\n(allow process-exec*)\n(allow sysctl-read)\n");
@@ -100,7 +132,51 @@ pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
     if !opts.allow_pasteboard {
         p.push_str("(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))\n");
     }
-    p
+    for protected in &opts.protected_paths {
+        emit_protected_denies(&mut p, protected)?;
+    }
+    Ok(p)
+}
+
+fn emit_protected_denies(out: &mut String, protected: &ProtectedHostPath) -> Result<()> {
+    if !protected.path.is_absolute() || protected.path == Path::new("/") {
+        return Err(GlassError::Backend(format!(
+            "protected host path must be absolute and cannot be the filesystem root: {:?}",
+            protected.path
+        )));
+    }
+    let quoted = sbpl_quote_path(&protected.path)?;
+    out.push_str("(deny file-read* file-read-metadata (literal ");
+    out.push_str(&quoted);
+    out.push(')');
+    if protected.kind == ProtectedHostPathKind::Directory {
+        out.push_str(" (subpath ");
+        out.push_str(&quoted);
+        out.push(')');
+    }
+    out.push_str(")\n(deny file-write* (literal ");
+    out.push_str(&quoted);
+    out.push(')');
+    if protected.kind == ProtectedHostPathKind::Directory {
+        out.push_str(" (subpath ");
+        out.push_str(&quoted);
+        out.push(')');
+    }
+    out.push_str(")\n");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sbpl_quote_path(path: &Path) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::str::from_utf8(path.as_os_str().as_bytes()).map_err(|_| {
+        GlassError::Backend(format!(
+            "protected host path cannot be represented in a Seatbelt profile: {:?}",
+            path
+        ))
+    })?;
+    Ok(sbpl_quote(path))
 }
 
 /// Emit a standalone read-allow statement for `path` (kept separate from the write block so an
@@ -212,6 +288,10 @@ fn sbpl_quote(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
+        build_profile(level, opts).unwrap()
+    }
+
     fn opts() -> ProfileOpts {
         ProfileOpts {
             cwd: PathBuf::from("/work/project"),
@@ -219,14 +299,68 @@ mod tests {
             ro_binds: vec![],
             ro_files: vec![],
             rw_binds: vec![],
+            protected_paths: vec![],
             // Default-safe: deny the real pasteboard unless a test opts in.
             allow_pasteboard: false,
         }
     }
 
     #[test]
+    fn protected_directory_and_lease_denies_are_last() {
+        let mut o = opts();
+        o.protected_paths = vec![
+            ProtectedHostPath::directory("/Users/u/project/.artifacts/server-a"),
+            ProtectedHostPath::file("/Users/u/project/.artifacts/server-a.lease"),
+        ];
+
+        let profile = build_profile(SandboxLevel::Default, &o).unwrap();
+        let last_allow = profile.rfind("(allow file-").unwrap();
+        let directory_deny = profile
+            .rfind(r#"(deny file-write* (literal "/Users/u/project/.artifacts/server-a") (subpath "/Users/u/project/.artifacts/server-a"))"#)
+            .unwrap();
+        let lease_deny = profile
+            .rfind(r#"(deny file-write* (literal "/Users/u/project/.artifacts/server-a.lease"))"#)
+            .unwrap();
+
+        assert!(directory_deny > last_allow, "{profile}");
+        assert!(lease_deny > last_allow, "{profile}");
+        assert!(profile.contains(r#"(deny file-read* file-read-metadata (literal "/Users/u/project/.artifacts/server-a") (subpath "/Users/u/project/.artifacts/server-a"))"#));
+        assert!(profile.contains(r#"(deny file-read* file-read-metadata (literal "/Users/u/project/.artifacts/server-a.lease"))"#));
+    }
+
+    #[test]
+    fn unsafe_relative_protected_path_fails_profile_construction() {
+        let mut o = opts();
+        o.protected_paths = vec![ProtectedHostPath::directory("relative")];
+
+        assert!(build_profile(SandboxLevel::Default, &o).is_err());
+    }
+
+    #[test]
+    fn invalid_protected_root_path_is_rejected() {
+        assert!(validate_protected_paths(&[ProtectedHostPath::directory("/")]).is_err());
+    }
+
+    #[test]
+    fn invalid_protected_path_kind_is_rejected() {
+        let root =
+            std::env::temp_dir().join(format!("glass-macos-protected-kind-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("lease");
+        std::fs::write(&file, "lease").unwrap();
+
+        let directory_as_file = validate_protected_paths(&[ProtectedHostPath::file(&root)]);
+        let file_as_directory = validate_protected_paths(&[ProtectedHostPath::directory(&file)]);
+
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(root).unwrap();
+        assert!(directory_as_file.is_err());
+        assert!(file_as_directory.is_err());
+    }
+
+    #[test]
     fn deny_default_and_mach_register_present() {
-        let p = build_profile(SandboxLevel::Default, &opts());
+        let p = profile(SandboxLevel::Default, &opts());
         assert!(p.contains("(deny default)"), "{p}");
         assert!(
             p.contains("(allow mach-register)"),
@@ -236,19 +370,19 @@ mod tests {
 
     #[test]
     fn default_allows_network() {
-        assert!(build_profile(SandboxLevel::Default, &opts()).contains("(allow network*)"));
+        assert!(profile(SandboxLevel::Default, &opts()).contains("(allow network*)"));
     }
 
     #[test]
     fn strict_omits_network() {
-        assert!(!build_profile(SandboxLevel::Strict, &opts()).contains("(allow network*)"));
+        assert!(!profile(SandboxLevel::Strict, &opts()).contains("(allow network*)"));
     }
 
     #[test]
     fn pasteboard_denied_when_not_injectable() {
         let mut o = opts();
         o.allow_pasteboard = false;
-        let p = build_profile(SandboxLevel::Default, &o);
+        let p = profile(SandboxLevel::Default, &o);
         assert!(
             p.contains(r#"(deny mach-lookup (global-name "com.apple.pasteboard.1"))"#),
             "{p}"
@@ -259,7 +393,7 @@ mod tests {
     fn pasteboard_allowed_when_injectable() {
         let mut o = opts();
         o.allow_pasteboard = true;
-        let p = build_profile(SandboxLevel::Default, &o);
+        let p = profile(SandboxLevel::Default, &o);
         assert!(
             !p.contains("com.apple.pasteboard.1"),
             "an injectable target must not deny the pasteboard (the shim redirects it):\n{p}"
@@ -268,7 +402,7 @@ mod tests {
 
     #[test]
     fn cwd_is_read_and_write_allowed() {
-        let p = build_profile(SandboxLevel::Default, &opts());
+        let p = profile(SandboxLevel::Default, &opts());
         // cwd appears under both the read-reallow statement and the write block.
         assert_eq!(p.matches(r#"(subpath "/work/project")"#).count(), 2, "{p}");
     }
@@ -277,7 +411,7 @@ mod tests {
     /// `/Users` carved out by an explicit deny — assert both halves of that model are present.
     #[test]
     fn reads_all_but_denies_home() {
-        let p = build_profile(SandboxLevel::Default, &opts());
+        let p = profile(SandboxLevel::Default, &opts());
         assert!(
             p.contains(r#"(allow file-read* file-read-metadata (subpath "/"))"#),
             "the whole filesystem must be read-allowed:\n{p}"
@@ -295,7 +429,7 @@ mod tests {
     fn cwd_under_home_is_reallowed_after_home_deny() {
         let mut o = opts();
         o.cwd = PathBuf::from("/Users/dev/project");
-        let p = build_profile(SandboxLevel::Default, &o);
+        let p = profile(SandboxLevel::Default, &o);
 
         let deny_idx = p
             .find(r#"(deny file-read* (subpath "/Users"))"#)
@@ -322,7 +456,7 @@ mod tests {
     fn home_root_cwd_is_not_reallowed() {
         let mut o = opts();
         o.cwd = PathBuf::from("/Users/dev");
-        let p = build_profile(SandboxLevel::Default, &o);
+        let p = profile(SandboxLevel::Default, &o);
         assert!(
             !p.contains(r#"(subpath "/Users/dev")"#),
             "a bare home root must not be reallowed for read or write:\n{p}"
@@ -330,7 +464,7 @@ mod tests {
 
         let mut o_root = opts();
         o_root.cwd = PathBuf::from("/");
-        let p_root = build_profile(SandboxLevel::Default, &o_root);
+        let p_root = profile(SandboxLevel::Default, &o_root);
         let write_block_start = p_root
             .find("(allow file-write*")
             .expect("write block present");
@@ -438,7 +572,7 @@ mod tests {
 
     #[test]
     fn program_dir_is_read_allowed() {
-        let p = build_profile(SandboxLevel::Default, &opts());
+        let p = profile(SandboxLevel::Default, &opts());
         assert!(
             p.contains(r#"(subpath "/Applications/Demo.app/Contents/MacOS")"#),
             "{p}"
@@ -450,7 +584,7 @@ mod tests {
         let mut o = opts();
         o.ro_binds = vec![PathBuf::from("/opt/data")];
         o.rw_binds = vec![PathBuf::from("/opt/scratch")];
-        let p = build_profile(SandboxLevel::Default, &o);
+        let p = profile(SandboxLevel::Default, &o);
         assert!(p.contains(r#"(subpath "/opt/data")"#), "{p}");
         assert!(p.contains(r#"(subpath "/opt/scratch")"#), "{p}");
     }
@@ -462,7 +596,7 @@ mod tests {
     fn build_profile_filters_an_unsafe_ro_binds_entry() {
         let mut o = opts();
         o.ro_binds = vec![PathBuf::from("/Users/dev")];
-        let p = build_profile(SandboxLevel::Default, &o);
+        let p = profile(SandboxLevel::Default, &o);
         assert!(
             !p.contains(r#"(subpath "/Users/dev")"#),
             "a bare home root passed via ro_binds must be filtered, not emitted:\n{p}"
@@ -478,7 +612,7 @@ mod tests {
         let mut o = opts();
         let dylib = "/Users/dev/proj/target/release/libglass_clip_shim_macos.dylib";
         o.ro_files = vec![PathBuf::from(dylib)];
-        let p = build_profile(SandboxLevel::Default, &o);
+        let p = profile(SandboxLevel::Default, &o);
 
         let literal = format!(r#"(allow file-read* file-read-metadata (literal "{dylib}"))"#);
         let literal_idx = p.find(&literal).unwrap_or_else(|| {
@@ -505,7 +639,7 @@ mod tests {
     fn cwd_with_quote_and_backslash_is_escaped_not_injected() {
         let mut o = opts();
         o.cwd = PathBuf::from(r#"/tmp/a"b\c"#);
-        let p = build_profile(SandboxLevel::Default, &o);
+        let p = profile(SandboxLevel::Default, &o);
         assert!(
             p.contains(r#"/tmp/a\"b\\c"#),
             "expected the escaped literal in the profile:\n{p}"
@@ -524,7 +658,7 @@ mod tests {
     fn bare_program_name_does_not_emit_empty_subpath() {
         let mut o = opts();
         o.program = PathBuf::from("Demo");
-        let p = build_profile(SandboxLevel::Default, &o);
+        let p = profile(SandboxLevel::Default, &o);
         assert!(!p.contains(r#"(subpath "")"#), "{p}");
     }
 
@@ -534,8 +668,8 @@ mod tests {
     fn strict_equals_default_minus_network_line() {
         let o = opts();
         assert_eq!(
-            build_profile(SandboxLevel::Strict, &o),
-            build_profile(SandboxLevel::Default, &o).replace("(allow network*)\n", "")
+            profile(SandboxLevel::Strict, &o),
+            profile(SandboxLevel::Default, &o).replace("(allow network*)\n", "")
         );
     }
 }

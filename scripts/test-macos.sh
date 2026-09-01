@@ -12,6 +12,11 @@ fi
 # (mirrors scripts/test-x11.sh / test-wayland.sh / test-windows.sh).
 cd "$(dirname "$0")/.."
 
+test_filter=()
+if [[ -n "${1:-}" ]]; then
+  test_filter=("$1")
+fi
+
 # process::tests' SandboxLevel::Default tests spawn this fixture and assert the clip shim was
 # actually injected — see src/bin/sandbox_probe.rs and process.rs's spawn doc. Neither is a
 # Cargo dependency of glass-macos, so a scoped `cargo test -p glass-macos --lib` builds neither
@@ -31,7 +36,7 @@ cargo build -p glass-clip-shim-macos
 # -connected context (a gui/501 LaunchAgent) that a plain on-box or CI run doesn't have,
 # so it would fail every ungranted run. `--lib` keeps this default invocation to exactly
 # the unit tests; see GLASS_MACOS_ONBOX below for the capture test.
-cargo test -p glass-macos --lib "${1:-}"
+cargo test -p glass-macos --lib "${test_filter[@]}"
 
 # GLASS_MACOS_ONBOX=1: also build the harness=false capture integration test
 # (crates/glass-macos/tests/capture.rs) — the first-real-pixels proof of the whole
@@ -48,7 +53,7 @@ if [[ "${GLASS_MACOS_ONBOX:-0}" == "1" ]]; then
   # them. Unlike the integration binaries below, these DO run here — this is the only
   # invocation that runs them, and it must be from a session with a window server.
   echo "GLASS_MACOS_ONBOX=1: running the on-device --lib tests..."
-  cargo test -p glass-macos --lib -- --ignored "${1:-}"
+  cargo test -p glass-macos --lib -- --ignored "${test_filter[@]}"
 
   echo "GLASS_MACOS_ONBOX=1: building the capture integration test binary..."
   cargo test -p glass-macos --test capture --no-run
