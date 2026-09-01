@@ -888,6 +888,10 @@ mod tests {
         let (_root, store) = store()?;
         let before = store.registry_len();
         let rejected = (100..900).find(|segments| {
+            #[cfg(windows)]
+            let process_dir =
+                std::path::PathBuf::from(r"C:\").join("long-segment".repeat(*segments));
+            #[cfg(not(windows))]
             let process_dir = std::path::PathBuf::from("/").join("long-segment".repeat(*segments));
             let descriptor = ArtifactDescriptor::new(
                 crate::output::ArtifactKind::ContentBlock,

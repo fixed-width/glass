@@ -1141,12 +1141,13 @@ fn shutdown_unlinks_a_hard_link_without_touching_its_other_name() {
 #[test]
 fn store_creates_random_private_child_and_holds_lease() {
     let root = tempfile::tempdir().unwrap();
+    let canonical_root = root.path().canonicalize().unwrap();
     let store = ArtifactStore::for_test(root.path(), 64 * 1024 * 1024).unwrap();
-    assert!(store.process_dir().starts_with(root.path()));
-    assert_ne!(store.process_dir(), root.path());
+    assert!(store.process_dir().starts_with(&canonical_root));
+    assert_ne!(store.process_dir(), canonical_root);
     assert!(store.lease_path().exists());
-    assert_eq!(store.process_dir().parent(), Some(root.path()));
-    assert_eq!(store.lease_path().parent(), Some(root.path()));
+    assert_eq!(store.process_dir().parent(), Some(canonical_root.as_path()));
+    assert_eq!(store.lease_path().parent(), Some(canonical_root.as_path()));
 }
 
 #[test]
@@ -1474,11 +1475,15 @@ fn replacing_root_ancestor_cannot_redirect_read() {
     let sentinel = outside.path().join("sentinel");
     fs::write(&sentinel, "keep").unwrap();
     let store = ArtifactStore::for_test(&root, 1024).unwrap();
+    let canonical_root = root.canonicalize().unwrap();
     let published = store
         .publish(vec![store.prepare(draft("known")).unwrap()])
         .unwrap();
     let descriptor = &published.descriptors()[0];
-    let relative = descriptor.local_path().strip_prefix(&root).unwrap();
+    let relative = descriptor
+        .local_path()
+        .strip_prefix(&canonical_root)
+        .unwrap();
     let replacement_root = parent.path().join("replacement-root");
     let redirected = replacement_root.join(relative);
     fs::create_dir_all(redirected.parent().unwrap()).unwrap();

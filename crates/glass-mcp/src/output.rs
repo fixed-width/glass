@@ -344,6 +344,16 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
 
+    #[cfg(windows)]
+    fn absolute_test_path(tail: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(r"C:\glass-test-root").join(tail)
+    }
+
+    #[cfg(not(windows))]
+    fn absolute_test_path(tail: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from("/glass-test-root").join(tail)
+    }
+
     fn artifact(path: &Path) -> Result<ArtifactDescriptor, ArtifactDescriptorError> {
         ArtifactDescriptor::new(
             ArtifactKind::ContentBlock,
@@ -359,11 +369,12 @@ mod tests {
     }
 
     fn artifact_with_trust(untrusted: bool) -> ArtifactDescriptor {
+        let path = absolute_test_path("artifact");
         ArtifactDescriptor::new(
             ArtifactKind::ContentBlock,
             Some(1),
             "glass-artifact://server/artifact",
-            Path::new("/glass/artifact"),
+            &path,
             "text/plain; charset=utf-8",
             17,
             "fixed-sha256",
@@ -424,7 +435,8 @@ mod tests {
 
     #[test]
     fn artifact_descriptor_always_uses_server_path_scope() {
-        let descriptor = artifact(Path::new("/artifact")).unwrap();
+        let path = absolute_test_path("artifact");
+        let descriptor = artifact(&path).unwrap();
         assert_eq!(descriptor.local_path_scope, "server");
     }
 
