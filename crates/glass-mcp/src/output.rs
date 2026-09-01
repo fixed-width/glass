@@ -148,7 +148,6 @@ impl ArtifactDescriptor {
         content_block: Option<usize>,
         uri: &str,
         local_path: &Path,
-        local_path_scope: &'static str,
         mime_type: &str,
         bytes: u64,
         sha256: &str,
@@ -168,7 +167,7 @@ impl ArtifactDescriptor {
             content_block,
             uri: uri.to_owned(),
             local_path,
-            local_path_scope,
+            local_path_scope: "server",
             mime_type: mime_type.to_owned(),
             bytes,
             sha256: sha256.to_owned(),
@@ -381,7 +380,6 @@ mod tests {
             Some(1),
             "glass-artifact://s/a",
             path,
-            "server",
             "text/plain",
             0,
             "test-sha256",
@@ -437,6 +435,12 @@ mod tests {
             artifact(Path::new("relative-artifact")).unwrap_err(),
             ArtifactDescriptorError::RelativePath
         );
+    }
+
+    #[test]
+    fn artifact_descriptor_always_uses_server_path_scope() {
+        let descriptor = artifact(Path::new("/artifact")).unwrap();
+        assert_eq!(descriptor.local_path_scope, "server");
     }
 
     #[cfg(unix)]
