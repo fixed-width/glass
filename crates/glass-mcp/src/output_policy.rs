@@ -64,8 +64,59 @@ pub(crate) struct OutputMetadata {
     pub externalized: Vec<ArtifactDescriptor>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub omitted_content_blocks: Vec<usize>,
+    #[serde(skip_serializing_if = "OmissionRanges::is_empty")]
+    pub omitted_content_block_ranges: OmissionRanges,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<OutputDeliveryError>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(transparent)]
+pub(crate) struct OmissionRanges(Vec<OmissionRange>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct OmissionRange {
+    pub start: usize,
+    pub end_exclusive: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OmissionRangeError {
+    EmptyOrReversed,
+    OverlappingOrUnsorted,
+}
+
+impl OmissionRanges {
+    fn new(bounds: &[(usize, usize)]) -> Result<Self, OmissionRangeError> {
+        let mut previous_end = None;
+        let mut ranges = Vec::with_capacity(bounds.len());
+        for &(start, end_exclusive) in bounds {
+            if start >= end_exclusive {
+                return Err(OmissionRangeError::EmptyOrReversed);
+            }
+            if previous_end.is_some_and(|end| start < end) {
+                return Err(OmissionRangeError::OverlappingOrUnsorted);
+            }
+            ranges.push(OmissionRange {
+                start,
+                end_exclusive,
+            });
+            previous_end = Some(end_exclusive);
+        }
+        Ok(Self(ranges))
+    }
+
+    fn all(count: usize) -> Self {
+        if count == 0 {
+            Self::default()
+        } else {
+            Self::new(&[(0, count)]).unwrap_or_default()
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[cfg_attr(
@@ -324,6 +375,7 @@ fn complete_metadata(
         target_access,
         externalized,
         omitted_content_blocks: Vec::new(),
+        omitted_content_block_ranges: OmissionRanges::default(),
         error: None,
     }
 }
@@ -416,6 +468,7 @@ fn incomplete(outcome: &ToolCallOutcome, original_text_bytes: usize) -> AppliedO
         target_access: outcome.target_access,
         externalized: Vec::new(),
         omitted_content_blocks: omitted,
+        omitted_content_block_ranges: OmissionRanges::default(),
         error: Some(delivery_error(outcome.effect, envelope_index.is_some())),
     };
     if let Some(index) = envelope_index {
@@ -449,7 +502,6 @@ fn incomplete(outcome: &ToolCallOutcome, original_text_bytes: usize) -> AppliedO
 
 fn emergency(outcome: &ToolCallOutcome, original_text_bytes: usize) -> AppliedOutcome {
     let omitted_count = outcome.output.0.len();
-    let omitted_content_blocks = (0..omitted_count.min(64)).collect::<Vec<_>>();
     let error = delivery_error_with_category(outcome.effect, false, "output_policy_failed");
     let metadata = OutputMetadata {
         mode: OutputMode::Incomplete,
@@ -459,7 +511,8 @@ fn emergency(outcome: &ToolCallOutcome, original_text_bytes: usize) -> AppliedOu
         complete: false,
         target_access: outcome.target_access,
         externalized: Vec::new(),
-        omitted_content_blocks,
+        omitted_content_blocks: Vec::new(),
+        omitted_content_block_ranges: OmissionRanges::all(omitted_count),
         error: Some(error),
     };
     let effect = match outcome.effect {
@@ -1140,6 +1193,147 @@ mod tests {
         Ok(())
     }
 
+    fn artifact_paths(store: &ArtifactStore) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
+        Ok(std::fs::read_dir(store.process_dir())?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("artifact-"))
+            })
+            .collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn retention_failure_after_registry_insertion_rolls_back_the_attempted_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let store = ArtifactStore::for_test_with_fault(
+            root.path(),
+            TEST_STORE_BYTES,
+            FaultStage::RetentionAfterRegistryInsertion,
+        )
+        .map_err(|error| format!("setup: {error:?}"))?;
+        let policy = OutputPolicy::new(store.clone());
+        let output = ToolOutput::result_with(
+            "glass_test",
+            json!({}),
+            vec![text(
+                "x".repeat(8_300),
+                TextTrust::Trusted,
+                TextRole::Observation,
+            )],
+        );
+
+        let applied = policy.apply(policy_outcome(output));
+
+        assert!(applied.output.text_bytes() <= MAX_TEXT_BYTES);
+        assert!(
+            !applied
+                .output
+                .0
+                .iter()
+                .any(|content| matches!(content, OutContent::ResourceLink(_)))
+        );
+        assert_eq!(store.registry_len(), 0);
+        assert!(artifact_paths(&store)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_batch_rollback_preserves_an_older_entry() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempfile::tempdir()?;
+        let store =
+            ArtifactStore::for_test(root.path(), 5).map_err(|error| format!("setup: {error:?}"))?;
+        let older = store
+            .prepare(ArtifactDraft::content_block(
+                "123456",
+                "text/plain; charset=utf-8",
+                false,
+                0,
+            ))
+            .map_err(|error| format!("prepare: {error:?}"))?;
+        let older_path = older.descriptor().local_path().to_path_buf();
+        let older_batch = store
+            .publish(vec![older])
+            .map_err(|error| format!("publish: {error:?}"))?;
+        std::fs::remove_file(&older_path)?;
+        std::fs::create_dir(&older_path)?;
+        std::fs::write(older_path.join("residue"), "123456")?;
+        drop(older_batch);
+        let policy = OutputPolicy::new(store.clone());
+        let output = ToolOutput::result_with(
+            "glass_test",
+            json!({}),
+            vec![text(
+                "x".repeat(8_300),
+                TextTrust::Trusted,
+                TextRole::Observation,
+            )],
+        );
+
+        let applied = policy.apply(policy_outcome(output));
+
+        assert!(applied.output.text_bytes() <= MAX_TEXT_BYTES);
+        assert!(
+            !applied
+                .output
+                .0
+                .iter()
+                .any(|content| matches!(content, OutContent::ResourceLink(_)))
+        );
+        assert_eq!(store.registry_len(), 1);
+        assert_eq!(artifact_paths(&store)?, vec![older_path]);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_committed_batch_cleanup_disables_future_externalization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let store = ArtifactStore::for_test_with_fault(
+            root.path(),
+            TEST_STORE_BYTES,
+            FaultStage::CommittedBatchRollbackCleanupFails,
+        )
+        .map_err(|error| format!("setup: {error:?}"))?;
+        let policy = OutputPolicy::new(store.clone());
+        let output = ToolOutput::result_with(
+            "glass_test",
+            json!({}),
+            vec![text(
+                "x".repeat(8_300),
+                TextTrust::Trusted,
+                TextRole::Observation,
+            )],
+        );
+
+        let applied = policy.apply(policy_outcome(output));
+
+        assert!(applied.output.text_bytes() <= MAX_TEXT_BYTES);
+        assert!(
+            !applied
+                .output
+                .0
+                .iter()
+                .any(|content| matches!(content, OutContent::ResourceLink(_)))
+        );
+        assert_eq!(store.registry_len(), 0);
+        assert_eq!(
+            store.availability_error(),
+            Some(ArtifactError::RollbackFailed)
+        );
+
+        let small = ToolOutput::result("glass_test", json!({"unchanged": true}));
+        let before = format!("{small:?}");
+        let pass_through = policy.apply(policy_outcome(small));
+        assert_eq!(format!("{:?}", pass_through.output), before);
+        assert!(pass_through.output_metadata().is_none());
+        Ok(())
+    }
+
     #[test]
     fn images_and_links_do_not_count_but_image_note_text_does()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1186,6 +1380,112 @@ mod tests {
         let applied = emergency(&outcome, 8_193);
         assert!(applied.output.text_bytes() <= MAX_TEXT_BYTES);
         assert!(!applied.output.render_text_blocks()[0].contains(HUGE_TOOL));
+        let metadata = serde_json::to_value(applied.output_metadata().expect("metadata"))
+            .expect("serializable metadata");
+        let ranges = metadata["omitted_content_block_ranges"]
+            .as_array()
+            .expect("emergency omission ranges");
+        let expanded = ranges
+            .iter()
+            .flat_map(|range| {
+                let start = range["start"].as_u64().expect("range start") as usize;
+                let end = range["end_exclusive"].as_u64().expect("range end") as usize;
+                start..end
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expanded, (0..10_001).collect::<Vec<_>>());
+        assert!(
+            metadata["omitted_content_blocks"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+    }
+
+    #[test]
+    fn omission_ranges_reject_empty_reversed_overlapping_and_unsorted_bounds() {
+        assert_eq!(
+            OmissionRanges::new(&[(4, 4)]).expect_err("empty range"),
+            OmissionRangeError::EmptyOrReversed
+        );
+        assert_eq!(
+            OmissionRanges::new(&[(5, 4)]).expect_err("reversed range"),
+            OmissionRangeError::EmptyOrReversed
+        );
+        assert_eq!(
+            OmissionRanges::new(&[(0, 4), (3, 6)]).expect_err("overlap"),
+            OmissionRangeError::OverlappingOrUnsorted
+        );
+        assert_eq!(
+            OmissionRanges::new(&[(5, 8), (0, 2)]).expect_err("unsorted"),
+            OmissionRangeError::OverlappingOrUnsorted
+        );
+    }
+
+    #[test]
+    fn omission_ranges_accept_adjacent_non_overlapping_bounds() -> Result<(), serde_json::Error> {
+        let ranges = OmissionRanges::new(&[(0, 3), (3, 7)]).expect("valid ranges");
+        assert_eq!(
+            serde_json::to_value(ranges)?,
+            json!([
+                {"start": 0, "end_exclusive": 3},
+                {"start": 3, "end_exclusive": 7}
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn complete_modes_leave_both_omission_representations_empty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_root, store) = store()?;
+        let policy = OutputPolicy::new(store);
+        let block_output = ToolOutput::result_with(
+            "glass_test",
+            json!({}),
+            vec![text(
+                "x".repeat(8_300),
+                TextTrust::Trusted,
+                TextRole::Observation,
+            )],
+        );
+        let block_applied = policy.apply(policy_outcome(block_output));
+        let block_metadata = block_applied.output_metadata().ok_or("block metadata")?;
+        assert_eq!(block_metadata.mode, OutputMode::ContentBlocks);
+        assert!(block_metadata.omitted_content_blocks.is_empty());
+        assert!(block_metadata.omitted_content_block_ranges.is_empty());
+
+        let manifest_output = ToolOutput(vec![text(
+            "x".repeat(8_300),
+            TextTrust::Trusted,
+            TextRole::Observation,
+        )]);
+        let manifest_applied = policy.apply(policy_outcome(manifest_output));
+        let manifest_metadata = manifest_applied
+            .output_metadata()
+            .ok_or("manifest metadata")?;
+        assert_eq!(manifest_metadata.mode, OutputMode::ResponseManifest);
+        assert!(manifest_metadata.omitted_content_blocks.is_empty());
+        assert!(manifest_metadata.omitted_content_block_ranges.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_incomplete_uses_only_explicit_omitted_indices() {
+        let policy = OutputPolicy::unavailable();
+        let output = ToolOutput::result_with(
+            "glass_test",
+            json!({"preserved": true}),
+            vec![text(
+                "x".repeat(8_300),
+                TextTrust::Trusted,
+                TextRole::Observation,
+            )],
+        );
+        let applied = policy.apply(policy_outcome(output));
+        let metadata = applied.output_metadata().expect("metadata");
+        assert_eq!(metadata.mode, OutputMode::Incomplete);
+        assert_eq!(metadata.omitted_content_blocks, vec![1]);
+        assert!(metadata.omitted_content_block_ranges.is_empty());
     }
 
     proptest! {

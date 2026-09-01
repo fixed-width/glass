@@ -238,6 +238,10 @@ pub(crate) enum FaultStage {
     ProcessProtectionThenDirectoryCleanupFails,
     DirectoryCreateThenLeaseCleanupFails,
     PublicationRollbackCleanupFails,
+    #[cfg(test)]
+    RetentionAfterRegistryInsertion,
+    #[cfg(test)]
+    CommittedBatchRollbackCleanupFails,
     ShutdownRemoveContents,
     ShutdownRemoveDirectory,
     ShutdownCloseHandles,
@@ -494,15 +498,44 @@ impl ArtifactStore {
             );
         }
         drop(state);
-        let batch = PublishedBatch {
+        let injected_retention_failure = match self.inner.fault {
+            #[cfg(test)]
+            Some(FaultStage::RetentionAfterRegistryInsertion)
+            | Some(FaultStage::CommittedBatchRollbackCleanupFails) => true,
+            Some(
+                FaultStage::TempCreated(_)
+                | FaultStage::TempWritten(_)
+                | FaultStage::FinalRenamed(_)
+                | FaultStage::GrowDuringRead
+                | FaultStage::ReadBodyFails
+                | FaultStage::ProcessProtectionThenDirectoryCleanupFails
+                | FaultStage::DirectoryCreateThenLeaseCleanupFails
+                | FaultStage::PublicationRollbackCleanupFails
+                | FaultStage::ShutdownRemoveContents
+                | FaultStage::ShutdownRemoveDirectory
+                | FaultStage::ShutdownCloseHandles
+                | FaultStage::ShutdownRemoveLease,
+            )
+            | None => false,
+        };
+        let retention = if injected_retention_failure {
+            self.inner.fault_fired.store(true, Ordering::Release);
+            Err(ArtifactError::CleanupFailed(
+                std::io::ErrorKind::PermissionDenied,
+            ))
+        } else {
+            self.enforce_retention()
+        };
+        if let Err(error) = retention {
+            return self.rollback_committed_batch(&ids, &created, error);
+        }
+        Ok(PublishedBatch {
             descriptors,
             pin: PinGuard {
                 store: Arc::downgrade(&self.inner),
                 artifact_ids: ids,
             },
-        };
-        self.enforce_retention()?;
-        Ok(batch)
+        })
     }
 
     fn write_and_rename(
@@ -573,6 +606,37 @@ impl ArtifactStore {
         if let Ok(mut state) = self.inner.state.lock() {
             state.availability_error = Some(ArtifactError::RollbackFailed);
         }
+        Err(ArtifactError::RollbackFailed)
+    }
+
+    fn rollback_committed_batch(
+        &self,
+        ids: &[String],
+        paths: &[PathBuf],
+        original: ArtifactError,
+    ) -> Result<PublishedBatch, ArtifactError> {
+        let registry_rolled_back = match self.inner.state.lock() {
+            Ok(mut state) => {
+                for id in ids {
+                    state.entries.remove(id);
+                }
+                true
+            }
+            Err(mut poisoned) => {
+                poisoned.get_mut().availability_error = Some(ArtifactError::RollbackFailed);
+                false
+            }
+        };
+        #[cfg(test)]
+        let injected_cleanup_failure =
+            self.inner.fault == Some(FaultStage::CommittedBatchRollbackCleanupFails);
+        #[cfg(not(test))]
+        let injected_cleanup_failure = false;
+        let paths_rolled_back = !injected_cleanup_failure && rollback_paths(paths).is_ok();
+        if registry_rolled_back && paths_rolled_back {
+            return Err(original);
+        }
+        self.mark_unavailable(ArtifactError::RollbackFailed);
         Err(ArtifactError::RollbackFailed)
     }
 
