@@ -521,14 +521,17 @@ mod tests {
         match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
-                    t.starts_with(crate::untrusted::NOTE),
-                    "must be marked untrusted: {t}"
+                    t.as_str().starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t:?}"
                 );
                 assert!(
-                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "enveloped: {t}"
+                    t.as_str().contains("⟦untrusted:") && t.as_str().contains("⟦/untrusted:"),
+                    "enveloped: {t:?}"
                 );
-                assert!(t.contains("\"name\":\"Save\""), "app-controlled name: {t}");
+                assert!(
+                    t.as_str().contains("\"name\":\"Save\""),
+                    "app-controlled name: {t:?}"
+                );
             }
             _ => panic!("expected untrusted element sibling"),
         }
@@ -551,8 +554,12 @@ mod tests {
         let OutContent::Text(sibling) = &out.0[1] else {
             panic!("expected untrusted element sibling")
         };
-        assert!(sibling.contains(&format!("\"id\":{expected_id}")));
-        assert!(sibling.contains("\"description\":\"Search settings\""));
+        assert!(sibling.as_str().contains(&format!("\"id\":{expected_id}")));
+        assert!(
+            sibling
+                .as_str()
+                .contains("\"description\":\"Search settings\"")
+        );
     }
 
     /// Like `fake_tree()`'s "Save" but placed off-screen to the right of the
@@ -647,8 +654,8 @@ mod tests {
             panic!("expected untrusted element sibling")
         };
         assert!(
-            sibling.contains("\"description\":\"Bold\""),
-            "the element's only label must be reported: {sibling}"
+            sibling.as_str().contains("\"description\":\"Bold\""),
+            "the element's only label must be reported: {sibling:?}"
         );
     }
 
@@ -740,15 +747,18 @@ mod tests {
         match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
-                    t.starts_with(crate::untrusted::NOTE),
-                    "must be marked untrusted: {t}"
+                    t.as_str().starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t:?}"
                 );
                 assert!(
-                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "enveloped: {t}"
+                    t.as_str().contains("⟦untrusted:") && t.as_str().contains("⟦/untrusted:"),
+                    "enveloped: {t:?}"
                 );
-                assert!(t.contains("\"id\":1"), "element id: {t}");
-                assert!(t.contains("\"name\":\"Save\""), "app-controlled name: {t}");
+                assert!(t.as_str().contains("\"id\":1"), "element id: {t:?}");
+                assert!(
+                    t.as_str().contains("\"name\":\"Save\""),
+                    "app-controlled name: {t:?}"
+                );
             }
             _ => panic!("expected untrusted element sibling"),
         }
@@ -1076,16 +1086,16 @@ mod tests {
         match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
-                    t.starts_with(crate::untrusted::NOTE),
-                    "must be marked untrusted: {t}"
+                    t.as_str().starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t:?}"
                 );
                 assert!(
-                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "enveloped: {t}"
+                    t.as_str().contains("⟦untrusted:") && t.as_str().contains("⟦/untrusted:"),
+                    "enveloped: {t:?}"
                 );
                 assert!(
-                    t.contains("\"text\":\"build done\""),
-                    "app-controlled log text: {t}"
+                    t.as_str().contains("\"text\":\"build done\""),
+                    "app-controlled log text: {t:?}"
                 );
             }
             _ => panic!("expected untrusted line sibling"),
@@ -1185,16 +1195,15 @@ mod tests {
             "expected [Image, meta, IMAGE_NOTE], got {} items",
             out.0.len()
         );
-        let has_note = out
-            .0
-            .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        let has_note = out.0.iter().any(
+            |c| matches!(c, OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
+        );
         assert!(
             has_note,
             "IMAGE_NOTE must be present when image is returned"
         );
         // scalar meta is NOT enveloped
-        let meta_enveloped = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t.contains("matched") && t.contains("⟦untrusted:")));
+        let meta_enveloped = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t.as_str().contains("matched") && t.as_str().contains("⟦untrusted:")));
         assert!(!meta_enveloped, "scalar meta must NOT be enveloped");
     }
 
@@ -1205,15 +1214,14 @@ mod tests {
         let mut g = started_frames(vec![black, white]);
         // include_image defaults to None (false) -> no image -> no note
         let out = wait_for_region(&mut g, &region_args()).unwrap();
-        let has_note = out
-            .0
-            .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        let has_note = out.0.iter().any(
+            |c| matches!(c, OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
+        );
         assert!(!has_note, "no IMAGE_NOTE when no image is produced");
         let has_envelope = out
             .0
             .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t.contains("⟦untrusted:")));
+            .any(|c| matches!(c, OutContent::Text(t) if t.as_str().contains("⟦untrusted:")));
         assert!(!has_envelope, "no envelope on scalar-only result");
     }
 }

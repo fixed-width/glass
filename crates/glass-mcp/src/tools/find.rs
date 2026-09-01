@@ -267,7 +267,7 @@ mod tests {
         let OutContent::Text(text) = &output.0[1] else {
             panic!("text block")
         };
-        let after_note = text.split_once('\n').unwrap().1;
+        let after_note = text.as_str().split_once('\n').unwrap().1;
         let after_open = after_note.split_once('\n').unwrap().1;
         let body = after_open.rsplit_once('\n').unwrap().0;
         let value: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -469,8 +469,8 @@ mod tests {
         let OutContent::Text(untrusted) = &output.0[1] else {
             panic!("text block")
         };
-        assert!(untrusted.starts_with(crate::untrusted::NOTE));
-        assert!(untrusted.contains("\"name\":\"Save account\""));
+        assert!(untrusted.as_str().starts_with(crate::untrusted::NOTE));
+        assert!(untrusted.as_str().contains("\"name\":\"Save account\""));
     }
 
     #[test]
@@ -529,7 +529,7 @@ mod tests {
         let OutContent::Text(untrusted) = &output.0[1] else {
             panic!("text block")
         };
-        assert!(untrusted.contains("\"name\":\"Save\""));
+        assert!(untrusted.as_str().contains("\"name\":\"Save\""));
         assert!(!format!("{output:?}").contains("context-secret-sentinel"));
     }
 

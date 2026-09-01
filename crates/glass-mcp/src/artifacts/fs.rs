@@ -1,8 +1,3 @@
-#![expect(
-    dead_code,
-    reason = "Artifact lifecycle interfaces are consumed by response externalization."
-)]
-
 use crate::output::{ArtifactDescriptor, ArtifactKind};
 use fs4::FileExt;
 use rand::Rng;
@@ -16,6 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+#[cfg_attr(
+    windows,
+    expect(
+        dead_code,
+        reason = "Windows bounds retained-handle enumeration internally."
+    )
+)]
 const MAX_OWNED_DIRECTORY_ENTRIES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +27,6 @@ pub(crate) enum ArtifactError {
     RootCreateFailed,
     RootCanonicalizeFailed,
     PathRepresentationFailed,
-    PermissionFailed,
     LockFailed,
     LeaseUnavailable,
     WriteFailed,
@@ -56,6 +57,10 @@ struct ArtifactStoreInner {
     fault: Option<FaultStage>,
     fault_fired: AtomicBool,
     #[cfg(test)]
+    #[cfg_attr(
+        windows,
+        expect(dead_code, reason = "Unix race tests use this hook storage.")
+    )]
     test_hook: Mutex<Option<TestHook>>,
 }
 
@@ -79,6 +84,10 @@ struct StoreState {
     lease_quarantine: Option<OsString>,
 }
 
+#[cfg_attr(
+    windows,
+    expect(dead_code, reason = "Some hook points exercise Unix quarantine paths.")
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TestHookPoint {
     AfterAccountingEnumeration,
@@ -208,6 +217,13 @@ pub(crate) struct PreparedArtifact {
 }
 
 pub(crate) struct PublishedBatch {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Descriptors are consumed before the response pin is retained."
+        )
+    )]
     descriptors: Vec<ArtifactDescriptor>,
     pin: ResponsePin,
 }
@@ -219,6 +235,10 @@ impl PreparedArtifact {
 }
 
 impl PublishedBatch {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Used by artifact and resource-boundary tests.")
+    )]
     pub(crate) fn descriptors(&self) -> &[ArtifactDescriptor] {
         &self.descriptors
     }
@@ -331,7 +351,6 @@ impl ArtifactStore {
         fault: Option<FaultStage>,
     ) -> Result<Self, ArtifactError> {
         fs::create_dir_all(root).map_err(|_| ArtifactError::RootCreateFailed)?;
-        set_dir_private(root)?;
         let root = fs::canonicalize(root).map_err(|_| ArtifactError::RootCanonicalizeFailed)?;
         require_absolute_utf8(&root)?;
         let root_handle = open_process_directory(&root)?;
@@ -749,6 +768,13 @@ impl ArtifactStore {
         )
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Used to verify fail-closed store state transitions."
+        )
+    )]
     pub(crate) fn availability_error(&self) -> Option<ArtifactError> {
         self.inner
             .state
@@ -995,12 +1021,20 @@ impl ArtifactStore {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        windows,
+        expect(dead_code, reason = "Unix race tests install store hooks.")
+    )]
     pub(crate) fn set_test_hook(&self, point: TestHookPoint, hook: impl FnOnce() + Send + 'static) {
         if let Ok(mut slot) = self.inner.test_hook.lock() {
             *slot = Some((point, Box::new(hook)));
         }
     }
 
+    #[cfg_attr(
+        windows,
+        expect(dead_code, reason = "Unix race paths fire store hooks.")
+    )]
     fn fire_test_hook(&self, point: TestHookPoint) {
         #[cfg(test)]
         let hook = self
@@ -1163,18 +1197,6 @@ fn create_private_dir(path: &Path) -> Result<(), ArtifactError> {
     Ok(())
 }
 
-fn set_dir_private(path: &Path) -> Result<(), ArtifactError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|_| ArtifactError::PermissionFailed)?;
-    }
-    #[cfg(windows)]
-    protect_path(path)?;
-    Ok(())
-}
-
 fn protect_path(path: &Path) -> Result<(), ArtifactError> {
     #[cfg(windows)]
     glass_windows::restrict_path_to_current_user(path)
@@ -1288,6 +1310,7 @@ fn remove_link_no_follow(path: &Path, metadata: &fs::Metadata) -> Result<(), Art
     result.map_err(|error| ArtifactError::CleanupFailed(error.kind()))
 }
 
+#[expect(dead_code, reason = "Retained no-follow accounting test seam.")]
 fn process_file_bytes_no_follow(path: &Path) -> Result<u64, ArtifactError> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
@@ -1317,6 +1340,7 @@ fn process_file_bytes_no_follow(path: &Path) -> Result<u64, ArtifactError> {
     Ok(total)
 }
 
+#[expect(dead_code, reason = "Retained no-follow cleanup test seam.")]
 fn remove_regular_file_no_follow(path: &Path) -> Result<(), ArtifactError> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
@@ -1500,6 +1524,10 @@ fn remove_directory_from_handle(
 }
 
 #[cfg(windows)]
+#[expect(
+    dead_code,
+    reason = "Retained local adapter for handle-safe cleanup tests."
+)]
 fn remove_non_directory_from_handle(
     parent: &File,
     _path: &Path,
@@ -1510,6 +1538,10 @@ fn remove_non_directory_from_handle(
 }
 
 #[cfg(windows)]
+#[expect(
+    dead_code,
+    reason = "Retained local adapter for handle-safe cleanup tests."
+)]
 fn remove_regular_file_from_handle(
     parent: &File,
     _path: &Path,
@@ -1547,6 +1579,7 @@ fn map_host_cleanup(_error: glass_windows::HostFsError) -> ArtifactError {
     ArtifactError::CleanupFailed(std::io::ErrorKind::Other)
 }
 
+#[cfg(test)]
 fn scavenge_root(root: &Path, lease_open_fault: Option<&Path>) -> Result<(), ArtifactError> {
     let root_handle = open_process_directory(root)?;
     scavenge_root_from_handle(root, &root_handle, lease_open_fault)
@@ -1858,6 +1891,10 @@ fn exact_server_id(name: &str) -> Option<&str> {
     .then_some(id)
 }
 
+#[cfg_attr(
+    windows,
+    expect(dead_code, reason = "Unix lease recovery parses quarantine names.")
+)]
 fn exact_quarantine_id(name: &str) -> Option<&str> {
     let rest = name.strip_prefix("server-")?;
     let (id, nonce) = rest.split_once(".lease-cleanup-")?;
@@ -1874,6 +1911,7 @@ fn safe_directory_metadata(metadata: &fs::Metadata) -> bool {
     metadata.is_dir() && !metadata.file_type().is_symlink() && !is_reparse_point(metadata)
 }
 
+#[expect(dead_code, reason = "Shared by retained pathname lease helper seams.")]
 fn safe_file_metadata(metadata: &fs::Metadata) -> bool {
     metadata.is_file() && !metadata.file_type().is_symlink() && !is_reparse_point(metadata)
 }
@@ -1890,6 +1928,10 @@ fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
+#[expect(
+    dead_code,
+    reason = "Retained Unix pathname lease seam; production scavenging opens beneath the root handle."
+)]
 fn open_existing_lease_no_follow(path: &Path) -> std::io::Result<File> {
     let fd = rustix::fs::open(
         path,
@@ -1905,6 +1947,7 @@ fn open_existing_lease_no_follow(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(windows)]
+#[expect(dead_code, reason = "Retained pathname lease test seam.")]
 fn open_existing_lease_no_follow(path: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     let file = OpenOptions::new()
@@ -1919,6 +1962,10 @@ fn open_existing_lease_no_follow(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(unix)]
+#[expect(
+    dead_code,
+    reason = "Retained Unix pathname lease seam; production scavenging compares child handles."
+)]
 fn lease_handle_matches_path(handle: &File, path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -1934,6 +1981,7 @@ fn lease_handle_matches_path(handle: &File, path: &Path) -> bool {
 }
 
 #[cfg(windows)]
+#[expect(dead_code, reason = "Retained pathname lease test seam.")]
 fn lease_handle_matches_path(handle: &File, path: &Path) -> bool {
     glass_windows::file_matches_path_no_reparse(handle, path).unwrap_or(false)
 }

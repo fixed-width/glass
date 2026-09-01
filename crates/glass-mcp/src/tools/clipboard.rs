@@ -48,7 +48,7 @@ mod tests {
 
     fn text_at(out: &ToolOutput, i: usize) -> &str {
         match &out.0[i] {
-            OutContent::Text(t) => t,
+            OutContent::Text(t) => t.as_str(),
             _ => panic!("expected text at index {i}"),
         }
     }

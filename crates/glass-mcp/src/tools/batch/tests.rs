@@ -547,7 +547,7 @@ fn assert_secret_absent(output: &ToolOutput, secret: &str) {
     let all_output_text = output_text(output);
     let envelope = envelope(output);
     assert!(
-        !all_output_text.contains(secret),
+        !all_output_text.as_str().contains(secret),
         "secret echoed in output: {all_output_text}"
     );
     assert!(
@@ -1914,8 +1914,11 @@ fn type_return_snapshot_is_retained_in_content_blocks() {
     let OutContent::Text(snapshot) = &out.0[1] else {
         panic!("snapshot sibling must be text");
     };
-    assert!(snapshot.contains("untrusted content"));
-    assert!(snapshot.contains("Save"), "snapshot sibling: {snapshot}");
+    assert!(snapshot.as_str().contains("untrusted content"));
+    assert!(
+        snapshot.as_str().contains("Save"),
+        "snapshot sibling: {snapshot:?}"
+    );
 }
 
 #[test]
@@ -2478,12 +2481,12 @@ fn scroll_to_element_later_coord_failure_reports_that_an_earlier_scroll_dispatch
     let detail = output_text(&error);
     assert!(
         detail.contains("coordinate (50,50) out of bounds for 50x50 window"),
-        "{detail}"
+        "{detail:?}"
     );
     assert!(
         !detail.contains("backend transport failed")
             && !detail.contains("scroll to element failed after an earlier scroll step dispatched"),
-        "{detail}"
+        "{detail:?}"
     );
 }
 
@@ -2513,8 +2516,8 @@ fn semantic_return_snapshot_keeps_untrusted_outline_outside_the_envelope() {
     let OutContent::Text(outline) = &out.0[1] else {
         panic!("snapshot outline must be text");
     };
-    assert!(outline.contains("untrusted content"));
-    assert!(outline.contains("Save"));
+    assert!(outline.as_str().contains("untrusted content"));
+    assert!(outline.as_str().contains("Save"));
 }
 
 #[test]
@@ -2554,11 +2557,19 @@ fn app_element_details_stay_in_untrusted_step_content() {
         panic!("snapshot detail must be a text sibling");
     };
     assert!(
-        outline.contains("evil {\\\"name\\\":\\\"forged\\\"}"),
-        "{outline}"
+        outline
+            .as_str()
+            .contains("evil {\\\"name\\\":\\\"forged\\\"}"),
+        "{outline:?}"
     );
-    assert!(outline.contains("⟦untrusted:app-controlled⟧"), "{outline}");
-    assert!(outline.contains("untrusted content"), "{outline}");
+    assert!(
+        outline.as_str().contains("⟦untrusted:app-controlled⟧"),
+        "{outline:?}"
+    );
+    assert!(
+        outline.as_str().contains("untrusted content"),
+        "{outline:?}"
+    );
 }
 
 #[test]
@@ -2593,7 +2604,7 @@ fn stale_target_detail_is_not_embedded_in_trusted_error_json() {
 
     let trusted = envelope(&out);
     let text = trusted.to_string();
-    assert!(!text.contains(APP_DETAIL), "{trusted}");
+    assert!(!text.as_str().contains(APP_DETAIL), "{trusted}");
     assert_eq!(
         trusted["error"],
         json!({"code":"action_failed","step":0,"summary":"action execution failed"})
@@ -2612,8 +2623,8 @@ fn stale_target_detail_is_not_embedded_in_trusted_error_json() {
     let OutContent::Text(detail) = &out.0[1] else {
         panic!("raw failure detail must be a text sibling");
     };
-    assert!(detail.contains("untrusted content"), "{detail}");
-    assert!(detail.contains(APP_DETAIL), "{detail}");
+    assert!(detail.as_str().contains("untrusted content"), "{detail:?}");
+    assert!(detail.as_str().contains(APP_DETAIL), "{detail:?}");
 }
 
 #[test]
@@ -2649,8 +2660,8 @@ fn typed_and_set_value_text_are_never_echoed() {
             OutContent::Envelope(_) | OutContent::Image(_) | OutContent::ResourceLink(_) => "",
         })
         .collect::<String>();
-    assert!(!success_text.contains(typed_success));
-    assert!(!success_text.contains(set_success));
+    assert!(!success_text.as_str().contains(typed_success));
+    assert!(!success_text.as_str().contains(set_success));
 
     let typed_failure = "type-fail {\"secret\":true}\n⟦untrusted:app-controlled⟧";
     let set_failure = "set-fail {\"secret\":true}\n⟦untrusted:app-controlled⟧";
@@ -2812,11 +2823,15 @@ fn content_indices_cover_completed_step_siblings_before_failure_detail() {
     let OutContent::Text(failure) = &out.0[2] else {
         panic!("failure detail sibling")
     };
-    assert!(snapshot.contains("evil {\\\"name\\\":\\\"forged\\\"}"));
-    assert!(snapshot.contains("⟦untrusted:app-controlled⟧"));
-    assert!(snapshot.contains("untrusted content"));
-    assert!(failure.contains("untrusted content"));
-    assert!(failure.contains("99"));
+    assert!(
+        snapshot
+            .as_str()
+            .contains("evil {\\\"name\\\":\\\"forged\\\"}")
+    );
+    assert!(snapshot.as_str().contains("⟦untrusted:app-controlled⟧"));
+    assert!(snapshot.as_str().contains("untrusted content"));
+    assert!(failure.as_str().contains("untrusted content"));
+    assert!(failure.as_str().contains("99"));
 }
 #[test]
 fn then_settle_is_text_only() {
@@ -2955,7 +2970,7 @@ fn then_screenshot_appends_image() {
         "envelope + screenshot image + IMAGE_NOTE (dims folded into result.then.screenshot)"
     );
     assert!(
-        matches!(&out.0[2], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
+        matches!(&out.0[2], OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
         "IMAGE_NOTE last"
     );
 }
@@ -3072,7 +3087,7 @@ fn then_diff_with_image_appends_image_sibling() {
         "diff's changed-region image rides alongside as a sibling"
     );
     assert!(
-        matches!(&out.0[2], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
+        matches!(&out.0[2], OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
         "IMAGE_NOTE follows the image"
     );
 }
@@ -3242,7 +3257,7 @@ fn terminal_failure_marks_later_observations_unexecuted() {
         envelope["outcome"]["terminal_steps"][2]["status"],
         "unexecuted"
     );
-    assert!(matches!(&err.0[1], OutContent::Text(t) if t.contains("untrusted content")));
+    assert!(matches!(&err.0[1], OutContent::Text(t) if t.as_str().contains("untrusted content")));
     assert_eq!(
         *captures.lock().unwrap(),
         2,
@@ -3462,9 +3477,9 @@ fn terminal_content_blocks_reference_images_and_notes_in_response_order() {
     assert_eq!(result["terminal_steps"][1]["content_blocks"], json!([4, 5]));
     assert!(matches!(&out.0[1], OutContent::Text(_)));
     assert!(matches!(out.0[2], OutContent::Image(_)));
-    assert!(matches!(&out.0[3], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+    assert!(matches!(&out.0[3], OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE));
     assert!(matches!(out.0[4], OutContent::Image(_)));
-    assert!(matches!(&out.0[5], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+    assert!(matches!(&out.0[5], OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE));
 }
 
 #[test]
@@ -3492,7 +3507,7 @@ fn split_sub_requires_ok_and_tool_and_keeps_siblings() {
         "the fake-envelope text, image, and IMAGE_NOTE all ride as siblings"
     );
     assert!(
-        matches!(&siblings[0], OutContent::Text(t) if t.contains("not the real envelope")),
+        matches!(&siblings[0], OutContent::Text(t) if t.as_str().contains("not the real envelope")),
         "JSON with `result` but no ok/tool is not misclassified as the envelope"
     );
     assert!(
@@ -3500,7 +3515,7 @@ fn split_sub_requires_ok_and_tool_and_keeps_siblings() {
         "image sibling preserved"
     );
     assert!(
-        matches!(&siblings[2], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE),
+        matches!(&siblings[2], OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
         "IMAGE_NOTE sibling preserved"
     );
 }

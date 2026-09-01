@@ -2,6 +2,66 @@ use super::*;
 use std::fs;
 use std::sync::Arc;
 
+#[cfg(unix)]
+#[test]
+fn store_preserves_operator_root_and_keeps_owned_children_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("operator-root");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    let unrelated = root.join("operator-owned.txt");
+    fs::write(&unrelated, "leave me alone").unwrap();
+
+    let store = ArtifactStore::for_test(&root, 1024).unwrap();
+    let process_dir = store.process_dir().to_owned();
+    let lease_path = store.lease_path().to_owned();
+
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(&process_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&lease_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(fs::read_to_string(&unrelated).unwrap(), "leave me alone");
+
+    store.shutdown().unwrap();
+
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(fs::read_to_string(&unrelated).unwrap(), "leave me alone");
+}
+
+#[cfg(windows)]
+#[test]
+fn store_preserves_existing_operator_root_dacl_posture() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("operator-root");
+    fs::create_dir(&root).unwrap();
+    let unrelated = root.join("operator-owned.txt");
+    fs::write(&unrelated, "leave me alone").unwrap();
+    assert!(!glass_windows::path_has_private_dacl(&root).unwrap());
+
+    let store = ArtifactStore::for_test(&root, 1024).unwrap();
+    assert!(!glass_windows::path_has_private_dacl(&root).unwrap());
+    assert!(glass_windows::path_has_private_dacl(&store.process_dir()).unwrap());
+    assert!(glass_windows::path_has_private_dacl(&store.lease_path()).unwrap());
+
+    store.shutdown().unwrap();
+
+    assert!(!glass_windows::path_has_private_dacl(&root).unwrap());
+    assert_eq!(fs::read_to_string(&unrelated).unwrap(), "leave me alone");
+}
+
 fn draft(text: &str) -> ArtifactDraft {
     ArtifactDraft::content_block(text, "text/plain; charset=utf-8", true, 1)
 }

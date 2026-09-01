@@ -728,14 +728,14 @@ mod tests {
         match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
-                    t.starts_with(crate::untrusted::NOTE),
-                    "must be marked untrusted: {t}"
+                    t.as_str().starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t:?}"
                 );
                 assert!(
-                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "enveloped: {t}"
+                    t.as_str().contains("⟦untrusted:") && t.as_str().contains("⟦/untrusted:"),
+                    "enveloped: {t:?}"
                 );
-                assert!(t.contains("\"text\":\"ready\""));
+                assert!(t.as_str().contains("\"text\":\"ready\""));
             }
             _ => panic!("expected untrusted lines text as second item"),
         }
@@ -876,10 +876,9 @@ mod tests {
             "first item must be Image"
         );
         // IMAGE_NOTE is present
-        let has_note = out
-            .0
-            .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        let has_note = out.0.iter().any(
+            |c| matches!(c, OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
+        );
         assert!(
             has_note,
             "IMAGE_NOTE must be present when include_image=true"
@@ -912,10 +911,9 @@ mod tests {
         };
         let out = wait_stable(&mut g, &a).unwrap();
         // no image -> no IMAGE_NOTE
-        let has_note = out
-            .0
-            .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        let has_note = out.0.iter().any(
+            |c| matches!(c, OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
+        );
         assert!(
             !has_note,
             "IMAGE_NOTE must NOT appear in text-only (include_image=false) result"
@@ -924,7 +922,7 @@ mod tests {
         let has_envelope = out
             .0
             .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t.contains("⟦untrusted:")));
+            .any(|c| matches!(c, OutContent::Text(t) if t.as_str().contains("⟦untrusted:")));
         assert!(!has_envelope, "no envelope markers in text-only result");
     }
 
@@ -951,7 +949,7 @@ mod tests {
         // third item is the IMAGE_NOTE
         match &out.0[2] {
             OutContent::Text(t) => assert_eq!(
-                t,
+                t.as_str(),
                 crate::untrusted::IMAGE_NOTE,
                 "third item must be IMAGE_NOTE"
             ),
@@ -993,16 +991,15 @@ mod tests {
             out.0.len()
         );
         // IMAGE_NOTE is present
-        let has_note = out
-            .0
-            .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        let has_note = out.0.iter().any(
+            |c| matches!(c, OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
+        );
         assert!(
             has_note,
             "IMAGE_NOTE must be present when image is included"
         );
         // metrics text is NOT enveloped
-        let metrics_enveloped = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t.contains("changed_pixels") && t.contains("⟦untrusted:")));
+        let metrics_enveloped = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t.as_str().contains("changed_pixels") && t.as_str().contains("⟦untrusted:")));
         assert!(!metrics_enveloped, "metrics text must NOT be enveloped");
     }
 
@@ -1025,16 +1022,15 @@ mod tests {
         )
         .unwrap();
         // no image -> no note
-        let has_note = out
-            .0
-            .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        let has_note = out.0.iter().any(
+            |c| matches!(c, OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
+        );
         assert!(!has_note, "no IMAGE_NOTE when nothing changed");
         // no envelope markers anywhere
         let has_envelope = out
             .0
             .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t.contains("⟦untrusted:")));
+            .any(|c| matches!(c, OutContent::Text(t) if t.as_str().contains("⟦untrusted:")));
         assert!(!has_envelope, "no envelope markers on metrics-only result");
     }
 }
