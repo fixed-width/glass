@@ -6144,9 +6144,11 @@ mod session_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        BwrapStatusPipe, PendingWaylandSession, launch_ready, nudge_x, parse_sway_version,
-        reap_pending, start_recovery_after,
+        BwrapStatusPipe, PendingWaylandSession, WaylandPlatform, find_wayland_socket, launch_ready,
+        nudge_x, open_session, parse_sway_version, reap_pending, start_recovery_after,
     };
+    use crate::command::{build_sway_command, sway_config};
+    use glass_core::{AppSpec, SandboxLevel};
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
@@ -6221,6 +6223,85 @@ mod tests {
         assert!(
             !glass_proc_linux::any_alive(&target_tree),
             "late-reported target tree survived cleanup: {target_tree:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor; needs sway >=1.12 and Mesa"]
+    fn open_session_ipc_discovery_stops_at_the_shared_deadline() {
+        let runtime_dir = tempfile::Builder::new()
+            .prefix("glass-wl-deadline.")
+            .tempdir()
+            .expect("private runtime directory");
+        let config = runtime_dir.path().join("sway.cfg");
+        let spec = AppSpec {
+            build: None,
+            run: vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 5_000,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        };
+        std::fs::write(
+            &config,
+            sway_config(&spec, runtime_dir.path(), None, None, &[]).expect("sway config"),
+        )
+        .expect("write sway config");
+        let platform = WaylandPlatform::new().expect("sway >=1.12");
+        let mut command =
+            build_sway_command(&platform.sway, &config, &spec, runtime_dir.path(), None);
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let child = command.spawn().expect("start private sway");
+        let mut pending = PendingWaylandSession {
+            child,
+            status: None,
+            ownership_root: None,
+        };
+        let mut cleanup = PendingCleanup(Some(&mut pending));
+
+        let setup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (socket, ipc_socket) = loop {
+            let socket = find_wayland_socket(runtime_dir.path());
+            let ipc_socket = std::fs::read_dir(runtime_dir.path())
+                .expect("read private runtime directory")
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("sway-ipc.") && name.ends_with(".sock")
+                        })
+                });
+            if let (Some(socket), Some(ipc_socket)) = (socket, ipc_socket) {
+                break (socket, ipc_socket);
+            }
+            assert!(
+                std::time::Instant::now() < setup_deadline,
+                "private sway did not publish both sockets"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        super::Ipc::connect(runtime_dir.path())
+            .expect("published IPC socket must accept connections");
+        std::fs::remove_file(&ipc_socket).expect("unlink IPC socket");
+
+        let budget = std::time::Duration::from_millis(250);
+        let started = std::time::Instant::now();
+        let error = match open_session(&socket, runtime_dir.path(), started + budget) {
+            Ok(_) => panic!("IPC discovery succeeded after its socket was unlinked"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+
+        cleanup.reap();
+        cleanup.disarm();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(150)
+                && elapsed < std::time::Duration::from_millis(900),
+            "session setup ignored its 250ms shared deadline and took {elapsed:?}: {error}"
         );
     }
 
