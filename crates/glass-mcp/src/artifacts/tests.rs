@@ -1,5 +1,6 @@
 use super::*;
 use std::fs;
+use std::sync::Arc;
 
 fn draft(text: &str) -> ArtifactDraft {
     ArtifactDraft::content_block(text, "text/plain; charset=utf-8", true, 1)
@@ -32,6 +33,79 @@ fn oldest_unpinned_artifact_is_evicted_and_reads_do_not_refresh_age() {
     );
     assert_eq!(store.read(&second_uri).unwrap().text, "bbbbbb");
     assert_eq!(store.read(&third_uri).unwrap().text, "cccccc");
+}
+
+#[test]
+fn absent_valid_current_server_id_is_expired_but_malformed_and_foreign_ids_are_not_found() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let unknown = format!("glass-artifact://{}/{}", store.server_id(), "a".repeat(32));
+
+    assert_eq!(
+        store.read(&unknown).unwrap_err(),
+        ArtifactReadError::ExpiredOrUnavailable
+    );
+    assert_eq!(
+        store
+            .read("glass-artifact://foreign/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap_err(),
+        ArtifactReadError::ResourceNotFound
+    );
+    assert_eq!(
+        store
+            .read(&format!("glass-artifact://{}/bad", store.server_id()))
+            .unwrap_err(),
+        ArtifactReadError::ResourceNotFound
+    );
+}
+
+#[test]
+fn sequence_overflow_is_bounded_and_rolls_back_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    store.set_next_seq_for_test(u64::MAX);
+    let prepared = store.prepare(draft("overflow")).unwrap();
+
+    assert!(matches!(
+        store.publish(vec![prepared]),
+        Err(ArtifactError::InvalidOutputState)
+    ));
+    assert_eq!(store.registry_len(), 0);
+    assert_eq!(fs::read_dir(store.process_dir()).unwrap().count(), 0);
+}
+
+#[test]
+fn concurrent_publishers_reserve_the_final_sequence_once() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    store.set_next_seq_for_test(u64::MAX - 1);
+    let first = store.prepare(draft("first")).unwrap();
+    let second = store.prepare(draft("second")).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let mut threads = Vec::new();
+    for prepared in [first, second] {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            store.publish(vec![prepared])
+        }));
+    }
+    barrier.wait();
+    let results = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(ArtifactError::InvalidOutputState)))
+            .count(),
+        1
+    );
+    assert_eq!(store.registry_len(), 1);
 }
 
 #[test]
@@ -340,6 +414,102 @@ fn shutdown_retries_each_incomplete_cleanup_phase() {
         assert!(!lease_path.exists());
         drop(batch);
     }
+}
+
+#[test]
+fn shutdown_retry_advances_when_process_directory_was_removed_externally() {
+    let root = tempfile::tempdir().unwrap();
+    let store =
+        ArtifactStore::for_test_with_fault(root.path(), 1024, FaultStage::ShutdownRemoveContents)
+            .unwrap();
+    let lease = store.lease_path();
+    assert!(store.shutdown().is_err());
+    fs::remove_dir_all(store.process_dir()).unwrap();
+
+    store.shutdown().unwrap();
+
+    assert!(!lease.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_removes_fifo_and_socket_residue() {
+    use std::os::unix::net::UnixListener;
+
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let fifo = store.process_dir().join("fifo");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    let socket = store.process_dir().join("socket");
+    let listener = UnixListener::bind(&socket).unwrap();
+
+    store.shutdown().unwrap();
+    drop(listener);
+
+    assert!(!fifo.exists());
+    assert!(!socket.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn retention_and_shutdown_do_not_follow_a_replaced_process_path() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "outside").unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1).unwrap();
+    let batch = store
+        .publish(vec![store.prepare(draft("retained")).unwrap()])
+        .unwrap();
+    let detached = root.path().join("detached-process");
+    fs::rename(store.process_dir(), &detached).unwrap();
+    symlink(outside.path(), store.process_dir()).unwrap();
+
+    drop(batch);
+    assert_eq!(store.total_file_bytes().unwrap(), 0);
+    assert!(store.shutdown().is_err());
+    assert_eq!(fs::read_to_string(&sentinel).unwrap(), "outside");
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_preserves_a_replacement_lease() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let lease = store.lease_path();
+    let retained = root.path().join("retained-lease");
+    fs::rename(&lease, &retained).unwrap();
+    fs::write(&lease, "replacement").unwrap();
+
+    assert!(store.shutdown().is_err());
+    assert_eq!(fs::read_to_string(&lease).unwrap(), "replacement");
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_uses_the_retained_root_after_ancestor_replacement() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let store = ArtifactStore::for_test(&root, 1024).unwrap();
+    let detached = parent.path().join("detached-root");
+    fs::rename(&root, &detached).unwrap();
+    fs::create_dir(&root).unwrap();
+    let sentinel = root.join("sentinel");
+    fs::write(&sentinel, "replacement").unwrap();
+
+    store.shutdown().unwrap();
+
+    assert_eq!(fs::read_to_string(&sentinel).unwrap(), "replacement");
 }
 
 #[test]

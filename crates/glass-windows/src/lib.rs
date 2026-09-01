@@ -31,8 +31,9 @@ pub mod vkmap; // pure named-keysym->VK map — cross-platform, host-tested
 
 #[cfg(windows)]
 pub use host_fs::{
-    HostFsError, file_matches_path_no_reparse, open_directory_no_reparse, open_file_beneath,
-    path_has_private_dacl, restrict_path_to_current_user,
+    HostFsError, directory_entry_names, file_matches_path_no_reparse, open_directory_beneath,
+    open_directory_no_reparse, open_entry_child, open_file_beneath, open_file_child,
+    path_has_private_dacl, remove_by_handle, restrict_path_to_current_user, same_file_object,
 };
 
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).

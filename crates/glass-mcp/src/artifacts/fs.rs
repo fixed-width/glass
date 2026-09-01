@@ -7,7 +7,9 @@ use crate::output::{ArtifactDescriptor, ArtifactKind};
 use fs4::FileExt;
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -55,13 +57,13 @@ struct ArtifactStoreInner {
 
 struct StoreState {
     root: PathBuf,
+    root_handle: Option<File>,
     process_dir: PathBuf,
     lease_path: PathBuf,
     lease: Option<File>,
     process_dir_handle: Option<File>,
     server_id: String,
     entries: HashMap<String, RegistryEntry>,
-    expired_ids: HashSet<String>,
     next_seq: u64,
     limit_bytes: u64,
     availability_error: Option<ArtifactError>,
@@ -278,7 +280,8 @@ impl ArtifactStore {
         set_dir_private(root)?;
         let root = fs::canonicalize(root).map_err(|_| ArtifactError::RootCanonicalizeFailed)?;
         require_absolute_utf8(&root)?;
-        scavenge_root(&root, None)?;
+        let root_handle = open_process_directory(&root)?;
+        scavenge_root_from_handle(&root, &root_handle, None)?;
         let process_dir = root.join(format!("server-{server_id}"));
         let lease_path = root.join(format!("server-{server_id}.lease"));
         require_immediate_child(&root, &process_dir)?;
@@ -315,13 +318,13 @@ impl ArtifactStore {
             inner: Arc::new(ArtifactStoreInner {
                 state: Mutex::new(StoreState {
                     root,
+                    root_handle: Some(root_handle),
                     process_dir,
                     lease_path,
                     lease: Some(lease),
                     process_dir_handle: Some(process_dir_handle),
                     server_id,
                     entries: HashMap::new(),
-                    expired_ids: HashSet::new(),
                     next_seq: 0,
                     limit_bytes,
                     availability_error: None,
@@ -393,12 +396,6 @@ impl ArtifactStore {
             if state.lifecycle != Lifecycle::Open || state.availability_error.is_some() {
                 return Err(ArtifactError::InvalidOutputState);
             }
-            let count =
-                u64::try_from(prepared.len()).map_err(|_| ArtifactError::InvalidOutputState)?;
-            state
-                .next_seq
-                .checked_add(count)
-                .ok_or(ArtifactError::InvalidOutputState)?;
         }
 
         let mut created = Vec::with_capacity(prepared.len() * 2);
@@ -425,9 +422,14 @@ impl ArtifactStore {
             drop(state);
             return self.rollback_publication(&created, ArtifactError::InvalidOutputState);
         }
-        for item in prepared {
-            let seq = state.next_seq;
-            state.next_seq += 1;
+        let count = u64::try_from(prepared.len()).map_err(|_| ArtifactError::InvalidOutputState)?;
+        let Some(next_seq) = state.next_seq.checked_add(count) else {
+            drop(state);
+            return self.rollback_publication(&created, ArtifactError::InvalidOutputState);
+        };
+        let first_seq = state.next_seq;
+        state.next_seq = next_seq;
+        for (seq, item) in (first_seq..next_seq).zip(prepared) {
             state.entries.insert(
                 item.id,
                 RegistryEntry {
@@ -541,11 +543,7 @@ impl ArtifactStore {
                 .try_clone()
                 .map_err(|_| ArtifactReadError::ReadFailed)?;
             if !state.entries.contains_key(id) {
-                return if state.expired_ids.contains(id) {
-                    Err(ArtifactReadError::ExpiredOrUnavailable)
-                } else {
-                    Err(ArtifactReadError::ResourceNotFound)
-                };
+                return Err(ArtifactReadError::ExpiredOrUnavailable);
             }
             let Some(entry) = state.entries.get_mut(id) else {
                 return Err(ArtifactReadError::ExpiredOrUnavailable);
@@ -644,7 +642,13 @@ impl ArtifactStore {
             return Ok(());
         }
         loop {
-            if process_file_bytes_no_follow(&state.process_dir)? <= state.limit_bytes {
+            let process_handle = state
+                .process_dir_handle
+                .as_ref()
+                .ok_or(ArtifactError::InvalidOutputState)?;
+            if process_file_bytes_from_handle(process_handle, &state.process_dir)?
+                <= state.limit_bytes
+            {
                 return Ok(());
             }
             let candidate = state
@@ -656,9 +660,9 @@ impl ArtifactStore {
             let Some((id, path)) = candidate else {
                 return Ok(());
             };
-            remove_regular_file_no_follow(&path)?;
+            let filename = path.file_name().ok_or(ArtifactError::InvalidOutputState)?;
+            remove_regular_file_from_handle(process_handle, &state.process_dir, filename)?;
             state.entries.remove(&id);
-            state.expired_ids.insert(id);
         }
     }
 
@@ -669,7 +673,11 @@ impl ArtifactStore {
             .state
             .lock()
             .map_err(|_| ArtifactError::StatePoisoned)?;
-        process_file_bytes_no_follow(&state.process_dir)
+        let handle = state
+            .process_dir_handle
+            .as_ref()
+            .ok_or(ArtifactError::InvalidOutputState)?;
+        process_file_bytes_from_handle(handle, &state.process_dir)
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), ArtifactError> {
@@ -690,7 +698,15 @@ impl ArtifactStore {
                 FaultStage::ShutdownRemoveContents,
                 ArtifactError::CleanupFailed(std::io::ErrorKind::PermissionDenied),
             )?;
-            remove_owned_contents(&state.process_dir)?;
+            let result = match state.process_dir_handle.as_ref() {
+                Some(handle) => remove_owned_contents_from_handle(handle, &state.process_dir),
+                None => Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)),
+            };
+            match result {
+                Ok(()) => {}
+                Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)) => {}
+                Err(error) => return Err(error),
+            }
             progress.contents_removed = true;
             state.lifecycle = Lifecycle::Closing(progress);
         }
@@ -699,12 +715,45 @@ impl ArtifactStore {
                 FaultStage::ShutdownRemoveDirectory,
                 ArtifactError::CleanupFailed(std::io::ErrorKind::PermissionDenied),
             )?;
-            match fs::remove_dir(&state.process_dir) {
+            let root_handle = state
+                .root_handle
+                .as_ref()
+                .ok_or(ArtifactError::InvalidOutputState)?;
+            let process_name = state
+                .process_dir
+                .file_name()
+                .ok_or(ArtifactError::InvalidOutputState)?;
+            match remove_directory_from_handle(root_handle, &state.root, process_name) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ArtifactError::CleanupFailed(error.kind())),
+                Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)) => {}
+                Err(error) => return Err(error),
             }
             progress.directory_removed = true;
+            state.lifecycle = Lifecycle::Closing(progress);
+        }
+        if !progress.lease_removed {
+            self.fail_at(
+                FaultStage::ShutdownRemoveLease,
+                ArtifactError::CleanupFailed(std::io::ErrorKind::PermissionDenied),
+            )?;
+            let root_handle = state
+                .root_handle
+                .as_ref()
+                .ok_or(ArtifactError::InvalidOutputState)?;
+            let lease_name = state
+                .lease_path
+                .file_name()
+                .ok_or(ArtifactError::InvalidOutputState)?;
+            let lease = state
+                .lease
+                .as_ref()
+                .ok_or(ArtifactError::InvalidOutputState)?;
+            match remove_locked_lease_from_handle(root_handle, &state.root, lease_name, lease) {
+                Ok(()) => {}
+                Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)) => {}
+                Err(error) => return Err(error),
+            }
+            progress.lease_removed = true;
             state.lifecycle = Lifecycle::Closing(progress);
         }
         if !progress.handles_closed {
@@ -717,21 +766,8 @@ impl ArtifactStore {
             progress.handles_closed = true;
             state.lifecycle = Lifecycle::Closing(progress);
         }
-        if !progress.lease_removed {
-            self.fail_at(
-                FaultStage::ShutdownRemoveLease,
-                ArtifactError::CleanupFailed(std::io::ErrorKind::PermissionDenied),
-            )?;
-            match fs::remove_file(&state.lease_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ArtifactError::CleanupFailed(error.kind())),
-            }
-            progress.lease_removed = true;
-            state.lifecycle = Lifecycle::Closing(progress);
-        }
         state.entries.clear();
-        state.expired_ids.clear();
+        drop(state.root_handle.take());
         state.lifecycle = Lifecycle::Closed;
         Ok(())
     }
@@ -759,6 +795,13 @@ impl ArtifactStore {
             let _guard = inner.state.lock().unwrap();
             panic!("poison artifact state for drop coverage");
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_seq_for_test(&self, next_seq: u64) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.next_seq = next_seq;
+        }
     }
 }
 
@@ -995,7 +1038,7 @@ fn remove_owned_entry(path: &Path) -> Result<(), ArtifactError> {
         remove_owned_contents(path)?;
         return fs::remove_dir(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()));
     }
-    if metadata.is_file() {
+    if !metadata.is_dir() {
         return fs::remove_file(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()));
     }
     Err(ArtifactError::CleanupFailed(
@@ -1059,49 +1102,360 @@ fn remove_regular_file_no_follow(path: &Path) -> Result<(), ArtifactError> {
     fs::remove_file(path).map_err(|error| ArtifactError::CleanupFailed(error.kind()))
 }
 
+#[cfg(unix)]
+fn handle_directory_entries(handle: &File) -> Result<Vec<OsString>, ArtifactError> {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "linux")]
+    let directory = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+    #[cfg(not(target_os = "linux"))]
+    let directory = PathBuf::from(format!("/dev/fd/{}", handle.as_raw_fd()));
+    fs::read_dir(directory)
+        .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| ArtifactError::CleanupFailed(error.kind()))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn open_directory_from_handle(parent: &File, name: &OsStr) -> Result<File, ArtifactError> {
+    let fd = rustix::fs::openat(
+        parent,
+        Path::new(name),
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| ArtifactError::CleanupFailed(std::io::Error::from(error).kind()))?;
+    Ok(File::from(fd))
+}
+
+#[cfg(unix)]
+fn remove_owned_contents_from_handle(handle: &File, _path: &Path) -> Result<(), ArtifactError> {
+    for name in handle_directory_entries(handle)? {
+        match open_directory_from_handle(handle, &name) {
+            Ok(child) => {
+                remove_owned_contents_from_handle(&child, Path::new("."))?;
+                drop(child);
+                remove_directory_from_handle(handle, Path::new("."), &name)?;
+            }
+            Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)) => {}
+            Err(_) => remove_non_directory_from_handle(handle, Path::new("."), &name)?,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_directory_from_handle(
+    parent: &File,
+    _path: &Path,
+    name: &OsStr,
+) -> Result<(), ArtifactError> {
+    rustix::fs::unlinkat(parent, Path::new(name), rustix::fs::AtFlags::REMOVEDIR)
+        .map_err(|error| ArtifactError::CleanupFailed(std::io::Error::from(error).kind()))
+}
+
+#[cfg(unix)]
+fn remove_non_directory_from_handle(
+    parent: &File,
+    _path: &Path,
+    name: &OsStr,
+) -> Result<(), ArtifactError> {
+    rustix::fs::unlinkat(parent, Path::new(name), rustix::fs::AtFlags::empty())
+        .map_err(|error| ArtifactError::CleanupFailed(std::io::Error::from(error).kind()))
+}
+
+#[cfg(unix)]
+fn remove_regular_file_from_handle(
+    parent: &File,
+    _path: &Path,
+    name: &OsStr,
+) -> Result<(), ArtifactError> {
+    let fd = rustix::fs::openat(
+        parent,
+        Path::new(name),
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| ArtifactError::CleanupFailed(std::io::Error::from(error).kind()))?;
+    let file = File::from(fd);
+    if !file
+        .metadata()
+        .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?
+        .is_file()
+    {
+        return Err(ArtifactError::CleanupFailed(
+            std::io::ErrorKind::InvalidInput,
+        ));
+    }
+    drop(file);
+    remove_non_directory_from_handle(parent, Path::new("."), name)
+}
+
+#[cfg(unix)]
+fn process_file_bytes_from_handle(handle: &File, _path: &Path) -> Result<u64, ArtifactError> {
+    let mut total = 0_u64;
+    for name in handle_directory_entries(handle)? {
+        if let Ok(child) = open_directory_from_handle(handle, &name) {
+            total = total
+                .checked_add(process_file_bytes_from_handle(&child, Path::new("."))?)
+                .ok_or(ArtifactError::InvalidOutputState)?;
+            continue;
+        }
+        let fd = match rustix::fs::openat(
+            handle,
+            Path::new(&name),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(_) => continue,
+        };
+        let metadata = File::from(fd)
+            .metadata()
+            .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+        if metadata.is_file() {
+            total = total
+                .checked_add(metadata.len())
+                .ok_or(ArtifactError::InvalidOutputState)?;
+        }
+    }
+    Ok(total)
+}
+
+#[cfg(windows)]
+fn remove_owned_contents_from_handle(handle: &File, _path: &Path) -> Result<(), ArtifactError> {
+    for name in glass_windows::directory_entry_names(handle).map_err(map_host_cleanup)? {
+        match glass_windows::open_directory_beneath(handle, &name) {
+            Ok(child) => {
+                remove_owned_contents_from_handle(&child, Path::new("."))?;
+                glass_windows::remove_by_handle(&child).map_err(map_host_cleanup)?;
+            }
+            Err(_) => {
+                let child =
+                    glass_windows::open_entry_child(handle, &name).map_err(map_host_cleanup)?;
+                glass_windows::remove_by_handle(&child).map_err(map_host_cleanup)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn remove_directory_from_handle(
+    parent: &File,
+    _path: &Path,
+    name: &std::ffi::OsStr,
+) -> Result<(), ArtifactError> {
+    let child = glass_windows::open_directory_beneath(parent, name).map_err(map_host_cleanup)?;
+    glass_windows::remove_by_handle(&child).map_err(map_host_cleanup)
+}
+
+#[cfg(windows)]
+fn remove_non_directory_from_handle(
+    parent: &File,
+    _path: &Path,
+    name: &std::ffi::OsStr,
+) -> Result<(), ArtifactError> {
+    let child = glass_windows::open_entry_child(parent, name).map_err(map_host_cleanup)?;
+    glass_windows::remove_by_handle(&child).map_err(map_host_cleanup)
+}
+
+#[cfg(windows)]
+fn remove_regular_file_from_handle(
+    parent: &File,
+    _path: &Path,
+    name: &std::ffi::OsStr,
+) -> Result<(), ArtifactError> {
+    let child = glass_windows::open_file_child(parent, name).map_err(map_host_cleanup)?;
+    glass_windows::remove_by_handle(&child).map_err(map_host_cleanup)
+}
+
+#[cfg(windows)]
+fn process_file_bytes_from_handle(handle: &File, _path: &Path) -> Result<u64, ArtifactError> {
+    let mut total = 0_u64;
+    for name in glass_windows::directory_entry_names(handle).map_err(map_host_cleanup)? {
+        if let Ok(child) = glass_windows::open_directory_beneath(handle, &name) {
+            total = total
+                .checked_add(process_file_bytes_from_handle(&child, Path::new("."))?)
+                .ok_or(ArtifactError::InvalidOutputState)?;
+        } else if let Ok(child) = glass_windows::open_file_child(handle, &name) {
+            total = total
+                .checked_add(
+                    child
+                        .metadata()
+                        .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?
+                        .len(),
+                )
+                .ok_or(ArtifactError::InvalidOutputState)?;
+        }
+    }
+    Ok(total)
+}
+
+#[cfg(windows)]
+fn map_host_cleanup(_error: glass_windows::HostFsError) -> ArtifactError {
+    ArtifactError::CleanupFailed(std::io::ErrorKind::Other)
+}
+
 fn scavenge_root(root: &Path, lease_open_fault: Option<&Path>) -> Result<(), ArtifactError> {
-    for child in fs::read_dir(root).map_err(|error| ArtifactError::CleanupFailed(error.kind()))? {
-        let child = child.map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
-        let name = child.file_name();
-        let Some(name) = name.to_str() else {
+    let root_handle = open_process_directory(root)?;
+    scavenge_root_from_handle(root, &root_handle, lease_open_fault)
+}
+
+#[cfg(unix)]
+fn scavenge_root_from_handle(
+    root: &Path,
+    root_handle: &File,
+    lease_open_fault: Option<&Path>,
+) -> Result<(), ArtifactError> {
+    for name in handle_directory_entries(root_handle)? {
+        let Some(name_text) = name.to_str() else {
             continue;
         };
-        let Some(id) = exact_server_id(name) else {
+        let Some(id) = exact_server_id(name_text) else {
             continue;
         };
-        let process_dir = root.join(name);
-        let lease_path = root.join(format!("server-{id}.lease"));
-        if lease_open_fault == Some(lease_path.as_path()) {
+        let lease_name = OsString::from(format!("server-{id}.lease"));
+        if lease_open_fault == Some(root.join(&lease_name).as_path()) {
             continue;
         }
-        let Ok(process_metadata) = fs::symlink_metadata(&process_dir) else {
+        let Ok(process_handle) = open_directory_from_handle(root_handle, &name) else {
             continue;
         };
-        let Ok(lease_metadata) = fs::symlink_metadata(&lease_path) else {
-            continue;
+        let lease_fd = match rustix::fs::openat(
+            root_handle,
+            Path::new(&lease_name),
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(_) => continue,
         };
-        if !safe_directory_metadata(&process_metadata) || !safe_file_metadata(&lease_metadata) {
+        let lease = File::from(lease_fd);
+        if !lease.metadata().is_ok_and(|metadata| metadata.is_file()) {
             continue;
         }
-        let Ok(lease) = open_existing_lease_no_follow(&lease_path) else {
+        match FileExt::try_lock(&lease) {
+            Ok(()) => {}
+            Err(fs4::TryLockError::WouldBlock | fs4::TryLockError::Error(_)) => continue,
+        }
+        if remove_owned_contents_from_handle(&process_handle, Path::new(".")).is_err() {
+            continue;
+        }
+        drop(process_handle);
+        if remove_directory_from_handle(root_handle, root, &name).is_err() {
+            continue;
+        }
+        remove_locked_lease_from_handle(root_handle, root, &lease_name, &lease)?;
+        drop(lease);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn relative_file_matches_handle(parent: &File, name: &OsStr, retained: &File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(fd) = rustix::fs::openat(
+        parent,
+        Path::new(name),
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) else {
+        return false;
+    };
+    let current = File::from(fd);
+    let (Ok(current), Ok(retained)) = (current.metadata(), retained.metadata()) else {
+        return false;
+    };
+    current.is_file() && retained.dev() == current.dev() && retained.ino() == current.ino()
+}
+
+#[cfg(unix)]
+fn remove_locked_lease_from_handle(
+    parent: &File,
+    _path: &Path,
+    name: &OsStr,
+    retained: &File,
+) -> Result<(), ArtifactError> {
+    let quarantine = OsString::from(format!(".lease-cleanup-{}", random_id()));
+    rustix::fs::renameat(parent, Path::new(name), parent, Path::new(&quarantine))
+        .map_err(|error| ArtifactError::CleanupFailed(std::io::Error::from(error).kind()))?;
+    if relative_file_matches_handle(parent, &quarantine, retained) {
+        return remove_non_directory_from_handle(parent, Path::new("."), &quarantine);
+    }
+    let restore = rustix::fs::renameat(parent, Path::new(&quarantine), parent, Path::new(name));
+    match restore {
+        Ok(()) => Err(ArtifactError::CleanupFailed(
+            std::io::ErrorKind::InvalidInput,
+        )),
+        Err(error) => Err(ArtifactError::CleanupFailed(
+            std::io::Error::from(error).kind(),
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn remove_locked_lease_from_handle(
+    parent: &File,
+    _path: &Path,
+    name: &std::ffi::OsStr,
+    retained: &File,
+) -> Result<(), ArtifactError> {
+    let current = glass_windows::open_file_child(parent, name).map_err(map_host_cleanup)?;
+    if !glass_windows::same_file_object(retained, &current).unwrap_or(false) {
+        return Err(ArtifactError::CleanupFailed(
+            std::io::ErrorKind::InvalidInput,
+        ));
+    }
+    glass_windows::remove_by_handle(retained).map_err(map_host_cleanup)
+}
+
+#[cfg(windows)]
+fn scavenge_root_from_handle(
+    root: &Path,
+    root_handle: &File,
+    lease_open_fault: Option<&Path>,
+) -> Result<(), ArtifactError> {
+    for name in glass_windows::directory_entry_names(root_handle).map_err(map_host_cleanup)? {
+        let Some(name_text) = name.to_str() else {
+            continue;
+        };
+        let Some(id) = exact_server_id(name_text) else {
+            continue;
+        };
+        let lease_name = std::ffi::OsString::from(format!("server-{id}.lease"));
+        if lease_open_fault == Some(root.join(&lease_name).as_path()) {
+            continue;
+        }
+        let Ok(process_handle) = glass_windows::open_directory_beneath(root_handle, &name) else {
+            continue;
+        };
+        let Ok(lease) = glass_windows::open_file_child(root_handle, &lease_name) else {
             continue;
         };
         match FileExt::try_lock(&lease) {
             Ok(()) => {}
             Err(fs4::TryLockError::WouldBlock | fs4::TryLockError::Error(_)) => continue,
         }
-        if !lease_handle_matches_path(&lease, &lease_path) {
+        if remove_owned_contents_from_handle(&process_handle, Path::new(".")).is_err() {
             continue;
         }
-        if remove_owned_dir(&process_dir).is_err() {
+        if glass_windows::remove_by_handle(&process_handle).is_err() {
             continue;
         }
+        glass_windows::remove_by_handle(&lease).map_err(map_host_cleanup)?;
         drop(lease);
-        if let Err(error) = fs::remove_file(&lease_path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(ArtifactError::CleanupFailed(error.kind()));
-        }
     }
     Ok(())
 }

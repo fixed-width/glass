@@ -1,7 +1,7 @@
 use glass_core::GlassError;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
@@ -23,9 +23,12 @@ use windows::Win32::Security::{
     PSECURITY_DESCRIPTOR, SetFileSecurityW,
 };
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, SYNCHRONIZE,
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ID_BOTH_DIR_INFO, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, FileIdBothDirectoryRestartInfo,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, SYNCHRONIZE,
+    SetFileInformationByHandle,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::core::{PCWSTR, PWSTR};
@@ -80,6 +83,101 @@ pub fn open_file_beneath(
     open_file_beneath_with_hook(directory, directory_path, filename, |_| Ok(()))
 }
 
+/// Opens one single-component directory child relative to a retained directory handle.
+pub fn open_directory_beneath(directory: &File, filename: &OsStr) -> Result<File, HostFsError> {
+    open_relative(directory, filename, Some(true))
+}
+
+/// Opens one single-component regular-file child relative to a retained directory handle.
+pub fn open_file_child(directory: &File, filename: &OsStr) -> Result<File, HostFsError> {
+    open_relative(directory, filename, Some(false))
+}
+
+/// Opens a child entry itself, including a reparse object, relative to a retained directory.
+pub fn open_entry_child(directory: &File, filename: &OsStr) -> Result<File, HostFsError> {
+    open_relative(directory, filename, None)
+}
+
+/// Enumerates names from a retained directory handle without consulting its pathname.
+pub fn directory_entry_names(directory: &File) -> Result<Vec<std::ffi::OsString>, HostFsError> {
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    // SAFETY: `directory` is borrowed and live. `buffer` is writable for its full reported size.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(directory.as_raw_handle()),
+            FileIdBothDirectoryRestartInfo,
+            buffer.as_mut_ptr().cast(),
+            u32::try_from(buffer.len()).map_err(|_| HostFsError::Integrity)?,
+        )
+        .map_err(|_| HostFsError::Open)?;
+    }
+    parse_directory_names(&buffer)
+}
+
+/// Marks the exact retained filesystem object for deletion, without reopening a pathname.
+pub fn remove_by_handle(file: &File) -> Result<(), HostFsError> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: `file` is live and borrowed. `disposition` has the exact structure and byte size
+    // required by `FileDispositionInfoEx` and remains initialized for the call.
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            u32::try_from(std::mem::size_of_val(&disposition))
+                .map_err(|_| HostFsError::Integrity)?,
+        )
+        .map_err(|_| HostFsError::Open)
+    }
+}
+
+fn parse_directory_names(bytes: &[u8]) -> Result<Vec<std::ffi::OsString>, HostFsError> {
+    let mut names = Vec::new();
+    let mut offset = 0_usize;
+    loop {
+        if bytes.len().saturating_sub(offset) < std::mem::size_of::<FILE_ID_BOTH_DIR_INFO>() {
+            return Err(HostFsError::Integrity);
+        }
+        // SAFETY: The bounds check above covers the fixed record. The API aligns every record for
+        // this structure, and `offset` advances only by its validated `NextEntryOffset`.
+        let record = unsafe { &*bytes.as_ptr().add(offset).cast::<FILE_ID_BOTH_DIR_INFO>() };
+        let name_units = usize::try_from(record.FileNameLength)
+            .ok()
+            .and_then(|length| length.checked_div(std::mem::size_of::<u16>()))
+            .ok_or(HostFsError::Integrity)?;
+        let fixed = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+        let end = offset
+            .checked_add(fixed)
+            .and_then(|start| {
+                name_units
+                    .checked_mul(2)
+                    .and_then(|length| start.checked_add(length))
+            })
+            .filter(|end| *end <= bytes.len())
+            .ok_or(HostFsError::Integrity)?;
+        // SAFETY: The validated range contains `name_units` UTF-16 units and the record alignment
+        // guarantees the flexible filename member's u16 alignment.
+        let name = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr().add(offset + fixed).cast::<u16>(), name_units)
+        };
+        let name = std::ffi::OsString::from_wide(name);
+        if name != "." && name != ".." {
+            names.push(name);
+        }
+        if record.NextEntryOffset == 0 {
+            let _ = end;
+            break;
+        }
+        offset = offset
+            .checked_add(
+                usize::try_from(record.NextEntryOffset).map_err(|_| HostFsError::Integrity)?,
+            )
+            .filter(|next| *next > offset && *next < bytes.len())
+            .ok_or(HostFsError::Integrity)?;
+    }
+    Ok(names)
+}
+
 #[derive(Clone, Copy)]
 enum ChildOpenStage {
     BeforeOpen,
@@ -110,6 +208,18 @@ fn open_file_beneath_with_hook(
 }
 
 fn open_relative_file(directory: &File, filename: &OsStr) -> Result<File, HostFsError> {
+    open_relative(directory, filename, Some(false))
+}
+
+fn open_relative(
+    directory: &File,
+    filename: &OsStr,
+    directory_child: Option<bool>,
+) -> Result<File, HostFsError> {
+    let mut components = Path::new(filename).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(HostFsError::Integrity);
+    }
     let mut name = filename.encode_wide().collect::<Vec<_>>();
     if name.contains(&0) {
         return Err(HostFsError::Integrity);
@@ -148,14 +258,24 @@ fn open_relative_file(directory: &File, filename: &OsStr) -> Result<File, HostFs
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE | DELETE,
             &attributes,
             &mut status_block,
             None,
             FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_OPEN,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            directory_child.map_or_else(
+                windows::Wdk::Storage::FileSystem::NTCREATEFILE_CREATE_OPTIONS::default,
+                |is_directory| {
+                    if is_directory {
+                        windows::Wdk::Storage::FileSystem::FILE_DIRECTORY_FILE
+                    } else {
+                        FILE_NON_DIRECTORY_FILE
+                    }
+                },
+            ) | FILE_SYNCHRONOUS_IO_NONALERT
+                | FILE_OPEN_REPARSE_POINT,
             None,
             0,
         )
@@ -165,55 +285,14 @@ fn open_relative_file(directory: &File, filename: &OsStr) -> Result<File, HostFs
     }
     // SAFETY: A successful NtCreateFile call returned one owned file handle in `handle`.
     // `File` assumes that ownership and closes the handle exactly once when dropped.
-    Ok(unsafe { File::from_raw_handle(handle.0) })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Read;
-
-    #[test]
-    fn child_open_never_follows_a_swap_open_restore_directory_race() {
-        let parent = tempfile::tempdir().unwrap();
-        let directory_path = parent.path().join("owned");
-        let detached_path = parent.path().join("detached");
-        let external_path = parent.path().join("external");
-        std::fs::create_dir(&directory_path).unwrap();
-        std::fs::create_dir(&external_path).unwrap();
-        let filename = OsStr::new("artifact.txt");
-        std::fs::write(directory_path.join(filename), "retained").unwrap();
-        std::fs::write(external_path.join(filename), "external").unwrap();
-        let directory = open_directory_no_reparse(&directory_path).unwrap();
-
-        let mut file =
-            open_file_beneath_with_hook(&directory, &directory_path, filename, |stage| {
-                match stage {
-                    ChildOpenStage::BeforeOpen => {
-                        std::fs::rename(&directory_path, &detached_path)
-                            .map_err(|_| HostFsError::Open)?;
-                        std::fs::rename(&external_path, &directory_path)
-                            .map_err(|_| HostFsError::Open)?;
-                    }
-                    ChildOpenStage::AfterOpen => {
-                        std::fs::rename(&directory_path, &external_path)
-                            .map_err(|_| HostFsError::Open)?;
-                        std::fs::rename(&detached_path, &directory_path)
-                            .map_err(|_| HostFsError::Open)?;
-                    }
-                }
-                Ok(())
-            })
-            .unwrap();
-        let mut text = String::new();
-        file.read_to_string(&mut text).unwrap();
-
-        assert_eq!(text, "retained");
-        assert_eq!(
-            std::fs::read_to_string(external_path.join(filename)).unwrap(),
-            "external"
-        );
+    let file = unsafe { File::from_raw_handle(handle.0) };
+    let metadata = file.metadata().map_err(|_| HostFsError::Open)?;
+    if directory_child
+        .is_some_and(|is_directory| is_reparse(&metadata) || metadata.is_dir() != is_directory)
+    {
+        return Err(HostFsError::Integrity);
     }
+    Ok(file)
 }
 
 fn directory_matches_path(directory: &File, path: &Path) -> Result<bool, HostFsError> {
@@ -232,6 +311,11 @@ fn file_identity(file: &File) -> Result<(u32, u64), HostFsError> {
     let index =
         (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
     Ok((information.dwVolumeSerialNumber, index))
+}
+
+/// Compares the stable filesystem identities of two retained handles.
+pub fn same_file_object(first: &File, second: &File) -> Result<bool, HostFsError> {
+    Ok(file_identity(first)? == file_identity(second)?)
 }
 
 fn is_reparse(metadata: &std::fs::Metadata) -> bool {
@@ -334,4 +418,80 @@ fn wide_text(text: &str) -> Vec<u16> {
 
 fn backend_error(operation: &str, error: windows::core::Error) -> GlassError {
     GlassError::Backend(format!("{operation} failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn child_open_never_follows_a_swap_open_restore_directory_race() {
+        let parent = tempfile::tempdir().unwrap();
+        let directory_path = parent.path().join("owned");
+        let detached_path = parent.path().join("detached");
+        let external_path = parent.path().join("external");
+        std::fs::create_dir(&directory_path).unwrap();
+        std::fs::create_dir(&external_path).unwrap();
+        let filename = OsStr::new("artifact.txt");
+        std::fs::write(directory_path.join(filename), "retained").unwrap();
+        std::fs::write(external_path.join(filename), "external").unwrap();
+        let directory = open_directory_no_reparse(&directory_path).unwrap();
+
+        let mut file =
+            open_file_beneath_with_hook(&directory, &directory_path, filename, |stage| {
+                match stage {
+                    ChildOpenStage::BeforeOpen => {
+                        std::fs::rename(&directory_path, &detached_path)
+                            .map_err(|_| HostFsError::Open)?;
+                        std::fs::rename(&external_path, &directory_path)
+                            .map_err(|_| HostFsError::Open)?;
+                    }
+                    ChildOpenStage::AfterOpen => {
+                        std::fs::rename(&directory_path, &external_path)
+                            .map_err(|_| HostFsError::Open)?;
+                        std::fs::rename(&detached_path, &directory_path)
+                            .map_err(|_| HostFsError::Open)?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+
+        assert_eq!(text, "retained");
+        assert_eq!(
+            std::fs::read_to_string(external_path.join(filename)).unwrap(),
+            "external"
+        );
+    }
+
+    #[test]
+    fn enumeration_and_removal_stay_on_the_retained_directory_after_swap() {
+        let parent = tempfile::tempdir().unwrap();
+        let owned = parent.path().join("owned");
+        let detached = parent.path().join("detached");
+        let replacement = parent.path().join("replacement");
+        std::fs::create_dir(&owned).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(owned.join("artifact.txt"), "owned").unwrap();
+        let sentinel = replacement.join("sentinel.txt");
+        std::fs::write(&sentinel, "outside").unwrap();
+        let handle = open_directory_no_reparse(&owned).unwrap();
+        std::fs::rename(&owned, &detached).unwrap();
+        std::fs::rename(&replacement, &owned).unwrap();
+
+        let names = directory_entry_names(&handle).unwrap();
+        assert_eq!(names, [std::ffi::OsString::from("artifact.txt")]);
+        let child = open_file_child(&handle, &names[0]).unwrap();
+        remove_by_handle(&child).unwrap();
+        drop(child);
+
+        assert_eq!(
+            std::fs::read_to_string(owned.join("sentinel.txt")).unwrap(),
+            "outside"
+        );
+        assert!(!detached.join("artifact.txt").exists());
+    }
 }
