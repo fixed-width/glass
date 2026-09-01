@@ -843,7 +843,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.0.len(), 1, "no change -> no image");
-        assert!(matches!(out.0[0], OutContent::Text(_)));
+        assert!(matches!(out.0[0], OutContent::Envelope(_)));
     }
 
     #[test]
@@ -884,16 +884,12 @@ mod tests {
             has_note,
             "IMAGE_NOTE must be present when include_image=true"
         );
-        // meta text contains settled/width/height and is NOT enveloped
-        let meta_enveloped = out.0.iter().any(|c| {
-            matches!(c, OutContent::Text(t) if t.contains("\"settled\"") && t.contains("⟦untrusted:"))
-        });
-        assert!(!meta_enveloped, "settled-metadata must NOT be enveloped");
-        // meta text contains expected fields
-        let has_meta = out.0.iter().any(|c| {
-            matches!(c, OutContent::Text(t) if t.contains("\"settled\"") && t.contains("\"width\"") && t.contains("\"height\""))
-        });
-        assert!(has_meta, "settled-metadata text must be present");
+        let OutContent::Envelope(meta) = &out.0[1] else {
+            panic!("settled metadata must be a structured envelope")
+        };
+        assert!(meta.result.get("settled").is_some());
+        assert!(meta.result.get("width").is_some());
+        assert!(meta.result.get("height").is_some());
     }
 
     #[test]
@@ -961,16 +957,12 @@ mod tests {
             ),
             _ => panic!("expected IMAGE_NOTE text as third item"),
         }
-        // meta (second item) must NOT be enveloped
+        // Metadata is the typed envelope in the second item.
         match &out.0[1] {
-            OutContent::Text(t) => {
-                assert!(t.contains("\"width\":4"), "meta must contain width");
-                assert!(
-                    !t.contains("⟦untrusted:"),
-                    "meta must NOT be enveloped: {t}"
-                );
+            OutContent::Envelope(envelope) => {
+                assert_eq!(envelope.result["width"], 4, "meta must contain width");
             }
-            _ => panic!("expected meta text as second item"),
+            _ => panic!("expected metadata envelope as second item"),
         }
     }
 

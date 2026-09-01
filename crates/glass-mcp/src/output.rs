@@ -160,6 +160,7 @@ impl ArtifactDescriptor {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Resource links are emitted by the artifact task.
 pub(crate) enum OutContent {
     Envelope(EnvelopeBlock),
     Text(TextBlock),
@@ -168,6 +169,7 @@ pub(crate) enum OutContent {
 }
 
 impl OutContent {
+    #[allow(dead_code)] // Individual rendering is consumed by the output policy task.
     pub(crate) fn render_text(&self) -> Option<String> {
         match self {
             Self::Envelope(envelope) => Some(envelope.render()),
@@ -267,10 +269,12 @@ impl ToolOutput {
             .sum()
     }
 
+    #[allow(dead_code)] // Full rendering is consumed by the output policy task.
     pub(crate) fn render_text_blocks(&self) -> Vec<String> {
         self.0.iter().filter_map(OutContent::render_text).collect()
     }
 
+    #[allow(dead_code)] // Typed text access is consumed by the output policy task.
     pub(crate) fn text_block(&self, index: usize) -> Option<&TextBlock> {
         match self.0.get(index) {
             Some(OutContent::Text(text)) => Some(text),

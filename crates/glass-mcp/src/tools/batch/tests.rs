@@ -1005,18 +1005,16 @@ fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
     )
     .unwrap()
     .output;
-    let OutContent::Text(standalone_envelope) = &standalone_out.0[0] else {
+    let OutContent::Envelope(standalone_envelope) = &standalone_out.0[0] else {
         panic!("standalone type settle envelope must lead")
     };
-    let OutContent::Text(contextual_envelope) = &contextual_out.0[0] else {
+    let OutContent::Envelope(contextual_envelope) = &contextual_out.0[0] else {
         panic!("contextual type settle envelope must lead")
     };
-    let mut standalone_value: serde_json::Value =
-        serde_json::from_str(standalone_envelope).unwrap();
-    let mut contextual_value: serde_json::Value =
-        serde_json::from_str(contextual_envelope).unwrap();
-    standalone_value["result"]["observed"]["observed_ms"] = json!(0);
-    contextual_value["result"]["observed"]["observed_ms"] = json!(0);
+    let mut standalone_value = standalone_envelope.result.clone();
+    let mut contextual_value = contextual_envelope.result.clone();
+    standalone_value["observed"]["observed_ms"] = json!(0);
+    contextual_value["observed"]["observed_ms"] = json!(0);
     assert_eq!(standalone_value, contextual_value);
     assert_eq!(standalone_deadlines.lock().unwrap()[0], Deadline::UNBOUNDED);
     assert_eq!(contextual_deadlines.lock().unwrap()[0], Deadline::UNBOUNDED);
@@ -1037,13 +1035,14 @@ fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
     )
     .unwrap()
     .output;
-    let OutContent::Text(standalone_envelope) = &standalone_out.0[0] else {
+    let OutContent::Envelope(standalone_envelope) = &standalone_out.0[0] else {
         panic!("standalone type snapshot envelope must lead")
     };
-    let OutContent::Text(contextual_envelope) = &contextual_out.0[0] else {
+    let OutContent::Envelope(contextual_envelope) = &contextual_out.0[0] else {
         panic!("contextual type snapshot envelope must lead")
     };
-    assert_eq!(standalone_envelope, contextual_envelope);
+    assert_eq!(standalone_envelope.tool, contextual_envelope.tool);
+    assert_eq!(standalone_envelope.result, contextual_envelope.result);
     assert_eq!(
         exact_contents(&standalone_out),
         exact_contents(&contextual_out)
@@ -2547,7 +2546,7 @@ fn app_element_details_stay_in_untrusted_step_content() {
     )
     .unwrap();
 
-    let trusted = envelope_at(&out, 0);
+    let trusted = envelope(&out);
     assert!(!trusted.to_string().contains(app_detail), "{trusted}");
     assert_eq!(trusted["result"]["steps"][0]["content_blocks"], json!([1]));
     assert_eq!(out.0.len(), 2);
@@ -2592,7 +2591,7 @@ fn stale_target_detail_is_not_embedded_in_trusted_error_json() {
     )
     .unwrap_err();
 
-    let trusted = envelope_at(&out, 0);
+    let trusted = envelope(&out);
     let text = trusted.to_string();
     assert!(!text.contains(APP_DETAIL), "{trusted}");
     assert_eq!(
@@ -2801,7 +2800,7 @@ fn content_indices_cover_completed_step_siblings_before_failure_detail() {
         },
     )
     .unwrap_err();
-    let trusted = envelope_at(&out, 0);
+    let trusted = envelope(&out);
     let steps = trusted["outcome"]["steps"].as_array().unwrap();
     assert_eq!(steps[0]["content_blocks"], json!([1]));
     assert_eq!(steps[1]["content_blocks"], json!([2]));

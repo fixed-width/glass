@@ -624,13 +624,11 @@ fn a11y_marks_returns_image_and_legend() {
         matches!(out.0[0], OutContent::Image(_)),
         "first item is the image"
     );
-    let OutContent::Text(t) = &out.0[1] else {
-        panic!("expected envelope text as the second item")
+    let OutContent::Envelope(envelope) = &out.0[1] else {
+        panic!("expected envelope as the second item")
     };
-    let v: serde_json::Value = serde_json::from_str(t).expect("envelope must be valid JSON");
-    assert_eq!(v["ok"], json!(true), "envelope: {v}");
-    assert_eq!(v["tool"], json!("glass_a11y_marks"), "envelope: {v}");
-    assert_eq!(v["result"]["count"], json!(1), "envelope: {v}");
+    assert_eq!(envelope.tool, "glass_a11y_marks");
+    assert_eq!(envelope.result["count"], json!(1));
     match &out.0[2] {
         OutContent::Text(t) => assert!(t.contains("#1 Button \"Save\""), "legend: {t}"),
         _ => panic!("expected legend text"),
@@ -713,13 +711,10 @@ fn a11y_marks_legend_untrusted_wrapped_and_image_note_present() {
     );
     // the trusted envelope comes right after the image
     match &out.0[1] {
-        OutContent::Text(t) => {
-            let v: serde_json::Value =
-                serde_json::from_str(t).expect("envelope must be valid JSON");
-            assert_eq!(v["ok"], json!(true), "envelope: {v}");
-            assert_eq!(v["tool"], json!("glass_a11y_marks"), "envelope: {v}");
+        OutContent::Envelope(envelope) => {
+            assert_eq!(envelope.tool, "glass_a11y_marks");
         }
-        _ => panic!("expected envelope text as second item"),
+        _ => panic!("expected envelope as second item"),
     }
     // legend must be untrusted-wrapped
     match &out.0[2] {
@@ -1306,13 +1301,11 @@ fn list_and_select_window_tools() {
 #[test]
 fn result_envelope_is_leading_and_shaped() {
     let out = ToolOutput::result("glass_stop", serde_json::json!({}));
-    let OutContent::Text(t) = &out.0[0] else {
-        panic!("expected text")
+    let OutContent::Envelope(envelope) = &out.0[0] else {
+        panic!("expected envelope")
     };
-    let v: serde_json::Value = serde_json::from_str(t).unwrap();
-    assert_eq!(v["ok"], serde_json::json!(true));
-    assert_eq!(v["tool"], serde_json::json!("glass_stop"));
-    assert_eq!(v["result"], serde_json::json!({}));
+    assert_eq!(envelope.tool, "glass_stop");
+    assert_eq!(envelope.result, serde_json::json!({}));
 }
 
 #[test]
@@ -1322,6 +1315,9 @@ fn result_with_puts_envelope_first_then_extra() {
         serde_json::json!({ "width": 4, "height": 4 }),
         vec![OutContent::Image(vec![1, 2, 3])],
     );
-    assert!(matches!(out.0[0], OutContent::Text(_)), "envelope leads");
+    assert!(
+        matches!(out.0[0], OutContent::Envelope(_)),
+        "envelope leads"
+    );
     assert!(matches!(out.0[1], OutContent::Image(_)), "extra follows");
 }
