@@ -646,17 +646,72 @@ mod platform_tests {
         "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
     );
 
+    const PROTECTED_PATH_SENTINEL: &str =
+        "/host-vault-orchid-731/device-boundary-cobalt-842/report-ember-953.txt";
+    const PROTECTED_PATH_COMPONENTS: [&str; 3] = [
+        "host-vault-orchid-731",
+        "device-boundary-cobalt-842",
+        "report-ember-953.txt",
+    ];
+
+    fn assert_protected_path_absent(observed: impl IntoIterator<Item = String>) {
+        for value in observed {
+            assert!(!value.contains(PROTECTED_PATH_SENTINEL), "{value}");
+            for component in PROTECTED_PATH_COMPONENTS {
+                assert!(!value.contains(component), "{value}");
+            }
+        }
+    }
+
     #[test]
-    fn protected_host_paths_use_separate_filesystem_without_adb_commands() {
-        let fake = FakeAdb::new(&[]);
+    fn protected_host_paths_never_reach_successful_android_launch_commands_or_logs() {
+        let fake = launchable();
         let mut platform = platform_over(&fake);
 
         let mode = platform
-            .configure_protected_host_paths(&[ProtectedHostPath::file("host-only-marker")])
+            .configure_protected_host_paths(&[ProtectedHostPath::file(PROTECTED_PATH_SENTINEL)])
             .unwrap();
+        platform.start_app(&spec()).expect("the launch succeeds");
+        assert!(fake.wait_called("logcat -v threadtime --pid=4321", Duration::from_secs(5)));
+        let logs = platform
+            .drain_logs()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>();
+        drop(platform);
 
         assert_eq!(mode, HostPathProtectionMode::SeparateFilesystem);
-        assert!(fake.calls().is_empty());
+        assert_protected_path_absent(fake.calls());
+        assert_protected_path_absent(logs);
+    }
+
+    #[test]
+    fn protected_host_paths_never_reach_failed_android_launch_commands_logs_or_error() {
+        let fake = FakeAdb::new(&[(
+            "shell am start *",
+            Answer::says("Starting: Intent {...}\nError: Activity not started\n"),
+        )]);
+        let mut platform = platform_over(&fake);
+
+        let mode = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(
+                PROTECTED_PATH_SENTINEL,
+            )])
+            .unwrap();
+        let error = platform
+            .start_app(&spec())
+            .expect_err("the device refuses the launch");
+        let logs = platform
+            .drain_logs()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>();
+        drop(platform);
+
+        assert_eq!(mode, HostPathProtectionMode::SeparateFilesystem);
+        assert_protected_path_absent(fake.calls());
+        assert_protected_path_absent(logs);
+        assert_protected_path_absent([error.to_string()]);
     }
 
     /// The same dump with the dialog gone — the app's window list after it is dismissed.

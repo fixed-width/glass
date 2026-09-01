@@ -1385,17 +1385,92 @@ mod teardown_tests {
             .collect()
     }
 
+    const PROTECTED_PATH_SENTINEL: &str =
+        "/host-vault-juniper-164/simulator-boundary-saffron-275/result-onyx-386.txt";
+    const PROTECTED_PATH_COMPONENTS: [&str; 3] = [
+        "host-vault-juniper-164",
+        "simulator-boundary-saffron-275",
+        "result-onyx-386.txt",
+    ];
+
+    fn assert_protected_path_absent(observed: impl IntoIterator<Item = String>) {
+        for value in observed {
+            assert!(!value.contains(PROTECTED_PATH_SENTINEL), "{value}");
+            for component in PROTECTED_PATH_COMPONENTS {
+                assert!(!value.contains(component), "{value}");
+            }
+        }
+    }
+
     #[test]
-    fn protected_host_paths_use_separate_filesystem_without_simctl_commands() {
+    fn protected_host_paths_never_reach_successful_ios_launch_commands_environment_or_logs() {
         let fake = FakeSimctl::new();
+        fake.writes_screenshot(&png(390, 844));
         let mut platform = platform(&fake, false);
+        let mut launch = spec();
+        launch
+            .env
+            .push(("VISIBLE_TEST_KEY".into(), "ordinary".into()));
 
         let mode = platform
-            .configure_protected_host_paths(&[ProtectedHostPath::directory("host-only-marker")])
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(
+                PROTECTED_PATH_SENTINEL,
+            )])
             .unwrap();
+        platform
+            .start_app(&launch)
+            .expect("the scripted launch succeeds");
+        let logs = platform
+            .drain_logs()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>();
+        drop(platform);
 
         assert_eq!(mode, HostPathProtectionMode::SeparateFilesystem);
-        assert!(fake.calls().is_empty());
+        assert!(
+            fake.environments()
+                .iter()
+                .any(|entry| entry == "SIMCTL_CHILD_VISIBLE_TEST_KEY=ordinary")
+        );
+        assert_protected_path_absent(fake.calls());
+        assert_protected_path_absent(fake.environments());
+        assert_protected_path_absent(logs);
+    }
+
+    #[test]
+    fn protected_host_paths_never_reach_failed_ios_launch_commands_environment_logs_or_error() {
+        let fake = FakeSimctl::new();
+        fake.fails("launch");
+        let mut platform = platform(&fake, false);
+        let mut launch = spec();
+        launch
+            .env
+            .push(("VISIBLE_TEST_KEY".into(), "ordinary".into()));
+
+        let mode = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::file(PROTECTED_PATH_SENTINEL)])
+            .unwrap();
+        let error = platform
+            .start_app(&launch)
+            .expect_err("the scripted launch fails");
+        let logs = platform
+            .drain_logs()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>();
+        drop(platform);
+
+        assert_eq!(mode, HostPathProtectionMode::SeparateFilesystem);
+        assert!(
+            fake.environments()
+                .iter()
+                .any(|entry| entry == "SIMCTL_CHILD_VISIBLE_TEST_KEY=ordinary")
+        );
+        assert_protected_path_absent(fake.calls());
+        assert_protected_path_absent(fake.environments());
+        assert_protected_path_absent(logs);
+        assert_protected_path_absent([error.to_string()]);
     }
 
     #[test]

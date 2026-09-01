@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn nonempty_protected_paths_fail_closed_for_unaware_backend() {
+    fn nonempty_protected_host_paths_fail_closed_for_unaware_backend() {
         let starts = Arc::new(AtomicUsize::new(0));
         let mut g = glass_with_unaware(starts.clone());
         g.set_protected_host_paths(vec![ProtectedHostPath::directory("secret")])
@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_protected_paths_remain_compatible_with_unaware_backend() {
+    fn empty_protected_host_paths_remain_compatible_with_unaware_backend() {
         let starts = Arc::new(AtomicUsize::new(0));
         let mut g = glass_with_unaware(starts.clone());
 
@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_rules_report_access_from_successful_launch_sandbox_level() {
+    fn host_path_access_for_sandbox_rules_follows_successful_launch_sandbox_level() {
         for (sandbox, expected) in [
             (SandboxLevel::Default, HostPathAccess::DeniedBySandbox),
             (SandboxLevel::Strict, HostPathAccess::DeniedBySandbox),
@@ -253,8 +253,12 @@ mod tests {
     }
 
     #[test]
-    fn separate_filesystem_reports_unreachable_for_contained_and_off_launches() {
-        for sandbox in [SandboxLevel::Default, SandboxLevel::Off] {
+    fn host_path_access_for_separate_filesystem_is_unreachable_at_every_sandbox_level() {
+        for sandbox in [
+            SandboxLevel::Default,
+            SandboxLevel::Strict,
+            SandboxLevel::Off,
+        ] {
             let mut launch = spec();
             launch.sandbox = sandbox;
             let mut g = glass_with(
@@ -270,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_paths_cannot_change_during_active_session() {
+    fn protected_host_paths_cannot_change_during_active_session() {
         let stops = Arc::new(Mutex::new(0));
         let log = Arc::new(Mutex::new(Vec::new()));
         let configured = Arc::new(Mutex::new(Vec::new()));
@@ -307,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_failed_stop_reset_host_path_access() {
+    fn host_path_access_resets_after_stop_and_failed_stop() {
         let mut stopped = glass_with(FakePlatform::new(10, 10));
         stopped.start(&spec()).unwrap();
         stopped.stop().unwrap();
@@ -320,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_resets_host_path_access() {
+    fn host_path_access_resets_after_shutdown() {
         let mut g = glass_with(FakePlatform::new(10, 10));
         g.start(&spec()).unwrap();
         g.shutdown(soon());
@@ -328,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_configure_and_start_leave_no_stale_access_and_allow_reconfiguration() {
+    fn host_path_access_resets_after_failed_configure_and_start_and_allows_reconfiguration() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_factory = calls.clone();
         let factory: PlatformFactory = Box::new(move |_| {
@@ -366,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_path_configuration_runs_before_every_start_and_failure_prevents_launch() {
+    fn protected_host_path_configuration_runs_before_every_start_and_failure_prevents_launch() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(AtomicUsize::new(0));
         let factory_log = log.clone();
@@ -389,6 +393,48 @@ mod tests {
             vec!["configure", "start", "configure"]
         );
         assert_eq!(g.host_path_access(), HostPathAccess::NoActiveTarget);
+    }
+
+    #[test]
+    fn host_path_access_resets_after_replacement_factory_failure_and_new_paths_reach_restart() {
+        let stops = Arc::new(Mutex::new(0u32));
+        let configured = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_stops = stops.clone();
+        let factory_configured = configured.clone();
+        let factory_calls = calls.clone();
+        let factory: PlatformFactory =
+            Box::new(
+                move |_| match factory_calls.fetch_add(1, Ordering::SeqCst) {
+                    1 => Err(GlassError::Backend("scripted factory failure".into())),
+                    _ => Ok(Backend::display_only(Box::new(
+                        FakePlatform::new(10, 10)
+                            .counting_stops(factory_stops.clone())
+                            .with_protected_paths_log(factory_configured.clone()),
+                    ))),
+                },
+            );
+        let mut g = glass_with_factory(factory);
+        let old_paths = vec![ProtectedHostPath::directory("old")];
+        let new_paths = vec![ProtectedHostPath::file("new")];
+        g.set_protected_host_paths(old_paths.clone()).unwrap();
+        g.start(&spec()).unwrap();
+
+        assert!(matches!(
+            g.start(&spec()).unwrap_err(),
+            GlassError::Backend(message) if message == "scripted factory failure"
+        ));
+        assert_eq!(*stops.lock().unwrap(), 1);
+        assert_eq!(g.host_path_access(), HostPathAccess::NoActiveTarget);
+
+        g.set_protected_host_paths(new_paths.clone()).unwrap();
+        g.start(&spec()).unwrap();
+
+        assert_eq!(*configured.lock().unwrap(), vec![old_paths, new_paths]);
+        assert_eq!(
+            g.host_path_access(),
+            HostPathAccess::NotGuaranteedSandboxOff
+        );
     }
 
     #[test]
