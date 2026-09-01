@@ -1,4 +1,5 @@
 use rmcp::model::{Meta, Resource};
+use std::path::Path;
 
 /// Indicates whether text was produced by Glass or observed from the target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -14,7 +15,7 @@ pub(crate) enum TextTrust {
 pub(crate) enum TextRole {
     #[expect(
         dead_code,
-        reason = "Envelope control text is serialized by later output policy tasks."
+        reason = "Envelope distinguishes Glass control text from observations."
     )]
     Envelope,
     Observation,
@@ -74,7 +75,7 @@ impl EnvelopeBlock {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(dead_code, reason = "Later output policy tasks consume tool effects.")]
+#[expect(dead_code, reason = "Tool effects classify output metadata.")]
 pub(crate) enum ToolEffect {
     ReadOnly,
     MayMutate,
@@ -82,7 +83,7 @@ pub(crate) enum ToolEffect {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-#[expect(dead_code, reason = "Later calls provide the target access posture.")]
+#[expect(dead_code, reason = "Target access describes resource availability.")]
 pub(crate) enum TargetAccess {
     DeniedBySandbox,
     NotGuaranteedSandboxOff,
@@ -92,7 +93,10 @@ pub(crate) enum TargetAccess {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-#[expect(dead_code, reason = "Artifact emitters are introduced by later tasks.")]
+#[expect(
+    dead_code,
+    reason = "Artifact kinds distinguish resource representations."
+)]
 pub(crate) enum ArtifactKind {
     ContentBlock,
     ResponseManifest,
@@ -100,21 +104,79 @@ pub(crate) enum ArtifactKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct ArtifactDescriptor {
-    pub kind: ArtifactKind,
+    kind: ArtifactKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_block: Option<usize>,
-    pub uri: String,
-    pub local_path: String,
-    pub local_path_scope: &'static str,
-    pub mime_type: String,
-    pub bytes: u64,
-    pub sha256: String,
-    pub untrusted: bool,
+    content_block: Option<usize>,
+    uri: String,
+    local_path: String,
+    local_path_scope: &'static str,
+    mime_type: String,
+    bytes: u64,
+    sha256: String,
+    untrusted: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub original_content_blocks: Vec<usize>,
+    original_content_blocks: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Descriptor construction validates resource metadata before rendering."
+    )
+)]
+pub(crate) enum ArtifactDescriptorError {
+    RelativePath,
+    NonUtf8Path,
 }
 
 impl ArtifactDescriptor {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Each argument is immutable metadata for one artifact descriptor."
+    )]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Descriptor construction validates resource metadata before rendering."
+        )
+    )]
+    pub(crate) fn new(
+        kind: ArtifactKind,
+        content_block: Option<usize>,
+        uri: &str,
+        local_path: &Path,
+        local_path_scope: &'static str,
+        mime_type: &str,
+        bytes: u64,
+        sha256: &str,
+        untrusted: bool,
+        original_content_blocks: &[usize],
+    ) -> Result<Self, ArtifactDescriptorError> {
+        if !local_path.is_absolute() {
+            return Err(ArtifactDescriptorError::RelativePath);
+        }
+        let local_path = local_path
+            .to_str()
+            .ok_or(ArtifactDescriptorError::NonUtf8Path)?
+            .to_owned();
+
+        Ok(Self {
+            kind,
+            content_block,
+            uri: uri.to_owned(),
+            local_path,
+            local_path_scope,
+            mime_type: mime_type.to_owned(),
+            bytes,
+            sha256: sha256.to_owned(),
+            untrusted,
+            original_content_blocks: original_content_blocks.to_vec(),
+        })
+    }
+
     pub(crate) fn to_resource(&self, target_access: TargetAccess) -> Resource {
         let name = match self.kind {
             ArtifactKind::ContentBlock => "glass-output-content-block",
@@ -160,7 +222,13 @@ impl ArtifactDescriptor {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Resource links are emitted by the artifact task.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Resource links are a supported MCP output content variant."
+    )
+)]
 pub(crate) enum OutContent {
     Envelope(EnvelopeBlock),
     Text(TextBlock),
@@ -169,7 +237,13 @@ pub(crate) enum OutContent {
 }
 
 impl OutContent {
-    #[allow(dead_code)] // Individual rendering is consumed by the output policy task.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Individual text rendering supports MCP content conversion."
+        )
+    )]
     pub(crate) fn render_text(&self) -> Option<String> {
         match self {
             Self::Envelope(envelope) => Some(envelope.render()),
@@ -178,10 +252,7 @@ impl OutContent {
         }
     }
 
-    #[expect(
-        dead_code,
-        reason = "Output policy consumes text trust in a later task."
-    )]
+    #[expect(dead_code, reason = "Text trust is exposed for output consumers.")]
     pub(crate) fn text_trust(&self) -> Option<TextTrust> {
         match self {
             Self::Envelope(_) => Some(TextTrust::Trusted),
@@ -269,12 +340,24 @@ impl ToolOutput {
             .sum()
     }
 
-    #[allow(dead_code)] // Full rendering is consumed by the output policy task.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Text blocks preserve response order for MCP conversion."
+        )
+    )]
     pub(crate) fn render_text_blocks(&self) -> Vec<String> {
         self.0.iter().filter_map(OutContent::render_text).collect()
     }
 
-    #[allow(dead_code)] // Typed text access is consumed by the output policy task.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Typed text access preserves trust and role metadata."
+        )
+    )]
     pub(crate) fn text_block(&self, index: usize) -> Option<&TextBlock> {
         match self.0.get(index) {
             Some(OutContent::Text(text)) => Some(text),
@@ -290,6 +373,22 @@ impl ToolOutput {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::Path;
+
+    fn artifact(path: &Path) -> Result<ArtifactDescriptor, ArtifactDescriptorError> {
+        ArtifactDescriptor::new(
+            ArtifactKind::ContentBlock,
+            Some(1),
+            "glass-artifact://s/a",
+            path,
+            "server",
+            "text/plain",
+            0,
+            "test-sha256",
+            false,
+            &[1],
+        )
+    }
 
     #[test]
     fn under_budget_envelope_renders_the_existing_json_bytes() {
@@ -330,5 +429,26 @@ mod tests {
             OutContent::trusted_error("é"),
         ]);
         assert_eq!(output.text_bytes(), 5);
+    }
+
+    #[test]
+    fn artifact_descriptor_rejects_relative_paths() {
+        assert_eq!(
+            artifact(Path::new("relative-artifact")).unwrap_err(),
+            ArtifactDescriptorError::RelativePath
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_descriptor_rejects_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = std::path::PathBuf::from(OsString::from_vec(b"/artifact-\xff".to_vec()));
+        assert_eq!(
+            artifact(&path).unwrap_err(),
+            ArtifactDescriptorError::NonUtf8Path
+        );
     }
 }
