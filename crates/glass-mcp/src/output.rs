@@ -131,7 +131,34 @@ pub(crate) enum ArtifactDescriptorError {
     NonUtf8Path,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Descriptor accessors support artifact publication and verified reads."
+    )
+)]
 impl ArtifactDescriptor {
+    pub(crate) fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub(crate) fn local_path(&self) -> &Path {
+        Path::new(&self.local_path)
+    }
+
+    pub(crate) fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(crate) fn untrusted(&self) -> bool {
+        self.untrusted
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "Each argument is immutable metadata for one artifact descriptor."

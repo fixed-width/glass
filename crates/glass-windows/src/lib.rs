@@ -18,6 +18,8 @@ pub mod containment; // Windows containment provider seam (pure config is host-t
 pub mod discovery; // pure window-discovery poll-loop decision — cross-platform, host-tested
 pub mod doctor; // pure check-mapping cross-platform; Windows fact-gathering is cfg(windows)
 pub mod dpi; // pure coordinate math — cross-platform, unit-tested on any host
+#[cfg(windows)]
+mod host_fs;
 pub mod jobcfg; // pure SandboxLevel -> job-limit descriptor — unit-tested on any host
 pub mod jobpids; // pure JOBOBJECT_BASIC_PROCESS_ID_LIST byte parser — host-tested
 pub mod logtap; // pure line splitting — cross-platform, host-tested; the reader is cfg(windows)
@@ -26,6 +28,9 @@ pub mod onbox_support; // env-resolved paths shared by the on-box examples + tes
 pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on any host
 pub mod teardown; // pure graceful-close decisions — cross-platform, unit-tested on any host
 pub mod vkmap; // pure named-keysym->VK map — cross-platform, host-tested
+
+#[cfg(windows)]
+pub use host_fs::{path_has_private_dacl, restrict_path_to_current_user};
 
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
 pub const BACKEND: &str = "windows";

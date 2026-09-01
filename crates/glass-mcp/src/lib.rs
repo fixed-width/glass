@@ -21,6 +21,7 @@ pub(crate) const WEBSITE_URL: Option<&str> = {
     if url.is_empty() { None } else { Some(url) }
 };
 
+mod artifacts;
 pub mod audit;
 pub mod capabilities;
 pub mod cli;
