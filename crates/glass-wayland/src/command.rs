@@ -185,9 +185,7 @@ pub fn build_sway_command(
     build_sway_command_inner(sway, config, spec, runtime_dir, dbus_addr)
 }
 
-/// Build sway while declaring the Bubblewrap status descriptor that must remain open across the
-/// sway exec. The descriptor is created inheritable by [`glass_sandbox_linux::BwrapStatusPipe`];
-/// keeping the pipe alive through `Command::spawn` carries it through sway to the config's exec.
+/// Builds sway with an inheritable Bubblewrap status descriptor preserved through sway's exec.
 pub fn build_sway_command_with_status(
     sway: &Path,
     config: &Path,

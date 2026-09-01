@@ -3,10 +3,8 @@
 //! Drives Sandboxie via its CLI (`Start.exe` / `SbieIni.exe`) as subprocesses — no FFI,
 //! no linking against Sandboxie. The recipe is the on-box-validated one:
 //!
-//! - Per-attempt box `glass_<process><attempt>` uses fixed-width base-36 components and is
-//!   configured via `SbieIni.exe set/append` from the pure policy in [`super::config`], plus
-//!   the compat templates (without which PowerShell etc. break inside the box) and, for
-//!   `strict`, a `ClosedFilePath \Device\Afd*` to belt the `AllowNetworkAccess=n` policy.
+//! - Each fixed-width base-36 box gets [`super::config`] policy and compatibility templates.
+//! - `strict` adds `ClosedFilePath \Device\Afd*` as a network-policy backstop.
 //! - `strict` additionally gates on the **global** `PromptForInternetAccess`: a `y` there
 //!   would deadlock a no-network box on a UI prompt, so we detect it and fail closed. We
 //!   never write `[GlobalSettings]`.
@@ -233,12 +231,8 @@ fn service_running(name: &str) -> bool {
 pub(crate) struct Sandboxie {
     pub dir: String,
     pub box_name: String,
-    /// Armed by `configure()` once it begins writing this box's `Sandboxie.ini`
-    /// section; disarmed by a successful `launch()` (which hands the clear to
-    /// [`SandboxieApp::kill`]). While armed, dropping `Sandboxie` clears the
-    /// section, so a failure anywhere between `configure()` and a successful
-    /// `launch()` never orphans a per-attempt Glass section in the
-    /// shared `Sandboxie.ini`.
+    /// Tracks responsibility for clearing this box's `Sandboxie.ini` section until launch transfers
+    /// it to [`SandboxieApp::kill`].
     section_armed: AtomicBool,
 }
 
@@ -715,13 +709,8 @@ impl SandboxieApp {
         self.clip.as_ref().map(|(store, _)| store.clone())
     }
 
-    /// Tear the box down, ordered so no log line is lost and no tailer outlives teardown:
-    /// `/terminate` (stop the box producing output) → signal stop → **join** the tailers
-    /// (each does a final `drain()` of the real log files) → kill+reap the wrapper → stop
-    /// the clipboard pipe server → remove the log dir (only now that the tailers have exited
-    /// and read everything) → clear the box's config section so per-attempt `glass_<process><attempt>`
-    /// boxes don't accumulate in `Sandboxie.ini` (`SbieIni set <box> * ""` — the
-    /// maintainer's documented box-clear).
+    /// Terminates the box, joins tailers after their final drain, reaps helpers, removes logs, and
+    /// clears the per-attempt `Sandboxie.ini` section.
     pub(crate) fn kill(mut self) -> crate::process::Closed {
         let _ = Command::new(start_exe(&self.dir))
             .args([&format!("/box:{}", self.box_name), "/terminate"])

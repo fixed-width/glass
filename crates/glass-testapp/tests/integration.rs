@@ -1296,8 +1296,8 @@ fn clipboard_owner_refuses_text_too_large_for_one_x11_property_write() {
 /// glass spawned is `bwrap`, not the app — so the window belongs to a descendant pid. If that
 /// walk failed, teardown would silently fall back to signalling every sandboxed app.
 ///
-/// The sandbox uses a PID namespace, so the app publishes a namespace-relative `_NET_WM_PID`.
-/// Glass correlates that value with refreshed host and namespace identities for the contained tree.
+/// PID namespaces make the app publish a namespace-relative `_NET_WM_PID` that Glass correlates
+/// with refreshed host and namespace identities.
 #[test]
 #[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
 fn sandbox_default_app_is_still_asked_to_close() {

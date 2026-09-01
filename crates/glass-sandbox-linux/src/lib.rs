@@ -1,9 +1,7 @@
 //! Linux process containment for glass via bubblewrap (`bwrap`).
 //!
-//! `wrap_argv` builds a launch argv after validating protected host path metadata, so its
-//! behavior is unit-tested by asserting arguments and validation errors. `availability` runs
-//! `bwrap` to prove the required namespace and status capabilities. Callers handle
-//! `SandboxLevel::Off` themselves (never wrap).
+//! Validates protected paths, probes required Bubblewrap capabilities, and builds contained launch
+//! arguments. Callers bypass this crate for `SandboxLevel::Off`.
 
 #![cfg(target_os = "linux")]
 

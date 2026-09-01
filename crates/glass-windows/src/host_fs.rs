@@ -91,10 +91,8 @@ pub fn file_matches_path_no_reparse(file: &File, path: &Path) -> Result<bool, Ho
     Ok(file_identity(file)? == file_identity(&current)?)
 }
 
-/// Opens one generated single-component regular-file child relative to a retained directory handle.
-///
-/// The pathname is consulted only to reject an already-substituted directory before the native
-/// relative open. Once that check completes, directory renames cannot redirect the child lookup.
+/// Opens a generated regular-file child through the retained handle after confirming path identity,
+/// so directory renames cannot redirect lookup.
 pub fn open_file_beneath(
     directory: &File,
     directory_path: &Path,
@@ -138,9 +136,7 @@ pub fn directory_entry_records(directory: &File) -> Result<Vec<DirectoryEntryRec
     let mut restart = true;
     loop {
         let mut status_block = IO_STATUS_BLOCK::default();
-        // SAFETY: `directory` remains borrowed and live. `buffer` is writable for its full length,
-        // `status_block` is initialized writable output, optional event/APC/name pointers are null,
-        // and the synchronous directory handle makes completion visible before the call returns.
+        // SAFETY: The borrowed directory and writable buffers remain valid through this synchronous call.
         let status = unsafe {
             NtQueryDirectoryFile(
                 HANDLE(directory.as_raw_handle()),
@@ -208,8 +204,7 @@ pub fn open_directory_entry(
 /// Marks the exact retained filesystem object for deletion, without reopening a pathname.
 pub fn remove_by_handle(file: &File) -> Result<(), HostFsError> {
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-    // SAFETY: `file` is live and borrowed. `disposition` has the exact structure and byte size
-    // required by `FileDispositionInfoEx` and remains initialized for the call.
+    // SAFETY: The borrowed file and initialized disposition remain valid through this size-matched call.
     unsafe {
         SetFileInformationByHandle(
             HANDLE(file.as_raw_handle()),
@@ -252,7 +247,7 @@ fn parse_directory_records(
         }
         let name = std::ffi::OsString::from_wide(&units);
         if name == "." || name == ".." {
-            // Directory queries may include navigation records. They are never exposed as children.
+            // Skip navigation records returned by directory queries.
         } else if !valid_child_name(&name) {
             return Err(HostFsError::Integrity);
         } else {
@@ -476,16 +471,8 @@ fn open_relative(
     };
     let mut status_block = IO_STATUS_BLOCK::default();
     let mut handle = HANDLE::default();
-    // SAFETY: `directory` supplies a live directory handle and remains borrowed for the call.
-    // `unicode_name` references the initialized UTF-16 `name` buffer, whose byte length fits u16;
-    // native counted strings do not require a terminator. `attributes` has the required size,
-    // points to `unicode_name`, uses that directory as `RootDirectory`, and has null optional
-    // security pointers. `handle` and `status_block` are writable outputs. The access mask requests
-    // only reads, attributes, and synchronous completion; sharing includes read, write, and delete.
-    // `FILE_OPEN` cannot create, `FILE_NON_DIRECTORY_FILE` rejects directories, and
-    // `FILE_OPEN_REPARSE_POINT` opens a reparse object itself so the safe wrapper can reject it.
-    // On success, ownership of the returned handle transfers exactly once to `File`; on failure,
-    // NT does not return an owned handle and the initialized default value is not closed.
+    // `FILE_OPEN_REPARSE_POINT` inspects reparse objects instead of traversing their targets.
+    // SAFETY: The borrowed directory and all referenced storage remain valid through this synchronous call.
     let status = unsafe {
         NtCreateFile(
             &mut handle,
@@ -514,8 +501,7 @@ fn open_relative(
     if !status.is_ok() {
         return Err(HostFsError::Open);
     }
-    // SAFETY: A successful NtCreateFile call returned one owned file handle in `handle`.
-    // `File` assumes that ownership and closes the handle exactly once when dropped.
+    // SAFETY: Successful `NtCreateFile` returned the single owned handle transferred to `File`.
     let file = unsafe { File::from_raw_handle(handle.0) };
     let metadata = file.metadata().map_err(|_| HostFsError::Open)?;
     if directory_child
@@ -533,8 +519,7 @@ fn directory_matches_path(directory: &File, path: &Path) -> Result<bool, HostFsE
 
 fn file_identity(file: &File) -> Result<(u32, u64), HostFsError> {
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `file` owns a live kernel handle for the duration of the call and
-    // `information` points to writable storage of the required type.
+    // SAFETY: The borrowed file and writable information buffer remain valid for the call.
     unsafe {
         GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information)
             .map_err(|_| HostFsError::Open)?;
@@ -591,7 +576,7 @@ pub fn path_has_private_dacl(path: &Path) -> glass_core::Result<bool> {
     let path = wide(path);
     let information = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
     let mut needed = 0_u32;
-    // SAFETY: `path` is NUL-terminated. A null descriptor with length zero is the documented size query.
+    // SAFETY: The NUL-terminated path and documented zero-length size query are valid for this call.
     unsafe {
         let _ = GetFileSecurityW(PCWSTR(path.as_ptr()), information.0, None, 0, &mut needed);
     }

@@ -318,8 +318,7 @@ pub enum GlassError {
         cleanup: Box<GlassError>,
     },
 
-    /// Both an operation and its mandatory cleanup failed; each structured cause remains
-    /// inspectable without assigning the cleanup to a more specific error domain.
+    /// Both an operation and generic mandatory cleanup failed.
     #[error("{primary}; cleanup failed while {operation}: {cleanup}")]
     CleanupFailed {
         operation: &'static str,

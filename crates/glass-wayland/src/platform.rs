@@ -313,9 +313,8 @@ struct LaunchCleanupOutcome {
 }
 
 fn reap_pending(pending: &mut PendingWaylandSession) -> LaunchCleanupOutcome {
-    // The status may have been buffered while discovery failed or while sway was exiting. Read it
-    // before the authoritative snapshot so its host PID remains a reaping root after reparenting.
-    // A malformed status still falls through to reap sway's known host tree.
+    // Poll buffered status before snapshotting so reparenting cannot hide its host PID from reaping.
+    // Malformed status still falls back to sway's known host tree.
     let status_error = pending.poll_status().err();
     reap_pending_after_status_poll(pending, status_error)
 }
