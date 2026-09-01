@@ -1049,6 +1049,10 @@ const _: () = assert!(
     "a servicing slice must not become a wait in its own right"
 );
 
+fn compositor_service_deadline(deadline: Instant, now: Instant) -> Instant {
+    deadline.min(now + COMPOSITOR_SERVICE_SLICE)
+}
+
 /// Set by the compositor's answer to `wl_display.sync`, which is what a roundtrip waits for.
 pub(crate) type SyncDone = Arc<std::sync::atomic::AtomicBool>;
 
@@ -1732,7 +1736,7 @@ fn bring_up_session(
                 &conn,
                 &mut queue,
                 &mut state,
-                deadline.min(Instant::now() + COMPOSITOR_SERVICE_SLICE),
+                compositor_service_deadline(deadline, Instant::now()),
                 "launch",
             );
             // Distinguish "sway says no windows" from "sway did not answer": an unanswered
@@ -6219,9 +6223,10 @@ mod session_tests {
 mod tests {
     use super::{
         BwrapStatusPipe, LaunchCleanupOutcome, PendingWaylandSession, WaylandPlatform,
-        failed_launch_error, find_wayland_socket, launch_cleanup_error, launch_deadline_error,
-        launch_ready, launch_with_retry, nudge_x, open_session, parse_sway_version, reap_pending,
-        recover_after_grace, start_recovery_after, time_remains, wayland_host_tree,
+        compositor_service_deadline, failed_launch_error, find_wayland_socket,
+        launch_cleanup_error, launch_deadline_error, launch_ready, launch_with_retry, nudge_x,
+        open_session, parse_sway_version, reap_pending, recover_after_grace, start_recovery_after,
+        time_remains, wayland_host_tree,
     };
     use crate::command::{build_sway_command, sway_config};
     use glass_core::{
@@ -6264,6 +6269,28 @@ mod tests {
         let deadline = std::time::Instant::now();
 
         assert!(!time_remains(deadline, deadline));
+    }
+
+    #[test]
+    fn compositor_service_deadline_is_limited_to_one_slice() {
+        let now = std::time::Instant::now();
+        let shared_deadline = now + std::time::Duration::from_secs(1);
+
+        assert_eq!(
+            compositor_service_deadline(shared_deadline, now),
+            now + super::COMPOSITOR_SERVICE_SLICE
+        );
+    }
+
+    #[test]
+    fn compositor_service_deadline_is_limited_to_the_shared_deadline() {
+        let now = std::time::Instant::now();
+        let shared_deadline = now + super::COMPOSITOR_SERVICE_SLICE / 2;
+
+        assert_eq!(
+            compositor_service_deadline(shared_deadline, now),
+            shared_deadline
+        );
     }
 
     #[test]
