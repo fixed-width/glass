@@ -6150,11 +6150,23 @@ mod tests {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    struct PendingCleanup<'a>(&'a mut PendingWaylandSession);
+    struct PendingCleanup<'a>(Option<&'a mut PendingWaylandSession>);
+
+    impl PendingCleanup<'_> {
+        fn reap(&mut self) {
+            reap_pending(self.0.as_deref_mut().expect("armed cleanup guard"));
+        }
+
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
 
     impl Drop for PendingCleanup<'_> {
         fn drop(&mut self) {
-            reap_pending(self.0);
+            if let Some(pending) = self.0.as_deref_mut() {
+                reap_pending(pending);
+            }
         }
     }
 
@@ -6196,13 +6208,19 @@ mod tests {
             status: Some(pipe.into_reader()),
             ownership_root: None,
         };
-        let cleanup = PendingCleanup(&mut pending);
+        let target_tree = glass_proc_linux::proc_tree_pids(target);
+        assert!(
+            target_tree.len() > 1,
+            "target fixture must have a descendant: {target_tree:?}"
+        );
+        let mut cleanup = PendingCleanup(Some(&mut pending));
 
-        reap_pending(cleanup.0);
+        cleanup.reap();
+        cleanup.disarm();
 
         assert!(
-            !glass_proc_linux::any_alive(&glass_proc_linux::proc_tree_pids(target)),
-            "late-reported target tree survived cleanup from root {target}"
+            !glass_proc_linux::any_alive(&target_tree),
+            "late-reported target tree survived cleanup: {target_tree:?}"
         );
     }
 
