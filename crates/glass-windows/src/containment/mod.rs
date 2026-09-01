@@ -78,8 +78,7 @@ mod imp {
         match decide(spec.sandbox, choice, super::sandboxie::available(&dir)) {
             Decision::Unconfined => Ok(Containment::Unconfined),
             Decision::Sandboxie => {
-                let s =
-                    super::sandboxie::Sandboxie::new(dir, format!("glass_{}", std::process::id()));
+                let s = super::sandboxie::Sandboxie::new(dir, super::sandboxie::unique_box_name());
                 s.configure_with_paths(spec.sandbox, protected_paths)?;
                 Ok(Containment::Sandboxie(s))
             }

@@ -152,12 +152,36 @@ if ($Tests -ne "") {
       Write-Host "tests($Tests): FAIL (no integration test binary built)"; $failures++
     } else {
       $anyFail = $false
+      $artifactMatches = 0
+      $safeTests = ($Tests -replace '[^A-Za-z0-9_.-]', '_')
+      $artifactEvidence = Join-Path $artifacts "artifact.log"
+      if ($Tests -eq "artifact" -and (Test-Path $artifactEvidence)) { Remove-Item $artifactEvidence -Force }
       foreach ($exe in $exes) {
         $tag = [System.IO.Path]::GetFileNameWithoutExtension($exe)
-        $r = Invoke-Interactive $exe $tag "--ignored --test-threads=1 $Tests"
+        if ($Tests -eq "artifact") {
+          $testArgs = "--ignored --test-threads=1 --exact containment::artifact_onbox::sandboxie_denies_artifact_read_and_lease_tampering"
+          $evidenceTag = "artifact"
+        } else {
+          $testArgs = "--ignored --test-threads=1 $Tests"
+          $evidenceTag = "$tag-$safeTests"
+        }
+        $r = Invoke-Interactive $exe $tag $testArgs
         Write-Host $r.text
-        $r.text | Out-File -Encoding ascii (Join-Path $artifacts "$tag-$Tests.log")
+        if ($Tests -eq "artifact") {
+          $r.text | Out-File -Encoding ascii -Append $artifactEvidence
+        } else {
+          $r.text | Out-File -Encoding ascii (Join-Path $artifacts "$evidenceTag.log")
+        }
+        if ($Tests -eq "artifact" -and
+            $r.text -match 'test containment::artifact_onbox::sandboxie_denies_artifact_read_and_lease_tampering \.\.\. ok' -and
+            $r.text -match 'test result: ok\. 1 passed;') {
+          $artifactMatches++
+        }
         if (-not ($r.ran -and $r.result -eq "0")) { $anyFail = $true }
+      }
+      if ($Tests -eq "artifact" -and $artifactMatches -ne 1) {
+        Write-Host "tests(artifact): FAIL (expected exactly one passing artifact test, found $artifactMatches)"
+        $anyFail = $true
       }
       if ($anyFail) { Write-Host "tests($Tests): FAIL"; $failures++ } else { Write-Host "tests($Tests): PASS" }
     }

@@ -16,12 +16,49 @@ use super::sandboxie::{Sandboxie, available, sandboxie_dir};
 enum AccessResult {
     Denied,
     UnexpectedSuccess,
+    UnexpectedError(i32),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct ProbeResult {
     marker_read: AccessResult,
     lease_write: AccessResult,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeParseError {
+    Incomplete(String),
+}
+
+const ACCESS_DENIED_HRESULT: i32 = -2_147_024_891;
+const SHARING_VIOLATION: i32 = 32;
+
+fn parse_access(text: &str, label: &str) -> AccessResult {
+    if text.lines().any(|line| line == format!("{label}_SUCCESS")) {
+        return AccessResult::UnexpectedSuccess;
+    }
+    let prefix = format!("{label}_ERROR:");
+    let code = text
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|value| value.parse::<i32>().ok());
+    match code {
+        Some(ACCESS_DENIED_HRESULT) => AccessResult::Denied,
+        Some(code) => AccessResult::UnexpectedError(code),
+        None => AccessResult::UnexpectedSuccess,
+    }
+}
+
+fn parse_probe_logs(text: &str) -> Result<ProbeResult, ProbeParseError> {
+    if !text.lines().any(|line| line == "PROBE_COMPLETE") {
+        return Err(ProbeParseError::Incomplete(
+            text.chars().take(1024).collect(),
+        ));
+    }
+    Ok(ProbeResult {
+        marker_read: parse_access(text, "MARKER"),
+        lease_write: parse_access(text, "LEASE"),
+    })
 }
 
 struct ArtifactOnboxFixture {
@@ -73,7 +110,7 @@ impl ArtifactOnboxFixture {
         ]
     }
 
-    fn run_probe_in_sandboxie(&self, level: SandboxLevel) -> ProbeResult {
+    fn run_probe_in_sandboxie(&self, level: SandboxLevel) -> Result<ProbeResult, ProbeParseError> {
         let dir = sandboxie_dir();
         assert!(available(&dir), "Sandboxie not available at {dir}");
         let box_name = format!("{}_{level}", self.box_prefix);
@@ -84,7 +121,7 @@ impl ArtifactOnboxFixture {
 
         let marker = path_string(&self.marker);
         let lease = path_string(&self.lease_path);
-        let script = "$ErrorActionPreference='Stop'; try { $v=[IO.File]::ReadAllText($env:ARTIFACT_MARKER); Write-Output ('MARKER_SUCCESS:'+ $v) } catch { Write-Output 'MARKER_DENIED' }; try { [IO.File]::AppendAllText($env:ARTIFACT_LEASE,'tamper'); Write-Output 'LEASE_SUCCESS' } catch { Write-Output 'LEASE_DENIED' }".to_string();
+        let script = "$ErrorActionPreference='Stop'; try { [void][IO.File]::ReadAllText($env:ARTIFACT_MARKER); Write-Output 'MARKER_SUCCESS' } catch { Write-Output ('MARKER_ERROR:'+ $_.Exception.HResult) }; try { [IO.File]::AppendAllText($env:ARTIFACT_LEASE,'tamper'); Write-Output 'LEASE_SUCCESS' } catch { Write-Output ('LEASE_ERROR:'+ $_.Exception.HResult) }; Write-Output 'PROBE_COMPLETE'".to_string();
         let spec = AppSpec {
             build: None,
             run: vec![
@@ -104,10 +141,13 @@ impl ArtifactOnboxFixture {
             a11y: false,
         };
         let logs: Arc<Mutex<Vec<(Stream, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut app = sandboxie.launch(&spec, logs.clone()).expect("launch probe");
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let app = sandboxie.launch(&spec, logs.clone()).expect("launch probe");
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            if app.try_wait().expect("query probe").is_some() {
+            let complete = logs
+                .lock()
+                .is_ok_and(|lines| lines.iter().any(|(_, line)| line == "PROBE_COMPLETE"));
+            if complete {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -120,27 +160,18 @@ impl ArtifactOnboxFixture {
             .map(|(_, line)| line.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        ProbeResult {
-            marker_read: if text.contains("MARKER_DENIED") && !text.contains("MARKER_SUCCESS") {
-                AccessResult::Denied
-            } else {
-                AccessResult::UnexpectedSuccess
-            },
-            lease_write: if text.contains("LEASE_DENIED") && !text.contains("LEASE_SUCCESS") {
-                AccessResult::Denied
-            } else {
-                AccessResult::UnexpectedSuccess
-            },
-        }
+        parse_probe_logs(&text)
     }
 
-    fn lease_is_still_exclusively_locked(&self) -> bool {
+    fn conflicting_lease_open_error(&self) -> i32 {
         let _keep_alive = self.lease.as_ref().expect("lease handle retained");
         OpenOptions::new()
             .write(true)
             .share_mode(0)
             .open(&self.lease_path)
-            .is_err()
+            .expect_err("exclusive lease must reject a conflicting host open")
+            .raw_os_error()
+            .expect("Windows sharing failure has an OS error")
     }
 }
 
@@ -180,7 +211,9 @@ fn sandboxie_denies_artifact_read_and_lease_tampering() {
     }
 
     for level in [SandboxLevel::Default, SandboxLevel::Strict] {
-        let result = fixture.run_probe_in_sandboxie(level);
+        let result = fixture
+            .run_probe_in_sandboxie(level)
+            .expect("probe reached completion sentinel");
         assert_eq!(result.marker_read, AccessResult::Denied);
         assert_eq!(result.lease_write, AccessResult::Denied);
     }
@@ -188,5 +221,40 @@ fn sandboxie_denies_artifact_read_and_lease_tampering() {
         std::fs::read_to_string(&fixture.marker).expect("host reads marker"),
         fixture.marker_text
     );
-    assert!(fixture.lease_is_still_exclusively_locked());
+    assert_eq!(fixture.conflicting_lease_open_error(), SHARING_VIOLATION);
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::{AccessResult, ProbeParseError, parse_probe_logs};
+
+    #[test]
+    fn access_denied_hresult_and_completion_are_required() {
+        let result =
+            parse_probe_logs("MARKER_ERROR:-2147024891\nLEASE_ERROR:-2147024891\nPROBE_COMPLETE")
+                .unwrap();
+
+        assert_eq!(result.marker_read, AccessResult::Denied);
+        assert_eq!(result.lease_write, AccessResult::Denied);
+    }
+
+    #[test]
+    fn sharing_violation_does_not_prove_sandboxie_lease_denial() {
+        let result =
+            parse_probe_logs("MARKER_ERROR:-2147024891\nLEASE_ERROR:-2147024864\nPROBE_COMPLETE")
+                .unwrap();
+
+        assert_eq!(
+            result.lease_write,
+            AccessResult::UnexpectedError(-2147024864)
+        );
+    }
+
+    #[test]
+    fn missing_completion_is_a_distinct_timeout() {
+        assert_eq!(
+            parse_probe_logs("MARKER_ERROR:-2147024891\nLEASE_ERROR:-2147024891").unwrap_err(),
+            ProbeParseError::Incomplete("MARKER_ERROR:-2147024891\nLEASE_ERROR:-2147024891".into())
+        );
+    }
 }
