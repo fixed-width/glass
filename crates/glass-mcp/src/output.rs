@@ -86,7 +86,10 @@ pub(crate) enum ToolEffect {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-#[expect(dead_code, reason = "Target access describes resource availability.")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Target access describes resource availability.")
+)]
 pub(crate) enum TargetAccess {
     DeniedBySandbox,
     NotGuaranteedSandboxOff,

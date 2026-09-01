@@ -80,6 +80,7 @@ pub(crate) struct OmissionRange {
     pub end_exclusive: usize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OmissionRangeError {
     EmptyOrReversed,
@@ -87,6 +88,7 @@ enum OmissionRangeError {
 }
 
 impl OmissionRanges {
+    #[cfg(test)]
     fn new(bounds: &[(usize, usize)]) -> Result<Self, OmissionRangeError> {
         let mut previous_end = None;
         let mut ranges = Vec::with_capacity(bounds.len());
@@ -110,7 +112,10 @@ impl OmissionRanges {
         if count == 0 {
             Self::default()
         } else {
-            Self::new(&[(0, count)]).unwrap_or_default()
+            Self(vec![OmissionRange {
+                start: 0,
+                end_exclusive: count,
+            }])
         }
     }
 
@@ -501,60 +506,80 @@ fn incomplete(outcome: &ToolCallOutcome, original_text_bytes: usize) -> AppliedO
 }
 
 fn emergency(outcome: &ToolCallOutcome, original_text_bytes: usize) -> AppliedOutcome {
-    let omitted_count = outcome.output.0.len();
-    let error = delivery_error_with_category(outcome.effect, false, "output_policy_failed");
-    let metadata = OutputMetadata {
+    emergency_from_counts(
+        outcome.tool,
+        outcome.effect,
+        outcome.is_error,
+        outcome.target_access,
+        original_text_bytes,
+        outcome.output.0.len(),
+    )
+}
+
+fn emergency_from_counts(
+    tool: &'static str,
+    effect: ToolEffect,
+    is_error: bool,
+    target_access: TargetAccess,
+    original_text_bytes: usize,
+    omitted_count: usize,
+) -> AppliedOutcome {
+    let mut metadata = OutputMetadata {
         mode: OutputMode::Incomplete,
         budget_bytes: MAX_TEXT_BYTES,
         original_text_bytes,
         inline_text_bytes: 0,
         complete: false,
-        target_access: outcome.target_access,
+        target_access,
         externalized: Vec::new(),
         omitted_content_blocks: Vec::new(),
         omitted_content_block_ranges: OmissionRanges::all(omitted_count),
-        error: Some(error),
+        error: Some(delivery_error_with_category(
+            effect,
+            false,
+            "output_policy_failed",
+        )),
     };
-    let effect = match outcome.effect {
+    let rendered_effect = match effect {
         ToolEffect::ReadOnly => "read_only",
         ToolEffect::MayMutate => "may_mutate",
     };
-    let result = serde_json::json!({
-        "effect": effect,
-        "is_error": outcome.is_error,
-        "omitted_content_block_count": omitted_count,
-        "output": metadata,
-    });
-    let mut output = ToolOutput::result(bounded_tool(outcome.tool), result);
-    let mut metadata = metadata;
-    for _ in 0..=6 {
-        let exact = output.text_bytes();
-        if metadata.inline_text_bytes == exact {
-            break;
-        }
-        metadata.inline_text_bytes = exact;
-        if set_envelope_metadata(&mut output.0, 0, &metadata).is_none() {
-            output = ToolOutput::result(
-                "glass_output_policy",
-                serde_json::json!({"complete": false, "error": "output_policy_failed"}),
-            );
-            metadata.inline_text_bytes = output.text_bytes();
-            break;
-        }
+    let zero_output = render_emergency(tool, rendered_effect, is_error, omitted_count, &metadata);
+    let fixed_overhead = zero_output.text_bytes().saturating_sub(1);
+    let mut inline_text_bytes = fixed_overhead.saturating_add(1);
+    for _ in 0..=decimal_digits(usize::MAX) {
+        inline_text_bytes = fixed_overhead.saturating_add(decimal_digits(inline_text_bytes));
     }
-    if output.text_bytes() > MAX_TEXT_BYTES {
-        output = ToolOutput::result(
-            "glass_output_policy",
-            serde_json::json!({"complete": false, "error": "output_policy_failed"}),
-        );
-        metadata.inline_text_bytes = output.text_bytes();
-    }
+    metadata.inline_text_bytes = inline_text_bytes;
+    let output = render_emergency(tool, rendered_effect, is_error, omitted_count, &metadata);
     AppliedOutcome {
         output,
-        is_error: outcome.is_error,
+        is_error,
         metadata: Some(metadata),
         response_pin: None,
     }
+}
+
+fn render_emergency(
+    tool: &'static str,
+    effect: &'static str,
+    is_error: bool,
+    omitted_count: usize,
+    metadata: &OutputMetadata,
+) -> ToolOutput {
+    ToolOutput::result(
+        bounded_tool(tool),
+        serde_json::json!({
+            "effect": effect,
+            "is_error": is_error,
+            "omitted_content_block_count": omitted_count,
+            "output": metadata,
+        }),
+    )
+}
+
+fn decimal_digits(value: usize) -> usize {
+    value.checked_ilog10().map_or(1, |log| log as usize + 1)
 }
 
 fn delivery_error(effect: ToolEffect, preserved: bool) -> OutputDeliveryError {
@@ -1399,6 +1424,68 @@ mod tests {
                 .as_array()
                 .is_none_or(Vec::is_empty)
         );
+    }
+
+    #[test]
+    fn emergency_helper_renders_the_same_complete_metadata_it_returns_for_all_classifications() {
+        static HUGE_TOOL: &str = include_str!("../../../README.md");
+        for target_access in [
+            TargetAccess::DeniedBySandbox,
+            TargetAccess::NotGuaranteedSandboxOff,
+            TargetAccess::HostFilesystemUnreachable,
+            TargetAccess::NoActiveTarget,
+        ] {
+            for (effect, expected_retry, expected_recovery) in [
+                (ToolEffect::ReadOnly, "safe_to_retry_read", READ_RECOVERY),
+                (
+                    ToolEffect::MayMutate,
+                    "do_not_repeat_action",
+                    MUTATE_RECOVERY,
+                ),
+            ] {
+                for is_error in [false, true] {
+                    let applied = emergency_from_counts(
+                        HUGE_TOOL,
+                        effect,
+                        is_error,
+                        target_access,
+                        usize::MAX,
+                        usize::MAX,
+                    );
+                    let returned =
+                        serde_json::to_value(applied.output_metadata().expect("metadata"))
+                            .expect("serializable metadata");
+                    let OutContent::Envelope(envelope) = &applied.output.0[0] else {
+                        panic!("emergency output must be one envelope");
+                    };
+                    let rendered = &envelope.result["output"];
+
+                    assert_eq!(rendered, &returned);
+                    assert_eq!(rendered["original_text_bytes"], usize::MAX);
+                    assert_eq!(
+                        rendered["target_access"],
+                        serde_json::to_value(target_access).expect("target access")
+                    );
+                    assert_eq!(rendered["error"]["retry_safety"], expected_retry);
+                    assert_eq!(rendered["error"]["recovery"], expected_recovery);
+                    assert_eq!(rendered["error"]["category"], "output_policy_failed");
+                    assert_eq!(envelope.result["is_error"], is_error);
+                    assert_eq!(applied.is_error, is_error);
+                    assert_eq!(
+                        rendered["omitted_content_block_ranges"],
+                        json!([{"start": 0, "end_exclusive": usize::MAX}])
+                    );
+                    assert!(rendered.get("omitted_content_blocks").is_none());
+                    assert_eq!(
+                        applied.output.text_bytes(),
+                        rendered["inline_text_bytes"]
+                            .as_u64()
+                            .expect("inline bytes") as usize
+                    );
+                    assert!(applied.output.text_bytes() <= MAX_TEXT_BYTES);
+                }
+            }
+        }
     }
 
     #[test]
