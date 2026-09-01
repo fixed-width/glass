@@ -57,6 +57,56 @@ Most input/action tools (`glass_click`, `glass_move`, `glass_drag`, `glass_scrol
 the envelope is itself the confirmation that the action ran. (`glass_type` can fold an optional
 observe into that result via `return` — see its entry.)
 
+### Bounded text output and artifacts
+
+Every tool response has one fixed ceiling of exactly **8,192 UTF-8 bytes**, summed across every MCP
+text content block. This includes the JSON envelope and any `result.output` metadata serialized
+inside it. Images, MCP resource-link content objects, annotations, and non-text MCP metadata are
+excluded from text-byte accounting. A response at or below the ceiling is byte-compatible with the
+original response: its content and order are unchanged, and it receives no new `result.output`
+metadata.
+
+For an oversized response, glass replaces complete logical text blocks with read-only
+`glass-artifact://` resource links. The links remain in the original block positions, and MCP
+`resources/read` returns the exact omitted text. If the links plus the result envelope cannot fit,
+the response instead contains one whole-response manifest link; that resource uses schema
+`glass.output-manifest.v1` and records the original block sequence. Artifact resources are not
+enumerable and do not support subscriptions.
+
+When the output policy changes a response, the envelope includes `result.output` transport metadata:
+
+| Field | Meaning |
+|---|---|
+| `mode` | `content_blocks` when individual blocks were externalized, `response_manifest` for one whole-response manifest, or `incomplete` when exact delivery could not be retained |
+| `budget_bytes` | The fixed text ceiling, `8192` |
+| `original_text_bytes` | UTF-8 bytes across all original text blocks before applying the policy |
+| `inline_text_bytes` | UTF-8 bytes across all text blocks in the returned response |
+| `complete` | Whether all original output remains available inline or through the linked artifacts |
+| `target_access` | The server's guarantee about whether the active target can address the artifact paths: `denied_by_sandbox`, `not_guaranteed_sandbox_off`, `host_filesystem_unreachable`, or `no_active_target` |
+| `externalized` | Optional descriptors for the created artifacts, including URI, server-local path, MIME type, byte count, SHA-256 digest, trust label, and original block indices |
+| `omitted_content_blocks` | Optional individual indices of original blocks that were not retained |
+| `omitted_content_block_ranges` | Optional half-open `start`/`end_exclusive` ranges of original blocks that were not retained |
+| `error` | Optional output-delivery failure details, including `retry_safety` and recovery guidance |
+
+`complete` describes **output delivery only**. It does not report whether the tool or action
+succeeded; keep it distinct from MCP `isError` and the envelope's `ok`. `complete:false` means some
+original output was not retained. Follow `error.retry_safety`: `safe_to_retry_read` allows a
+read-only operation to be retried after correcting artifact storage or narrowing the read, while
+`do_not_repeat_action` means a mutating action must not be repeated solely to recover its
+observation.
+
+Artifacts belong to the current `glass-mcp` process. They survive `glass_start` and `glass_stop`,
+but disappear when the server shuts down or restarts. The store retains up to 64 MiB and evicts the
+oldest-created unpinned artifacts first; reads do not refresh age, and artifacts pinned by an active
+response or read are not evicted while in use. A descriptor's local path is only a convenience on
+the server host and is unusable to clients that do not share that filesystem. Every client can read
+the `glass-artifact://` URI with MCP `resources/read`.
+
+Artifact text containing target-controlled content remains untrusted and is explicitly labeled with
+`untrusted:true`. Trusted Glass-generated artifact text is labeled with `untrusted:false`. Explicit
+observation tools and observations requested automatically after an action use this same output
+policy.
+
 ## Type conventions
 
 Exact wire types for the ids and coordinates used throughout this reference (freshness rules for

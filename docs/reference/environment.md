@@ -32,6 +32,7 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 |---|---|---|---|
 | `GLASS_SANDBOX` | Default containment level: `default`, `strict`, or `off` | `default` | all |
 | `GLASS_SANDBOX_FLOOR` | Operator-enforced minimum containment level; raises an omitted request, refuses an explicit one below it | `off` (no floor) | all |
+| `GLASS_ARTIFACT_DIR` | Absolute artifact cache-root override; relative paths are rejected | Linux: `$XDG_CACHE_HOME/glass/artifacts`, falling back to `~/.cache/glass/artifacts`; macOS: `~/Library/Caches/glass/artifacts`; Windows: `%LOCALAPPDATA%\glass\artifacts` | all |
 | `GLASS_BWRAP` | bubblewrap binary | `bwrap` (on `PATH`) | Linux |
 | `GLASS_WIN_SANDBOX_PROVIDER` | Windows containment provider: `auto`, `sandboxie`, or `none` | `auto` | Windows |
 | `GLASS_SANDBOXIE_DIR` | Sandboxie install directory | `%ProgramFiles%\Sandboxie` | Windows |
@@ -40,6 +41,11 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 
 `default` and `strict` are fail-closed; the levels and per-OS mechanisms are explained in
 [explanation/containment.md](../explanation/containment.md).
+
+Glass treats the artifact root as an operator-owned cache container. It does not change an existing
+root's permissions or DACL. Under that root, glass creates one owner-private process directory and
+lease, and applies owner-private protection to its temporary and final artifact files. Contained
+desktop targets are denied access to the process directory and lease.
 
 ## Rendering under containment (Linux)
 

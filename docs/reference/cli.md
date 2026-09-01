@@ -11,6 +11,10 @@
 Serve MCP over **stdio** on stdin/stdout. This is how an MCP client that spawns the binary talks to
 it; see [how-to/connect-an-agent.md](../how-to/connect-an-agent.md).
 
+Tool responses can contain `glass-artifact://` links for bounded text output. Read them with MCP
+`resources/read`. A local path in resource metadata is on the server host, not necessarily the MCP
+client's filesystem.
+
 - `--audit-log <path>` — append a JSONL audit record per actuation (same as `GLASS_AUDIT_LOG`); see
   [reference/audit-log.md](audit-log.md).
 
@@ -26,6 +30,8 @@ Serve MCP over the network (Streamable HTTP) instead of stdio.
 - `--audit-log <path>` — as above.
 
 Loopback binds need no token; see [how-to/run-over-the-network.md](../how-to/run-over-the-network.md).
+Remote HTTP clients must read `glass-artifact://` links with MCP `resources/read`; they must not try
+to open the server-local path from resource metadata on the client machine.
 
 ## `gen-token`
 
