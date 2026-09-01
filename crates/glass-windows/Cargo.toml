@@ -34,6 +34,7 @@ windows = { version = "0.62", features = [
   "Wdk_System_SystemServices", "Win32_System_SystemInformation",
   # private clipboard: host named-pipe server + scoped security descriptor
   "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_IO",
+  "Wdk_Foundation", "Wdk_Storage_FileSystem",
   "Win32_Security_Authorization",
   # doctor/env color: switch the console into ANSI-interpreting mode before emitting escapes.
   "Win32_System_Console",

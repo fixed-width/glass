@@ -4,9 +4,16 @@ use std::fs::{File, OpenOptions};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::FromRawHandle;
+use std::path::Component;
 use std::path::Path;
+use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows::Wdk::Storage::FileSystem::{
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+    NtCreateFile,
+};
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
+use windows::Win32::Foundation::{HLOCAL, LocalFree, OBJ_CASE_INSENSITIVE, UNICODE_STRING};
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -16,10 +23,11 @@ use windows::Win32::Security::{
     PSECURITY_DESCRIPTOR, SetFileSecurityW,
 };
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, SYNCHRONIZE,
 };
+use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::core::{PCWSTR, PWSTR};
 
 const PRIVATE_DACL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)";
@@ -45,39 +53,152 @@ pub fn open_directory_no_reparse(path: &Path) -> Result<File, HostFsError> {
     Ok(file)
 }
 
-/// Opens one named regular-file child and verifies the retained directory still names the same object.
+/// Opens one generated single-component regular-file child relative to a retained directory handle.
+///
+/// The pathname is consulted only to reject an already-substituted directory before the native
+/// relative open. Once that check completes, directory renames cannot redirect the child lookup.
 pub fn open_file_beneath(
     directory: &File,
     directory_path: &Path,
     filename: &OsStr,
 ) -> Result<File, HostFsError> {
-    if Path::new(filename).components().count() != 1
+    open_file_beneath_with_hook(directory, directory_path, filename, |_| Ok(()))
+}
+
+#[derive(Clone, Copy)]
+enum ChildOpenStage {
+    BeforeOpen,
+    AfterOpen,
+}
+
+fn open_file_beneath_with_hook(
+    directory: &File,
+    directory_path: &Path,
+    filename: &OsStr,
+    mut hook: impl FnMut(ChildOpenStage) -> Result<(), HostFsError>,
+) -> Result<File, HostFsError> {
+    let mut components = Path::new(filename).components();
+    if !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
         || !directory_matches_path(directory, directory_path)?
     {
         return Err(HostFsError::Integrity);
     }
-    let path = directory_path.join(filename);
-    let file = OpenOptions::new()
-        .read(true)
-        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(&path)
-        .map_err(|_| HostFsError::Open)?;
+    hook(ChildOpenStage::BeforeOpen)?;
+    let file = open_relative_file(directory, filename)?;
+    hook(ChildOpenStage::AfterOpen)?;
     let metadata = file.metadata().map_err(|_| HostFsError::Open)?;
-    if !metadata.is_file()
-        || is_reparse(&metadata)
-        || !directory_matches_path(directory, directory_path)?
-    {
-        return Err(HostFsError::Integrity);
-    }
-    let resolved_file = path.canonicalize().map_err(|_| HostFsError::Open)?;
-    let resolved_directory = directory_path
-        .canonicalize()
-        .map_err(|_| HostFsError::Open)?;
-    if resolved_file.parent() != Some(resolved_directory.as_path()) {
+    if !metadata.is_file() || is_reparse(&metadata) {
         return Err(HostFsError::Integrity);
     }
     Ok(file)
+}
+
+fn open_relative_file(directory: &File, filename: &OsStr) -> Result<File, HostFsError> {
+    let mut name = filename.encode_wide().collect::<Vec<_>>();
+    if name.contains(&0) {
+        return Err(HostFsError::Integrity);
+    }
+    let byte_len = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or(HostFsError::Integrity)?;
+    let unicode_name = UNICODE_STRING {
+        Length: byte_len,
+        MaximumLength: byte_len,
+        Buffer: PWSTR(name.as_mut_ptr()),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>())
+            .map_err(|_| HostFsError::Open)?,
+        RootDirectory: HANDLE(directory.as_raw_handle()),
+        ObjectName: &unicode_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let mut handle = HANDLE::default();
+    // SAFETY: `directory` supplies a live directory handle and remains borrowed for the call.
+    // `unicode_name` references the initialized UTF-16 `name` buffer, whose byte length fits u16;
+    // native counted strings do not require a terminator. `attributes` has the required size,
+    // points to `unicode_name`, uses that directory as `RootDirectory`, and has null optional
+    // security pointers. `handle` and `status_block` are writable outputs. The access mask requests
+    // only reads, attributes, and synchronous completion; sharing includes read, write, and delete.
+    // `FILE_OPEN` cannot create, `FILE_NON_DIRECTORY_FILE` rejects directories, and
+    // `FILE_OPEN_REPARSE_POINT` opens a reparse object itself so the safe wrapper can reject it.
+    // On success, ownership of the returned handle transfers exactly once to `File`; on failure,
+    // NT does not return an owned handle and the initialized default value is not closed.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &attributes,
+            &mut status_block,
+            None,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            None,
+            0,
+        )
+    };
+    if !status.is_ok() {
+        return Err(HostFsError::Open);
+    }
+    // SAFETY: A successful NtCreateFile call returned one owned file handle in `handle`.
+    // `File` assumes that ownership and closes the handle exactly once when dropped.
+    Ok(unsafe { File::from_raw_handle(handle.0) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn child_open_never_follows_a_swap_open_restore_directory_race() {
+        let parent = tempfile::tempdir().unwrap();
+        let directory_path = parent.path().join("owned");
+        let detached_path = parent.path().join("detached");
+        let external_path = parent.path().join("external");
+        std::fs::create_dir(&directory_path).unwrap();
+        std::fs::create_dir(&external_path).unwrap();
+        let filename = OsStr::new("artifact.txt");
+        std::fs::write(directory_path.join(filename), "retained").unwrap();
+        std::fs::write(external_path.join(filename), "external").unwrap();
+        let directory = open_directory_no_reparse(&directory_path).unwrap();
+
+        let mut file =
+            open_file_beneath_with_hook(&directory, &directory_path, filename, |stage| {
+                match stage {
+                    ChildOpenStage::BeforeOpen => {
+                        std::fs::rename(&directory_path, &detached_path)
+                            .map_err(|_| HostFsError::Open)?;
+                        std::fs::rename(&external_path, &directory_path)
+                            .map_err(|_| HostFsError::Open)?;
+                    }
+                    ChildOpenStage::AfterOpen => {
+                        std::fs::rename(&directory_path, &external_path)
+                            .map_err(|_| HostFsError::Open)?;
+                        std::fs::rename(&detached_path, &directory_path)
+                            .map_err(|_| HostFsError::Open)?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+
+        assert_eq!(text, "retained");
+        assert_eq!(
+            std::fs::read_to_string(external_path.join(filename)).unwrap(),
+            "external"
+        );
+    }
 }
 
 fn directory_matches_path(directory: &File, path: &Path) -> Result<bool, HostFsError> {
