@@ -488,7 +488,7 @@ fn shutdown_retry_advances_when_process_directory_was_removed_externally() {
     assert!(!lease.exists());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn shutdown_removes_fifo_and_socket_residue() {
     use std::os::unix::net::UnixListener;
