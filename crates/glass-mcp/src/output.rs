@@ -13,10 +13,6 @@ pub(crate) enum TextTrust {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TextRole {
-    #[expect(
-        dead_code,
-        reason = "Envelope distinguishes Glass control text from observations."
-    )]
     Envelope,
     Observation,
     Guidance,
@@ -75,9 +71,16 @@ impl EnvelopeBlock {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(dead_code, reason = "Tool effects classify output metadata.")]
 pub(crate) enum ToolEffect {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Reserved for output classification.")
+    )]
     ReadOnly,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Reserved for output classification.")
+    )]
     MayMutate,
 }
 
@@ -93,10 +96,6 @@ pub(crate) enum TargetAccess {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-#[expect(
-    dead_code,
-    reason = "Artifact kinds distinguish resource representations."
-)]
 pub(crate) enum ArtifactKind {
     ContentBlock,
     ResponseManifest,

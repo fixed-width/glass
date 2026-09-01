@@ -93,6 +93,7 @@ static_vcruntime = "3.0"
 [dev-dependencies]
 tempfile.workspace = true
 image.workspace = true
+proptest.workspace = true
 rmcp = { version = "2.2", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 tokio = { version = "1", features = ["full"] }
 # Named directly in tests/network_roundtrip.rs (the client transport is generic over

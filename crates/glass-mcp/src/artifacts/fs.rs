@@ -684,6 +684,13 @@ impl ArtifactStore {
             })
     }
 
+    pub(crate) fn mark_unavailable(&self, error: ArtifactError) {
+        match self.inner.state.lock() {
+            Ok(mut state) => state.availability_error = Some(error),
+            Err(mut poisoned) => poisoned.get_mut().availability_error = Some(error),
+        }
+    }
+
     pub(crate) fn enforce_retention(&self) -> Result<(), ArtifactError> {
         let mut state = self
             .inner
