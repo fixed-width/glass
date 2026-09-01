@@ -1410,7 +1410,7 @@ fn bring_up_session(
     let config = runtime_dir.path().join("sway.cfg");
     std::fs::write(
         &config,
-        sway_config(spec, runtime_dir.path(), a11y.map(|a| a.dir)),
+        sway_config(spec, runtime_dir.path(), a11y.map(|a| a.dir), None, &[])?,
     )
     .map_err(GlassError::Io)?;
     let mut cmd = build_sway_command(

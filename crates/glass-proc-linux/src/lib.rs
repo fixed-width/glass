@@ -354,6 +354,62 @@ pub fn proc_tree_pids(root_pid: u32) -> Vec<u32> {
     collect_descendants(root_pid, &parent_of)
 }
 
+/// Host and namespace-visible identities for one live process tree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessIdentitySet {
+    host_pids: Vec<u32>,
+    matching_pids: Vec<u32>,
+}
+
+/// Parse the PID visible in the innermost namespace from a Linux status file.
+pub fn namespace_pid_from_status(status: &str) -> Option<u32> {
+    status.lines().find_map(|line| {
+        line.strip_prefix("NSpid:")?
+            .split_whitespace()
+            .last()?
+            .parse()
+            .ok()
+    })
+}
+
+impl ProcessIdentitySet {
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (u32, Option<u32>)>) -> Self {
+        let mut host_pids = Vec::new();
+        let mut matching_pids = Vec::new();
+        for (host, namespace) in pairs {
+            host_pids.push(host);
+            matching_pids.push(host);
+            matching_pids.extend(namespace);
+        }
+        host_pids.sort_unstable();
+        host_pids.dedup();
+        matching_pids.sort_unstable();
+        matching_pids.dedup();
+        Self {
+            host_pids,
+            matching_pids,
+        }
+    }
+
+    pub fn from_host_root(root: u32) -> Self {
+        Self::from_pairs(proc_tree_pids(root).into_iter().map(|host| {
+            let namespace = std::fs::read_to_string(format!("/proc/{host}/status"))
+                .ok()
+                .as_deref()
+                .and_then(namespace_pid_from_status);
+            (host, namespace)
+        }))
+    }
+
+    pub fn host_pids(&self) -> &[u32] {
+        &self.host_pids
+    }
+
+    pub fn matching_pids(&self) -> &[u32] {
+        &self.matching_pids
+    }
+}
+
 /// Collect `root` and all its descendants given a child→parent-pid map.
 /// Cycle-safe (a `seen` set guarantees termination even if the map contains a
 /// cycle, e.g. from PID reuse mid-scan).
@@ -373,6 +429,36 @@ fn collect_descendants(root: u32, parent_of: &HashMap<u32, u32>) -> Vec<u32> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{ProcessIdentitySet, namespace_pid_from_status};
+
+    #[test]
+    fn nspid_uses_the_innermost_namespace_pid() {
+        let status = "Name:\tapp\nPid:\t4242\nNSpid:\t4242\t2\n";
+        assert_eq!(namespace_pid_from_status(status), Some(2));
+    }
+
+    #[test]
+    fn malformed_or_missing_nspid_is_ignored() {
+        for status in ["Name:\tapp\n", "NSpid:\t4242\tbad\n", "NSpid:\t\n"] {
+            assert_eq!(namespace_pid_from_status(status), None);
+        }
+    }
+
+    #[test]
+    fn identity_set_sorts_and_deduplicates_host_and_matching_pids() {
+        let set = ProcessIdentitySet::from_pairs([
+            (4243, Some(3)),
+            (4242, Some(2)),
+            (7, Some(7)),
+            (4242, Some(2)),
+        ]);
+        assert_eq!(set.host_pids(), &[7, 4242, 4243]);
+        assert_eq!(set.matching_pids(), &[2, 3, 7, 4242, 4243]);
+    }
 }
 
 #[cfg(test)]

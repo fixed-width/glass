@@ -581,7 +581,7 @@ impl X11Platform {
             addr: b.session_bus_address(),
             dir: b.runtime_dir(),
         });
-        let mut cmd = build_command(spec, &self.display, a11y);
+        let mut cmd = build_command(spec, &self.display, a11y, None, &[])?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
             .spawn()

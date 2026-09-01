@@ -10,6 +10,8 @@ publish.workspace = true
 glass-core.workspace = true
 glass-exec-unix.workspace = true
 glass-sandbox-unix.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile.workspace = true

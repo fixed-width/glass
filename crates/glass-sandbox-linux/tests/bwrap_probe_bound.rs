@@ -53,8 +53,8 @@ fn hung_bwrap(dir: &Path) -> PathBuf {
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\n[ $# -eq 6 ] || exit 3\n\
-             [ \"$*\" = '--unshare-user --ro-bind / / -- true' ] || exit 3\n\
+            "#!/bin/sh\n[ $# -eq 11 ] || exit 3\n\
+             [ \"$*\" = '--unshare-user --unshare-pid --ro-bind / / --proc /proc --json-status-fd 1 -- true' ] || exit 3\n\
              exec sleep {FIXTURE_SECS}\n"
         ),
     )

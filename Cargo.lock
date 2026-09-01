@@ -1377,6 +1377,8 @@ dependencies = [
  "glass-core",
  "glass-exec-unix",
  "glass-sandbox-unix",
+ "rustix",
+ "serde_json",
  "tempfile",
 ]
 
