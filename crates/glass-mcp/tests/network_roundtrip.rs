@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use glass_mcp::serve::config::ServeConfig;
 use rmcp::ServiceExt;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ErrorCode};
 use rmcp::model::{SubscribeRequestParams, UnsubscribeRequestParams};
+use rmcp::service::ServiceError;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 
@@ -47,8 +48,6 @@ async fn start_server(token: Option<&str>) -> TestServer {
         })
         .await
     });
-    // Give the listener a beat to start accepting.
-    tokio::time::sleep(Duration::from_millis(50)).await;
     TestServer {
         url: format!("http://{addr}/"),
         cancel,
@@ -70,6 +69,17 @@ fn client_transport(
         cfg = cfg.auth_header(t.to_string());
     }
     StreamableHttpClientTransport::from_config(cfg)
+}
+
+fn assert_method_not_found(error: ServiceError) {
+    match error {
+        ServiceError::McpError(error) => assert_eq!(
+            error.code,
+            ErrorCode::METHOD_NOT_FOUND,
+            "unexpected MCP error: {error:?}"
+        ),
+        other => panic!("expected MCP method-not-found error, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -191,16 +201,8 @@ async fn resources_are_read_only_without_lists_templates_or_subscriptions() {
         .unsubscribe(UnsubscribeRequestParams::new("glass-artifact://server/id"))
         .await
         .expect_err("unsubscriptions are unsupported");
-    let subscribe_debug = format!("{subscribe:?}");
-    let unsubscribe_debug = format!("{unsubscribe:?}");
-    assert!(
-        subscribe_debug.contains("-32601"),
-        "unexpected subscribe error: {subscribe_debug}"
-    );
-    assert!(
-        unsubscribe_debug.contains("-32601"),
-        "unexpected unsubscribe error: {unsubscribe_debug}"
-    );
+    assert_method_not_found(subscribe);
+    assert_method_not_found(unsubscribe);
 
     client.cancel().await.ok();
     server.shutdown().await;
