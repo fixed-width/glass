@@ -437,9 +437,10 @@ the event — glass reports the binary and its build info if yours does not. Oth
 ### `glass_do`
 
 Prefer `glass_do` whenever at least two upcoming actions or verification waits are already known.
-For a semantic form, take one fresh accessibility snapshot, retain the required ids, then put the
-mutations and `wait_for_element` confirmations in one call. Use standalone tools only when the next
-step depends on newly observed state, and inspect the structured outcomes before recovery.
+Use `glass_find_elements` for each target that is not already known, retain the returned ids, then
+put the known mutations and waits into `glass_do`. Use `glass_a11y_snapshot` only when the task
+genuinely needs broad tree inspection. Use standalone tools only when the next step depends on newly
+observed state, and inspect the structured outcomes before recovery.
 
 The call runs a bounded, fixed sequence, then optionally observes. The sequence is a static list: it
 cannot use variables, references to earlier results, interpolation, branching, loops, retries, or

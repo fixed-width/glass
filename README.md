@@ -53,13 +53,18 @@ tree, the agent drives it semantically — addressing widgets by `#id` and confi
 text, no per-step screenshot:
 
 ```jsonc
-glass_start            { "run": ["python3", "app.py"] }   // launch (accessibility on by default)
-glass_a11y_snapshot                        // the tree: role, name, #id, bounds — as text
-glass_click_element    { "id": 5 }         // click by #id, not pixels
-glass_wait_for_element { "name": "Save", "condition": "enabled" }       // wait on state — no polling
-glass_set_value        { "id": 4, "value": "hello" }   // set a field / toggle / dropdown
-glass_logs                                 // read the app's stderr
+glass_start         { "run": ["python3", "app.py"] }
+glass_find_elements { "query": "account", "states": ["visible"] } // returns field #4 and Save #5
+glass_do            { "actions": [
+  { "action": "set_value", "id": 4, "text": "hello" },
+  { "action": "click_element", "id": 5 },
+  { "action": "wait_for_element", "name": "Saved" }
+] }
+glass_logs
 ```
+
+Use `glass_a11y_snapshot` when the agent needs broad structural inspection rather than a small set
+of likely targets.
 
 For a canvas or custom-rendered app with no accessibility tree, drive it by pixels instead —
 `glass_screenshot`, `glass_click {x,y}`, and `glass_diff`, which returns `changed_pct` + a `bbox` as
