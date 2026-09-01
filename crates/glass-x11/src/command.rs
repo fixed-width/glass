@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_command_threads_real_status_fd_and_masks_after_display_and_a11y_binds() {
+    fn default_sandbox_command_has_pid_namespace_status_and_final_artifact_masks() {
         let temp = tempfile::tempdir().unwrap();
         let protected = temp.path().join("protected");
         std::fs::create_dir(&protected).unwrap();
@@ -156,6 +156,7 @@ mod tests {
             .unwrap();
         let a11y = argv.iter().rposition(|arg| *arg == temp.path()).unwrap();
         let mask = argv.iter().rposition(|arg| *arg == protected).unwrap();
+        assert!(argv.contains(&OsStr::new("--unshare-pid")));
         assert_eq!(argv[status + 1], OsStr::new(&pipe.writer_fd().to_string()));
         assert!(mask > a11y);
     }

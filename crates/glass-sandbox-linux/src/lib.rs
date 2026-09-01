@@ -317,7 +317,8 @@ pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Result<
     Ok(v)
 }
 
-fn validate_protected_paths(paths: &[ProtectedHostPath]) -> Result<()> {
+/// Validate protected host paths before a target command is launched.
+pub fn validate_protected_paths(paths: &[ProtectedHostPath]) -> Result<()> {
     for protected in paths {
         let path = &protected.path;
         if !path.is_absolute() || path == Path::new("/") {
