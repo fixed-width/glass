@@ -5422,7 +5422,6 @@ mod tests {
     #[test]
     fn toggle_verify_stops_at_the_nearer_caller_deadline() {
         let drags = Arc::new(Mutex::new(Vec::new()));
-        let deadline = Deadline::from_millis(350);
         let platform = FakePlatform::new(400, 400)
             .with_drag_log(drags.clone())
             .with_trailing_toggle_backend();
@@ -5435,6 +5434,7 @@ mod tests {
         g.a11y_snapshot(None).unwrap();
         ax_deadlines.lock().unwrap().clear();
         read_starts.lock().unwrap().clear();
+        let deadline = Deadline::from_millis(350);
         let err = g.set_value_by(AxNodeId(1), "true", deadline).unwrap_err();
         assert!(
             matches!(
