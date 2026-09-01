@@ -385,6 +385,14 @@ fn launch_ready(
     status_confirmed && window_discovered && observed_at < deadline
 }
 
+fn time_remains(observed_at: Instant, deadline: Instant) -> bool {
+    observed_at < deadline
+}
+
+fn recovery_start(observed_at: Instant, timeout_ms: u64) -> Instant {
+    observed_at + start_recovery_after(timeout_ms)
+}
+
 fn launch_with_retry<T>(
     deadline: Instant,
     timeout_ms: u64,
@@ -392,15 +400,13 @@ fn launch_with_retry<T>(
 ) -> Result<T> {
     const ATTEMPTS: u32 = 2;
     let mut last_error = None;
-    for attempt_number in 0..ATTEMPTS {
+    for _ in 0..ATTEMPTS {
         if Instant::now() >= deadline {
             return Err(last_error.unwrap_or(GlassError::Timeout(timeout_ms)));
         }
         match attempt(deadline) {
             Ok(value) => return Ok(value),
-            Err(error @ (GlassError::Timeout(_) | GlassError::Backend(_)))
-                if attempt_number + 1 < ATTEMPTS =>
-            {
+            Err(error @ (GlassError::Timeout(_) | GlassError::Backend(_))) => {
                 last_error = Some(error);
             }
             Err(error) => return Err(error),
@@ -1501,7 +1507,7 @@ fn open_session(
     let ipc = loop {
         match Ipc::connect(runtime_dir) {
             Ok(c) => break c,
-            Err(_) if Instant::now() < deadline => {
+            Err(_) if time_remains(Instant::now(), deadline) => {
                 std::thread::sleep(
                     Duration::from_millis(40)
                         .min(deadline.saturating_duration_since(Instant::now())),
@@ -1646,14 +1652,14 @@ fn bring_up_session(
     let taps = vec![stdout_tap, stderr_tap];
 
     let socket = loop {
-        if Instant::now() >= deadline {
+        if !time_remains(Instant::now(), deadline) {
             return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
         }
         if let Err(error) = pending.poll_status() {
             return Err(failed_launch_error(&mut pending, error));
         }
         if let Some(s) = find_wayland_socket(runtime_dir.path())
-            && Instant::now() < deadline
+            && time_remains(Instant::now(), deadline)
         {
             break s;
         }
@@ -1670,14 +1676,14 @@ fn bring_up_session(
         );
     };
 
-    if Instant::now() >= deadline {
+    if !time_remains(Instant::now(), deadline) {
         return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
     }
     let (conn, mut queue, mut state, manager, output, pointer, keyboard, mut ipc, output_size) =
         match open_session(&socket, runtime_dir.path(), deadline) {
             Ok(v) => v,
             Err(e) => {
-                if Instant::now() >= deadline {
+                if !time_remains(Instant::now(), deadline) {
                     return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
                 }
                 return Err(failed_launch_error(&mut pending, e));
@@ -1703,7 +1709,7 @@ fn bring_up_session(
         // a slow toolkit under load can sit there for a while. Waiting out half the budget makes
         // an arriving window very unlikely to be mistaken for a lost one, and still leaves the
         // other half to notice, re-map, and see the window appear.
-        let start_grace = Instant::now() + start_recovery_after(spec.timeout_ms);
+        let start_grace = recovery_start(Instant::now(), spec.timeout_ms);
         let mut discovered = None;
         loop {
             if Instant::now() >= deadline {
@@ -6213,12 +6219,15 @@ mod tests {
         BwrapStatusPipe, LaunchCleanupOutcome, PendingWaylandSession, WaylandPlatform,
         failed_launch_error, find_wayland_socket, launch_cleanup_error, launch_deadline_error,
         launch_ready, launch_with_retry, nudge_x, open_session, parse_sway_version, reap_pending,
-        start_recovery_after,
+        recovery_start, start_recovery_after, time_remains, wayland_host_tree,
     };
     use crate::command::{build_sway_command, sway_config};
-    use glass_core::{AppSpec, SandboxLevel};
+    use glass_core::{
+        AppSpec, HostPathProtectionMode, Platform as _, ProtectedHostPath, SandboxLevel,
+    };
     use std::io::Write as _;
-    use std::process::{Command, Stdio};
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Child, Command, Stdio};
 
     struct PendingCleanup<'a>(Option<&'a mut PendingWaylandSession>);
 
@@ -6238,6 +6247,72 @@ mod tests {
                 let _ = reap_pending(pending);
             }
         }
+    }
+
+    struct ProcessGroupCleanup(Child);
+
+    impl Drop for ProcessGroupCleanup {
+        fn drop(&mut self) {
+            glass_proc_linux::reap_group(&mut self.0, glass_proc_linux::REAP_GRACE);
+        }
+    }
+
+    #[test]
+    fn a_deadline_observed_at_its_exact_instant_has_no_time_remaining() {
+        let deadline = std::time::Instant::now();
+
+        assert!(!time_remains(deadline, deadline));
+    }
+
+    #[test]
+    fn recovery_starts_only_after_its_grace_period() {
+        let now = std::time::Instant::now();
+
+        assert_eq!(recovery_start(now, 200), now + start_recovery_after(200));
+    }
+
+    #[test]
+    fn valid_protected_paths_are_enforced_with_sandbox_rules() {
+        let protected = tempfile::tempdir().expect("protected directory");
+        let mut platform = WaylandPlatform {
+            sway: std::path::PathBuf::new(),
+            logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            active: None,
+            clipboard_owner: None,
+            dbus: None,
+            protected_host_paths: Vec::new(),
+        };
+
+        let mode = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(protected.path())])
+            .expect("valid protected path");
+
+        assert_eq!(mode, HostPathProtectionMode::SandboxRules);
+    }
+
+    #[test]
+    fn a_missing_protected_path_is_rejected() {
+        let mut platform = WaylandPlatform {
+            sway: std::path::PathBuf::new(),
+            logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            active: None,
+            clipboard_owner: None,
+            dbus: None,
+            protected_host_paths: Vec::new(),
+        };
+        let missing = tempfile::tempdir()
+            .expect("temporary parent")
+            .path()
+            .join("missing");
+
+        let error = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(missing)])
+            .expect_err("a nonexistent protected path cannot be enforced");
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::SandboxUnavailable(_)
+        ));
     }
 
     #[test]
@@ -6276,6 +6351,66 @@ mod tests {
 
         assert_eq!(value, 42);
         assert_eq!(attempts, [deadline, deadline]);
+    }
+
+    #[test]
+    fn launch_retry_returns_the_second_retryable_failure_without_a_third_attempt() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut attempts = 0;
+
+        let error = launch_with_retry(deadline, 1_000, |_| {
+            attempts += 1;
+            Err::<(), _>(glass_core::GlassError::Backend(format!(
+                "failure {attempts}"
+            )))
+        })
+        .expect_err("only one retry is allowed");
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::Backend(ref message) if message == "failure 2"
+        ));
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn wayland_host_tree_includes_the_child_and_reported_host_root_tree() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn process-tree fixture");
+        let child = ProcessGroupCleanup(child);
+        let host_root = Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn reported host-root fixture");
+        let host_root = ProcessGroupCleanup(host_root);
+        let host_tree = (0..100)
+            .find_map(|_| {
+                let tree = glass_proc_linux::proc_tree_pids(host_root.0.id());
+                (tree.len() > 1).then_some(tree).or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    None
+                })
+            })
+            .expect("reported host root must have a descendant");
+
+        let tree = wayland_host_tree(&child.0, host_root.0.id());
+
+        assert!(
+            tree.contains(&child.0.id()),
+            "compositor missing from {tree:?}"
+        );
+        assert!(
+            host_tree.iter().all(|pid| tree.contains(pid)),
+            "reported host tree {host_tree:?} missing from {tree:?}"
+        );
     }
 
     #[test]
@@ -6409,6 +6544,35 @@ mod tests {
     }
 
     #[test]
+    fn launch_deadline_reports_unrecovered_x11_windows() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn deadline fixture");
+        let root = child.id();
+        let mut pending = PendingWaylandSession {
+            child,
+            status: None,
+            ownership_root: Some(root),
+        };
+        let mut cleanup = PendingCleanup(Some(&mut pending));
+
+        let error = launch_deadline_error(
+            cleanup.0.as_deref_mut().expect("armed cleanup guard"),
+            20,
+            1,
+        );
+        cleanup.disarm();
+
+        assert!(
+            matches!(error, glass_core::GlassError::Backend(ref message) if message.contains("mapped 1 X11 window")),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn reap_pending_reaps_a_late_reported_separate_session_tree() {
         let dir = tempfile::tempdir().expect("fixture directory");
         let target_pid = dir.path().join("target-pid");
@@ -6446,12 +6610,16 @@ mod tests {
             status: Some(pipe.into_reader()),
             ownership_root: None,
         };
-        let target_tree = glass_proc_linux::proc_tree_pids(target);
-        assert!(
-            target_tree.len() > 1,
-            "target fixture must have a descendant: {target_tree:?}"
-        );
         let mut cleanup = PendingCleanup(Some(&mut pending));
+        let target_tree = (0..300)
+            .find_map(|_| {
+                let tree = glass_proc_linux::proc_tree_pids(target);
+                (tree.len() > 1).then_some(tree).or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    None
+                })
+            })
+            .expect("target fixture must have a descendant");
 
         let outcome = cleanup.reap();
         cleanup.disarm();

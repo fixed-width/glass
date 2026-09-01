@@ -368,6 +368,10 @@ fn require_contained_root(child: &mut ContainedChild, deadline: Instant) -> Resu
     }
 }
 
+fn launch_deadline(observed_at: Instant, timeout_ms: u64) -> Instant {
+    observed_at + Duration::from_millis(timeout_ms.max(1))
+}
+
 /// What display the X11 backend should use, derived from `GLASS_DISPLAY`.
 #[derive(Debug, PartialEq, Eq)]
 enum DisplayTarget {
@@ -665,10 +669,9 @@ impl X11Platform {
             &self.display,
             a11y,
             status_pipe.as_ref().map(BwrapStatusPipe::writer_fd),
-            if spec.sandbox == SandboxLevel::Off {
-                &[]
-            } else {
-                &self.protected_host_paths
+            match spec.sandbox {
+                SandboxLevel::Off => &[],
+                SandboxLevel::Default | SandboxLevel::Strict => &self.protected_host_paths,
             },
         )?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -1488,7 +1491,7 @@ impl Platform for X11Platform {
         } else {
             None
         };
-        let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
+        let deadline = launch_deadline(Instant::now(), spec.timeout_ms);
         if let Err(e) = self.spawn(spec, deadline) {
             self.kill_child(); // reap the private bus (and any child) on a failed spawn
             return Err(e);
@@ -1959,15 +1962,35 @@ fn button_number(button: glass_core::MouseButton) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        LaunchedChild, X11DeadlineWatch, X11Dispatch, hint_matches, legacy_window_selection,
-        modifier_keycodes_dispatched, pid_matches, rollback_bounded_window_selection,
-        run_clicks_by, run_scroll_buttons_by, run_x11_call_by, run_x11_type_by,
+        ContainedChild, LaunchedChild, X11DeadlineWatch, X11Dispatch, hint_matches,
+        launch_deadline, legacy_window_selection, modifier_keycodes_dispatched, pid_matches,
+        require_contained_root, rollback_bounded_window_selection, run_clicks_by,
+        run_scroll_buttons_by, run_x11_call_by, run_x11_type_by,
     };
     use glass_core::{
         BoundDispatch, BoundKind, Deadline, GlassError, Result, TypeSink, Whose, WindowHint,
     };
     use std::cell::{Cell, RefCell};
+    use std::io::Write as _;
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
+
+    struct LaunchedCleanup(LaunchedChild);
+
+    impl Drop for LaunchedCleanup {
+        fn drop(&mut self) {
+            glass_proc_linux::reap_group(self.0.child_mut(), glass_proc_linux::REAP_GRACE);
+        }
+    }
+
+    struct ContainedCleanup(ContainedChild);
+
+    impl Drop for ContainedCleanup {
+        fn drop(&mut self) {
+            glass_proc_linux::reap_group(&mut self.0.child, glass_proc_linux::REAP_GRACE);
+        }
+    }
 
     #[test]
     fn namespaced_net_wm_pid_matches_the_host_process_tree() {
@@ -1975,6 +1998,83 @@ mod tests {
         assert!(pid_matches(2, &identities));
         assert!(pid_matches(4242, &identities));
         assert!(!pid_matches(9, &identities));
+    }
+
+    #[test]
+    fn a_contained_launch_uses_the_reported_host_root_for_ownership() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ownership fixture");
+        let launched = LaunchedCleanup(LaunchedChild::Contained {
+            child,
+            host_root: 42_424,
+        });
+
+        assert_eq!(launched.0.ownership_root(), 42_424);
+    }
+
+    #[test]
+    fn contained_status_returns_the_reported_child_pid() {
+        let pipe = glass_sandbox_linux::BwrapStatusPipe::new().expect("status pipe");
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", pipe.writer_fd()))
+            .expect("duplicate status writer");
+        writer
+            .write_all(b"{\"child-pid\":42424}\n")
+            .expect("write status");
+        drop(writer);
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn status fixture");
+        let mut contained = ContainedCleanup(ContainedChild {
+            child,
+            status: pipe.into_reader(),
+        });
+
+        let reported =
+            require_contained_root(&mut contained.0, Instant::now() + Duration::from_secs(1))
+                .expect("valid status");
+
+        assert_eq!(reported, 42_424);
+    }
+
+    #[test]
+    fn expired_contained_status_is_rejected_and_reaped() {
+        let pipe = glass_sandbox_linux::BwrapStatusPipe::new().expect("status pipe");
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn status fixture");
+        let pid = child.id();
+        let mut contained = ContainedCleanup(ContainedChild {
+            child,
+            status: pipe.into_reader(),
+        });
+
+        let error = require_contained_root(&mut contained.0, Instant::now())
+            .expect_err("expired status wait must fail");
+
+        assert!(matches!(error, GlassError::SandboxUnavailable(_)));
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn a_zero_timeout_still_creates_a_nonexpired_launch_deadline() {
+        let now = Instant::now();
+
+        assert!(launch_deadline(now, 0) > now);
     }
 
     #[test]
@@ -2438,6 +2538,37 @@ mod tests {
 mod display_tests {
     use super::*;
     use crate::testx::TestX;
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn valid_protected_paths_are_enforced_with_sandbox_rules() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let protected = tempfile::tempdir().expect("protected directory");
+
+        let mode = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(protected.path())])
+            .expect("valid protected path");
+
+        assert_eq!(mode, HostPathProtectionMode::SandboxRules);
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn a_missing_protected_path_is_rejected() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let missing = tempfile::tempdir()
+            .expect("temporary parent")
+            .path()
+            .join("missing");
+
+        let error = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(missing)])
+            .expect_err("a nonexistent protected path cannot be enforced");
+
+        assert!(matches!(error, GlassError::SandboxUnavailable(_)));
+    }
 
     /// A pid no window on a fresh private display can be carrying.
     const OTHER_PID: u32 = 999_999;
