@@ -327,14 +327,30 @@ fn truncate_text(text: &str, max_bytes: usize, preserve: Option<&str>) -> String
     if max_bytes < ellipsis.len() {
         return String::new();
     }
-    let content_bytes = max_bytes - ellipsis.len();
-    let start = preserve
+    let matched = preserve
         .filter(|needle| !needle.is_empty())
-        .and_then(|needle| text.to_lowercase().find(&needle.to_lowercase()))
-        .map(|position| position.saturating_sub(content_bytes / 3))
-        .unwrap_or(0);
-    let start = floor_char_boundary(text, start.min(text.len()));
-    let end = floor_char_boundary(text, (start + content_bytes).min(text.len()));
+        .and_then(|needle| case_insensitive_match_range(text, needle));
+    let leading_ellipsis = matched.as_ref().is_some_and(|range| range.start > 0);
+    let trailing_ellipsis = matched.as_ref().is_none_or(|range| range.end < text.len());
+    let content_bytes = max_bytes
+        .saturating_sub(usize::from(leading_ellipsis) * ellipsis.len())
+        .saturating_sub(usize::from(trailing_ellipsis) * ellipsis.len());
+    let (start, end) = if let Some(matched) = matched {
+        let retained_match_end =
+            floor_char_boundary(text, (matched.start + content_bytes).min(matched.end));
+        let retained_match_len = retained_match_end - matched.start;
+        let surrounding = content_bytes.saturating_sub(retained_match_len);
+        let start = floor_char_boundary(text, matched.start.saturating_sub(surrounding / 3));
+        let end = floor_char_boundary(text, (start + content_bytes).min(text.len()));
+        if end < retained_match_end {
+            let start = floor_char_boundary(text, retained_match_end.saturating_sub(content_bytes));
+            (start, retained_match_end)
+        } else {
+            (start, end)
+        }
+    } else {
+        (0, floor_char_boundary(text, content_bytes.min(text.len())))
+    };
     let mut output = String::new();
     if start > 0 {
         output.push('…');
@@ -348,6 +364,34 @@ fn truncate_text(text: &str, max_bytes: usize, preserve: Option<&str>) -> String
         output.truncate(end);
     }
     output
+}
+
+fn case_insensitive_match_range(text: &str, needle: &str) -> Option<std::ops::Range<usize>> {
+    let folded_needle = needle.to_lowercase();
+    let mut folded_text = String::new();
+    let mut spans = Vec::new();
+    for (start, character) in text.char_indices() {
+        let folded_start = folded_text.len();
+        folded_text.extend(character.to_lowercase());
+        spans.push((
+            folded_start,
+            folded_text.len(),
+            start,
+            start + character.len_utf8(),
+        ));
+    }
+
+    let folded_start = folded_text.find(&folded_needle)?;
+    let folded_end = folded_start + folded_needle.len();
+    let start = spans
+        .iter()
+        .find(|(_, end, _, _)| *end > folded_start)
+        .map(|(_, _, start, _)| *start)?;
+    let end = spans
+        .iter()
+        .find(|(start, end, _, _)| *start < folded_end && *end >= folded_end)
+        .map(|(_, _, _, end)| *end)?;
+    Some(start..end)
 }
 
 fn floor_char_boundary(text: &str, mut index: usize) -> usize {
@@ -544,6 +588,63 @@ mod tests {
         assert_eq!(envelope["tool"], serde_json::json!("glass_find_elements"));
         assert_eq!(envelope["result"]["matched"], serde_json::json!(false));
         assert!(!format!("{output:?}").contains("needle-secret"));
+    }
+
+    #[test]
+    fn truncation_preserves_a_long_match_near_the_end() {
+        let matched = "target-region-".repeat(5);
+        let text = format!("{}{}{}", "before-".repeat(40), matched, "after-".repeat(40));
+
+        let truncated = truncate_text(&text, 96, Some(&matched));
+
+        assert!(truncated.contains(&matched), "{truncated:?}");
+        assert!(truncated.len() <= 96);
+    }
+
+    #[test]
+    fn truncation_preserves_match_offsets_across_unicode_lowercase_expansion() {
+        let matched = "target-region-".repeat(5);
+        let text = format!("{}{}{}", "İ".repeat(80), matched, "after-".repeat(40));
+
+        let truncated = truncate_text(&text, 96, Some(&matched.to_uppercase()));
+
+        assert!(truncated.contains(&matched), "{truncated:?}");
+        assert!(truncated.len() <= 96);
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn find_redacts_secure_neighbor_values_from_successful_match_context() {
+        let mut tree = fake_tree();
+        let mut secure_neighbor = tree.root.children[0].clone();
+        secure_neighbor.name = Some("Password".into());
+        secure_neighbor.states.secure = true;
+        secure_neighbor.states.editable = true;
+        secure_neighbor.value = Some("context-secret-sentinel".into());
+        tree.root.children.push(secure_neighbor);
+        tree.assign_ids();
+        let mut glass = started_a11y_with(tree);
+
+        let output = find_elements(
+            &mut glass,
+            &FindElementsArgs {
+                query: Some("save".into()),
+                role: Some("Button".into()),
+                states: None,
+                within: None,
+                max_results: None,
+                max_nodes: None,
+                timeout_ms: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(envelope_at(&output, 0)["result"]["matched"], json!(true));
+        let OutContent::Text(untrusted) = &output.0[1] else {
+            panic!("text block")
+        };
+        assert!(untrusted.contains("\"name\":\"Save\""));
+        assert!(!format!("{output:?}").contains("context-secret-sentinel"));
     }
 
     #[test]
