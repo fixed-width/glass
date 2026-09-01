@@ -182,6 +182,49 @@ pub fn build_sway_command(
     runtime_dir: &Path,
     dbus_addr: Option<&str>,
 ) -> Command {
+    build_sway_command_inner(sway, config, spec, runtime_dir, dbus_addr)
+}
+
+/// Build sway while declaring the Bubblewrap status descriptor that must remain open across the
+/// sway exec. The descriptor is created inheritable by [`glass_sandbox_linux::BwrapStatusPipe`];
+/// keeping the pipe alive through `Command::spawn` carries it through sway to the config's exec.
+pub fn build_sway_command_with_status(
+    sway: &Path,
+    config: &Path,
+    spec: &AppSpec,
+    runtime_dir: &Path,
+    dbus_addr: Option<&str>,
+    status_fd: Option<i32>,
+) -> Result<Command> {
+    match (spec.sandbox, status_fd) {
+        (SandboxLevel::Off, None) | (SandboxLevel::Default | SandboxLevel::Strict, Some(0..)) => {}
+        (SandboxLevel::Off, Some(_)) => {
+            return Err(glass_core::GlassError::Backend(
+                "sandbox-off sway launch received a Bubblewrap status descriptor".into(),
+            ));
+        }
+        (SandboxLevel::Default | SandboxLevel::Strict, _) => {
+            return Err(glass_core::GlassError::SandboxUnavailable(
+                "contained sway launch requires an inheritable Bubblewrap status descriptor".into(),
+            ));
+        }
+    }
+    Ok(build_sway_command_inner(
+        sway,
+        config,
+        spec,
+        runtime_dir,
+        dbus_addr,
+    ))
+}
+
+fn build_sway_command_inner(
+    sway: &Path,
+    config: &Path,
+    spec: &AppSpec,
+    runtime_dir: &Path,
+    dbus_addr: Option<&str>,
+) -> Command {
     let mut cmd = Command::new(sway);
     // Run sway as its own process-group leader so the whole compositor subtree
     // it spawns (Xwayland + the exec'd app) can be torn down as a group on stop;
@@ -288,6 +331,70 @@ mod tests {
     ) -> String {
         String::from_utf8(sway_config(spec, runtime_dir, a11y_bind_dir, None, &[]).unwrap())
             .unwrap()
+    }
+
+    #[test]
+    fn sway_config_passes_the_inherited_status_fd_to_bwrap() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        let protected = temp.path().join("protected");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::create_dir(&protected).unwrap();
+        let pipe = glass_sandbox_linux::BwrapStatusPipe::new().unwrap();
+        let mut s = spec(&["/bin/app"]);
+        s.sandbox = SandboxLevel::Default;
+
+        let config = sway_config(
+            &s,
+            &runtime,
+            None,
+            Some(pipe.writer_fd()),
+            &[ProtectedHostPath::directory(&protected)],
+        )
+        .unwrap();
+
+        assert!(contains_bytes(&config, b"'--unshare-pid'"));
+        assert!(contains_bytes(
+            &config,
+            format!("'--json-status-fd' '{}'", pipe.writer_fd()).as_bytes()
+        ));
+    }
+
+    #[test]
+    fn sway_command_passes_the_status_writer_through_a_spawned_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("sway-probe");
+        std::fs::write(
+            &probe,
+            b"#!/bin/sh\npython3 -c 'import os; os.write(int(os.environ[\"TEST_STATUS_FD\"]), b\"{\\\"child-pid\\\":42}\\n\")'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = temp.path().join("sway.cfg");
+        std::fs::write(&config, b"").unwrap();
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let pipe = glass_sandbox_linux::BwrapStatusPipe::new().unwrap();
+        let mut s = spec(&["/bin/app"]);
+        s.sandbox = SandboxLevel::Default;
+        s.env
+            .push(("TEST_STATUS_FD".into(), pipe.writer_fd().to_string()));
+
+        let mut command = build_sway_command_with_status(
+            &probe,
+            &config,
+            &s,
+            &runtime,
+            None,
+            Some(pipe.writer_fd()),
+        )
+        .unwrap();
+        let mut child = command.spawn().unwrap();
+        let mut reader = pipe.into_reader();
+        child.wait().unwrap();
+
+        assert_eq!(reader.poll_child_pid().unwrap(), Some(42));
     }
 
     #[test]

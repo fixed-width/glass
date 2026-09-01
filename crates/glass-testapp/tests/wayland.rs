@@ -8,7 +8,7 @@
 // Each site carries a `// SAFETY:` note; the file opts out of `unsafe_code = "deny"`.
 #![allow(unsafe_code)]
 
-use glass_core::{AppSpec, GlassError, Platform};
+use glass_core::{AppSpec, Backend, BaselineStore, Glass, GlassError, Platform, PlatformFactory};
 use glass_wayland::WaylandPlatform;
 
 const TESTAPP: &str = env!("CARGO_BIN_EXE_glass-testapp");
@@ -706,6 +706,186 @@ fn clipboard_get_with_no_selection_returns_empty() {
 // ---------------------------------------------------------------------------
 // Sandbox integration tests (bwrap + sway)
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum ArtifactBackend {
+    Wayland,
+    Xwayland,
+}
+
+struct RunningPlatform(Option<WaylandPlatform>);
+
+impl Drop for RunningPlatform {
+    fn drop(&mut self) {
+        if let Some(platform) = self.0.as_mut() {
+            let _ = platform.stop_app();
+        }
+    }
+}
+
+fn assert_artifact_reads_denied(backend: ArtifactBackend, level: glass_core::SandboxLevel) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let artifacts = temp.path().join("artifacts");
+    let marker = artifacts.join("marker");
+    let lease = temp.path().join("artifacts.lease");
+    std::fs::create_dir(&artifacts).unwrap();
+    std::fs::write(&marker, b"wayland-host-marker-7f1d").unwrap();
+    std::fs::write(&lease, b"wayland-host-lease-3a92").unwrap();
+
+    let proc_root_marker = std::path::PathBuf::from("/proc")
+        .join(std::process::id().to_string())
+        .join("root")
+        .join(marker.strip_prefix("/").unwrap());
+    let probe = temp.path().join("artifact-probe.sh");
+    std::fs::write(
+        &probe,
+        b"#!/bin/sh\nfor item in ordinary:$1 proc_root:$2 lease:$3; do label=${item%%:*}; path=${item#*:}; if content=$(cat -- \"$path\" 2>/dev/null); then printf 'ARTIFACT_%s_ALLOWED:%s\\n' \"$label\" \"$content\"; else printf 'ARTIFACT_%s_DENIED\\n' \"$label\"; fi; done\nexec \"$4\" \"$5\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fixture = std::fs::canonicalize(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../glass-a11y-linux/tests/fixtures/a11y_fixture.py"
+    ))
+    .unwrap();
+    let gdk_backend = match backend {
+        ArtifactBackend::Wayland => "wayland",
+        ArtifactBackend::Xwayland => "x11",
+    };
+    let mut platform = WaylandPlatform::new().unwrap();
+    assert_eq!(
+        platform
+            .configure_protected_host_paths(&[
+                glass_core::ProtectedHostPath::directory(&artifacts),
+                glass_core::ProtectedHostPath::file(&lease),
+            ])
+            .unwrap(),
+        glass_core::HostPathProtectionMode::SandboxRules
+    );
+    let spec = AppSpec {
+        build: None,
+        run: vec![
+            probe.into_os_string().into_string().unwrap(),
+            marker.clone().into_os_string().into_string().unwrap(),
+            proc_root_marker.into_os_string().into_string().unwrap(),
+            lease.clone().into_os_string().into_string().unwrap(),
+            "python3".into(),
+            fixture.into_os_string().into_string().unwrap(),
+        ],
+        cwd: Some(temp.path().to_path_buf()),
+        env: vec![
+            ("GDK_BACKEND".into(), gdk_backend.into()),
+            ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+        ],
+        window_hint: None,
+        timeout_ms: APP_TIMEOUT_MS,
+        sandbox: level,
+        a11y: false,
+    };
+    if let Err(error) = platform.start_app(&spec) {
+        panic!(
+            "contained artifact probe failed: {error}; logs: {:?}",
+            platform.drain_logs()
+        );
+    }
+    let mut running = RunningPlatform(Some(platform));
+    let platform = running.0.as_mut().unwrap();
+    let mut results = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while std::time::Instant::now() < deadline && results.len() < 3 {
+        for (_, line) in platform.drain_logs() {
+            assert!(
+                !line.contains("_ALLOWED:"),
+                "target read a protected path: {line}"
+            );
+            assert!(!line.contains("wayland-host-marker-7f1d"));
+            assert!(!line.contains("wayland-host-lease-3a92"));
+            if let Some(label) = line
+                .strip_prefix("ARTIFACT_")
+                .and_then(|line| line.strip_suffix("_DENIED"))
+            {
+                results.insert(label.to_string());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        results,
+        ["ordinary", "proc_root", "lease"].map(String::from).into()
+    );
+    assert_eq!(std::fs::read(&marker).unwrap(), b"wayland-host-marker-7f1d");
+    assert_eq!(std::fs::read(&lease).unwrap(), b"wayland-host-lease-3a92");
+    platform.stop_app().unwrap();
+    running.0 = None;
+}
+
+#[test]
+#[ignore = "requires sway + native Wayland GTK fixture + bwrap; run via scripts/test-wayland.sh artifact"]
+fn artifact_paths_are_hidden_from_default_wayland_target() {
+    assert_artifact_reads_denied(ArtifactBackend::Wayland, glass_core::SandboxLevel::Default);
+}
+
+#[test]
+#[ignore = "requires sway + native Wayland GTK fixture + bwrap; run via scripts/test-wayland.sh artifact"]
+fn artifact_paths_are_hidden_from_strict_wayland_target() {
+    assert_artifact_reads_denied(ArtifactBackend::Wayland, glass_core::SandboxLevel::Strict);
+}
+
+#[test]
+#[ignore = "requires sway + Xwayland GTK fixture + bwrap; run via scripts/test-wayland.sh artifact"]
+fn artifact_paths_are_hidden_from_default_xwayland_target() {
+    assert_artifact_reads_denied(ArtifactBackend::Xwayland, glass_core::SandboxLevel::Default);
+}
+
+#[test]
+#[ignore = "requires sway + Xwayland GTK fixture + bwrap; run via scripts/test-wayland.sh artifact"]
+fn artifact_paths_are_hidden_from_strict_xwayland_target() {
+    assert_artifact_reads_denied(ArtifactBackend::Xwayland, glass_core::SandboxLevel::Strict);
+}
+
+#[test]
+#[ignore = "requires sway; run via scripts/test-wayland.sh artifact"]
+fn invalid_artifact_path_fails_before_wayland_target_launch() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let launched = temp.path().join("launched");
+    let launch_script = temp.path().join("launch.sh");
+    std::fs::write(&launch_script, b"#!/bin/sh\ntouch \"$1\"\nexec \"$2\"\n").unwrap();
+    std::fs::set_permissions(&launch_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let factory: PlatformFactory =
+        Box::new(|_backend| Ok(Backend::display_only(Box::new(WaylandPlatform::new()?))));
+    let mut glass = Glass::new(
+        factory,
+        "wayland".into(),
+        BaselineStore::new(temp.path().join("baselines")),
+        100,
+    );
+    glass
+        .set_protected_host_paths(vec![glass_core::ProtectedHostPath::file(
+            temp.path().join("missing"),
+        )])
+        .unwrap();
+    let spec = AppSpec {
+        run: vec![
+            launch_script.into_os_string().into_string().unwrap(),
+            launched.clone().into_os_string().into_string().unwrap(),
+            TESTAPP.into(),
+        ],
+        timeout_ms: 5000,
+        ..spec(vec![TESTAPP.into()], 5000)
+    };
+
+    let error = glass
+        .start(&spec)
+        .expect_err("missing protected path must prevent launch");
+    assert!(matches!(error, GlassError::SandboxUnavailable(_)));
+    assert!(!launched.exists());
+}
 
 /// Launch `glass-testapp` under `SandboxLevel::Default` inside the sway
 /// compositor. The app must reach the Wayland socket (runtime_dir rw-bind) and

@@ -10,6 +10,7 @@
 # The GLASS_SANDBOX env var controls containment for glass-mcp-launched apps generally
 # (off / default / strict); it has no effect on integration tests, which set their
 # sandbox level explicitly in the AppSpec.
+# Use `./scripts/test-wayland.sh artifact` for the native Wayland and Xwayland protected-path cases.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib/have-sway.sh
