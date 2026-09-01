@@ -11,7 +11,7 @@
 mod common;
 
 use common::Xvfb;
-use glass_core::{AppSpec, Platform};
+use glass_core::{AppSpec, Backend, BaselineStore, Glass, Platform, PlatformFactory};
 use glass_x11::X11Platform;
 
 const TESTAPP: &str = env!("CARGO_BIN_EXE_glass-testapp");
@@ -104,13 +104,42 @@ fn artifact_paths_are_hidden_from_strict_x11_target() {
 fn invalid_artifact_path_fails_before_target_launch() {
     let temp = tempfile::tempdir().unwrap();
     let launched = temp.path().join("launched");
+    let launch_script = temp.path().join("launch.sh");
+    std::fs::write(&launch_script, b"#!/bin/sh\ntouch \"$1\"\nexec \"$2\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&launch_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
     let xvfb = Xvfb::start();
-    let mut platform = X11Platform::connect(Some(&xvfb.display)).unwrap();
-    let error = platform
-        .configure_protected_host_paths(&[glass_core::ProtectedHostPath::file(
+    let display = xvfb.display.clone();
+    let factory: PlatformFactory = Box::new(move |_backend| {
+        Ok(Backend::display_only(Box::new(X11Platform::connect(
+            Some(&display),
+        )?)))
+    });
+    let mut glass = Glass::new(
+        factory,
+        "x11".into(),
+        BaselineStore::new(temp.path().join("baselines")),
+        100,
+    );
+    glass
+        .set_protected_host_paths(vec![glass_core::ProtectedHostPath::file(
             temp.path().join("missing"),
         )])
-        .expect_err("missing protected path must be rejected");
+        .unwrap();
+    let spec = AppSpec {
+        run: vec![
+            launch_script.into_os_string().into_string().unwrap(),
+            launched.clone().into_os_string().into_string().unwrap(),
+            TESTAPP.into(),
+        ],
+        timeout_ms: 5000,
+        ..app_spec()
+    };
+
+    let error = glass
+        .start(&spec)
+        .expect_err("missing protected path must prevent launch");
     assert!(matches!(
         error,
         glass_core::GlassError::SandboxUnavailable(_)
