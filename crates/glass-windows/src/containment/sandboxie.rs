@@ -3,10 +3,10 @@
 //! Drives Sandboxie via its CLI (`Start.exe` / `SbieIni.exe`) as subprocesses — no FFI,
 //! no linking against Sandboxie. The recipe is the on-box-validated one:
 //!
-//! - Per-attempt box `glass_<pid>_<nonce>_<attempt>` configured via `SbieIni.exe set/append` from the pure
-//!   policy in [`super::config`], plus the compat templates (without which PowerShell etc.
-//!   break inside the box) and, for `strict`, a `ClosedFilePath \Device\Afd*` to belt the
-//!   `AllowNetworkAccess=n` policy.
+//! - Per-attempt box `glass_<process><attempt>` uses fixed-width base-36 components and is
+//!   configured via `SbieIni.exe set/append` from the pure policy in [`super::config`], plus
+//!   the compat templates (without which PowerShell etc. break inside the box) and, for
+//!   `strict`, a `ClosedFilePath \Device\Afd*` to belt the `AllowNetworkAccess=n` policy.
 //! - `strict` additionally gates on the **global** `PromptForInternetAccess`: a `y` there
 //!   would deadlock a no-network box on a UI prompt, so we detect it and fail closed. We
 //!   never write `[GlobalSettings]`.
@@ -125,8 +125,37 @@ fn require_success(
     }
 }
 
+fn mix_process_identity(pid: u32, process_nonce: u64) -> u64 {
+    let pid = u64::from(pid);
+    let mut value = process_nonce ^ (pid << 32 | pid);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn fixed_base36(mut value: u64) -> String {
+    const WIDTH: usize = 13;
+    let mut encoded = [b'0'; WIDTH];
+    for digit in encoded.iter_mut().rev() {
+        let remainder = (value % 36) as u8;
+        *digit = if remainder < 10 {
+            b'0' + remainder
+        } else {
+            b'a' + remainder - 10
+        };
+        value /= 36;
+    }
+    encoded.into_iter().map(char::from).collect()
+}
+
 fn box_name_for(pid: u32, process_nonce: u64, attempt: u64) -> String {
-    format!("glass_{pid}_{process_nonce:016x}_{attempt}")
+    format!(
+        "glass_{}{}",
+        fixed_base36(mix_process_identity(pid, process_nonce)),
+        fixed_base36(attempt)
+    )
 }
 
 pub(crate) fn unique_box_name() -> String {
@@ -735,7 +764,7 @@ mod tests {
 
     use super::{
         BoxAppend, CommandOutcome, Sandboxie, box_appends, box_name_for, closed_file_paths,
-        unique_box_name, validate_closed_path,
+        mix_process_identity, unique_box_name, validate_closed_path,
     };
 
     #[derive(Clone, Copy)]
@@ -1161,6 +1190,52 @@ mod tests {
             second
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        );
+    }
+
+    #[test]
+    fn maximum_inputs_fit_classic_box_name_limit_and_alphabet() {
+        let name = box_name_for(u32::MAX, u64::MAX, u64::MAX);
+
+        assert!(name.starts_with("glass_"));
+        assert!(name.len() <= 32, "{} characters: {name}", name.len());
+        assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
+
+    #[test]
+    fn box_name_width_is_fixed_at_the_32_character_compatibility_limit() {
+        for (pid, nonce, attempt) in [
+            (0, 0, 0),
+            (1, 1, 1),
+            (u32::MAX, 0, u64::MAX),
+            (u32::MAX, u64::MAX, 0),
+        ] {
+            assert_eq!(box_name_for(pid, nonce, attempt).len(), 32);
+        }
+    }
+
+    #[test]
+    fn wrapped_attempt_pair_remains_distinct() {
+        let before_wrap = box_name_for(u32::MAX, u64::MAX, u64::MAX);
+        let after_wrap = box_name_for(u32::MAX, u64::MAX, 0);
+
+        assert_ne!(before_wrap, after_wrap);
+    }
+
+    #[test]
+    fn different_attempts_produce_different_names() {
+        assert_ne!(box_name_for(412, 0x1234, 7), box_name_for(412, 0x1234, 8));
+    }
+
+    #[test]
+    fn process_identity_mix_responds_to_pid_and_nonce_boundaries() {
+        assert_ne!(
+            mix_process_identity(0, u64::MAX),
+            mix_process_identity(u32::MAX, u64::MAX)
+        );
+        assert_ne!(
+            mix_process_identity(u32::MAX, 0),
+            mix_process_identity(u32::MAX, u64::MAX)
         );
     }
 
