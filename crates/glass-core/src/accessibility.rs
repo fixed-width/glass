@@ -10,6 +10,12 @@ use crate::deadline::Deadline;
 use crate::error::{GlassError, Result};
 use crate::platform::{Segment, WindowGeometry};
 
+mod query;
+pub use query::{
+    MatchField, MatchTier, ScopeResolution, SemanticMatch, SemanticQuery, SemanticQueryError,
+    SemanticQueryResult, SemanticSelector, SemanticState,
+};
+
 /// Normalized accessibility role — the union of the AT-SPI / AX / UIA
 /// vocabularies. A backend maps its native role in; anything unmapped becomes
 /// [`AxRole::Other`] with the native string preserved in [`AxNode::raw_role`].
