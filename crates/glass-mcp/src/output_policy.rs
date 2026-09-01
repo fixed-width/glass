@@ -1233,31 +1233,50 @@ mod tests {
     fn whole_blocks_externalize_at_original_sibling_indices_without_reordering()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_root, store) = store()?;
-        let policy = OutputPolicy::new(store);
+        let policy = OutputPolicy::new(store.clone());
+        const ALPHA: &str = "alpha-original-sibling-marker";
+        const BETA: &str = "beta-original-sibling-marker";
+        const GAMMA: &str = "gamma-original-sibling-marker";
         let output = real_batch_output(&[
-            format!("alpha-{}", "a".repeat(5_000)),
-            format!("beta-{}", "b".repeat(4_000)),
-            format!("gamma-{}", "g".repeat(5_000)),
+            format!("{ALPHA}-{}", "a".repeat(5_000)),
+            format!("{BETA}-{}", "b".repeat(4_000)),
+            format!("{GAMMA}-{}", "g".repeat(5_000)),
         ]);
 
         let applied = policy.apply(policy_outcome(output));
-        let indices = applied
-            .output
-            .0
-            .iter()
-            .filter_map(|content| match content {
-                OutContent::ResourceLink(_) => {
-                    descriptor_value(content).and_then(|value| value["content_block"].as_u64())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let [
+            OutContent::Envelope(_),
+            OutContent::ResourceLink(alpha),
+            OutContent::Text(beta),
+            OutContent::ResourceLink(gamma),
+        ] = applied.output.0.as_slice()
+        else {
+            panic!("expected envelope, alpha link, beta text, gamma link")
+        };
+        let alpha_text = store
+            .read(alpha.uri())
+            .map_err(|error| format!("read alpha: {error:?}"))?
+            .text;
+        let gamma_text = store
+            .read(gamma.uri())
+            .map_err(|error| format!("read gamma: {error:?}"))?
+            .text;
 
-        assert_eq!(indices, vec![1, 3]);
-        assert!(matches!(applied.output.0[0], OutContent::Envelope(_)));
-        assert!(matches!(applied.output.0[1], OutContent::ResourceLink(_)));
-        assert!(matches!(applied.output.0[2], OutContent::Text(_)));
-        assert!(matches!(applied.output.0[3], OutContent::ResourceLink(_)));
+        assert_eq!(
+            descriptor_value(&applied.output.0[1]).unwrap()["content_block"],
+            1
+        );
+        assert!(alpha_text.contains(ALPHA));
+        assert!(!alpha_text.contains(GAMMA));
+        assert!(beta.body.contains(BETA));
+        assert!(!beta.body.contains(ALPHA));
+        assert!(!beta.body.contains(GAMMA));
+        assert_eq!(
+            descriptor_value(&applied.output.0[3]).unwrap()["content_block"],
+            3
+        );
+        assert!(gamma_text.contains(GAMMA));
+        assert!(!gamma_text.contains(ALPHA));
         Ok(())
     }
 
