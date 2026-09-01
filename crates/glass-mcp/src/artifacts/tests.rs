@@ -1071,6 +1071,7 @@ fn shutdown_uses_retained_root_when_ancestor_is_substituted_before_directory_rem
     let replacement_parent = grandparent.path().join("replacement-parent");
     let replacement_root = replacement_parent.join("root");
     let sentinel = replacement_root.join("sentinel");
+    let installed_sentinel = parent.join("root").join("sentinel");
     let sentinel_for_hook = sentinel.clone();
     set_fs_test_hook(TestHookPoint::BeforeProcessDirectoryRemove, move || {
         fs::rename(&parent, &detached).unwrap();
@@ -1081,7 +1082,10 @@ fn shutdown_uses_retained_root_when_ancestor_is_substituted_before_directory_rem
 
     store.shutdown().unwrap();
 
-    assert_eq!(fs::read_to_string(sentinel).unwrap(), "replacement");
+    assert_eq!(
+        fs::read_to_string(installed_sentinel).unwrap(),
+        "replacement"
+    );
 }
 
 #[cfg(windows)]
