@@ -1997,6 +1997,56 @@ mod tests {
         }
     }
 
+    struct DelayedDescendantArtifacts {
+        directory: tempfile::TempDir,
+    }
+
+    impl DelayedDescendantArtifacts {
+        fn new() -> Self {
+            Self {
+                directory: tempfile::tempdir().expect("create delayed-descendant artifacts"),
+            }
+        }
+
+        fn directory(&self) -> &std::path::Path {
+            self.directory.path()
+        }
+
+        fn readiness(&self) -> std::path::PathBuf {
+            self.directory.path().join("readiness")
+        }
+
+        fn staging(&self) -> std::path::PathBuf {
+            self.directory.path().join("readiness.tmp")
+        }
+    }
+
+    #[test]
+    fn delayed_descendant_artifacts_are_removed_during_unwinding() {
+        let owned_paths = RefCell::new(None);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let artifacts = DelayedDescendantArtifacts::new();
+            let paths = (
+                artifacts.directory().to_path_buf(),
+                artifacts.readiness().to_path_buf(),
+                artifacts.staging().to_path_buf(),
+            );
+            std::fs::write(&paths.1, "ready").expect("write published readiness");
+            std::fs::write(&paths.2, "staging").expect("write staging readiness");
+            *owned_paths.borrow_mut() = Some(paths);
+            panic!("force artifact cleanup");
+        }));
+
+        assert!(panic.is_err());
+        let (directory, readiness, staging) = owned_paths
+            .into_inner()
+            .expect("paths recorded before unwinding");
+        assert!(!directory.exists());
+        assert!(!readiness.exists());
+        assert!(!staging.exists());
+    }
+
     struct ContainedCleanup(ContainedChild);
 
     impl Drop for ContainedCleanup {
@@ -2107,14 +2157,8 @@ mod tests {
 
     #[test]
     fn later_identity_snapshot_discovers_a_descendant_created_after_launch() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock after Unix epoch")
-            .as_nanos();
-        let readiness = std::env::temp_dir().join(format!(
-            "glass-x11-delayed-descendant-{}-{unique}",
-            std::process::id()
-        ));
+        let artifacts = DelayedDescendantArtifacts::new();
+        let readiness = artifacts.readiness();
         let child = std::process::Command::new("sh")
             .args([
                 "-c",
@@ -2189,7 +2233,6 @@ mod tests {
                 .any(|pid| !initial.host_pids().contains(pid)),
             "refreshed identities did not include a newly created descendant"
         );
-        std::fs::remove_file(readiness).expect("remove readiness file");
     }
 
     #[test]
