@@ -368,8 +368,14 @@ fn require_contained_root(child: &mut ContainedChild, deadline: Instant) -> Resu
     }
 }
 
-fn launch_deadline(observed_at: Instant, timeout_ms: u64) -> Instant {
-    observed_at + Duration::from_millis(timeout_ms.max(1))
+fn dispatch_launch<T, C>(
+    timeout_ms: u64,
+    context: &mut C,
+    dispatch: impl FnOnce(&mut C, Instant) -> Result<T>,
+    cleanup: impl FnOnce(&mut C),
+) -> Result<T> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    dispatch(context, deadline).inspect_err(|_| cleanup(context))
 }
 
 /// What display the X11 backend should use, derived from `GLASS_DISPLAY`.
@@ -1491,11 +1497,15 @@ impl Platform for X11Platform {
         } else {
             None
         };
-        let deadline = launch_deadline(Instant::now(), spec.timeout_ms);
-        if let Err(e) = self.spawn(spec, deadline) {
-            self.kill_child(); // reap the private bus (and any child) on a failed spawn
-            return Err(e);
-        }
+        let deadline = dispatch_launch(
+            spec.timeout_ms,
+            self,
+            |platform, deadline| {
+                platform.spawn(spec, deadline)?;
+                Ok(deadline)
+            },
+            X11Platform::kill_child,
+        )?;
         match self
             .discover_window(spec, deadline)
             .and_then(|_| self.window_geometry())
@@ -1962,8 +1972,8 @@ fn button_number(button: glass_core::MouseButton) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainedChild, LaunchedChild, X11DeadlineWatch, X11Dispatch, hint_matches,
-        launch_deadline, legacy_window_selection, modifier_keycodes_dispatched, pid_matches,
+        ContainedChild, LaunchedChild, X11DeadlineWatch, X11Dispatch, dispatch_launch,
+        hint_matches, legacy_window_selection, modifier_keycodes_dispatched, pid_matches,
         require_contained_root, rollback_bounded_window_selection, run_clicks_by,
         run_scroll_buttons_by, run_x11_call_by, run_x11_type_by,
     };
@@ -2071,30 +2081,64 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_timeout_still_creates_a_nonexpired_launch_deadline() {
-        let now = Instant::now();
+    fn a_zero_timeout_reaches_launch_dispatch_before_timeout_cleanup() {
+        let observed_before_dispatch = Instant::now();
+        let events = RefCell::new(Vec::new());
 
-        assert!(launch_deadline(now, 0) > now);
+        let error = dispatch_launch(
+            0,
+            &mut (),
+            |(), deadline| {
+                events.borrow_mut().push("dispatch");
+                assert!(
+                    deadline > observed_before_dispatch,
+                    "zero-timeout dispatch received an already-expired deadline"
+                );
+                Err::<(), _>(GlassError::Timeout(0))
+            },
+            |()| events.borrow_mut().push("cleanup"),
+        )
+        .expect_err("the controlled dispatch reports timeout");
+
+        assert!(matches!(error, GlassError::Timeout(0)));
+        assert_eq!(*events.borrow(), ["dispatch", "cleanup"]);
     }
 
     #[test]
     fn later_identity_snapshot_discovers_a_descendant_created_after_launch() {
         let child = std::process::Command::new("sh")
-            .args(["-c", "sleep 0.2; sleep 5 & wait"])
+            .args(["-c", "sleep 0.8; sleep 5 & wait"])
+            .process_group(0)
             .spawn()
-            .unwrap();
-        let mut launched = LaunchedChild::Direct(child);
-        let root = launched.ownership_root();
+            .expect("spawn delayed-descendant fixture");
+        let launched = LaunchedCleanup(LaunchedChild::Direct(child));
+        let root = launched.0.ownership_root();
         let initial = glass_proc_linux::ProcessIdentitySet::from_host_root(root);
-        std::thread::sleep(Duration::from_millis(400));
-        let refreshed = glass_proc_linux::ProcessIdentitySet::from_host_root(root);
+        let poll_deadline = Instant::now() + Duration::from_secs(3);
+        let refreshed = loop {
+            let identities = glass_proc_linux::ProcessIdentitySet::from_host_root(root);
+            if identities
+                .host_pids()
+                .iter()
+                .any(|pid| !initial.host_pids().contains(pid))
+            {
+                break identities;
+            }
+            assert!(
+                Instant::now() < poll_deadline,
+                "no new descendant appeared within 3s; initial identities: {:?}, latest identities: {:?}",
+                initial.host_pids(),
+                identities.host_pids()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert!(
             refreshed
                 .host_pids()
                 .iter()
-                .any(|pid| !initial.host_pids().contains(pid))
+                .any(|pid| !initial.host_pids().contains(pid)),
+            "refreshed identities did not include a newly created descendant"
         );
-        glass_proc_linux::reap_group(launched.child_mut(), glass_proc_linux::REAP_GRACE);
     }
 
     #[test]

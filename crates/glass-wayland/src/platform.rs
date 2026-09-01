@@ -389,8 +389,16 @@ fn time_remains(observed_at: Instant, deadline: Instant) -> bool {
     observed_at < deadline
 }
 
-fn recovery_start(observed_at: Instant, timeout_ms: u64) -> Instant {
-    observed_at + start_recovery_after(timeout_ms)
+fn recover_after_grace(
+    launched_at: Instant,
+    timeout_ms: u64,
+    observed_at: Instant,
+    listed: bool,
+    recover: impl FnOnce(),
+) {
+    if observed_at >= launched_at + start_recovery_after(timeout_ms) && listed {
+        recover();
+    }
 }
 
 fn launch_with_retry<T>(
@@ -1709,7 +1717,7 @@ fn bring_up_session(
         // a slow toolkit under load can sit there for a while. Waiting out half the budget makes
         // an arriving window very unlikely to be mistaken for a lost one, and still leaves the
         // other half to notice, re-map, and see the window appear.
-        let start_grace = recovery_start(Instant::now(), spec.timeout_ms);
+        let launched_at = Instant::now();
         let mut discovered = None;
         loop {
             if Instant::now() >= deadline {
@@ -1754,9 +1762,9 @@ fn bring_up_session(
                 break window;
             }
             let now = Instant::now();
-            if now >= start_grace && listed.is_ok() {
+            recover_after_grace(launched_at, spec.timeout_ms, now, listed.is_ok(), || {
                 recovery.recover_if_due(now, &x11_ids(wins));
-            }
+            });
             if let Ok(Some(status)) = pending.child.try_wait() {
                 // Reap the whole group (see the socket-wait loop above): an
                 // unclean sway exit can orphan Xwayland + the app otherwise.
@@ -6219,7 +6227,7 @@ mod tests {
         BwrapStatusPipe, LaunchCleanupOutcome, PendingWaylandSession, WaylandPlatform,
         failed_launch_error, find_wayland_socket, launch_cleanup_error, launch_deadline_error,
         launch_ready, launch_with_retry, nudge_x, open_session, parse_sway_version, reap_pending,
-        recovery_start, start_recovery_after, time_remains, wayland_host_tree,
+        recover_after_grace, start_recovery_after, time_remains, wayland_host_tree,
     };
     use crate::command::{build_sway_command, sway_config};
     use glass_core::{
@@ -6265,10 +6273,33 @@ mod tests {
     }
 
     #[test]
-    fn recovery_starts_only_after_its_grace_period() {
-        let now = std::time::Instant::now();
+    fn recovery_is_not_attempted_just_before_its_grace_boundary() {
+        let launched_at = std::time::Instant::now();
+        let grace = std::time::Duration::from_secs(5);
+        let mut attempts = 0;
 
-        assert_eq!(recovery_start(now, 200), now + start_recovery_after(200));
+        recover_after_grace(
+            launched_at,
+            10_000,
+            launched_at + grace - std::time::Duration::from_nanos(1),
+            true,
+            || attempts += 1,
+        );
+
+        assert_eq!(attempts, 0);
+    }
+
+    #[test]
+    fn recovery_is_attempted_at_its_grace_boundary() {
+        let launched_at = std::time::Instant::now();
+        let grace = std::time::Duration::from_secs(5);
+        let mut attempts = 0;
+
+        recover_after_grace(launched_at, 10_000, launched_at + grace, true, || {
+            attempts += 1
+        });
+
+        assert_eq!(attempts, 1);
     }
 
     #[test]
