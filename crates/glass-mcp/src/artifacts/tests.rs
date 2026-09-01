@@ -496,6 +496,26 @@ fn shutdown_preserves_a_replacement_lease() {
 
 #[cfg(unix)]
 #[test]
+fn shutdown_quarantine_never_overwrites_a_replacement_created_mid_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+    let lease = store.lease_path();
+    let replacement = lease.clone();
+    store.set_test_hook(TestHookPoint::AfterLeaseQuarantine, move || {
+        fs::write(&replacement, "replacement").unwrap();
+    });
+
+    assert!(store.shutdown().is_err());
+    assert_eq!(fs::read_to_string(&lease).unwrap(), "replacement");
+    assert_eq!(store.lease_quarantine_count_for_test(), 1);
+
+    fs::remove_file(&lease).unwrap();
+    store.shutdown().unwrap();
+    assert_eq!(store.lease_quarantine_count_for_test(), 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn shutdown_uses_the_retained_root_after_ancestor_replacement() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("root");

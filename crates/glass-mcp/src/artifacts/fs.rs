@@ -53,7 +53,12 @@ struct ArtifactStoreInner {
     state: Mutex<StoreState>,
     fault: Option<FaultStage>,
     fault_fired: AtomicBool,
+    #[cfg(test)]
+    test_hook: Mutex<Option<TestHook>>,
 }
+
+#[cfg(test)]
+type TestHook = (TestHookPoint, Box<dyn FnOnce() + Send>);
 
 struct StoreState {
     root: PathBuf,
@@ -68,6 +73,13 @@ struct StoreState {
     limit_bytes: u64,
     availability_error: Option<ArtifactError>,
     lifecycle: Lifecycle,
+    #[cfg(unix)]
+    lease_quarantine: Option<OsString>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TestHookPoint {
+    AfterLeaseQuarantine,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,9 +341,13 @@ impl ArtifactStore {
                     limit_bytes,
                     availability_error: None,
                     lifecycle: Lifecycle::Open,
+                    #[cfg(unix)]
+                    lease_quarantine: None,
                 }),
                 fault,
                 fault_fired: AtomicBool::new(false),
+                #[cfg(test)]
+                test_hook: Mutex::new(None),
             }),
         })
     }
@@ -739,16 +755,32 @@ impl ArtifactStore {
             let root_handle = state
                 .root_handle
                 .as_ref()
-                .ok_or(ArtifactError::InvalidOutputState)?;
+                .ok_or(ArtifactError::InvalidOutputState)?
+                .try_clone()
+                .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
             let lease_name = state
                 .lease_path
                 .file_name()
-                .ok_or(ArtifactError::InvalidOutputState)?;
+                .ok_or(ArtifactError::InvalidOutputState)?
+                .to_os_string();
             let lease = state
                 .lease
                 .as_ref()
-                .ok_or(ArtifactError::InvalidOutputState)?;
-            match remove_locked_lease_from_handle(root_handle, &state.root, lease_name, lease) {
+                .ok_or(ArtifactError::InvalidOutputState)?
+                .try_clone()
+                .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?;
+            #[cfg(unix)]
+            let result = remove_locked_lease_for_shutdown(
+                &root_handle,
+                &lease_name,
+                &lease,
+                &mut state.lease_quarantine,
+                || self.fire_test_hook(TestHookPoint::AfterLeaseQuarantine),
+            );
+            #[cfg(windows)]
+            let result =
+                remove_locked_lease_from_handle(&root_handle, &state.root, &lease_name, &lease);
+            match result {
                 Ok(()) => {}
                 Err(ArtifactError::CleanupFailed(std::io::ErrorKind::NotFound)) => {}
                 Err(error) => return Err(error),
@@ -802,6 +834,42 @@ impl ArtifactStore {
         if let Ok(mut state) = self.inner.state.lock() {
             state.next_seq = next_seq;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_hook(&self, point: TestHookPoint, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(mut slot) = self.inner.test_hook.lock() {
+            *slot = Some((point, Box::new(hook)));
+        }
+    }
+
+    fn fire_test_hook(&self, point: TestHookPoint) {
+        #[cfg(test)]
+        let hook = self
+            .inner
+            .test_hook
+            .lock()
+            .ok()
+            .and_then(|mut slot| match slot.as_ref() {
+                Some((scheduled, _)) if *scheduled == point => slot.take().map(|(_, hook)| hook),
+                _ => None,
+            });
+        #[cfg(test)]
+        {
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        #[cfg(not(test))]
+        let _ = point;
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn lease_quarantine_count_for_test(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .map_or(0, |state| usize::from(state.lease_quarantine.is_some()))
     }
 }
 
@@ -1388,21 +1456,59 @@ fn remove_locked_lease_from_handle(
     name: &OsStr,
     retained: &File,
 ) -> Result<(), ArtifactError> {
-    let quarantine = OsString::from(format!(".lease-cleanup-{}", random_id()));
-    rustix::fs::renameat(parent, Path::new(name), parent, Path::new(&quarantine))
-        .map_err(|error| ArtifactError::CleanupFailed(std::io::Error::from(error).kind()))?;
-    if relative_file_matches_handle(parent, &quarantine, retained) {
-        return remove_non_directory_from_handle(parent, Path::new("."), &quarantine);
+    let mut quarantine = None;
+    remove_locked_lease_for_shutdown(parent, name, retained, &mut quarantine, || {})
+}
+
+#[cfg(unix)]
+fn remove_locked_lease_for_shutdown(
+    parent: &File,
+    name: &OsStr,
+    retained: &File,
+    quarantine: &mut Option<OsString>,
+    after_quarantine: impl FnOnce(),
+) -> Result<(), ArtifactError> {
+    if quarantine.is_none() {
+        if !relative_file_matches_handle(parent, name, retained) {
+            return Err(ArtifactError::CleanupFailed(
+                std::io::ErrorKind::InvalidInput,
+            ));
+        }
+        let candidate = OsString::from(format!(".lease-cleanup-{}", random_id()));
+        rustix::fs::renameat(parent, Path::new(name), parent, Path::new(&candidate))
+            .map_err(|error| ArtifactError::CleanupFailed(std::io::Error::from(error).kind()))?;
+        *quarantine = Some(candidate);
+        after_quarantine();
     }
-    let restore = rustix::fs::renameat(parent, Path::new(&quarantine), parent, Path::new(name));
-    match restore {
-        Ok(()) => Err(ArtifactError::CleanupFailed(
+
+    let quarantined = quarantine
+        .as_ref()
+        .ok_or(ArtifactError::InvalidOutputState)?;
+    match rustix::fs::statat(
+        parent,
+        Path::new(name),
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(_) => {
+            return Err(ArtifactError::CleanupFailed(
+                std::io::ErrorKind::AlreadyExists,
+            ));
+        }
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => {
+            return Err(ArtifactError::CleanupFailed(
+                std::io::Error::from(error).kind(),
+            ));
+        }
+    }
+    if !relative_file_matches_handle(parent, quarantined, retained) {
+        return Err(ArtifactError::CleanupFailed(
             std::io::ErrorKind::InvalidInput,
-        )),
-        Err(error) => Err(ArtifactError::CleanupFailed(
-            std::io::Error::from(error).kind(),
-        )),
+        ));
     }
+    remove_non_directory_from_handle(parent, Path::new("."), quarantined)?;
+    *quarantine = None;
+    Ok(())
 }
 
 #[cfg(windows)]
