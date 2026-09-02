@@ -68,11 +68,14 @@ struct ArtifactStoreInner {
 type TestHook = (TestHookPoint, Box<dyn FnOnce() + Send>);
 
 struct StoreState {
+    #[cfg(unix)]
     root: PathBuf,
     root_handle: Option<File>,
     process_dir: PathBuf,
     lease_path: PathBuf,
     lease: Option<File>,
+    #[cfg(windows)]
+    lease_lock_held: bool,
     process_dir_handle: Option<File>,
     server_id: String,
     entries: HashMap<String, RegistryEntry>,
@@ -390,11 +393,14 @@ impl ArtifactStore {
         Ok(Self {
             inner: Arc::new(ArtifactStoreInner {
                 state: Mutex::new(StoreState {
+                    #[cfg(unix)]
                     root,
                     root_handle: Some(root_handle),
                     process_dir,
                     lease_path,
                     lease: Some(lease),
+                    #[cfg(windows)]
+                    lease_lock_held: true,
                     process_dir_handle: Some(process_dir_handle),
                     server_id,
                     entries: HashMap::new(),
@@ -956,9 +962,9 @@ impl ArtifactStore {
                 Some(lease) => {
                     let result = remove_locked_lease_from_handle(
                         &root_handle,
-                        &state.root,
                         &lease_name,
                         &lease,
+                        &mut state.lease_lock_held,
                     );
                     match result {
                         Ok(()) => {
@@ -1863,20 +1869,49 @@ fn remove_locked_lease_for_shutdown(
 }
 
 #[cfg(windows)]
-fn remove_locked_lease_from_handle(
+pub(super) fn remove_locked_lease_from_handle(
     parent: &File,
-    _path: &Path,
     name: &std::ffi::OsStr,
     retained: &File,
+    lock_held: &mut bool,
 ) -> Result<(), ArtifactError> {
+    remove_locked_lease_from_handle_with(
+        parent,
+        name,
+        retained,
+        lock_held,
+        glass_windows::remove_by_handle,
+    )
+}
+
+#[cfg(windows)]
+pub(super) fn remove_locked_lease_from_handle_with(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    retained: &File,
+    lock_held: &mut bool,
+    remove: impl FnOnce(&File) -> Result<(), glass_windows::HostFsError>,
+) -> Result<(), ArtifactError> {
+    if !*lock_held {
+        FileExt::try_lock(retained).map_err(|_| ArtifactError::LockFailed)?;
+        *lock_held = true;
+    }
     let current = glass_windows::open_file_child(parent, name).map_err(map_host_cleanup)?;
     if !glass_windows::same_file_object(retained, &current).unwrap_or(false) {
         return Err(ArtifactError::CleanupFailed(
             std::io::ErrorKind::InvalidInput,
         ));
     }
-    drop(current);
-    glass_windows::remove_by_handle(retained).map_err(map_host_cleanup)
+    FileExt::unlock(retained).map_err(|_| ArtifactError::LockFailed)?;
+    *lock_held = false;
+    match remove(&current) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            FileExt::try_lock(retained).map_err(|_| ArtifactError::LockFailed)?;
+            *lock_held = true;
+            Err(map_host_cleanup(error))
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -2109,7 +2144,7 @@ fn directory_handle_matches_path(handle: &File, path: &Path) -> Result<bool, Art
 }
 
 #[cfg(windows)]
-fn open_process_directory(path: &Path) -> Result<File, ArtifactError> {
+pub(super) fn open_process_directory(path: &Path) -> Result<File, ArtifactError> {
     glass_windows::open_directory_no_reparse(path)
         .map_err(|_| ArtifactError::RootCanonicalizeFailed)
 }

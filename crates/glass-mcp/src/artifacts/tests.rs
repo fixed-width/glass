@@ -491,6 +491,85 @@ fn shutdown_removes_registered_and_unregistered_files_and_is_idempotent() {
     drop(batch);
 }
 
+#[cfg(windows)]
+#[test]
+fn lease_removal_releases_its_lock_before_disposition() {
+    let root = tempfile::tempdir().unwrap();
+    let lease_name = std::ffi::OsStr::new("server-test.lease");
+    let lease_path = root.path().join(lease_name);
+    let root_handle = super::fs::open_process_directory(root.path()).unwrap();
+    let lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&lease_path)
+        .unwrap();
+    lease.lock().unwrap();
+    let mut lock_held = true;
+
+    super::fs::remove_locked_lease_from_handle(&root_handle, lease_name, &lease, &mut lock_held)
+        .unwrap();
+    assert!(!lock_held);
+    drop(lease);
+
+    assert!(!lease_path.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn lease_removal_retry_reacquires_a_lock_released_by_a_failed_disposition() {
+    let root = tempfile::tempdir().unwrap();
+    let lease_name = std::ffi::OsStr::new("server-test.lease");
+    let lease_path = root.path().join(lease_name);
+    let root_handle = super::fs::open_process_directory(root.path()).unwrap();
+    let lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&lease_path)
+        .unwrap();
+    lease.lock().unwrap();
+    let mut lock_held = true;
+    let competing_lock = Arc::new(std::sync::Mutex::new(None));
+    let competing_lock_during_remove = Arc::clone(&competing_lock);
+    let lease_path_during_remove = lease_path.clone();
+
+    assert_eq!(
+        super::fs::remove_locked_lease_from_handle_with(
+            &root_handle,
+            lease_name,
+            &lease,
+            &mut lock_held,
+            move |_| {
+                let competitor = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(lease_path_during_remove)
+                    .unwrap();
+                competitor.lock().unwrap();
+                *competing_lock_during_remove.lock().unwrap() = Some(competitor);
+                Err(glass_windows::HostFsError::Open)
+            },
+        )
+        .unwrap_err(),
+        ArtifactError::LockFailed
+    );
+    assert!(!lock_held);
+    drop(competing_lock.lock().unwrap().take());
+
+    super::fs::remove_locked_lease_from_handle_with(
+        &root_handle,
+        lease_name,
+        &lease,
+        &mut lock_held,
+        glass_windows::remove_by_handle,
+    )
+    .unwrap();
+    drop(lease);
+
+    assert!(!lease_path.exists());
+}
+
 #[test]
 fn shutdown_closing_state_rejects_reads_and_publication_until_retry_succeeds() {
     let root = tempfile::tempdir().unwrap();
@@ -1112,7 +1191,7 @@ fn shutdown_uses_the_retained_root_after_ancestor_replacement() {
     assert_eq!(fs::read_to_string(&sentinel).unwrap(), "replacement");
 }
 
-#[cfg(windows)]
+#[cfg(unix)]
 #[test]
 fn shutdown_uses_retained_root_when_ancestor_is_substituted_before_directory_removal() {
     let grandparent = tempfile::tempdir().unwrap();
@@ -1141,7 +1220,7 @@ fn shutdown_uses_retained_root_when_ancestor_is_substituted_before_directory_rem
     );
 }
 
-#[cfg(windows)]
+#[cfg(unix)]
 #[test]
 fn shutdown_preserves_lease_substituted_immediately_before_removal() {
     let root = tempfile::tempdir().unwrap();
@@ -1534,7 +1613,7 @@ fn replacing_process_directory_cannot_redirect_read() {
     assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep");
 }
 
-#[cfg(windows)]
+#[cfg(unix)]
 #[test]
 fn replacing_root_ancestor_cannot_redirect_read() {
     let grandparent = tempfile::tempdir().unwrap();
