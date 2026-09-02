@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
+use super::a11y::SetValueExecution;
 use super::*;
 use crate::{
-    ActionabilityReport, AxStateCoverage, ScopeResolution, SemanticMatch, SemanticQuery,
+    ActionabilityCheck, ActionabilityCheckName, ActionabilityReport, ActionabilitySource,
+    ActionabilityVerdict, AxStateCoverage, ScopeResolution, SemanticMatch, SemanticQuery,
     SemanticQueryResult, SemanticSelector, SemanticState, Whose,
 };
 
@@ -590,6 +592,75 @@ fn ax_target(element: &ElementInfo) -> AxTarget {
     }
 }
 
+fn role_supports_set_value(element: &ElementInfo) -> bool {
+    element.states.editable
+        || element.states.checkable
+        || matches!(
+            element.role,
+            AxRole::ComboBox
+                | AxRole::Slider
+                | AxRole::SpinButton
+                | AxRole::ToggleButton
+                | AxRole::CheckBox
+                | AxRole::RadioButton
+        )
+}
+
+fn set_value_eligibility(element: &ElementInfo, coverage: AxStateCoverage) -> ActionabilityVerdict {
+    if matches!(
+        element.role,
+        AxRole::ComboBox
+            | AxRole::Slider
+            | AxRole::SpinButton
+            | AxRole::ToggleButton
+            | AxRole::RadioButton
+            | AxRole::CheckBox
+    ) || (coverage.editable && element.states.editable)
+        || (coverage.checkable && element.states.checkable)
+    {
+        ActionabilityVerdict::Passed
+    } else if coverage.editable && coverage.checkable {
+        ActionabilityVerdict::Failed
+    } else {
+        ActionabilityVerdict::Unproven
+    }
+}
+
+fn set_value_actionability(
+    element: &ElementInfo,
+    coverage: AxStateCoverage,
+    window: (u32, u32),
+    legacy_id: bool,
+) -> ActionabilityReport {
+    let mut report = ActionabilityReport::evaluate_click(
+        element,
+        coverage,
+        None,
+        window,
+        crate::PointerHit::Inconclusive,
+        legacy_id,
+        false,
+    );
+    let source = if legacy_id {
+        ActionabilitySource::LegacyCache
+    } else {
+        ActionabilitySource::NormalizedState
+    };
+    let check = ActionabilityCheck::new(
+        ActionabilityCheckName::FocusEligible,
+        set_value_eligibility(element, coverage),
+        !legacy_id,
+        source,
+    );
+    let insert_at = report
+        .checks
+        .iter()
+        .position(|existing| existing.name == ActionabilityCheckName::Stable)
+        .unwrap_or(report.checks.len());
+    report.checks.insert(insert_at, check);
+    report
+}
+
 fn actionability_error(
     kind: SemanticActionFailureKind,
     summary: &'static str,
@@ -656,6 +727,61 @@ fn action_source_error(
     if dispatch_started && error.action_dispatch != DispatchStatus::NotDispatched {
         error.retry = RetryGuidance::DoNotRetry;
     }
+    error
+}
+
+fn set_value_source_error(
+    source: GlassError,
+    resolution: Option<ResolutionReport>,
+    actionability: ActionabilityReport,
+    bound: ActionDeadline,
+) -> SemanticActionError {
+    let possible_dispatch = source.set_value_failed_after_writing()
+        || source.bound_dispatch() == Some(crate::BoundDispatch::MayHaveDispatched);
+    let cause = source.cause();
+    let proven_pre_dispatch = source.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched)
+        || matches!(
+            cause,
+            GlassError::NoActiveSession
+                | GlassError::NoAxSnapshot
+                | GlassError::AxUnsupported
+                | GlassError::AxElementChanged(_)
+                | GlassError::AxElementGone(_)
+                | GlassError::AxElementNotFound(_)
+                | GlassError::AxElementNotEditable(_)
+                | GlassError::AxValueNotBoolean(_, _)
+        );
+    let retry = if possible_dispatch || !proven_pre_dispatch {
+        RetryGuidance::DoNotRetry
+    } else if matches!(
+        cause,
+        GlassError::NoActiveSession
+            | GlassError::NoAxSnapshot
+            | GlassError::AxElementChanged(_)
+            | GlassError::AxElementGone(_)
+            | GlassError::AxElementNotFound(_)
+    ) {
+        RetryGuidance::Reobserve
+    } else if matches!(
+        cause,
+        GlassError::AxUnsupported
+            | GlassError::AxElementNotEditable(_)
+            | GlassError::AxValueNotBoolean(_, _)
+    ) {
+        RetryGuidance::CorrectRequest
+    } else {
+        RetryGuidance::SafeToRetry
+    };
+    let mut error = source_error(source, bound);
+    error.summary = "semantic set-value action failed";
+    error.resolution = resolution;
+    error.actionability = actionability;
+    error.action_dispatch = if possible_dispatch || !proven_pre_dispatch {
+        DispatchStatus::MayHaveDispatched
+    } else {
+        DispatchStatus::NotDispatched
+    };
+    error.retry = retry;
     error
 }
 
@@ -1449,6 +1575,189 @@ impl Glass {
                 Err(error) => Err(error),
             },
         }
+    }
+
+    fn legacy_set_value_snapshot(
+        &self,
+        id: AxNodeId,
+    ) -> Option<(ElementInfo, AxStateCoverage, (u32, u32))> {
+        let active = self.active.as_ref()?;
+        let node = active.last_ax.as_ref()?.find(id)?;
+        let coverage = active
+            .accessibility
+            .as_ref()
+            .map_or(AxStateCoverage::NONE, |reader| reader.state_coverage());
+        Some((
+            ElementInfo::from_node(node),
+            coverage,
+            (active.geometry.width, active.geometry.height),
+        ))
+    }
+
+    fn set_value_once(
+        &mut self,
+        params: &SetValueTargetParams,
+        text: &str,
+        sequence_deadline: Deadline,
+        bound: ActionDeadline,
+    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+        let (element, resolution, coverage, window, legacy_id, execution) = match &params.target {
+            ActionTarget::Id(id) => {
+                let before = self.legacy_set_value_snapshot(*id);
+                let actionability = before
+                    .as_ref()
+                    .map(|(element, coverage, window)| {
+                        set_value_actionability(element, *coverage, *window, true)
+                    })
+                    .unwrap_or_default();
+                let execution = self
+                    .set_value_inner(*id, text, bound.deadline)
+                    .map_err(|source| set_value_source_error(source, None, actionability, bound))?;
+                let (element, coverage, window) = self
+                    .legacy_set_value_snapshot(*id)
+                    .or(before)
+                    .expect("a successful ID set-value retained its cached target");
+                (element, None, coverage, window, true, execution)
+            }
+            ActionTarget::Semantic(target) => {
+                let (window, coverage) = self
+                    .active
+                    .as_ref()
+                    .map(|active| {
+                        (
+                            (active.geometry.width, active.geometry.height),
+                            active
+                                .accessibility
+                                .as_ref()
+                                .map_or(AxStateCoverage::NONE, |reader| reader.state_coverage()),
+                        )
+                    })
+                    .unwrap_or_default();
+                let resolved = self
+                    .resolve_semantic_target_by_bound(
+                        target,
+                        params.max_nodes,
+                        sequence_deadline,
+                        bound,
+                        |element, coverage| {
+                            role_supports_set_value(element)
+                                && set_value_actionability(element, coverage, window, false)
+                                    .blocking()
+                                    .is_none()
+                        },
+                    )
+                    .map_err(|mut error| {
+                        if error.kind == SemanticActionFailureKind::NotActionable {
+                            let element = error
+                                .candidates
+                                .first()
+                                .map(|candidate| candidate.element.clone());
+                            if let Some(element) = element {
+                                error.actionability =
+                                    set_value_actionability(&element, coverage, window, false);
+                            }
+                        }
+                        error
+                    })?;
+                let actionability =
+                    set_value_actionability(&resolved.element, resolved.coverage, window, false);
+                let execution = self
+                    .set_value_inner(resolved.element.id, text, resolved.bound.deadline)
+                    .map_err(|source| {
+                        set_value_source_error(
+                            source,
+                            Some(resolved.resolution.clone()),
+                            actionability,
+                            resolved.bound,
+                        )
+                    })?;
+                (
+                    resolved.element,
+                    Some(resolved.resolution),
+                    resolved.coverage,
+                    window,
+                    false,
+                    execution,
+                )
+            }
+        };
+        let mut actionability = set_value_actionability(&element, coverage, window, legacy_id);
+        actionability.pass_backend_fingerprint();
+        Ok(SemanticActionOutcome {
+            target: element,
+            resolution,
+            actionability,
+            focus: None,
+            action: MutationReport {
+                method: ActionMethod::AccessibilityValue,
+                dispatch: match execution {
+                    SetValueExecution::AlreadyApplied => DispatchStatus::NotDispatched,
+                    SetValueExecution::DispatchedAndConfirmed => DispatchStatus::Dispatched,
+                },
+                confirmation: ConfirmationStatus::ValueConfirmed,
+            },
+            bound,
+        })
+    }
+
+    pub fn set_value_target(
+        &mut self,
+        params: &SetValueTargetParams,
+        text: &str,
+    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+        self.set_value_target_by(params, text, Deadline::UNBOUNDED)
+    }
+
+    pub fn set_value_target_by(
+        &mut self,
+        params: &SetValueTargetParams,
+        text: &str,
+        sequence_deadline: Deadline,
+    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+        let started = std::time::Instant::now();
+        let result = target_deadline(
+            &params.target,
+            params.timeout_ms,
+            params.max_nodes,
+            sequence_deadline,
+        )
+        .and_then(|bound| self.set_value_once(params, text, sequence_deadline, bound));
+        let element = match &result {
+            Ok(outcome) => crate::audit::ElementRef {
+                id: outcome.target.id.0,
+                role: Some(format!("{:?}", outcome.target.role)),
+                name: outcome.target.name.clone(),
+            },
+            Err(_) => match &params.target {
+                ActionTarget::Id(id) => self.element_ref(*id),
+                ActionTarget::Semantic(target) => crate::audit::ElementRef {
+                    id: 0,
+                    role: target.target.role().map(|role| format!("{role:?}")),
+                    name: target.target.query().map(str::to_owned),
+                },
+            },
+        };
+        let (dispatch, confirmation) = match &result {
+            Ok(outcome) => (
+                outcome.action.dispatch.as_str(),
+                outcome.action.confirmation.as_str(),
+            ),
+            Err(error) => (
+                error.action_dispatch.as_str(),
+                ConfirmationStatus::Unconfirmed.as_str(),
+            ),
+        };
+        self.emit_audit(
+            &crate::audit::Actuation::SetValue {
+                element,
+                text,
+                dispatch,
+                confirmation,
+            },
+            crate::audit::AuditOutcome::from_result(&result),
+            started.elapsed(),
+        );
+        result
     }
 }
 

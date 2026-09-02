@@ -1018,6 +1018,8 @@ pub(crate) struct SeqAccessibility {
     invoke_calls: Arc<AtomicUsize>,
     hit_calls: Arc<AtomicUsize>,
     hit_points: Arc<Mutex<Vec<(i32, i32)>>>,
+    set_log: Arc<Mutex<Vec<(AxNodeId, String)>>>,
+    set_results: VecDeque<Result<()>>,
 }
 
 #[allow(dead_code)]
@@ -1045,6 +1047,8 @@ impl SeqAccessibility {
             invoke_calls: Arc::new(AtomicUsize::new(0)),
             hit_calls: Arc::new(AtomicUsize::new(0)),
             hit_points: Arc::new(Mutex::new(Vec::new())),
+            set_log: Arc::new(Mutex::new(Vec::new())),
+            set_results: VecDeque::new(),
         }
     }
 
@@ -1090,6 +1094,16 @@ impl SeqAccessibility {
 
     pub(crate) fn with_hit_points(mut self, points: Arc<Mutex<Vec<(i32, i32)>>>) -> Self {
         self.hit_points = points;
+        self
+    }
+
+    pub(crate) fn with_set_log(mut self, log: Arc<Mutex<Vec<(AxNodeId, String)>>>) -> Self {
+        self.set_log = log;
+        self
+    }
+
+    pub(crate) fn with_set_results(mut self, results: Vec<Result<()>>) -> Self {
+        self.set_results = results.into();
         self
     }
 
@@ -1154,9 +1168,13 @@ impl Accessibility for SeqAccessibility {
         }
         Ok(self.hit)
     }
-    fn set_value(&mut self, ctx: &AxContext, _t: &AxTarget, _s: &str) -> Result<()> {
+    fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         self.deadlines.lock().unwrap().push(ctx.deadline);
-        Ok(())
+        self.set_log
+            .lock()
+            .unwrap()
+            .push((target.id, text.to_string()));
+        self.set_results.pop_front().unwrap_or(Ok(()))
     }
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         self.deadlines.lock().unwrap().push(ctx.deadline);
@@ -1518,11 +1536,22 @@ pub(crate) struct RecordedClickAudit {
     pub(crate) ok: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedSetValueAudit {
+    pub(crate) element: crate::audit::ElementRef,
+    pub(crate) text: String,
+    pub(crate) dispatch: String,
+    pub(crate) confirmation: String,
+    pub(crate) ok: bool,
+    pub(crate) error: Option<String>,
+}
+
 /// Records `"action:ok"` for each actuation plus structured click metadata.
 #[derive(Clone, Default)]
 pub(crate) struct RecordingSink(
     pub(crate) Arc<Mutex<Vec<String>>>,
     pub(crate) Arc<Mutex<Vec<RecordedClickAudit>>>,
+    pub(crate) Arc<Mutex<Vec<RecordedSetValueAudit>>>,
 );
 impl AuditSink for RecordingSink {
     fn record(&self, act: &Actuation, _ctx: &ActuationContext, o: &AuditOutcome, _d: Duration) {
@@ -1565,6 +1594,22 @@ impl AuditSink for RecordingSink {
                 dispatch: (*dispatch).into(),
                 confirmation: (*confirmation).into(),
                 ok: o.ok,
+            });
+        }
+        if let Actuation::SetValue {
+            element,
+            text,
+            dispatch,
+            confirmation,
+        } = act
+        {
+            self.2.lock().unwrap().push(RecordedSetValueAudit {
+                element: element.clone(),
+                text: (*text).into(),
+                dispatch: (*dispatch).into(),
+                confirmation: (*confirmation).into(),
+                ok: o.ok,
+                error: o.error.clone(),
             });
         }
     }

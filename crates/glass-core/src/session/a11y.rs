@@ -16,6 +16,12 @@ const TOGGLE_SWIPE_MS: u64 = 250;
 const COMBO_OPEN_POINTER_REASON: &str =
     "combo popup opened by pointer so the keyboard commit lands in it";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SetValueExecution {
+    AlreadyApplied,
+    DispatchedAndConfirmed,
+}
+
 fn click_method_from_semantic_outcome(outcome: SemanticActionOutcome) -> ClickMethod {
     match outcome.action.method {
         ActionMethod::NativeAction { actuated } => ClickMethod::NativeAction { actuated },
@@ -35,7 +41,7 @@ fn glass_error_from_semantic_action(mut error: SemanticActionError) -> GlassErro
     error
         .source
         .take()
-        .expect("ID click failures always retain their original GlassError")
+        .expect("legacy ID action failures always retain their original GlassError")
 }
 
 /// Poll cadence for `set_value`'s post-toggle verify: how often to re-snapshot while waiting for
@@ -523,18 +529,25 @@ impl Glass {
     }
 
     pub fn set_value_by(&mut self, id: AxNodeId, text: &str, deadline: Deadline) -> Result<()> {
-        let t = std::time::Instant::now();
-        let element = self.element_ref(id);
-        let result = self.set_value_inner(id, text, deadline);
-        self.emit_audit(
-            &crate::audit::Actuation::SetValue { element, text },
-            crate::audit::AuditOutcome::from_result(&result),
-            t.elapsed(),
-        );
-        result
+        self.set_value_target_by(
+            &SetValueTargetParams {
+                target: ActionTarget::Id(id),
+                timeout_ms: None,
+                max_nodes: None,
+            },
+            text,
+            deadline,
+        )
+        .map(|_| ())
+        .map_err(glass_error_from_semantic_action)
     }
 
-    fn set_value_inner(&mut self, id: AxNodeId, text: &str, deadline: Deadline) -> Result<()> {
+    pub(super) fn set_value_inner(
+        &mut self,
+        id: AxNodeId,
+        text: &str,
+        deadline: Deadline,
+    ) -> Result<SetValueExecution> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("set value"));
         }
@@ -579,7 +592,23 @@ impl Glass {
         //
         // Invalidate the cache unless input is proven pre-dispatch; a snapshot replaces it.
         if target.role == AxRole::ComboBox {
-            return self.set_combo_value(id, &target, text, deadline);
+            let already_applied = self
+                .require_active()?
+                .last_ax
+                .as_ref()
+                .and_then(|tree| tree.find(id))
+                .is_some_and(|combo| {
+                    !combo.states.expanded
+                        && combo
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(text.trim()))
+                });
+            if already_applied {
+                return Ok(SetValueExecution::AlreadyApplied);
+            }
+            self.set_combo_value(id, &target, text, deadline)?;
+            return Ok(SetValueExecution::DispatchedAndConfirmed);
         }
         // iOS's value-set (tap+type) can't drive a checkable: a tap doesn't toggle a UISwitch
         // and there's no text to type, so it takes the trailing-edge swipe instead.
@@ -609,7 +638,7 @@ impl Glass {
             let want = parse_bool(text)
                 .ok_or_else(|| GlassError::AxValueNotBoolean(id.0, text.to_string()))?;
             if st.checked == want {
-                return Ok(()); // truthful no-op, no actuation
+                return Ok(SetValueExecution::AlreadyApplied); // truthful no-op, no actuation
             }
             let actuation = self.click_element_inner(id, deadline);
             // Drop the pre-toggle cache after ambiguous actuation to prevent a reversing retry.
@@ -647,7 +676,7 @@ impl Glass {
                 seen = find_checkable_near(&tree.root, target.bounds.as_ref())
                     .map(|n| n.states.checked);
                 if seen == Some(want) {
-                    return Ok(());
+                    return Ok(SetValueExecution::DispatchedAndConfirmed);
                 }
                 let left = verify_deadline.remaining().unwrap_or_default();
                 if left.is_zero() {
@@ -704,7 +733,7 @@ impl Glass {
             node.value = (!text.is_empty()).then(|| text.to_string());
         }
         s.pump();
-        Ok(())
+        Ok(SetValueExecution::DispatchedAndConfirmed)
     }
 
     /// Select an option in a dropdown/combo by label (case-insensitive). Opens the popup when

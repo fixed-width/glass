@@ -20,6 +20,89 @@ fn semantic_target(query: &str) -> SemanticTarget {
     }
 }
 
+fn value_control_tree(name: &str, role: AxRole, value: Option<&str>, states: AxStates) -> AxTree {
+    AxTree::new(AxNode {
+        id: AxNodeId(0),
+        role: AxRole::Window,
+        raw_role: "window".into(),
+        name: Some("App".into()),
+        description: None,
+        value: None,
+        states: AxStates::default(),
+        bounds: Some(AxRect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 240,
+        }),
+        children: vec![AxNode {
+            id: AxNodeId(0),
+            role,
+            raw_role: format!("{role:?}"),
+            name: Some(name.into()),
+            description: None,
+            value: value.map(str::to_owned),
+            states,
+            bounds: Some(AxRect {
+                x: 20,
+                y: 20,
+                width: 160,
+                height: 30,
+            }),
+            children: Vec::new(),
+        }],
+    })
+}
+
+fn editable_field_tree(name: &str, value: Option<&str>, enabled: bool) -> AxTree {
+    value_control_tree(
+        name,
+        AxRole::TextField,
+        value,
+        AxStates {
+            enabled,
+            visible: true,
+            focusable: true,
+            editable: true,
+            ..AxStates::default()
+        },
+    )
+}
+
+fn semantic_set_value_params(query: &str, timeout_ms: u64) -> SetValueTargetParams {
+    SetValueTargetParams {
+        target: ActionTarget::Semantic(semantic_target(query)),
+        timeout_ms: Some(timeout_ms),
+        max_nodes: None,
+    }
+}
+
+fn semantic_set_value_glass(
+    trees: Vec<AxTree>,
+    set_results: Vec<crate::Result<()>>,
+) -> (
+    Glass,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<(AxNodeId, String)>>>,
+    AxDeadlineLog,
+) {
+    let walks = Arc::new(AtomicUsize::new(0));
+    let set_log = Arc::new(Mutex::new(Vec::new()));
+    let deadlines = Arc::new(Mutex::new(Vec::new()));
+    let accessibility = SeqAccessibility::new(trees)
+        .with_coverage(full_state_coverage())
+        .with_walks(walks.clone())
+        .with_deadlines(deadlines.clone())
+        .with_set_log(set_log.clone())
+        .with_set_results(set_results);
+    (
+        glass_with_backend(FakePlatform::new(320, 240), Box::new(accessibility)),
+        walks,
+        set_log,
+        deadlines,
+    )
+}
+
 fn named_button_tree(name: &str) -> AxTree {
     let mut tree = fake_tree();
     tree.root.children[0].name = Some(name.into());
@@ -2135,4 +2218,285 @@ fn semantic_public_click_audit_emits_exactly_one_record_on_native_fallback_and_f
         assert_eq!(audits[0].confirmation, expected_confirmation);
         assert_eq!(audits[0].ok, succeeds);
     }
+}
+
+#[test]
+fn semantic_set_value_resolves_fresh_and_calls_the_backend_once() {
+    let cached = editable_field_tree("Former account name", Some("old"), true);
+    let fresh = editable_field_tree("Account name", Some("old"), true);
+    let (mut glass, walks, set_log, deadlines) =
+        semantic_set_value_glass(vec![cached, fresh], Vec::new());
+    glass.start(&spec()).unwrap();
+    glass.a11y_snapshot(None).unwrap();
+
+    let outcome = glass
+        .set_value_target_by(
+            &semantic_set_value_params("Account name", 500),
+            "updated",
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(walks.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        set_log.lock().unwrap().as_slice(),
+        &[(outcome.target.id, "updated".into())]
+    );
+    assert_eq!(outcome.target.name.as_deref(), Some("Account name"));
+    assert_eq!(outcome.action.method, ActionMethod::AccessibilityValue);
+    assert_eq!(outcome.action.dispatch, DispatchStatus::Dispatched);
+    assert_eq!(
+        outcome.action.confirmation,
+        ConfirmationStatus::ValueConfirmed
+    );
+    let deadlines = deadlines.lock().unwrap();
+    assert_eq!(deadlines.len(), 3);
+    assert!(
+        deadlines[1..]
+            .iter()
+            .all(|deadline| *deadline == outcome.bound.deadline)
+    );
+}
+
+#[test]
+fn semantic_set_value_waits_for_a_known_disabled_field_to_become_enabled() {
+    let disabled = editable_field_tree("Account name", Some("old"), false);
+    let enabled = editable_field_tree("Account name", Some("old"), true);
+    let (mut glass, walks, set_log, _) =
+        semantic_set_value_glass(vec![disabled, enabled], Vec::new());
+    glass.start(&spec()).unwrap();
+
+    let outcome = glass
+        .set_value_target(&semantic_set_value_params("Account name", 500), "updated")
+        .unwrap();
+
+    assert_eq!(walks.load(Ordering::Relaxed), 2);
+    assert_eq!(set_log.lock().unwrap().len(), 1);
+    assert_eq!(outcome.action.dispatch, DispatchStatus::Dispatched);
+    assert_eq!(
+        outcome.action.confirmation,
+        ConfirmationStatus::ValueConfirmed
+    );
+}
+
+#[test]
+fn semantic_set_value_refuses_a_known_non_value_role_before_backend_dispatch() {
+    let tree = value_control_tree(
+        "Save",
+        AxRole::Button,
+        None,
+        AxStates {
+            enabled: true,
+            visible: true,
+            focusable: true,
+            ..AxStates::default()
+        },
+    );
+    let (mut glass, walks, set_log, _) = semantic_set_value_glass(vec![tree], Vec::new());
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .set_value_target(&semantic_set_value_params("Save", 0), "not-a-value")
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(error.retry, RetryGuidance::Reobserve);
+    assert_eq!(
+        error.actionability.blocking().unwrap().name,
+        ActionabilityCheckName::FocusEligible
+    );
+    assert_eq!(walks.load(Ordering::Relaxed), 1);
+    assert!(set_log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn semantic_set_value_preserves_backend_value_confirmation() {
+    let tree = editable_field_tree("Account name", Some("old"), true);
+    let (mut glass, walks, set_log, _) = semantic_set_value_glass(vec![tree], Vec::new());
+    glass.start(&spec()).unwrap();
+    glass.a11y_snapshot(None).unwrap();
+    let id = glass
+        .active
+        .as_ref()
+        .unwrap()
+        .last_ax
+        .as_ref()
+        .unwrap()
+        .root
+        .children[0]
+        .id;
+
+    let outcome = glass
+        .set_value_target(
+            &SetValueTargetParams {
+                target: ActionTarget::Id(id),
+                timeout_ms: None,
+                max_nodes: None,
+            },
+            "updated",
+        )
+        .unwrap();
+
+    assert_eq!(walks.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        set_log.lock().unwrap().as_slice(),
+        &[(id, "updated".into())]
+    );
+    assert_eq!(outcome.action.method, ActionMethod::AccessibilityValue);
+    assert_eq!(outcome.action.dispatch, DispatchStatus::Dispatched);
+    assert_eq!(
+        outcome.action.confirmation,
+        ConfirmationStatus::ValueConfirmed
+    );
+}
+
+#[test]
+fn unconfirmed_semantic_write_is_terminal_and_clears_the_cached_value() {
+    let secret = "requested secret text";
+    let tree = editable_field_tree("Account name", Some("old"), true);
+    let (mut glass, _, set_log, _) = semantic_set_value_glass(
+        vec![tree],
+        vec![Err(GlassError::AxWriteUnconfirmed(1, secret.into()))],
+    );
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .set_value_target(&semantic_set_value_params("Account name", 0), secret)
+        .unwrap_err();
+
+    let calls = set_log.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, secret);
+    let id = calls[0].0;
+    drop(calls);
+    assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(error.retry, RetryGuidance::DoNotRetry);
+    assert!(!error.to_string().contains(secret));
+    assert!(!error.summary.contains(secret));
+    assert!(!format!("{:?}", error.candidates).contains(secret));
+    assert!(!format!("{:?}", error.actionability).contains(secret));
+    assert_eq!(
+        glass
+            .active
+            .as_ref()
+            .and_then(|active| active.last_ax.as_ref())
+            .and_then(|tree| tree.find(id))
+            .and_then(|node| node.value.as_deref()),
+        None
+    );
+}
+
+#[test]
+fn semantic_set_value_does_not_retry_after_a_may_have_dispatched_transport_failure() {
+    let tree = editable_field_tree("Account name", Some("old"), true);
+    let (mut glass, walks, set_log, _) = semantic_set_value_glass(
+        vec![tree],
+        vec![Err(GlassError::AccessibilityUnavailable(
+            "scripted transport failure".into(),
+        ))],
+    );
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .set_value_target(&semantic_set_value_params("Account name", 500), "updated")
+        .unwrap_err();
+
+    assert_eq!(walks.load(Ordering::Relaxed), 1);
+    assert_eq!(set_log.lock().unwrap().len(), 1);
+    assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(error.retry, RetryGuidance::DoNotRetry);
+}
+
+#[test]
+fn legacy_set_value_uses_the_cached_id_without_a_fresh_read() {
+    let cached = editable_field_tree("Cached account name", Some("old"), true);
+    let fresh = editable_field_tree("Different field", Some("other"), true);
+    let (mut glass, walks, set_log, _) = semantic_set_value_glass(vec![cached, fresh], Vec::new());
+    glass.start(&spec()).unwrap();
+    glass.a11y_snapshot(None).unwrap();
+    let cached_id = glass
+        .active
+        .as_ref()
+        .unwrap()
+        .last_ax
+        .as_ref()
+        .unwrap()
+        .root
+        .children[0]
+        .id;
+
+    glass.set_value(cached_id, "updated").unwrap();
+
+    assert_eq!(walks.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        set_log.lock().unwrap().as_slice(),
+        &[(cached_id, "updated".into())]
+    );
+}
+
+#[test]
+fn semantic_set_value_already_applied_reports_a_truthful_no_op() {
+    let tree = value_control_tree(
+        "Beta",
+        AxRole::ComboBox,
+        Some("Beta"),
+        AxStates {
+            enabled: true,
+            visible: true,
+            focusable: true,
+            ..AxStates::default()
+        },
+    );
+    let (mut glass, walks, set_log, _) = semantic_set_value_glass(vec![tree], Vec::new());
+    glass.start(&spec()).unwrap();
+
+    let outcome = glass
+        .set_value_target(&semantic_set_value_params("Beta", 0), "Beta")
+        .unwrap();
+
+    assert_eq!(walks.load(Ordering::Relaxed), 1);
+    assert!(set_log.lock().unwrap().is_empty());
+    assert_eq!(outcome.action.method, ActionMethod::AccessibilityValue);
+    assert_eq!(outcome.action.dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        outcome.action.confirmation,
+        ConfirmationStatus::ValueConfirmed
+    );
+}
+
+#[test]
+fn semantic_public_set_value_audit_emits_one_safe_high_level_record() {
+    let secret = "audit secret text";
+    let tree = editable_field_tree("Account name", Some("old"), true);
+    let (mut glass, _, set_log, _) = semantic_set_value_glass(
+        vec![tree],
+        vec![Err(GlassError::AxWriteUnconfirmed(1, secret.into()))],
+    );
+    let sink = RecordingSink::default();
+    glass.set_audit_sink(Box::new(sink.clone()));
+    glass.start(&spec()).unwrap();
+
+    let result = glass.set_value_target(&semantic_set_value_params("Account name", 0), secret);
+
+    assert!(result.is_err());
+    assert_eq!(set_log.lock().unwrap().len(), 1);
+    let records = sink.0.lock().unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.starts_with("set_value:"))
+            .count(),
+        1,
+        "records: {records:?}"
+    );
+    drop(records);
+    let audits = sink.2.lock().unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].element.name.as_deref(), Some("Account name"));
+    assert_eq!(audits[0].text, secret);
+    assert_eq!(audits[0].dispatch, "may_have_dispatched");
+    assert_eq!(audits[0].confirmation, "unconfirmed");
+    assert!(!audits[0].ok);
+    assert!(!audits[0].error.as_deref().unwrap().contains(secret));
 }

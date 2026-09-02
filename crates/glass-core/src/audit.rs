@@ -84,6 +84,8 @@ pub enum Actuation<'a> {
     SetValue {
         element: ElementRef,
         text: &'a str,
+        dispatch: &'a str,
+        confirmation: &'a str,
     },
 }
 
