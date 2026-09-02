@@ -898,6 +898,13 @@ fn strict_pid_match(pids: &[u32], pid: Result<u32>) -> Result<bool> {
     }
 }
 
+fn contextualize_pid_lookup_error(bus_name: &str, error: GlassError) -> GlassError {
+    match error {
+        error @ GlassError::Bounded { .. } => error,
+        error => pointer_reference_error(format!("application {bus_name} PID lookup: {error}")),
+    }
+}
+
 async fn pointer_accessible<'a>(
     conn: &'a zbus::Connection,
     object: &'a ObjectRefOwned,
@@ -986,12 +993,7 @@ async fn find_app_strict(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Conne
                 ),
             )
             .await
-            .map_err(|e| {
-                pointer_reference_error(format!(
-                    "application {} PID lookup: {e}",
-                    identity.bus_name
-                ))
-            }),
+            .map_err(|error| contextualize_pid_lookup_error(identity.bus_name, error)),
             None => Ok(0),
         };
         if strict_pid_match(&ctx.pids, pid)? {
@@ -1782,12 +1784,31 @@ mod tests {
         let null = ObjectRefOwned::new(ObjectRef::Null);
         assert!(validate_strict_reference(&null, "registry application").is_err());
 
-        let error = strict_pid_match(
-            &[42],
-            Err(pointer_reference_error("PID lookup permission denied")),
-        )
-        .expect_err("a PID lookup failure is not an absent application");
+        let pid_error = contextualize_pid_lookup_error(
+            ":1.42",
+            pointer_reference_error("PID lookup permission denied"),
+        );
+        let error = strict_pid_match(&[42], Err(pid_error))
+            .expect_err("a PID lookup failure is not an absent application");
         assert!(error.to_string().contains("permission denied"));
+        assert!(error.to_string().contains(":1.42"));
+    }
+
+    #[test]
+    fn strict_pid_lookup_timeout_preserves_exact_deadline_metadata() {
+        let timeout = GlassError::caller_deadline_elapsed(POINTER_HIT_OP);
+        let original_message = timeout.to_string();
+
+        let error = contextualize_pid_lookup_error(":1.42", timeout);
+
+        assert!(matches!(error, GlassError::Bounded { .. }), "{error}");
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(error.to_string(), original_message);
     }
 
     #[test]
