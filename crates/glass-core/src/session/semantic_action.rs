@@ -312,8 +312,13 @@ impl PlannedPointerInput {
             |(x, y): (i32, i32)| x >= 0 && y >= 0 && (x as u32) < window.0 && (y as u32) < window.1;
         match self {
             Self::Click { point } => inside(*point),
-            Self::TrailingToggle { segment, .. } => {
-                inside((segment.from_x, segment.from_y)) && inside((segment.to_x, segment.to_y))
+            Self::TrailingToggle {
+                segment,
+                probe_point,
+            } => {
+                inside((segment.from_x, segment.from_y))
+                    && inside((segment.to_x, segment.to_y))
+                    && inside(*probe_point)
             }
         }
     }

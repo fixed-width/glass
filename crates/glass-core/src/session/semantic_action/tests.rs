@@ -1432,6 +1432,27 @@ fn selector_pointer_rejects_a_trailing_toggle_with_a_boundary_endpoint() {
 }
 
 #[test]
+fn exact_trailing_toggle_plan_validates_the_stored_probe_point() {
+    let segment = crate::Segment {
+        from_x: 10,
+        from_y: 20,
+        to_x: 30,
+        to_y: 20,
+    };
+    let valid = PlannedPointerInput::TrailingToggle {
+        segment,
+        probe_point: (20, 20),
+    };
+    let invalid = PlannedPointerInput::TrailingToggle {
+        segment,
+        probe_point: (100, 100),
+    };
+
+    assert!(valid.is_inside_window((100, 100)));
+    assert!(!invalid.is_inside_window((100, 100)));
+}
+
+#[test]
 fn selector_pointer_popover_row_toggle_dispatches_the_translated_planned_segment() {
     let mut tree = fake_tree_with_popover_option();
     let toggle = &mut tree.root.children[0].children[0];
