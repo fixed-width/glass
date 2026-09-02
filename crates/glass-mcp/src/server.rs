@@ -1892,7 +1892,11 @@ mod tests {
             .expect("explicit snapshot");
         let automatic = server
             .glass_click_element(Parameters(ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: Some("snapshot".into()),
             }))
             .await

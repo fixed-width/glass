@@ -592,6 +592,10 @@ fn type_secret_failure_preserves_no_active_session_without_echoing_input() {
         &mut glass,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: secret.into(),
                 return_: None,
             })],
@@ -617,7 +621,10 @@ fn set_value_secret_failure_preserves_no_active_session_without_echoing_input() 
         &mut glass,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: secret.into(),
                 return_: None,
             })],
@@ -648,7 +655,10 @@ fn assert_safe_set_value_category(
         &mut glass,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: secret.into(),
                 return_: None,
             })],
@@ -805,7 +815,10 @@ fn real_combo_missing_option_after_open_and_failed_escape_is_attempted_and_secre
         &mut glass,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: submitted_secret.into(),
                 return_: None,
             })],
@@ -846,6 +859,10 @@ fn secret_failure_omits_backend_detail_containing_submitted_input() {
         &mut type_glass,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: typed_secret.into(),
                 return_: None,
             })],
@@ -866,7 +883,10 @@ fn secret_failure_omits_backend_detail_containing_submitted_input() {
         &mut set_glass,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: set_secret.into(),
                 return_: None,
             })],
@@ -986,6 +1006,10 @@ fn sequence_deadline_construction_is_checked() {
 fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
     let frame = Frame::solid(100, 100, [7, 8, 9, 255]);
     let settle_args = TypeArgs {
+        target: None,
+        focus_mode: None,
+        timeout_ms: None,
+        max_nodes: None,
         text: "private".into(),
         return_: Some("settle".into()),
     };
@@ -1020,6 +1044,10 @@ fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
     assert_eq!(contextual_deadlines.lock().unwrap()[0], Deadline::UNBOUNDED);
 
     let snapshot_args = TypeArgs {
+        target: None,
+        focus_mode: None,
+        timeout_ms: None,
+        max_nodes: None,
         text: "private".into(),
         return_: Some("snapshot".into()),
     };
@@ -1059,6 +1087,10 @@ fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
     }
 
     let invalid = TypeArgs {
+        target: None,
+        focus_mode: None,
+        timeout_ms: None,
+        max_nodes: None,
         text: "private".into(),
         return_: Some("later".into()),
     };
@@ -1466,6 +1498,10 @@ fn caller_soft_return_settle_fails_the_mutating_action() {
             vec![
                 click(1, 1),
                 Action::Type(TypeArgs {
+                    target: None,
+                    focus_mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     text: "secret".into(),
                     return_: Some("settle".into()),
                 }),
@@ -1502,6 +1538,10 @@ fn caller_soft_return_snapshot_stops_before_accessibility_work() {
         &mut g,
         &do_args(
             vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("snapshot".into()),
             })],
@@ -1527,6 +1567,10 @@ fn return_snapshot_propagates_settle_capture_failure_after_dispatch() {
         &mut g,
         &do_args(
             vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("snapshot".into()),
             })],
@@ -1559,6 +1603,10 @@ fn type_return_not_dispatched_after_actuation_remains_attempted() {
         &mut g,
         &do_args(
             vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("settle".into()),
             })],
@@ -1579,7 +1627,11 @@ fn click_element_return_not_dispatched_after_actuation_remains_attempted() {
         &mut g,
         &do_args(
             vec![Action::ClickElement(ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: Some("settle".into()),
             })],
             100,
@@ -1599,7 +1651,10 @@ fn set_value_return_not_dispatched_after_actuation_remains_attempted() {
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("settle".into()),
             })],
@@ -1620,7 +1675,10 @@ fn set_value_caller_deadline_shorter_than_backend_ceiling_is_sequence_deadline_e
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: None,
             })],
@@ -1652,7 +1710,10 @@ fn set_value_backend_ceiling_shorter_than_sequence_is_transport_failure() {
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: None,
             })],
@@ -1684,7 +1745,10 @@ fn set_value_transport_failure_keeps_post_write_retry_guidance() {
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: None,
             })],
@@ -1714,7 +1778,10 @@ fn set_value_worker_spawn_failure_is_unattempted_and_safe_to_retry() {
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: None,
             })],
@@ -1850,6 +1917,10 @@ fn success_retains_existing_fields_and_adds_every_step_result() {
             actions: vec![
                 click(10, 20),
                 Action::Type(TypeArgs {
+                    target: None,
+                    focus_mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     text: "alice".into(),
                     return_: None,
                 }),
@@ -1897,6 +1968,10 @@ fn type_return_snapshot_is_retained_in_content_blocks() {
         &mut g,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "hi".into(),
                 return_: Some("snapshot".into()),
             })],
@@ -1930,6 +2005,10 @@ fn type_action_with_return_none_is_allowed() {
         &mut g,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "hi".into(),
                 return_: Some("none".into()),
             })],
@@ -2101,6 +2180,10 @@ fn mutating_action_validation_failures_are_proven_not_dispatched() {
         (
             "type return",
             Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("invalid".into()),
             }),
@@ -2108,14 +2191,21 @@ fn mutating_action_validation_failures_are_proven_not_dispatched() {
         (
             "click_element return",
             Action::ClickElement(ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: Some("invalid".into()),
             }),
         ),
         (
             "set_value return",
             Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("invalid".into()),
             }),
@@ -2235,7 +2325,10 @@ fn invalid_boolean_semantic_validation_is_proven_not_dispatched() {
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "not-a-boolean".into(),
                 return_: None,
             })],
@@ -2263,11 +2356,18 @@ fn semantic_actions_delegate_and_retain_standalone_results() {
         &DoArgs {
             actions: vec![
                 Action::ClickElement(ClickElementArgs {
-                    id: 1,
+                    id: Some(1),
+                    target: None,
+                    mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     return_: None,
                 }),
                 Action::SetValue(SetValueArgs {
-                    id: 1,
+                    id: Some(1),
+                    target: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     text: "secret".into(),
                     return_: None,
                 }),
@@ -2349,7 +2449,11 @@ fn click_element_stale_target_stops_with_structured_detail() {
             &DoArgs {
                 actions: vec![
                     Action::ClickElement(ClickElementArgs {
-                        id: 99,
+                        id: Some(99),
+                        target: None,
+                        mode: None,
+                        timeout_ms: None,
+                        max_nodes: None,
                         return_: None,
                     }),
                     Action::Key(KeyArgs {
@@ -2501,7 +2605,11 @@ fn semantic_return_snapshot_keeps_untrusted_outline_outside_the_envelope() {
         &mut g,
         &DoArgs {
             actions: vec![Action::ClickElement(ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: Some("snapshot".into()),
             })],
             then: None,
@@ -2539,7 +2647,11 @@ fn app_element_details_stay_in_untrusted_step_content() {
         &mut g,
         &DoArgs {
             actions: vec![Action::ClickElement(ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: Some("snapshot".into()),
             })],
             then: None,
@@ -2588,7 +2700,11 @@ fn stale_target_detail_is_not_embedded_in_trusted_error_json() {
         &DoArgs {
             actions: vec![
                 Action::ClickElement(ClickElementArgs {
-                    id: 1,
+                    id: Some(1),
+                    target: None,
+                    mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     return_: None,
                 }),
                 Action::Key(KeyArgs {
@@ -2637,11 +2753,18 @@ fn typed_and_set_value_text_are_never_echoed() {
         &DoArgs {
             actions: vec![
                 Action::Type(TypeArgs {
+                    target: None,
+                    focus_mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     text: typed_success.into(),
                     return_: None,
                 }),
                 Action::SetValue(SetValueArgs {
-                    id: 1,
+                    id: Some(1),
+                    target: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     text: set_success.into(),
                     return_: None,
                 }),
@@ -2670,6 +2793,10 @@ fn typed_and_set_value_text_are_never_echoed() {
         &mut type_g,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: typed_failure.into(),
                 return_: Some("not-a-return".into()),
             })],
@@ -2684,7 +2811,10 @@ fn typed_and_set_value_text_are_never_echoed() {
         &mut set_g,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 99,
+                id: Some(99),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: set_failure.into(),
                 return_: None,
             })],
@@ -2717,6 +2847,10 @@ fn typed_and_set_value_text_are_never_echoed() {
         &mut type_g,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: typed_dispatch_failure.into(),
                 return_: None,
             })],
@@ -2741,7 +2875,10 @@ fn typed_and_set_value_text_are_never_echoed() {
         &mut set_g,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: set_dispatch_failure.into(),
                 return_: None,
             })],
@@ -2794,11 +2931,19 @@ fn content_indices_cover_completed_step_siblings_before_failure_detail() {
         &DoArgs {
             actions: vec![
                 Action::ClickElement(ClickElementArgs {
-                    id: 1,
+                    id: Some(1),
+                    target: None,
+                    mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     return_: Some("snapshot".into()),
                 }),
                 Action::ClickElement(ClickElementArgs {
-                    id: 99,
+                    id: Some(99),
+                    target: None,
+                    mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     return_: None,
                 }),
                 Action::Key(KeyArgs {
@@ -3447,6 +3592,10 @@ fn terminal_content_blocks_reference_images_and_notes_in_response_order() {
         &mut g,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("snapshot".into()),
             })],

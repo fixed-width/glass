@@ -494,7 +494,10 @@ fn set_value_tool_ok_and_errors() {
     let out = set_value(
         &mut g,
         &SetValueArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            timeout_ms: None,
+            max_nodes: None,
             text: "hello".into(),
             return_: None,
         },
@@ -506,7 +509,10 @@ fn set_value_tool_ok_and_errors() {
     let err = set_value(
         &mut g,
         &SetValueArgs {
-            id: 99,
+            id: Some(99),
+            target: None,
+            timeout_ms: None,
+            max_nodes: None,
             text: "x".into(),
             return_: None,
         },
@@ -540,7 +546,10 @@ fn set_value_tool_rejects_uneditable_and_stale() {
     let err = set_value(
         &mut g,
         &SetValueArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            timeout_ms: None,
+            max_nodes: None,
             text: "x".into(),
             return_: None,
         },
@@ -559,7 +568,10 @@ fn set_value_tool_rejects_uneditable_and_stale() {
     let err = set_value(
         &mut g,
         &SetValueArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            timeout_ms: None,
+            max_nodes: None,
             text: "x".into(),
             return_: None,
         },
@@ -587,7 +599,11 @@ fn click_element_tool_ok_and_errors() {
         click_element(
             &mut g,
             &ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: None
             }
         )
@@ -596,7 +612,11 @@ fn click_element_tool_ok_and_errors() {
     let err = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 99,
+            id: Some(99),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: None,
         },
     )
@@ -770,7 +790,11 @@ fn return_none_is_confirmation_only() {
     let out = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: None,
         },
     )
@@ -790,7 +814,11 @@ fn return_none_is_confirmation_only() {
     let out2 = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: Some("none".into()),
         },
     )
@@ -816,7 +844,11 @@ fn click_element_discloses_native_action_with_no_fallback() {
     let out = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: None,
         },
     )
@@ -849,7 +881,11 @@ fn click_element_names_the_element_it_actuated_instead() {
     let out = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: None,
         },
     )
@@ -878,7 +914,11 @@ fn click_element_omits_actuated_id_when_the_target_itself_was_clicked() {
     let out = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: None,
         },
     )
@@ -896,7 +936,11 @@ fn return_unknown_errors() {
     let err = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: Some("wat".into()),
         },
     )
@@ -910,7 +954,11 @@ fn return_snapshot_appends_tree_and_refreshes_cache() {
     let out = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: Some("snapshot".into()),
         },
     )
@@ -944,7 +992,11 @@ fn return_snapshot_appends_tree_and_refreshes_cache() {
         click_element(
             &mut g,
             &ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: None
             }
         )
@@ -976,7 +1028,11 @@ fn return_snapshot_discloses_an_unpublished_document_the_same_way_a_snapshot_doe
     let out = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: Some("snapshot".into()),
         },
     )
@@ -1034,7 +1090,11 @@ fn return_snapshot_settles_before_folding() {
     let out = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: Some("snapshot".into()),
         },
     )
@@ -1055,7 +1115,11 @@ fn return_snapshot_without_frames_propagates_settle_failure() {
     let error = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: Some("snapshot".into()),
         },
     )
@@ -1073,7 +1137,11 @@ fn return_settle_appends_settled_text() {
     let out = click_element(
         &mut g,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: Some("settle".into()),
         },
     )
@@ -1094,7 +1162,10 @@ fn set_value_return_snapshot() {
     let out = set_value(
         &mut g,
         &SetValueArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            timeout_ms: None,
+            max_nodes: None,
             text: "x".into(),
             return_: Some("snapshot".into()),
         },
@@ -1116,7 +1187,10 @@ fn set_value_return_settle_folds_into_observed() {
     let out = set_value(
         &mut g,
         &SetValueArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            timeout_ms: None,
+            max_nodes: None,
             text: "x".into(),
             return_: Some("settle".into()),
         },
@@ -1140,6 +1214,10 @@ fn type_return_settle_folds_into_observed() {
     let out = type_text(
         &mut g,
         &TypeArgs {
+            target: None,
+            focus_mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             text: "hi".into(),
             return_: Some("settle".into()),
         },
@@ -1160,6 +1238,10 @@ fn type_return_snapshot_appends_outline() {
     let out = type_text(
         &mut g,
         &TypeArgs {
+            target: None,
+            focus_mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             text: "x".into(),
             return_: Some("snapshot".into()),
         },
@@ -1180,7 +1262,11 @@ fn type_return_snapshot_appends_outline() {
         click_element(
             &mut g,
             &ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: None
             }
         )
@@ -1209,6 +1295,10 @@ fn type_unknown_return_rejected_before_any_keystroke() {
     let err = type_text(
         &mut g,
         &TypeArgs {
+            target: None,
+            focus_mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             text: "x".into(),
             return_: Some("bogus".into()),
         },
@@ -1244,6 +1334,10 @@ fn type_observe_failure_says_text_was_typed() {
     let err = type_text(
         &mut g,
         &TypeArgs {
+            target: None,
+            focus_mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             text: "hi".into(),
             return_: Some("snapshot".into()),
         },
@@ -1365,7 +1459,11 @@ fn production_application_text_conduits_have_explicit_trust_roles() {
     let automatic = click_element(
         &mut semantic,
         &ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: Some("snapshot".into()),
         },
     )
@@ -1449,7 +1547,11 @@ fn production_application_text_conduits_have_explicit_trust_roles() {
         &mut failed,
         &DoArgs {
             actions: vec![Action::ClickElement(ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: None,
             })],
             then: None,

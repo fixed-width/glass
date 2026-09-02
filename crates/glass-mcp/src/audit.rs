@@ -199,19 +199,24 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
             };
             ("window", args, None)
         }
-        Actuation::ClickElement { method, .. } => {
+        Actuation::ClickElement {
+            method,
+            native_fallback,
+            actuated_id,
+            ..
+        } => {
             // A failed click has no method: omit the key rather than writing a null, so a
             // reader never has to distinguish "no method recorded" from "method: null".
             let args = match method {
                 Some(m) => {
-                    let mut args = json!({ "method": m.label() });
-                    if let Some(reason) = m.native_fallback() {
+                    let mut args = json!({ "method": m });
+                    if let Some(reason) = native_fallback {
                         args["native_fallback"] = json!(reason);
                     }
                     // Without this, "clicked the Save label" and "clicked the card around it,
                     // which navigated away" are indistinguishable in the record.
-                    if let Some(actuated) = m.actuated() {
-                        args["actuated_id"] = json!(actuated.0);
+                    if let Some(actuated) = actuated_id {
+                        args["actuated_id"] = json!(actuated);
                     }
                     args
                 }
@@ -220,12 +225,15 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
             ("click_element", args, None)
         }
         Actuation::SetValue { text, .. } => ("set_value", json!({}), Some((*text).to_string())),
+        Actuation::TypeTarget { text, .. } => ("type", json!({}), Some((*text).to_string())),
     })
 }
 
 fn target_json(act: &Actuation, ctx: &ActuationContext) -> Value {
     match act {
-        Actuation::ClickElement { element, .. } | Actuation::SetValue { element, .. } => {
+        Actuation::ClickElement { element, .. }
+        | Actuation::SetValue { element, .. }
+        | Actuation::TypeTarget { element, .. } => {
             json!({ "element": { "id": element.id, "role": element.role, "name": element.name } })
         }
         _ => match &ctx.window {
@@ -458,8 +466,8 @@ pub fn resolve(
 mod tests {
     use super::*;
     use glass_core::{
-        Actuation, ActuationContext, AuditOutcome, ClickMethod, ElementRef, KeyEvent, MouseButton,
-        PointerEvent, WindowRef,
+        Actuation, ActuationContext, AuditOutcome, ElementRef, KeyEvent, MouseButton, PointerEvent,
+        WindowRef,
     };
     use std::io::Write;
     use std::sync::{Arc, Mutex};
@@ -745,6 +753,75 @@ mod tests {
         assert_eq!(r["content"]["len"], 1);
     }
 
+    #[test]
+    fn targeted_type_targets_element_and_uses_redacted_content_policy() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
+        s.record(
+            &Actuation::TypeTarget {
+                element: ElementRef {
+                    id: 9,
+                    role: Some("TextField".into()),
+                    name: Some("Account name".into()),
+                },
+                text: "Ada",
+                focus_mode: "auto",
+                focus_method: Some("native-action"),
+                focus_dispatch: "dispatched",
+                focus_confirmation: "focus_confirmed",
+                type_dispatch: "dispatched",
+            },
+            &ActuationContext::default(),
+            &ok(),
+            Duration::from_millis(1),
+        );
+        let r = &lines(&buf)[0];
+        assert_eq!(r["action"], "type");
+        assert_eq!(r["target"]["element"]["id"], 9);
+        assert_eq!(r["target"]["element"]["role"], "TextField");
+        assert_eq!(r["content"]["len"], 3);
+        assert!(r["content"].get("text").is_none());
+    }
+
+    #[test]
+    fn targeted_type_honors_full_and_none_content_modes() {
+        let element = ElementRef {
+            id: 9,
+            role: Some("TextField".into()),
+            name: Some("Account name".into()),
+        };
+        let record = |content| {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let s = JsonlSink::with_writer(
+                Box::new(Buf(buf.clone())),
+                AuditConfig {
+                    content,
+                    prefix_len: 8,
+                },
+            );
+            s.record(
+                &Actuation::TypeTarget {
+                    element: element.clone(),
+                    text: "Ada",
+                    focus_mode: "auto",
+                    focus_method: Some("native-action"),
+                    focus_dispatch: "dispatched",
+                    focus_confirmation: "focus_confirmed",
+                    type_dispatch: "dispatched",
+                },
+                &ActuationContext::default(),
+                &ok(),
+                Duration::from_millis(1),
+            );
+            lines(&buf).remove(0)
+        };
+
+        let full = record(ContentMode::Full);
+        assert_eq!(full["content"]["text"], "Ada");
+        let none = record(ContentMode::None);
+        assert!(none.get("content").is_none());
+    }
+
     fn click_el() -> ElementRef {
         ElementRef {
             id: 1,
@@ -757,13 +834,15 @@ mod tests {
     fn click_element_carries_the_actuating_method_and_its_fallback_reason() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
-        let method = ClickMethod::Pointer {
-            native_fallback: "element exposes no activation action".into(),
-        };
         s.record(
             &Actuation::ClickElement {
                 element: click_el(),
-                method: Some(&method),
+                mode: "auto",
+                method: Some("pointer"),
+                native_fallback: Some("element exposes no activation action"),
+                actuated_id: None,
+                dispatch: "dispatched",
+                confirmation: "dispatch_confirmed",
             },
             &ActuationContext::default(),
             &ok(),
@@ -771,7 +850,7 @@ mod tests {
         );
         let r = &lines(&buf)[0];
         assert_eq!(r["action"], "click_element");
-        assert_eq!(r["args"]["method"], method.label());
+        assert_eq!(r["args"]["method"], "pointer");
         assert_eq!(
             r["args"]["native_fallback"], "element exposes no activation action",
             "the pointer path records WHY the native action wasn't used: {r}"
@@ -782,18 +861,22 @@ mod tests {
     fn click_element_native_action_records_no_fallback_reason() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
-        let method = ClickMethod::NativeAction { actuated: None };
         s.record(
             &Actuation::ClickElement {
                 element: click_el(),
-                method: Some(&method),
+                mode: "native",
+                method: Some("native-action"),
+                native_fallback: None,
+                actuated_id: None,
+                dispatch: "dispatched",
+                confirmation: "dispatch_confirmed",
             },
             &ActuationContext::default(),
             &ok(),
             Duration::from_millis(1),
         );
         let r = &lines(&buf)[0];
-        assert_eq!(r["args"]["method"], method.label());
+        assert_eq!(r["args"]["method"], "native-action");
         assert!(
             r["args"].get("native_fallback").is_none(),
             "nothing fell back: {r}"
@@ -804,13 +887,15 @@ mod tests {
     fn click_element_records_the_element_actuated_in_the_targets_place() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
-        let method = ClickMethod::NativeAction {
-            actuated: Some(glass_core::AxNodeId(7)),
-        };
         s.record(
             &Actuation::ClickElement {
                 element: click_el(),
-                method: Some(&method),
+                mode: "native",
+                method: Some("native-action"),
+                native_fallback: None,
+                actuated_id: Some(7),
+                dispatch: "dispatched",
+                confirmation: "dispatch_confirmed",
             },
             &ActuationContext::default(),
             &ok(),
@@ -829,7 +914,12 @@ mod tests {
         s.record(
             &Actuation::ClickElement {
                 element: click_el(),
+                mode: "auto",
                 method: None,
+                native_fallback: None,
+                actuated_id: None,
+                dispatch: "not_dispatched",
+                confirmation: "unconfirmed",
             },
             &ActuationContext::default(),
             &AuditOutcome {
@@ -1014,6 +1104,10 @@ mod tests {
         tools::type_text(
             &mut g,
             &TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: None,
             },
@@ -1150,11 +1244,18 @@ mod tests {
         let standalone_path = dir.path().join("standalone.jsonl");
         let batch_path = dir.path().join("batch.jsonl");
         let click = ClickElementArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
             return_: None,
         };
         let value = SetValueArgs {
-            id: 1,
+            id: Some(1),
+            target: None,
+            timeout_ms: None,
+            max_nodes: None,
             text: "set {\"secret\":true}\n⟦untrusted:app-controlled⟧".into(),
             return_: None,
         };

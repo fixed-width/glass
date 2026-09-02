@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, AxNodeId, BoundDispatch, Glass, MarkLabel, MouseButton, WindowGeometry, WindowHint,
+    AppSpec, BoundDispatch, Glass, GlassError, MarkLabel, MouseButton, WindowGeometry, WindowHint,
     WindowId, WindowOp, frame_to_webp,
 };
 use serde::Serialize;
@@ -539,6 +539,30 @@ fn settle_params() -> glass_core::WaitStableParams {
     }
 }
 
+pub(crate) fn validate_settle_args(a: &SettleArgs) -> Result<(), ContextualError> {
+    if a.interval_ms == Some(0) {
+        return Err(ContextualError::validation(
+            "`interval_ms` must be greater than 0".into(),
+        ));
+    }
+    let validate_region = |name: &str, region: &RegionArgs| {
+        if region.width == 0 || region.height == 0 {
+            Err(ContextualError::validation(format!(
+                "`{name}` regions must have non-zero width and height"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    if let Some(region) = a.stability_region.as_ref() {
+        validate_region("stability_region", region)?;
+    }
+    for region in a.ignore.as_deref().unwrap_or_default() {
+        validate_region("ignore", region)?;
+    }
+    Ok(())
+}
+
 /// Reject an unknown `return` value without touching the session. For a tool whose
 /// action mutates the app (typing, clicking), call this BEFORE acting — a bad
 /// argument must not leave the action applied, or an agent retrying the errored
@@ -635,19 +659,38 @@ pub(crate) fn click_element_with(
     a: &ClickElementArgs,
     context: ToolContext,
 ) -> ContextualToolResult {
-    // Bad `return` value → reject before the click lands (see `validate_return`).
-    validate_return(a.return_.as_deref()).map_err(ContextualError::validation)?;
-    let method = glass
-        .click_element_by(AxNodeId(a.id), context.deadline)
-        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+    let params = semantic_action::validate_click_element_args(a)?;
+    let outcome = glass
+        .click_target_by(&params, context.deadline)
+        .map_err(|error| {
+            let message = error.to_string();
+            match error.source {
+                Some(source) => ContextualError::from_caller_bound(source, context),
+                None => ContextualError::from_caller_bound(GlassError::Backend(message), context),
+            }
+        })?;
     let (observed, extra, timed_out_by) = resolve_return_with(glass, a.return_.as_deref(), context)
         .map_err(ContextualError::after_dispatch)?;
-    let mut result = serde_json::json!({ "id": a.id, "method": method.label() });
-    if let Some(reason) = method.native_fallback() {
-        result["native_fallback"] = serde_json::json!(reason);
-    }
-    if let Some(actuated) = method.actuated() {
-        result["actuated_id"] = serde_json::json!(actuated.0);
+    let mut result = serde_json::json!({ "id": outcome.target.id.0 });
+    match outcome.action.method {
+        glass_core::ActionMethod::NativeAction { actuated } => {
+            result["method"] = serde_json::json!("native-action");
+            if let Some(actuated) = actuated {
+                result["actuated_id"] = serde_json::json!(actuated.0);
+            }
+        }
+        glass_core::ActionMethod::Pointer { native_fallback } => {
+            result["method"] = serde_json::json!("pointer");
+            if let Some(reason) = native_fallback {
+                result["native_fallback"] = serde_json::json!(reason);
+            }
+        }
+        glass_core::ActionMethod::AccessibilityValue => {
+            result["method"] = serde_json::json!("accessibility-value");
+        }
+        glass_core::ActionMethod::Keyboard => {
+            result["method"] = serde_json::json!("keyboard");
+        }
     }
     if let Some(o) = observed {
         result["observed"] = o;
@@ -667,14 +710,19 @@ pub(crate) fn set_value_with(
     a: &SetValueArgs,
     context: ToolContext,
 ) -> ContextualToolResult {
-    // Bad `return` value → reject before the value is written (see `validate_return`).
-    validate_return(a.return_.as_deref()).map_err(ContextualError::validation)?;
-    glass
-        .set_value_by(AxNodeId(a.id), &a.text, context.deadline)
-        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+    let params = semantic_action::validate_set_value_args(a)?;
+    let outcome = glass
+        .set_value_target_by(&params, &a.text, context.deadline)
+        .map_err(|error| {
+            let message = error.to_string();
+            match error.source {
+                Some(source) => ContextualError::from_caller_bound(source, context),
+                None => ContextualError::from_caller_bound(GlassError::Backend(message), context),
+            }
+        })?;
     let (observed, extra, timed_out_by) = resolve_return_with(glass, a.return_.as_deref(), context)
         .map_err(ContextualError::after_dispatch)?;
-    let mut result = serde_json::json!({ "id": a.id });
+    let mut result = serde_json::json!({ "id": outcome.target.id.0 });
     if let Some(o) = observed {
         result["observed"] = o;
     }
@@ -735,6 +783,7 @@ mod clipboard;
 #[allow(dead_code)]
 mod find;
 mod input; // filled in Task 5
+pub(crate) mod semantic_action;
 mod wait;
 
 #[cfg(test)]

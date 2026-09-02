@@ -1,10 +1,10 @@
 use glass_core::{
     AxRole, FindElementsParams, Glass, MatchField, MatchTier, ScopeResolution, SemanticMatch,
-    SemanticQuery, SemanticSelector, SemanticState,
+    SemanticQuery, SemanticSelector, SemanticState, SemanticTarget,
 };
 use serde_json::{Value, json};
 
-use crate::params::{FindElementsArgs, FindSelectorArgs};
+use crate::params::{ActionTargetArgs, FindElementsArgs, FindSelectorArgs};
 use crate::tools::{OutContent, ToolOutput, ToolResult};
 
 const DEFAULT_MAX_RESULTS: usize = 10;
@@ -42,7 +42,7 @@ pub fn find_elements(glass: &mut Glass, a: &FindElementsArgs) -> ToolResult {
         return Err(bounded_error("max_results must be between 1 and 20"));
     }
 
-    let target = selector(a.query.clone(), a.role.as_deref(), a.states.as_deref())?;
+    let target = semantic_selector(a.query.clone(), a.role.as_deref(), a.states.as_deref())?;
     let within = a.within.as_ref().map(selector_args).transpose()?;
     let query = SemanticQuery::new(target, within, max_results as usize)
         .map_err(|error| bounded_error(error.to_string()))?;
@@ -89,14 +89,14 @@ pub fn find_elements(glass: &mut Glass, a: &FindElementsArgs) -> ToolResult {
 }
 
 fn selector_args(args: &FindSelectorArgs) -> Result<SemanticSelector, String> {
-    selector(
+    semantic_selector(
         args.query.clone(),
         args.role.as_deref(),
         args.states.as_deref(),
     )
 }
 
-fn selector(
+pub(crate) fn semantic_selector(
     query: Option<String>,
     role: Option<&str>,
     states: Option<&[String]>,
@@ -117,6 +117,28 @@ fn selector(
         })
         .collect::<Result<Vec<_>, _>>()?;
     SemanticSelector::new(query, role, states).map_err(|error| bounded_error(error.to_string()))
+}
+
+pub(crate) fn semantic_target(args: &ActionTargetArgs) -> Result<SemanticTarget, String> {
+    let within = args
+        .within
+        .as_ref()
+        .map(|scope| {
+            semantic_selector(
+                scope.query.clone(),
+                scope.role.as_deref(),
+                scope.states.as_deref(),
+            )
+        })
+        .transpose()?;
+    Ok(SemanticTarget {
+        target: semantic_selector(
+            args.query.clone(),
+            args.role.as_deref(),
+            args.states.as_deref(),
+        )?,
+        within,
+    })
 }
 
 fn render_match(matched: &SemanticMatch) -> RenderedMatch {

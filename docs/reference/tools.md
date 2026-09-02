@@ -401,6 +401,14 @@ Click at window-relative coordinates.
 Type a string into the focused window.
 
 - `text` (string, **required**).
+- `target` (object) — optional semantic target with `query`, `role`, `states`, and an optional
+  non-recursive `within` scope using `query`, `role`, and `states`.
+- `focus_mode` (string) — `"auto"` (default), `"native"`, or `"pointer"`; accepted only with
+  `target`.
+- `timeout_ms` (integer, range 0–120000, default 10000) — semantic-target deadline; accepted only
+  with `target`.
+- `max_nodes` (integer) — accessibility walk limit for semantic-target resolution; accepted only
+  with `target`.
 - `return` (string) — `"snapshot"`, `"settle"`, or `"none"` (default), as for
   `glass_click_element`. All three values are also accepted inside a `glass_do` `type` action;
   the chosen observation is retained in that action step's `result` and sibling `content_blocks`.
@@ -719,7 +727,14 @@ Address an element by its `#id`. Glass tries the platform's role-appropriate nat
 operation first, falling back to a synthetic pointer click at the center of the element's bounds.
 For a text editor, the native operation may focus and confirm focus rather than activate it.
 
-- `id` (integer, **required**) — the `#id` from the latest snapshot.
+- `id` (integer) — the `#id` from the latest snapshot. Supply exactly one of `id` or `target`.
+- `target` (object) — semantic target with `query`, `role`, `states`, and an optional non-recursive
+  `within` scope using `query`, `role`, and `states`. Supply exactly one of `id` or `target`.
+- `mode` (string) — `"auto"` (default), `"native"`, or `"pointer"`.
+- `timeout_ms` (integer, range 0–120000, default 10000) — semantic-target deadline; accepted only
+  with `target`.
+- `max_nodes` (integer) — accessibility walk limit for semantic-target resolution; accepted only
+  with `target`.
 - `return` (string) — `"snapshot"` appends a fresh a11y outline as an untrusted sibling block (and
   refreshes the id cache), `"settle"` folds settle metadata into `result.observed`, or `"none"`
   (default) adds nothing.
@@ -766,8 +781,14 @@ fixes it. Clearing a field (`text: ""`) additionally needs the element to have a
 field is not by itself evidence the clear landed on the element you meant, so a nameless one reports
 unconfirmed rather than a success it cannot prove.
 
-- `id` (integer, **required**) — the element's `#id`.
+- `id` (integer) — the element's `#id`. Supply exactly one of `id` or `target`.
+- `target` (object) — semantic target with `query`, `role`, `states`, and an optional non-recursive
+  `within` scope using `query`, `role`, and `states`. Supply exactly one of `id` or `target`.
 - `text` (string, **required**) — the value to set.
+- `timeout_ms` (integer, range 0–120000, default 10000) — semantic-target deadline; accepted only
+  with `target`.
+- `max_nodes` (integer) — accessibility walk limit for semantic-target resolution; accepted only
+  with `target`.
 - `return` (string) — `"snapshot"`, `"settle"`, or `"none"` (default), as for `glass_click_element`.
 
 Returns `{id}` plus `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`, exactly

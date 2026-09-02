@@ -31,15 +31,9 @@ fn standalone_scroll_to_element(result: ContextualToolResult) -> ToolResult {
     })
 }
 
-pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult {
-    standalone(wait_for_element_with(glass, a, ToolContext::UNBOUNDED))
-}
-
-pub(crate) fn wait_for_element_with(
-    glass: &mut Glass,
+pub(crate) fn validate_wait_for_element_args(
     a: &WaitForElementArgs,
-    context: ToolContext,
-) -> ContextualToolResult {
+) -> Result<(Option<AxRole>, ElementCondition), ContextualError> {
     if a.name.is_none() && a.description.is_none() && a.role.is_none() {
         return Err(ContextualError::validation(
             "specify `name`, `description`, and/or `role` to select an element".into(),
@@ -49,17 +43,70 @@ pub(crate) fn wait_for_element_with(
         return Err(ContextualError::validation("specify `value` for exact matching or `value_contains` for substring matching, not both".into()));
     }
     let role = match a.role.as_deref() {
-        Some(r) => Some(
-            AxRole::from_name(r)
-                .ok_or_else(|| ContextualError::validation(format!("unknown role '{r}'")))?,
+        Some(role) => Some(
+            AxRole::from_name(role)
+                .ok_or_else(|| ContextualError::validation(format!("unknown role '{role}'")))?,
         ),
         None => None,
     };
     let condition = match a.condition.as_deref() {
         None => ElementCondition::Appears,
-        Some(c) => ElementCondition::from_name(c)
-            .ok_or_else(|| ContextualError::validation(format!("unknown condition '{c}' (appears/disappears/enabled/disabled/checked/unchecked/selected/unselected/expanded/collapsed/focused/visible/hidden)")))?,
+        Some(condition) => ElementCondition::from_name(condition).ok_or_else(|| {
+            ContextualError::validation(format!(
+                "unknown condition '{condition}' (appears/disappears/enabled/disabled/checked/unchecked/selected/unselected/expanded/collapsed/focused/visible/hidden)"
+            ))
+        })?,
     };
+    Ok((role, condition))
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn validate_scroll_to_element_args(
+    a: &ScrollToElementArgs,
+) -> Result<(Option<AxRole>, Option<ScrollDirection>, Option<(i32, i32)>), ContextualError> {
+    if a.name.is_none() && a.description.is_none() && a.role.is_none() {
+        return Err(ContextualError::validation(
+            "specify `name`, `description`, and/or `role` to select the element to scroll to"
+                .into(),
+        ));
+    }
+    let role = match a.role.as_deref() {
+        Some(role) => Some(
+            AxRole::from_name(role)
+                .ok_or_else(|| ContextualError::validation(format!("unknown role '{role}'")))?,
+        ),
+        None => None,
+    };
+    let direction = match a.direction.as_deref() {
+        None => None,
+        Some(direction) => Some(ScrollDirection::from_name(direction).ok_or_else(|| {
+            ContextualError::validation(format!(
+                "unknown direction '{direction}' (use up/down/left/right)"
+            ))
+        })?),
+    };
+    let anchor = match (a.x, a.y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        (None, None) => None,
+        _ => {
+            return Err(ContextualError::validation(
+                "specify both `x` and `y` for a scroll anchor, or neither".into(),
+            ));
+        }
+    };
+    Ok((role, direction, anchor))
+}
+
+pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult {
+    standalone(wait_for_element_with(glass, a, ToolContext::UNBOUNDED))
+}
+
+pub(crate) fn wait_for_element_with(
+    glass: &mut Glass,
+    a: &WaitForElementArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
+    let (role, condition) = validate_wait_for_element_args(a)?;
     let params = WaitElementParams {
         name: a.name.clone(),
         description: a.description.clone(),
@@ -116,37 +163,7 @@ pub(crate) fn scroll_to_element_with(
     a: &ScrollToElementArgs,
     context: ToolContext,
 ) -> ContextualToolResult {
-    if a.name.is_none() && a.description.is_none() && a.role.is_none() {
-        return Err(ContextualError::validation(
-            "specify `name`, `description`, and/or `role` to select the element to scroll to"
-                .into(),
-        ));
-    }
-    let role = match a.role.as_deref() {
-        Some(r) => Some(
-            AxRole::from_name(r)
-                .ok_or_else(|| ContextualError::validation(format!("unknown role '{r}'")))?,
-        ),
-        None => None,
-    };
-    let direction = match a.direction.as_deref() {
-        None => None,
-        Some(d) => Some(ScrollDirection::from_name(d).ok_or_else(|| {
-            ContextualError::validation(format!("unknown direction '{d}' (use up/down/left/right)"))
-        })?),
-    };
-    // Anchor: both x and y, or neither (default: the target's own row/column). One
-    // without the other is a caller mistake worth naming rather than silently
-    // half-defaulting.
-    let anchor = match (a.x, a.y) {
-        (Some(x), Some(y)) => Some((x, y)),
-        (None, None) => None,
-        _ => {
-            return Err(ContextualError::validation(
-                "specify both `x` and `y` for a scroll anchor, or neither".into(),
-            ));
-        }
-    };
+    let (role, direction, anchor) = validate_scroll_to_element_args(a)?;
     let params = ScrollToElementParams {
         name: a.name.clone(),
         description: a.description.clone(),
