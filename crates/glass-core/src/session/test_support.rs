@@ -701,8 +701,10 @@ pub(crate) struct FakeAccessibility {
     coverage: AxStateCoverage,
     focus_behavior: InvokeBehavior,
     hit: PointerHit,
+    hit_error: bool,
     focus_calls: Arc<AtomicUsize>,
     hit_calls: Arc<AtomicUsize>,
+    hit_points: Arc<Mutex<Vec<(i32, i32)>>>,
 }
 
 #[allow(dead_code)]
@@ -718,8 +720,10 @@ impl FakeAccessibility {
             coverage: AxStateCoverage::NONE,
             focus_behavior: InvokeBehavior::Unsupported,
             hit: PointerHit::Inconclusive,
+            hit_error: false,
             focus_calls: Arc::new(AtomicUsize::new(0)),
             hit_calls: Arc::new(AtomicUsize::new(0)),
+            hit_points: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -738,6 +742,11 @@ impl FakeAccessibility {
         self
     }
 
+    pub(crate) fn with_hit_error(mut self) -> Self {
+        self.hit_error = true;
+        self
+    }
+
     pub(crate) fn with_focus_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
         self.focus_calls = calls;
         self
@@ -745,6 +754,11 @@ impl FakeAccessibility {
 
     pub(crate) fn with_hit_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
         self.hit_calls = calls;
+        self
+    }
+
+    pub(crate) fn with_hit_points(mut self, points: Arc<Mutex<Vec<(i32, i32)>>>) -> Self {
+        self.hit_points = points;
         self
     }
 }
@@ -772,10 +786,16 @@ impl Accessibility for FakeAccessibility {
         &mut self,
         ctx: &AxContext,
         _target: &AxTarget,
-        _point: (i32, i32),
+        point: (i32, i32),
     ) -> Result<PointerHit> {
         *self.ctx_log.lock().unwrap() = Some(ctx.clone());
         self.hit_calls.fetch_add(1, Ordering::Relaxed);
+        self.hit_points.lock().unwrap().push(point);
+        if self.hit_error {
+            return Err(GlassError::AccessibilityUnavailable(
+                "scripted pointer hit probe failure".into(),
+            ));
+        }
         Ok(self.hit)
     }
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -985,8 +1005,10 @@ pub(crate) struct SeqAccessibility {
     coverage: AxStateCoverage,
     focus_behavior: InvokeBehavior,
     hit: PointerHit,
+    hit_error: bool,
     focus_calls: Arc<AtomicUsize>,
     hit_calls: Arc<AtomicUsize>,
+    hit_points: Arc<Mutex<Vec<(i32, i32)>>>,
 }
 
 #[allow(dead_code)]
@@ -1009,8 +1031,10 @@ impl SeqAccessibility {
             coverage: AxStateCoverage::NONE,
             focus_behavior: InvokeBehavior::Unsupported,
             hit: PointerHit::Inconclusive,
+            hit_error: false,
             focus_calls: Arc::new(AtomicUsize::new(0)),
             hit_calls: Arc::new(AtomicUsize::new(0)),
+            hit_points: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1029,6 +1053,11 @@ impl SeqAccessibility {
         self
     }
 
+    pub(crate) fn with_hit_error(mut self) -> Self {
+        self.hit_error = true;
+        self
+    }
+
     pub(crate) fn with_focus_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
         self.focus_calls = calls;
         self
@@ -1036,6 +1065,11 @@ impl SeqAccessibility {
 
     pub(crate) fn with_hit_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
         self.hit_calls = calls;
+        self
+    }
+
+    pub(crate) fn with_hit_points(mut self, points: Arc<Mutex<Vec<(i32, i32)>>>) -> Self {
+        self.hit_points = points;
         self
     }
 
@@ -1088,10 +1122,16 @@ impl Accessibility for SeqAccessibility {
         &mut self,
         ctx: &AxContext,
         _target: &AxTarget,
-        _point: (i32, i32),
+        point: (i32, i32),
     ) -> Result<PointerHit> {
         self.deadlines.lock().unwrap().push(ctx.deadline);
         self.hit_calls.fetch_add(1, Ordering::Relaxed);
+        self.hit_points.lock().unwrap().push(point);
+        if self.hit_error {
+            return Err(GlassError::AccessibilityUnavailable(
+                "scripted pointer hit probe failure".into(),
+            ));
+        }
         Ok(self.hit)
     }
     fn set_value(&mut self, ctx: &AxContext, _t: &AxTarget, _s: &str) -> Result<()> {

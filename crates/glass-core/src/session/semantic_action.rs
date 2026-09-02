@@ -270,6 +270,64 @@ struct ResolutionObservation {
     eligible: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SemanticIdentity {
+    role: AxRole,
+    name: Option<String>,
+    description: Option<String>,
+}
+
+impl From<&ElementInfo> for SemanticIdentity {
+    fn from(element: &ElementInfo) -> Self {
+        Self {
+            role: element.role,
+            name: element.name.clone(),
+            description: element.description.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StabilitySample {
+    observed_at: std::time::Instant,
+    identity: SemanticIdentity,
+    bounds: AxRect,
+    pointer: PlannedPointerInput,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PlannedPointerInput {
+    Click {
+        point: (i32, i32),
+    },
+    TrailingToggle {
+        segment: crate::Segment,
+        probe_point: (i32, i32),
+    },
+}
+
+#[derive(Clone, Debug)]
+struct PointerCandidate {
+    element: ElementInfo,
+    target: AxTarget,
+    plan: PlannedPointerInput,
+}
+
+#[derive(Debug)]
+struct PointerResolutionObservation {
+    resolution: ResolutionObservation,
+    candidate: Option<PointerCandidate>,
+    stable: bool,
+}
+
+#[derive(Debug)]
+struct ResolvedPointerTarget {
+    candidate: PointerCandidate,
+    resolution: ResolutionReport,
+    coverage: AxStateCoverage,
+    bound: ActionDeadline,
+}
+
 fn empty_error(
     kind: SemanticActionFailureKind,
     summary: &'static str,
@@ -456,6 +514,122 @@ fn source_error(source: GlassError, bound: ActionDeadline) -> SemanticActionErro
     )
 }
 
+fn pointer_plan(
+    element: &ElementInfo,
+    window: (u32, u32),
+    trailing_toggle_backend: bool,
+) -> Option<PlannedPointerInput> {
+    const ROW_ASPECT: u32 = 4;
+    let bounds = element.bounds?;
+    if element.states.checkable
+        && trailing_toggle_backend
+        && bounds.width > bounds.height.saturating_mul(ROW_ASPECT)
+    {
+        let segment = bounds.trailing_toggle_swipe(window.0, window.1)?;
+        let probe_point = (
+            (segment.from_x + segment.to_x) / 2,
+            (segment.from_y + segment.to_y) / 2,
+        );
+        Some(PlannedPointerInput::TrailingToggle {
+            segment,
+            probe_point,
+        })
+    } else {
+        Some(PlannedPointerInput::Click {
+            point: bounds.clamped_center(window.0, window.1)?,
+        })
+    }
+}
+
+fn ax_target(element: &ElementInfo) -> AxTarget {
+    AxTarget {
+        id: element.id,
+        role: element.role,
+        name: element.name.clone(),
+        bounds: element.bounds,
+        value: element.value.clone(),
+    }
+}
+
+fn actionability_error(
+    kind: SemanticActionFailureKind,
+    summary: &'static str,
+    resolution: Option<ResolutionReport>,
+    actionability: ActionabilityReport,
+    bound: ActionDeadline,
+    retry: RetryGuidance,
+    source: Option<GlassError>,
+    dispatch: DispatchStatus,
+) -> SemanticActionError {
+    SemanticActionError {
+        kind,
+        summary,
+        resolution,
+        actionability,
+        focus: None,
+        action_dispatch: dispatch,
+        candidates: Vec::new(),
+        bound,
+        retry,
+        source,
+    }
+}
+
+fn action_source_error(
+    source: GlassError,
+    resolution: Option<ResolutionReport>,
+    actionability: ActionabilityReport,
+    bound: ActionDeadline,
+    dispatch_started: bool,
+) -> SemanticActionError {
+    let proves_not_dispatched = !dispatch_started
+        || source.invoke_fallback_eligible()
+        || source.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched)
+        || matches!(
+            &source,
+            GlassError::NoAxSnapshot
+                | GlassError::AxElementNotFound(_)
+                | GlassError::AxElementNotClickable(_)
+                | GlassError::AxElementInUnmappedPopover(_)
+                | GlassError::WindowNotFound
+        );
+    let mut error = source_error(source, bound);
+    error.summary = "semantic action failed";
+    error.resolution = resolution;
+    error.actionability = actionability;
+    error.action_dispatch = if proves_not_dispatched {
+        DispatchStatus::NotDispatched
+    } else if dispatch_started {
+        error
+            .source
+            .as_ref()
+            .and_then(GlassError::bound_dispatch)
+            .map_or(
+                DispatchStatus::MayHaveDispatched,
+                |dispatch| match dispatch {
+                    crate::BoundDispatch::NotDispatched => DispatchStatus::NotDispatched,
+                    crate::BoundDispatch::MayHaveDispatched => DispatchStatus::MayHaveDispatched,
+                },
+            )
+    } else {
+        unreachable!("non-dispatching failures are classified above")
+    };
+    if dispatch_started && error.action_dispatch != DispatchStatus::NotDispatched {
+        error.retry = RetryGuidance::DoNotRetry;
+    }
+    error
+}
+
+fn native_fallback_reason(source: &GlassError) -> String {
+    match source {
+        GlassError::AxUnsupported => "native accessibility action is unsupported".into(),
+        GlassError::AxActionUnavailable(_) => {
+            "target exposes no native accessibility action".into()
+        }
+        _ => "native accessibility action did not dispatch".into(),
+    }
+}
+
 impl Glass {
     pub(super) fn resolve_semantic_target(
         &mut self,
@@ -471,6 +645,23 @@ impl Glass {
             max_nodes,
             sequence_deadline,
         )?;
+        self.resolve_semantic_target_by_bound(
+            target,
+            max_nodes,
+            sequence_deadline,
+            bound,
+            eligibility,
+        )
+    }
+
+    fn resolve_semantic_target_by_bound(
+        &mut self,
+        target: &SemanticTarget,
+        max_nodes: Option<usize>,
+        sequence_deadline: Deadline,
+        bound: ActionDeadline,
+        eligibility: impl Fn(&ElementInfo, AxStateCoverage) -> bool,
+    ) -> std::result::Result<ResolvedSemanticTarget, SemanticActionError> {
         let coverage = {
             let active = self
                 .active_mut()
@@ -555,6 +746,644 @@ impl Glass {
             coverage,
             bound,
         })
+    }
+
+    fn resolve_stable_pointer_target(
+        &mut self,
+        target: &SemanticTarget,
+        max_nodes: Option<usize>,
+        sequence_deadline: Deadline,
+        bound: ActionDeadline,
+    ) -> std::result::Result<ResolvedPointerTarget, SemanticActionError> {
+        let coverage = {
+            let active = self
+                .active_mut()
+                .map_err(|source| source_error(source, bound))?;
+            active
+                .accessibility
+                .as_ref()
+                .ok_or_else(|| source_error(GlassError::AxUnsupported, bound))?
+                .state_coverage()
+        };
+        if !target.uncovered_states(coverage).is_empty() {
+            return Err(empty_error(
+                SemanticActionFailureKind::UnprovenSelectorState,
+                "accessibility backend cannot prove a requested selector state",
+                bound,
+                RetryGuidance::CorrectRequest,
+                None,
+            ));
+        }
+        self.set_a11y_limits(max_nodes)
+            .map_err(|source| source_error(source, bound))?;
+        let query = SemanticQuery::new(
+            target.target.clone(),
+            target.within.clone(),
+            SEMANTIC_ACTION_CANDIDATE_LIMIT,
+        )
+        .expect("the fixed candidate limit is valid");
+        let (window, trailing_toggle_backend) = {
+            let active = self
+                .active
+                .as_ref()
+                .ok_or_else(|| source_error(GlassError::NoActiveSession, bound))?;
+            (
+                (active.geometry.width, active.geometry.height),
+                active.platform.a11y_toggle_control_at_trailing_edge(),
+            )
+        };
+        let mut sample: Option<StabilitySample> = None;
+        let poll = self
+            .poll_accessibility_until_by_deadline(
+                SEMANTIC_ACTION_STABILITY_MS,
+                std::time::Duration::from_millis(SEMANTIC_ACTION_STABILITY_MS),
+                bound.deadline,
+                bound.owner.unwrap_or(Whose::Callee),
+                bound.allow_wait,
+                sequence_deadline,
+                "stabilize semantic pointer target",
+                |tree| {
+                    let result = tree.semantic_query(&query);
+                    let complete_unique = matches!(
+                        result.scope,
+                        ScopeResolution::Unscoped | ScopeResolution::Resolved(_)
+                    ) && result.matches_in_walk == 1
+                        && result.search_complete
+                        && result.matches.len() == 1;
+                    let candidate = complete_unique
+                        .then(|| {
+                            let element = result.matches[0].element.clone();
+                            let plan = pointer_plan(&element, window, trailing_toggle_backend)?;
+                            let report = ActionabilityReport::evaluate_click(
+                                &element,
+                                coverage,
+                                Some(true),
+                                window,
+                                crate::PointerHit::Inconclusive,
+                                false,
+                                true,
+                            );
+                            report.blocking().is_none().then(|| PointerCandidate {
+                                target: ax_target(&element),
+                                element,
+                                plan,
+                            })
+                        })
+                        .flatten();
+                    let now = std::time::Instant::now();
+                    let mut stable = false;
+                    if let Some(candidate) = &candidate {
+                        let bounds = candidate
+                            .element
+                            .bounds
+                            .expect("a pointer candidate always has bounds");
+                        let identity = SemanticIdentity::from(&candidate.element);
+                        match &sample {
+                            Some(previous)
+                                if previous.identity == identity
+                                    && previous.bounds == bounds
+                                    && previous.pointer == candidate.plan =>
+                            {
+                                stable = now.duration_since(previous.observed_at)
+                                    >= std::time::Duration::from_millis(
+                                        SEMANTIC_ACTION_STABILITY_MS,
+                                    );
+                            }
+                            _ => {
+                                sample = Some(StabilitySample {
+                                    observed_at: now,
+                                    identity,
+                                    bounds,
+                                    pointer: candidate.plan.clone(),
+                                });
+                            }
+                        }
+                    } else {
+                        sample = None;
+                    }
+                    PointerResolutionObservation {
+                        resolution: ResolutionObservation {
+                            result,
+                            eligible: candidate.is_some(),
+                        },
+                        candidate,
+                        stable,
+                    }
+                },
+                |observation| observation.stable,
+            )
+            .map_err(|source| source_error(source, bound))?;
+        let report = resolution_report(
+            &poll.observation.resolution.result,
+            poll.elapsed_ms,
+            poll.timed_out_by,
+        );
+        if !poll.satisfied {
+            if let Some(candidate) = poll.observation.candidate {
+                let actionability = ActionabilityReport::evaluate_click(
+                    &candidate.element,
+                    coverage,
+                    Some(false),
+                    window,
+                    crate::PointerHit::Inconclusive,
+                    false,
+                    true,
+                );
+                return Err(actionability_error(
+                    SemanticActionFailureKind::UnstableTarget,
+                    "semantic pointer target did not remain stable",
+                    Some(report),
+                    actionability,
+                    bound,
+                    RetryGuidance::WaitOrRefine,
+                    None,
+                    DispatchStatus::NotDispatched,
+                ));
+            }
+            return Err(classified_resolution_error(
+                poll.observation.resolution,
+                report,
+                bound,
+            ));
+        }
+        Ok(ResolvedPointerTarget {
+            candidate: poll
+                .observation
+                .candidate
+                .expect("a satisfied stability observation has a candidate"),
+            resolution: report,
+            coverage,
+            bound,
+        })
+    }
+
+    fn accessibility_context_for_action(&mut self, deadline: Deadline) -> Result<AxContext> {
+        let active = self.active_mut()?;
+        let pids = active.platform.app_pids_by(deadline)?;
+        Ok(AxContext {
+            pids,
+            window: active.geometry.clone(),
+            window_handle: active.platform.active_window_handle(),
+            a11y_bus_addr: active.platform.a11y_bus_addr(),
+            limits: active.a11y_limits,
+            deadline,
+        })
+    }
+
+    fn invoke_semantic_target(
+        &mut self,
+        target: &AxTarget,
+        deadline: Deadline,
+    ) -> Result<Option<AxNodeId>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility action",
+            ));
+        }
+        let ctx = self.accessibility_context_for_action(deadline)?;
+        let active = self.active_mut()?;
+        let actuated = active
+            .accessibility
+            .as_mut()
+            .ok_or(GlassError::AxUnsupported)?
+            .invoke(&ctx, target)?;
+        active.pump();
+        Ok(actuated)
+    }
+
+    fn probe_semantic_pointer(
+        &mut self,
+        target: &AxTarget,
+        point: (i32, i32),
+        deadline: Deadline,
+    ) -> Result<crate::PointerHit> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("pointer hit probe"));
+        }
+        let ctx = self.accessibility_context_for_action(deadline)?;
+        let active = self.active_mut()?;
+        let hit = active
+            .accessibility
+            .as_mut()
+            .ok_or(GlassError::AxUnsupported)?
+            .pointer_target_at(&ctx, target, point)?;
+        active.pump();
+        Ok(hit)
+    }
+
+    fn dispatch_native_click(
+        &mut self,
+        resolved: ResolvedSemanticTarget,
+    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+        let window = {
+            let active = self
+                .active
+                .as_ref()
+                .ok_or_else(|| source_error(GlassError::NoActiveSession, resolved.bound))?;
+            (active.geometry.width, active.geometry.height)
+        };
+        let mut actionability = ActionabilityReport::evaluate_click(
+            &resolved.element,
+            resolved.coverage,
+            None,
+            window,
+            crate::PointerHit::Inconclusive,
+            false,
+            false,
+        );
+        if actionability.blocking().is_some() {
+            return Err(actionability_error(
+                SemanticActionFailureKind::NotActionable,
+                "semantic target is not actionable",
+                Some(resolved.resolution),
+                actionability,
+                resolved.bound,
+                RetryGuidance::Reobserve,
+                None,
+                DispatchStatus::NotDispatched,
+            ));
+        }
+        let actuated = self
+            .invoke_semantic_target(&resolved.target, resolved.bound.deadline)
+            .map_err(|source| {
+                action_source_error(
+                    source,
+                    Some(resolved.resolution.clone()),
+                    actionability.clone(),
+                    resolved.bound,
+                    true,
+                )
+            })?;
+        actionability.pass_backend_fingerprint();
+        Ok(SemanticActionOutcome {
+            target: resolved.element,
+            resolution: Some(resolved.resolution),
+            actionability,
+            focus: None,
+            action: MutationReport {
+                method: ActionMethod::NativeAction { actuated },
+                dispatch: DispatchStatus::Dispatched,
+                confirmation: ConfirmationStatus::NotRequested,
+            },
+            bound: resolved.bound,
+        })
+    }
+
+    fn dispatch_pointer_click(
+        &mut self,
+        resolved: ResolvedPointerTarget,
+        native_fallback: Option<String>,
+    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+        let window = {
+            let active = self
+                .active
+                .as_ref()
+                .ok_or_else(|| source_error(GlassError::NoActiveSession, resolved.bound))?;
+            (active.geometry.width, active.geometry.height)
+        };
+        let probe_point = match &resolved.candidate.plan {
+            PlannedPointerInput::Click { point } => *point,
+            PlannedPointerInput::TrailingToggle { probe_point, .. } => *probe_point,
+        };
+        let hit = self
+            .probe_semantic_pointer(
+                &resolved.candidate.target,
+                probe_point,
+                resolved.bound.deadline,
+            )
+            .map_err(|source| {
+                action_source_error(
+                    source,
+                    Some(resolved.resolution.clone()),
+                    ActionabilityReport::evaluate_click(
+                        &resolved.candidate.element,
+                        resolved.coverage,
+                        Some(true),
+                        window,
+                        crate::PointerHit::Inconclusive,
+                        false,
+                        true,
+                    ),
+                    resolved.bound,
+                    false,
+                )
+            })?;
+        let actionability = ActionabilityReport::evaluate_click(
+            &resolved.candidate.element,
+            resolved.coverage,
+            Some(true),
+            window,
+            hit,
+            false,
+            true,
+        );
+        if actionability.blocking().is_some() {
+            return Err(actionability_error(
+                SemanticActionFailureKind::NotActionable,
+                "semantic pointer target is not actionable",
+                Some(resolved.resolution),
+                actionability,
+                resolved.bound,
+                RetryGuidance::Reobserve,
+                None,
+                DispatchStatus::NotDispatched,
+            ));
+        }
+        self.click_element_pointer_only(
+            resolved.candidate.element.id,
+            Some(&resolved.candidate.plan),
+            resolved.bound.deadline,
+        )
+        .map_err(|source| {
+            action_source_error(
+                source,
+                Some(resolved.resolution.clone()),
+                actionability.clone(),
+                resolved.bound,
+                true,
+            )
+        })?;
+        Ok(SemanticActionOutcome {
+            target: resolved.candidate.element,
+            resolution: Some(resolved.resolution),
+            actionability,
+            focus: None,
+            action: MutationReport {
+                method: ActionMethod::Pointer { native_fallback },
+                dispatch: DispatchStatus::Dispatched,
+                confirmation: ConfirmationStatus::NotRequested,
+            },
+            bound: resolved.bound,
+        })
+    }
+
+    fn legacy_click_target(
+        &mut self,
+        id: AxNodeId,
+        mode: ActionMode,
+        bound: ActionDeadline,
+    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+        let (element, target, coverage, window) = {
+            let active = self
+                .active
+                .as_ref()
+                .ok_or_else(|| source_error(GlassError::NoActiveSession, bound))?;
+            let tree = active
+                .last_ax
+                .as_ref()
+                .ok_or_else(|| source_error(GlassError::NoAxSnapshot, bound))?;
+            let node = tree
+                .find(id)
+                .ok_or_else(|| source_error(GlassError::AxElementNotFound(id.0), bound))?;
+            let element = ElementInfo::from_node(node);
+            let coverage = active
+                .accessibility
+                .as_ref()
+                .map_or(AxStateCoverage::NONE, |reader| reader.state_coverage());
+            (
+                element.clone(),
+                ax_target(&element),
+                coverage,
+                (active.geometry.width, active.geometry.height),
+            )
+        };
+        let (method, pointer) = match mode {
+            ActionMode::Native => {
+                let actuated = self
+                    .invoke_semantic_target(&target, bound.deadline)
+                    .map_err(|source| {
+                        action_source_error(
+                            source,
+                            None,
+                            ActionabilityReport::evaluate_click(
+                                &element,
+                                coverage,
+                                None,
+                                window,
+                                crate::PointerHit::Inconclusive,
+                                true,
+                                false,
+                            ),
+                            bound,
+                            true,
+                        )
+                    })?;
+                (ActionMethod::NativeAction { actuated }, false)
+            }
+            ActionMode::Pointer => {
+                self.click_element_pointer_only(id, None, bound.deadline)
+                    .map_err(|source| {
+                        action_source_error(
+                            source,
+                            None,
+                            ActionabilityReport::evaluate_click(
+                                &element,
+                                coverage,
+                                None,
+                                window,
+                                crate::PointerHit::Inconclusive,
+                                true,
+                                true,
+                            ),
+                            bound,
+                            true,
+                        )
+                    })?;
+                (
+                    ActionMethod::Pointer {
+                        native_fallback: None,
+                    },
+                    true,
+                )
+            }
+            ActionMode::Auto => {
+                let method = self
+                    .click_element_by(id, bound.deadline)
+                    .map_err(|source| {
+                        action_source_error(
+                            source,
+                            None,
+                            ActionabilityReport::evaluate_click(
+                                &element,
+                                coverage,
+                                None,
+                                window,
+                                crate::PointerHit::Inconclusive,
+                                true,
+                                false,
+                            ),
+                            bound,
+                            true,
+                        )
+                    })?;
+                match method {
+                    ClickMethod::NativeAction { actuated } => {
+                        (ActionMethod::NativeAction { actuated }, false)
+                    }
+                    ClickMethod::Pointer { native_fallback } => (
+                        ActionMethod::Pointer {
+                            native_fallback: Some(native_fallback),
+                        },
+                        true,
+                    ),
+                }
+            }
+        };
+        let mut actionability = ActionabilityReport::evaluate_click(
+            &element,
+            coverage,
+            None,
+            window,
+            crate::PointerHit::Inconclusive,
+            true,
+            pointer,
+        );
+        if !pointer {
+            actionability.pass_backend_fingerprint();
+        }
+        Ok(SemanticActionOutcome {
+            target: element,
+            resolution: None,
+            actionability,
+            focus: None,
+            action: MutationReport {
+                method,
+                dispatch: DispatchStatus::Dispatched,
+                confirmation: ConfirmationStatus::NotRequested,
+            },
+            bound,
+        })
+    }
+
+    pub(super) fn click_target_inner(
+        &mut self,
+        params: ClickTargetParams,
+        sequence_deadline: Deadline,
+    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+        let bound = target_deadline(
+            &params.target,
+            params.timeout_ms,
+            params.max_nodes,
+            sequence_deadline,
+        )?;
+        match params.target {
+            ActionTarget::Id(id) => self.legacy_click_target(id, params.mode, bound),
+            ActionTarget::Semantic(target) => match params.mode {
+                ActionMode::Native => {
+                    let window = self
+                        .active
+                        .as_ref()
+                        .map(|active| (active.geometry.width, active.geometry.height))
+                        .unwrap_or_default();
+                    let resolved = self.resolve_semantic_target_by_bound(
+                        &target,
+                        params.max_nodes,
+                        sequence_deadline,
+                        bound,
+                        |element, coverage| {
+                            ActionabilityReport::evaluate_click(
+                                element,
+                                coverage,
+                                None,
+                                window,
+                                crate::PointerHit::Inconclusive,
+                                false,
+                                false,
+                            )
+                            .blocking()
+                            .is_none()
+                        },
+                    )?;
+                    self.dispatch_native_click(resolved)
+                }
+                ActionMode::Pointer => {
+                    let resolved = self.resolve_stable_pointer_target(
+                        &target,
+                        params.max_nodes,
+                        sequence_deadline,
+                        bound,
+                    )?;
+                    self.dispatch_pointer_click(resolved, None)
+                }
+                ActionMode::Auto => {
+                    let window = self
+                        .active
+                        .as_ref()
+                        .map(|active| (active.geometry.width, active.geometry.height))
+                        .unwrap_or_default();
+                    let resolved = self.resolve_semantic_target_by_bound(
+                        &target,
+                        params.max_nodes,
+                        sequence_deadline,
+                        bound,
+                        |element, coverage| {
+                            ActionabilityReport::evaluate_click(
+                                element,
+                                coverage,
+                                None,
+                                window,
+                                crate::PointerHit::Inconclusive,
+                                false,
+                                false,
+                            )
+                            .blocking()
+                            .is_none()
+                        },
+                    )?;
+                    match self.invoke_semantic_target(&resolved.target, bound.deadline) {
+                        Ok(actuated) => {
+                            let mut actionability = ActionabilityReport::evaluate_click(
+                                &resolved.element,
+                                resolved.coverage,
+                                None,
+                                window,
+                                crate::PointerHit::Inconclusive,
+                                false,
+                                false,
+                            );
+                            actionability.pass_backend_fingerprint();
+                            Ok(SemanticActionOutcome {
+                                target: resolved.element,
+                                resolution: Some(resolved.resolution),
+                                actionability,
+                                focus: None,
+                                action: MutationReport {
+                                    method: ActionMethod::NativeAction { actuated },
+                                    dispatch: DispatchStatus::Dispatched,
+                                    confirmation: ConfirmationStatus::NotRequested,
+                                },
+                                bound,
+                            })
+                        }
+                        Err(source) if source.invoke_fallback_eligible() => {
+                            let reason = native_fallback_reason(&source);
+                            let resolved = self.resolve_stable_pointer_target(
+                                &target,
+                                params.max_nodes,
+                                sequence_deadline,
+                                bound,
+                            )?;
+                            self.dispatch_pointer_click(resolved, Some(reason))
+                        }
+                        Err(source) => Err(action_source_error(
+                            source,
+                            Some(resolved.resolution),
+                            ActionabilityReport::evaluate_click(
+                                &resolved.element,
+                                resolved.coverage,
+                                None,
+                                window,
+                                crate::PointerHit::Inconclusive,
+                                false,
+                                false,
+                            ),
+                            bound,
+                            true,
+                        )),
+                    }
+                }
+            },
+        }
     }
 }
 

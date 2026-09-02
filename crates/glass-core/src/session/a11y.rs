@@ -233,7 +233,7 @@ impl Glass {
             Err(e) if !e.invoke_fallback_eligible() => return Err(e),
             Err(e) => native_fallback_reason(&e),
         };
-        self.click_element_pointer_only(id, deadline)
+        self.click_element_pointer_only(id, None, deadline)
             .map(|()| ClickMethod::Pointer { native_fallback })
     }
 
@@ -242,7 +242,12 @@ impl Glass {
     /// one, or swiped across the trailing control for a row-shaped checkable on a
     /// trailing-toggle backend. Callable directly by an internal caller that must NOT take
     /// the native action (see [`Glass::set_combo_value`]).
-    fn click_element_pointer_only(&mut self, id: AxNodeId, deadline: Deadline) -> Result<()> {
+    pub(super) fn click_element_pointer_only(
+        &mut self,
+        id: AxNodeId,
+        plan: Option<&super::semantic_action::PlannedPointerInput>,
+        deadline: Deadline,
+    ) -> Result<()> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("click element"));
         }
@@ -295,16 +300,41 @@ impl Glass {
                     .after_dispatch(),
                 });
             }
-            let primary = self.pointer_inner_by(
-                &PointerEvent::Click {
-                    x: bounds.x - container.x,
-                    y: bounds.y - container.y,
-                    button: MouseButton::Left,
-                    count: 1,
-                    modifiers: vec![],
-                },
-                deadline,
-            );
+            let primary = match plan {
+                Some(super::semantic_action::PlannedPointerInput::TrailingToggle {
+                    segment,
+                    ..
+                }) => self.pointer_inner_by(
+                    &PointerEvent::Drag {
+                        from_x: segment.from_x - container.x,
+                        from_y: segment.from_y - container.y,
+                        to_x: segment.to_x - container.x,
+                        to_y: segment.to_y - container.y,
+                        duration_ms: TOGGLE_SWIPE_MS,
+                        button: MouseButton::Left,
+                        modifiers: vec![],
+                    },
+                    deadline,
+                ),
+                planned => {
+                    let point = match planned {
+                        Some(super::semantic_action::PlannedPointerInput::Click { point }) => {
+                            *point
+                        }
+                        _ => (bounds.x, bounds.y),
+                    };
+                    self.pointer_inner_by(
+                        &PointerEvent::Click {
+                            x: point.0 - container.x,
+                            y: point.1 - container.y,
+                            button: MouseButton::Left,
+                            count: 1,
+                            modifiers: vec![],
+                        },
+                        deadline,
+                    )
+                }
+            };
             // Restore focus even after expiry; temporary selection already makes failure
             // after-dispatch.
             let restore = self.select_window_by(prev, Deadline::UNBOUNDED);
@@ -326,12 +356,18 @@ impl Glass {
         //
         // Gate on the backend capability, NOT geometry alone: a wide labeled checkbox on a
         // desktop backend is row-shaped too, but its indicator is at the LEADING edge.
+        let planned_segment = match plan {
+            Some(super::semantic_action::PlannedPointerInput::TrailingToggle {
+                segment, ..
+            }) => Some(*segment),
+            _ => None,
+        };
         let row_shaped_toggle = checkable
             && trailing_toggle_backend
             && bounds.width > bounds.height.saturating_mul(ROW_ASPECT);
-        if row_shaped_toggle {
-            let seg = bounds
-                .trailing_toggle_swipe(active_geo.width, active_geo.height)
+        if planned_segment.is_some() || (plan.is_none() && row_shaped_toggle) {
+            let seg = planned_segment
+                .or_else(|| bounds.trailing_toggle_swipe(active_geo.width, active_geo.height))
                 .ok_or(GlassError::AxElementNotClickable(id.0))?;
             self.pointer_inner_by(
                 &PointerEvent::Drag {
@@ -346,9 +382,12 @@ impl Glass {
                 deadline,
             )
         } else {
-            let (x, y) = bounds
-                .clamped_center(active_geo.width, active_geo.height)
-                .ok_or(GlassError::AxElementNotClickable(id.0))?;
+            let (x, y) = match plan {
+                Some(super::semantic_action::PlannedPointerInput::Click { point }) => *point,
+                _ => bounds
+                    .clamped_center(active_geo.width, active_geo.height)
+                    .ok_or(GlassError::AxElementNotClickable(id.0))?,
+            };
             self.pointer_inner_by(
                 &PointerEvent::Click {
                     x,
@@ -654,10 +693,11 @@ impl Glass {
                     // Use a pointer click because UIA programmatic expand does not move keyboard
                     // focus to the popup.
                     let open = self.audited_click(id, |g, id| {
-                        g.click_element_pointer_only(id, deadline)
-                            .map(|()| ClickMethod::Pointer {
+                        g.click_element_pointer_only(id, None, deadline).map(|()| {
+                            ClickMethod::Pointer {
                                 native_fallback: COMBO_OPEN_POINTER_REASON.into(),
-                            })
+                            }
+                        })
                     });
                     self.invalidate_ax_cache_after_possible_dispatch(open)?;
                     mutation_may_have_dispatched = true;

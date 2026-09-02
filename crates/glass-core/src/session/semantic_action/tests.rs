@@ -1,8 +1,9 @@
 use super::*;
 use crate::session::test_support::*;
 use crate::{
-    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStateCoverage, AxStates, AxTree,
-    ChangeSignal, SemanticSelector, SemanticState, Truncation, TruncationLimit, WalkLimits,
+    Accessibility, ActionabilityCheckName, ActionabilityVerdict, AxContext, AxNode, AxNodeId,
+    AxRect, AxRole, AxStateCoverage, AxStates, AxTree, ChangeSignal, PointerHit, SemanticSelector,
+    SemanticState, Truncation, TruncationLimit, WalkLimits,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,68 @@ fn named_button_tree(name: &str) -> AxTree {
     let mut tree = fake_tree();
     tree.root.children[0].name = Some(name.into());
     tree
+}
+
+fn actionable_button_tree(name: &str, bounds: AxRect) -> AxTree {
+    let mut tree = named_button_tree(name);
+    let button = &mut tree.root.children[0];
+    button.bounds = Some(bounds);
+    button.states.enabled = true;
+    button.states.visible = true;
+    tree
+}
+
+fn pointer_params(target: ActionTarget, timeout_ms: Option<u64>) -> ClickTargetParams {
+    ClickTargetParams {
+        target,
+        mode: ActionMode::Pointer,
+        timeout_ms,
+        max_nodes: None,
+    }
+}
+
+fn pointer_glass(
+    platform: FakePlatform,
+    trees: Vec<AxTree>,
+    hit: PointerHit,
+    hit_error: bool,
+) -> (
+    Glass,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<(i32, i32)>>>,
+) {
+    let walks = Arc::new(AtomicUsize::new(0));
+    let hit_calls = Arc::new(AtomicUsize::new(0));
+    let hit_points = Arc::new(Mutex::new(Vec::new()));
+    let mut accessibility = SeqAccessibility::new(trees)
+        .with_coverage(full_state_coverage())
+        .with_hit(hit)
+        .with_walks(walks.clone())
+        .with_hit_calls(hit_calls.clone())
+        .with_hit_points(hit_points.clone());
+    if hit_error {
+        accessibility = accessibility.with_hit_error();
+    }
+    (
+        glass_with_backend(platform, Box::new(accessibility)),
+        walks,
+        hit_calls,
+        hit_points,
+    )
+}
+
+fn report_verdict(
+    outcome: &SemanticActionOutcome,
+    name: ActionabilityCheckName,
+) -> ActionabilityVerdict {
+    outcome
+        .actionability
+        .checks
+        .iter()
+        .find(|check| check.name == name)
+        .expect("missing actionability check")
+        .verdict
 }
 
 fn duplicate_button_tree(name: &str, count: usize) -> AxTree {
@@ -712,4 +775,542 @@ fn target_deadlines_preserve_id_and_selector_bound_ownership() {
     assert_eq!(sequence_limited.deadline, sequence);
     assert_eq!(sequence_limited.owner, Some(Whose::Caller));
     assert!(sequence_limited.allow_wait);
+}
+
+#[test]
+fn selector_pointer_waits_for_two_identical_samples_at_least_one_hundred_ms_apart() {
+    let bounds = AxRect {
+        x: 10,
+        y: 10,
+        width: 20,
+        height: 20,
+    };
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+    let (mut glass, walks, hit_calls, _) = pointer_glass(
+        platform,
+        vec![
+            actionable_button_tree("Save", bounds),
+            actionable_button_tree("Save", bounds),
+        ],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    let started = std::time::Instant::now();
+    let outcome = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+    assert_eq!(walks.load(Ordering::Relaxed), 2);
+    assert_eq!(hit_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(clicks.lock().unwrap().as_slice(), &[(20, 20)]);
+    assert_eq!(
+        report_verdict(&outcome, ActionabilityCheckName::Stable),
+        ActionabilityVerdict::Passed
+    );
+}
+
+#[test]
+fn moving_bounds_reset_the_stability_sample_until_the_target_stops() {
+    let first = AxRect {
+        x: 10,
+        y: 10,
+        width: 20,
+        height: 20,
+    };
+    let final_bounds = AxRect { x: 40, ..first };
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+    let (mut glass, walks, _, _) = pointer_glass(
+        platform,
+        vec![
+            actionable_button_tree("Save", first),
+            actionable_button_tree("Save", final_bounds),
+            actionable_button_tree("Save", final_bounds),
+        ],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    let started = std::time::Instant::now();
+    glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(600)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+    assert_eq!(walks.load(Ordering::Relaxed), 3);
+    assert_eq!(clicks.lock().unwrap().as_slice(), &[(50, 20)]);
+}
+
+#[test]
+fn identity_change_resets_stability_even_when_bounds_are_equal() {
+    let bounds = AxRect {
+        x: 10,
+        y: 10,
+        width: 20,
+        height: 20,
+    };
+    let mut first = actionable_button_tree("Save", bounds);
+    first.root.children[0].description = Some("old identity".into());
+    let mut final_tree = actionable_button_tree("Save", bounds);
+    final_tree.root.children[0].description = Some("new identity".into());
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+    let (mut glass, walks, _, _) = pointer_glass(
+        platform,
+        vec![first, final_tree.clone(), final_tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(600)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(walks.load(Ordering::Relaxed), 3);
+    assert_eq!(clicks.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn zero_timeout_native_action_dispatches_after_one_fresh_read() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let (mut glass, walks, _, invoke_log) =
+        semantic_glass(vec![tree], None, InvokeBehavior::Succeed);
+    glass.start(&spec()).unwrap();
+
+    let outcome = glass
+        .click_target_inner(
+            ClickTargetParams {
+                target: ActionTarget::Semantic(semantic_target("Save")),
+                mode: ActionMode::Native,
+                timeout_ms: Some(0),
+                max_nodes: None,
+            },
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(walks.load(Ordering::Relaxed), 1);
+    assert_eq!(invoke_log.lock().unwrap().len(), 1);
+    assert!(matches!(
+        outcome.action.method,
+        ActionMethod::NativeAction { .. }
+    ));
+}
+
+#[test]
+fn zero_timeout_pointer_action_returns_unstable_without_dispatch() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+    let (mut glass, walks, hit_calls, _) =
+        pointer_glass(platform, vec![tree], PointerHit::Target, false);
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(0)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::UnstableTarget);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(walks.load(Ordering::Relaxed), 1);
+    assert_eq!(hit_calls.load(Ordering::Relaxed), 0);
+    assert!(clicks.lock().unwrap().is_empty());
+}
+
+#[test]
+fn selector_pointer_known_occlusion_blocks_before_pointer_dispatch() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+    let (mut glass, _, hit_calls, _) =
+        pointer_glass(platform, vec![tree.clone(), tree], PointerHit::Other, false);
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(hit_calls.load(Ordering::Relaxed), 1);
+    assert!(clicks.lock().unwrap().is_empty());
+}
+
+#[test]
+fn selector_pointer_inconclusive_occlusion_dispatches_once_and_discloses_unproven() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+    let (mut glass, _, hit_calls, _) = pointer_glass(
+        platform,
+        vec![tree.clone(), tree],
+        PointerHit::Inconclusive,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    let outcome = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(hit_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(clicks.lock().unwrap().len(), 1);
+    assert_eq!(
+        report_verdict(&outcome, ActionabilityCheckName::NonOccluded),
+        ActionabilityVerdict::Unproven
+    );
+}
+
+#[test]
+fn selector_pointer_hit_probe_and_dispatch_use_the_same_planned_point() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: -10,
+            y: 10,
+            width: 30,
+            height: 20,
+        },
+    );
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+    let (mut glass, _, _, hit_points) = pointer_glass(
+        platform,
+        vec![tree.clone(), tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(hit_points.lock().unwrap().as_slice(), &[(10, 20)]);
+    assert_eq!(clicks.lock().unwrap().as_slice(), &[(10, 20)]);
+}
+
+#[test]
+fn selector_pointer_row_toggle_probes_and_dispatches_the_same_trailing_control() {
+    let bounds = AxRect {
+        x: 10,
+        y: 10,
+        width: 80,
+        height: 15,
+    };
+    let mut tree = actionable_button_tree("Wi-Fi", bounds);
+    let toggle = &mut tree.root.children[0];
+    toggle.role = AxRole::CheckBox;
+    toggle.states.checkable = true;
+    let drags = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100)
+        .with_drag_log(drags.clone())
+        .with_trailing_toggle_backend();
+    let (mut glass, _, _, hit_points) = pointer_glass(
+        platform,
+        vec![tree.clone(), tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Wi-Fi")), Some(500)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    let segment = bounds.trailing_toggle_swipe(100, 100).unwrap();
+    let midpoint = (
+        (segment.from_x + segment.to_x) / 2,
+        (segment.from_y + segment.to_y) / 2,
+    );
+    assert_eq!(hit_points.lock().unwrap().as_slice(), &[midpoint]);
+    let drags = drags.lock().unwrap();
+    assert_eq!(drags.len(), 1);
+    assert!(matches!(
+        drags[0],
+        PointerEvent::Drag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            ..
+        } if (from_x, from_y, to_x, to_y)
+            == (segment.from_x, segment.from_y, segment.to_x, segment.to_y)
+    ));
+}
+
+#[test]
+fn selector_pointer_popover_row_toggle_dispatches_the_translated_planned_segment() {
+    let mut tree = fake_tree_with_popover_option();
+    let toggle = &mut tree.root.children[0].children[0];
+    toggle.role = AxRole::CheckBox;
+    toggle.states.enabled = true;
+    toggle.states.visible = true;
+    toggle.states.checkable = true;
+    toggle.bounds.as_mut().unwrap().width = 200;
+    let bounds = toggle.bounds.unwrap();
+    let active = window_info(
+        1,
+        WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 340,
+            height: 300,
+        },
+        true,
+    );
+    let popover = window_info(
+        2,
+        WindowGeometry {
+            x: -3,
+            y: 220,
+            width: 326,
+            height: 135,
+        },
+        false,
+    );
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let drags = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(340, 300)
+        .with_windows(vec![active, popover])
+        .with_click_log(clicks.clone())
+        .with_drag_log(drags.clone())
+        .with_trailing_toggle_backend();
+    let (mut glass, _, _, hit_points) = pointer_glass(
+        platform,
+        vec![tree.clone(), tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Globex")), Some(500)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    let segment = bounds.trailing_toggle_swipe(340, 300).unwrap();
+    let probe_point = (
+        (segment.from_x + segment.to_x) / 2,
+        (segment.from_y + segment.to_y) / 2,
+    );
+    assert_eq!(hit_points.lock().unwrap().as_slice(), &[probe_point]);
+    assert!(clicks.lock().unwrap().is_empty());
+    let drags = drags.lock().unwrap();
+    assert_eq!(drags.len(), 1);
+    assert!(matches!(
+        drags[0],
+        PointerEvent::Drag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            ..
+        } if (from_x, from_y, to_x, to_y)
+            == (
+                segment.from_x,
+                segment.from_y - 194,
+                segment.to_x,
+                segment.to_y - 194,
+            )
+    ));
+}
+
+#[test]
+fn legacy_id_forced_pointer_dispatches_without_a_fresh_read_or_stability_sleep() {
+    let tree = fake_tree();
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+    let (mut glass, walks, hit_calls, _) =
+        pointer_glass(platform, vec![tree], PointerHit::Other, false);
+    glass.start(&spec()).unwrap();
+    glass.a11y_snapshot(None).unwrap();
+    walks.store(0, Ordering::Relaxed);
+    hit_calls.store(0, Ordering::Relaxed);
+    clicks.lock().unwrap().clear();
+
+    let started = std::time::Instant::now();
+    let outcome = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Id(AxNodeId(1)), None),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert!(started.elapsed() < std::time::Duration::from_millis(75));
+    assert_eq!(walks.load(Ordering::Relaxed), 0);
+    assert_eq!(hit_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(clicks.lock().unwrap().len(), 1);
+    for name in [
+        ActionabilityCheckName::Unique,
+        ActionabilityCheckName::Stable,
+        ActionabilityCheckName::NonOccluded,
+    ] {
+        let check = outcome
+            .actionability
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap();
+        assert_eq!(check.verdict, ActionabilityVerdict::Unproven);
+        assert!(!check.required);
+    }
+}
+
+#[test]
+fn selector_pointer_hit_probe_errors_are_action_failed_before_dispatch() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+    let (mut glass, _, hit_calls, _) = pointer_glass(
+        platform,
+        vec![tree.clone(), tree],
+        PointerHit::Inconclusive,
+        true,
+    );
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::ActionFailed);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(hit_calls.load(Ordering::Relaxed), 1);
+    assert!(clicks.lock().unwrap().is_empty());
+}
+
+#[test]
+fn native_mode_unsupported_is_proven_not_dispatched() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+    let (mut glass, _, _, _) = pointer_glass(platform, vec![tree], PointerHit::Inconclusive, false);
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_inner(
+            ClickTargetParams {
+                target: ActionTarget::Semantic(semantic_target("Save")),
+                mode: ActionMode::Native,
+                timeout_ms: Some(0),
+                max_nodes: None,
+            },
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert!(matches!(error.source, Some(GlassError::AxUnsupported)));
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert!(clicks.lock().unwrap().is_empty());
+}
+
+#[test]
+fn legacy_id_missing_bounds_preserves_the_primitive_error_before_dispatch() {
+    let mut tree = fake_tree();
+    tree.root.children[0].bounds = None;
+    let (mut glass, _, _, _) = pointer_glass(
+        FakePlatform::new(100, 100),
+        vec![tree],
+        PointerHit::Other,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+    glass.a11y_snapshot(None).unwrap();
+
+    let error = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Id(AxNodeId(1)), None),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error.source,
+        Some(GlassError::AxElementNotClickable(1))
+    ));
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
 }
