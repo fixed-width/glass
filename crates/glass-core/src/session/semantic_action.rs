@@ -465,38 +465,22 @@ impl Glass {
         sequence_deadline: Deadline,
         eligibility: impl Fn(&ElementInfo, AxStateCoverage) -> bool,
     ) -> std::result::Result<ResolvedSemanticTarget, SemanticActionError> {
-        let coverage = {
-            let active = self.active_mut().map_err(|source| {
-                source_error(
-                    source,
-                    ActionDeadline {
-                        deadline: sequence_deadline,
-                        owner: sequence_deadline.instant().map(|_| Whose::Caller),
-                        allow_wait: timeout_ms > 0,
-                    },
-                )
-            })?;
-            active
-                .accessibility
-                .as_ref()
-                .ok_or_else(|| {
-                    source_error(
-                        GlassError::AxUnsupported,
-                        ActionDeadline {
-                            deadline: sequence_deadline,
-                            owner: sequence_deadline.instant().map(|_| Whose::Caller),
-                            allow_wait: timeout_ms > 0,
-                        },
-                    )
-                })?
-                .state_coverage()
-        };
         let bound = target_deadline(
             &ActionTarget::Semantic(target.clone()),
             Some(timeout_ms),
             max_nodes,
             sequence_deadline,
         )?;
+        let coverage = {
+            let active = self
+                .active_mut()
+                .map_err(|source| source_error(source, bound))?;
+            active
+                .accessibility
+                .as_ref()
+                .ok_or_else(|| source_error(GlassError::AxUnsupported, bound))?
+                .state_coverage()
+        };
         if !target.uncovered_states(coverage).is_empty() {
             return Err(empty_error(
                 SemanticActionFailureKind::UnprovenSelectorState,
@@ -515,9 +499,12 @@ impl Glass {
         )
         .expect("the fixed candidate limit is valid");
         let poll = self
-            .poll_accessibility_until(
+            .poll_accessibility_until_by_deadline(
                 SEMANTIC_ACTION_STABILITY_MS,
-                timeout_ms,
+                std::time::Duration::from_secs(1),
+                bound.deadline,
+                bound.owner.unwrap_or(Whose::Callee),
+                bound.allow_wait,
                 sequence_deadline,
                 "resolve semantic action target",
                 |tree| {

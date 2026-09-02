@@ -1,8 +1,8 @@
 use super::*;
 use crate::session::test_support::*;
 use crate::{
-    AxNode, AxNodeId, AxRect, AxRole, AxStateCoverage, AxStates, AxTree, ChangeSignal,
-    SemanticSelector, SemanticState, Truncation, TruncationLimit, WalkLimits,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStateCoverage, AxStates, AxTree,
+    ChangeSignal, SemanticSelector, SemanticState, Truncation, TruncationLimit, WalkLimits,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -99,6 +99,61 @@ fn semantic_glass(
         .with_focus_calls(focus_calls.clone());
     let glass = glass_with_backend(FakePlatform::new(100, 100), Box::new(accessibility));
     (glass, walks, focus_calls, invoke_log)
+}
+
+struct DeadlineRecordingAccessibility {
+    tree: AxTree,
+    coverage_delay: std::time::Duration,
+    coverage_finished: Arc<Mutex<Option<std::time::Instant>>>,
+    subscription_deadlines: Arc<Mutex<Vec<Deadline>>>,
+    snapshot_deadlines: Arc<Mutex<Vec<Deadline>>>,
+}
+
+impl Accessibility for DeadlineRecordingAccessibility {
+    fn snapshot(&mut self, ctx: &AxContext) -> crate::Result<AxTree> {
+        self.snapshot_deadlines.lock().unwrap().push(ctx.deadline);
+        Ok(self.tree.clone())
+    }
+
+    fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        self.subscription_deadlines
+            .lock()
+            .unwrap()
+            .push(ctx.deadline);
+        None
+    }
+
+    fn state_coverage(&self) -> AxStateCoverage {
+        std::thread::sleep(self.coverage_delay);
+        *self.coverage_finished.lock().unwrap() = Some(std::time::Instant::now());
+        full_state_coverage()
+    }
+}
+
+fn deadline_recording_glass(
+    coverage_delay: std::time::Duration,
+) -> (
+    Glass,
+    Arc<Mutex<Option<std::time::Instant>>>,
+    Arc<Mutex<Vec<Deadline>>>,
+    Arc<Mutex<Vec<Deadline>>>,
+) {
+    let coverage_finished = Arc::new(Mutex::new(None));
+    let subscription_deadlines = Arc::new(Mutex::new(Vec::new()));
+    let snapshot_deadlines = Arc::new(Mutex::new(Vec::new()));
+    let accessibility = DeadlineRecordingAccessibility {
+        tree: named_button_tree("Save account"),
+        coverage_delay,
+        coverage_finished: coverage_finished.clone(),
+        subscription_deadlines: subscription_deadlines.clone(),
+        snapshot_deadlines: snapshot_deadlines.clone(),
+    };
+    (
+        glass_with_backend(FakePlatform::new(100, 100), Box::new(accessibility)),
+        coverage_finished,
+        subscription_deadlines,
+        snapshot_deadlines,
+    )
 }
 
 #[test]
@@ -292,6 +347,70 @@ fn selector_resolution_waits_for_delayed_publication() {
     assert_eq!(walks.load(Ordering::Relaxed), 2);
     assert_eq!(resolved.element.name.as_deref(), Some("Save account"));
     assert!(resolved.bound.allow_wait);
+}
+
+#[test]
+fn selector_resolution_uses_the_reported_deadline_for_subscription_and_snapshot() {
+    let (mut glass, _, subscription_deadlines, snapshot_deadlines) =
+        deadline_recording_glass(std::time::Duration::ZERO);
+    glass.start(&spec()).unwrap();
+
+    let resolved = glass
+        .resolve_semantic_target(
+            &semantic_target("Save account"),
+            None,
+            500,
+            Deadline::UNBOUNDED,
+            |_, _| true,
+        )
+        .unwrap();
+
+    assert_eq!(
+        subscription_deadlines.lock().unwrap().as_slice(),
+        &[resolved.bound.deadline]
+    );
+    assert_eq!(
+        snapshot_deadlines.lock().unwrap().as_slice(),
+        &[resolved.bound.deadline]
+    );
+}
+
+#[test]
+fn selector_resolution_setup_consumes_the_reported_action_budget() {
+    let timeout = std::time::Duration::from_millis(300);
+    let (mut glass, coverage_finished, subscription_deadlines, snapshot_deadlines) =
+        deadline_recording_glass(std::time::Duration::from_millis(150));
+    glass.start(&spec()).unwrap();
+
+    let resolved = glass
+        .resolve_semantic_target(
+            &semantic_target("Save account"),
+            None,
+            timeout.as_millis() as u64,
+            Deadline::UNBOUNDED,
+            |_, _| true,
+        )
+        .unwrap();
+
+    let coverage_finished = coverage_finished.lock().unwrap().unwrap();
+    let remaining_after_setup = resolved
+        .bound
+        .deadline
+        .instant()
+        .unwrap()
+        .saturating_duration_since(coverage_finished);
+    assert!(
+        remaining_after_setup < std::time::Duration::from_millis(225),
+        "pre-poll setup did not consume the action budget: {remaining_after_setup:?} remained"
+    );
+    assert_eq!(
+        subscription_deadlines.lock().unwrap().as_slice(),
+        &[resolved.bound.deadline]
+    );
+    assert_eq!(
+        snapshot_deadlines.lock().unwrap().as_slice(),
+        &[resolved.bound.deadline]
+    );
 }
 
 #[test]

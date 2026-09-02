@@ -97,8 +97,8 @@ impl Glass {
         timeout_ms: u64,
         sequence_deadline: Deadline,
         operation: &'static str,
-        mut observe: impl FnMut(&AxTree) -> O,
-        mut satisfied: impl FnMut(&O) -> bool,
+        observe: impl FnMut(&AxTree) -> O,
+        satisfied: impl FnMut(&O) -> bool,
     ) -> Result<A11yPollOutcome<O>> {
         if sequence_deadline.has_passed() {
             return Err(GlassError::deadline_not_started(operation));
@@ -108,16 +108,93 @@ impl Glass {
         let (effective_duration, whose) =
             sequence_deadline.budget(std::time::Duration::from_millis(timeout_ms), started);
         let action_deadline = Deadline::at(started + effective_duration);
+        self.poll_accessibility_until_with_deadline(
+            interval_ms,
+            reread_after,
+            action_deadline,
+            whose,
+            timeout_ms > 0,
+            sequence_deadline,
+            operation,
+            started,
+            observe,
+            satisfied,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn poll_accessibility_until_by_deadline<O>(
+        &mut self,
+        interval_ms: u64,
+        reread_after: std::time::Duration,
+        action_deadline: Deadline,
+        whose: crate::Whose,
+        allow_wait: bool,
+        sequence_deadline: Deadline,
+        operation: &'static str,
+        observe: impl FnMut(&AxTree) -> O,
+        satisfied: impl FnMut(&O) -> bool,
+    ) -> Result<A11yPollOutcome<O>> {
+        if sequence_deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(operation));
+        }
+        self.require_active()?;
+        if allow_wait && action_deadline.has_passed() {
+            return Err(GlassError::Bounded {
+                kind: crate::BoundKind::NotStarted,
+                whose,
+                dispatch: crate::BoundDispatch::NotDispatched,
+                message: format!(
+                    "{operation}: its effective deadline was already spent, so it was not started"
+                ),
+            });
+        }
+        self.poll_accessibility_until_with_deadline(
+            interval_ms,
+            reread_after,
+            action_deadline,
+            whose,
+            allow_wait,
+            sequence_deadline,
+            operation,
+            std::time::Instant::now(),
+            observe,
+            satisfied,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn poll_accessibility_until_with_deadline<O>(
+        &mut self,
+        interval_ms: u64,
+        reread_after: std::time::Duration,
+        action_deadline: Deadline,
+        whose: crate::Whose,
+        allow_wait: bool,
+        sequence_deadline: Deadline,
+        operation: &'static str,
+        started: std::time::Instant,
+        mut observe: impl FnMut(&AxTree) -> O,
+        mut satisfied: impl FnMut(&O) -> bool,
+    ) -> Result<A11yPollOutcome<O>> {
         let mut signal = (interval_ms > 0)
             .then(|| self.subscribe_a11y_changes(action_deadline))
             .flatten();
-        let remaining = (effective_duration.as_millis() as u64)
-            .saturating_sub(started.elapsed().as_millis() as u64);
+        let remaining = if allow_wait {
+            let deadline = action_deadline
+                .instant()
+                .expect("a waiting accessibility poll has a finite deadline");
+            let effective_duration = deadline.saturating_duration_since(started);
+            (effective_duration.as_millis() as u64)
+                .saturating_sub(started.elapsed().as_millis() as u64)
+        } else {
+            0
+        };
         let mut last_read = std::time::Instant::now();
         let mut unread: Option<GlassError> = None;
         let mut unread_owner = whose;
         let mut saw_a_tree = false;
-        let first_read_deadline = if timeout_ms == 0 {
+        let first_read_deadline = if !allow_wait {
             sequence_deadline
         } else {
             action_deadline
@@ -168,7 +245,7 @@ impl Glass {
                     action_deadline
                 };
                 let read_owner =
-                    if first_read && timeout_ms == 0 && sequence_deadline.instant().is_some() {
+                    if first_read && !allow_wait && sequence_deadline.instant().is_some() {
                         crate::Whose::Caller
                     } else {
                         whose
