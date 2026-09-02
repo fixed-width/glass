@@ -1248,7 +1248,7 @@ mod tests {
                         modifiers: None,
                     }),
                     Action::Settle(SettleArgs {
-                        interval_ms: Some(0),
+                        interval_ms: Some(1),
                         settle_frames: Some(1),
                         tolerance: None,
                         timeout_ms: Some(500),
