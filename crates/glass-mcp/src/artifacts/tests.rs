@@ -497,7 +497,7 @@ fn lease_removal_releases_its_lock_before_disposition() {
     let root = tempfile::tempdir().unwrap();
     let lease_name = std::ffi::OsStr::new("server-test.lease");
     let lease_path = root.path().join(lease_name);
-    let root_handle = super::fs::open_process_directory(root.path()).unwrap();
+    let root_handle = super::fs::open_root_directory(root.path()).unwrap();
     let lease = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -521,7 +521,7 @@ fn lease_removal_retry_reacquires_a_lock_released_by_a_failed_disposition() {
     let root = tempfile::tempdir().unwrap();
     let lease_name = std::ffi::OsStr::new("server-test.lease");
     let lease_path = root.path().join(lease_name);
-    let root_handle = super::fs::open_process_directory(root.path()).unwrap();
+    let root_handle = super::fs::open_root_directory(root.path()).unwrap();
     let lease = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -568,6 +568,21 @@ fn lease_removal_retry_reacquires_a_lock_released_by_a_failed_disposition() {
     drop(lease);
 
     assert!(!lease_path.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn artifact_root_handle_lacks_delete_access() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("artifact-root");
+    fs::create_dir(&root).unwrap();
+    let handle = super::fs::open_root_directory(&root).unwrap();
+
+    assert_eq!(
+        glass_windows::remove_by_handle(&handle),
+        Err(glass_windows::HostFsError::Open)
+    );
+    assert!(root.exists());
 }
 
 #[test]

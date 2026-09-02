@@ -356,7 +356,7 @@ impl ArtifactStore {
         fs::create_dir_all(root).map_err(|_| ArtifactError::RootCreateFailed)?;
         let root = fs::canonicalize(root).map_err(|_| ArtifactError::RootCanonicalizeFailed)?;
         require_absolute_utf8(&root)?;
-        let root_handle = open_process_directory(&root)?;
+        let root_handle = open_root_directory(&root)?;
         scavenge_root_from_handle(&root, &root_handle, None)?;
         let process_dir = root.join(format!("server-{server_id}"));
         let lease_path = root.join(format!("server-{server_id}.lease"));
@@ -1638,7 +1638,7 @@ pub(crate) fn map_host_cleanup(error: glass_windows::HostFsError) -> ArtifactErr
 
 #[cfg(test)]
 fn scavenge_root(root: &Path, lease_open_fault: Option<&Path>) -> Result<(), ArtifactError> {
-    let root_handle = open_process_directory(root)?;
+    let root_handle = open_root_directory(root)?;
     scavenge_root_from_handle(root, &root_handle, lease_open_fault)
 }
 
@@ -2093,6 +2093,11 @@ pub(crate) fn classify_uri<'a>(
 }
 
 #[cfg(unix)]
+fn open_root_directory(path: &Path) -> Result<File, ArtifactError> {
+    open_process_directory(path)
+}
+
+#[cfg(unix)]
 fn open_process_directory(path: &Path) -> Result<File, ArtifactError> {
     let fd = rustix::fs::open(
         path,
@@ -2144,8 +2149,14 @@ fn directory_handle_matches_path(handle: &File, path: &Path) -> Result<bool, Art
 }
 
 #[cfg(windows)]
-pub(super) fn open_process_directory(path: &Path) -> Result<File, ArtifactError> {
+pub(super) fn open_root_directory(path: &Path) -> Result<File, ArtifactError> {
     glass_windows::open_directory_no_reparse(path)
+        .map_err(|_| ArtifactError::RootCanonicalizeFailed)
+}
+
+#[cfg(windows)]
+pub(super) fn open_process_directory(path: &Path) -> Result<File, ArtifactError> {
+    glass_windows::open_deletable_directory_no_reparse(path)
         .map_err(|_| ArtifactError::RootCanonicalizeFailed)
 }
 

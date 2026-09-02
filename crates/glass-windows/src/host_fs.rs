@@ -67,12 +67,31 @@ impl DirectoryEntryRecord {
 
 /// Opens a directory itself, rather than a reparse target, and retains rename-compatible sharing.
 pub fn open_directory_no_reparse(path: &Path) -> Result<File, HostFsError> {
-    let file = OpenOptions::new()
+    let file = directory_open_options()
         .read(true)
-        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
-        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
         .open(path)
         .map_err(|_| HostFsError::Open)?;
+    validate_directory(file)
+}
+
+/// Opens a retained no-reparse directory handle that can delete the exact directory.
+pub fn open_deletable_directory_no_reparse(path: &Path) -> Result<File, HostFsError> {
+    let file = directory_open_options()
+        .access_mode((FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE | DELETE).0)
+        .open(path)
+        .map_err(|_| HostFsError::Open)?;
+    validate_directory(file)
+}
+
+fn directory_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0);
+    options
+}
+
+fn validate_directory(file: File) -> Result<File, HostFsError> {
     let metadata = file.metadata().map_err(|_| HostFsError::Open)?;
     if !metadata.is_dir() || is_reparse(&metadata) {
         return Err(HostFsError::Integrity);
@@ -1301,6 +1320,18 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let parent = open_directory_no_reparse(root.path()).unwrap();
         let directory = open_directory_beneath(&parent, OsStr::new("retained-directory")).unwrap();
+
+        remove_retained(directory).unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn deletable_directory_handle_removes_the_exact_retained_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("retained-directory");
+        std::fs::create_dir(&path).unwrap();
+        let directory = open_deletable_directory_no_reparse(&path).unwrap();
 
         remove_retained(directory).unwrap();
 
