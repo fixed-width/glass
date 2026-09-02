@@ -1671,8 +1671,6 @@ mod tests {
                     ChildOpenStage::AfterOpen => {
                         std::fs::rename(&directory_path, &external_path)
                             .map_err(|_| HostFsError::Open)?;
-                        std::fs::rename(&detached_path, &directory_path)
-                            .map_err(|_| HostFsError::Open)?;
                     }
                 }
                 Ok(())
@@ -1680,6 +1678,8 @@ mod tests {
             .unwrap();
         let mut text = String::new();
         file.read_to_string(&mut text).unwrap();
+        drop(file);
+        std::fs::rename(&detached_path, &directory_path).unwrap();
 
         assert_eq!(text, "retained");
         assert_eq!(
