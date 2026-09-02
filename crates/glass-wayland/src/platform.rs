@@ -2066,6 +2066,10 @@ fn modifier_mask(mods: &[glass_core::keys::Modifier]) -> u32 {
     })
 }
 
+fn click_needs_keyboard(mask: u32) -> bool {
+    mask != 0
+}
+
 /// Lets `glass_core::run_drag` drive a Wayland drag through the virtual-pointer
 /// protocol. Each method self-commits (`frame` + roundtrip + 8ms settle) and
 /// advances the event clock so timestamps stay monotonic across the drag.
@@ -2601,7 +2605,8 @@ impl Platform for WaylandPlatform {
                 } => {
                     position(session, x, y)?;
                     let mask = modifier_mask(modifiers);
-                    if mask != 0 {
+                    let needs_keyboard = click_needs_keyboard(mask);
+                    if needs_keyboard {
                         upload_keymap_by(
                             session,
                             &kb,
@@ -2613,7 +2618,7 @@ impl Platform for WaylandPlatform {
                         dispatch.mark();
                     }
                     let mut held = Held {
-                        modifiers: mask != 0,
+                        modifiers: needs_keyboard,
                         ..Held::default()
                     };
                     let b = evdev_button(button);
@@ -4160,6 +4165,16 @@ mod pure_tests {
         assert_eq!(find_wayland_socket(dir.path()), None);
     }
 
+    #[test]
+    fn a_plain_click_does_not_configure_the_virtual_keyboard() {
+        assert!(!click_needs_keyboard(0));
+    }
+
+    #[test]
+    fn a_modified_click_configures_the_virtual_keyboard() {
+        assert!(click_needs_keyboard(0b100));
+    }
+
     /// The XKB real-modifier bits, in the order `include "complete"` assigns them.
     #[test]
     fn each_modifier_is_its_own_xkb_bit() {
@@ -5258,6 +5273,11 @@ mod session_tests {
             count: 1,
             modifiers,
         };
+        // Drain one plain click because sway may deliver its initial keyboard state with the first focused input.
+        s.platform()
+            .send_pointer(&click(vec![]))
+            .expect("prime input");
+        s.wait_for_log(" 272 0");
         s.platform().send_pointer(&click(vec![])).expect("plain");
         let plain = s.wait_for_log(" 272 0");
         assert!(
