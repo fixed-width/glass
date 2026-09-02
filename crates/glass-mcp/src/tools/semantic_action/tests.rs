@@ -1,8 +1,13 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use glass_core::{
-    ActionMode, ActionTarget, Backend, BaselineStore, BoundDispatch, Glass, PlatformFactory,
+    Accessibility, ActionMode, ActionTarget, AppSpec, AxContext, AxNodeId, AxStateCoverage,
+    AxTarget, Backend, BaselineStore, BoundDispatch, ChangeSignal, Deadline, Frame, Glass,
+    GlassError, HostPathProtectionMode, KeyEvent, Platform, PlatformFactory, PointerEvent,
+    PointerHit, ProtectedHostPath, Region, SandboxLevel, Stream, WindowGeometry, WindowId,
+    WindowInfo, WindowOp,
 };
 
 use super::{
@@ -14,18 +19,339 @@ use crate::tools::{
     ContextualError, ToolContext, click_element_with, set_value_with, type_text_with,
 };
 
-fn panicking_glass() -> (Glass, Arc<AtomicBool>) {
-    let touched = Arc::new(AtomicBool::new(false));
-    let factory_touched = touched.clone();
-    let factory: PlatformFactory = Box::new(move |_| -> glass_core::Result<Backend> {
-        factory_touched.store(true, Ordering::SeqCst);
-        panic!("invalid request reached the platform factory")
+#[derive(Clone, Copy)]
+enum SessionIoKind {
+    Action,
+    Input,
+    Capture,
+    Accessibility,
+    Other,
+}
+
+#[derive(Default)]
+struct SessionIoCounters {
+    action: AtomicUsize,
+    input: AtomicUsize,
+    capture: AtomicUsize,
+    accessibility: AtomicUsize,
+    other: AtomicUsize,
+    calls: Mutex<Vec<&'static str>>,
+}
+
+impl SessionIoCounters {
+    fn record(&self, kind: SessionIoKind, call: &'static str) {
+        let counter = match kind {
+            SessionIoKind::Action => &self.action,
+            SessionIoKind::Input => &self.input,
+            SessionIoKind::Capture => &self.capture,
+            SessionIoKind::Accessibility => &self.accessibility,
+            SessionIoKind::Other => &self.other,
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+        self.calls.lock().unwrap().push(call);
+    }
+
+    fn clear(&self) {
+        self.action.store(0, Ordering::SeqCst);
+        self.input.store(0, Ordering::SeqCst);
+        self.capture.store(0, Ordering::SeqCst);
+        self.accessibility.store(0, Ordering::SeqCst);
+        self.other.store(0, Ordering::SeqCst);
+        self.calls.lock().unwrap().clear();
+    }
+
+    fn assert_zero(&self, name: &str) {
+        let counts = [
+            ("action", self.action.load(Ordering::SeqCst)),
+            ("input", self.input.load(Ordering::SeqCst)),
+            ("capture", self.capture.load(Ordering::SeqCst)),
+            ("accessibility", self.accessibility.load(Ordering::SeqCst)),
+            ("other", self.other.load(Ordering::SeqCst)),
+        ];
+        assert!(
+            counts.iter().all(|(_, count)| *count == 0),
+            "{name}: invalid request performed post-start session I/O: {counts:?}; calls={:?}",
+            self.calls.lock().unwrap()
+        );
+    }
+}
+
+struct InstrumentedPlatform {
+    counters: Arc<SessionIoCounters>,
+    geometry: WindowGeometry,
+}
+
+impl Platform for InstrumentedPlatform {
+    fn configure_protected_host_paths(
+        &mut self,
+        _paths: &[ProtectedHostPath],
+    ) -> glass_core::Result<HostPathProtectionMode> {
+        self.counters.record(SessionIoKind::Other, "configure");
+        Ok(HostPathProtectionMode::SandboxRules)
+    }
+
+    fn start_app(&mut self, _spec: &AppSpec) -> glass_core::Result<WindowGeometry> {
+        self.counters.record(SessionIoKind::Other, "start");
+        Ok(self.geometry.clone())
+    }
+
+    fn stop_app_by(&mut self, _deadline: Deadline) -> glass_core::Result<()> {
+        self.counters.record(SessionIoKind::Other, "stop");
+        Ok(())
+    }
+
+    fn capture_frame_by(
+        &mut self,
+        _region: Option<&Region>,
+        _deadline: Deadline,
+    ) -> glass_core::Result<Frame> {
+        self.counters
+            .record(SessionIoKind::Capture, "capture_frame");
+        Frame::new(1, 1, vec![0, 0, 0, 255])
+    }
+
+    fn capture_window_by(
+        &mut self,
+        _id: WindowId,
+        _region: Option<&Region>,
+        _deadline: Deadline,
+    ) -> glass_core::Result<Frame> {
+        self.counters
+            .record(SessionIoKind::Capture, "capture_window");
+        Frame::new(1, 1, vec![0, 0, 0, 255])
+    }
+
+    fn send_pointer_by(
+        &mut self,
+        _event: &PointerEvent,
+        _deadline: Deadline,
+    ) -> glass_core::Result<()> {
+        self.counters.record(SessionIoKind::Input, "pointer");
+        Ok(())
+    }
+
+    fn send_key_by(&mut self, _event: &KeyEvent, _deadline: Deadline) -> glass_core::Result<()> {
+        self.counters.record(SessionIoKind::Input, "key");
+        Ok(())
+    }
+
+    fn get_clipboard(&mut self) -> glass_core::Result<String> {
+        self.counters.record(SessionIoKind::Other, "get_clipboard");
+        Ok(String::new())
+    }
+
+    fn set_clipboard(&mut self, _text: &str) -> glass_core::Result<()> {
+        self.counters.record(SessionIoKind::Other, "set_clipboard");
+        Ok(())
+    }
+
+    fn window_by(
+        &mut self,
+        _op: &WindowOp,
+        _deadline: Deadline,
+    ) -> glass_core::Result<WindowGeometry> {
+        self.counters.record(SessionIoKind::Action, "window");
+        Ok(self.geometry.clone())
+    }
+
+    fn list_windows_by(&mut self, _deadline: Deadline) -> glass_core::Result<Vec<WindowInfo>> {
+        self.counters.record(SessionIoKind::Other, "list_windows");
+        Ok(vec![WindowInfo {
+            id: WindowId(1),
+            title: Some("instrumented".into()),
+            class: None,
+            geometry: self.geometry.clone(),
+            active: true,
+        }])
+    }
+
+    fn select_window_by(
+        &mut self,
+        _id: WindowId,
+        _deadline: Deadline,
+    ) -> glass_core::Result<WindowGeometry> {
+        self.counters.record(SessionIoKind::Action, "select_window");
+        Ok(self.geometry.clone())
+    }
+
+    fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+        self.counters.record(SessionIoKind::Other, "drain_logs");
+        Vec::new()
+    }
+
+    fn app_pid(&self) -> Option<u32> {
+        self.counters.record(SessionIoKind::Other, "app_pid");
+        None
+    }
+
+    fn app_pids(&self) -> Vec<u32> {
+        self.counters.record(SessionIoKind::Other, "app_pids");
+        Vec::new()
+    }
+
+    fn app_pids_by(&self, _deadline: Deadline) -> glass_core::Result<Vec<u32>> {
+        self.counters.record(SessionIoKind::Other, "app_pids_by");
+        Ok(Vec::new())
+    }
+
+    fn a11y_bus_addr(&self) -> Option<String> {
+        self.counters.record(SessionIoKind::Other, "a11y_bus_addr");
+        None
+    }
+
+    fn active_window_handle(&self) -> Option<i64> {
+        self.counters
+            .record(SessionIoKind::Other, "active_window_handle");
+        None
+    }
+
+    fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
+        self.counters
+            .record(SessionIoKind::Other, "a11y_toggle_control_at_trailing_edge");
+        false
+    }
+}
+
+struct InstrumentedAccessibility {
+    counters: Arc<SessionIoCounters>,
+}
+
+impl Accessibility for InstrumentedAccessibility {
+    fn snapshot(&mut self, _ctx: &AxContext) -> glass_core::Result<glass_core::AxTree> {
+        self.counters
+            .record(SessionIoKind::Accessibility, "a11y_snapshot");
+        Ok(crate::tools::testutil::empty_tree())
+    }
+
+    fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        self.counters
+            .record(SessionIoKind::Accessibility, "a11y_subscribe");
+        None
+    }
+
+    fn state_coverage(&self) -> AxStateCoverage {
+        self.counters
+            .record(SessionIoKind::Accessibility, "a11y_state_coverage");
+        AxStateCoverage::NONE
+    }
+
+    fn focus(
+        &mut self,
+        _ctx: &AxContext,
+        _target: &AxTarget,
+    ) -> glass_core::Result<Option<AxNodeId>> {
+        self.counters.record(SessionIoKind::Action, "a11y_focus");
+        Ok(None)
+    }
+
+    fn pointer_target_at(
+        &mut self,
+        _ctx: &AxContext,
+        _target: &AxTarget,
+        _point: (i32, i32),
+    ) -> glass_core::Result<PointerHit> {
+        self.counters
+            .record(SessionIoKind::Accessibility, "a11y_pointer_target");
+        Ok(PointerHit::Inconclusive)
+    }
+
+    fn set_value(
+        &mut self,
+        _ctx: &AxContext,
+        _target: &AxTarget,
+        _text: &str,
+    ) -> glass_core::Result<()> {
+        self.counters
+            .record(SessionIoKind::Action, "a11y_set_value");
+        Ok(())
+    }
+
+    fn invoke(
+        &mut self,
+        _ctx: &AxContext,
+        _target: &AxTarget,
+    ) -> glass_core::Result<Option<AxNodeId>> {
+        self.counters.record(SessionIoKind::Action, "a11y_invoke");
+        Ok(None)
+    }
+}
+
+fn started_instrumented_glass() -> (Glass, Arc<SessionIoCounters>, Arc<AtomicUsize>) {
+    let counters = Arc::new(SessionIoCounters::default());
+    let geometry = WindowGeometry {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+    };
+    let mut held = Some(Backend {
+        platform: Box::new(InstrumentedPlatform {
+            counters: counters.clone(),
+            geometry,
+        }),
+        accessibility: Some(Box::new(InstrumentedAccessibility {
+            counters: counters.clone(),
+        })),
     });
-    let root = tempfile::tempdir().unwrap().path().join("baselines");
-    (
-        Glass::new(factory, "x11".into(), BaselineStore::new(root), 100),
-        touched,
-    )
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let recorded_factory_calls = factory_calls.clone();
+    let factory: PlatformFactory = Box::new(move |_| {
+        recorded_factory_calls.fetch_add(1, Ordering::SeqCst);
+        held.take()
+            .ok_or_else(|| GlassError::Backend("test factory called twice".into()))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    let mut glass = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["app".into()],
+            cwd: None,
+            env: Vec::new(),
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: true,
+        })
+        .unwrap();
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+    counters.clear();
+    (glass, counters, factory_calls)
+}
+
+#[test]
+fn invalid_handler_harness_runs_with_an_active_session() {
+    let (glass, counters, factory_calls) = started_instrumented_glass();
+    assert!(
+        glass.geometry().is_ok(),
+        "invalid-handler tests must exercise validation against an active session"
+    );
+    counters.assert_zero("harness setup");
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn invalid_handler_harness_observes_every_session_io_category() {
+    let (mut glass, counters, _) = started_instrumented_glass();
+    glass.screenshot(None, None).unwrap();
+    glass.key(&KeyEvent::Text("x".into())).unwrap();
+    glass.a11y_snapshot(None).unwrap();
+    glass.window(&WindowOp::Geometry).unwrap();
+
+    for (kind, count) in [
+        ("action", counters.action.load(Ordering::SeqCst)),
+        ("input", counters.input.load(Ordering::SeqCst)),
+        ("capture", counters.capture.load(Ordering::SeqCst)),
+        (
+            "accessibility",
+            counters.accessibility.load(Ordering::SeqCst),
+        ),
+        ("other", counters.other.load(Ordering::SeqCst)),
+    ] {
+        assert!(count > 0, "instrumentation did not observe {kind} I/O");
+    }
 }
 
 enum InvalidHandlerArgs {
@@ -35,7 +361,7 @@ enum InvalidHandlerArgs {
 }
 
 fn assert_invalid_handler(name: &str, args: InvalidHandlerArgs, expected: &str) {
-    let (mut glass, touched) = panicking_glass();
+    let (mut glass, counters, factory_calls) = started_instrumented_glass();
     let result = match args {
         InvalidHandlerArgs::Click(args) => {
             click_element_with(&mut glass, &args, ToolContext::UNBOUNDED)
@@ -56,9 +382,11 @@ fn assert_invalid_handler(name: &str, args: InvalidHandlerArgs, expected: &str) 
         Some(BoundDispatch::NotDispatched),
         "{name}: validation must be proven pre-dispatch"
     );
-    assert!(
-        !touched.load(Ordering::SeqCst),
-        "{name}: validation touched the platform factory"
+    counters.assert_zero(name);
+    assert_eq!(
+        factory_calls.load(Ordering::SeqCst),
+        1,
+        "{name}: validation attempted to create another session"
     );
 }
 

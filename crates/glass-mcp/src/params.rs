@@ -332,9 +332,9 @@ pub struct ScrollArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TypeArgs {
-    /// Text to type into whatever currently has keyboard focus — this tool does not
-    /// focus a field, so click or `glass_click_element` one first. Sent as synthetic
-    /// key events, not pasted, so an app's per-keystroke handlers run.
+    /// Text to type. When `target` is omitted, text is sent to the current keyboard focus.
+    /// When `target` is supplied, Glass resolves and focuses that element before typing.
+    /// Sent as synthetic key events, not pasted, so an app's per-keystroke handlers run.
     pub text: String,
     pub target: Option<ActionTargetArgs>,
     pub focus_mode: Option<ActionModeArg>,
@@ -1029,6 +1029,34 @@ mod tests {
         );
         assert!(matches!(a.focus_mode, Some(ActionModeArg::Native)));
         assert_eq!(a.timeout_ms, Some(5_000));
+    }
+
+    #[test]
+    fn type_args_text_schema_distinguishes_targeted_and_untargeted_focus() {
+        let schema = serde_json::to_value(schemars::schema_for!(TypeArgs)).unwrap();
+        let description = schema["properties"]["text"]["description"]
+            .as_str()
+            .expect("text has a public schema description");
+        assert!(
+            description.contains("When `target` is omitted"),
+            "{description}"
+        );
+        assert!(
+            description.contains("current keyboard focus"),
+            "{description}"
+        );
+        assert!(
+            description.contains("When `target` is supplied"),
+            "{description}"
+        );
+        assert!(
+            description.contains("resolves and focuses"),
+            "{description}"
+        );
+        assert!(
+            !description.contains("does not focus a field"),
+            "{description}"
+        );
     }
 
     fn json_contains_number(value: &serde_json::Value, key: &str, expected: u64) -> bool {
