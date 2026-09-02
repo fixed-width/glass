@@ -4254,16 +4254,11 @@ mod tests {
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
         let log2 = log.clone();
+        let mut accessibility = FakeAccessibility::new(fake_tree());
+        accessibility.set_log = log2;
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(FakePlatform::new(100, 100)),
-            accessibility: Some(Box::new(FakeAccessibility {
-                tree: fake_tree(),
-                set_log: log2,
-                set_fail: false,
-                ctx_log: Arc::new(Mutex::new(None)),
-                invoke_behavior: InvokeBehavior::Unsupported,
-                invoke_log: Arc::new(Mutex::new(Vec::new())),
-            })),
+            accessibility: Some(Box::new(accessibility)),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
             held.take()
@@ -4326,14 +4321,9 @@ mod tests {
         tree: AxTree,
         set_log: Arc<Mutex<Vec<(AxTarget, String)>>>,
     ) -> FakeAccessibility {
-        FakeAccessibility {
-            tree,
-            set_log,
-            set_fail: false,
-            ctx_log: Arc::new(Mutex::new(None)),
-            invoke_behavior: InvokeBehavior::Unsupported,
-            invoke_log: Arc::new(Mutex::new(Vec::new())),
-        }
+        let mut accessibility = FakeAccessibility::new(tree);
+        accessibility.set_log = set_log;
+        accessibility
     }
 
     fn glass_with_geometry_failure_ready_for_set_value(
@@ -4674,16 +4664,11 @@ mod tests {
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
         let ctx_log = Arc::new(Mutex::new(None));
+        let mut accessibility = FakeAccessibility::new(fake_tree());
+        accessibility.ctx_log = ctx_log.clone();
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(FakePlatform::new(100, 100)),
-            accessibility: Some(Box::new(FakeAccessibility {
-                tree: fake_tree(),
-                set_log: Arc::new(Mutex::new(Vec::new())),
-                set_fail: false,
-                ctx_log: ctx_log.clone(),
-                invoke_behavior: InvokeBehavior::Unsupported,
-                invoke_log: Arc::new(Mutex::new(Vec::new())),
-            })),
+            accessibility: Some(Box::new(accessibility)),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
             held.take()
@@ -4724,16 +4709,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
+        let mut accessibility = FakeAccessibility::new(fake_tree());
+        accessibility.set_fail = true;
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(FakePlatform::new(100, 100)),
-            accessibility: Some(Box::new(FakeAccessibility {
-                tree: fake_tree(),
-                set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-                set_fail: true,
-                ctx_log: Arc::new(Mutex::new(None)),
-                invoke_behavior: InvokeBehavior::Unsupported,
-                invoke_log: Arc::new(Mutex::new(Vec::new())),
-            })),
+            accessibility: Some(Box::new(accessibility)),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
             held.take()
@@ -5185,20 +5165,16 @@ mod tests {
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
         let log2 = log.clone();
+        let mut accessibility = FakeAccessibility::new(fake_tree());
+        accessibility.set_log = log2;
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(
                 FakePlatform::new(100, 100)
                     .with_drag_log(drags.clone())
                     .with_trailing_toggle_backend(),
             ),
-            accessibility: Some(Box::new(FakeAccessibility {
-                tree: fake_tree(), // #1 is a non-checkable Button "Save"
-                set_log: log2,
-                set_fail: false,
-                ctx_log: Arc::new(Mutex::new(None)),
-                invoke_behavior: InvokeBehavior::Unsupported,
-                invoke_log: Arc::new(Mutex::new(Vec::new())),
-            })),
+            // fake_tree: #1 is a non-checkable Button "Save"
+            accessibility: Some(Box::new(accessibility)),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
             held.take()
@@ -5234,20 +5210,16 @@ mod tests {
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
         let log2 = log.clone();
+        let mut accessibility = FakeAccessibility::new(sw(false));
+        accessibility.set_log = log2;
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(
                 FakePlatform::new(400, 400)
                     .with_drag_log(drags.clone())
                     .with_trailing_toggle_backend(),
             ),
-            accessibility: Some(Box::new(FakeAccessibility {
-                tree: sw(false), // #1 is the checkable switch "Sw"
-                set_log: log2,
-                set_fail: false,
-                ctx_log: Arc::new(Mutex::new(None)),
-                invoke_behavior: InvokeBehavior::Unsupported,
-                invoke_log: Arc::new(Mutex::new(Vec::new())),
-            })),
+            // sw(false): #1 is the checkable switch "Sw"
+            accessibility: Some(Box::new(accessibility)),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
             held.take()

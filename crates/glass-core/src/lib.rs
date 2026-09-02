@@ -123,8 +123,12 @@ pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef
 
 pub mod session;
 pub use session::{
-    Backend, FindElementsOutcome, FindElementsParams, Glass, PlatformFactory,
-    SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS, ScrollDirection, ScrollToElementOutcome,
-    ScrollToElementParams, WaitElementOutcome, WaitElementParams, WaitLogOutcome, WaitLogParams,
-    WaitRegionOutcome, WaitRegionParams, WaitStableOutcome, WaitStableParams,
+    ActionDeadline, ActionMethod, ActionMode, ActionTarget, Backend, ClickTargetParams,
+    ConfirmationStatus, DispatchStatus, FindElementsOutcome, FindElementsParams, Glass,
+    MutationReport, PlatformFactory, ResolutionReport, RetryGuidance, SCROLL_TO_DEFAULT_STEP,
+    SCROLL_TO_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS,
+    SEMANTIC_ACTION_MAX_TIMEOUT_MS, ScrollDirection, ScrollToElementOutcome, ScrollToElementParams,
+    SemanticActionError, SemanticActionFailureKind, SemanticActionOutcome, SemanticTarget,
+    SetValueTargetParams, TypeTargetParams, WaitElementOutcome, WaitElementParams, WaitLogOutcome,
+    WaitLogParams, WaitRegionOutcome, WaitRegionParams, WaitStableOutcome, WaitStableParams,
 };

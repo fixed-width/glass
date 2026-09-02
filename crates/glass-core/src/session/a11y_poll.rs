@@ -1,8 +1,5 @@
 use super::*;
 
-/// Maximum wall-clock time a change signal may suppress tree reads.
-const REREAD_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// Reader headroom reserved before a quiet wait's deadline, capped at one quarter of the
 /// remaining budget.
 const FINAL_READ_HEADROOM: std::time::Duration = std::time::Duration::from_millis(20);
@@ -18,8 +15,12 @@ fn final_read_pause(left: std::time::Duration) -> std::time::Duration {
     left.saturating_sub(FINAL_READ_HEADROOM.min(left / 4))
 }
 
-fn quiet_wait_needs_read(final_read: bool, since_last: std::time::Duration) -> bool {
-    final_read || since_last >= REREAD_AFTER
+fn quiet_wait_needs_read(
+    final_read: bool,
+    since_last: std::time::Duration,
+    reread_after: std::time::Duration,
+) -> bool {
+    final_read || since_last >= reread_after
 }
 
 fn should_schedule_final_read(
@@ -75,6 +76,27 @@ impl Glass {
         timeout_ms: u64,
         sequence_deadline: Deadline,
         operation: &'static str,
+        observe: impl FnMut(&AxTree) -> O,
+        satisfied: impl FnMut(&O) -> bool,
+    ) -> Result<A11yPollOutcome<O>> {
+        self.poll_accessibility_until_with_reread(
+            interval_ms,
+            std::time::Duration::from_secs(1),
+            timeout_ms,
+            sequence_deadline,
+            operation,
+            observe,
+            satisfied,
+        )
+    }
+
+    pub(super) fn poll_accessibility_until_with_reread<O>(
+        &mut self,
+        interval_ms: u64,
+        reread_after: std::time::Duration,
+        timeout_ms: u64,
+        sequence_deadline: Deadline,
+        operation: &'static str,
         mut observe: impl FnMut(&AxTree) -> O,
         mut satisfied: impl FnMut(&O) -> bool,
     ) -> Result<A11yPollOutcome<O>> {
@@ -122,7 +144,9 @@ impl Glass {
                 let read_now = match signal.as_mut() {
                     Some(s) => match s.wait(pause_budget) {
                         ChangeWait::Changed => true,
-                        ChangeWait::Quiet => quiet_wait_needs_read(final_read, last_read.elapsed()),
+                        ChangeWait::Quiet => {
+                            quiet_wait_needs_read(final_read, last_read.elapsed(), reread_after)
+                        }
                         ChangeWait::Unusable => {
                             signal = None;
                             true
@@ -252,12 +276,14 @@ mod tests {
 
     #[test]
     fn a_quiet_signal_reads_only_for_a_safety_or_periodic_refresh() {
+        let reread_after = Duration::from_secs(1);
         assert!(!quiet_wait_needs_read(
             false,
-            REREAD_AFTER - Duration::from_millis(1)
+            reread_after - Duration::from_millis(1),
+            reread_after,
         ));
-        assert!(quiet_wait_needs_read(false, REREAD_AFTER));
-        assert!(quiet_wait_needs_read(true, Duration::ZERO));
+        assert!(quiet_wait_needs_read(false, reread_after, reread_after));
+        assert!(quiet_wait_needs_read(true, Duration::ZERO, reread_after));
     }
 
     #[test]
