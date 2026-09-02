@@ -5,8 +5,6 @@
 
 use std::time::Duration;
 
-use crate::accessibility::ClickMethod;
-use crate::error::Result;
 use crate::platform::{AppSpec, KeyEvent, PointerEvent, WindowOp};
 
 /// The active window an actuation was directed at (best-effort).
@@ -38,8 +36,8 @@ pub struct AuditOutcome {
 }
 
 impl AuditOutcome {
-    /// Derive an outcome from a `glass-core` result (the error is stringified).
-    pub fn from_result<T>(r: &Result<T>) -> Self {
+    /// Derive an outcome from a result whose error can be safely stringified.
+    pub fn from_result<T, E: std::fmt::Display>(r: &std::result::Result<T, E>) -> Self {
         match r {
             Ok(_) => AuditOutcome {
                 ok: true,
@@ -76,10 +74,12 @@ pub enum Actuation<'a> {
     },
     ClickElement {
         element: ElementRef,
-        /// How the click actuated — the sink renders its label and, for the pointer
-        /// path, the reason the native action was not used. `None` when the click
-        /// ultimately failed (neither path succeeded).
-        method: Option<&'a ClickMethod>,
+        mode: &'a str,
+        method: Option<&'a str>,
+        native_fallback: Option<&'a str>,
+        actuated_id: Option<u32>,
+        dispatch: &'a str,
+        confirmation: &'a str,
     },
     SetValue {
         element: ElementRef,
@@ -109,39 +109,53 @@ mod tests {
 
     #[test]
     fn outcome_from_result_captures_ok_and_error() {
-        let ok: Result<()> = Ok(());
+        let ok: std::result::Result<(), &str> = Ok(());
         let o = AuditOutcome::from_result(&ok);
         assert!(o.ok && o.error.is_none());
 
-        let err: Result<()> = Err(GlassError::NoActiveSession);
+        let err: std::result::Result<(), GlassError> = Err(GlassError::NoActiveSession);
         let e = AuditOutcome::from_result(&err);
         assert!(!e.ok);
         assert!(e.error.unwrap().to_lowercase().contains("session"));
     }
 
     #[test]
-    fn click_element_actuation_carries_the_actuating_method() {
+    fn click_element_actuation_carries_safe_semantic_dispatch_metadata() {
         let element = ElementRef {
             id: 1,
             role: Some("Button".into()),
             name: Some("Save".into()),
         };
-        let method = ClickMethod::Pointer {
-            native_fallback: "element exposes no activation action".into(),
-        };
         let act = Actuation::ClickElement {
-            element,
-            method: Some(&method),
+            element: element.clone(),
+            mode: "auto",
+            method: Some("pointer"),
+            native_fallback: Some("target exposes no native accessibility action"),
+            actuated_id: None,
+            dispatch: "dispatched",
+            confirmation: "dispatch_confirmed",
         };
-        let Actuation::ClickElement { method: got, .. } = act else {
+        let Actuation::ClickElement {
+            element: got_element,
+            mode,
+            method,
+            native_fallback,
+            actuated_id,
+            dispatch,
+            confirmation,
+        } = act
+        else {
             panic!("wrong variant");
         };
-        // The sink renders both halves; borrowing the whole method (not a pre-rendered
-        // label) is what keeps the fallback reason reachable.
-        assert_eq!(got.map(ClickMethod::label), Some(method.label()));
+        assert_eq!(got_element, element);
+        assert_eq!(mode, "auto");
+        assert_eq!(method, Some("pointer"));
         assert_eq!(
-            got.and_then(ClickMethod::native_fallback),
-            Some("element exposes no activation action")
+            native_fallback,
+            Some("target exposes no native accessibility action")
         );
+        assert_eq!(actuated_id, None);
+        assert_eq!(dispatch, "dispatched");
+        assert_eq!(confirmation, "dispatch_confirmed");
     }
 }

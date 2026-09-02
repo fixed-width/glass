@@ -1665,3 +1665,474 @@ fn legacy_id_missing_bounds_preserves_the_primitive_error_before_dispatch() {
     ));
     assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
 }
+
+fn click_mode_glass(
+    trees: Vec<AxTree>,
+    behavior: InvokeBehavior,
+) -> (
+    Glass,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<(i32, i32)>>>,
+    AxDeadlineLog,
+) {
+    let native_calls = Arc::new(AtomicUsize::new(0));
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let deadlines = Arc::new(Mutex::new(Vec::new()));
+    let accessibility = SeqAccessibility::new(trees)
+        .with_coverage(full_state_coverage())
+        .with_invoke_behavior(behavior)
+        .with_invoke_calls(native_calls.clone())
+        .with_deadlines(deadlines.clone())
+        .with_hit(PointerHit::Target);
+    let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+    (
+        glass_with_backend(platform, Box::new(accessibility)),
+        native_calls,
+        clicks,
+        deadlines,
+    )
+}
+
+fn semantic_click_params(mode: ActionMode, timeout_ms: u64) -> ClickTargetParams {
+    ClickTargetParams {
+        target: ActionTarget::Semantic(semantic_target("Save")),
+        mode,
+        timeout_ms: Some(timeout_ms),
+        max_nodes: None,
+    }
+}
+
+#[test]
+fn semantic_auto_click_uses_native_action_first() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let (mut glass, native_calls, clicks, _) =
+        click_mode_glass(vec![tree], InvokeBehavior::Succeed);
+    glass.start(&spec()).unwrap();
+
+    let outcome = glass
+        .click_target_by(
+            &semantic_click_params(ActionMode::Auto, 500),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(native_calls.load(Ordering::Relaxed), 1);
+    assert!(clicks.lock().unwrap().is_empty());
+    assert!(matches!(
+        outcome.action.method,
+        ActionMethod::NativeAction { actuated: None }
+    ));
+    assert_eq!(outcome.action.dispatch, DispatchStatus::Dispatched);
+    assert_eq!(
+        outcome.action.confirmation,
+        ConfirmationStatus::DispatchConfirmed
+    );
+}
+
+#[test]
+fn semantic_auto_click_falls_back_only_after_proven_pre_dispatch_unavailable() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let (mut glass, native_calls, clicks, deadlines) =
+        click_mode_glass(vec![tree.clone(), tree], InvokeBehavior::NoAction);
+    glass.start(&spec()).unwrap();
+
+    let outcome = glass
+        .click_target_by(
+            &semantic_click_params(ActionMode::Auto, 500),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(native_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(clicks.lock().unwrap().len(), 1);
+    assert!(matches!(
+        outcome.action.method,
+        ActionMethod::Pointer {
+            native_fallback: Some(ref reason)
+        } if reason == "element exposes no activation action"
+    ));
+    assert_eq!(outcome.action.dispatch, DispatchStatus::Dispatched);
+    assert!(
+        deadlines
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|deadline| *deadline == outcome.bound.deadline),
+        "auto fallback must keep the original action deadline"
+    );
+    assert_eq!(
+        outcome.action.confirmation,
+        ConfirmationStatus::DispatchConfirmed
+    );
+}
+
+#[test]
+fn semantic_auto_click_never_falls_back_after_possible_native_dispatch() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let (mut glass, native_calls, clicks, _) =
+        click_mode_glass(vec![tree], InvokeBehavior::MayHaveDispatched);
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_by(
+            &semantic_click_params(ActionMode::Auto, 500),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_eq!(native_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(native_calls.load(Ordering::Relaxed).saturating_sub(1), 0);
+    assert!(clicks.lock().unwrap().is_empty());
+    assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(error.retry, RetryGuidance::DoNotRetry);
+}
+
+#[test]
+fn semantic_native_mode_never_dispatches_pointer() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let (mut glass, native_calls, clicks, _) =
+        click_mode_glass(vec![tree], InvokeBehavior::Unsupported);
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_by(
+            &semantic_click_params(ActionMode::Native, 500),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_eq!(native_calls.load(Ordering::Relaxed), 1);
+    assert!(clicks.lock().unwrap().is_empty());
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+}
+
+#[test]
+fn semantic_pointer_mode_never_attempts_native_invoke() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let (mut glass, native_calls, clicks, _) =
+        click_mode_glass(vec![tree.clone(), tree], InvokeBehavior::Succeed);
+    let sink = RecordingSink::default();
+    glass.set_audit_sink(Box::new(sink.clone()));
+    glass.start(&spec()).unwrap();
+
+    let outcome = glass
+        .click_target_by(
+            &semantic_click_params(ActionMode::Pointer, 500),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(native_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(clicks.lock().unwrap().len(), 1);
+    assert_eq!(
+        outcome.action.method,
+        ActionMethod::Pointer {
+            native_fallback: None
+        }
+    );
+    let audits = sink.1.lock().unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].mode, "pointer");
+    assert_eq!(audits[0].method.as_deref(), Some("pointer"));
+    assert_eq!(audits[0].native_fallback, None);
+    assert_eq!(audits[0].dispatch, "dispatched");
+    assert_eq!(audits[0].confirmation, "dispatch_confirmed");
+}
+
+#[test]
+fn semantic_native_click_can_actuate_a_known_hidden_target_and_discloses_visibility_failure_as_optional()
+ {
+    let mut tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    tree.root.children[0].states.visible = false;
+    let (mut glass, native_calls, clicks, _) =
+        click_mode_glass(vec![tree], InvokeBehavior::Succeed);
+    glass.start(&spec()).unwrap();
+
+    let outcome = glass
+        .click_target_by(
+            &semantic_click_params(ActionMode::Native, 500),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(native_calls.load(Ordering::Relaxed), 1);
+    assert!(clicks.lock().unwrap().is_empty());
+    let visible = outcome
+        .actionability
+        .checks
+        .iter()
+        .find(|check| check.name == ActionabilityCheckName::Visible)
+        .unwrap();
+    assert_eq!(visible.verdict, ActionabilityVerdict::Failed);
+    assert!(!visible.required);
+}
+
+#[test]
+fn semantic_pointer_click_refuses_the_same_known_hidden_target() {
+    let mut tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    tree.root.children[0].states.visible = false;
+    let (mut glass, native_calls, clicks, _) =
+        click_mode_glass(vec![tree], InvokeBehavior::Succeed);
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_by(
+            &semantic_click_params(ActionMode::Pointer, 0),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_eq!(native_calls.load(Ordering::Relaxed), 0);
+    assert!(clicks.lock().unwrap().is_empty());
+    assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(
+        error.actionability.blocking().unwrap().name,
+        ActionabilityCheckName::Visible
+    );
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+}
+
+#[test]
+fn duplicate_semantic_click_dispatches_neither_native_nor_pointer() {
+    let tree = duplicate_button_tree("Save", 2);
+    let (mut glass, native_calls, clicks, _) =
+        click_mode_glass(vec![tree], InvokeBehavior::Succeed);
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_by(
+            &semantic_click_params(ActionMode::Auto, 0),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_eq!(native_calls.load(Ordering::Relaxed), 0);
+    assert!(clicks.lock().unwrap().is_empty());
+    assert_eq!(error.kind, SemanticActionFailureKind::AmbiguousTarget);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+}
+
+#[test]
+fn legacy_click_element_fields_and_native_first_behavior_are_unchanged() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let id = tree.root.children[0].id;
+    let (mut legacy, legacy_native_calls, legacy_clicks, _) =
+        click_mode_glass(vec![tree.clone()], InvokeBehavior::SucceedOnAnother(7));
+    let legacy_sink = RecordingSink::default();
+    legacy.set_audit_sink(Box::new(legacy_sink.clone()));
+    legacy.start(&spec()).unwrap();
+    legacy.a11y_snapshot(None).unwrap();
+
+    let legacy_method = legacy.click_element(id).unwrap();
+
+    assert_eq!(legacy_method.label(), "native-action");
+    assert_eq!(legacy_method.native_fallback(), None);
+    assert_eq!(legacy_method.actuated(), Some(AxNodeId(7)));
+    assert_eq!(legacy_native_calls.load(Ordering::Relaxed), 1);
+    assert!(legacy_clicks.lock().unwrap().is_empty());
+    let legacy_audits = legacy_sink.1.lock().unwrap();
+    assert_eq!(legacy_audits.len(), 1);
+    assert_eq!(legacy_audits[0].mode, "auto");
+    assert_eq!(legacy_audits[0].method.as_deref(), Some("native-action"));
+    assert_eq!(legacy_audits[0].actuated_id, Some(7));
+    drop(legacy_audits);
+
+    let (mut semantic, semantic_native_calls, semantic_clicks, _) =
+        click_mode_glass(vec![tree], InvokeBehavior::NoAction);
+    let semantic_sink = RecordingSink::default();
+    semantic.set_audit_sink(Box::new(semantic_sink.clone()));
+    semantic.start(&spec()).unwrap();
+    semantic.a11y_snapshot(None).unwrap();
+    let outcome = semantic
+        .click_target_by(
+            &ClickTargetParams {
+                target: ActionTarget::Id(id),
+                mode: ActionMode::Auto,
+                timeout_ms: None,
+                max_nodes: None,
+            },
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+    let legacy_pointer = semantic.click_element(id).unwrap();
+
+    assert!(matches!(
+        outcome.action.method,
+        ActionMethod::Pointer {
+            native_fallback: Some(_)
+        }
+    ));
+    assert_eq!(legacy_pointer.label(), "pointer");
+    assert_eq!(
+        legacy_pointer.native_fallback(),
+        Some("element exposes no activation action")
+    );
+    assert_eq!(legacy_pointer.actuated(), None);
+    assert_eq!(semantic_native_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(semantic_clicks.lock().unwrap().len(), 2);
+    let semantic_audits = semantic_sink.1.lock().unwrap();
+    assert_eq!(semantic_audits.len(), 2);
+    assert!(semantic_audits.iter().all(|audit| {
+        audit.mode == "auto"
+            && audit.method.as_deref() == Some("pointer")
+            && audit.native_fallback.as_deref() == Some("element exposes no activation action")
+            && audit.actuated_id.is_none()
+    }));
+}
+
+#[test]
+fn semantic_public_click_audit_emits_exactly_one_record_on_native_fallback_and_failure() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let cases = [
+        (
+            vec![tree.clone()],
+            InvokeBehavior::Succeed,
+            500,
+            true,
+            Some("native-action"),
+            None,
+            "dispatched",
+            "dispatch_confirmed",
+        ),
+        (
+            vec![tree.clone(), tree.clone()],
+            InvokeBehavior::Unsupported,
+            500,
+            true,
+            Some("pointer"),
+            Some("backend has no native action path"),
+            "dispatched",
+            "dispatch_confirmed",
+        ),
+        (
+            vec![duplicate_button_tree("Save", 2)],
+            InvokeBehavior::Succeed,
+            0,
+            false,
+            None,
+            None,
+            "not_dispatched",
+            "unconfirmed",
+        ),
+    ];
+
+    for (
+        trees,
+        behavior,
+        timeout_ms,
+        succeeds,
+        expected_method,
+        expected_fallback,
+        expected_dispatch,
+        expected_confirmation,
+    ) in cases
+    {
+        let (mut glass, _, _, _) = click_mode_glass(trees, behavior);
+        let sink = RecordingSink::default();
+        glass.set_audit_sink(Box::new(sink.clone()));
+        glass.start(&spec()).unwrap();
+
+        let result = glass.click_target_by(
+            &semantic_click_params(ActionMode::Auto, timeout_ms),
+            Deadline::UNBOUNDED,
+        );
+
+        assert_eq!(result.is_ok(), succeeds);
+        let records = sink.0.lock().unwrap();
+        let click_records = records
+            .iter()
+            .filter(|record| record.starts_with("click_element:"))
+            .collect::<Vec<_>>();
+        assert_eq!(click_records.len(), 1, "records: {records:?}");
+        assert_eq!(
+            click_records[0].as_str(),
+            if succeeds {
+                "click_element:true"
+            } else {
+                "click_element:false"
+            }
+        );
+        drop(records);
+        let audits = sink.1.lock().unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].element.name.as_deref(), Some("Save"));
+        assert_eq!(audits[0].mode, "auto");
+        assert_eq!(audits[0].method.as_deref(), expected_method);
+        assert_eq!(audits[0].native_fallback.as_deref(), expected_fallback);
+        assert_eq!(audits[0].dispatch, expected_dispatch);
+        assert_eq!(audits[0].confirmation, expected_confirmation);
+        assert_eq!(audits[0].ok, succeeds);
+    }
+}

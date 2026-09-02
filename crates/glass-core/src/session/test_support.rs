@@ -622,6 +622,8 @@ pub(crate) enum InvokeBehavior {
     NoAction,
     /// Action fired but the toolkit reported failure.
     Fail,
+    /// The caller's bound elapsed after the backend may have dispatched the action.
+    MayHaveDispatched,
     /// Fingerprint mismatch — tree drifted since the snapshot.
     Drifted,
 }
@@ -648,6 +650,9 @@ fn scripted_invoke(
             target.id.0,
             "action reported failure".into(),
         )),
+        InvokeBehavior::MayHaveDispatched => Err(GlassError::caller_deadline_elapsed(
+            "scripted native accessibility action",
+        )),
         InvokeBehavior::Drifted => Err(GlassError::AxElementChanged(target.id.0)),
     }
 }
@@ -661,6 +666,9 @@ fn scripted_focus(behavior: InvokeBehavior, target: &AxTarget) -> Result<Option<
         InvokeBehavior::Fail => Err(GlassError::AxActionFailed(
             target.id.0,
             "focus reported failure".into(),
+        )),
+        InvokeBehavior::MayHaveDispatched => Err(GlassError::caller_deadline_elapsed(
+            "scripted native accessibility focus",
         )),
         InvokeBehavior::Drifted => Err(GlassError::AxElementChanged(target.id.0)),
     }
@@ -1007,6 +1015,7 @@ pub(crate) struct SeqAccessibility {
     hit: PointerHit,
     hit_error: bool,
     focus_calls: Arc<AtomicUsize>,
+    invoke_calls: Arc<AtomicUsize>,
     hit_calls: Arc<AtomicUsize>,
     hit_points: Arc<Mutex<Vec<(i32, i32)>>>,
 }
@@ -1033,6 +1042,7 @@ impl SeqAccessibility {
             hit: PointerHit::Inconclusive,
             hit_error: false,
             focus_calls: Arc::new(AtomicUsize::new(0)),
+            invoke_calls: Arc::new(AtomicUsize::new(0)),
             hit_calls: Arc::new(AtomicUsize::new(0)),
             hit_points: Arc::new(Mutex::new(Vec::new())),
         }
@@ -1060,6 +1070,16 @@ impl SeqAccessibility {
 
     pub(crate) fn with_focus_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
         self.focus_calls = calls;
+        self
+    }
+
+    pub(crate) fn with_invoke_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
+        self.invoke_calls = calls;
+        self
+    }
+
+    pub(crate) fn with_deadlines(mut self, deadlines: AxDeadlineLog) -> Self {
+        self.deadlines = deadlines;
         self
     }
 
@@ -1140,6 +1160,7 @@ impl Accessibility for SeqAccessibility {
     }
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         self.deadlines.lock().unwrap().push(ctx.deadline);
+        self.invoke_calls.fetch_add(1, Ordering::Relaxed);
         scripted_invoke(self.invoke_behavior, &self.invoke_log, target)
     }
 }
@@ -1485,9 +1506,24 @@ impl Platform for BareMinPlatform {
     }
 }
 
-/// Records `"action:ok"` for each actuation the seam reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedClickAudit {
+    pub(crate) element: crate::audit::ElementRef,
+    pub(crate) mode: String,
+    pub(crate) method: Option<String>,
+    pub(crate) native_fallback: Option<String>,
+    pub(crate) actuated_id: Option<u32>,
+    pub(crate) dispatch: String,
+    pub(crate) confirmation: String,
+    pub(crate) ok: bool,
+}
+
+/// Records `"action:ok"` for each actuation plus structured click metadata.
 #[derive(Clone, Default)]
-pub(crate) struct RecordingSink(pub(crate) Arc<Mutex<Vec<String>>>);
+pub(crate) struct RecordingSink(
+    pub(crate) Arc<Mutex<Vec<String>>>,
+    pub(crate) Arc<Mutex<Vec<RecordedClickAudit>>>,
+);
 impl AuditSink for RecordingSink {
     fn record(&self, act: &Actuation, _ctx: &ActuationContext, o: &AuditOutcome, _d: Duration) {
         let action = match act {
@@ -1510,6 +1546,27 @@ impl AuditSink for RecordingSink {
             Actuation::SetValue { .. } => "set_value",
         };
         self.0.lock().unwrap().push(format!("{action}:{}", o.ok));
+        if let Actuation::ClickElement {
+            element,
+            mode,
+            method,
+            native_fallback,
+            actuated_id,
+            dispatch,
+            confirmation,
+        } = act
+        {
+            self.1.lock().unwrap().push(RecordedClickAudit {
+                element: element.clone(),
+                mode: (*mode).into(),
+                method: method.map(|value| (*value).into()),
+                native_fallback: native_fallback.map(Into::into),
+                actuated_id: *actuated_id,
+                dispatch: (*dispatch).into(),
+                confirmation: (*confirmation).into(),
+                ok: o.ok,
+            });
+        }
     }
 }
 

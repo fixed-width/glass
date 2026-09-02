@@ -16,6 +16,28 @@ const TOGGLE_SWIPE_MS: u64 = 250;
 const COMBO_OPEN_POINTER_REASON: &str =
     "combo popup opened by pointer so the keyboard commit lands in it";
 
+fn click_method_from_semantic_outcome(outcome: SemanticActionOutcome) -> ClickMethod {
+    match outcome.action.method {
+        ActionMethod::NativeAction { actuated } => ClickMethod::NativeAction { actuated },
+        ActionMethod::Pointer {
+            native_fallback: Some(native_fallback),
+        } => ClickMethod::Pointer { native_fallback },
+        ActionMethod::Pointer {
+            native_fallback: None,
+        } => unreachable!("legacy auto click always records its native fallback reason"),
+        ActionMethod::AccessibilityValue | ActionMethod::Keyboard => {
+            unreachable!("click actions cannot return a non-click method")
+        }
+    }
+}
+
+fn glass_error_from_semantic_action(mut error: SemanticActionError) -> GlassError {
+    error
+        .source
+        .take()
+        .expect("ID click failures always retain their original GlassError")
+}
+
 /// Poll cadence for `set_value`'s post-toggle verify: how often to re-snapshot while waiting for
 /// the swiped switch to read back the wanted state.
 const TOGGLE_VERIFY_INTERVAL_MS: u64 = 50;
@@ -188,17 +210,23 @@ impl Glass {
     }
 
     pub fn click_element_by(&mut self, id: AxNodeId, deadline: Deadline) -> Result<ClickMethod> {
-        self.audited_click(id, |g, id| g.click_element_inner(id, deadline))
+        self.click_target_by(
+            &ClickTargetParams {
+                target: ActionTarget::Id(id),
+                mode: ActionMode::Auto,
+                timeout_ms: None,
+                max_nodes: None,
+            },
+            deadline,
+        )
+        .map(click_method_from_semantic_outcome)
+        .map_err(glass_error_from_semantic_action)
     }
 
-    /// Run one element click and record it through the audit seam. Both clicks that stand on
-    /// their own go through here — the native-first [`Glass::click_element`] and the
-    /// deliberately pointer-only combo open — so the log can't miss one just because an
-    /// internal caller took a different route to the same actuation.
-    ///
-    /// The exception is `set_value_inner`'s trailing-toggle branch, which calls
-    /// `click_element_inner` directly: there the click is one step *inside* a `set_value`, and
-    /// the enclosing `SetValue` record already accounts for it.
+    /// Record an internal pointer-only click that does not pass through [`Glass::click_target_by`].
+    /// Public semantic and ID clicks are audited by that high-level owner. The combo open flow
+    /// remains here because it deliberately bypasses native invoke, while a trailing-toggle click
+    /// inside `set_value_inner` is already accounted for by the enclosing `SetValue` record.
     fn audited_click(
         &mut self,
         id: AxNodeId,
@@ -207,10 +235,33 @@ impl Glass {
         let t = std::time::Instant::now();
         let element = self.element_ref(id);
         let result = click(self, id);
+        let dispatch = match &result {
+            Ok(_) => DispatchStatus::Dispatched.as_str(),
+            Err(error) => match error.bound_dispatch() {
+                Some(crate::BoundDispatch::NotDispatched) => DispatchStatus::NotDispatched.as_str(),
+                Some(crate::BoundDispatch::MayHaveDispatched) | None => {
+                    DispatchStatus::MayHaveDispatched.as_str()
+                }
+            },
+        };
+        let confirmation = if result.is_ok() {
+            ConfirmationStatus::DispatchConfirmed.as_str()
+        } else {
+            ConfirmationStatus::Unconfirmed.as_str()
+        };
         self.emit_audit(
             &crate::audit::Actuation::ClickElement {
                 element,
-                method: result.as_ref().ok(),
+                mode: ActionMode::Pointer.as_str(),
+                method: result.as_ref().ok().map(ClickMethod::label),
+                native_fallback: result.as_ref().ok().and_then(ClickMethod::native_fallback),
+                actuated_id: result
+                    .as_ref()
+                    .ok()
+                    .and_then(ClickMethod::actuated)
+                    .map(|id| id.0),
+                dispatch,
+                confirmation,
             },
             crate::audit::AuditOutcome::from_result(&result),
             t.elapsed(),
@@ -219,22 +270,17 @@ impl Glass {
     }
 
     fn click_element_inner(&mut self, id: AxNodeId, deadline: Deadline) -> Result<ClickMethod> {
-        if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("click element"));
-        }
-        // Native action first: works for occluded/off-screen/boundless elements, and on a
-        // backend whose action API is out-of-band it doesn't move the cursor.
-        //
-        // Do not widen the fallback to a denylist: only an attempt that dispatched NOTHING may
-        // retry with the pointer (see [`GlassError::invoke_fallback_eligible`]), or a native
-        // action that may still land actuates the control twice.
-        let native_fallback = match self.try_native_invoke(id, deadline) {
-            Ok(actuated) => return Ok(ClickMethod::NativeAction { actuated }),
-            Err(e) if !e.invoke_fallback_eligible() => return Err(e),
-            Err(e) => native_fallback_reason(&e),
-        };
-        self.click_element_pointer_only(id, None, deadline)
-            .map(|()| ClickMethod::Pointer { native_fallback })
+        self.click_target_inner(
+            ClickTargetParams {
+                target: ActionTarget::Id(id),
+                mode: ActionMode::Auto,
+                timeout_ms: None,
+                max_nodes: None,
+            },
+            deadline,
+        )
+        .map(click_method_from_semantic_outcome)
+        .map_err(glass_error_from_semantic_action)
     }
 
     /// The synthetic-pointer half of [`Glass::click_element`], on its own: the center of the
@@ -404,7 +450,11 @@ impl Glass {
     /// One native-invoke attempt: the same fingerprint + context assembly as
     /// `set_value_inner` (over freshly re-read window geometry — see below), then the
     /// backend's `invoke`. Passes on the element the backend actuated when it is not `id`.
-    fn try_native_invoke(&mut self, id: AxNodeId, deadline: Deadline) -> Result<Option<AxNodeId>> {
+    pub(super) fn try_native_invoke(
+        &mut self,
+        id: AxNodeId,
+        deadline: Deadline,
+    ) -> Result<Option<AxNodeId>> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started(
                 "native accessibility action",
@@ -817,22 +867,6 @@ impl Glass {
             return Err(GlassError::deadline_not_started("semantic key input"));
         }
         self.key_by(event, deadline)
-    }
-}
-
-/// Short, agent-facing reason a native-invoke attempt fell back to the pointer path.
-/// `AxUnsupported`'s own `Display` is snapshot-oriented (it tells the agent to screenshot
-/// instead), which would mislead in a click result — map it.
-///
-/// Only the two fallback-eligible errors reach here (see
-/// [`GlassError::invoke_fallback_eligible`], the single place that decides). The `other` arm
-/// is unreachable defence-in-depth, kept so this stays a total function if the eligibility
-/// set ever widens.
-fn native_fallback_reason(e: &GlassError) -> String {
-    match e {
-        GlassError::AxUnsupported => "backend has no native action path".into(),
-        GlassError::AxActionUnavailable(_) => "element exposes no activation action".into(),
-        other => format!("native action error: {other}"),
     }
 }
 
