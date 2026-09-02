@@ -2,6 +2,59 @@ use super::*;
 use std::fs;
 use std::sync::Arc;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn store_initializes_from_an_empty_root_on_macos() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1024).unwrap();
+
+    store.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_directory_enumeration_excludes_navigation_entries() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("owned"), "owned").unwrap();
+    let handle = fs::File::open(root.path()).unwrap();
+
+    let entries = super::fs::handle_directory_entries(&handle).unwrap();
+
+    assert_eq!(entries, [std::ffi::OsString::from("owned")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_directory_enumeration_preserves_non_utf8_names() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let name = std::ffi::OsString::from_vec(vec![b'o', 0xff, b'k']);
+    fs::write(root.path().join(&name), "owned").unwrap();
+    let handle = fs::File::open(root.path()).unwrap();
+
+    assert_eq!(
+        super::fs::handle_directory_entries(&handle).unwrap(),
+        [name]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_directory_enumeration_treats_a_removed_directory_as_empty() {
+    let parent = tempfile::tempdir().unwrap();
+    let path = parent.path().join("removed");
+    fs::create_dir(&path).unwrap();
+    let handle = fs::File::open(&path).unwrap();
+    fs::remove_dir(&path).unwrap();
+
+    assert!(
+        super::fs::handle_directory_entries(&handle)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn store_preserves_operator_root_and_keeps_owned_children_private() {

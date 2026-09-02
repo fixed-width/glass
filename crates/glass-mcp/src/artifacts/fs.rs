@@ -1391,25 +1391,30 @@ fn remove_regular_file_no_follow(path: &Path) -> Result<(), ArtifactError> {
 }
 
 #[cfg(unix)]
-fn handle_directory_entries(handle: &File) -> Result<Vec<OsString>, ArtifactError> {
-    use std::os::fd::AsRawFd;
+pub(super) fn handle_directory_entries(handle: &File) -> Result<Vec<OsString>, ArtifactError> {
+    use std::os::unix::ffi::OsStringExt;
 
-    #[cfg(target_os = "linux")]
-    let directory = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
-    #[cfg(not(target_os = "linux"))]
-    let directory = PathBuf::from(format!("/dev/fd/{}", handle.as_raw_fd()));
+    let mut directory = match rustix::fs::Dir::read_from(handle) {
+        Ok(directory) => directory,
+        Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(ArtifactError::CleanupFailed(
+                std::io::Error::from(error).kind(),
+            ));
+        }
+    };
     let mut entries = Vec::new();
-    for entry in
-        fs::read_dir(directory).map_err(|error| ArtifactError::CleanupFailed(error.kind()))?
-    {
+    for entry in &mut directory {
+        let entry = entry
+            .map_err(|error| ArtifactError::CleanupFailed(std::io::Error::from(error).kind()))?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
         if entries.len() == MAX_OWNED_DIRECTORY_ENTRIES {
             return Err(ArtifactError::InvalidOutputState);
         }
-        entries.push(
-            entry
-                .map_err(|error| ArtifactError::CleanupFailed(error.kind()))?
-                .file_name(),
-        );
+        entries.push(OsString::from_vec(name.to_vec()));
     }
     Ok(entries)
 }
