@@ -1,9 +1,10 @@
 use super::*;
 use crate::session::test_support::*;
 use crate::{
-    Accessibility, ActionabilityCheckName, ActionabilityVerdict, AxContext, AxNode, AxNodeId,
-    AxRect, AxRole, AxStateCoverage, AxStates, AxTree, ChangeSignal, PointerHit, SemanticSelector,
-    SemanticState, Truncation, TruncationLimit, WalkLimits,
+    Accessibility, ActionabilityCheck, ActionabilityCheckName, ActionabilitySource,
+    ActionabilityVerdict, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStateCoverage, AxStates,
+    AxTree, ChangeSignal, PointerHit, SemanticSelector, SemanticState, Truncation, TruncationLimit,
+    WalkLimits,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -85,6 +86,39 @@ fn report_verdict(
         .find(|check| check.name == name)
         .expect("missing actionability check")
         .verdict
+}
+
+fn error_report_check(
+    error: &SemanticActionError,
+    name: ActionabilityCheckName,
+) -> ActionabilityCheck {
+    error
+        .actionability
+        .checks
+        .iter()
+        .copied()
+        .find(|check| check.name == name)
+        .expect("missing actionability check")
+}
+
+fn assert_pointer_report_order(error: &SemanticActionError) {
+    assert_eq!(
+        error
+            .actionability
+            .checks
+            .iter()
+            .map(|check| check.name)
+            .collect::<Vec<_>>(),
+        vec![
+            ActionabilityCheckName::Unique,
+            ActionabilityCheckName::Enabled,
+            ActionabilityCheckName::Visible,
+            ActionabilityCheckName::Stable,
+            ActionabilityCheckName::InWindow,
+            ActionabilityCheckName::NonOccluded,
+            ActionabilityCheckName::BackendFingerprint,
+        ]
+    );
 }
 
 fn duplicate_button_tree(name: &str, count: usize) -> AxTree {
@@ -886,6 +920,261 @@ fn identity_change_resets_stability_even_when_bounds_are_equal() {
 }
 
 #[test]
+fn selector_pointer_builds_each_stability_sample_from_its_refreshed_window() {
+    let bounds = AxRect {
+        x: 10,
+        y: 10,
+        width: 20,
+        height: 20,
+    };
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let narrow = WindowGeometry {
+        x: 0,
+        y: 0,
+        width: 15,
+        height: 100,
+    };
+    let full = WindowGeometry {
+        width: 100,
+        ..narrow.clone()
+    };
+    let platform = FakePlatform::new(100, 100)
+        .with_click_log(clicks.clone())
+        .resized_to(narrow)
+        .resized_to(full.clone())
+        .resized_to(full);
+    let tree = actionable_button_tree("Save", bounds);
+    let (mut glass, walks, _, hit_points) = pointer_glass(
+        platform,
+        vec![tree.clone(), tree.clone(), tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(600)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(walks.load(Ordering::Relaxed), 3);
+    assert_eq!(hit_points.lock().unwrap().as_slice(), &[(20, 20)]);
+    assert_eq!(clicks.lock().unwrap().as_slice(), &[(20, 20)]);
+}
+
+#[test]
+fn selector_pointer_revalidates_the_exact_plan_against_the_dispatch_window() {
+    let bounds = AxRect {
+        x: 80,
+        y: 10,
+        width: 20,
+        height: 20,
+    };
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let full = WindowGeometry {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+    };
+    let narrow = WindowGeometry {
+        width: 15,
+        ..full.clone()
+    };
+    let platform = FakePlatform::new(100, 100)
+        .with_click_log(clicks.clone())
+        .resized_to(full.clone())
+        .resized_to(full)
+        .resized_to(narrow);
+    let tree = actionable_button_tree("Save", bounds);
+    let (mut glass, _, hit_calls, _) = pointer_glass(
+        platform,
+        vec![tree.clone(), tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        error_report_check(&error, ActionabilityCheckName::InWindow).verdict,
+        ActionabilityVerdict::Failed
+    );
+    assert_eq!(hit_calls.load(Ordering::Relaxed), 0);
+    assert!(clicks.lock().unwrap().is_empty());
+}
+
+#[test]
+fn auto_native_discloses_the_post_resolution_window_geometry() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 80,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let platform = FakePlatform::new(100, 100).resized_to(WindowGeometry {
+        x: 0,
+        y: 0,
+        width: 15,
+        height: 100,
+    });
+    let invoke_log = Arc::new(Mutex::new(Vec::new()));
+    let accessibility = SeqAccessibility::new(vec![tree])
+        .with_coverage(full_state_coverage())
+        .with_invoke_behavior(InvokeBehavior::Succeed)
+        .with_invoke_log(invoke_log.clone());
+    let mut glass = glass_with_backend(platform, Box::new(accessibility));
+    glass.start(&spec()).unwrap();
+
+    let outcome = glass
+        .click_target_inner(
+            ClickTargetParams {
+                target: ActionTarget::Semantic(semantic_target("Save")),
+                mode: ActionMode::Auto,
+                timeout_ms: Some(0),
+                max_nodes: None,
+            },
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(invoke_log.lock().unwrap().len(), 1);
+    let in_window = outcome
+        .actionability
+        .checks
+        .iter()
+        .find(|check| check.name == ActionabilityCheckName::InWindow)
+        .unwrap();
+    assert_eq!(in_window.verdict, ActionabilityVerdict::Failed);
+    assert!(!in_window.required);
+}
+
+#[test]
+fn selector_pointer_disabled_target_preserves_the_ordered_blocking_report() {
+    let mut tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    tree.root.children[0].states.enabled = false;
+    let (mut glass, _, hit_calls, _) = pointer_glass(
+        FakePlatform::new(100, 100),
+        vec![tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(0)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_pointer_report_order(&error);
+    assert_eq!(
+        error.actionability.blocking().unwrap().name,
+        ActionabilityCheckName::Enabled
+    );
+    let stable = error_report_check(&error, ActionabilityCheckName::Stable);
+    assert_eq!(stable.verdict, ActionabilityVerdict::Unproven);
+    assert!(stable.required);
+    assert_eq!(stable.source, ActionabilitySource::GeometrySamples);
+    assert_eq!(hit_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn selector_pointer_hidden_target_preserves_the_ordered_blocking_report() {
+    let mut tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    tree.root.children[0].states.visible = false;
+    let (mut glass, _, hit_calls, _) = pointer_glass(
+        FakePlatform::new(100, 100),
+        vec![tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(0)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_pointer_report_order(&error);
+    assert_eq!(
+        error.actionability.blocking().unwrap().name,
+        ActionabilityCheckName::Visible
+    );
+    assert_eq!(hit_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn selector_pointer_off_window_target_preserves_the_ordered_blocking_report() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 100,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let (mut glass, _, hit_calls, _) = pointer_glass(
+        FakePlatform::new(100, 100),
+        vec![tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(0)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_pointer_report_order(&error);
+    assert_eq!(
+        error.actionability.blocking().unwrap().name,
+        ActionabilityCheckName::InWindow
+    );
+    let in_window = error_report_check(&error, ActionabilityCheckName::InWindow);
+    assert_eq!(in_window.verdict, ActionabilityVerdict::Failed);
+    assert!(in_window.required);
+    assert_eq!(in_window.source, ActionabilitySource::WindowGeometry);
+    assert_eq!(hit_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn zero_timeout_native_action_dispatches_after_one_fresh_read() {
     let tree = actionable_button_tree(
         "Save",
@@ -1099,6 +1388,47 @@ fn selector_pointer_row_toggle_probes_and_dispatches_the_same_trailing_control()
         } if (from_x, from_y, to_x, to_y)
             == (segment.from_x, segment.from_y, segment.to_x, segment.to_y)
     ));
+}
+
+#[test]
+fn selector_pointer_rejects_a_trailing_toggle_with_a_boundary_endpoint() {
+    let bounds = AxRect {
+        x: 99,
+        y: 99,
+        width: 80,
+        height: 15,
+    };
+    let mut tree = actionable_button_tree("Wi-Fi", bounds);
+    let toggle = &mut tree.root.children[0];
+    toggle.role = AxRole::CheckBox;
+    toggle.states.checkable = true;
+    let drags = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100)
+        .with_drag_log(drags.clone())
+        .with_trailing_toggle_backend();
+    let (mut glass, _, hit_calls, _) = pointer_glass(
+        platform,
+        vec![tree.clone(), tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Wi-Fi")), Some(500)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        error.actionability.blocking().unwrap().name,
+        ActionabilityCheckName::InWindow
+    );
+    assert_eq!(hit_calls.load(Ordering::Relaxed), 0);
+    assert!(drags.lock().unwrap().is_empty());
 }
 
 #[test]

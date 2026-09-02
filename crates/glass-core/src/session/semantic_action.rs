@@ -306,17 +306,32 @@ pub(super) enum PlannedPointerInput {
     },
 }
 
+impl PlannedPointerInput {
+    fn is_inside_window(&self, window: (u32, u32)) -> bool {
+        let inside =
+            |(x, y): (i32, i32)| x >= 0 && y >= 0 && (x as u32) < window.0 && (y as u32) < window.1;
+        match self {
+            Self::Click { point } => inside(*point),
+            Self::TrailingToggle { segment, .. } => {
+                inside((segment.from_x, segment.from_y)) && inside((segment.to_x, segment.to_y))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PointerCandidate {
     element: ElementInfo,
     target: AxTarget,
     plan: PlannedPointerInput,
+    window: (u32, u32),
 }
 
 #[derive(Debug)]
 struct PointerResolutionObservation {
     resolution: ResolutionObservation,
     candidate: Option<PointerCandidate>,
+    actionability: Option<ActionabilityReport>,
     stable: bool,
 }
 
@@ -521,24 +536,25 @@ fn pointer_plan(
 ) -> Option<PlannedPointerInput> {
     const ROW_ASPECT: u32 = 4;
     let bounds = element.bounds?;
-    if element.states.checkable
+    let plan = if element.states.checkable
         && trailing_toggle_backend
         && bounds.width > bounds.height.saturating_mul(ROW_ASPECT)
     {
         let segment = bounds.trailing_toggle_swipe(window.0, window.1)?;
         let probe_point = (
-            (segment.from_x + segment.to_x) / 2,
-            (segment.from_y + segment.to_y) / 2,
+            segment.from_x + (segment.to_x - segment.from_x) / 2,
+            segment.from_y + (segment.to_y - segment.from_y) / 2,
         );
-        Some(PlannedPointerInput::TrailingToggle {
+        PlannedPointerInput::TrailingToggle {
             segment,
             probe_point,
-        })
+        }
     } else {
-        Some(PlannedPointerInput::Click {
+        PlannedPointerInput::Click {
             point: bounds.clamped_center(window.0, window.1)?,
-        })
-    }
+        }
+    };
+    plan.is_inside_window(window).then_some(plan)
 }
 
 fn ax_target(element: &ElementInfo) -> AxTarget {
@@ -782,19 +798,16 @@ impl Glass {
             SEMANTIC_ACTION_CANDIDATE_LIMIT,
         )
         .expect("the fixed candidate limit is valid");
-        let (window, trailing_toggle_backend) = {
+        let trailing_toggle_backend = {
             let active = self
                 .active
                 .as_ref()
                 .ok_or_else(|| source_error(GlassError::NoActiveSession, bound))?;
-            (
-                (active.geometry.width, active.geometry.height),
-                active.platform.a11y_toggle_control_at_trailing_edge(),
-            )
+            active.platform.a11y_toggle_control_at_trailing_edge()
         };
         let mut sample: Option<StabilitySample> = None;
         let poll = self
-            .poll_accessibility_until_by_deadline(
+            .poll_accessibility_until_by_deadline_with_window(
                 SEMANTIC_ACTION_STABILITY_MS,
                 std::time::Duration::from_millis(SEMANTIC_ACTION_STABILITY_MS),
                 bound.deadline,
@@ -802,7 +815,7 @@ impl Glass {
                 bound.allow_wait,
                 sequence_deadline,
                 "stabilize semantic pointer target",
-                |tree| {
+                |tree, window| {
                     let result = tree.semantic_query(&query);
                     let complete_unique = matches!(
                         result.scope,
@@ -810,26 +823,37 @@ impl Glass {
                     ) && result.matches_in_walk == 1
                         && result.search_complete
                         && result.matches.len() == 1;
-                    let candidate = complete_unique
-                        .then(|| {
-                            let element = result.matches[0].element.clone();
-                            let plan = pointer_plan(&element, window, trailing_toggle_backend)?;
-                            let report = ActionabilityReport::evaluate_click(
-                                &element,
-                                coverage,
-                                Some(true),
-                                window,
-                                crate::PointerHit::Inconclusive,
-                                false,
-                                true,
-                            );
-                            report.blocking().is_none().then(|| PointerCandidate {
+                    let mut actionability = None;
+                    let candidate = if complete_unique {
+                        let element = result.matches[0].element.clone();
+                        let plan = pointer_plan(&element, window, trailing_toggle_backend);
+                        let mut report = ActionabilityReport::evaluate_click(
+                            &element,
+                            coverage,
+                            None,
+                            window,
+                            crate::PointerHit::Inconclusive,
+                            false,
+                            true,
+                        );
+                        if plan.is_none() {
+                            report.fail_in_window();
+                        }
+                        let candidate = if report.blocking().is_none() {
+                            plan.map(|plan| PointerCandidate {
                                 target: ax_target(&element),
                                 element,
                                 plan,
+                                window,
                             })
-                        })
-                        .flatten();
+                        } else {
+                            None
+                        };
+                        actionability = Some(report);
+                        candidate
+                    } else {
+                        None
+                    };
                     let now = std::time::Instant::now();
                     let mut stable = false;
                     if let Some(candidate) = &candidate {
@@ -858,6 +882,15 @@ impl Glass {
                                 });
                             }
                         }
+                        actionability = Some(ActionabilityReport::evaluate_click(
+                            &candidate.element,
+                            coverage,
+                            Some(stable),
+                            candidate.window,
+                            crate::PointerHit::Inconclusive,
+                            false,
+                            true,
+                        ));
                     } else {
                         sample = None;
                     }
@@ -867,6 +900,7 @@ impl Glass {
                             eligible: candidate.is_some(),
                         },
                         candidate,
+                        actionability,
                         stable,
                     }
                 },
@@ -879,32 +913,23 @@ impl Glass {
             poll.timed_out_by,
         );
         if !poll.satisfied {
-            if let Some(candidate) = poll.observation.candidate {
-                let actionability = ActionabilityReport::evaluate_click(
-                    &candidate.element,
-                    coverage,
-                    Some(false),
-                    window,
-                    crate::PointerHit::Inconclusive,
-                    false,
-                    true,
-                );
+            if poll.observation.candidate.is_some() {
                 return Err(actionability_error(
                     SemanticActionFailureKind::UnstableTarget,
                     "semantic pointer target did not remain stable",
                     Some(report),
-                    actionability,
+                    poll.observation
+                        .actionability
+                        .expect("a pointer candidate has an actionability report"),
                     bound,
                     RetryGuidance::WaitOrRefine,
                     None,
                     DispatchStatus::NotDispatched,
                 ));
             }
-            return Err(classified_resolution_error(
-                poll.observation.resolution,
-                report,
-                bound,
-            ));
+            let mut error = classified_resolution_error(poll.observation.resolution, report, bound);
+            error.actionability = poll.observation.actionability.unwrap_or_default();
+            return Err(error);
         }
         Ok(ResolvedPointerTarget {
             candidate: poll
@@ -928,6 +953,14 @@ impl Glass {
             limits: active.a11y_limits,
             deadline,
         })
+    }
+
+    fn refresh_action_window(&mut self, deadline: Deadline) -> Result<(u32, u32)> {
+        let active = self.active_mut()?;
+        let window = active.platform.window_by(&WindowOp::Geometry, deadline)?;
+        let dimensions = (window.width, window.height);
+        active.geometry = window;
+        Ok(dimensions)
     }
 
     fn invoke_semantic_target(
@@ -1034,13 +1067,50 @@ impl Glass {
         resolved: ResolvedPointerTarget,
         native_fallback: Option<String>,
     ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
-        let window = {
-            let active = self
-                .active
-                .as_ref()
-                .ok_or_else(|| source_error(GlassError::NoActiveSession, resolved.bound))?;
-            (active.geometry.width, active.geometry.height)
-        };
+        let sample_actionability = ActionabilityReport::evaluate_click(
+            &resolved.candidate.element,
+            resolved.coverage,
+            Some(true),
+            resolved.candidate.window,
+            crate::PointerHit::Inconclusive,
+            false,
+            true,
+        );
+        let window = self
+            .refresh_action_window(resolved.bound.deadline)
+            .map_err(|source| {
+                action_source_error(
+                    source,
+                    Some(resolved.resolution.clone()),
+                    sample_actionability,
+                    resolved.bound,
+                    false,
+                )
+            })?;
+        let mut actionability = ActionabilityReport::evaluate_click(
+            &resolved.candidate.element,
+            resolved.coverage,
+            Some(true),
+            window,
+            crate::PointerHit::Inconclusive,
+            false,
+            true,
+        );
+        if !resolved.candidate.plan.is_inside_window(window) {
+            actionability.fail_in_window();
+        }
+        if actionability.blocking().is_some() {
+            return Err(actionability_error(
+                SemanticActionFailureKind::NotActionable,
+                "semantic pointer target is not actionable",
+                Some(resolved.resolution),
+                actionability,
+                resolved.bound,
+                RetryGuidance::Reobserve,
+                None,
+                DispatchStatus::NotDispatched,
+            ));
+        }
         let probe_point = match &resolved.candidate.plan {
             PlannedPointerInput::Click { point } => *point,
             PlannedPointerInput::TrailingToggle { probe_point, .. } => *probe_point,
@@ -1055,20 +1125,12 @@ impl Glass {
                 action_source_error(
                     source,
                     Some(resolved.resolution.clone()),
-                    ActionabilityReport::evaluate_click(
-                        &resolved.candidate.element,
-                        resolved.coverage,
-                        Some(true),
-                        window,
-                        crate::PointerHit::Inconclusive,
-                        false,
-                        true,
-                    ),
+                    actionability.clone(),
                     resolved.bound,
                     false,
                 )
             })?;
-        let actionability = ActionabilityReport::evaluate_click(
+        actionability = ActionabilityReport::evaluate_click(
             &resolved.candidate.element,
             resolved.coverage,
             Some(true),
@@ -1306,7 +1368,7 @@ impl Glass {
                     self.dispatch_pointer_click(resolved, None)
                 }
                 ActionMode::Auto => {
-                    let window = self
+                    let eligibility_window = self
                         .active
                         .as_ref()
                         .map(|active| (active.geometry.width, active.geometry.height))
@@ -1321,7 +1383,7 @@ impl Glass {
                                 element,
                                 coverage,
                                 None,
-                                window,
+                                eligibility_window,
                                 crate::PointerHit::Inconclusive,
                                 false,
                                 false,
@@ -1330,6 +1392,11 @@ impl Glass {
                             .is_none()
                         },
                     )?;
+                    let window = self
+                        .active
+                        .as_ref()
+                        .map(|active| (active.geometry.width, active.geometry.height))
+                        .ok_or_else(|| source_error(GlassError::NoActiveSession, bound))?;
                     match self.invoke_semantic_target(&resolved.target, bound.deadline) {
                         Ok(actuated) => {
                             let mut actionability = ActionabilityReport::evaluate_click(

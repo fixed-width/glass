@@ -189,6 +189,16 @@ impl ActionabilityReport {
             check.verdict = ActionabilityVerdict::Passed;
         }
     }
+
+    pub(crate) fn fail_in_window(&mut self) {
+        if let Some(check) = self
+            .checks
+            .iter_mut()
+            .find(|check| check.name == ActionabilityCheckName::InWindow)
+        {
+            check.verdict = ActionabilityVerdict::Failed;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

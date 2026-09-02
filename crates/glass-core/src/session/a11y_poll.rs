@@ -164,6 +164,47 @@ impl Glass {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(super) fn poll_accessibility_until_by_deadline_with_window<O>(
+        &mut self,
+        interval_ms: u64,
+        reread_after: std::time::Duration,
+        action_deadline: Deadline,
+        whose: crate::Whose,
+        allow_wait: bool,
+        sequence_deadline: Deadline,
+        operation: &'static str,
+        observe: impl FnMut(&AxTree, (u32, u32)) -> O,
+        satisfied: impl FnMut(&O) -> bool,
+    ) -> Result<A11yPollOutcome<O>> {
+        if sequence_deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(operation));
+        }
+        self.require_active()?;
+        if allow_wait && action_deadline.has_passed() {
+            return Err(GlassError::Bounded {
+                kind: crate::BoundKind::NotStarted,
+                whose,
+                dispatch: crate::BoundDispatch::NotDispatched,
+                message: format!(
+                    "{operation}: its effective deadline was already spent, so it was not started"
+                ),
+            });
+        }
+        self.poll_accessibility_until_with_deadline_and_window(
+            interval_ms,
+            reread_after,
+            action_deadline,
+            whose,
+            allow_wait,
+            sequence_deadline,
+            operation,
+            std::time::Instant::now(),
+            observe,
+            satisfied,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn poll_accessibility_until_with_deadline<O>(
         &mut self,
         interval_ms: u64,
@@ -175,6 +216,34 @@ impl Glass {
         operation: &'static str,
         started: std::time::Instant,
         mut observe: impl FnMut(&AxTree) -> O,
+        satisfied: impl FnMut(&O) -> bool,
+    ) -> Result<A11yPollOutcome<O>> {
+        self.poll_accessibility_until_with_deadline_and_window(
+            interval_ms,
+            reread_after,
+            action_deadline,
+            whose,
+            allow_wait,
+            sequence_deadline,
+            operation,
+            started,
+            move |tree, _window| observe(tree),
+            satisfied,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn poll_accessibility_until_with_deadline_and_window<O>(
+        &mut self,
+        interval_ms: u64,
+        reread_after: std::time::Duration,
+        action_deadline: Deadline,
+        whose: crate::Whose,
+        allow_wait: bool,
+        sequence_deadline: Deadline,
+        operation: &'static str,
+        started: std::time::Instant,
+        mut observe: impl FnMut(&AxTree, (u32, u32)) -> O,
         mut satisfied: impl FnMut(&O) -> bool,
     ) -> Result<A11yPollOutcome<O>> {
         let mut signal = (interval_ms > 0)
@@ -271,7 +340,11 @@ impl Glass {
                     }
                     Err(e) => return Err(e),
                 };
-                let observation = observe(&tree);
+                let window = {
+                    let active = self.require_active()?;
+                    (active.geometry.width, active.geometry.height)
+                };
+                let observation = observe(&tree, window);
                 let is_satisfied = satisfied(&observation);
                 last_observation = Some(observation);
                 Ok(is_satisfied.then_some(()))
@@ -396,5 +469,56 @@ mod tests {
             .unwrap();
         assert!(!out.satisfied);
         assert_eq!(out.observation, "latest");
+    }
+
+    #[test]
+    fn window_aware_exact_deadline_pairs_each_tree_with_its_refreshed_geometry() {
+        let mut first = fake_tree();
+        first.root.name = Some("first".into());
+        let mut second = fake_tree();
+        second.root.name = Some("second".into());
+        let first_window = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 50,
+        };
+        let second_window = WindowGeometry {
+            width: 80,
+            height: 90,
+            ..first_window.clone()
+        };
+        let platform = FakePlatform::new(100, 100)
+            .resized_to(first_window)
+            .resized_to(second_window);
+        let mut glass = glass_with_a11y_seq(platform, vec![first, second]);
+        glass.start(&spec()).unwrap();
+        let mut observed = Vec::new();
+
+        let outcome = glass
+            .poll_accessibility_until_by_deadline_with_window(
+                1,
+                Duration::from_millis(1),
+                Deadline::from_millis(100),
+                crate::Whose::Callee,
+                true,
+                Deadline::UNBOUNDED,
+                "observe geometry",
+                |tree, window| {
+                    observed.push((tree.root.name.clone(), window));
+                    tree.root.name.as_deref() == Some("second")
+                },
+                |matched| *matched,
+            )
+            .unwrap();
+
+        assert!(outcome.satisfied);
+        assert_eq!(
+            observed,
+            vec![
+                (Some("first".into()), (40, 50)),
+                (Some("second".into()), (80, 90)),
+            ]
+        );
     }
 }
