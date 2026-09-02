@@ -12,7 +12,7 @@ use windows::Wdk::Storage::FileSystem::{
     FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
     FileIdBothDirectoryInformation, NtCreateFile, NtQueryDirectoryFile,
 };
-use windows::Win32::Foundation::{HANDLE, STATUS_NO_MORE_FILES};
+use windows::Win32::Foundation::{HANDLE, STATUS_DELETE_PENDING, STATUS_NO_MORE_FILES};
 use windows::Win32::Foundation::{HLOCAL, LocalFree, OBJ_CASE_INSENSITIVE, UNICODE_STRING};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -29,8 +29,9 @@ use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
-    GetFileInformationByHandle, SYNCHRONIZE, SetFileInformationByHandle,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileDispositionInfo,
+    FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, SYNCHRONIZE,
+    SetFileInformationByHandle,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::core::{PCWSTR, PWSTR};
@@ -149,6 +150,9 @@ pub fn directory_entry_names(directory: &File) -> Result<Vec<std::ffi::OsString>
 
 #[doc(hidden)]
 pub fn directory_entry_records(directory: &File) -> Result<Vec<DirectoryEntryRecord>, HostFsError> {
+    if directory_delete_pending(directory)? {
+        return Ok(Vec::new());
+    }
     let mut names = Vec::new();
     let mut name_bytes = 0_usize;
     let (volume, parent_id) = file_identity(directory)?;
@@ -179,6 +183,9 @@ pub fn directory_entry_records(directory: &File) -> Result<Vec<DirectoryEntryRec
         if status == STATUS_NO_MORE_FILES {
             return Ok(names);
         }
+        if status == STATUS_DELETE_PENDING {
+            return Ok(Vec::new());
+        }
         if !status.is_ok() {
             return Err(HostFsError::Open);
         }
@@ -195,6 +202,21 @@ pub fn directory_entry_records(directory: &File) -> Result<Vec<DirectoryEntryRec
             MAX_DIRECTORY_NAME_BYTES,
         )?;
     }
+}
+
+fn directory_delete_pending(directory: &File) -> Result<bool, HostFsError> {
+    let mut info = FILE_STANDARD_INFO::default();
+    // SAFETY: `info` is a correctly sized writable buffer for this synchronous query.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(directory.as_raw_handle()),
+            FileStandardInfo,
+            (&raw mut info).cast(),
+            u32::try_from(std::mem::size_of_val(&info)).map_err(|_| HostFsError::Integrity)?,
+        )
+        .map_err(|_| HostFsError::Open)?;
+    }
+    Ok(info.DeletePending)
 }
 
 /// Enumerates and opens each exact child before returning, retaining identity across renames.
