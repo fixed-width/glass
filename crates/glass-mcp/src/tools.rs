@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, BoundDispatch, Glass, GlassError, MarkLabel, MouseButton, WindowGeometry, WindowHint,
-    WindowId, WindowOp, frame_to_webp,
+    AppSpec, BoundDispatch, Glass, MarkLabel, MouseButton, WindowGeometry, WindowHint, WindowId,
+    WindowOp, frame_to_webp,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -22,11 +22,15 @@ pub type ToolResult = Result<ToolOutput, String>;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ToolContext {
     pub deadline: glass_core::Deadline,
+    pub owner: Option<glass_core::Whose>,
+    pub allow_wait: bool,
 }
 
 impl ToolContext {
     pub const UNBOUNDED: Self = Self {
         deadline: glass_core::Deadline::UNBOUNDED,
+        owner: None,
+        allow_wait: true,
     };
 }
 
@@ -54,17 +58,29 @@ impl ContextualOutput {
 
 #[derive(Debug)]
 pub(crate) struct ContextualError {
+    pub code: &'static str,
     pub message: String,
     pub category: SafeErrorCategory,
     pub safe_summary: &'static str,
     pub sequence_deadline_exceeded: bool,
     pub bound_dispatch: Option<BoundDispatch>,
+    pub result: Option<serde_json::Value>,
+    pub siblings: Vec<OutContent>,
     post_write: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SafeErrorCategory {
+    NoMatch,
+    AmbiguousTarget,
+    AmbiguousScope,
+    IncompleteTree,
+    UnprovenSelectorState,
+    NotActionable,
+    UnstableTarget,
+    FocusUnconfirmed,
+    UnsupportedMode,
     NoActiveSession,
     StaleElement,
     NotEditable,
@@ -108,6 +124,15 @@ impl SafeErrorCategory {
 
     fn summary(self) -> &'static str {
         match self {
+            Self::NoMatch => "semantic target was not found",
+            Self::AmbiguousTarget => "semantic target is ambiguous",
+            Self::AmbiguousScope => "semantic scope is ambiguous",
+            Self::IncompleteTree => "accessibility tree is incomplete",
+            Self::UnprovenSelectorState => "selector state could not be proven",
+            Self::NotActionable => "semantic target is not actionable",
+            Self::UnstableTarget => "semantic target is unstable",
+            Self::FocusUnconfirmed => "target focus was not confirmed",
+            Self::UnsupportedMode => "semantic action mode is unsupported",
             Self::NoActiveSession => "no active session",
             Self::StaleElement => "element is stale or missing",
             Self::NotEditable => "element is not editable",
@@ -119,6 +144,31 @@ impl SafeErrorCategory {
             Self::ActionDeadlineExceeded => "action deadline exceeded",
             Self::SequenceDeadlineExceeded => "sequence deadline exceeded",
             Self::Other => "action execution failed",
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::NoMatch => "no_match",
+            Self::AmbiguousTarget => "ambiguous_target",
+            Self::AmbiguousScope => "ambiguous_scope",
+            Self::IncompleteTree => "incomplete_tree",
+            Self::UnprovenSelectorState => "unproven_selector_state",
+            Self::NotActionable => "not_actionable",
+            Self::UnstableTarget => "unstable_target",
+            Self::FocusUnconfirmed => "focus_unconfirmed",
+            Self::UnsupportedMode => "unsupported_mode",
+            Self::NoActiveSession => "no_active_session",
+            Self::StaleElement => "stale_element",
+            Self::NotEditable => "not_editable",
+            Self::InvalidValue => "invalid_value",
+            Self::OptionNotFound => "option_not_found",
+            Self::UnsupportedAccessibility => "unsupported_accessibility",
+            Self::PermissionDenied => "permission_denied",
+            Self::TransportFailure => "transport_failure",
+            Self::ActionDeadlineExceeded => "action_deadline_exceeded",
+            Self::SequenceDeadlineExceeded => "sequence_deadline_exceeded",
+            Self::Other => "action_failed",
         }
     }
 
@@ -142,12 +192,19 @@ impl SafeErrorCategory {
 
 impl ContextualError {
     pub fn validation(message: String) -> Self {
+        Self::validation_with_code("invalid_argument", message)
+    }
+
+    pub fn validation_with_code(code: &'static str, message: String) -> Self {
         Self {
+            code,
             message,
             category: SafeErrorCategory::Other,
             safe_summary: "action validation failed",
             sequence_deadline_exceeded: false,
             bound_dispatch: Some(BoundDispatch::NotDispatched),
+            result: None,
+            siblings: Vec::new(),
             post_write: false,
         }
     }
@@ -167,6 +224,7 @@ impl ContextualError {
             .then_some(BoundDispatch::NotDispatched)
         });
         Self {
+            code: category.code(),
             message: error.to_string(),
             category,
             safe_summary: if post_write {
@@ -176,16 +234,23 @@ impl ContextualError {
             },
             sequence_deadline_exceeded: error.bound_owner() == Some(glass_core::Whose::Caller),
             bound_dispatch,
+            result: None,
+            siblings: Vec::new(),
             post_write,
         }
     }
 
-    pub fn from_core(error: glass_core::GlassError, _context: ToolContext) -> Self {
-        Self::from_error(error)
+    pub fn from_core(error: glass_core::GlassError, context: ToolContext) -> Self {
+        let out = Self::from_error(error);
+        if context.owner == Some(glass_core::Whose::Caller) && context.deadline.has_passed() {
+            out.after_sequence_deadline()
+        } else {
+            out
+        }
     }
 
-    pub fn from_caller_bound(error: glass_core::GlassError, _context: ToolContext) -> Self {
-        Self::from_error(error)
+    pub fn from_caller_bound(error: glass_core::GlassError, context: ToolContext) -> Self {
+        Self::from_core(error, context)
     }
 
     pub fn from_resolved_bound(
@@ -195,11 +260,12 @@ impl ContextualError {
     ) -> Self {
         let bounded = error.bound().is_some();
         let mut out = Self::from_error(error);
-        if context.deadline.has_passed() {
+        if context.owner == Some(glass_core::Whose::Caller) && context.deadline.has_passed() {
             return out.after_sequence_deadline();
         }
         if whose == glass_core::Whose::Callee && bounded {
             out.category = SafeErrorCategory::ActionDeadlineExceeded;
+            out.code = out.category.code();
             out.safe_summary = if out.post_write {
                 SafeErrorCategory::ActionDeadlineExceeded.post_write_summary()
             } else {
@@ -219,6 +285,7 @@ impl ContextualError {
     /// operation's safe detail or its dispatch verdict.
     pub fn after_sequence_deadline(mut self) -> Self {
         self.category = SafeErrorCategory::SequenceDeadlineExceeded;
+        self.code = self.category.code();
         self.safe_summary = if self.post_write {
             SafeErrorCategory::SequenceDeadlineExceeded.post_write_summary()
         } else {
@@ -235,11 +302,14 @@ impl ContextualError {
 
     pub fn sequence_deadline(message: String) -> Self {
         Self {
+            code: "sequence_deadline_exceeded",
             message,
             category: SafeErrorCategory::SequenceDeadlineExceeded,
             safe_summary: SafeErrorCategory::SequenceDeadlineExceeded.summary(),
             sequence_deadline_exceeded: true,
             bound_dispatch: None,
+            result: None,
+            siblings: Vec::new(),
             post_write: false,
         }
     }
@@ -252,12 +322,50 @@ type ReturnObservation = (
     Option<glass_core::Whose>,
 );
 
-fn erase_context(result: ContextualToolResult) -> ToolResult {
-    result.map(|o| o.output).map_err(|e| e.message)
-}
-
 /// Batch tool result: either outcome may carry structured MCP content.
 pub(crate) type BatchToolResult = Result<ToolOutput, ToolOutput>;
+
+pub(crate) fn erase_semantic_context(
+    tool: &'static str,
+    result: ContextualToolResult,
+) -> BatchToolResult {
+    result.map(|output| output.output).map_err(|error| {
+        let ContextualError {
+            code,
+            category,
+            safe_summary,
+            bound_dispatch,
+            result,
+            mut siblings,
+            ..
+        } = error;
+        let mut envelope = json!({
+            "ok": false,
+            "tool": tool,
+            "error": {
+                "code": code,
+                "category": category,
+                "summary": safe_summary,
+            },
+        });
+        envelope["result"] = result.unwrap_or_else(|| {
+            let dispatch = match bound_dispatch {
+                Some(BoundDispatch::NotDispatched) => "not_dispatched",
+                Some(BoundDispatch::MayHaveDispatched) | None => "may_have_dispatched",
+            };
+            json!({
+                "dispatch": dispatch,
+                "side_effects_may_have_occurred": dispatch != "not_dispatched",
+            })
+        });
+        if !siblings.is_empty() {
+            envelope["content_blocks"] = json!((1..=siblings.len()).collect::<Vec<usize>>());
+        }
+        let mut contents = vec![OutContent::trusted_error(envelope.to_string())];
+        contents.append(&mut siblings);
+        ToolOutput(contents)
+    })
+}
 
 fn geometry_value(g: &WindowGeometry) -> serde_json::Value {
     json!({ "x": g.x, "y": g.y, "width": g.width, "height": g.height })
@@ -584,6 +692,24 @@ fn resolve_return_with(
     ret: Option<&str>,
     context: ToolContext,
 ) -> Result<ReturnObservation, ContextualError> {
+    if !context.allow_wait && matches!(ret, Some("settle" | "snapshot")) {
+        let category = if context.owner == Some(glass_core::Whose::Caller) {
+            SafeErrorCategory::SequenceDeadlineExceeded
+        } else {
+            SafeErrorCategory::ActionDeadlineExceeded
+        };
+        return Err(ContextualError {
+            code: category.code(),
+            message: category.summary().into(),
+            category,
+            safe_summary: category.summary(),
+            sequence_deadline_exceeded: category == SafeErrorCategory::SequenceDeadlineExceeded,
+            bound_dispatch: Some(BoundDispatch::NotDispatched),
+            result: None,
+            siblings: Vec::new(),
+            post_write: false,
+        });
+    }
     match ret {
         None | Some("none") => Ok((None, vec![], None)),
         Some("settle") => {
@@ -650,8 +776,30 @@ fn resolve_return_with(
     }
 }
 
-pub fn click_element(glass: &mut Glass, a: &ClickElementArgs) -> ToolResult {
-    erase_context(click_element_with(glass, a, ToolContext::UNBOUNDED))
+pub(crate) fn semantic_return_error(
+    tool: &'static str,
+    outcome: &glass_core::SemanticActionOutcome,
+    mut error: ContextualError,
+    annotation: &str,
+) -> ContextualError {
+    let disclosure = semantic_action::success_output(tool, outcome, None, Vec::new());
+    let mut contents = disclosure.0.into_iter();
+    if let Some(OutContent::Envelope(envelope)) = contents.next() {
+        let mut result = envelope.result;
+        result["dispatch"] = json!(outcome.action.dispatch.as_str());
+        result["side_effects_may_have_occurred"] = json!(true);
+        result["retry"] = json!("do_not_retry");
+        error.result = Some(result);
+    }
+    error.siblings = contents.collect();
+    error.after_dispatch().annotate(annotation)
+}
+
+pub fn click_element(glass: &mut Glass, a: &ClickElementArgs) -> BatchToolResult {
+    erase_semantic_context(
+        "glass_click_element",
+        click_element_with(glass, a, ToolContext::UNBOUNDED),
+    )
 }
 
 pub(crate) fn click_element_with(
@@ -660,49 +808,78 @@ pub(crate) fn click_element_with(
     context: ToolContext,
 ) -> ContextualToolResult {
     let params = semantic_action::validate_click_element_args(a)?;
+    let semantic = matches!(&params.target, glass_core::ActionTarget::Semantic(_));
     let outcome = glass
         .click_target_by(&params, context.deadline)
         .map_err(|error| {
-            let message = error.to_string();
-            match error.source {
-                Some(source) => ContextualError::from_caller_bound(source, context),
-                None => ContextualError::from_caller_bound(GlassError::Backend(message), context),
+            if semantic {
+                semantic_action::semantic_error("glass_click_element", error)
+            } else {
+                let message = error.to_string();
+                match error.source {
+                    Some(source) => ContextualError::from_caller_bound(source, context),
+                    None => ContextualError::from_caller_bound(
+                        glass_core::GlassError::Backend(message),
+                        context,
+                    ),
+                }
             }
         })?;
-    let (observed, extra, timed_out_by) = resolve_return_with(glass, a.return_.as_deref(), context)
-        .map_err(ContextualError::after_dispatch)?;
-    let mut result = serde_json::json!({ "id": outcome.target.id.0 });
-    match outcome.action.method {
-        glass_core::ActionMethod::NativeAction { actuated } => {
-            result["method"] = serde_json::json!("native-action");
-            if let Some(actuated) = actuated {
-                result["actuated_id"] = serde_json::json!(actuated.0);
+    let action_context = ToolContext {
+        deadline: outcome.bound.deadline,
+        owner: outcome.bound.owner,
+        allow_wait: outcome.bound.allow_wait,
+    };
+    let (observed, extra, timed_out_by) =
+        resolve_return_with(glass, a.return_.as_deref(), action_context).map_err(|error| {
+            if semantic {
+                semantic_return_error(
+                    "glass_click_element",
+                    &outcome,
+                    error,
+                    "click was dispatched; return observe failed",
+                )
+            } else {
+                error.after_dispatch()
+            }
+        })?;
+    let output = if semantic {
+        semantic_action::success_output("glass_click_element", &outcome, observed, extra)
+    } else {
+        let mut result = json!({ "id": outcome.target.id.0 });
+        match &outcome.action.method {
+            glass_core::ActionMethod::NativeAction { actuated } => {
+                result["method"] = json!("native-action");
+                if let Some(actuated) = actuated {
+                    result["actuated_id"] = json!(actuated.0);
+                }
+            }
+            glass_core::ActionMethod::Pointer { native_fallback } => {
+                result["method"] = json!("pointer");
+                if let Some(reason) = native_fallback {
+                    result["native_fallback"] = json!(reason);
+                }
+            }
+            glass_core::ActionMethod::AccessibilityValue => {
+                result["method"] = json!("accessibility-value");
+            }
+            glass_core::ActionMethod::Keyboard => {
+                result["method"] = json!("keyboard");
             }
         }
-        glass_core::ActionMethod::Pointer { native_fallback } => {
-            result["method"] = serde_json::json!("pointer");
-            if let Some(reason) = native_fallback {
-                result["native_fallback"] = serde_json::json!(reason);
-            }
+        if let Some(observed) = observed {
+            result["observed"] = observed;
         }
-        glass_core::ActionMethod::AccessibilityValue => {
-            result["method"] = serde_json::json!("accessibility-value");
-        }
-        glass_core::ActionMethod::Keyboard => {
-            result["method"] = serde_json::json!("keyboard");
-        }
-    }
-    if let Some(o) = observed {
-        result["observed"] = o;
-    }
-    Ok(ContextualOutput::with_timeout(
-        ToolOutput::result_with("glass_click_element", result, extra),
-        timed_out_by,
-    ))
+        ToolOutput::result_with("glass_click_element", result, extra)
+    };
+    Ok(ContextualOutput::with_timeout(output, timed_out_by))
 }
 
-pub fn set_value(glass: &mut Glass, a: &SetValueArgs) -> ToolResult {
-    erase_context(set_value_with(glass, a, ToolContext::UNBOUNDED))
+pub fn set_value(glass: &mut Glass, a: &SetValueArgs) -> BatchToolResult {
+    erase_semantic_context(
+        "glass_set_value",
+        set_value_with(glass, a, ToolContext::UNBOUNDED),
+    )
 }
 
 pub(crate) fn set_value_with(
@@ -711,25 +888,51 @@ pub(crate) fn set_value_with(
     context: ToolContext,
 ) -> ContextualToolResult {
     let params = semantic_action::validate_set_value_args(a)?;
+    let semantic = matches!(&params.target, glass_core::ActionTarget::Semantic(_));
     let outcome = glass
         .set_value_target_by(&params, &a.text, context.deadline)
         .map_err(|error| {
-            let message = error.to_string();
-            match error.source {
-                Some(source) => ContextualError::from_caller_bound(source, context),
-                None => ContextualError::from_caller_bound(GlassError::Backend(message), context),
+            if semantic {
+                semantic_action::semantic_error("glass_set_value", error)
+            } else {
+                let message = error.to_string();
+                match error.source {
+                    Some(source) => ContextualError::from_caller_bound(source, context),
+                    None => ContextualError::from_caller_bound(
+                        glass_core::GlassError::Backend(message),
+                        context,
+                    ),
+                }
             }
         })?;
-    let (observed, extra, timed_out_by) = resolve_return_with(glass, a.return_.as_deref(), context)
-        .map_err(ContextualError::after_dispatch)?;
-    let mut result = serde_json::json!({ "id": outcome.target.id.0 });
-    if let Some(o) = observed {
-        result["observed"] = o;
-    }
-    Ok(ContextualOutput::with_timeout(
-        ToolOutput::result_with("glass_set_value", result, extra),
-        timed_out_by,
-    ))
+    let action_context = ToolContext {
+        deadline: outcome.bound.deadline,
+        owner: outcome.bound.owner,
+        allow_wait: outcome.bound.allow_wait,
+    };
+    let (observed, extra, timed_out_by) =
+        resolve_return_with(glass, a.return_.as_deref(), action_context).map_err(|error| {
+            if semantic {
+                semantic_return_error(
+                    "glass_set_value",
+                    &outcome,
+                    error,
+                    "value was written; return observe failed",
+                )
+            } else {
+                error.after_dispatch()
+            }
+        })?;
+    let output = if semantic {
+        semantic_action::success_output("glass_set_value", &outcome, observed, extra)
+    } else {
+        let mut result = json!({ "id": outcome.target.id.0 });
+        if let Some(observed) = observed {
+            result["observed"] = observed;
+        }
+        ToolOutput::result_with("glass_set_value", result, extra)
+    };
+    Ok(ContextualOutput::with_timeout(output, timed_out_by))
 }
 
 pub fn a11y_marks(glass: &mut Glass) -> ToolResult {

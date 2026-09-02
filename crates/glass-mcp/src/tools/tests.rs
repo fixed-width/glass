@@ -16,6 +16,15 @@ fn start_args() -> StartArgs {
     }
 }
 
+fn structured_error(output: &ToolOutput, tool: &str) -> serde_json::Value {
+    let blocks = output.render_text_blocks();
+    let envelope: serde_json::Value =
+        serde_json::from_str(&blocks[0]).expect("structured standalone error envelope");
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["tool"], tool);
+    envelope
+}
+
 #[test]
 fn a11y_defaults_on_when_omitted() {
     // The a11y-first path is the low-token default, so an omitted flag enables it.
@@ -518,7 +527,8 @@ fn set_value_tool_ok_and_errors() {
         },
     )
     .unwrap_err();
-    assert!(err.contains("not in the current snapshot"), "msg: {err}");
+    let err = structured_error(&err, "glass_set_value");
+    assert_eq!(err["error"]["code"], "stale_element");
 }
 
 #[test]
@@ -555,7 +565,8 @@ fn set_value_tool_rejects_uneditable_and_stale() {
         },
     )
     .unwrap_err();
-    assert!(err.contains("not editable"), "msg: {err}");
+    let err = structured_error(&err, "glass_set_value");
+    assert_eq!(err["error"]["code"], "not_editable");
 
     // Element changed since the snapshot: same contract — error, not success.
     let mut g = glass_with_a11y_outcome(
@@ -577,7 +588,8 @@ fn set_value_tool_rejects_uneditable_and_stale() {
         },
     )
     .unwrap_err();
-    assert!(err.contains("changed since the snapshot"), "msg: {err}");
+    let err = structured_error(&err, "glass_set_value");
+    assert_eq!(err["error"]["code"], "stale_element");
 }
 
 #[test]
@@ -621,7 +633,8 @@ fn click_element_tool_ok_and_errors() {
         },
     )
     .unwrap_err();
-    assert!(err.contains("not in the current snapshot"), "msg: {err}");
+    let err = structured_error(&err, "glass_click_element");
+    assert_eq!(err["error"]["code"], "stale_element");
 }
 
 #[test]
@@ -945,7 +958,8 @@ fn return_unknown_errors() {
         },
     )
     .unwrap_err();
-    assert!(err.contains("unknown return"), "msg: {err}");
+    let err = structured_error(&err, "glass_click_element");
+    assert_eq!(err["error"]["code"], "invalid_return");
 }
 
 #[test]
@@ -1124,10 +1138,11 @@ fn return_snapshot_without_frames_propagates_settle_failure() {
         },
     )
     .unwrap_err();
-    assert!(
-        error.contains("capture failed: no scripted frames"),
-        "{error}"
-    );
+    let error = structured_error(&error, "glass_click_element");
+    assert_eq!(error["error"]["category"], "transport_failure");
+    assert_eq!(error["error"]["summary"], "backend transport failed");
+    assert_eq!(error["result"]["dispatch"], "may_have_dispatched");
+    assert_eq!(error["result"]["side_effects_may_have_occurred"], true);
 }
 
 #[test]
@@ -1304,7 +1319,8 @@ fn type_unknown_return_rejected_before_any_keystroke() {
         },
     )
     .unwrap_err();
-    assert!(err.contains("unknown return"), "msg: {err}");
+    let err = structured_error(&err, "glass_type");
+    assert_eq!(err["error"]["code"], "invalid_return");
     assert!(
         log.lock().unwrap().is_empty(),
         "no input injected on a rejected `return`: {:?}",
@@ -1343,8 +1359,90 @@ fn type_observe_failure_says_text_was_typed() {
         },
     )
     .unwrap_err();
-    assert!(err.contains("text was typed"), "msg: {err}");
+    let rendered = err.render_text_blocks().join("\n");
+    let err = structured_error(&err, "glass_type");
+    assert_eq!(err["error"]["code"], "transport_failure");
+    assert_eq!(err["result"]["side_effects_may_have_occurred"], true);
+    assert!(
+        !rendered.contains("hi"),
+        "submitted text leaked: {rendered}"
+    );
     assert_eq!(*log.lock().unwrap(), vec!["type(hi)"], "keystrokes landed");
+}
+
+#[test]
+fn click_element_legacy_id_success_retains_wire_fields_without_semantic_resolution() {
+    let mut g = glass_with_a11y_invoke_on_another(FakePlatform::new(100, 100), fake_tree(), 7);
+    start(&mut g, &start_args()).unwrap();
+    a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+    let out = click_element(
+        &mut g,
+        &ClickElementArgs {
+            id: Some(1),
+            target: None,
+            mode: None,
+            timeout_ms: None,
+            max_nodes: None,
+            return_: None,
+        },
+    )
+    .unwrap();
+    let result = assert_envelope(&out, "glass_click_element");
+    assert_eq!(result["id"], 1);
+    assert_eq!(result["method"], "native-action");
+    assert_eq!(result["actuated_id"], 7);
+    assert!(result.get("dispatch").is_none());
+    assert!(result.get("confirmation").is_none());
+    assert!(result.get("resolution").is_none());
+    assert_eq!(out.0.len(), 1);
+}
+
+#[test]
+fn set_value_legacy_id_success_retains_wire_fields_without_semantic_resolution() {
+    let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
+    start(&mut g, &start_args()).unwrap();
+    a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+    let out = set_value(
+        &mut g,
+        &SetValueArgs {
+            id: Some(1),
+            target: None,
+            timeout_ms: None,
+            max_nodes: None,
+            text: "hello".into(),
+            return_: None,
+        },
+    )
+    .unwrap();
+    let result = assert_envelope(&out, "glass_set_value");
+    assert_eq!(result["id"], 1);
+    assert!(result.get("method").is_none());
+    assert!(result.get("dispatch").is_none());
+    assert!(result.get("confirmation").is_none());
+    assert!(result.get("resolution").is_none());
+    assert_eq!(out.0.len(), 1);
+}
+
+#[test]
+fn type_untargeted_preserves_key_by_behavior_and_empty_success_shape() {
+    use std::sync::{Arc, Mutex};
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut g = glass_with(FakePlatform::new(100, 100).with_event_log(log.clone()));
+    start(&mut g, &start_args()).unwrap();
+    let out = type_text(
+        &mut g,
+        &TypeArgs {
+            target: None,
+            focus_mode: None,
+            timeout_ms: None,
+            max_nodes: None,
+            text: "legacy typing".into(),
+            return_: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(assert_envelope(&out, "glass_type"), serde_json::json!({}));
+    assert_eq!(*log.lock().unwrap(), vec!["type(legacy typing)"]);
 }
 
 #[test]

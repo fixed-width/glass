@@ -3,20 +3,25 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use glass_core::{
-    Accessibility, ActionMode, ActionTarget, AppSpec, AxContext, AxNodeId, AxStateCoverage,
-    AxTarget, Backend, BaselineStore, BoundDispatch, ChangeSignal, Deadline, Frame, Glass,
-    GlassError, HostPathProtectionMode, KeyEvent, Platform, PlatformFactory, PointerEvent,
-    PointerHit, ProtectedHostPath, Region, SandboxLevel, Stream, WindowGeometry, WindowId,
-    WindowInfo, WindowOp,
+    Accessibility, ActionDeadline, ActionMethod, ActionMode, ActionTarget, ActionabilityCheck,
+    ActionabilityCheckName, ActionabilityReport, ActionabilitySource, ActionabilityVerdict,
+    AppSpec, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStateCoverage, AxStates, AxTarget,
+    Backend, BaselineStore, BoundDispatch, ChangeSignal, ConfirmationStatus, Deadline,
+    DispatchStatus, ElementInfo, Frame, Glass, GlassError, HostPathProtectionMode, KeyEvent,
+    MatchField, MatchTier, MutationReport, Platform, PlatformFactory, PointerEvent, PointerHit,
+    ProtectedHostPath, Region, ResolutionReport, RetryGuidance, SandboxLevel, ScopeResolution,
+    SemanticActionError, SemanticActionFailureKind, SemanticActionOutcome, SemanticMatch, Stream,
+    Whose, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 
 use super::{
-    ValidatedType, validate_action, validate_click_element_args, validate_set_value_args,
-    validate_type_args,
+    ValidatedType, candidates_json, element_json, semantic_error, success_output, validate_action,
+    validate_click_element_args, validate_set_value_args, validate_type_args,
 };
 use crate::params::{Action, ClickElementArgs, SetValueArgs, TypeArgs};
 use crate::tools::{
-    ContextualError, ToolContext, click_element_with, set_value_with, type_text_with,
+    ContextualError, SafeErrorCategory, ToolContext, click_element_with, erase_semantic_context,
+    set_value_with, type_text_with,
 };
 
 #[derive(Clone, Copy)]
@@ -214,13 +219,16 @@ impl Platform for InstrumentedPlatform {
 
 struct InstrumentedAccessibility {
     counters: Arc<SessionIoCounters>,
+    tree: glass_core::AxTree,
+    coverage: AxStateCoverage,
+    invoke_result: Option<AxNodeId>,
 }
 
 impl Accessibility for InstrumentedAccessibility {
     fn snapshot(&mut self, _ctx: &AxContext) -> glass_core::Result<glass_core::AxTree> {
         self.counters
             .record(SessionIoKind::Accessibility, "a11y_snapshot");
-        Ok(crate::tools::testutil::empty_tree())
+        Ok(self.tree.clone())
     }
 
     fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
@@ -232,7 +240,7 @@ impl Accessibility for InstrumentedAccessibility {
     fn state_coverage(&self) -> AxStateCoverage {
         self.counters
             .record(SessionIoKind::Accessibility, "a11y_state_coverage");
-        AxStateCoverage::NONE
+        self.coverage
     }
 
     fn focus(
@@ -272,11 +280,23 @@ impl Accessibility for InstrumentedAccessibility {
         _target: &AxTarget,
     ) -> glass_core::Result<Option<AxNodeId>> {
         self.counters.record(SessionIoKind::Action, "a11y_invoke");
-        Ok(None)
+        Ok(self.invoke_result)
     }
 }
 
 fn started_instrumented_glass() -> (Glass, Arc<SessionIoCounters>, Arc<AtomicUsize>) {
+    started_instrumented_glass_with(
+        crate::tools::testutil::empty_tree(),
+        AxStateCoverage::NONE,
+        None,
+    )
+}
+
+fn started_instrumented_glass_with(
+    tree: glass_core::AxTree,
+    coverage: AxStateCoverage,
+    invoke_result: Option<AxNodeId>,
+) -> (Glass, Arc<SessionIoCounters>, Arc<AtomicUsize>) {
     let counters = Arc::new(SessionIoCounters::default());
     let geometry = WindowGeometry {
         x: 0,
@@ -291,6 +311,9 @@ fn started_instrumented_glass() -> (Glass, Arc<SessionIoCounters>, Arc<AtomicUsi
         }),
         accessibility: Some(Box::new(InstrumentedAccessibility {
             counters: counters.clone(),
+            tree,
+            coverage,
+            invoke_result,
         })),
     });
     let factory_calls = Arc::new(AtomicUsize::new(0));
@@ -660,4 +683,690 @@ fn validate_action_routes_each_invalid_variant_to_its_pure_helper() {
         );
         assert_eq!(error.bound_dispatch, Some(BoundDispatch::NotDispatched));
     }
+}
+
+fn element_with_text(name: &str, value: &str, secure: bool) -> ElementInfo {
+    ElementInfo {
+        id: AxNodeId(4),
+        role: AxRole::Button,
+        name: Some(name.into()),
+        description: Some(format!("description for {name}")),
+        value: Some(value.into()),
+        bounds: Some(AxRect {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        }),
+        states: AxStates {
+            enabled: true,
+            visible: true,
+            secure,
+            ..AxStates::default()
+        },
+    }
+}
+
+fn actionability_report() -> ActionabilityReport {
+    ActionabilityReport {
+        checks: vec![ActionabilityCheck::new(
+            ActionabilityCheckName::Unique,
+            ActionabilityVerdict::Passed,
+            true,
+            ActionabilitySource::SemanticResolution,
+        )],
+    }
+}
+
+fn resolution_report(timed_out_by: Option<Whose>) -> ResolutionReport {
+    ResolutionReport {
+        elapsed_ms: 12,
+        scope: ScopeResolution::Resolved(AxNodeId(3)),
+        matches_in_walk: 1,
+        search_complete: true,
+        timed_out_by,
+        tree_truncated: false,
+        unreadable_subtrees: 0,
+        unexposed_placeholders: 0,
+    }
+}
+
+fn action_bound(owner: Option<Whose>) -> ActionDeadline {
+    ActionDeadline {
+        deadline: Deadline::UNBOUNDED,
+        owner,
+        allow_wait: true,
+    }
+}
+
+fn outcome(
+    method: ActionMethod,
+    focus: Option<MutationReport>,
+    semantic: bool,
+    name: &str,
+) -> SemanticActionOutcome {
+    SemanticActionOutcome {
+        target: element_with_text(name, "application value", false),
+        resolution: semantic.then(|| resolution_report(None)),
+        actionability: actionability_report(),
+        focus,
+        action: MutationReport {
+            method,
+            dispatch: DispatchStatus::Dispatched,
+            confirmation: ConfirmationStatus::DispatchConfirmed,
+        },
+        bound: action_bound(Some(Whose::Callee)),
+    }
+}
+
+fn semantic_match(name: &str, context: &str) -> SemanticMatch {
+    SemanticMatch {
+        element: element_with_text(name, "candidate value", false),
+        field: Some(MatchField::Name),
+        tier: MatchTier::ExactName,
+        context: context.into(),
+    }
+}
+
+fn semantic_failure(
+    kind: SemanticActionFailureKind,
+    timed_out_by: Option<Whose>,
+    owner: Option<Whose>,
+    candidates: Vec<SemanticMatch>,
+) -> SemanticActionError {
+    SemanticActionError {
+        kind,
+        summary: "APP CONTROLLED SUMMARY MUST NOT BE USED",
+        resolution: Some(resolution_report(timed_out_by)),
+        actionability: actionability_report(),
+        focus: None,
+        action_dispatch: DispatchStatus::NotDispatched,
+        candidates,
+        bound: action_bound(owner),
+        retry: RetryGuidance::WaitOrRefine,
+        source: Some(GlassError::Backend(
+            "APP CONTROLLED BACKEND DETAIL MUST NOT BE USED".into(),
+        )),
+    }
+}
+
+fn success_result(output: &crate::tools::ToolOutput) -> &serde_json::Value {
+    let crate::tools::OutContent::Envelope(envelope) = &output.0[0] else {
+        panic!("expected success envelope")
+    };
+    &envelope.result
+}
+
+fn error_envelope(output: &crate::tools::ToolOutput) -> serde_json::Value {
+    let block = output.render_text_blocks().remove(0);
+    serde_json::from_str(&block).expect("structured error envelope")
+}
+
+fn untrusted_body(block: &str) -> &str {
+    let after_open = block.split_once("⟧\n").expect("untrusted open marker").1;
+    after_open
+        .rsplit_once("\n⟦/untrusted:")
+        .expect("untrusted close marker")
+        .0
+}
+
+#[test]
+fn semantic_success_shapes_disclose_mutation_and_complete_evidence() {
+    let click = success_output(
+        "glass_click_element",
+        &outcome(
+            ActionMethod::NativeAction {
+                actuated: Some(AxNodeId(9)),
+            },
+            None,
+            true,
+            "Save",
+        ),
+        None,
+        vec![],
+    );
+    let click_result = success_result(&click);
+    assert_eq!(click_result["id"], 4);
+    assert_eq!(click_result["method"], "native-action");
+    assert_eq!(click_result["dispatch"], "dispatched");
+    assert_eq!(click_result["confirmation"], "dispatch_confirmed");
+    assert_eq!(click_result["actuated_id"], 9);
+    assert_eq!(click_result["resolution"]["source"], "semantic");
+    assert_eq!(click_result["resolution"]["elapsed_ms"], 12);
+    assert_eq!(click_result["resolution"]["scope_status"], "resolved");
+    assert_eq!(click_result["resolution"]["resolved_scope_id"], 3);
+    assert_eq!(click_result["resolution"]["search_complete"], true);
+    assert_eq!(click_result["resolution"]["tree_truncated"], false);
+    assert_eq!(
+        click_result["actionability"][0],
+        serde_json::json!({
+            "check": "unique",
+            "verdict": "passed",
+            "required": true,
+            "source": "semantic_resolution",
+        })
+    );
+
+    let set = success_output(
+        "glass_set_value",
+        &outcome(ActionMethod::AccessibilityValue, None, true, "Account name"),
+        Some(serde_json::json!({"settled": true})),
+        vec![],
+    );
+    let set_result = success_result(&set);
+    assert_eq!(set_result["method"], "accessibility-value");
+    assert_eq!(set_result["dispatch"], "dispatched");
+    assert_eq!(set_result["confirmation"], "dispatch_confirmed");
+    assert_eq!(set_result["observed"]["settled"], true);
+
+    let typed = success_output(
+        "glass_type",
+        &outcome(
+            ActionMethod::Keyboard,
+            Some(MutationReport {
+                method: ActionMethod::NativeAction { actuated: None },
+                dispatch: DispatchStatus::Dispatched,
+                confirmation: ConfirmationStatus::FocusConfirmed,
+            }),
+            true,
+            "UNIQUE_SUBMITTED_TYPE_SENTINEL",
+        ),
+        None,
+        vec![],
+    );
+    let type_result = success_result(&typed);
+    assert_eq!(type_result["focus_method"], "native-action");
+    assert_eq!(type_result["focus_dispatch"], "dispatched");
+    assert_eq!(type_result["focus_confirmation"], "focus_confirmed");
+    assert_eq!(type_result["type_dispatch"], "dispatched");
+    assert!(type_result.get("method").is_none());
+    assert!(
+        typed
+            .render_text_blocks()
+            .iter()
+            .all(|block| !block.contains("UNIQUE_SUBMITTED_TYPE_SENTINEL"))
+    );
+}
+
+#[test]
+fn semantic_selector_success_has_one_untrusted_target_sibling_and_trusted_text_is_clean() {
+    let output = success_output(
+        "glass_click_element",
+        &outcome(
+            ActionMethod::Pointer {
+                native_fallback: None,
+            },
+            None,
+            true,
+            "Pay now",
+        ),
+        None,
+        vec![],
+    );
+    assert_eq!(output.0.len(), 2);
+    let trusted = output.render_text_blocks()[0].clone();
+    assert!(!trusted.contains("Pay now"));
+    assert!(!trusted.contains("description for"));
+    assert!(!trusted.contains("application value"));
+    let sibling = output.text_block(1).expect("target sibling");
+    assert_eq!(
+        sibling.trust,
+        crate::output::TextTrust::UntrustedApplication
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(untrusted_body(&sibling.body)).expect("target JSON");
+    assert_eq!(body["target"]["name"], "Pay now");
+    assert_eq!(
+        success_result(&output)["content_blocks"],
+        serde_json::json!([1])
+    );
+
+    let legacy = success_output(
+        "glass_click_element",
+        &outcome(
+            ActionMethod::Pointer {
+                native_fallback: None,
+            },
+            None,
+            false,
+            "Pay now",
+        ),
+        None,
+        vec![],
+    );
+    assert_eq!(legacy.0.len(), 1);
+    assert!(success_result(&legacy).get("resolution").is_none());
+    assert!(success_result(&legacy).get("content_blocks").is_none());
+}
+
+#[test]
+fn element_and_candidate_rendering_enforce_text_and_secure_value_policy() {
+    let secure = element_with_text("Secret field", "TOP SECRET", true);
+    let visible = element_json(&secure, true);
+    assert_eq!(visible["name"], "Secret field");
+    assert_eq!(visible["value"], serde_json::Value::Null);
+
+    let hidden = element_json(&secure, false);
+    assert_eq!(hidden["name"], serde_json::Value::Null);
+    assert_eq!(hidden["description"], serde_json::Value::Null);
+    assert_eq!(hidden["value"], serde_json::Value::Null);
+
+    let candidates = candidates_json(&[semantic_match("Neighbor", "near Account")], false);
+    assert_eq!(candidates[0]["name"], serde_json::Value::Null);
+    assert_eq!(candidates[0]["matched_text"], serde_json::Value::Null);
+    assert_eq!(candidates[0]["context"], serde_json::Value::Null);
+    assert_eq!(candidates[0]["id"], 4);
+    assert_eq!(candidates[0]["match_tier"], "exact_name");
+}
+
+#[test]
+fn semantic_error_categories_and_codes_are_stable_snake_case() {
+    let rows = [
+        (
+            SemanticActionFailureKind::NoMatch,
+            SafeErrorCategory::NoMatch,
+            "no_match",
+        ),
+        (
+            SemanticActionFailureKind::AmbiguousTarget,
+            SafeErrorCategory::AmbiguousTarget,
+            "ambiguous_target",
+        ),
+        (
+            SemanticActionFailureKind::AmbiguousScope,
+            SafeErrorCategory::AmbiguousScope,
+            "ambiguous_scope",
+        ),
+        (
+            SemanticActionFailureKind::IncompleteTree,
+            SafeErrorCategory::IncompleteTree,
+            "incomplete_tree",
+        ),
+        (
+            SemanticActionFailureKind::UnprovenSelectorState,
+            SafeErrorCategory::UnprovenSelectorState,
+            "unproven_selector_state",
+        ),
+        (
+            SemanticActionFailureKind::NotActionable,
+            SafeErrorCategory::NotActionable,
+            "not_actionable",
+        ),
+        (
+            SemanticActionFailureKind::UnstableTarget,
+            SafeErrorCategory::UnstableTarget,
+            "unstable_target",
+        ),
+        (
+            SemanticActionFailureKind::FocusUnconfirmed,
+            SafeErrorCategory::FocusUnconfirmed,
+            "focus_unconfirmed",
+        ),
+        (
+            SemanticActionFailureKind::UnsupportedMode,
+            SafeErrorCategory::UnsupportedMode,
+            "unsupported_mode",
+        ),
+    ];
+    for (kind, category, code) in rows {
+        let rendered = semantic_error(
+            "glass_click_element",
+            semantic_failure(kind, None, None, vec![]),
+        );
+        assert_eq!(rendered.category, category);
+        assert_eq!(rendered.code, code);
+        assert_eq!(serde_json::to_value(category).unwrap(), code);
+        assert!(!rendered.message.contains("APP CONTROLLED"));
+    }
+}
+
+#[test]
+fn structured_ambiguity_error_keeps_candidates_only_in_untrusted_sibling() {
+    let error = semantic_error(
+        "glass_click_element",
+        semantic_failure(
+            SemanticActionFailureKind::AmbiguousTarget,
+            None,
+            None,
+            vec![
+                semantic_match("Pay personal", "inside Personal card"),
+                semantic_match("Pay business", "inside Business card"),
+            ],
+        ),
+    );
+    let output = erase_semantic_context("glass_click_element", Err(error)).unwrap_err();
+    let envelope = error_envelope(&output);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["tool"], "glass_click_element");
+    assert_eq!(envelope["error"]["code"], "ambiguous_target");
+    assert_eq!(envelope["error"]["summary"], "semantic target is ambiguous");
+    assert_eq!(envelope["result"]["dispatch"], "not_dispatched");
+    assert_eq!(envelope["result"]["side_effects_may_have_occurred"], false);
+    assert_eq!(envelope["result"]["retry"], "wait_or_refine");
+    assert_eq!(envelope["content_blocks"], serde_json::json!([1]));
+    let trusted = output.render_text_blocks()[0].clone();
+    assert!(!trusted.contains("Pay personal"));
+    assert!(!trusted.contains("Business card"));
+    let sibling = output.text_block(1).expect("candidate sibling");
+    assert!(sibling.body.contains("Pay personal"));
+    assert!(sibling.body.contains("Business card"));
+}
+
+#[test]
+fn structured_actionability_failure_uses_one_untrusted_known_target_block() {
+    let error = semantic_error(
+        "glass_set_value",
+        semantic_failure(
+            SemanticActionFailureKind::NotActionable,
+            None,
+            None,
+            vec![semantic_match("Disabled account", "inside settings")],
+        ),
+    );
+    let output = erase_semantic_context("glass_set_value", Err(error)).unwrap_err();
+    assert_eq!(output.0.len(), 2);
+    let sibling = output.text_block(1).expect("known target sibling");
+    let body: serde_json::Value = serde_json::from_str(untrusted_body(&sibling.body)).unwrap();
+    assert!(body.get("target").is_some(), "{body}");
+    assert!(body.get("candidates").is_none(), "{body}");
+}
+
+#[test]
+fn caller_owned_or_expired_semantic_context_uses_sequence_deadline_and_keeps_evidence() {
+    let error = semantic_error(
+        "glass_click_element",
+        semantic_failure(
+            SemanticActionFailureKind::NoMatch,
+            Some(Whose::Caller),
+            Some(Whose::Caller),
+            vec![],
+        ),
+    );
+    assert_eq!(error.code, "sequence_deadline_exceeded");
+    assert_eq!(error.category, SafeErrorCategory::SequenceDeadlineExceeded);
+    let result = error.result.expect("semantic evidence");
+    assert_eq!(result["resolution"]["timed_out_by"], "sequence");
+    assert_eq!(result["resolution"]["matches_in_walk"], 1);
+    assert_eq!(result["resolution"]["search_complete"], true);
+
+    let action_timeout = semantic_error(
+        "glass_click_element",
+        semantic_failure(
+            SemanticActionFailureKind::NoMatch,
+            Some(Whose::Callee),
+            Some(Whose::Callee),
+            vec![],
+        ),
+    );
+    assert_eq!(action_timeout.code, "no_match");
+    assert_eq!(
+        action_timeout.result.unwrap()["resolution"]["timed_out_by"],
+        "action"
+    );
+}
+
+#[test]
+fn structured_backend_stale_and_deadline_errors_do_not_format_backend_source() {
+    let mut stale = semantic_failure(SemanticActionFailureKind::ActionFailed, None, None, vec![]);
+    stale.source = Some(GlassError::AxElementChanged(4));
+    let stale = semantic_error("glass_click_element", stale);
+    assert_eq!(stale.code, "stale_element");
+    assert_eq!(stale.category, SafeErrorCategory::StaleElement);
+
+    for (kind, owner, code) in [
+        (
+            SemanticActionFailureKind::ActionDeadlineExceeded,
+            Some(Whose::Callee),
+            "action_deadline_exceeded",
+        ),
+        (
+            SemanticActionFailureKind::SequenceDeadlineExceeded,
+            Some(Whose::Caller),
+            "sequence_deadline_exceeded",
+        ),
+    ] {
+        let rendered = semantic_error(
+            "glass_click_element",
+            semantic_failure(kind, owner, owner, vec![]),
+        );
+        assert_eq!(rendered.code, code);
+        assert!(!rendered.message.contains("APP CONTROLLED BACKEND DETAIL"));
+    }
+}
+
+#[test]
+fn structured_type_failure_excludes_submitted_payload_from_blocks_and_artifacts() {
+    const SENTINEL: &str = "TYPE_PAYLOAD_SENTINEL_7e3e5037";
+    let mut failure = semantic_failure(
+        SemanticActionFailureKind::FocusUnconfirmed,
+        None,
+        None,
+        vec![semantic_match(SENTINEL, SENTINEL)],
+    );
+    failure.source = Some(GlassError::Backend(format!("backend echoed {SENTINEL}")));
+    let output = erase_semantic_context("glass_type", Err(semantic_error("glass_type", failure)))
+        .unwrap_err();
+    assert!(
+        output
+            .render_text_blocks()
+            .iter()
+            .all(|block| !block.contains(SENTINEL))
+    );
+
+    let root = tempfile::tempdir().unwrap();
+    let store = crate::artifacts::ArtifactStore::for_test(root.path(), 1 << 20).unwrap();
+    let policy = crate::output_policy::OutputPolicy::new(store.clone());
+    let applied = policy.apply(crate::output_policy::ToolCallOutcome {
+        tool: "glass_type",
+        effect: crate::output::ToolEffect::MayMutate,
+        is_error: true,
+        target_access: crate::output::TargetAccess::NoActiveTarget,
+        output,
+    });
+    for content in &applied.output.0 {
+        if let crate::tools::OutContent::ResourceLink(descriptor) = content {
+            let artifact = store.read(descriptor.uri()).unwrap();
+            assert!(!artifact.text.contains(SENTINEL));
+        }
+    }
+}
+
+fn semantic_success_with_total_text_bytes(total: usize) -> crate::tools::ToolOutput {
+    let mut output = success_output(
+        "glass_click_element",
+        &outcome(
+            ActionMethod::Pointer {
+                native_fallback: None,
+            },
+            None,
+            true,
+            "",
+        ),
+        None,
+        vec![],
+    );
+    output.0[1] = crate::tools::OutContent::untrusted_observation(
+        &serde_json::json!({"target": {"padding": ""}}).to_string(),
+    );
+    let padding = "x".repeat(total - output.text_bytes());
+    output.0[1] = crate::tools::OutContent::untrusted_observation(
+        &serde_json::json!({"target": {"padding": padding}}).to_string(),
+    );
+    assert_eq!(output.text_bytes(), total);
+    output
+}
+
+fn semantic_error_with_total_text_bytes(total: usize) -> crate::tools::ToolOutput {
+    let mut output = erase_semantic_context(
+        "glass_click_element",
+        Err(semantic_error(
+            "glass_click_element",
+            semantic_failure(
+                SemanticActionFailureKind::AmbiguousTarget,
+                None,
+                None,
+                vec![semantic_match("", "")],
+            ),
+        )),
+    )
+    .unwrap_err();
+    output.0[1] = crate::tools::OutContent::untrusted_observation(
+        &serde_json::json!({"candidates": [{"padding": ""}]}).to_string(),
+    );
+    let padding = "x".repeat(total - output.text_bytes());
+    output.0[1] = crate::tools::OutContent::untrusted_observation(
+        &serde_json::json!({"candidates": [{"padding": padding}]}).to_string(),
+    );
+    assert_eq!(output.text_bytes(), total);
+    output
+}
+
+fn assert_output_budget_roundtrip(total: usize, is_error: bool, output: crate::tools::ToolOutput) {
+    let original = output.render_text_blocks();
+    let root = tempfile::tempdir().unwrap();
+    let store = crate::artifacts::ArtifactStore::for_test(root.path(), 1 << 20).unwrap();
+    let policy = crate::output_policy::OutputPolicy::new(store.clone());
+    let applied = policy.apply(crate::output_policy::ToolCallOutcome {
+        tool: "glass_click_element",
+        effect: crate::output::ToolEffect::MayMutate,
+        is_error,
+        target_access: crate::output::TargetAccess::NoActiveTarget,
+        output,
+    });
+    assert!(applied.output.text_bytes() <= crate::output_policy::MAX_TEXT_BYTES);
+    assert_eq!(applied.is_error, is_error);
+    if total <= crate::output_policy::MAX_TEXT_BYTES {
+        assert_eq!(applied.output.render_text_blocks(), original);
+        assert!(applied.output_metadata().is_none());
+    } else {
+        let descriptor = applied
+            .output
+            .0
+            .iter()
+            .find_map(|content| match content {
+                crate::tools::OutContent::ResourceLink(descriptor) => Some(descriptor),
+                _ => None,
+            })
+            .expect("oversized semantic block externalized");
+        let artifact = store.read(descriptor.uri()).unwrap();
+        let externalized = if artifact.text.starts_with(crate::untrusted::NOTE) {
+            artifact.text
+        } else {
+            let manifest: serde_json::Value = serde_json::from_str(&artifact.text).unwrap();
+            manifest["blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|block| block["index"] == 1)
+                .and_then(|block| block["text"].as_str())
+                .expect("manifest preserves externalized semantic block")
+                .to_owned()
+        };
+        assert_eq!(externalized, original[1]);
+        assert!(externalized.starts_with(crate::untrusted::NOTE));
+    }
+}
+
+#[test]
+fn output_budget_success_target_8191_8192_8193_roundtrips_exact_untrusted_block() {
+    for total in [8_191, 8_192, 8_193] {
+        assert_output_budget_roundtrip(total, false, semantic_success_with_total_text_bytes(total));
+    }
+}
+
+#[test]
+fn output_budget_error_candidates_8191_8192_8193_preserve_error_and_roundtrip() {
+    for total in [8_191, 8_192, 8_193] {
+        assert_output_budget_roundtrip(total, true, semantic_error_with_total_text_bytes(total));
+    }
+}
+
+#[test]
+fn zero_timeout_return_observe_fails_after_dispatch_without_waiting() {
+    let mut tree = crate::tools::testutil::empty_tree();
+    tree.root.children.push(AxNode {
+        id: AxNodeId(0),
+        role: AxRole::Button,
+        raw_role: "button".into(),
+        name: Some("Save".into()),
+        description: None,
+        value: None,
+        states: AxStates {
+            enabled: true,
+            visible: true,
+            ..AxStates::default()
+        },
+        bounds: Some(AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        }),
+        children: vec![],
+    });
+    tree.assign_ids();
+    let coverage = AxStateCoverage {
+        enabled: true,
+        visible: true,
+        ..AxStateCoverage::NONE
+    };
+    let (mut glass, counters, _) =
+        started_instrumented_glass_with(tree, coverage, Some(AxNodeId(1)));
+    let args: ClickElementArgs = serde_json::from_str(
+        r#"{"target":{"query":"Save","role":"Button"},"mode":"native","timeout_ms":0,"return":"settle"}"#,
+    )
+    .unwrap();
+    counters.clear();
+    let started = std::time::Instant::now();
+    let error = click_element_with(&mut glass, &args, ToolContext::UNBOUNDED).unwrap_err();
+    assert_eq!(error.code, "action_deadline_exceeded");
+    assert_eq!(error.category, SafeErrorCategory::ActionDeadlineExceeded);
+    assert_eq!(error.bound_dispatch, Some(BoundDispatch::MayHaveDispatched));
+    assert_eq!(
+        counters
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| **call == "a11y_invoke")
+            .count(),
+        1,
+        "one native dispatch"
+    );
+    assert_eq!(
+        counters.capture.load(Ordering::SeqCst),
+        0,
+        "no settle capture"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(100),
+        "return path must not sleep for the settle interval"
+    );
+}
+
+#[test]
+fn semantic_validators_assign_stable_request_codes_without_app_text_codes() {
+    let invalid_return: ClickElementArgs =
+        serde_json::from_str(r#"{"id":1,"return":"APP_TEXT_CODE"}"#).unwrap();
+    let error = validate_click_element_args(&invalid_return).unwrap_err();
+    assert_eq!(error.code, "invalid_return");
+    assert_ne!(error.code, "APP_TEXT_CODE");
+
+    let invalid_target: ClickElementArgs = serde_json::from_str(r#"{}"#).unwrap();
+    assert_eq!(
+        validate_click_element_args(&invalid_target)
+            .unwrap_err()
+            .code,
+        "invalid_action_target"
+    );
+
+    let invalid_sequence = Action::ClickElement(invalid_target);
+    assert_eq!(
+        validate_action(&invalid_sequence).unwrap_err().code,
+        "invalid_sequence"
+    );
+    assert_eq!(
+        ContextualError::validation("legacy".into()).code,
+        "invalid_argument"
+    );
 }

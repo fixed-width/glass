@@ -605,7 +605,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<TypeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run("glass_type", tool_effect("glass_type"), move |g| {
+        self.run_batch("glass_type", tool_effect("glass_type"), move |g| {
             tools::type_text(g, &a)
         })
         .await
@@ -899,7 +899,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ClickElementArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(
+        self.run_batch(
             "glass_click_element",
             tool_effect("glass_click_element"),
             move |g| tools::click_element(g, &a),
@@ -941,7 +941,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<SetValueArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(
+        self.run_batch(
             "glass_set_value",
             tool_effect("glass_set_value"),
             move |g| tools::set_value(g, &a),
@@ -1924,6 +1924,65 @@ mod tests {
         assert_eq!(r.is_error, Some(true));
         assert_eq!(r.content.len(), 2);
         assert!(first_text(&r).contains("step_failed"));
+    }
+
+    #[tokio::test]
+    async fn semantic_standalone_endpoints_use_structured_batch_transport() {
+        const SENTINEL: &str = "SERVER_TYPE_PAYLOAD_SENTINEL_219bb7";
+        let server = GlassServer::new(
+            crate::boot(None),
+            crate::audit::report_from_config(None, |_| None),
+        );
+        let click_args: ClickElementArgs =
+            serde_json::from_str(r#"{"target":{"role":"Button"},"timeout_ms":0}"#).unwrap();
+        let set_args: SetValueArgs = serde_json::from_str(
+            r#"{"target":{"role":"TextField"},"text":"SERVER_SET_PAYLOAD_SENTINEL","timeout_ms":0}"#,
+        )
+        .unwrap();
+        let type_args: TypeArgs = serde_json::from_value(serde_json::json!({
+            "target": {"role": "TextField"},
+            "text": SENTINEL,
+            "timeout_ms": 0,
+        }))
+        .unwrap();
+
+        for (tool, result) in [
+            (
+                "glass_click_element",
+                server
+                    .glass_click_element(Parameters(click_args))
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "glass_set_value",
+                server.glass_set_value(Parameters(set_args)).await.unwrap(),
+            ),
+            (
+                "glass_type",
+                server.glass_type(Parameters(type_args)).await.unwrap(),
+            ),
+        ] {
+            assert_eq!(result.is_error, Some(true));
+            let envelope: serde_json::Value =
+                serde_json::from_str(&first_text(&result)).expect("structured semantic error");
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["tool"], tool);
+            assert!(envelope["error"]["code"].as_str().is_some());
+            assert!(envelope["error"]["summary"].as_str().is_some());
+            assert!(
+                result
+                    .content
+                    .iter()
+                    .filter_map(|content| content.as_text())
+                    .all(|text| !text.text.contains(SENTINEL))
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_transport_keeps_the_tool_registry_count_unchanged() {
+        assert_eq!(registered_tools().len(), 31);
     }
 
     #[test]

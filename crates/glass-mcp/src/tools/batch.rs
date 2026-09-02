@@ -101,7 +101,11 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
             "`timeout_ms` is outside this platform's monotonic clock range",
         ));
     };
-    let context = ToolContext { deadline };
+    let context = ToolContext {
+        deadline,
+        owner: Some(glass_core::Whose::Caller),
+        allow_wait: true,
+    };
     let n = a.actions.len();
     let mut steps = Vec::with_capacity(n);
     let mut siblings = Vec::new();

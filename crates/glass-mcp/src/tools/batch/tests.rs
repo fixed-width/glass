@@ -1096,16 +1096,23 @@ fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
     };
     let mut standalone = started(FakePlatform::new(100, 100));
     let mut contextual = started(FakePlatform::new(100, 100));
+    let standalone = crate::tools::type_text(&mut standalone, &invalid).unwrap_err();
+    let contextual = crate::tools::type_text_with(
+        &mut contextual,
+        &invalid,
+        crate::tools::ToolContext::UNBOUNDED,
+    )
+    .unwrap_err();
+    let envelope: serde_json::Value =
+        serde_json::from_str(&standalone.render_text_blocks()[0]).unwrap();
+    assert_eq!(envelope["error"]["code"], contextual.code);
+    assert_eq!(envelope["error"]["summary"], contextual.safe_summary);
     assert_eq!(
-        crate::tools::type_text(&mut standalone, &invalid).unwrap_err(),
-        crate::tools::type_text_with(
-            &mut contextual,
-            &invalid,
-            crate::tools::ToolContext::UNBOUNDED,
-        )
-        .unwrap_err()
-        .message
+        contextual.bound_dispatch,
+        Some(glass_core::BoundDispatch::NotDispatched)
     );
+    assert_eq!(envelope["result"]["dispatch"], "not_dispatched");
+    assert_eq!(envelope["result"]["side_effects_may_have_occurred"], false);
 }
 
 #[test]

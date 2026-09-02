@@ -200,32 +200,60 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
             ("window", args, None)
         }
         Actuation::ClickElement {
+            mode,
             method,
             native_fallback,
             actuated_id,
+            dispatch,
+            confirmation,
             ..
         } => {
-            // A failed click has no method: omit the key rather than writing a null, so a
-            // reader never has to distinguish "no method recorded" from "method: null".
-            let args = match method {
-                Some(m) => {
-                    let mut args = json!({ "method": m });
-                    if let Some(reason) = native_fallback {
-                        args["native_fallback"] = json!(reason);
-                    }
-                    // Without this, "clicked the Save label" and "clicked the card around it,
-                    // which navigated away" are indistinguishable in the record.
-                    if let Some(actuated) = actuated_id {
-                        args["actuated_id"] = json!(actuated);
-                    }
-                    args
-                }
-                None => json!({}),
-            };
+            let mut args = json!({
+                "mode": mode,
+                "dispatch": dispatch,
+                "confirmation": confirmation,
+            });
+            if let Some(method) = method {
+                args["method"] = json!(method);
+            }
+            if let Some(reason) = native_fallback {
+                args["native_fallback"] = json!(reason);
+            }
+            if let Some(actuated) = actuated_id {
+                args["actuated_id"] = json!(actuated);
+            }
             ("click_element", args, None)
         }
-        Actuation::SetValue { text, .. } => ("set_value", json!({}), Some((*text).to_string())),
-        Actuation::TypeTarget { text, .. } => ("type", json!({}), Some((*text).to_string())),
+        Actuation::SetValue {
+            text,
+            dispatch,
+            confirmation,
+            ..
+        } => (
+            "set_value",
+            json!({ "dispatch": dispatch, "confirmation": confirmation }),
+            Some((*text).to_string()),
+        ),
+        Actuation::TypeTarget {
+            text,
+            focus_mode,
+            focus_method,
+            focus_dispatch,
+            focus_confirmation,
+            type_dispatch,
+            ..
+        } => {
+            let mut args = json!({
+                "focus_mode": focus_mode,
+                "focus_dispatch": focus_dispatch,
+                "focus_confirmation": focus_confirmation,
+                "type_dispatch": type_dispatch,
+            });
+            if let Some(method) = focus_method {
+                args["focus_method"] = json!(method);
+            }
+            ("type", args, Some((*text).to_string()))
+        }
     })
 }
 
@@ -342,10 +370,13 @@ impl AuditSink for JsonlSink {
             content: raw.as_deref().and_then(|r| render_content(r, &self.cfg)),
             result: ResultRecord {
                 ok: outcome.ok,
-                // `error` is recorded verbatim and is NOT run through content redaction.
-                // Invariant: backend error messages must never embed actuation content
-                // (e.g. the typed text), or it would leak here regardless of content mode.
-                error: outcome.error.clone(),
+                error: outcome.error.as_ref().map(|error| {
+                    if raw.is_some() {
+                        "action failed".into()
+                    } else {
+                        error.clone()
+                    }
+                }),
                 duration_ms: u64::try_from(dur.as_millis()).unwrap_or(u64::MAX),
             },
         };
@@ -749,7 +780,13 @@ mod tests {
         assert_eq!(r["action"], "set_value");
         assert_eq!(r["target"]["element"]["id"], 5);
         assert_eq!(r["target"]["element"]["role"], "PasswordField");
-        assert_eq!(r["args"], json!({}));
+        assert_eq!(
+            r["args"],
+            json!({
+                "dispatch": "dispatched",
+                "confirmation": "value_confirmed",
+            })
+        );
         assert_eq!(r["content"]["len"], 1);
     }
 
@@ -779,6 +816,11 @@ mod tests {
         assert_eq!(r["action"], "type");
         assert_eq!(r["target"]["element"]["id"], 9);
         assert_eq!(r["target"]["element"]["role"], "TextField");
+        assert_eq!(r["args"]["focus_mode"], "auto");
+        assert_eq!(r["args"]["focus_method"], "native-action");
+        assert_eq!(r["args"]["focus_dispatch"], "dispatched");
+        assert_eq!(r["args"]["focus_confirmation"], "focus_confirmed");
+        assert_eq!(r["args"]["type_dispatch"], "dispatched");
         assert_eq!(r["content"]["len"], 3);
         assert!(r["content"].get("text").is_none());
     }
@@ -850,7 +892,10 @@ mod tests {
         );
         let r = &lines(&buf)[0];
         assert_eq!(r["action"], "click_element");
+        assert_eq!(r["args"]["mode"], "auto");
         assert_eq!(r["args"]["method"], "pointer");
+        assert_eq!(r["args"]["dispatch"], "dispatched");
+        assert_eq!(r["args"]["confirmation"], "dispatch_confirmed");
         assert_eq!(
             r["args"]["native_fallback"], "element exposes no activation action",
             "the pointer path records WHY the native action wasn't used: {r}"
@@ -876,7 +921,10 @@ mod tests {
             Duration::from_millis(1),
         );
         let r = &lines(&buf)[0];
+        assert_eq!(r["args"]["mode"], "native");
         assert_eq!(r["args"]["method"], "native-action");
+        assert_eq!(r["args"]["dispatch"], "dispatched");
+        assert_eq!(r["args"]["confirmation"], "dispatch_confirmed");
         assert!(
             r["args"].get("native_fallback").is_none(),
             "nothing fell back: {r}"
@@ -931,8 +979,83 @@ mod tests {
         let r = &lines(&buf)[0];
         assert_eq!(r["action"], "click_element");
         assert_eq!(r["result"]["ok"], false);
+        assert_eq!(r["args"]["mode"], "auto");
+        assert_eq!(r["args"]["dispatch"], "not_dispatched");
+        assert_eq!(r["args"]["confirmation"], "unconfirmed");
         assert!(r["args"].get("method").is_none(), "no null method: {r}");
         assert!(r["args"].get("native_fallback").is_none(), "{r}");
+    }
+
+    #[test]
+    fn semantic_content_modes_never_let_typed_or_set_text_bypass_result_error_policy() {
+        const SENTINEL: &str = "AUDIT_PAYLOAD_SENTINEL_4f937e";
+        let record = |content: ContentMode, act: Actuation<'_>| {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let sink = JsonlSink::with_writer(
+                Box::new(Buf(buf.clone())),
+                AuditConfig {
+                    content,
+                    prefix_len: 5,
+                },
+            );
+            sink.record(
+                &act,
+                &ActuationContext::default(),
+                &AuditOutcome {
+                    ok: false,
+                    error: Some(format!("backend echoed {SENTINEL}")),
+                },
+                Duration::from_millis(1),
+            );
+            lines(&buf).remove(0)
+        };
+        let element = ElementRef {
+            id: 9,
+            role: Some("TextField".into()),
+            name: Some("Account".into()),
+        };
+        let make = |targeted_type: bool| {
+            if targeted_type {
+                Actuation::TypeTarget {
+                    element: element.clone(),
+                    text: SENTINEL,
+                    focus_mode: "auto",
+                    focus_method: Some("native-action"),
+                    focus_dispatch: "dispatched",
+                    focus_confirmation: "focus_confirmed",
+                    type_dispatch: "may_have_dispatched",
+                }
+            } else {
+                Actuation::SetValue {
+                    element: element.clone(),
+                    text: SENTINEL,
+                    dispatch: "may_have_dispatched",
+                    confirmation: "unconfirmed",
+                }
+            }
+        };
+
+        for targeted_type in [false, true] {
+            let none = record(ContentMode::None, make(targeted_type));
+            assert!(none.get("content").is_none());
+            assert!(!none["result"]["error"].as_str().unwrap().contains(SENTINEL));
+
+            let redacted = record(ContentMode::Redacted, make(targeted_type));
+            assert_eq!(redacted["content"]["len"], SENTINEL.len());
+            assert!(redacted["content"]["sha256"].as_str().is_some());
+            assert_eq!(redacted["content"]["prefix"], &SENTINEL[..5]);
+            assert!(
+                !redacted["result"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains(SENTINEL)
+            );
+
+            let full = record(ContentMode::Full, make(targeted_type));
+            assert_eq!(full["content"]["text"], SENTINEL);
+            assert!(!full["result"]["error"].as_str().unwrap().contains(SENTINEL));
+            assert_eq!(full.to_string().matches(SENTINEL).count(), 1);
+        }
     }
 
     #[test]

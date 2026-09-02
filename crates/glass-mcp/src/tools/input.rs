@@ -4,8 +4,8 @@ use glass_core::{Glass, KeyEvent, Modifier, MouseButton, PointerEvent};
 
 use crate::params::*;
 use crate::tools::{
-    ContextualError, ContextualOutput, ContextualToolResult, ToolContext, ToolOutput, ToolResult,
-    parse_button,
+    BatchToolResult, ContextualError, ContextualOutput, ContextualToolResult, ToolContext,
+    ToolOutput, ToolResult, erase_semantic_context, parse_button, semantic_return_error,
 };
 
 fn standalone(result: ContextualToolResult) -> ToolResult {
@@ -204,8 +204,11 @@ pub(crate) fn scroll_with(
     )))
 }
 
-pub fn type_text(glass: &mut Glass, a: &TypeArgs) -> ToolResult {
-    standalone(type_text_with(glass, a, ToolContext::UNBOUNDED))
+pub fn type_text(glass: &mut Glass, a: &TypeArgs) -> BatchToolResult {
+    erase_semantic_context(
+        "glass_type",
+        type_text_with(glass, a, ToolContext::UNBOUNDED),
+    )
 }
 
 pub(crate) fn type_text_with(
@@ -214,39 +217,59 @@ pub(crate) fn type_text_with(
     context: ToolContext,
 ) -> ContextualToolResult {
     match crate::tools::semantic_action::validate_type_args(a)? {
-        crate::tools::semantic_action::ValidatedType::Untargeted => glass
-            .key_by(&KeyEvent::Text(a.text.clone()), context.deadline)
-            .map_err(|e| ContextualError::from_caller_bound(e, context))?,
-        crate::tools::semantic_action::ValidatedType::Targeted(params) => {
+        crate::tools::semantic_action::ValidatedType::Untargeted => {
             glass
+                .key_by(&KeyEvent::Text(a.text.clone()), context.deadline)
+                .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+            let (observed, extra, timed_out_by) =
+                crate::tools::resolve_return_with(glass, a.return_.as_deref(), context).map_err(
+                    |error| {
+                        error
+                            .after_dispatch()
+                            .annotate("text was typed; return observe failed")
+                    },
+                )?;
+            let mut result = serde_json::json!({});
+            if let Some(observed) = observed {
+                result["observed"] = observed;
+            }
+            Ok(ContextualOutput::with_timeout(
+                ToolOutput::result_with("glass_type", result, extra),
+                timed_out_by,
+            ))
+        }
+        crate::tools::semantic_action::ValidatedType::Targeted(params) => {
+            let outcome = glass
                 .type_target_by(&params, &a.text, context.deadline)
                 .map_err(|error| {
-                    let message = error.to_string();
-                    match error.source {
-                        Some(source) => ContextualError::from_caller_bound(source, context),
-                        None => ContextualError::from_caller_bound(
-                            glass_core::GlassError::Backend(message),
-                            context,
-                        ),
-                    }
+                    crate::tools::semantic_action::semantic_error("glass_type", error)
                 })?;
+            let action_context = ToolContext {
+                deadline: outcome.bound.deadline,
+                owner: outcome.bound.owner,
+                allow_wait: outcome.bound.allow_wait,
+            };
+            let (observed, extra, timed_out_by) =
+                crate::tools::resolve_return_with(glass, a.return_.as_deref(), action_context)
+                    .map_err(|error| {
+                        semantic_return_error(
+                            "glass_type",
+                            &outcome,
+                            error,
+                            "text was typed; return observe failed",
+                        )
+                    })?;
+            Ok(ContextualOutput::with_timeout(
+                crate::tools::semantic_action::success_output(
+                    "glass_type",
+                    &outcome,
+                    observed,
+                    extra,
+                ),
+                timed_out_by,
+            ))
         }
     }
-    // Past this point the keystrokes have landed: a failing observe (e.g. `snapshot`
-    // with no a11y reader) must say so, or an agent retries and types the text twice.
-    let (observed, extra, timed_out_by) =
-        crate::tools::resolve_return_with(glass, a.return_.as_deref(), context).map_err(|e| {
-            e.after_dispatch()
-                .annotate("text was typed; return observe failed")
-        })?;
-    let mut result = serde_json::json!({});
-    if let Some(o) = observed {
-        result["observed"] = o;
-    }
-    Ok(ContextualOutput::with_timeout(
-        ToolOutput::result_with("glass_type", result, extra),
-        timed_out_by,
-    ))
 }
 
 pub fn key(glass: &mut Glass, a: &KeyArgs) -> ToolResult {
