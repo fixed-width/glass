@@ -188,18 +188,9 @@ pub fn directory_entry_records(directory: &File) -> Result<Vec<DirectoryEntryRec
         if used == 0 || used > buffer.len() {
             return Err(HostFsError::Integrity);
         }
-        let (volume, _) = match parent_identity {
-            Some(identity) => identity,
-            None => {
-                let identity = file_identity(directory)?;
-                if identity.0 == 0 || identity.1 == 0 {
-                    return Err(HostFsError::Integrity);
-                }
-                parent_identity = Some(identity);
-                identity
-            }
-        };
-        let batch = parse_directory_records(&buffer[..used], volume)?;
+        let batch = parse_directory_batch(&buffer[..used], &mut parent_identity, || {
+            file_identity(directory)
+        })?;
         append_directory_batch(
             &mut names,
             &mut name_bytes,
@@ -260,10 +251,33 @@ fn remove_retained(file: File) -> Result<(), HostFsError> {
     Ok(())
 }
 
-fn parse_directory_records(
+fn parse_directory_batch(
     bytes: &[u8],
-    volume: u32,
+    parent_identity: &mut Option<(u32, u64)>,
+    identity: impl FnOnce() -> Result<(u32, u64), HostFsError>,
 ) -> Result<Vec<DirectoryEntryRecord>, HostFsError> {
+    let mut records = parse_directory_records(bytes)?;
+    if records.is_empty() {
+        return Ok(records);
+    }
+    let (volume, parent_id) = match *parent_identity {
+        Some(identity) => identity,
+        None => {
+            let identity = identity()?;
+            *parent_identity = Some(identity);
+            identity
+        }
+    };
+    if volume == 0 || parent_id == 0 {
+        return Err(HostFsError::Integrity);
+    }
+    for record in &mut records {
+        record.volume = volume;
+    }
+    Ok(records)
+}
+
+fn parse_directory_records(bytes: &[u8]) -> Result<Vec<DirectoryEntryRecord>, HostFsError> {
     let mut names = Vec::new();
     let mut offset = 0_usize;
     let fixed = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
@@ -294,12 +308,12 @@ fn parse_directory_records(
         } else if !valid_child_name(&name) {
             return Err(HostFsError::Integrity);
         } else {
-            if file_id == 0 || volume == 0 {
+            if file_id == 0 {
                 return Err(HostFsError::Integrity);
             }
             names.push(DirectoryEntryRecord {
                 name,
-                volume,
+                volume: 0,
                 file_id,
             });
         }
@@ -322,7 +336,7 @@ fn parse_directory_records(
 
 #[cfg(test)]
 fn parse_directory_names(bytes: &[u8]) -> Result<Vec<std::ffi::OsString>, HostFsError> {
-    Ok(parse_directory_records(bytes, 1)?
+    Ok(parse_directory_records(bytes)?
         .into_iter()
         .map(|record| record.name)
         .collect())
@@ -1372,12 +1386,28 @@ mod tests {
     fn parser_captures_exact_file_identity() {
         let fixed = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
         let bytes = directory_record(&['a' as u16], 0, fixed + 2);
+        let mut parent_identity = None;
 
-        let records = parse_directory_records(&bytes, 0xAABBCCDD).unwrap();
+        let records = parse_directory_batch(&bytes, &mut parent_identity, || {
+            Ok((0xAABBCCDD, 0x1122334455667788))
+        })
+        .unwrap();
 
         assert_eq!(records[0].file_id, 0x1122334455667788);
         assert_eq!(records[0].volume, 0xAABBCCDD);
         assert_eq!(records[0].name, OsStr::new("a"));
+    }
+
+    #[test]
+    fn navigation_only_batch_does_not_require_parent_identity() {
+        let fixed = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+        let bytes = directory_record(&['.' as u16], 0, fixed + 2);
+        let mut parent_identity = None;
+
+        let records =
+            parse_directory_batch(&bytes, &mut parent_identity, || Err(HostFsError::Open)).unwrap();
+
+        assert!(records.is_empty());
     }
 
     #[test]
@@ -1388,7 +1418,7 @@ mod tests {
         bytes[file_id_offset..file_id_offset + 8].fill(0);
 
         assert!(matches!(
-            parse_directory_records(&bytes, 1),
+            parse_directory_records(&bytes),
             Err(HostFsError::Integrity)
         ));
     }
