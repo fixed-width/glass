@@ -23,7 +23,7 @@ fn retained_directory_enumeration_excludes_navigation_entries() {
     assert_eq!(entries, [std::ffi::OsString::from("owned")]);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn retained_directory_enumeration_preserves_non_utf8_names() {
     use std::os::unix::ffi::OsStringExt;
@@ -1528,7 +1528,8 @@ fn replacing_root_ancestor_after_publication_cannot_redirect_read() {
     use std::os::unix::fs::symlink;
 
     let parent = tempfile::tempdir().unwrap();
-    let root = parent.path().join("root");
+    let parent_path = parent.path().canonicalize().unwrap();
+    let root = parent_path.join("root");
     fs::create_dir(&root).unwrap();
     let outside = tempfile::tempdir().unwrap();
     let sentinel = outside.path().join("sentinel");
@@ -1542,7 +1543,7 @@ fn replacing_root_ancestor_after_publication_cannot_redirect_read() {
     let redirected = outside.path().join(relative);
     fs::create_dir_all(redirected.parent().unwrap()).unwrap();
     fs::write(&redirected, "known").unwrap();
-    fs::rename(&root, parent.path().join("detached-root")).unwrap();
+    fs::rename(&root, parent_path.join("detached-root")).unwrap();
     symlink(outside.path(), &root).unwrap();
 
     assert_eq!(
