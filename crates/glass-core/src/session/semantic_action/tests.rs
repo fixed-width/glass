@@ -3068,3 +3068,116 @@ fn targeted_type_uses_the_same_absolute_deadline_for_focus_confirmation_and_typi
         &[outcome.bound.deadline]
     );
 }
+
+#[test]
+fn targeted_type_sanitizes_a_secret_bearing_key_backend_error_after_classification() {
+    let secret = "scripted key failure";
+    let mut fixture = targeted_type_glass(
+        vec![
+            targeted_type_field_tree("Account name", false),
+            targeted_type_field_tree("Account name", true),
+        ],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        true,
+    );
+    let sink = RecordingSink::default();
+    fixture.glass.set_audit_sink(Box::new(sink.clone()));
+    fixture.glass.start(&spec()).unwrap();
+    sink.0.lock().unwrap().clear();
+    sink.3.lock().unwrap().clear();
+
+    let error = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("Account name", ActionMode::Native, 500),
+            secret,
+        )
+        .unwrap_err();
+
+    assert_eq!(fixture.key_log.lock().unwrap().len(), 1);
+    assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(error.retry, RetryGuidance::DoNotRetry);
+    assert!(!error.to_string().contains(secret));
+    assert!(!format!("{error:?}").contains(secret));
+    assert!(!format!("{:?}", error.source).contains(secret));
+    assert!(error.source.is_none());
+    assert!(!format!("{:?}", error.candidates).contains(secret));
+    assert!(!format!("{:?}", error.actionability).contains(secret));
+    assert_eq!(sink.0.lock().unwrap().as_slice(), &["type_target:false"]);
+    let audits = sink.3.lock().unwrap();
+    assert_eq!(audits.len(), 1);
+    assert!(!audits[0].error.as_deref().unwrap().contains(secret));
+}
+
+#[test]
+fn targeted_type_confirms_and_reports_a_substituted_native_focus_target() {
+    let mut before = targeted_type_field_tree("Account name", false);
+    before.root.children.push(AxNode {
+        id: AxNodeId(2),
+        role: AxRole::TextArea,
+        raw_role: "text area".into(),
+        name: Some("Actual editor".into()),
+        description: None,
+        value: Some("old".into()),
+        states: AxStates {
+            enabled: true,
+            visible: true,
+            focusable: true,
+            editable: true,
+            ..AxStates::default()
+        },
+        bounds: Some(AxRect {
+            x: 20,
+            y: 70,
+            width: 160,
+            height: 60,
+        }),
+        children: Vec::new(),
+    });
+    let mut after = before.clone();
+    after.root.children[1].states.focused = true;
+    let mut fixture = targeted_type_glass(
+        vec![before, after],
+        InvokeBehavior::SucceedOnAnother(2),
+        full_state_coverage(),
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+
+    let outcome = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("Account name", ActionMode::Native, 0),
+            "typed once",
+        )
+        .unwrap();
+
+    assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 1);
+    assert!(fixture.clicks.lock().unwrap().is_empty());
+    assert_eq!(fixture.key_log.lock().unwrap().len(), 1);
+    assert_eq!(outcome.target.id, AxNodeId(2));
+    assert_eq!(outcome.target.role, AxRole::TextArea);
+    assert_eq!(outcome.target.name.as_deref(), Some("Actual editor"));
+    assert_eq!(
+        outcome.focus,
+        Some(MutationReport {
+            method: ActionMethod::NativeAction {
+                actuated: Some(AxNodeId(2)),
+            },
+            dispatch: DispatchStatus::Dispatched,
+            confirmation: ConfirmationStatus::FocusConfirmed,
+        })
+    );
+    let deadlines = fixture.ax_deadlines.lock().unwrap();
+    assert_eq!(deadlines.len(), 3);
+    assert!(
+        deadlines
+            .iter()
+            .all(|deadline| *deadline == outcome.bound.deadline)
+    );
+    assert_eq!(
+        fixture.key_deadlines.lock().unwrap().as_slice(),
+        &[outcome.bound.deadline]
+    );
+}

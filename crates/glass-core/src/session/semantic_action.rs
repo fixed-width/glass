@@ -826,6 +826,7 @@ fn key_source_error(source: GlassError, focused: ConfirmedFocus) -> SemanticActi
     } else {
         RetryGuidance::DoNotRetry
     };
+    error.source = None;
     error
 }
 
@@ -1996,6 +1997,26 @@ impl Glass {
         }
     }
 
+    fn native_focus_confirmation_target(
+        &self,
+        original: &AxTarget,
+        actuated: Option<AxNodeId>,
+    ) -> Result<AxTarget> {
+        let Some(id) = actuated else {
+            return Ok(original.clone());
+        };
+        let active = self.require_active()?;
+        let tree = active.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
+        let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
+        Ok(AxTarget {
+            id,
+            role: node.role,
+            name: node.name.clone(),
+            bounds: node.bounds,
+            value: node.value.clone(),
+        })
+    }
+
     fn focus_target_native_once(
         &mut self,
         params: &TypeTargetParams,
@@ -2053,8 +2074,20 @@ impl Glass {
             })?;
         actionability.pass_backend_fingerprint();
         let method = ActionMethod::NativeAction { actuated };
+        let confirmation_target = self
+            .native_focus_confirmation_target(&resolved.target, actuated)
+            .map_err(|source| {
+                focus_unconfirmed_error(
+                    Some(source),
+                    resolved.resolution.clone(),
+                    actionability.clone(),
+                    resolved.coverage,
+                    method.clone(),
+                    resolved.bound,
+                )
+            })?;
         let confirmed = self
-            .confirm_focused_target(&resolved.target, resolved.bound)
+            .confirm_focused_target(&confirmation_target, resolved.bound)
             .map_err(|error| {
                 focus_unconfirmed_error(
                     error.source,
