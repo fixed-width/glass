@@ -170,6 +170,62 @@ mod tests {
         assert!(m.checkable && !m.checked);
     }
 
+    macro_rules! state_witness {
+        ($name:ident, $state:ident, $field:ident) => {
+            #[test]
+            fn $name() {
+                assert_eq!(
+                    map_states(&StateSet::new(State::$state)),
+                    AxStates {
+                        $field: true,
+                        ..AxStates::default()
+                    }
+                );
+            }
+        };
+    }
+
+    state_witness!(focused_has_an_independent_atspi_witness, Focused, focused);
+    state_witness!(
+        focusable_has_an_independent_atspi_witness,
+        Focusable,
+        focusable
+    );
+    state_witness!(enabled_has_an_independent_atspi_witness, Enabled, enabled);
+    state_witness!(visible_has_an_independent_atspi_witness, Showing, visible);
+    state_witness!(
+        selected_has_an_independent_atspi_witness,
+        Selected,
+        selected
+    );
+    state_witness!(checked_has_an_independent_atspi_witness, Checked, checked);
+    state_witness!(
+        checkable_has_an_independent_atspi_witness,
+        Checkable,
+        checkable
+    );
+    state_witness!(
+        expanded_has_an_independent_atspi_witness,
+        Expanded,
+        expanded
+    );
+    state_witness!(
+        editable_has_an_independent_atspi_witness,
+        Editable,
+        editable
+    );
+
+    #[test]
+    fn sensitive_is_an_independent_enabled_witness() {
+        assert_eq!(
+            map_states(&StateSet::new(State::Sensitive)),
+            AxStates {
+                enabled: true,
+                ..AxStates::default()
+            }
+        );
+    }
+
     /// One AT-SPI role per normalized role — the witness list the parity test walks.
     const ROLE_SAMPLES: &[(Role, AxRole)] = &[
         (Role::Application, AxRole::Application),

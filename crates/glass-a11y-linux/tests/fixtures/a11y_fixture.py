@@ -16,9 +16,36 @@ and presents its window immediately without waiting for portal services to settl
 import sys
 import gi
 
-gi.require_version("Gtk", "4.0")
+GTK3_FOCUS_MODE = "--gtk3-focus" in sys.argv
+
+gi.require_version("Gtk", "3.0" if GTK3_FOCUS_MODE else "4.0")
 gi.require_version("Gio", "2.0")
-from gi.repository import Gio, Gtk  # noqa: E402
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
+
+if GTK3_FOCUS_MODE:
+    gi.require_version("Atk", "1.0")
+    from gi.repository import Atk  # noqa: E402
+
+
+class FocusFixtureApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(
+            application_id="net.jesterscourt.GlassA11yFocusFixture",
+            flags=Gio.ApplicationFlags.NON_UNIQUE,
+        )
+
+    def do_activate(self):
+        win = Gtk.ApplicationWindow(
+            application=self, title="Glass A11y Focus Fixture"
+        )
+        win.set_default_size(320, 120)
+        entry = Gtk.Entry()
+        entry.set_text("hello")
+        accessible = entry.get_accessible()
+        accessible.set_name("Field")
+        accessible.set_role(Atk.Role.ENTRY)
+        win.add(entry)
+        win.show_all()
 
 
 class FixtureApp(Gtk.Application):
@@ -33,6 +60,50 @@ class FixtureApp(Gtk.Application):
         win.set_default_size(320, 420)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         box.append(Gtk.Label(label="Ready"))
+
+        moving = Gtk.Button(label="Moving semantic")
+
+        def _start_moving(_button):
+            print("SEMANTIC_SAVE", flush=True)
+            started = GLib.get_monotonic_time()
+
+            def _move():
+                elapsed_ms = (GLib.get_monotonic_time() - started) // 1000
+                if elapsed_ms >= 300:
+                    print("MOVING_SETTLED", flush=True)
+                    return GLib.SOURCE_REMOVE
+                moving.set_margin_start((elapsed_ms // 30) * 4)
+                return GLib.SOURCE_CONTINUE
+
+            GLib.timeout_add(30, _move)
+
+        save_semantic = Gtk.Button(label="Semantic Save")
+        save_semantic.connect("clicked", _start_moving)
+
+        blocked = Gtk.Button(label="Disabled semantic")
+        blocked.set_sensitive(False)
+
+        duplicate_one = Gtk.Button(label="Duplicate semantic")
+        duplicate_two = Gtk.Button(label="Duplicate semantic")
+
+        occlusion_stage = Gtk.Overlay()
+        occluded = Gtk.Button(label="Occluded semantic")
+        occluded.set_hexpand(True)
+        occlusion_stage.set_child(occluded)
+        occluder = Gtk.Button(label="Occluder")
+        occluder.set_halign(Gtk.Align.CENTER)
+        occluder.set_valign(Gtk.Align.CENTER)
+        occlusion_stage.add_overlay(occluder)
+
+        semantic_grid = Gtk.Grid(row_spacing=4, column_spacing=8)
+        semantic_grid.attach(save_semantic, 0, 0, 1, 1)
+        semantic_grid.attach(blocked, 1, 0, 1, 1)
+        semantic_grid.attach(duplicate_one, 0, 1, 1, 1)
+        semantic_grid.attach(duplicate_two, 1, 1, 1, 1)
+        semantic_grid.attach(moving, 0, 2, 1, 1)
+        semantic_grid.attach(occlusion_stage, 1, 2, 1, 1)
+        box.append(semantic_grid)
+
         box.append(Gtk.Button(label="Save"))
         bold = Gtk.Button(label="Bold")
         # update_property(DESCRIPTION) populates AT-SPI Description (verified on the bus).
@@ -141,4 +212,5 @@ class FixtureApp(Gtk.Application):
 
 
 if __name__ == "__main__":
-    FixtureApp().run(sys.argv)
+    app_args = [arg for arg in sys.argv if arg != "--gtk3-focus"]
+    (FocusFixtureApp() if GTK3_FOCUS_MODE else FixtureApp()).run(app_args)
