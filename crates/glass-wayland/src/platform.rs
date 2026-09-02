@@ -6740,6 +6740,42 @@ mod tests {
         );
     }
 
+    fn live_process_start_time(pid: u32) -> Result<Option<u64>, String> {
+        let path = format!("/proc/{pid}/stat");
+        let stat = match std::fs::read_to_string(&path) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("read {path}: {error}")),
+        };
+        let (_, fields) = stat
+            .rsplit_once(')')
+            .ok_or_else(|| format!("malformed {path}: missing command terminator"))?;
+        let mut fields = fields.split_whitespace();
+        let state = fields
+            .next()
+            .ok_or_else(|| format!("malformed {path}: missing process state"))?;
+        if state == "Z" {
+            return Ok(None);
+        }
+        let start_time = fields
+            .nth(18)
+            .ok_or_else(|| format!("malformed {path}: missing start time"))?
+            .parse()
+            .map_err(|error| format!("malformed {path}: invalid start time: {error}"))?;
+        Ok(Some(start_time))
+    }
+
+    fn matching_live_processes(identities: &[(u32, u64)]) -> Result<Vec<u32>, String> {
+        identities
+            .iter()
+            .map(|&(pid, start_time)| {
+                live_process_start_time(pid)
+                    .map(|observed| (observed == Some(start_time)).then_some(pid))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|matches| matches.into_iter().flatten().collect())
+    }
+
     #[test]
     fn reap_pending_reaps_a_late_reported_separate_session_tree() {
         let dir = tempfile::tempdir().expect("fixture directory");
@@ -6753,6 +6789,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn compositor fixture");
+        let child_pid = child.id();
         let pipe = BwrapStatusPipe::new().expect("status pipe");
         let mut writer = std::fs::OpenOptions::new()
             .write(true)
@@ -6788,14 +6825,37 @@ mod tests {
                 })
             })
             .expect("target fixture must have a descendant");
+        let mut cleanup_tree = glass_proc_linux::proc_tree_pids(child_pid);
+        cleanup_tree.extend(target_tree);
+        cleanup_tree.sort_unstable();
+        cleanup_tree.dedup();
+        // Linux may reuse a PID before this highly concurrent test observes cleanup completion.
+        let cleanup_identities = cleanup_tree
+            .into_iter()
+            .filter_map(|pid| {
+                live_process_start_time(pid)
+                    .expect("inspect live cleanup fixture identity")
+                    .map(|start_time| (pid, start_time))
+            })
+            .collect::<Vec<_>>();
 
         let outcome = cleanup.reap();
         cleanup.disarm();
 
-        assert!(launch_cleanup_error(outcome).is_none());
+        assert!(outcome.status_error.is_none(), "{:?}", outcome.status_error);
+        // A delivered signal takes effect only when its target is next scheduled.
+        let settle_deadline = std::time::Instant::now() + glass_proc_linux::REAP_GRACE;
+        let survivors = loop {
+            let survivors = matching_live_processes(&cleanup_identities)
+                .expect("inspect cleanup identities after cleanup");
+            if survivors.is_empty() || std::time::Instant::now() >= settle_deadline {
+                break survivors;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert!(
-            !glass_proc_linux::any_alive(&target_tree),
-            "late-reported target tree survived cleanup: {target_tree:?}"
+            survivors.is_empty(),
+            "cleanup tree survived reaping: {survivors:?}"
         );
     }
 
