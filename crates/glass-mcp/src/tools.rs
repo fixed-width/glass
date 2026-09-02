@@ -948,7 +948,7 @@ pub(crate) fn set_value_with(
     let (observed, extra, timed_out_by) =
         resolve_return_with(glass, a.return_.as_deref(), action_context, true).map_err(
             |error| {
-                if semantic {
+                let error = if semantic {
                     semantic_return_error(
                         "glass_set_value",
                         &outcome,
@@ -957,7 +957,10 @@ pub(crate) fn set_value_with(
                     )
                 } else {
                     error.after_dispatch()
-                }
+                };
+                error
+                    .scrub_message()
+                    .annotate("set-value return observe failed")
             },
         )?;
     let output = if semantic {

@@ -226,6 +226,7 @@ pub(crate) fn type_text_with(
                     .map_err(|error| {
                         error
                             .after_dispatch()
+                            .scrub_message()
                             .annotate("text was typed; return observe failed")
                     })?;
             let mut result = serde_json::json!({});
@@ -261,6 +262,8 @@ pub(crate) fn type_text_with(
                     error,
                     "text was typed; return observe failed",
                 )
+                .scrub_message()
+                .annotate("text was typed; return observe failed")
             })?;
             Ok(ContextualOutput::with_timeout(
                 crate::tools::semantic_action::success_output(

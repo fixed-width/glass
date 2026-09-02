@@ -85,6 +85,7 @@ struct InstrumentedPlatform {
     counters: Arc<SessionIoCounters>,
     geometry: WindowGeometry,
     key_error: Option<String>,
+    capture_error: Option<String>,
 }
 
 impl Platform for InstrumentedPlatform {
@@ -113,6 +114,9 @@ impl Platform for InstrumentedPlatform {
     ) -> glass_core::Result<Frame> {
         self.counters
             .record(SessionIoKind::Capture, "capture_frame");
+        if let Some(message) = &self.capture_error {
+            return Err(GlassError::CaptureFailed(message.clone()));
+        }
         Frame::new(1, 1, vec![0, 0, 0, 255])
     }
 
@@ -124,6 +128,9 @@ impl Platform for InstrumentedPlatform {
     ) -> glass_core::Result<Frame> {
         self.counters
             .record(SessionIoKind::Capture, "capture_window");
+        if let Some(message) = &self.capture_error {
+            return Err(GlassError::CaptureFailed(message.clone()));
+        }
         Frame::new(1, 1, vec![0, 0, 0, 255])
     }
 
@@ -305,7 +312,7 @@ fn started_instrumented_glass_with(
     coverage: AxStateCoverage,
     invoke_result: Option<AxNodeId>,
 ) -> (Glass, Arc<SessionIoCounters>, Arc<AtomicUsize>) {
-    started_instrumented_glass_with_errors(tree, coverage, invoke_result, None, None)
+    started_instrumented_glass_with_errors(tree, coverage, invoke_result, None, None, None)
 }
 
 fn started_instrumented_glass_with_errors(
@@ -314,6 +321,7 @@ fn started_instrumented_glass_with_errors(
     invoke_result: Option<AxNodeId>,
     key_error: Option<String>,
     set_error: Option<String>,
+    capture_error: Option<String>,
 ) -> (Glass, Arc<SessionIoCounters>, Arc<AtomicUsize>) {
     let counters = Arc::new(SessionIoCounters::default());
     let geometry = WindowGeometry {
@@ -327,6 +335,7 @@ fn started_instrumented_glass_with_errors(
             counters: counters.clone(),
             geometry,
             key_error,
+            capture_error,
         }),
         accessibility: Some(Box::new(InstrumentedAccessibility {
             counters: counters.clone(),
@@ -1425,6 +1434,7 @@ fn untargeted_type_scrubs_payload_from_context_batch_standalone_and_artifacts() 
             None,
             Some(format!("backend echoed {SENTINEL}")),
             None,
+            None,
         )
         .0
     };
@@ -1481,6 +1491,7 @@ fn legacy_set_value_scrubs_payload_from_context_batch_standalone_and_artifacts()
             None,
             None,
             Some(format!("backend echoed {SENTINEL}")),
+            None,
         )
         .0;
         glass.a11y_snapshot(None).unwrap();
@@ -1520,6 +1531,141 @@ fn legacy_set_value_scrubs_payload_from_context_batch_standalone_and_artifacts()
             .iter()
             .all(|b| !b.contains(SENTINEL))
     );
+}
+
+#[test]
+fn untargeted_type_return_error_scrubs_submitted_capture_text() {
+    const SENTINEL: &str = "UNTARGETED_TYPE_RETURN_SENTINEL_5d38";
+    let args = TypeArgs {
+        target: None,
+        focus_mode: None,
+        timeout_ms: None,
+        max_nodes: None,
+        text: SENTINEL.into(),
+        return_: Some("snapshot".into()),
+    };
+    let mut glass = started_instrumented_glass_with_errors(
+        crate::tools::testutil::empty_tree(),
+        AxStateCoverage::NONE,
+        None,
+        None,
+        None,
+        Some(SENTINEL.into()),
+    )
+    .0;
+
+    let error = type_text_with(&mut glass, &args, ToolContext::UNBOUNDED).unwrap_err();
+
+    assert_eq!(error.code, "transport_failure");
+    assert_eq!(error.category, SafeErrorCategory::TransportFailure);
+    assert_eq!(error.bound_dispatch, Some(BoundDispatch::MayHaveDispatched));
+    assert!(!error.post_write);
+    assert!(!error.message.contains(SENTINEL), "{}", error.message);
+}
+
+#[test]
+fn targeted_type_return_error_scrubs_submitted_capture_text_and_keeps_evidence() {
+    const SENTINEL: &str = "TARGETED_TYPE_RETURN_SENTINEL_b415";
+    let coverage = AxStateCoverage {
+        focused: true,
+        ..semantic_control_coverage()
+    };
+    let mut glass = started_instrumented_glass_with_errors(
+        semantic_control_tree(AxRole::TextField, "Account", Some("old"), true),
+        coverage,
+        None,
+        None,
+        None,
+        Some(SENTINEL.into()),
+    )
+    .0;
+    let args: TypeArgs = serde_json::from_value(serde_json::json!({
+        "target": {"query": "Account", "role": "TextField"},
+        "focus_mode": "native",
+        "text": SENTINEL,
+        "timeout_ms": 1_000,
+        "max_nodes": 0,
+        "return": "snapshot",
+    }))
+    .unwrap();
+
+    let error = type_text_with(&mut glass, &args, ToolContext::UNBOUNDED).unwrap_err();
+
+    assert_eq!(error.code, "transport_failure");
+    assert_eq!(error.category, SafeErrorCategory::TransportFailure);
+    assert_eq!(error.bound_dispatch, Some(BoundDispatch::MayHaveDispatched));
+    assert_eq!(error.result.as_ref().unwrap()["dispatch"], "dispatched");
+    assert_eq!(error.siblings.len(), 1);
+    assert!(!error.post_write);
+    assert!(!error.message.contains(SENTINEL), "{}", error.message);
+}
+
+#[test]
+fn legacy_set_value_return_error_scrubs_submitted_capture_text() {
+    const SENTINEL: &str = "LEGACY_SET_RETURN_SENTINEL_c941";
+    let mut glass = started_instrumented_glass_with_errors(
+        semantic_control_tree(AxRole::TextField, "Account", Some("old"), false),
+        semantic_control_coverage(),
+        None,
+        None,
+        None,
+        Some(SENTINEL.into()),
+    )
+    .0;
+    glass.a11y_snapshot(None).unwrap();
+    let args = SetValueArgs {
+        id: Some(1),
+        target: None,
+        timeout_ms: None,
+        max_nodes: None,
+        text: SENTINEL.into(),
+        return_: Some("snapshot".into()),
+    };
+
+    let error = set_value_with(&mut glass, &args, ToolContext::UNBOUNDED).unwrap_err();
+
+    assert_eq!(error.code, "transport_failure");
+    assert_eq!(error.category, SafeErrorCategory::TransportFailure);
+    assert_eq!(error.bound_dispatch, Some(BoundDispatch::MayHaveDispatched));
+    assert!(error.result.is_none());
+    assert!(!error.post_write);
+    assert!(!error.message.contains(SENTINEL), "{}", error.message);
+}
+
+#[test]
+fn semantic_set_value_return_error_scrubs_submitted_capture_text_and_keeps_noop() {
+    const SENTINEL: &str = "SEMANTIC_SET_RETURN_SENTINEL_31a7";
+    let mut tree = semantic_control_tree(AxRole::ComboBox, SENTINEL, Some(SENTINEL), false);
+    tree.root.children[0].states.editable = true;
+    let mut glass = started_instrumented_glass_with_errors(
+        tree,
+        semantic_control_coverage(),
+        None,
+        None,
+        None,
+        Some(SENTINEL.into()),
+    )
+    .0;
+    let args: SetValueArgs = serde_json::from_value(serde_json::json!({
+        "target": {"query": SENTINEL, "role": "ComboBox"},
+        "text": SENTINEL,
+        "timeout_ms": 1_000,
+        "max_nodes": 0,
+        "return": "snapshot",
+    }))
+    .unwrap();
+
+    let error = set_value_with(&mut glass, &args, ToolContext::UNBOUNDED).unwrap_err();
+
+    assert_eq!(error.code, "transport_failure");
+    assert_eq!(error.category, SafeErrorCategory::TransportFailure);
+    assert_eq!(error.bound_dispatch, Some(BoundDispatch::NotDispatched));
+    let result = error.result.as_ref().unwrap();
+    assert_eq!(result["dispatch"], "not_dispatched");
+    assert_eq!(result["side_effects_may_have_occurred"], false);
+    assert_eq!(error.siblings.len(), 1);
+    assert!(!error.post_write);
+    assert!(!error.message.contains(SENTINEL), "{}", error.message);
 }
 
 fn semantic_success_with_total_text_bytes(total: usize) -> crate::tools::ToolOutput {
