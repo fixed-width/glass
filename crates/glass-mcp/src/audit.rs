@@ -730,6 +730,8 @@ mod tests {
             &Actuation::SetValue {
                 element: el,
                 text: "v",
+                dispatch: "dispatched",
+                confirmation: "value_confirmed",
             },
             &ActuationContext::default(),
             &ok(),
@@ -739,6 +741,7 @@ mod tests {
         assert_eq!(r["action"], "set_value");
         assert_eq!(r["target"]["element"]["id"], 5);
         assert_eq!(r["target"]["element"]["role"], "PasswordField");
+        assert_eq!(r["args"], json!({}));
         assert_eq!(r["content"]["len"], 1);
     }
 

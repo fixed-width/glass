@@ -592,18 +592,8 @@ fn ax_target(element: &ElementInfo) -> AxTarget {
     }
 }
 
-fn role_supports_set_value(element: &ElementInfo) -> bool {
-    element.states.editable
-        || element.states.checkable
-        || matches!(
-            element.role,
-            AxRole::ComboBox
-                | AxRole::Slider
-                | AxRole::SpinButton
-                | AxRole::ToggleButton
-                | AxRole::CheckBox
-                | AxRole::RadioButton
-        )
+fn role_supports_set_value(element: &ElementInfo, coverage: AxStateCoverage) -> bool {
+    set_value_eligibility(element, coverage) == ActionabilityVerdict::Passed
 }
 
 fn set_value_eligibility(element: &ElementInfo, coverage: AxStateCoverage) -> ActionabilityVerdict {
@@ -1640,7 +1630,7 @@ impl Glass {
                         sequence_deadline,
                         bound,
                         |element, coverage| {
-                            role_supports_set_value(element)
+                            role_supports_set_value(element, coverage)
                                 && set_value_actionability(element, coverage, window, false)
                                     .blocking()
                                     .is_none()
@@ -1715,13 +1705,15 @@ impl Glass {
         sequence_deadline: Deadline,
     ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
         let started = std::time::Instant::now();
-        let result = target_deadline(
+        let result = match target_deadline(
             &params.target,
             params.timeout_ms,
             params.max_nodes,
             sequence_deadline,
-        )
-        .and_then(|bound| self.set_value_once(params, text, sequence_deadline, bound));
+        ) {
+            Ok(bound) => self.set_value_once(params, text, sequence_deadline, bound),
+            Err(error) => Err(error),
+        };
         let element = match &result {
             Ok(outcome) => crate::audit::ElementRef {
                 id: outcome.target.id.0,

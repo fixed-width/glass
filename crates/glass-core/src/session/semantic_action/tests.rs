@@ -86,11 +86,24 @@ fn semantic_set_value_glass(
     Arc<Mutex<Vec<(AxNodeId, String)>>>,
     AxDeadlineLog,
 ) {
+    semantic_set_value_glass_with_coverage(trees, set_results, full_state_coverage())
+}
+
+fn semantic_set_value_glass_with_coverage(
+    trees: Vec<AxTree>,
+    set_results: Vec<crate::Result<()>>,
+    coverage: AxStateCoverage,
+) -> (
+    Glass,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<(AxNodeId, String)>>>,
+    AxDeadlineLog,
+) {
     let walks = Arc::new(AtomicUsize::new(0));
     let set_log = Arc::new(Mutex::new(Vec::new()));
     let deadlines = Arc::new(Mutex::new(Vec::new()));
     let accessibility = SeqAccessibility::new(trees)
-        .with_coverage(full_state_coverage())
+        .with_coverage(coverage)
         .with_walks(walks.clone())
         .with_deadlines(deadlines.clone())
         .with_set_log(set_log.clone())
@@ -2306,6 +2319,110 @@ fn semantic_set_value_refuses_a_known_non_value_role_before_backend_dispatch() {
         error.actionability.blocking().unwrap().name,
         ActionabilityCheckName::FocusEligible
     );
+    assert_eq!(walks.load(Ordering::Relaxed), 1);
+    assert!(set_log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn semantic_set_value_refuses_uncovered_editable_bit_on_unsupported_role() {
+    let tree = value_control_tree(
+        "Save",
+        AxRole::Button,
+        None,
+        AxStates {
+            enabled: true,
+            visible: true,
+            focusable: true,
+            editable: true,
+            ..AxStates::default()
+        },
+    );
+    let mut coverage = full_state_coverage();
+    coverage.editable = false;
+    let (mut glass, walks, set_log, _) =
+        semantic_set_value_glass_with_coverage(vec![tree], Vec::new(), coverage);
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .set_value_target(&semantic_set_value_params("Save", 0), "not-a-value")
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(error.retry, RetryGuidance::Reobserve);
+    let eligibility = error
+        .actionability
+        .checks
+        .iter()
+        .find(|check| check.name == ActionabilityCheckName::FocusEligible)
+        .unwrap();
+    assert_eq!(eligibility.verdict, ActionabilityVerdict::Unproven);
+    assert!(eligibility.required);
+    assert_eq!(walks.load(Ordering::Relaxed), 1);
+    assert!(set_log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn semantic_set_value_refuses_uncovered_checkable_bit_on_unsupported_role() {
+    let tree = value_control_tree(
+        "Save",
+        AxRole::Button,
+        None,
+        AxStates {
+            enabled: true,
+            visible: true,
+            focusable: true,
+            checkable: true,
+            ..AxStates::default()
+        },
+    );
+    let (mut glass, walks, set_log, _) =
+        semantic_set_value_glass_with_coverage(vec![tree], Vec::new(), AxStateCoverage::NONE);
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .set_value_target(&semantic_set_value_params("Save", 0), "not-a-value")
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(error.retry, RetryGuidance::Reobserve);
+    let eligibility = error
+        .actionability
+        .checks
+        .iter()
+        .find(|check| check.name == ActionabilityCheckName::FocusEligible)
+        .unwrap();
+    assert_eq!(eligibility.verdict, ActionabilityVerdict::Unproven);
+    assert!(eligibility.required);
+    assert_eq!(walks.load(Ordering::Relaxed), 1);
+    assert!(set_log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn semantic_set_value_refuses_uncovered_editable_support_on_text_field() {
+    let tree = editable_field_tree("Account name", Some("old"), true);
+    let mut coverage = full_state_coverage();
+    coverage.editable = false;
+    let (mut glass, walks, set_log, _) =
+        semantic_set_value_glass_with_coverage(vec![tree], Vec::new(), coverage);
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .set_value_target(&semantic_set_value_params("Account name", 0), "updated")
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(error.retry, RetryGuidance::Reobserve);
+    let eligibility = error
+        .actionability
+        .checks
+        .iter()
+        .find(|check| check.name == ActionabilityCheckName::FocusEligible)
+        .unwrap();
+    assert_eq!(eligibility.verdict, ActionabilityVerdict::Unproven);
+    assert!(eligibility.required);
     assert_eq!(walks.load(Ordering::Relaxed), 1);
     assert!(set_log.lock().unwrap().is_empty());
 }
