@@ -3,7 +3,9 @@
 //! Control-type ids are the stable UIA `ControlTypeId` constants (50000..=50040); the reader
 //! passes the numeric id so this module needs no `uiautomation` dependency.
 
-use glass_core::{AxRole, AxStates};
+#[cfg(any(target_os = "windows", test))]
+use glass_core::PointerHit;
+use glass_core::{AxRole, AxStateCoverage, AxStates};
 
 /// Every documented UIA control type (the contiguous 50000..=50040 range), as
 /// `(ControlTypeId, canonical name, mapped role)`.
@@ -126,6 +128,41 @@ pub fn map_role_with_framework(
 /// (a vendor-defined or future control type).
 pub fn canonical_name(control_type_id: u32) -> Option<&'static str> {
     control_type(control_type_id).map(|(_, name, _)| *name)
+}
+
+/// Every normalized state fact the UIA reader obtains from a property or applicable pattern.
+pub const STATE_COVERAGE: AxStateCoverage = AxStateCoverage {
+    enabled: true,
+    visible: true,
+    checkable: true,
+    checked: true,
+    selected: true,
+    expanded: true,
+    focused: true,
+    focusable: true,
+    editable: true,
+};
+
+/// Classify UIA element-from-point evidence from node-to-root runtime-id paths.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn classify_uia_hit_path(
+    target_path: &[&[i32]],
+    hit_path: Option<&[&[i32]]>,
+    hit_is_interactable: bool,
+) -> PointerHit {
+    let (Some(target), Some(hit_path)) = (target_path.first(), hit_path) else {
+        return PointerHit::Inconclusive;
+    };
+    let Some(hit) = hit_path.first() else {
+        return PointerHit::Inconclusive;
+    };
+    if hit == target || hit_path.iter().skip(1).any(|ancestor| ancestor == target) {
+        PointerHit::Target
+    } else if hit_is_interactable && target_path.iter().skip(1).any(|ancestor| ancestor == hit) {
+        PointerHit::AcceptedAncestor
+    } else {
+        PointerHit::Other
+    }
 }
 
 /// Plain state facts the reader gathers from a UIA element (no `uiautomation` types here,
@@ -280,6 +317,54 @@ pub const fn announcing_property(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_mapping_declares_every_uia_fact_gather_reads() {
+        assert_eq!(
+            STATE_COVERAGE,
+            glass_core::AxStateCoverage {
+                enabled: true,
+                visible: true,
+                checkable: true,
+                checked: true,
+                selected: true,
+                expanded: true,
+                focused: true,
+                focusable: true,
+                editable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn uia_hit_path_accepts_target_and_descendant_content_but_not_an_unrelated_element() {
+        let root = [1];
+        let target = [42, 7];
+        let descendant = [99, 1];
+        let unrelated = [88, 3];
+        let target_path = [&target[..], &root[..]];
+
+        assert_eq!(
+            [
+                classify_uia_hit_path(&target_path, Some(&target_path), true),
+                classify_uia_hit_path(
+                    &target_path,
+                    Some(&[&descendant[..], &target[..], &root[..]]),
+                    false,
+                ),
+                classify_uia_hit_path(&target_path, Some(&[&root[..]]), true),
+                classify_uia_hit_path(&target_path, Some(&[&unrelated[..], &root[..]]), true,),
+                classify_uia_hit_path(&target_path, None, false),
+            ],
+            [
+                glass_core::PointerHit::Target,
+                glass_core::PointerHit::Target,
+                glass_core::PointerHit::AcceptedAncestor,
+                glass_core::PointerHit::Other,
+                glass_core::PointerHit::Inconclusive,
+            ]
+        );
+    }
 
     #[test]
     fn common_control_types_map() {

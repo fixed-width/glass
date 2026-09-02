@@ -267,6 +267,69 @@ fn first_role_with_bounds<'a>(n: &'a AxNode, role: AxRole, out: &mut Option<&'a 
     }
 }
 
+fn named_node<'a>(node: &'a AxNode, name: &str) -> Option<&'a AxNode> {
+    if node.name.as_deref() == Some(name) {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| named_node(child, name))
+}
+
+fn semantic_target(
+    role: AxRole,
+    name: &str,
+    states: Vec<glass_core::SemanticState>,
+) -> glass_core::SemanticTarget {
+    glass_core::SemanticTarget {
+        target: glass_core::SemanticSelector::new(Some(name.into()), Some(role), states)
+            .expect("valid semantic selector"),
+        within: None,
+    }
+}
+
+fn actionability_verdict(
+    report: &glass_core::ActionabilityReport,
+    name: glass_core::ActionabilityCheckName,
+) -> glass_core::ActionabilityVerdict {
+    report
+        .checks
+        .iter()
+        .find(|check| check.name == name)
+        .unwrap_or_else(|| panic!("missing {name:?} in {:?}", report.checks))
+        .verdict
+}
+
+fn log_cursor(glass: &mut Glass) -> u64 {
+    glass
+        .logs(0, 100, None, None)
+        .expect("read fixture log cursor")
+        .1
+}
+
+fn log_count_since(glass: &mut Glass, cursor: u64, contains: &str) -> usize {
+    glass
+        .logs(cursor, 100, None, Some(contains))
+        .expect("read fixture logs")
+        .0
+        .len()
+}
+
+fn await_one_log(glass: &mut Glass, cursor: u64, contains: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let count = log_count_since(glass, cursor, contains);
+        if count == 1 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected exactly one {contains:?} log, got {count}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Nodes carrying UIA's Toggle pattern that are NOT already a checkbox or radio button —
 /// the evidence for whether a `ToggleButton` mapping has anything to map. `checkable` is
 /// Toggle-pattern availability (see `StateFacts` in glass-a11y-windows), so this needs no
@@ -860,6 +923,228 @@ fn onbox_egui_set_value_honesty() {
     );
 
     let _ = p.stop_app();
+}
+
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session + builds the egui fixture"]
+fn onbox_semantic_actions() {
+    use glass_core::{
+        ActionMethod, ActionMode, ActionTarget, ActionabilityCheckName, ActionabilityVerdict,
+        ConfirmationStatus, DispatchStatus, SemanticActionFailureKind, SemanticState,
+    };
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut glass = glass_windows_with_a11y();
+    let geometry = glass
+        .start(&egui_fixture_spec(glass_core::SandboxLevel::Off))
+        .expect("build + launch the egui fixture");
+
+    let initial = glass
+        .a11y_snapshot(None)
+        .expect("initial egui semantic snapshot");
+    assert_eq!(
+        Accessibility::state_coverage(&WindowsA11y::new()),
+        glass_core::AxStateCoverage {
+            enabled: true,
+            visible: true,
+            checkable: true,
+            checked: true,
+            selected: true,
+            expanded: true,
+            focused: true,
+            focusable: true,
+            editable: true,
+        }
+    );
+    let disabled = named_node(&initial.root, "Disabled semantic").expect("disabled semantic");
+    assert!(!disabled.states.enabled);
+    let moving_id = named_node(&initial.root, "Moving semantic")
+        .expect("moving semantic")
+        .id;
+    let occluded = named_node(&initial.root, "Occluded semantic").expect("occluded semantic");
+    let occluded_center = occluded
+        .bounds
+        .and_then(|bounds| bounds.clamped_center(geometry.width, geometry.height))
+        .expect("occluded semantic has an in-window center");
+    let automation = uiautomation::UIAutomation::new().expect("UI Automation client");
+    let screen = uiautomation::types::Point::new(
+        geometry.x.checked_add(occluded_center.0).expect("screen x"),
+        geometry.y.checked_add(occluded_center.1).expect("screen y"),
+    );
+    let hit = automation
+        .element_from_point(screen)
+        .expect("UIA element from occluded center");
+    assert_eq!(hit.get_name().expect("hit element name"), "Occluder");
+
+    let native_save_cursor = log_cursor(&mut glass);
+    let native_save = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Semantic Save",
+                vec![SemanticState::Enabled],
+            )),
+            mode: ActionMode::Native,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect("native semantic save");
+    assert_eq!(
+        native_save.action.method,
+        ActionMethod::NativeAction { actuated: None }
+    );
+    assert_eq!(native_save.action.dispatch, DispatchStatus::Dispatched);
+    await_one_log(&mut glass, native_save_cursor, "semantic_save");
+
+    let stale_cursor = log_cursor(&mut glass);
+    let stale = glass
+        .click_element(moving_id)
+        .expect_err("moving bounds must stale the backend fingerprint before dispatch");
+    assert!(matches!(stale, GlassError::AxElementChanged(_)));
+    assert_eq!(
+        log_count_since(&mut glass, stale_cursor, "moving_semantic"),
+        0
+    );
+
+    let moving_cursor = log_cursor(&mut glass);
+    let moving_started = Instant::now();
+    let moving = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Moving semantic",
+                vec![SemanticState::Enabled, SemanticState::Visible],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect("stable forced pointer click");
+    assert!(moving_started.elapsed() >= Duration::from_millis(100));
+    assert_eq!(
+        moving.action.method,
+        ActionMethod::Pointer {
+            native_fallback: None
+        }
+    );
+    assert_eq!(
+        actionability_verdict(&moving.actionability, ActionabilityCheckName::Stable),
+        ActionabilityVerdict::Passed
+    );
+    await_one_log(&mut glass, moving_cursor, "moving_semantic");
+
+    let pointer_save_cursor = log_cursor(&mut glass);
+    let pointer_save = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Semantic Save",
+                vec![SemanticState::Enabled],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect("forced pointer semantic save");
+    assert_eq!(
+        pointer_save.action.method,
+        ActionMethod::Pointer {
+            native_fallback: None
+        }
+    );
+    await_one_log(&mut glass, pointer_save_cursor, "semantic_save");
+
+    let text_cursor = log_cursor(&mut glass);
+    let typed = glass
+        .type_target(
+            &glass_core::TypeTargetParams {
+                target: semantic_target(
+                    AxRole::TextField,
+                    "Text",
+                    vec![SemanticState::Enabled, SemanticState::Visible],
+                ),
+                focus_mode: ActionMode::Native,
+                timeout_ms: 5_000,
+                max_nodes: None,
+            },
+            "Z",
+        )
+        .expect("native targeted type");
+    let focus = typed.focus.expect("targeted type focus report");
+    assert_eq!(focus.confirmation, ConfirmationStatus::FocusConfirmed);
+    assert_eq!(focus.dispatch, DispatchStatus::Dispatched);
+    await_one_log(&mut glass, text_cursor, "[fixture] text=Z");
+
+    let disabled_cursor = log_cursor(&mut glass);
+    let disabled = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Disabled semantic",
+                vec![],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(0),
+            max_nodes: None,
+        })
+        .expect_err("disabled semantic target must be refused");
+    assert_eq!(disabled.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(disabled.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        actionability_verdict(&disabled.actionability, ActionabilityCheckName::Enabled),
+        ActionabilityVerdict::Failed
+    );
+    assert_eq!(
+        log_count_since(&mut glass, disabled_cursor, "disabled_semantic"),
+        0
+    );
+
+    let duplicate_cursor = log_cursor(&mut glass);
+    let duplicate = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Duplicate semantic",
+                vec![],
+            )),
+            mode: ActionMode::Native,
+            timeout_ms: Some(0),
+            max_nodes: None,
+        })
+        .expect_err("duplicate semantic target must be refused");
+    assert_eq!(duplicate.kind, SemanticActionFailureKind::AmbiguousTarget);
+    assert_eq!(duplicate.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        log_count_since(&mut glass, duplicate_cursor, "duplicate_semantic"),
+        0
+    );
+
+    let occluded_cursor = log_cursor(&mut glass);
+    let occluded = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Occluded semantic",
+                vec![SemanticState::Enabled, SemanticState::Visible],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect_err("UIA must prove the foreground occluder before dispatch");
+    assert_eq!(occluded.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(occluded.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        actionability_verdict(&occluded.actionability, ActionabilityCheckName::NonOccluded,),
+        ActionabilityVerdict::Failed
+    );
+    assert_eq!(
+        log_count_since(&mut glass, occluded_cursor, "occluded_semantic"),
+        0
+    );
+
+    glass.stop().expect("stop egui semantic fixture");
 }
 
 // Uncontained: end-to-end verification that a Windows ctrl+scroll both DELIVERS the wheel with its

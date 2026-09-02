@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     A11yMutationDispatch, A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget,
-    AxTree, ChangeSignal, GlassError, Result, WalkBudget, normalize_description, normalize_name,
-    read_back_confirms, write_took_no_effect,
+    AxTree, ChangeSignal, GlassError, PointerHit, Result, WalkBudget, normalize_description,
+    normalize_name, read_back_confirms, write_took_no_effect,
 };
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
@@ -60,6 +60,32 @@ impl Accessibility for WindowsA11y {
         crate::events::subscribe(ctx)
     }
 
+    fn state_coverage(&self) -> glass_core::AxStateCoverage {
+        crate::mapping::STATE_COVERAGE
+    }
+
+    fn focus(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
+        let ctx = ctx.clone();
+        let target = target.clone();
+        focus_with_thread(&UIA, ctx, move |ctx, dispatch| {
+            run_focus(&ctx, &target, dispatch)
+        })?;
+        Ok(None)
+    }
+
+    fn pointer_target_at(
+        &mut self,
+        ctx: &AxContext,
+        target: &AxTarget,
+        point: (i32, i32),
+    ) -> Result<PointerHit> {
+        let ctx = ctx.clone();
+        let target = target.clone();
+        UIA.snapshot(ctx.deadline, move || {
+            run_pointer_target_at(&ctx, &target, point)
+        })
+    }
+
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         let ctx = ctx.clone();
         let target = target.clone();
@@ -97,8 +123,32 @@ fn invoke_with_thread(
     thread.invoke(ctx.deadline, move |dispatch| job(ctx, dispatch))
 }
 
+fn focus_with_thread(
+    thread: &A11yThread,
+    ctx: AxContext,
+    job: impl FnOnce(AxContext, &A11yMutationDispatch) -> Result<()> + Send + 'static,
+) -> Result<()> {
+    thread.focus(ctx.deadline, move |dispatch| job(ctx, dispatch))
+}
+
 fn uia_err(e: impl std::fmt::Display) -> GlassError {
     GlassError::AccessibilityUnavailable(format!("UI Automation error: {e}"))
+}
+
+fn required_uia<T>(result: uiautomation::Result<T>) -> Result<T> {
+    result.map_err(uia_err)
+}
+
+fn optional_uia<T>(result: uiautomation::Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.code() == 0 => Ok(None),
+        Err(error) => Err(uia_err(error)),
+    }
+}
+
+fn optional_pattern<T>(result: uiautomation::Result<T>) -> Result<Option<T>> {
+    optional_uia(result)
 }
 
 fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
@@ -173,7 +223,7 @@ fn walk(
     let name = nonempty(el.get_name().unwrap_or_default());
     let description = normalize_description(&help_text(el, ct_id), name.as_deref());
     let bounds = window_relative_bounds(el, origin);
-    let (facts, value) = gather(el, ct_id);
+    let (facts, value) = gather(el, ct_id)?;
     let states = crate::mapping::map_states(&facts);
 
     let mut children = Vec::new();
@@ -229,63 +279,53 @@ fn walk(
 /// same role regardless of which path reads it, and only one COM round-trip is spent per node
 /// either way — the same reason the value-pattern probe below fetches once for two facts.
 ///
-/// "This control has no Toggle pattern" and "the fetch failed" both yield `None` — a failure
-/// must not fail a whole snapshot over one node — but they are not the same event, and only one
-/// of them is a bug: a transient failure reports a toggle-capable `Button` as a plain `Button`,
-/// and since the same value feeds the `run_set_value`/`run_invoke` fingerprint, it surfaces to
-/// the caller as `AxElementChanged` ("the tree drifted") for an element that never moved. So the
-/// failure case logs. The two are told apart by the returned code: UIA documents
-/// `GetCurrentPattern` as returning success with a NULL interface for an unsupported pattern,
-/// which the bindings surface as an error carrying a *non-failure* code (`Error::result()` is
-/// `None`); a real COM failure carries a failure `HRESULT`. Neither path costs an extra
-/// round-trip.
-fn toggle_pattern(el: &UIElement, ct_id: u32) -> Option<UITogglePattern> {
+/// An unsupported pattern is the binding's explicit non-failure sentinel (`Error::code() == 0`),
+/// which [`optional_pattern`] maps to `None`. Every real HRESULT failure propagates so a transient
+/// provider error cannot silently change the node's role or state.
+fn toggle_pattern(el: &UIElement, ct_id: u32) -> Result<Option<UITogglePattern>> {
     if !matches!(ct_id, 50000 | 50002 | 50011 | 50031) {
         // Button/CheckBox/MenuItem/SplitButton
-        return None;
+        return Ok(None);
     }
-    match el.get_pattern::<UITogglePattern>() {
-        Ok(p) => Some(p),
-        Err(e) => {
-            if e.result().is_some() {
-                // Dev-tool diagnostic (stderr only, same shape as `select_window`'s in the
-                // macOS reader): without it, a control whose Toggle fetch broke is
-                // indistinguishable after the fact from one that never had the pattern.
-                eprintln!(
-                    "glass-a11y-windows: Toggle-pattern fetch failed on control type {ct_id} \
-                     (HRESULT {:#010x}: {e}); treating the element as not toggle-capable",
-                    e.code()
-                );
-            }
-            None
-        }
-    }
+    optional_pattern(el.get_pattern::<UITogglePattern>())
 }
 
 /// Gather state facts + the value string in one pass, gating each pattern probe by control type
 /// so we don't make a live cross-process `get_pattern` call for a pattern the control can't support
 /// (UIA is chatty — each probe is an out-of-process COM round-trip).
-fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<String>) {
+fn gather(el: &UIElement, ct_id: u32) -> Result<(crate::mapping::StateFacts, Option<String>)> {
     // Fetch the Toggle pattern once: its mere presence is `checkable` (the control exposes
     // on/off semantics at all), independent of whether we can also read its current state.
-    let pattern = toggle_pattern(el, ct_id);
+    let pattern = toggle_pattern(el, ct_id)?;
     let checkable = pattern.is_some();
-    let toggled_on = pattern
-        .and_then(|p| p.get_toggle_state().ok())
-        .map(|s| s == ToggleState::On)
-        .unwrap_or(false);
-    let selected = matches!(ct_id, 50007 | 50019 | 50024 | 50029) // ListItem/TabItem/TreeItem/DataItem
-        && el.get_pattern::<UISelectionItemPattern>().ok()
-            .and_then(|p| p.is_selected().ok()).unwrap_or(false);
-    let expanded = matches!(ct_id, 50003 | 50009 | 50011 | 50023 | 50024 | 50026 | 50033) // ComboBox/Menu/MenuItem/Tree/TreeItem/Group/Pane
-        && el.get_pattern::<UIExpandCollapsePattern>().ok()
-            .and_then(|p| p.get_state().ok())
-            .map(|s| s == ExpandCollapseState::Expanded).unwrap_or(false);
+    let toggled_on = match pattern.as_ref() {
+        Some(pattern) => required_uia(pattern.get_toggle_state())? == ToggleState::On,
+        None => false,
+    };
+    let selected = if matches!(ct_id, 50007 | 50019 | 50024 | 50029) {
+        match optional_pattern(el.get_pattern::<UISelectionItemPattern>())? {
+            Some(pattern) => required_uia(pattern.is_selected())?,
+            None => false,
+        }
+    } else {
+        false
+    };
+    let expanded = if matches!(ct_id, 50003 | 50009 | 50011 | 50023 | 50024 | 50026 | 50033) {
+        match optional_pattern(el.get_pattern::<UIExpandCollapsePattern>())? {
+            Some(pattern) => required_uia(pattern.get_state())? == ExpandCollapseState::Expanded,
+            None => false,
+        }
+    } else {
+        false
+    };
     // Value pattern: one fetch for both the value string and read-only (Edit/ComboBox/Document)
     let (value_text, readonly) = if matches!(ct_id, 50003 | 50004 | 50030) {
-        match el.get_pattern::<UIValuePattern>() {
-            Ok(p) => (p.get_value().ok(), p.is_readonly().ok()),
-            Err(_) => (None, None),
+        match optional_pattern(el.get_pattern::<UIValuePattern>())? {
+            Some(pattern) => (
+                Some(required_uia(pattern.get_value())?),
+                Some(required_uia(pattern.is_readonly())?),
+            ),
+            None => (None, None),
         }
     } else {
         (None, None)
@@ -293,16 +333,18 @@ fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<Str
     // RangeValue pattern: a Slider/Spinner/ProgressBar exposes its numeric position here, never
     // via ValuePattern, so read it (gated by control type — `get_pattern` is a COM round-trip) so
     // `value_contains`/`wait_for_element` can match the number.
-    let value = value_text.or_else(|| {
-        matches!(ct_id, 50012 | 50015 | 50016) // ProgressBar/Slider/Spinner
-            .then(|| {
-                el.get_pattern::<UIRangeValuePattern>()
-                    .ok()
-                    .and_then(|p| p.get_value().ok())
-                    .map(crate::mapping::format_range_value)
-            })
-            .flatten()
-    });
+    let value = if value_text.is_some() {
+        value_text
+    } else if matches!(ct_id, 50012 | 50015 | 50016) {
+        match optional_pattern(el.get_pattern::<UIRangeValuePattern>())? {
+            Some(pattern) => Some(crate::mapping::format_range_value(required_uia(
+                pattern.get_value(),
+            )?)),
+            None => None,
+        }
+    } else {
+        None
+    };
     // Editable iff a writable ValuePattern is present — for ANY value-bearing
     // control (Edit/ComboBox/Document), not just Edit; otherwise a writable
     // ComboBox/Document reports editable=false while set_value would succeed on
@@ -311,18 +353,18 @@ fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<Str
     let editable =
         matches!(ct_id, 50003 | 50004 | 50030) && readonly.map(|ro| !ro).unwrap_or(false);
     let facts = crate::mapping::StateFacts {
-        enabled: el.is_enabled().unwrap_or(false),
-        offscreen: el.is_offscreen().unwrap_or(false),
-        focused: el.has_keyboard_focus().unwrap_or(false),
-        focusable: el.is_keyboard_focusable().unwrap_or(false),
+        enabled: required_uia(el.is_enabled())?,
+        offscreen: required_uia(el.is_offscreen())?,
+        focused: required_uia(el.has_keyboard_focus())?,
+        focusable: required_uia(el.is_keyboard_focusable())?,
         selected,
         toggled_on,
         expanded,
         editable,
-        secure: el.is_password().unwrap_or(false),
+        secure: required_uia(el.is_password())?,
         checkable,
     };
-    (facts, value)
+    Ok((facts, value))
 }
 
 /// `el`'s UIA `HelpText` — the tooltip, and the secondary label the outline renders as
@@ -379,6 +421,120 @@ fn framework_id(el: &UIElement, ct_id: u32) -> Option<String> {
     nonempty(el.get_framework_id().unwrap_or_default())
 }
 
+fn find_target(
+    walker: &UITreeWalker,
+    window: &UIElement,
+    ctx: &AxContext,
+    target: &AxTarget,
+) -> Result<UIElement> {
+    let mut budget = WalkBudget::with_limits(ctx.limits);
+    find_nth(walker, window, 0, &mut budget, target.id.0)?
+        .ok_or(GlassError::AxElementChanged(target.id.0))
+}
+
+fn verify_target_fingerprint(el: &UIElement, ctx: &AxContext, target: &AxTarget) -> Result<u32> {
+    let ct_id = required_uia(el.get_control_type())? as i32 as u32;
+    let role = crate::mapping::map_role_with_framework(
+        ct_id,
+        toggle_pattern(el, ct_id)?.is_some(),
+        framework_id(el, ct_id).as_deref(),
+    );
+    let name = nonempty(required_uia(el.get_name())?);
+    let bounds = window_relative_bounds(el, (ctx.window.x, ctx.window.y));
+    if !target.matches(role, name.as_deref())
+        || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
+    {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    Ok(ct_id)
+}
+
+fn run_focus(ctx: &AxContext, target: &AxTarget, dispatch: &A11yMutationDispatch) -> Result<()> {
+    let automation = UIAutomation::new().map_err(uia_err)?;
+    let root = find_app_window(&automation, ctx)?;
+    let walker = automation.get_control_view_walker().map_err(uia_err)?;
+    let element = find_target(&walker, &root, ctx, target)?;
+    let ct_id = verify_target_fingerprint(&element, ctx, target)?;
+    let (facts, _) = gather(&element, ct_id)?;
+    if !facts.focusable && !facts.editable {
+        return Err(GlassError::AxActionUnavailable(target.id.0));
+    }
+    dispatch.dispatch(|| element.set_focus().map_err(uia_err))
+}
+
+fn runtime_id_path(
+    automation: &UIAutomation,
+    walker: &UITreeWalker,
+    root: &UIElement,
+    element: &UIElement,
+    depth_limit: usize,
+) -> Result<Vec<Vec<i32>>> {
+    let mut path = Vec::new();
+    let mut current = element.clone();
+    for _ in 0..=depth_limit {
+        path.push(required_uia(current.get_runtime_id())?);
+        if required_uia(automation.compare_elements(&current, root))? {
+            return Ok(path);
+        }
+        let Some(parent) = optional_uia(walker.get_parent(&current))? else {
+            return Ok(path);
+        };
+        current = parent;
+    }
+    Err(GlassError::AccessibilityUnavailable(format!(
+        "UI Automation hit ancestry exceeded the configured depth limit ({depth_limit})"
+    )))
+}
+
+fn run_pointer_target_at(
+    ctx: &AxContext,
+    target: &AxTarget,
+    point: (i32, i32),
+) -> Result<PointerHit> {
+    if ctx.deadline.has_passed() {
+        return Err(GlassError::deadline_not_started("pointer hit probe"));
+    }
+    let automation = UIAutomation::new().map_err(uia_err)?;
+    let root = find_app_window(&automation, ctx)?;
+    let walker = automation.get_control_view_walker().map_err(uia_err)?;
+    let element = find_target(&walker, &root, ctx, target)?;
+    verify_target_fingerprint(&element, ctx, target)?;
+
+    let screen_x = ctx
+        .window
+        .x
+        .checked_add(point.0)
+        .ok_or_else(|| GlassError::Backend("UIA hit-test x coordinate overflow".into()))?;
+    let screen_y = ctx
+        .window
+        .y
+        .checked_add(point.1)
+        .ok_or_else(|| GlassError::Backend("UIA hit-test y coordinate overflow".into()))?;
+    let screen = uiautomation::types::Point::new(screen_x, screen_y);
+    let Some(hit) = optional_uia(automation.element_from_point(screen))? else {
+        return Ok(PointerHit::Inconclusive);
+    };
+    if required_uia(automation.compare_elements(&hit, &element))? {
+        return Ok(PointerHit::Target);
+    }
+
+    let hit_ct_id = required_uia(hit.get_control_type())? as i32 as u32;
+    let hit_role = crate::mapping::map_role_with_framework(
+        hit_ct_id,
+        toggle_pattern(&hit, hit_ct_id)?.is_some(),
+        framework_id(&hit, hit_ct_id).as_deref(),
+    );
+    let target_ids = runtime_id_path(&automation, &walker, &root, &element, ctx.limits.depth)?;
+    let hit_ids = runtime_id_path(&automation, &walker, &root, &hit, ctx.limits.depth)?;
+    let target_path = target_ids.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let hit_path = hit_ids.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    Ok(crate::mapping::classify_uia_hit_path(
+        &target_path,
+        Some(&hit_path),
+        hit_role.is_interactable(),
+    ))
+}
+
 fn run_set_value(
     ctx: &AxContext,
     target: &AxTarget,
@@ -393,31 +549,16 @@ fn run_set_value(
 
     // Start at 0 so find_nth's pre-order numbering matches snapshot's walk +
     // assign_ids (root id = 0); the role+name verify backstops any drift.
-    let mut budget = WalkBudget::with_limits(ctx.limits);
-    let el = find_nth(&walker, &window, 0, &mut budget, target.id.0)
-        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+    let el = find_target(&walker, &window, ctx, target)?;
 
     // Verify role + name + bounds (guards a stale id / tree drift). role+name
     // alone isn't unique (many controls share a role and an empty name), so if
     // drift lands a different same-role+name element on this pre-order id, the
     // bounds fingerprint — the element sits elsewhere — rejects it. A target
     // without captured bounds falls back to role+name only.
-    let ct_id = el.get_control_type().map_err(uia_err)? as i32 as u32;
-    let role = crate::mapping::map_role_with_framework(
-        ct_id,
-        toggle_pattern(&el, ct_id).is_some(),
-        framework_id(&el, ct_id).as_deref(),
-    );
-    let name = nonempty(el.get_name().unwrap_or_default());
-    let bounds = window_relative_bounds(&el, (ctx.window.x, ctx.window.y));
-    if !target.matches(role, name.as_deref())
-        || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
-    {
-        return Err(GlassError::AxElementChanged(target.id.0));
-    }
-    let pat = el
-        .get_pattern::<UIValuePattern>()
-        .map_err(|_| GlassError::AxElementNotEditable(target.id.0))?;
+    verify_target_fingerprint(&el, ctx, target)?;
+    let pat = optional_pattern(el.get_pattern::<UIValuePattern>())?
+        .ok_or(GlassError::AxElementNotEditable(target.id.0))?;
     // Pre-write value: the baseline for the "changed" check. `None` (a failed pre-read) means the
     // baseline is unknown — the confirmation below then requires an exact match rather than
     // trusting a "differs from before" signal it cannot compute.
@@ -470,17 +611,12 @@ fn run_set_value(
 /// which `click_element` (glass-core) treats as a fall-back-to-pointer signal, not a fatal error.
 ///
 /// Only the Toggle rung has a post-state a client can read back, so only it verifies actuation;
-/// the other three are fire-and-report, exactly as their patterns define. That rung is also the
-/// one exception to "first pattern wins": if its state can't be read it is skipped rather than
-/// failed, since it cannot be verified and nothing has been dispatched yet.
+/// the other three are fire-and-report, exactly as their patterns define. A failed Toggle state
+/// read is a real provider error and propagates before dispatch.
 ///
-/// Known limitation, deliberate: `get_pattern` returning `Err` is indistinguishable here between
-/// "this control does not implement the pattern" and "the COM call itself failed", so both land
-/// on `AxActionUnavailable` and fall back to a pointer click. That is the safe direction —
-/// `get_pattern` dispatches no action, so the fallback actuates exactly once. UIA does publish
-/// `Is<Pattern>Available` properties that could tell the two apart, but acting on them would turn
-/// a disagreement between property and `get_pattern` into a hard, non-falling-back click failure
-/// (an error after dispatch never falls back), trading a harmless pointer click for a dead one.
+/// UIA explicitly identifies unsupported patterns with `UIA_E_NOTSUPPORTED`; only that result is
+/// treated as absence. Every other pattern lookup failure propagates, so a provider or COM failure
+/// cannot silently become pointer fallback.
 fn run_invoke(ctx: &AxContext, target: &AxTarget, dispatch: &A11yMutationDispatch) -> Result<()> {
     let automation = UIAutomation::new().map_err(|e| {
         GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))
@@ -490,65 +626,44 @@ fn run_invoke(ctx: &AxContext, target: &AxTarget, dispatch: &A11yMutationDispatc
 
     // Start at 0 so find_nth's pre-order numbering matches snapshot's walk + assign_ids, same as
     // run_set_value.
-    let mut budget = WalkBudget::with_limits(ctx.limits);
-    let el = find_nth(&walker, &window, 0, &mut budget, target.id.0)
-        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+    let el = find_target(&walker, &window, ctx, target)?;
 
     // Same fingerprint gate as run_set_value: role + name + bounds.
-    let ct_id = el.get_control_type().map_err(uia_err)? as i32 as u32;
-    let role = crate::mapping::map_role_with_framework(
-        ct_id,
-        toggle_pattern(&el, ct_id).is_some(),
-        framework_id(&el, ct_id).as_deref(),
-    );
-    let name = nonempty(el.get_name().unwrap_or_default());
-    let bounds = window_relative_bounds(&el, (ctx.window.x, ctx.window.y));
-    if !target.matches(role, name.as_deref())
-        || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
-    {
-        return Err(GlassError::AxElementChanged(target.id.0));
-    }
+    verify_target_fingerprint(&el, ctx, target)?;
 
     let fail = |e: uiautomation::Error| GlassError::AxActionFailed(target.id.0, e.to_string());
-    if let Ok(p) = el.get_pattern::<UIInvokePattern>() {
+    if let Some(p) = optional_pattern(el.get_pattern::<UIInvokePattern>())? {
         return dispatch.dispatch(|| p.invoke().map_err(fail));
     }
-    if let Ok(p) = el.get_pattern::<UITogglePattern>() {
+    if let Some(p) = optional_pattern(el.get_pattern::<UITogglePattern>())? {
         // Toggle is the one rung with a readable post-state, so don't take the ack as proof:
         // a provider that accepts `Toggle()` without applying it would otherwise report a
         // successful click on a control that never moved. Read before, fire, then poll until
-        // the state differs — same cadence as `run_set_value`'s write verify.
-        //
-        // A pattern whose state can't even be READ can't be verify-toggled, so this rung is
-        // unusable — fall through to the rest of the ladder instead of reporting a failure.
-        // Nothing has been dispatched at this point, so falling through is safe: the worst
-        // outcome is `AxActionUnavailable` and a single pointer click, whereas an error here
-        // would propagate (an error after dispatch never falls back) and kill the click.
-        if let Ok(before) = p.get_toggle_state() {
-            dispatch.dispatch(|| p.toggle().map_err(fail))?;
-            let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
-            loop {
-                // Past the dispatch, a failed read IS a failure: `fail` (AxActionFailed) is
-                // right here, because the toggle may have landed and must not be re-actuated.
-                if p.get_toggle_state().map_err(fail)? != before {
-                    return Ok(());
-                }
-                if Instant::now() >= deadline {
-                    // `AxActionFailed`, not `AxActionUnavailable`: the toggle WAS dispatched,
-                    // so this must not fall back to a pointer click that could actuate twice.
-                    return Err(GlassError::AxActionFailed(
-                        target.id.0,
-                        "the toggle action was acknowledged but the state did not change".into(),
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
+        // the state differs, using the same cadence as `run_set_value`'s write verification.
+        let before = p.get_toggle_state().map_err(fail)?;
+        dispatch.dispatch(|| p.toggle().map_err(fail))?;
+        let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
+        loop {
+            // Past the dispatch, a failed read IS a failure: `fail` (AxActionFailed) is
+            // right here, because the toggle may have landed and must not be re-actuated.
+            if p.get_toggle_state().map_err(fail)? != before {
+                return Ok(());
             }
+            if Instant::now() >= deadline {
+                // `AxActionFailed`, not `AxActionUnavailable`: the toggle WAS dispatched,
+                // so this must not fall back to a pointer click that could actuate twice.
+                return Err(GlassError::AxActionFailed(
+                    target.id.0,
+                    "the toggle action was acknowledged but the state did not change".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
         }
     }
-    if let Ok(p) = el.get_pattern::<UISelectionItemPattern>() {
+    if let Some(p) = optional_pattern(el.get_pattern::<UISelectionItemPattern>())? {
         return dispatch.dispatch(|| p.select().map_err(fail));
     }
-    if let Ok(p) = el.get_pattern::<UIExpandCollapsePattern>() {
+    if let Some(p) = optional_pattern(el.get_pattern::<UIExpandCollapsePattern>())? {
         let expanded = p.get_state().map_err(fail)? == ExpandCollapseState::Expanded;
         return dispatch
             .dispatch(|| if expanded { p.collapse() } else { p.expand() }.map_err(fail));
@@ -567,20 +682,20 @@ fn find_nth(
     depth: usize,
     budget: &mut WalkBudget,
     target: u32,
-) -> Option<UIElement> {
+) -> Result<Option<UIElement>> {
     if budget.nodes_walked() == target as usize {
-        return Some(el.clone());
+        return Ok(Some(el.clone()));
     }
     budget.visit();
     // Resolved before the gate: a childless node must never be reported truncated for
     // declining to explore a list that was already empty.
-    let first_child = step(walker.get_first_child(el), budget);
+    let first_child = optional_uia(walker.get_first_child(el))?;
     // Same gap as `walk`: only tests whether a first child exists, before `is_offscreen` runs.
     // A node whose children are all offscreen, reached once the budget is spent, still records
     // a truncation though nothing real was declined — left as-is for the same reason: it would
     // mean walking the whole sibling chain, exactly the scan `MAX_SIBLINGS` exists to bound.
     if first_child.is_none() || !budget.may_explore_children(depth) {
-        return None;
+        return Ok(None);
     }
     let mut child = first_child;
     let mut siblings = 0usize;
@@ -592,19 +707,59 @@ fn find_nth(
             break;
         }
         siblings += 1;
-        if !c.is_offscreen().unwrap_or(false)
-            && let Some(found) = find_nth(walker, &c, depth + 1, budget, target)
+        if !required_uia(c.is_offscreen())?
+            && let Some(found) = find_nth(walker, &c, depth + 1, budget, target)?
         {
-            return Some(found);
+            return Ok(Some(found));
         }
-        child = step(walker.get_next_sibling(&c), budget);
+        child = optional_uia(walker.get_next_sibling(&c))?;
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uia_property_hresult_is_propagated_instead_of_becoming_false() {
+        let error = required_uia::<bool>(Err(uiautomation::Error::new(
+            0x8000_4005_u32 as i32,
+            "synthetic property failure",
+        )))
+        .expect_err("a failed required property read must remain an error");
+
+        assert!(
+            matches!(error, GlassError::AccessibilityUnavailable(ref message)
+                if message.contains("synthetic property failure")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn uia_pattern_hresult_is_propagated_instead_of_becoming_absent() {
+        let error = optional_pattern::<()>(Err(uiautomation::Error::new(
+            0x8000_4005_u32 as i32,
+            "synthetic pattern failure",
+        )))
+        .expect_err("a real pattern HRESULT must remain an error");
+
+        assert!(
+            matches!(error, GlassError::AccessibilityUnavailable(ref message)
+                if message.contains("synthetic pattern failure")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn only_explicit_unsupported_pattern_result_becomes_absent() {
+        let pattern =
+            optional_pattern::<()>(Err(uiautomation::Error::new(0, "unsupported pattern"))).expect(
+                "the dependency's explicit unsupported-pattern sentinel is not a COM failure",
+            );
+
+        assert_eq!(pattern, None);
+    }
 
     #[test]
     fn windows_set_value_forwards_ax_context_deadline_to_a11y_thread() {

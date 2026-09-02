@@ -3,6 +3,7 @@
 //! Excluded from the workspace build (heavy egui deps; on-box-test-only).
 
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -38,6 +39,8 @@ struct Fixture {
     announced: bool,
     frames: u32,
     copied: bool,
+    movement_started: Option<Instant>,
+    logs: Vec<&'static str>,
 }
 
 impl eframe::App for Fixture {
@@ -109,6 +112,53 @@ impl eframe::App for Fixture {
             {
                 log(&format!("[fixture] value={}", self.value));
             }
+            if ui.button("Semantic Save").clicked() {
+                self.movement_started = Some(Instant::now());
+                self.logs.push("[fixture] semantic_save");
+            }
+            if ui
+                .add_enabled(false, egui::Button::new("Disabled semantic"))
+                .clicked()
+            {
+                self.logs.push("[fixture] disabled_semantic");
+            }
+            ui.horizontal(|ui| {
+                for _ in 0..2 {
+                    if ui.button("Duplicate semantic").clicked() {
+                        self.logs.push("[fixture] duplicate_semantic");
+                    }
+                }
+            });
+
+            let movement = self.movement_started.map_or(0.0, |started| {
+                let elapsed = started.elapsed().min(Duration::from_millis(300));
+                if elapsed < Duration::from_millis(300) {
+                    ui.ctx().request_repaint();
+                }
+                elapsed.as_secs_f32() * 1_500.0
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(movement);
+                if ui.button("Moving semantic").clicked() {
+                    self.logs.push("[fixture] moving_semantic");
+                }
+            });
+
+            let occluded = ui.add_sized([180.0, 32.0], egui::Button::new("Occluded semantic"));
+            if occluded.clicked() {
+                self.logs.push("[fixture] occluded_semantic");
+            }
+            egui::Area::new(egui::Id::new("semantic-occluder"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(occluded.rect.min)
+                .show(ui.ctx(), |ui| {
+                    if ui
+                        .add_sized(occluded.rect.size(), egui::Button::new("Occluder"))
+                        .clicked()
+                    {
+                        self.logs.push("[fixture] occluder");
+                    }
+                });
             // Nest Apply inside a pair of unnamed, single-child panes (see `wrap_in_pane`) —
             // this fixture's accessibility tree is otherwise flat, so on-box a11y tests that
             // assert the outline's compact render is smaller than its full render need this
@@ -122,13 +172,16 @@ impl eframe::App for Fixture {
                 });
             });
         });
+        for line in self.logs.drain(..) {
+            log(line);
+        }
     }
 }
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 300.0])
+            .with_inner_size([700.0, 500.0])
             .with_title("glass-fixture-egui"),
         ..Default::default()
     };
