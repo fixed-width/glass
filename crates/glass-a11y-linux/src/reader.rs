@@ -865,9 +865,10 @@ fn required_object_identity(object: &ObjectRefOwned) -> Result<ObjectIdentity<'_
         .ok_or_else(|| pointer_reference_error("malformed non-null object reference"))
 }
 
-async fn pointer_bus_call<T, F>(deadline: Deadline, operation: &str, future: F) -> Result<T>
+async fn pointer_bus_call<T, E, F>(deadline: Deadline, operation: &str, future: F) -> Result<T>
 where
-    F: std::future::Future<Output = zbus::Result<T>>,
+    E: std::fmt::Display,
+    F: std::future::Future<Output = std::result::Result<T, E>>,
 {
     if deadline.has_passed() {
         return Err(GlassError::deadline_not_started(POINTER_HIT_OP));
@@ -876,6 +877,25 @@ where
         .await
         .map_err(|()| GlassError::caller_deadline_elapsed(POINTER_HIT_OP))?
         .map_err(|e| pointer_reference_error(format!("{operation}: {e}")))
+}
+
+fn validate_strict_reference<'a>(
+    object: &'a ObjectRefOwned,
+    description: &str,
+) -> Result<ObjectIdentity<'a>> {
+    ObjectIdentity::from_object_ref(object).ok_or_else(|| {
+        pointer_reference_error(format!(
+            "{description} is an explicit null object reference"
+        ))
+    })
+}
+
+fn strict_pid_match(pids: &[u32], pid: Result<u32>) -> Result<bool> {
+    if pids.is_empty() {
+        Ok(true)
+    } else {
+        Ok(pids.contains(&pid?))
+    }
 }
 
 async fn pointer_accessible<'a>(
@@ -905,22 +925,173 @@ async fn pointer_component<'a>(
     pointer_bus_call(ctx.deadline, "component proxy", builder.build()).await
 }
 
-async fn pointer_window_root(
-    ctx: &AxContext,
-    conn: &zbus::Connection,
-    app_ref: &ObjectRefOwned,
-    app: &AccessibleProxy<'_>,
-) -> Result<ObjectRefOwned> {
-    let children =
-        pointer_bus_call(ctx.deadline, "application children", app.get_children()).await?;
-    for child in children.into_iter().take(ctx.limits.siblings) {
-        let child_proxy = pointer_accessible(conn, &child).await?;
-        let role = pointer_bus_call(ctx.deadline, "window role", child_proxy.get_role()).await?;
-        if map_role(role) == glass_core::AxRole::Window {
-            return Ok(child);
+/// Pointer-action app lookup. Unlike snapshot discovery, every registry reference and PID read is
+/// evidence used for an action decision, so an unreadable entry is an error rather than a skipped
+/// non-match.
+async fn find_app_strict(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)> {
+    let conn = match ctx.a11y_bus_addr.as_deref() {
+        Some(addr) => {
+            let parsed = addr.try_into().map_err(|e| {
+                GlassError::AccessibilityUnavailable(format!("bad a11y address: {e}"))
+            })?;
+            pointer_bus_call(
+                ctx.deadline,
+                "private accessibility bus connection",
+                AccessibilityConnection::from_address(parsed),
+            )
+            .await?
+        }
+        None => {
+            return Err(GlassError::AccessibilityUnavailable(
+                "no accessibility bus for this launch — relaunch the app with a11y:true \
+                 to enable the accessibility tree (Linux)"
+                    .into(),
+            ));
+        }
+    };
+    let zbus_conn = conn.connection().clone();
+    let root = pointer_bus_call(
+        ctx.deadline,
+        "registry root",
+        conn.root_accessible_on_registry(),
+    )
+    .await?;
+    let app_refs =
+        pointer_bus_call(ctx.deadline, "registry applications", root.get_children()).await?;
+    let dbus = if ctx.pids.is_empty() {
+        None
+    } else {
+        Some(
+            pointer_bus_call(
+                ctx.deadline,
+                "D-Bus proxy",
+                zbus::fdo::DBusProxy::new(&zbus_conn),
+            )
+            .await?,
+        )
+    };
+    for app_ref in app_refs {
+        let identity = validate_strict_reference(&app_ref, "registry application")?;
+        let _app = pointer_accessible(&zbus_conn, &app_ref).await?;
+        let pid = match &dbus {
+            Some(dbus) => pointer_bus_call(
+                ctx.deadline,
+                "application PID",
+                dbus.get_connection_unix_process_id(
+                    app_ref
+                        .name()
+                        .expect("a validated non-null reference has a unique name")
+                        .clone()
+                        .into(),
+                ),
+            )
+            .await
+            .map_err(|e| {
+                pointer_reference_error(format!(
+                    "application {} PID lookup: {e}",
+                    identity.bus_name
+                ))
+            }),
+            None => Ok(0),
+        };
+        if strict_pid_match(&ctx.pids, pid)? {
+            return Ok((app_ref, zbus_conn));
         }
     }
-    Ok(app_ref.clone())
+    Err(GlassError::AccessibilityNotReady(no_app_tree_message(
+        &ctx.pids,
+    )))
+}
+
+/// Action rewalk with the same pre-order and bounds as [`find_nth`], but without its
+/// snapshot-compatible null/proxy skips. Skipping here could shift the requested id onto another
+/// object, so every unreadable reference propagates.
+async fn find_nth_strict(
+    ctx: &AxContext,
+    node_ref: &ObjectRefOwned,
+    proxy: &AccessibleProxy<'_>,
+    conn: &zbus::Connection,
+    depth: usize,
+    target: u32,
+    budget: &mut WalkBudget,
+) -> Result<Option<ObjectRefOwned>> {
+    validate_strict_reference(node_ref, "walk node")?;
+    if budget.nodes_walked() == target as usize {
+        return Ok(Some(node_ref.clone()));
+    }
+    budget.visit();
+    let child_refs =
+        pointer_bus_call(ctx.deadline, "target walk children", proxy.get_children()).await?;
+    if child_refs.is_empty() || !budget.may_explore_children(depth) {
+        return Ok(None);
+    }
+    for (scanned, child_ref) in child_refs.into_iter().enumerate() {
+        if !budget.may_visit_sibling(scanned) {
+            break;
+        }
+        validate_strict_reference(&child_ref, "target walk child")?;
+        let child = pointer_accessible(conn, &child_ref).await?;
+        if let Some(found) = Box::pin(find_nth_strict(
+            ctx,
+            &child_ref,
+            &child,
+            conn,
+            depth + 1,
+            target,
+            budget,
+        ))
+        .await?
+        {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+fn is_window_coordinate_root(role: atspi_common::Role) -> bool {
+    matches!(
+        role,
+        atspi_common::Role::Frame
+            | atspi_common::Role::Window
+            | atspi_common::Role::Dialog
+            | atspi_common::Role::Alert
+            | atspi_common::Role::FileChooser
+            | atspi_common::Role::ColorChooser
+            | atspi_common::Role::FontChooser
+    )
+}
+
+async fn containing_window_root(
+    ctx: &AxContext,
+    conn: &zbus::Connection,
+    target_ref: &ObjectRefOwned,
+) -> Result<ObjectRefOwned> {
+    let mut current = target_ref.clone();
+    let mut seen = Vec::new();
+    for _ in 0..=ctx.limits.depth {
+        validate_strict_reference(&current, "target ancestry object")?;
+        if seen.contains(&current) {
+            return Err(pointer_reference_error("cyclic target ancestry"));
+        }
+        seen.push(current.clone());
+        let proxy = pointer_accessible(conn, &current).await?;
+        let role = pointer_bus_call(ctx.deadline, "target ancestor role", proxy.get_role()).await?;
+        if is_window_coordinate_root(role) {
+            return Ok(current);
+        }
+        let parent =
+            pointer_bus_call(ctx.deadline, "target ancestor parent", proxy.parent()).await?;
+        if parent.is_null() {
+            return Err(pointer_reference_error(
+                "target has no containing window, frame, or dialog",
+            ));
+        }
+        current = parent;
+    }
+    Err(pointer_reference_error(format!(
+        "target ancestry exceeded the configured depth limit ({})",
+        ctx.limits.depth
+    )))
 }
 
 async fn first_interactable_ancestor(
@@ -1006,12 +1177,20 @@ async fn pointer_target_at_async(
     if ctx.deadline.has_passed() {
         return Err(GlassError::deadline_not_started(POINTER_HIT_OP));
     }
-    let (app_ref, conn) = find_app(ctx).await?;
-    let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
+    let (app_ref, conn) = find_app_strict(ctx).await?;
+    let app = pointer_accessible(&conn, &app_ref).await?;
     let mut budget = WalkBudget::with_limits(ctx.limits);
-    let target_ref = Box::pin(find_nth(&app_ref, &app, &conn, 0, target.id.0, &mut budget))
-        .await?
-        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+    let target_ref = Box::pin(find_nth_strict(
+        ctx,
+        &app_ref,
+        &app,
+        &conn,
+        0,
+        target.id.0,
+        &mut budget,
+    ))
+    .await?
+    .ok_or(GlassError::AxElementChanged(target.id.0))?;
     let target_proxy = pointer_accessible(&conn, &target_ref).await?;
     let role =
         map_role(pointer_bus_call(ctx.deadline, "target role", target_proxy.get_role()).await?);
@@ -1025,7 +1204,7 @@ async fn pointer_target_at_async(
     } else {
         first_interactable_ancestor(ctx, &conn, &target_ref).await?
     };
-    let root_ref = pointer_window_root(ctx, &conn, &app_ref, &app).await?;
+    let root_ref = containing_window_root(ctx, &conn, &target_ref).await?;
     let component = pointer_component(ctx, &conn, &root_ref).await?;
     let hit = pointer_bus_call(
         ctx.deadline,
@@ -1596,6 +1775,36 @@ mod tests {
             classify_hit_reference(target, Some(ancestor), None),
             glass_core::PointerHit::Inconclusive
         );
+    }
+
+    #[test]
+    fn strict_pointer_lookup_rejects_null_references_and_propagates_pid_failures() {
+        let null = ObjectRefOwned::new(ObjectRef::Null);
+        assert!(validate_strict_reference(&null, "registry application").is_err());
+
+        let error = strict_pid_match(
+            &[42],
+            Err(pointer_reference_error("PID lookup permission denied")),
+        )
+        .expect_err("a PID lookup failure is not an absent application");
+        assert!(error.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn pointer_window_coordinate_root_roles_include_frames_and_dialogs_but_not_applications() {
+        for role in [
+            atspi_common::Role::Frame,
+            atspi_common::Role::Window,
+            atspi_common::Role::Dialog,
+            atspi_common::Role::Alert,
+            atspi_common::Role::FileChooser,
+            atspi_common::Role::ColorChooser,
+            atspi_common::Role::FontChooser,
+        ] {
+            assert!(is_window_coordinate_root(role), "{role:?}");
+        }
+        assert!(!is_window_coordinate_root(atspi_common::Role::Application));
+        assert!(!is_window_coordinate_root(atspi_common::Role::Panel));
     }
 
     #[test]

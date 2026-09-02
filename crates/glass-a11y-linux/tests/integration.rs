@@ -736,6 +736,88 @@ fn semantic_actions_cover_native_focus_pointer_stability_disabled_duplicates_and
     let row = find_role(&initial.root, AxRole::ListItem).expect("first realized row");
     assert!(!row.states.selected);
 
+    let pointer_typed = glass
+        .type_target(
+            &glass_core::TypeTargetParams {
+                target: semantic_target(
+                    AxRole::TextArea,
+                    "Field",
+                    vec![SemanticState::Enabled, SemanticState::Visible],
+                ),
+                focus_mode: ActionMode::Pointer,
+                timeout_ms: 5_000,
+                max_nodes: None,
+            },
+            "P",
+        )
+        .expect("pointer focus and one key batch");
+    assert_eq!(
+        pointer_typed.focus,
+        Some(glass_core::MutationReport {
+            method: ActionMethod::Pointer {
+                native_fallback: None,
+            },
+            dispatch: DispatchStatus::Dispatched,
+            confirmation: ConfirmationStatus::FocusConfirmed,
+        })
+    );
+    assert_eq!(pointer_typed.action.method, ActionMethod::Keyboard);
+    let pointer_typed_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let tree = glass
+            .a11y_snapshot(None)
+            .expect("pointer-typed value snapshot");
+        if find_node(&tree.root, "Field")
+            .and_then(|node| node.value.as_deref())
+            .is_some_and(|value| value != "hello" && value.contains('P'))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < pointer_typed_deadline,
+            "pointer-focused key batch did not change Field"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    let unconfirmed = glass
+        .type_target(
+            &glass_core::TypeTargetParams {
+                target: semantic_target(
+                    AxRole::TextArea,
+                    "Refusing Editor",
+                    vec![SemanticState::Enabled, SemanticState::Visible],
+                ),
+                focus_mode: ActionMode::Pointer,
+                timeout_ms: 5_000,
+                max_nodes: None,
+            },
+            "must not type",
+        )
+        .expect_err("typing must stop when pointer focus is not confirmed");
+    assert_eq!(
+        unconfirmed.kind,
+        SemanticActionFailureKind::FocusUnconfirmed
+    );
+    assert_eq!(unconfirmed.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        unconfirmed.focus,
+        Some(glass_core::MutationReport {
+            method: ActionMethod::Pointer {
+                native_fallback: None,
+            },
+            dispatch: DispatchStatus::Dispatched,
+            confirmation: ConfirmationStatus::Unconfirmed,
+        })
+    );
+    let unconfirmed_tree = glass
+        .a11y_snapshot(None)
+        .expect("unconfirmed field snapshot");
+    assert_eq!(
+        find_node(&unconfirmed_tree.root, "Refusing Editor").and_then(|node| node.value.as_deref()),
+        Some("untouched")
+    );
+
     let save = glass
         .click_target(&glass_core::ClickTargetParams {
             target: ActionTarget::Semantic(semantic_target(
@@ -804,6 +886,19 @@ fn semantic_actions_cover_native_focus_pointer_stability_disabled_duplicates_and
     assert!(
         !settled.is_empty(),
         "pointer dispatch returned before the GTK bounds stopped moving"
+    );
+    let moving_click = glass
+        .wait_for_log(&glass_core::WaitLogParams {
+            contains: "MOVING_CLICKED".into(),
+            stream: None,
+            cursor: Some(0),
+            interval_ms: 25,
+            timeout_ms: 2_000,
+        })
+        .expect("moving click log");
+    assert!(
+        moving_click.matched,
+        "forced pointer click did not reach Moving semantic"
     );
 
     let disabled = glass

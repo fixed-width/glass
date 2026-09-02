@@ -62,6 +62,9 @@ class FixtureApp(Gtk.Application):
         box.append(Gtk.Label(label="Ready"))
 
         moving = Gtk.Button(label="Moving semantic")
+        moving.connect(
+            "clicked", lambda _button: print("MOVING_CLICKED", flush=True)
+        )
 
         def _start_moving(_button):
             print("SEMANTIC_SAVE", flush=True)
@@ -119,6 +122,27 @@ class FixtureApp(Gtk.Application):
         entry.set_text("hello")
         entry.update_property([Gtk.AccessibleProperty.LABEL], ["Field"])
         box.append(entry)
+        unconfirmed = Gtk.Entry()
+        unconfirmed.set_text("untouched")
+        unconfirmed.set_focus_on_click(False)
+
+        def _restore_focusable():
+            unconfirmed.set_can_focus(True)
+            return GLib.SOURCE_REMOVE
+
+        def _refuse_pointer_focus(_gesture, _presses, _x, _y):
+            unconfirmed.set_can_focus(False)
+            win.set_focus(save_semantic)
+            GLib.timeout_add(300, _restore_focusable)
+
+        refusal_gesture = Gtk.GestureClick()
+        refusal_gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        refusal_gesture.connect("pressed", _refuse_pointer_focus)
+        unconfirmed.add_controller(refusal_gesture)
+        unconfirmed.update_property(
+            [Gtk.AccessibleProperty.LABEL], ["Refusing Editor"]
+        )
+        box.append(unconfirmed)
         # A SpinButton exposes BOTH the AT-SPI EditableText and Value interfaces; only
         # Value commits to the adjustment, so set_value must go through Value.
         spin = Gtk.SpinButton(
