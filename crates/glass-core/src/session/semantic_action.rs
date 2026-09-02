@@ -651,6 +651,184 @@ fn set_value_actionability(
     report
 }
 
+fn targeted_type_eligibility(
+    element: &ElementInfo,
+    coverage: AxStateCoverage,
+) -> ActionabilityVerdict {
+    if matches!(element.role, AxRole::TextField | AxRole::TextArea)
+        || (coverage.editable && element.states.editable)
+    {
+        ActionabilityVerdict::Passed
+    } else if coverage.editable {
+        ActionabilityVerdict::Failed
+    } else {
+        ActionabilityVerdict::Unproven
+    }
+}
+
+fn targeted_type_actionability(
+    element: &ElementInfo,
+    coverage: AxStateCoverage,
+    stable: Option<bool>,
+    window: (u32, u32),
+    pointer: bool,
+) -> ActionabilityReport {
+    let mut report = ActionabilityReport::evaluate_click(
+        element,
+        coverage,
+        stable,
+        window,
+        crate::PointerHit::Inconclusive,
+        false,
+        pointer,
+    );
+    insert_targeted_type_eligibility(&mut report, element, coverage);
+    report
+}
+
+fn insert_targeted_type_eligibility(
+    report: &mut ActionabilityReport,
+    element: &ElementInfo,
+    coverage: AxStateCoverage,
+) {
+    let insert_at = report
+        .checks
+        .iter()
+        .position(|check| check.name == ActionabilityCheckName::Stable)
+        .unwrap_or(report.checks.len());
+    report.checks.insert(
+        insert_at,
+        ActionabilityCheck::new(
+            ActionabilityCheckName::FocusEligible,
+            targeted_type_eligibility(element, coverage),
+            true,
+            ActionabilitySource::NormalizedState,
+        ),
+    );
+}
+
+fn record_focus_confirmation(
+    report: &mut ActionabilityReport,
+    coverage: AxStateCoverage,
+    confirmed: bool,
+) {
+    let verdict = if !coverage.focused {
+        ActionabilityVerdict::Unproven
+    } else if confirmed {
+        ActionabilityVerdict::Passed
+    } else {
+        ActionabilityVerdict::Failed
+    };
+    report.push(ActionabilityCheck::new(
+        ActionabilityCheckName::Focused,
+        verdict,
+        true,
+        ActionabilitySource::ConfirmationPoll,
+    ));
+}
+
+#[derive(Debug)]
+struct ConfirmedFocus {
+    element: ElementInfo,
+    resolution: ResolutionReport,
+    actionability: ActionabilityReport,
+    focus: MutationReport,
+    bound: ActionDeadline,
+}
+
+fn focus_dispatch(source: &GlassError, dispatch_started: bool) -> DispatchStatus {
+    if !dispatch_started
+        || source.invoke_fallback_eligible()
+        || source.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched)
+        || matches!(
+            source.cause(),
+            GlassError::NoActiveSession
+                | GlassError::NoAxSnapshot
+                | GlassError::AxElementNotFound(_)
+                | GlassError::AxElementNotClickable(_)
+                | GlassError::AxElementInUnmappedPopover(_)
+                | GlassError::WindowNotFound
+        )
+    {
+        DispatchStatus::NotDispatched
+    } else {
+        DispatchStatus::MayHaveDispatched
+    }
+}
+
+fn focus_source_error(
+    source: GlassError,
+    resolution: Option<ResolutionReport>,
+    actionability: ActionabilityReport,
+    method: ActionMethod,
+    bound: ActionDeadline,
+    dispatch_started: bool,
+) -> SemanticActionError {
+    let dispatch = focus_dispatch(&source, dispatch_started);
+    let mut error = source_error(source, bound);
+    error.summary = "semantic target focus failed";
+    error.resolution = resolution;
+    error.actionability = actionability;
+    error.focus = Some(MutationReport {
+        method,
+        dispatch,
+        confirmation: ConfirmationStatus::Unconfirmed,
+    });
+    error.action_dispatch = DispatchStatus::NotDispatched;
+    if dispatch != DispatchStatus::NotDispatched {
+        error.retry = RetryGuidance::DoNotRetry;
+    }
+    error
+}
+
+fn focus_unconfirmed_error(
+    source: Option<GlassError>,
+    resolution: ResolutionReport,
+    mut actionability: ActionabilityReport,
+    coverage: AxStateCoverage,
+    method: ActionMethod,
+    bound: ActionDeadline,
+) -> SemanticActionError {
+    record_focus_confirmation(&mut actionability, coverage, false);
+    let mut error = actionability_error(
+        SemanticActionFailureKind::FocusUnconfirmed,
+        "semantic target focus could not be confirmed",
+        Some(resolution),
+        actionability,
+        bound,
+        RetryGuidance::Reobserve,
+        source,
+        DispatchStatus::NotDispatched,
+    );
+    error.focus = Some(MutationReport {
+        method,
+        dispatch: DispatchStatus::Dispatched,
+        confirmation: ConfirmationStatus::Unconfirmed,
+    });
+    error
+}
+
+fn key_source_error(source: GlassError, focused: ConfirmedFocus) -> SemanticActionError {
+    let proven_not_dispatched =
+        source.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched);
+    let mut error = source_error(source, focused.bound);
+    error.summary = "semantic targeted typing failed";
+    error.resolution = Some(focused.resolution);
+    error.actionability = focused.actionability;
+    error.focus = Some(focused.focus);
+    error.action_dispatch = if proven_not_dispatched {
+        DispatchStatus::NotDispatched
+    } else {
+        DispatchStatus::MayHaveDispatched
+    };
+    error.retry = if proven_not_dispatched {
+        RetryGuidance::SafeToRetry
+    } else {
+        RetryGuidance::DoNotRetry
+    };
+    error
+}
+
 fn actionability_error(
     kind: SemanticActionFailureKind,
     summary: &'static str,
@@ -1745,6 +1923,359 @@ impl Glass {
                 text,
                 dispatch,
                 confirmation,
+            },
+            crate::audit::AuditOutcome::from_result(&result),
+            started.elapsed(),
+        );
+        result
+    }
+
+    fn confirm_focused_target(
+        &mut self,
+        target: &AxTarget,
+        deadline: ActionDeadline,
+    ) -> std::result::Result<ElementInfo, SemanticActionError> {
+        let coverage = self
+            .active
+            .as_ref()
+            .and_then(|active| active.accessibility.as_ref())
+            .map_or(AxStateCoverage::NONE, |reader| reader.state_coverage());
+        let observe = |tree: &crate::AxTree| {
+            if !coverage.focused {
+                return None;
+            }
+            match target.relocate(tree) {
+                crate::accessibility::Located::AtId(node)
+                | crate::accessibility::Located::Moved(node)
+                    if node.states.focused =>
+                {
+                    Some(ElementInfo::from_node(node))
+                }
+                _ => None,
+            }
+        };
+        if !deadline.allow_wait {
+            let tree = self
+                .a11y_resnapshot_for_wait(deadline.deadline)
+                .map_err(|source| source_error(source, deadline))?;
+            return observe(&tree).ok_or_else(|| {
+                empty_error(
+                    SemanticActionFailureKind::FocusUnconfirmed,
+                    "semantic target focus could not be confirmed",
+                    deadline,
+                    RetryGuidance::Reobserve,
+                    None,
+                )
+            });
+        }
+        let poll = self
+            .poll_accessibility_until_by_deadline(
+                SEMANTIC_ACTION_STABILITY_MS,
+                std::time::Duration::from_secs(1),
+                deadline.deadline,
+                deadline.owner.unwrap_or(Whose::Callee),
+                true,
+                Deadline::UNBOUNDED,
+                "confirm semantic target focus",
+                observe,
+                Option::is_some,
+            )
+            .map_err(|source| source_error(source, deadline))?;
+        if poll.satisfied {
+            Ok(poll
+                .observation
+                .expect("a satisfied focus confirmation observed a focused target"))
+        } else {
+            Err(empty_error(
+                SemanticActionFailureKind::FocusUnconfirmed,
+                "semantic target focus could not be confirmed",
+                deadline,
+                RetryGuidance::Reobserve,
+                None,
+            ))
+        }
+    }
+
+    fn focus_target_native_once(
+        &mut self,
+        params: &TypeTargetParams,
+        sequence_deadline: Deadline,
+        bound: ActionDeadline,
+    ) -> std::result::Result<ConfirmedFocus, SemanticActionError> {
+        let window = self
+            .active
+            .as_ref()
+            .map(|active| (active.geometry.width, active.geometry.height))
+            .unwrap_or_default();
+        let coverage = self
+            .active
+            .as_ref()
+            .and_then(|active| active.accessibility.as_ref())
+            .map_or(AxStateCoverage::NONE, |reader| reader.state_coverage());
+        let resolved = self
+            .resolve_semantic_target_by_bound(
+                &params.target,
+                params.max_nodes,
+                sequence_deadline,
+                bound,
+                |element, coverage| {
+                    targeted_type_eligibility(element, coverage) == ActionabilityVerdict::Passed
+                        && targeted_type_actionability(element, coverage, None, window, false)
+                            .blocking()
+                            .is_none()
+                },
+            )
+            .map_err(|mut error| {
+                if error.kind == SemanticActionFailureKind::NotActionable
+                    && let Some(element) = error
+                        .candidates
+                        .first()
+                        .map(|candidate| candidate.element.clone())
+                {
+                    error.actionability =
+                        targeted_type_actionability(&element, coverage, None, window, false);
+                }
+                error
+            })?;
+        let mut actionability =
+            targeted_type_actionability(&resolved.element, resolved.coverage, None, window, false);
+        let actuated = self
+            .try_native_focus(resolved.element.id, resolved.bound.deadline)
+            .map_err(|source| {
+                focus_source_error(
+                    source,
+                    Some(resolved.resolution.clone()),
+                    actionability.clone(),
+                    ActionMethod::NativeAction { actuated: None },
+                    resolved.bound,
+                    true,
+                )
+            })?;
+        actionability.pass_backend_fingerprint();
+        let method = ActionMethod::NativeAction { actuated };
+        let confirmed = self
+            .confirm_focused_target(&resolved.target, resolved.bound)
+            .map_err(|error| {
+                focus_unconfirmed_error(
+                    error.source,
+                    resolved.resolution.clone(),
+                    actionability.clone(),
+                    resolved.coverage,
+                    method.clone(),
+                    resolved.bound,
+                )
+            })?;
+        record_focus_confirmation(&mut actionability, resolved.coverage, true);
+        Ok(ConfirmedFocus {
+            element: confirmed,
+            resolution: resolved.resolution,
+            actionability,
+            focus: MutationReport {
+                method,
+                dispatch: DispatchStatus::Dispatched,
+                confirmation: ConfirmationStatus::FocusConfirmed,
+            },
+            bound: resolved.bound,
+        })
+    }
+
+    fn focus_target_pointer_once(
+        &mut self,
+        params: &TypeTargetParams,
+        sequence_deadline: Deadline,
+        bound: ActionDeadline,
+        native_fallback: Option<String>,
+    ) -> std::result::Result<ConfirmedFocus, SemanticActionError> {
+        let resolved = self.resolve_stable_pointer_target(
+            &params.target,
+            params.max_nodes,
+            sequence_deadline,
+            bound,
+        )?;
+        let mut pre_dispatch = targeted_type_actionability(
+            &resolved.candidate.element,
+            resolved.coverage,
+            Some(true),
+            resolved.candidate.window,
+            true,
+        );
+        if pre_dispatch.blocking().is_some() {
+            return Err(actionability_error(
+                SemanticActionFailureKind::NotActionable,
+                "semantic target is not eligible for targeted typing",
+                Some(resolved.resolution),
+                pre_dispatch,
+                resolved.bound,
+                RetryGuidance::Reobserve,
+                None,
+                DispatchStatus::NotDispatched,
+            ));
+        }
+        let target = resolved.candidate.target.clone();
+        let element = resolved.candidate.element.clone();
+        let coverage = resolved.coverage;
+        let method = ActionMethod::Pointer {
+            native_fallback: native_fallback.clone(),
+        };
+        let focused = self
+            .dispatch_pointer_click(resolved, native_fallback)
+            .map_err(|mut error| {
+                let focus_dispatch = error.action_dispatch;
+                insert_targeted_type_eligibility(&mut error.actionability, &element, coverage);
+                error.focus = Some(MutationReport {
+                    method: method.clone(),
+                    dispatch: focus_dispatch,
+                    confirmation: ConfirmationStatus::Unconfirmed,
+                });
+                error.action_dispatch = DispatchStatus::NotDispatched;
+                if focus_dispatch != DispatchStatus::NotDispatched {
+                    error.retry = RetryGuidance::DoNotRetry;
+                }
+                error
+            })?;
+        pre_dispatch = focused.actionability;
+        insert_targeted_type_eligibility(&mut pre_dispatch, &focused.target, coverage);
+        let confirmed = self
+            .confirm_focused_target(&target, focused.bound)
+            .map_err(|error| {
+                focus_unconfirmed_error(
+                    error.source,
+                    focused
+                        .resolution
+                        .clone()
+                        .expect("semantic pointer focus has a resolution report"),
+                    pre_dispatch.clone(),
+                    coverage,
+                    method.clone(),
+                    focused.bound,
+                )
+            })?;
+        record_focus_confirmation(&mut pre_dispatch, coverage, true);
+        Ok(ConfirmedFocus {
+            element: confirmed,
+            resolution: focused
+                .resolution
+                .expect("semantic pointer focus has a resolution report"),
+            actionability: pre_dispatch,
+            focus: MutationReport {
+                method,
+                dispatch: DispatchStatus::Dispatched,
+                confirmation: ConfirmationStatus::FocusConfirmed,
+            },
+            bound: focused.bound,
+        })
+    }
+
+    fn type_target_inner(
+        &mut self,
+        params: &TypeTargetParams,
+        text: &str,
+        sequence_deadline: Deadline,
+    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+        let bound = target_deadline(
+            &ActionTarget::Semantic(params.target.clone()),
+            Some(params.timeout_ms),
+            params.max_nodes,
+            sequence_deadline,
+        )?;
+        let focused = match params.focus_mode {
+            ActionMode::Native => self.focus_target_native_once(params, sequence_deadline, bound),
+            ActionMode::Pointer => {
+                self.focus_target_pointer_once(params, sequence_deadline, bound, None)
+            }
+            ActionMode::Auto => {
+                match self.focus_target_native_once(params, sequence_deadline, bound) {
+                    Ok(focused) => Ok(focused),
+                    Err(error) if error.proves_pre_dispatch_native_unavailable() => {
+                        let reason = error.safe_fallback_reason();
+                        self.focus_target_pointer_once(
+                            params,
+                            sequence_deadline,
+                            bound,
+                            Some(reason),
+                        )
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }?;
+        if let Err(source) =
+            self.key_inner_by(&KeyEvent::Text(text.to_owned()), focused.bound.deadline)
+        {
+            return Err(key_source_error(source, focused));
+        }
+        Ok(SemanticActionOutcome {
+            target: focused.element,
+            resolution: Some(focused.resolution),
+            actionability: focused.actionability,
+            focus: Some(focused.focus),
+            action: MutationReport {
+                method: ActionMethod::Keyboard,
+                dispatch: DispatchStatus::Dispatched,
+                confirmation: ConfirmationStatus::DispatchConfirmed,
+            },
+            bound: focused.bound,
+        })
+    }
+
+    pub fn type_target(
+        &mut self,
+        params: &TypeTargetParams,
+        text: &str,
+    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+        self.type_target_by(params, text, Deadline::UNBOUNDED)
+    }
+
+    pub fn type_target_by(
+        &mut self,
+        params: &TypeTargetParams,
+        text: &str,
+        sequence_deadline: Deadline,
+    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+        let started = std::time::Instant::now();
+        let result = self.type_target_inner(params, text, sequence_deadline);
+        let element = match &result {
+            Ok(outcome) => crate::audit::ElementRef {
+                id: outcome.target.id.0,
+                role: Some(format!("{:?}", outcome.target.role)),
+                name: outcome.target.name.clone(),
+            },
+            Err(error) => error
+                .candidates
+                .first()
+                .map(|candidate| crate::audit::ElementRef {
+                    id: candidate.element.id.0,
+                    role: Some(format!("{:?}", candidate.element.role)),
+                    name: candidate.element.name.clone(),
+                })
+                .unwrap_or_else(|| crate::audit::ElementRef {
+                    id: 0,
+                    role: params.target.target.role().map(|role| format!("{role:?}")),
+                    name: params.target.target.query().map(str::to_owned),
+                }),
+        };
+        let focus = match &result {
+            Ok(outcome) => outcome.focus.as_ref(),
+            Err(error) => error.focus.as_ref(),
+        };
+        let focus_method = focus.map(|report| report.method.as_str());
+        let focus_dispatch = focus.map_or(DispatchStatus::NotDispatched, |report| report.dispatch);
+        let focus_confirmation = focus.map_or(ConfirmationStatus::Unconfirmed, |report| {
+            report.confirmation
+        });
+        let type_dispatch = match &result {
+            Ok(outcome) => outcome.action.dispatch,
+            Err(error) => error.action_dispatch,
+        };
+        self.emit_audit(
+            &crate::audit::Actuation::TypeTarget {
+                element,
+                text,
+                focus_mode: params.focus_mode.as_str(),
+                focus_method,
+                focus_dispatch: focus_dispatch.as_str(),
+                focus_confirmation: focus_confirmation.as_str(),
+                type_dispatch: type_dispatch.as_str(),
             },
             crate::audit::AuditOutcome::from_result(&result),
             started.elapsed(),

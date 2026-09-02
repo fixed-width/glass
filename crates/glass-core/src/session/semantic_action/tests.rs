@@ -116,6 +116,106 @@ fn semantic_set_value_glass_with_coverage(
     )
 }
 
+fn targeted_type_params(query: &str, focus_mode: ActionMode, timeout_ms: u64) -> TypeTargetParams {
+    TypeTargetParams {
+        target: semantic_target(query),
+        focus_mode,
+        timeout_ms,
+        max_nodes: None,
+    }
+}
+
+fn targeted_type_field_tree(name: &str, focused: bool) -> AxTree {
+    let mut tree = editable_field_tree(name, Some("old"), true);
+    tree.root.children[0].id = AxNodeId(1);
+    tree.root.children[0].states.focused = focused;
+    tree
+}
+
+fn renumbered_targeted_type_field_tree(name: &str) -> AxTree {
+    let mut tree = targeted_type_field_tree(name, true);
+    tree.root.children.insert(
+        0,
+        AxNode {
+            id: AxNodeId(1),
+            role: AxRole::Label,
+            raw_role: "label".into(),
+            name: Some("Inserted helper".into()),
+            description: None,
+            value: None,
+            states: AxStates {
+                visible: true,
+                ..AxStates::default()
+            },
+            bounds: Some(AxRect {
+                x: 20,
+                y: 60,
+                width: 160,
+                height: 20,
+            }),
+            children: Vec::new(),
+        },
+    );
+    tree.root.children[1].id = AxNodeId(2);
+    AxTree::new(tree.root)
+}
+
+struct TargetedTypeFixture {
+    glass: Glass,
+    focus_calls: Arc<AtomicUsize>,
+    clicks: Arc<Mutex<Vec<(i32, i32)>>>,
+    key_log: Arc<Mutex<Vec<KeyEvent>>>,
+    walks: Arc<AtomicUsize>,
+    ax_deadlines: AxDeadlineLog,
+    key_deadlines: InputDeadlineLog,
+    hit_calls: Arc<AtomicUsize>,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+fn targeted_type_glass(
+    trees: Vec<AxTree>,
+    focus_behavior: InvokeBehavior,
+    coverage: AxStateCoverage,
+    fail_key: bool,
+) -> TargetedTypeFixture {
+    let focus_calls = Arc::new(AtomicUsize::new(0));
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let key_log = Arc::new(Mutex::new(Vec::new()));
+    let walks = Arc::new(AtomicUsize::new(0));
+    let ax_deadlines = Arc::new(Mutex::new(Vec::new()));
+    let key_deadlines = Arc::new(Mutex::new(Vec::new()));
+    let hit_calls = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut platform = FakePlatform::new(320, 240)
+        .with_click_log(clicks.clone())
+        .with_key_log(key_log.clone())
+        .with_key_deadline_log(key_deadlines.clone())
+        .with_event_log(events.clone());
+    if fail_key {
+        platform = platform.with_failing_key();
+    }
+    let accessibility = SeqAccessibility::new(trees)
+        .with_coverage(coverage)
+        .with_focus_behavior(focus_behavior)
+        .with_focus_calls(focus_calls.clone())
+        .with_hit(PointerHit::Target)
+        .with_hit_calls(hit_calls.clone())
+        .with_walks(walks.clone())
+        .with_deadlines(ax_deadlines.clone())
+        .with_event_log(events.clone());
+    TargetedTypeFixture {
+        glass: glass_with_backend(platform, Box::new(accessibility)),
+        focus_calls,
+        clicks,
+        key_log,
+        walks,
+        ax_deadlines,
+        key_deadlines,
+        hit_calls,
+        events,
+    }
+}
+
 fn named_button_tree(name: &str) -> AxTree {
     let mut tree = fake_tree();
     tree.root.children[0].name = Some(name.into());
@@ -2616,4 +2716,355 @@ fn semantic_public_set_value_audit_emits_one_safe_high_level_record() {
     assert_eq!(audits[0].confirmation, "unconfirmed");
     assert!(!audits[0].ok);
     assert!(!audits[0].error.as_deref().unwrap().contains(secret));
+}
+
+#[test]
+fn targeted_type_zero_timeout_types_only_if_the_first_confirmation_read_is_focused() {
+    for (focused, succeeds) in [(true, true), (false, false)] {
+        let mut fixture = targeted_type_glass(
+            vec![
+                targeted_type_field_tree("Account name", false),
+                targeted_type_field_tree("Account name", focused),
+                targeted_type_field_tree("Account name", true),
+            ],
+            InvokeBehavior::Succeed,
+            full_state_coverage(),
+            false,
+        );
+        fixture.glass.start(&spec()).unwrap();
+
+        let result = fixture.glass.type_target_by(
+            &targeted_type_params("Account name", ActionMode::Native, 0),
+            "typed once",
+            Deadline::UNBOUNDED,
+        );
+
+        assert_eq!(result.is_ok(), succeeds);
+        assert_eq!(fixture.walks.load(Ordering::Relaxed), 2);
+        assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.key_log.lock().unwrap().len(), usize::from(succeeds));
+    }
+}
+
+#[test]
+fn targeted_type_native_focuses_confirms_then_types_once() {
+    let secret = "private account text";
+    let mut fixture = targeted_type_glass(
+        vec![
+            targeted_type_field_tree("Account name", false),
+            targeted_type_field_tree("Account name", true),
+        ],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        false,
+    );
+    let sink = RecordingSink::default();
+    fixture.glass.set_audit_sink(Box::new(sink.clone()));
+    fixture.glass.start(&spec()).unwrap();
+    sink.0.lock().unwrap().clear();
+    sink.3.lock().unwrap().clear();
+
+    let outcome = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("Account name", ActionMode::Native, 500),
+            secret,
+        )
+        .unwrap();
+
+    assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 1);
+    assert!(fixture.clicks.lock().unwrap().is_empty());
+    assert_eq!(
+        fixture.key_log.lock().unwrap().as_slice(),
+        &[KeyEvent::Text(secret.into())]
+    );
+    assert_eq!(
+        fixture.events.lock().unwrap().as_slice(),
+        &["focus", "snapshot focused", "key"]
+    );
+    assert_eq!(
+        outcome.focus,
+        Some(MutationReport {
+            method: ActionMethod::NativeAction { actuated: None },
+            dispatch: DispatchStatus::Dispatched,
+            confirmation: ConfirmationStatus::FocusConfirmed,
+        })
+    );
+    assert_eq!(outcome.action.method, ActionMethod::Keyboard);
+    assert_eq!(outcome.action.dispatch, DispatchStatus::Dispatched);
+    assert_eq!(
+        outcome.action.confirmation,
+        ConfirmationStatus::DispatchConfirmed
+    );
+    assert_eq!(sink.0.lock().unwrap().as_slice(), &["type_target:true"]);
+    let audits = sink.3.lock().unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].text, secret);
+    assert_eq!(audits[0].focus_mode, "native");
+    assert_eq!(audits[0].focus_method.as_deref(), Some("native_action"));
+    assert_eq!(audits[0].focus_dispatch, "dispatched");
+    assert_eq!(audits[0].focus_confirmation, "focus_confirmed");
+    assert_eq!(audits[0].type_dispatch, "dispatched");
+}
+
+#[test]
+fn targeted_type_auto_falls_back_to_pointer_only_after_pre_dispatch_focus_unsupported() {
+    let mut fixture = targeted_type_glass(
+        vec![
+            targeted_type_field_tree("Account name", false),
+            targeted_type_field_tree("Account name", false),
+            targeted_type_field_tree("Account name", false),
+            targeted_type_field_tree("Account name", true),
+        ],
+        InvokeBehavior::Unsupported,
+        full_state_coverage(),
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+
+    let outcome = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("Account name", ActionMode::Auto, 500),
+            "typed once",
+        )
+        .unwrap();
+
+    assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.clicks.lock().unwrap().len(), 1);
+    assert_eq!(fixture.hit_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.key_log.lock().unwrap().len(), 1);
+    assert!(matches!(
+        outcome.focus,
+        Some(MutationReport {
+            method: ActionMethod::Pointer {
+                native_fallback: Some(_)
+            },
+            dispatch: DispatchStatus::Dispatched,
+            confirmation: ConfirmationStatus::FocusConfirmed,
+        })
+    ));
+}
+
+#[test]
+fn targeted_type_does_not_try_pointer_after_native_focus_may_have_dispatched() {
+    let mut fixture = targeted_type_glass(
+        vec![targeted_type_field_tree("Account name", false)],
+        InvokeBehavior::MayHaveDispatched,
+        full_state_coverage(),
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+
+    let error = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("Account name", ActionMode::Auto, 0),
+            "must not type",
+        )
+        .unwrap_err();
+
+    assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 1);
+    assert!(fixture.clicks.lock().unwrap().is_empty());
+    assert!(fixture.key_log.lock().unwrap().is_empty());
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(error.retry, RetryGuidance::DoNotRetry);
+    assert_eq!(
+        error.focus.as_ref().map(|focus| focus.dispatch),
+        Some(DispatchStatus::MayHaveDispatched)
+    );
+}
+
+#[test]
+fn targeted_type_never_types_when_focus_cannot_be_confirmed() {
+    let secret = "never expose this text";
+    let mut fixture = targeted_type_glass(
+        vec![
+            targeted_type_field_tree("Account name", false),
+            targeted_type_field_tree("Account name", true),
+        ],
+        InvokeBehavior::Succeed,
+        AxStateCoverage {
+            focused: false,
+            ..full_state_coverage()
+        },
+        false,
+    );
+    let sink = RecordingSink::default();
+    fixture.glass.set_audit_sink(Box::new(sink.clone()));
+    fixture.glass.start(&spec()).unwrap();
+    sink.0.lock().unwrap().clear();
+    sink.3.lock().unwrap().clear();
+
+    let error = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("Account name", ActionMode::Native, 0),
+            secret,
+        )
+        .unwrap_err();
+
+    assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 1);
+    assert!(fixture.key_log.lock().unwrap().is_empty());
+    assert_eq!(error.kind, SemanticActionFailureKind::FocusUnconfirmed);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(error.retry, RetryGuidance::Reobserve);
+    assert_eq!(
+        error.focus,
+        Some(MutationReport {
+            method: ActionMethod::NativeAction { actuated: None },
+            dispatch: DispatchStatus::Dispatched,
+            confirmation: ConfirmationStatus::Unconfirmed,
+        })
+    );
+    assert!(!error.to_string().contains(secret));
+    assert!(!format!("{:?}", error.source).contains(secret));
+    assert!(!format!("{:?}", error.candidates).contains(secret));
+    assert!(!format!("{:?}", error.actionability).contains(secret));
+    assert_eq!(sink.0.lock().unwrap().as_slice(), &["type_target:false"]);
+    let audits = sink.3.lock().unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].text, secret);
+    assert!(!audits[0].error.as_deref().unwrap().contains(secret));
+}
+
+#[test]
+fn targeted_type_never_dispatches_a_second_text_batch_after_possible_key_delivery() {
+    let mut fixture = targeted_type_glass(
+        vec![
+            targeted_type_field_tree("Account name", false),
+            targeted_type_field_tree("Account name", true),
+        ],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        true,
+    );
+    let sink = RecordingSink::default();
+    fixture.glass.set_audit_sink(Box::new(sink.clone()));
+    fixture.glass.start(&spec()).unwrap();
+    sink.0.lock().unwrap().clear();
+
+    let error = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("Account name", ActionMode::Native, 500),
+            "one batch",
+        )
+        .unwrap_err();
+
+    assert_eq!(fixture.key_log.lock().unwrap().len(), 1);
+    assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(error.retry, RetryGuidance::DoNotRetry);
+    assert_eq!(
+        error.focus.as_ref().map(|focus| focus.confirmation),
+        Some(ConfirmationStatus::FocusConfirmed)
+    );
+    assert_eq!(sink.0.lock().unwrap().as_slice(), &["type_target:false"]);
+}
+
+#[test]
+fn targeted_type_reacquires_a_renumbered_focused_field_by_identity() {
+    let initial = targeted_type_field_tree("Account name", false);
+    let initial_id = initial.root.children[0].id;
+    let focused = renumbered_targeted_type_field_tree("Account name");
+    let focused_id = focused.root.children[1].id;
+    assert_ne!(initial_id, focused_id);
+    let mut fixture = targeted_type_glass(
+        vec![initial, focused],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+
+    let outcome = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("Account name", ActionMode::Native, 500),
+            "typed after renumber",
+        )
+        .unwrap();
+
+    assert_eq!(outcome.target.id, focused_id);
+    assert_eq!(fixture.key_log.lock().unwrap().len(), 1);
+    assert!(
+        fixture
+            .glass
+            .active
+            .as_ref()
+            .and_then(|active| active.last_ax.as_ref())
+            .and_then(|tree| tree.find(focused_id))
+            .is_some_and(|node| node.states.focused)
+    );
+}
+
+#[test]
+fn targeted_type_rejects_a_button_even_when_the_backend_can_focus_it() {
+    let tree = value_control_tree(
+        "Save",
+        AxRole::Button,
+        None,
+        AxStates {
+            enabled: true,
+            visible: true,
+            focusable: true,
+            ..AxStates::default()
+        },
+    );
+    let mut fixture = targeted_type_glass(
+        vec![tree],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+
+    let error = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("Save", ActionMode::Native, 0),
+            "must not type",
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 0);
+    assert!(fixture.clicks.lock().unwrap().is_empty());
+    assert!(fixture.key_log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn targeted_type_uses_the_same_absolute_deadline_for_focus_confirmation_and_typing() {
+    let mut fixture = targeted_type_glass(
+        vec![
+            targeted_type_field_tree("Account name", false),
+            targeted_type_field_tree("Account name", true),
+        ],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+
+    let outcome = fixture
+        .glass
+        .type_target_by(
+            &targeted_type_params("Account name", ActionMode::Native, 500),
+            "one deadline",
+            Deadline::from_millis(1_000),
+        )
+        .unwrap();
+
+    let ax_deadlines = fixture.ax_deadlines.lock().unwrap();
+    assert_eq!(ax_deadlines.len(), 3);
+    assert!(
+        ax_deadlines
+            .iter()
+            .all(|deadline| *deadline == outcome.bound.deadline)
+    );
+    assert_eq!(
+        fixture.key_deadlines.lock().unwrap().as_slice(),
+        &[outcome.bound.deadline]
+    );
 }

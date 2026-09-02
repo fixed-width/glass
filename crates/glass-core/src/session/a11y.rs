@@ -520,6 +520,63 @@ impl Glass {
         Ok(actuated)
     }
 
+    /// One native-focus attempt with the same fresh geometry, target fingerprint, and deadline
+    /// ordering as [`Self::try_native_invoke`].
+    pub(super) fn try_native_focus(
+        &mut self,
+        id: AxNodeId,
+        deadline: Deadline,
+    ) -> Result<Option<AxNodeId>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility focus",
+            ));
+        }
+        {
+            let s = self.active_mut()?;
+            if s.accessibility.is_none() {
+                return Err(GlassError::AxUnsupported);
+            }
+            match s.platform.window_by(&WindowOp::Geometry, deadline) {
+                Ok(window) => s.geometry = window,
+                Err(_) if legacy_window_probe_is_best_effort(deadline) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility focus",
+            ));
+        }
+        let (target, ctx) = {
+            let s = self.require_active()?;
+            let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
+            let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
+            let target = AxTarget {
+                id,
+                role: node.role,
+                name: node.name.clone(),
+                bounds: node.bounds,
+                value: node.value.clone(),
+            };
+            let ctx = s.accessibility_context(s.geometry.clone(), deadline)?;
+            (target, ctx)
+        };
+        let s = self.active_mut()?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility focus",
+            ));
+        }
+        let focused = s
+            .accessibility
+            .as_mut()
+            .ok_or(GlassError::AxUnsupported)?
+            .focus(&ctx, &target)?;
+        s.pump();
+        Ok(focused)
+    }
+
     /// Set the value/text of element `id` (from the latest `a11y_snapshot`) via the
     /// platform a11y API. Errors `NoAxSnapshot`/`AxElementNotFound` (id not in the
     /// cached snapshot), `AxUnsupported` (no reader), or — from the backend —

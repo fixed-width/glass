@@ -39,6 +39,8 @@ pub(crate) struct FakePlatform {
     pointer_events: Vec<PointerEvent>,
     fail_pointer: bool,
     key_events: Vec<KeyEvent>,
+    fail_key: bool,
+    event_log: Option<Arc<Mutex<Vec<&'static str>>>>,
     started: bool,
     capture_log: Arc<Mutex<Vec<Option<Region>>>>,
     capture_deadline_log: Option<CaptureDeadlineLog>,
@@ -158,6 +160,14 @@ impl FakePlatform {
     }
     pub(crate) fn with_failing_pointer(mut self) -> Self {
         self.fail_pointer = true;
+        self
+    }
+    pub(crate) fn with_failing_key(mut self) -> Self {
+        self.fail_key = true;
+        self
+    }
+    pub(crate) fn with_event_log(mut self, log: Arc<Mutex<Vec<&'static str>>>) -> Self {
+        self.event_log = Some(log);
         self
     }
     pub(crate) fn with_key_deadline_log(mut self, log: InputDeadlineLog) -> Self {
@@ -444,6 +454,9 @@ impl Platform for FakePlatform {
         }
         if let PointerEvent::Click { x, y, .. } = event {
             self.click_log.lock().unwrap().push((*x, *y));
+            if let Some(log) = &self.event_log {
+                log.lock().unwrap().push("pointer");
+            }
         }
         if let PointerEvent::Scroll { .. } = event {
             self.scroll_log.lock().unwrap().push(event.clone());
@@ -485,7 +498,14 @@ impl Platform for FakePlatform {
         }
         self.key_events.push(event.clone());
         self.key_log.lock().unwrap().push(event.clone());
-        Ok(())
+        if let Some(log) = &self.event_log {
+            log.lock().unwrap().push("key");
+        }
+        if self.fail_key {
+            Err(GlassError::Backend("scripted key failure".into()))
+        } else {
+            Ok(())
+        }
     }
     fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
         if deadline.has_passed() {
@@ -1020,6 +1040,7 @@ pub(crate) struct SeqAccessibility {
     hit_points: Arc<Mutex<Vec<(i32, i32)>>>,
     set_log: Arc<Mutex<Vec<(AxNodeId, String)>>>,
     set_results: VecDeque<Result<()>>,
+    event_log: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
 #[allow(dead_code)]
@@ -1049,6 +1070,7 @@ impl SeqAccessibility {
             hit_points: Arc::new(Mutex::new(Vec::new())),
             set_log: Arc::new(Mutex::new(Vec::new())),
             set_results: VecDeque::new(),
+            event_log: None,
         }
     }
 
@@ -1126,6 +1148,11 @@ impl SeqAccessibility {
         self.signal = signal;
         self
     }
+
+    pub(crate) fn with_event_log(mut self, log: Arc<Mutex<Vec<&'static str>>>) -> Self {
+        self.event_log = Some(log);
+        self
+    }
 }
 
 impl Accessibility for SeqAccessibility {
@@ -1138,6 +1165,14 @@ impl Accessibility for SeqAccessibility {
         self.walks.fetch_add(1, Ordering::Relaxed);
         let t = self.trees[self.idx.min(self.trees.len() - 1)].clone();
         self.idx += 1;
+        fn contains_focused(node: &AxNode) -> bool {
+            node.states.focused || node.children.iter().any(contains_focused)
+        }
+        if contains_focused(&t.root)
+            && let Some(log) = &self.event_log
+        {
+            log.lock().unwrap().push("snapshot focused");
+        }
         Ok(t)
     }
     fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
@@ -1150,6 +1185,9 @@ impl Accessibility for SeqAccessibility {
     fn focus(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         self.deadlines.lock().unwrap().push(ctx.deadline);
         self.focus_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(log) = &self.event_log {
+            log.lock().unwrap().push("focus");
+        }
         scripted_focus(self.focus_behavior, target)
     }
     fn pointer_target_at(
@@ -1546,12 +1584,26 @@ pub(crate) struct RecordedSetValueAudit {
     pub(crate) error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedTypeTargetAudit {
+    pub(crate) element: crate::audit::ElementRef,
+    pub(crate) text: String,
+    pub(crate) focus_mode: String,
+    pub(crate) focus_method: Option<String>,
+    pub(crate) focus_dispatch: String,
+    pub(crate) focus_confirmation: String,
+    pub(crate) type_dispatch: String,
+    pub(crate) ok: bool,
+    pub(crate) error: Option<String>,
+}
+
 /// Records `"action:ok"` for each actuation plus structured click metadata.
 #[derive(Clone, Default)]
 pub(crate) struct RecordingSink(
     pub(crate) Arc<Mutex<Vec<String>>>,
     pub(crate) Arc<Mutex<Vec<RecordedClickAudit>>>,
     pub(crate) Arc<Mutex<Vec<RecordedSetValueAudit>>>,
+    pub(crate) Arc<Mutex<Vec<RecordedTypeTargetAudit>>>,
 );
 impl AuditSink for RecordingSink {
     fn record(&self, act: &Actuation, _ctx: &ActuationContext, o: &AuditOutcome, _d: Duration) {
@@ -1573,6 +1625,7 @@ impl AuditSink for RecordingSink {
             Actuation::Window { .. } => "window",
             Actuation::ClickElement { .. } => "click_element",
             Actuation::SetValue { .. } => "set_value",
+            Actuation::TypeTarget { .. } => "type_target",
         };
         self.0.lock().unwrap().push(format!("{action}:{}", o.ok));
         if let Actuation::ClickElement {
@@ -1608,6 +1661,28 @@ impl AuditSink for RecordingSink {
                 text: (*text).into(),
                 dispatch: (*dispatch).into(),
                 confirmation: (*confirmation).into(),
+                ok: o.ok,
+                error: o.error.clone(),
+            });
+        }
+        if let Actuation::TypeTarget {
+            element,
+            text,
+            focus_mode,
+            focus_method,
+            focus_dispatch,
+            focus_confirmation,
+            type_dispatch,
+        } = act
+        {
+            self.3.lock().unwrap().push(RecordedTypeTargetAudit {
+                element: element.clone(),
+                text: (*text).into(),
+                focus_mode: (*focus_mode).into(),
+                focus_method: focus_method.map(Into::into),
+                focus_dispatch: (*focus_dispatch).into(),
+                focus_confirmation: (*focus_confirmation).into(),
+                type_dispatch: (*type_dispatch).into(),
                 ok: o.ok,
                 error: o.error.clone(),
             });

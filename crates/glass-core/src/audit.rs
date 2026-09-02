@@ -87,6 +87,15 @@ pub enum Actuation<'a> {
         dispatch: &'a str,
         confirmation: &'a str,
     },
+    TypeTarget {
+        element: ElementRef,
+        text: &'a str,
+        focus_mode: &'a str,
+        focus_method: Option<&'a str>,
+        focus_dispatch: &'a str,
+        focus_confirmation: &'a str,
+        type_dispatch: &'a str,
+    },
 }
 
 /// Receives every actuation. Implemented in `glass-mcp` (`JsonlSink`). `Send` so it
@@ -159,5 +168,42 @@ mod tests {
         assert_eq!(actuated_id, None);
         assert_eq!(dispatch, "dispatched");
         assert_eq!(confirmation, "dispatch_confirmed");
+    }
+
+    #[test]
+    fn type_target_actuation_carries_focus_and_type_dispatch_metadata() {
+        let element = ElementRef {
+            id: 7,
+            role: Some("TextField".into()),
+            name: Some("Account name".into()),
+        };
+        let act = Actuation::TypeTarget {
+            element: element.clone(),
+            text: "submitted text",
+            focus_mode: "auto",
+            focus_method: Some("native_action"),
+            focus_dispatch: "dispatched",
+            focus_confirmation: "focus_confirmed",
+            type_dispatch: "dispatched",
+        };
+        let Actuation::TypeTarget {
+            element: got_element,
+            text,
+            focus_mode,
+            focus_method,
+            focus_dispatch,
+            focus_confirmation,
+            type_dispatch,
+        } = act
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(got_element, element);
+        assert_eq!(text, "submitted text");
+        assert_eq!(focus_mode, "auto");
+        assert_eq!(focus_method, Some("native_action"));
+        assert_eq!(focus_dispatch, "dispatched");
+        assert_eq!(focus_confirmation, "focus_confirmed");
+        assert_eq!(type_dispatch, "dispatched");
     }
 }
