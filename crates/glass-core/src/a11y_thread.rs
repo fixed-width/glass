@@ -177,6 +177,7 @@ enum Op {
     Snapshot,
     SetValue,
     Invoke,
+    Focus,
 }
 
 impl Op {
@@ -185,6 +186,7 @@ impl Op {
             Op::Snapshot => "snapshot",
             Op::SetValue => "set_value",
             Op::Invoke => "invoke",
+            Op::Focus => "focus",
         }
     }
 
@@ -194,7 +196,7 @@ impl Op {
         match self {
             Op::Snapshot => "",
             Op::SetValue => "; the write may still land — re-snapshot before retrying",
-            Op::Invoke => "; the action may still land — re-snapshot before retrying",
+            Op::Invoke | Op::Focus => "; the action may still land — re-snapshot before retrying",
         }
     }
 }
@@ -287,57 +289,87 @@ impl A11yThread {
         deadline: Deadline,
         job: impl FnOnce(&A11yMutationDispatch) -> Result<()> + Send + 'static,
     ) -> Result<()> {
+        self.mutation(Op::Invoke, "invoke", deadline, job)
+    }
+
+    pub fn focus(
+        &self,
+        deadline: Deadline,
+        job: impl FnOnce(&A11yMutationDispatch) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        self.mutation(Op::Focus, "focus", deadline, job)
+    }
+
+    fn mutation(
+        &self,
+        op: Op,
+        operation: &'static str,
+        deadline: Deadline,
+        job: impl FnOnce(&A11yMutationDispatch) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
         if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started(
-                "native accessibility invoke",
-            ));
+            return Err(GlassError::deadline_not_started(&format!(
+                "native accessibility {operation}"
+            )));
         }
         let (ends, ended_by) = self.bounded_wait(deadline);
-        let dispatch = A11yMutationDispatch::new("invoke", ends);
+        let dispatch = A11yMutationDispatch::new(operation, ends);
         let worker_dispatch = dispatch.duplicate();
         let timeout_dispatch = dispatch.duplicate();
         let panic_dispatch = dispatch.duplicate();
         let result = self.detached(
-            Op::Invoke,
+            op,
             ends,
             move || run_mutation_job(worker_dispatch, job),
-            || self.invoke_no_answer(ended_by, &timeout_dispatch),
-            || self.invoke_panicked(&panic_dispatch),
+            || self.mutation_no_answer(op, operation, ended_by, &timeout_dispatch),
+            || self.mutation_panicked(op, operation, &panic_dispatch),
         );
         dispatch.cancel_or_dispatched();
         result
     }
 
-    fn invoke_no_answer(&self, ended_by: Whose, dispatch: &A11yMutationDispatch) -> GlassError {
+    fn mutation_no_answer(
+        &self,
+        op: Op,
+        operation: &'static str,
+        ended_by: Whose,
+        dispatch: &A11yMutationDispatch,
+    ) -> GlassError {
         match (ended_by, dispatch.cancel_or_dispatched()) {
             (Whose::Caller, true) => GlassError::caller_deadline_elapsed_with_guidance(
-                "native accessibility invoke",
+                &format!("native accessibility {operation}"),
                 "the action may still land; re-snapshot before retrying",
             ),
             (Whose::Caller, false) => GlassError::Bounded {
                 kind: BoundKind::TimedOut,
                 whose: Whose::Caller,
                 dispatch: BoundDispatch::NotDispatched,
-                message: "native accessibility invoke: the caller deadline elapsed during target resolution; the action was not dispatched"
-                    .into(),
+                message: format!(
+                    "native accessibility {operation}: the caller deadline elapsed during target resolution; the action was not dispatched"
+                ),
             },
-            (Whose::Callee, true) => self.timed_out(Op::Invoke).after_dispatch(),
+            (Whose::Callee, true) => self.timed_out(op).after_dispatch(),
             (Whose::Callee, false) => GlassError::AccessibilityUnavailable(format!(
-                "accessibility invoke timed out ({} not responding) before the native action was dispatched",
+                "accessibility {operation} timed out ({} not responding) before the native action was dispatched",
                 self.backend
             ))
             .before_dispatch(),
         }
     }
 
-    fn invoke_panicked(&self, dispatch: &A11yMutationDispatch) -> GlassError {
-        let error = self.worker_panicked(Op::Invoke);
+    fn mutation_panicked(
+        &self,
+        op: Op,
+        operation: &'static str,
+        dispatch: &A11yMutationDispatch,
+    ) -> GlassError {
+        let error = self.worker_panicked(op);
         if dispatch.was_dispatched() {
             error.after_dispatch()
         } else {
             GlassError::AccessibilityUnavailable(format!(
-                "the {} accessibility worker panicked during invoke before the native action was dispatched — the panic is on glass's stderr",
-                self.backend
+                "the {} accessibility worker panicked during {operation} before the native action was dispatched — the panic is on glass's stderr",
+                self.backend,
             ))
             .before_dispatch()
         }
@@ -1159,6 +1191,70 @@ mod tests {
             error.to_string().contains("action may still land"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn focus_timeout_before_dispatch_is_retry_safe() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let worker_ran = Arc::clone(&ran);
+        let thread = A11yThread::new("focus test", Duration::from_millis(100));
+        let error = thread
+            .focus(Deadline::from_millis(5), move |dispatch| {
+                std::thread::sleep(Duration::from_millis(20));
+                dispatch.dispatch(|| {
+                    worker_ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+            .unwrap_err();
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn focus_timeout_after_dispatch_is_may_have_dispatched() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let worker_ran = Arc::clone(&ran);
+        let thread = A11yThread::new("focus test", Duration::from_millis(100));
+        let error = thread
+            .focus(Deadline::from_millis(5), move |dispatch| {
+                dispatch.dispatch(|| {
+                    worker_ran.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    Ok(())
+                })
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sequential_focus_dispatch_attempts_execute_only_one_mutation() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let worker_ran = Arc::clone(&ran);
+        let thread = A11yThread::new("focus test", Duration::from_secs(1));
+        thread
+            .focus(Deadline::UNBOUNDED, move |dispatch| {
+                dispatch.dispatch(|| {
+                    worker_ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })?;
+                assert!(
+                    dispatch
+                        .dispatch(|| {
+                            worker_ran.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                        .is_err()
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     #[test]
