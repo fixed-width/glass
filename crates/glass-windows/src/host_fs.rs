@@ -31,8 +31,9 @@ use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
-    GetFileInformationByHandle, SYNCHRONIZE, SetFileInformationByHandle,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileDispositionInfo,
+    FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, SYNCHRONIZE,
+    SetFileInformationByHandle,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::core::{PCWSTR, PWSTR};
@@ -232,7 +233,7 @@ pub fn open_directory_entry(
 pub fn remove_by_handle(file: &File) -> Result<(), HostFsError> {
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: The borrowed file and initialized disposition remain valid through this size-matched call.
-    unsafe {
+    let result = unsafe {
         SetFileInformationByHandle(
             HANDLE(file.as_raw_handle()),
             FileDispositionInfo,
@@ -240,8 +241,27 @@ pub fn remove_by_handle(file: &File) -> Result<(), HostFsError> {
             u32::try_from(std::mem::size_of_val(&disposition))
                 .map_err(|_| HostFsError::Integrity)?,
         )
-        .map_err(|_| HostFsError::Open)
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(_) if delete_pending(file)? => Ok(()),
+        Err(_) => Err(HostFsError::Open),
     }
+}
+
+fn delete_pending(file: &File) -> Result<bool, HostFsError> {
+    let mut info = FILE_STANDARD_INFO::default();
+    // SAFETY: `info` is a correctly sized writable buffer for this synchronous query.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileStandardInfo,
+            (&raw mut info).cast(),
+            u32::try_from(std::mem::size_of_val(&info)).map_err(|_| HostFsError::Integrity)?,
+        )
+        .map_err(|_| HostFsError::Open)?;
+    }
+    Ok(info.DeletePending)
 }
 
 #[cfg(test)]
@@ -1363,6 +1383,17 @@ mod tests {
         remove_retained(directory).unwrap();
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_by_handle_accepts_an_already_delete_pending_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("retained-directory");
+        std::fs::create_dir(&path).unwrap();
+        let directory = open_deletable_directory_no_reparse(&path).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+
+        remove_by_handle(&directory).unwrap();
     }
 
     fn directory_record(name: &[u16], next: u32, record_len: usize) -> Vec<u8> {
