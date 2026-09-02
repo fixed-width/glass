@@ -563,6 +563,7 @@ fn semantic_action_error_display_never_exposes_retained_payloads() {
         }),
         action_dispatch: DispatchStatus::MayHaveDispatched,
         candidates: Vec::new(),
+        target: None,
         bound: ActionDeadline {
             deadline: Deadline::UNBOUNDED,
             owner: None,
@@ -1419,7 +1420,7 @@ fn zero_timeout_pointer_action_returns_unstable_without_dispatch() {
     let clicks = Arc::new(Mutex::new(Vec::new()));
     let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
     let (mut glass, walks, hit_calls, _) =
-        pointer_glass(platform, vec![tree], PointerHit::Target, false);
+        pointer_glass(platform, vec![tree.clone()], PointerHit::Target, false);
     glass.start(&spec()).unwrap();
 
     let error = glass
@@ -1431,6 +1432,13 @@ fn zero_timeout_pointer_action_returns_unstable_without_dispatch() {
 
     assert_eq!(error.kind, SemanticActionFailureKind::UnstableTarget);
     assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    let target = error
+        .target
+        .as_ref()
+        .expect("unstable known target retained");
+    assert_eq!(target.id, AxNodeId(1));
+    assert_eq!(target.name.as_deref(), Some("Save"));
+    assert_eq!(target.bounds, tree.root.children[0].bounds);
     assert_eq!(walks.load(Ordering::Relaxed), 1);
     assert_eq!(hit_calls.load(Ordering::Relaxed), 0);
     assert!(clicks.lock().unwrap().is_empty());
@@ -2917,6 +2925,13 @@ fn targeted_type_never_types_when_focus_cannot_be_confirmed() {
             confirmation: ConfirmationStatus::Unconfirmed,
         })
     );
+    let target = error
+        .target
+        .as_ref()
+        .expect("focus-unconfirmed target retained");
+    assert_eq!(target.id, AxNodeId(1));
+    assert_eq!(target.name.as_deref(), Some("Account name"));
+    assert_eq!(target.role, AxRole::TextField);
     assert!(!error.to_string().contains(secret));
     assert!(!format!("{:?}", error.source).contains(secret));
     assert!(!format!("{:?}", error.candidates).contains(secret));

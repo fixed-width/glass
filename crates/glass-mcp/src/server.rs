@@ -1980,6 +1980,67 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn targeted_type_snapshot_resource_never_persists_submitted_or_coincident_text() {
+        const SENTINEL: &str = "SERVER_TARGETED_TYPE_SNAPSHOT_SENTINEL_76b1";
+        let output = crate::tools::semantic_action::tests::targeted_type_snapshot_output_for_server(
+            SENTINEL,
+        );
+        assert!(output.text_bytes() > crate::output_policy::MAX_TEXT_BYTES);
+        let root = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::for_test(root.path(), 1 << 20).unwrap();
+        let server = GlassServer::new_with_store(
+            crate::boot(None),
+            crate::audit::report_from_config(None, |_| None),
+            store,
+        )
+        .unwrap();
+        let result = server
+            .run_test_outcome(ToolCallOutcome {
+                tool: "glass_type",
+                effect: ToolEffect::MayMutate,
+                is_error: false,
+                target_access: TargetAccess::NoActiveTarget,
+                output,
+            })
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert!(
+            result
+                .content
+                .iter()
+                .filter_map(|content| content.as_text())
+                .map(|text| text.text.len())
+                .sum::<usize>()
+                <= crate::output_policy::MAX_TEXT_BYTES
+        );
+        assert!(
+            result
+                .content
+                .iter()
+                .filter_map(|content| content.as_text())
+                .all(|text| !text.text.contains(SENTINEL))
+        );
+        let links = result
+            .content
+            .iter()
+            .filter_map(|content| content.as_resource_link())
+            .collect::<Vec<_>>();
+        assert!(
+            !links.is_empty(),
+            "oversized targeted type snapshot externalized"
+        );
+        for link in links {
+            let resource = server.read_resource_for_test(&link.uri).unwrap();
+            assert_eq!(resource.contents.len(), 1);
+            let ResourceContents::TextResourceContents { text, .. } = &resource.contents[0] else {
+                panic!("expected text resource")
+            };
+            assert!(!text.contains(SENTINEL));
+        }
+    }
+
     #[test]
     fn semantic_transport_keeps_the_tool_registry_count_unchanged() {
         assert_eq!(registered_tools().len(), 31);

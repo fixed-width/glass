@@ -18,10 +18,10 @@ use super::{
     ValidatedType, candidates_json, element_json, semantic_error, success_output, validate_action,
     validate_click_element_args, validate_set_value_args, validate_type_args,
 };
-use crate::params::{Action, ClickElementArgs, SetValueArgs, TypeArgs};
+use crate::params::{Action, ClickElementArgs, DoArgs, SetValueArgs, TypeArgs};
 use crate::tools::{
-    ContextualError, SafeErrorCategory, ToolContext, click_element_with, erase_semantic_context,
-    set_value_with, type_text_with,
+    ContextualError, SafeErrorCategory, ToolContext, click_element_with, do_actions,
+    erase_semantic_context, set_value, set_value_with, type_text, type_text_with,
 };
 
 #[derive(Clone, Copy)]
@@ -84,6 +84,7 @@ impl SessionIoCounters {
 struct InstrumentedPlatform {
     counters: Arc<SessionIoCounters>,
     geometry: WindowGeometry,
+    key_error: Option<String>,
 }
 
 impl Platform for InstrumentedPlatform {
@@ -137,7 +138,10 @@ impl Platform for InstrumentedPlatform {
 
     fn send_key_by(&mut self, _event: &KeyEvent, _deadline: Deadline) -> glass_core::Result<()> {
         self.counters.record(SessionIoKind::Input, "key");
-        Ok(())
+        match &self.key_error {
+            Some(message) => Err(GlassError::Backend(message.clone())),
+            None => Ok(()),
+        }
     }
 
     fn get_clipboard(&mut self) -> glass_core::Result<String> {
@@ -222,6 +226,7 @@ struct InstrumentedAccessibility {
     tree: glass_core::AxTree,
     coverage: AxStateCoverage,
     invoke_result: Option<AxNodeId>,
+    set_error: Option<String>,
 }
 
 impl Accessibility for InstrumentedAccessibility {
@@ -271,7 +276,10 @@ impl Accessibility for InstrumentedAccessibility {
     ) -> glass_core::Result<()> {
         self.counters
             .record(SessionIoKind::Action, "a11y_set_value");
-        Ok(())
+        match &self.set_error {
+            Some(message) => Err(GlassError::Backend(message.clone())),
+            None => Ok(()),
+        }
     }
 
     fn invoke(
@@ -297,6 +305,16 @@ fn started_instrumented_glass_with(
     coverage: AxStateCoverage,
     invoke_result: Option<AxNodeId>,
 ) -> (Glass, Arc<SessionIoCounters>, Arc<AtomicUsize>) {
+    started_instrumented_glass_with_errors(tree, coverage, invoke_result, None, None)
+}
+
+fn started_instrumented_glass_with_errors(
+    tree: glass_core::AxTree,
+    coverage: AxStateCoverage,
+    invoke_result: Option<AxNodeId>,
+    key_error: Option<String>,
+    set_error: Option<String>,
+) -> (Glass, Arc<SessionIoCounters>, Arc<AtomicUsize>) {
     let counters = Arc::new(SessionIoCounters::default());
     let geometry = WindowGeometry {
         x: 0,
@@ -308,12 +326,14 @@ fn started_instrumented_glass_with(
         platform: Box::new(InstrumentedPlatform {
             counters: counters.clone(),
             geometry,
+            key_error,
         }),
         accessibility: Some(Box::new(InstrumentedAccessibility {
             counters: counters.clone(),
             tree,
             coverage,
             invoke_result,
+            set_error,
         })),
     });
     let factory_calls = Arc::new(AtomicUsize::new(0));
@@ -782,6 +802,7 @@ fn semantic_failure(
         focus: None,
         action_dispatch: DispatchStatus::NotDispatched,
         candidates,
+        target: None,
         bound: action_bound(owner),
         retry: RetryGuidance::WaitOrRefine,
         source: Some(GlassError::Backend(
@@ -1054,21 +1075,165 @@ fn structured_ambiguity_error_keeps_candidates_only_in_untrusted_sibling() {
 
 #[test]
 fn structured_actionability_failure_uses_one_untrusted_known_target_block() {
-    let error = semantic_error(
-        "glass_set_value",
-        semantic_failure(
-            SemanticActionFailureKind::NotActionable,
-            None,
-            None,
-            vec![semantic_match("Disabled account", "inside settings")],
-        ),
-    );
+    let mut failure =
+        semantic_failure(SemanticActionFailureKind::NotActionable, None, None, vec![]);
+    failure.target = Some(Box::new(element_with_text(
+        "Disabled account",
+        "old",
+        false,
+    )));
+    let error = semantic_error("glass_set_value", failure);
     let output = erase_semantic_context("glass_set_value", Err(error)).unwrap_err();
     assert_eq!(output.0.len(), 2);
     let sibling = output.text_block(1).expect("known target sibling");
     let body: serde_json::Value = serde_json::from_str(untrusted_body(&sibling.body)).unwrap();
     assert!(body.get("target").is_some(), "{body}");
     assert!(body.get("candidates").is_none(), "{body}");
+}
+
+fn semantic_control_tree(
+    role: AxRole,
+    name: &str,
+    value: Option<&str>,
+    focused: bool,
+) -> glass_core::AxTree {
+    glass_core::AxTree::new(AxNode {
+        id: AxNodeId(0),
+        role: AxRole::Window,
+        raw_role: "window".into(),
+        name: Some("App".into()),
+        description: None,
+        value: None,
+        states: AxStates::default(),
+        bounds: Some(AxRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }),
+        children: vec![AxNode {
+            id: AxNodeId(0),
+            role,
+            raw_role: format!("{role:?}"),
+            name: Some(name.into()),
+            description: None,
+            value: value.map(str::to_owned),
+            states: AxStates {
+                enabled: true,
+                visible: true,
+                focusable: matches!(role, AxRole::TextField | AxRole::ComboBox),
+                editable: role == AxRole::TextField,
+                focused,
+                ..AxStates::default()
+            },
+            bounds: Some(AxRect {
+                x: 10,
+                y: 10,
+                width: 40,
+                height: 20,
+            }),
+            children: vec![],
+        }],
+    })
+}
+
+fn semantic_control_coverage() -> AxStateCoverage {
+    AxStateCoverage {
+        enabled: true,
+        visible: true,
+        focused: false,
+        focusable: true,
+        editable: true,
+        ..AxStateCoverage::NONE
+    }
+}
+
+#[test]
+fn unstable_handler_error_retains_the_real_target_in_one_untrusted_sibling() {
+    let tree = semantic_control_tree(AxRole::Button, "Save", None, false);
+    let (mut glass, _, _) =
+        started_instrumented_glass_with(tree, semantic_control_coverage(), None);
+    let args: ClickElementArgs = serde_json::from_str(
+        r#"{"target":{"query":"Save","role":"Button"},"mode":"pointer","timeout_ms":0}"#,
+    )
+    .unwrap();
+
+    let error = click_element_with(&mut glass, &args, ToolContext::UNBOUNDED).unwrap_err();
+
+    assert_eq!(error.code, "unstable_target");
+    assert_eq!(error.bound_dispatch, Some(BoundDispatch::NotDispatched));
+    assert_eq!(error.siblings.len(), 1);
+    let target: serde_json::Value =
+        serde_json::from_str(untrusted_body(&error.siblings[0].render_text().unwrap())).unwrap();
+    assert_eq!(target["target"]["id"], 1);
+    assert_eq!(target["target"]["name"], "Save");
+}
+
+#[test]
+fn focus_unconfirmed_combines_focus_and_type_dispatch_evidence_truthfully() {
+    let args: TypeArgs = serde_json::from_str(
+        r#"{"target":{"query":"Account","role":"TextField"},"focus_mode":"native","text":"secret","timeout_ms":0}"#,
+    )
+    .unwrap();
+    let make = || {
+        started_instrumented_glass_with(
+            semantic_control_tree(AxRole::TextField, "Account", Some("old"), false),
+            semantic_control_coverage(),
+            None,
+        )
+        .0
+    };
+    let mut contextual_glass = make();
+    let error = type_text_with(&mut contextual_glass, &args, ToolContext::UNBOUNDED).unwrap_err();
+    assert_eq!(error.code, "focus_unconfirmed");
+    assert_eq!(error.bound_dispatch, Some(BoundDispatch::MayHaveDispatched));
+    let result = error.result.as_ref().unwrap();
+    assert_eq!(result["dispatch"], "not_dispatched");
+    assert_eq!(result["side_effects_may_have_occurred"], true);
+    assert_eq!(result["focus"]["dispatch"], "dispatched");
+    assert_eq!(error.siblings.len(), 1);
+    let target: serde_json::Value =
+        serde_json::from_str(untrusted_body(&error.siblings[0].render_text().unwrap())).unwrap();
+    assert_eq!(target["target"]["id"], 1);
+    assert_eq!(target["target"]["name"], serde_json::Value::Null);
+
+    let mut standalone_glass = make();
+    let output = type_text(&mut standalone_glass, &args).unwrap_err();
+    let envelope = error_envelope(&output);
+    assert_eq!(envelope["result"]["dispatch"], "not_dispatched");
+    assert_eq!(envelope["result"]["side_effects_may_have_occurred"], true);
+    assert_eq!(envelope["content_blocks"], serde_json::json!([1]));
+}
+
+#[test]
+fn noop_set_value_return_failure_preserves_not_dispatched_provenance() {
+    let args: SetValueArgs = serde_json::from_str(
+        r#"{"target":{"query":"already","role":"ComboBox"},"text":"already","timeout_ms":0,"return":"settle"}"#,
+    )
+    .unwrap();
+    let make = || {
+        started_instrumented_glass_with(
+            semantic_control_tree(AxRole::ComboBox, "already", Some("already"), false),
+            semantic_control_coverage(),
+            None,
+        )
+        .0
+    };
+    let mut contextual_glass = make();
+    let error = set_value_with(&mut contextual_glass, &args, ToolContext::UNBOUNDED).unwrap_err();
+    assert_eq!(error.code, "action_deadline_exceeded");
+    assert_eq!(error.bound_dispatch, Some(BoundDispatch::NotDispatched));
+    assert!(!error.message.contains("value was written"));
+    let result = error.result.as_ref().unwrap();
+    assert_eq!(result["dispatch"], "not_dispatched");
+    assert_eq!(result["side_effects_may_have_occurred"], false);
+    assert_eq!(result["retry"], "do_not_retry");
+
+    let mut standalone_glass = make();
+    let output = set_value(&mut standalone_glass, &args).unwrap_err();
+    let envelope = error_envelope(&output);
+    assert_eq!(envelope["result"]["dispatch"], "not_dispatched");
+    assert_eq!(envelope["result"]["side_effects_may_have_occurred"], false);
 }
 
 #[test]
@@ -1153,22 +1318,208 @@ fn structured_type_failure_excludes_submitted_payload_from_blocks_and_artifacts(
             .all(|block| !block.contains(SENTINEL))
     );
 
+    assert_forced_artifacts_exclude_payload(output, "glass_type", SENTINEL);
+}
+
+pub(crate) fn targeted_type_snapshot_output_for_server(sentinel: &str) -> crate::tools::ToolOutput {
+    let mut tree = semantic_control_tree(AxRole::TextField, "Account", Some(sentinel), true);
+    tree.root.children.extend((0..600).map(|index| AxNode {
+        id: AxNodeId(0),
+        role: AxRole::Label,
+        raw_role: "label".into(),
+        name: Some(format!("{sentinel}-{index}")),
+        description: Some(sentinel.into()),
+        value: Some(sentinel.into()),
+        states: AxStates {
+            visible: true,
+            ..AxStates::default()
+        },
+        bounds: None,
+        children: vec![],
+    }));
+    tree.subject = Some(glass_core::Subject {
+        asked: sentinel.into(),
+        actual: sentinel.into(),
+    });
+    tree.assign_ids();
+    let coverage = AxStateCoverage {
+        focused: true,
+        ..semantic_control_coverage()
+    };
+    let (mut glass, _, _) = started_instrumented_glass_with(tree, coverage, None);
+    let args: TypeArgs = serde_json::from_value(serde_json::json!({
+        "target": {"query": "Account", "role": "TextField"},
+        "focus_mode": "native",
+        "text": sentinel,
+        "timeout_ms": 1_000,
+        "max_nodes": 0,
+        "return": "snapshot",
+    }))
+    .unwrap();
+    type_text(&mut glass, &args).unwrap()
+}
+
+#[test]
+fn targeted_type_snapshot_clears_submitted_and_coincident_text_before_output_policy() {
+    const SENTINEL: &str = "TARGETED_TYPE_SNAPSHOT_SENTINEL_ef317";
+    let output = targeted_type_snapshot_output_for_server(SENTINEL);
+    assert!(output.text_bytes() > crate::output_policy::MAX_TEXT_BYTES);
+    assert!(
+        output
+            .render_text_blocks()
+            .iter()
+            .all(|block| !block.contains(SENTINEL))
+    );
+}
+
+fn assert_forced_artifacts_exclude_payload(
+    mut output: crate::tools::ToolOutput,
+    tool: &'static str,
+    sentinel: &str,
+) {
+    output.0.push(crate::tools::OutContent::trusted_guidance(
+        "safe-padding".repeat(900),
+    ));
     let root = tempfile::tempdir().unwrap();
     let store = crate::artifacts::ArtifactStore::for_test(root.path(), 1 << 20).unwrap();
-    let policy = crate::output_policy::OutputPolicy::new(store.clone());
-    let applied = policy.apply(crate::output_policy::ToolCallOutcome {
-        tool: "glass_type",
-        effect: crate::output::ToolEffect::MayMutate,
-        is_error: true,
-        target_access: crate::output::TargetAccess::NoActiveTarget,
-        output,
-    });
-    for content in &applied.output.0 {
-        if let crate::tools::OutContent::ResourceLink(descriptor) = content {
-            let artifact = store.read(descriptor.uri()).unwrap();
-            assert!(!artifact.text.contains(SENTINEL));
-        }
+    let applied = crate::output_policy::OutputPolicy::new(store.clone()).apply(
+        crate::output_policy::ToolCallOutcome {
+            tool,
+            effect: crate::output::ToolEffect::MayMutate,
+            is_error: true,
+            target_access: crate::output::TargetAccess::NoActiveTarget,
+            output,
+        },
+    );
+    let resources = applied
+        .output
+        .0
+        .iter()
+        .filter_map(|content| match content {
+            crate::tools::OutContent::ResourceLink(descriptor) => Some(descriptor),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!resources.is_empty(), "forced output must externalize");
+    for descriptor in resources {
+        let artifact = store.read(descriptor.uri()).unwrap();
+        assert!(!artifact.text.contains(sentinel));
     }
+}
+
+#[test]
+fn untargeted_type_scrubs_payload_from_context_batch_standalone_and_artifacts() {
+    const SENTINEL: &str = "UNTARGETED_TYPE_CONTEXT_SENTINEL_91f2";
+    let args = TypeArgs {
+        target: None,
+        focus_mode: None,
+        timeout_ms: None,
+        max_nodes: None,
+        text: SENTINEL.into(),
+        return_: None,
+    };
+    let make = || {
+        started_instrumented_glass_with_errors(
+            crate::tools::testutil::empty_tree(),
+            AxStateCoverage::NONE,
+            None,
+            Some(format!("backend echoed {SENTINEL}")),
+            None,
+        )
+        .0
+    };
+
+    let mut contextual_glass = make();
+    let contextual =
+        type_text_with(&mut contextual_glass, &args, ToolContext::UNBOUNDED).unwrap_err();
+    assert!(!contextual.message.contains(SENTINEL));
+
+    let mut standalone_glass = make();
+    let standalone = type_text(&mut standalone_glass, &args).unwrap_err();
+    assert!(
+        standalone
+            .render_text_blocks()
+            .iter()
+            .all(|b| !b.contains(SENTINEL))
+    );
+    assert_forced_artifacts_exclude_payload(standalone, "glass_type", SENTINEL);
+
+    let mut batch_glass = make();
+    let batch = do_actions(
+        &mut batch_glass,
+        &DoArgs {
+            actions: vec![Action::Type(args)],
+            then: None,
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        batch
+            .render_text_blocks()
+            .iter()
+            .all(|b| !b.contains(SENTINEL))
+    );
+}
+
+#[test]
+fn legacy_set_value_scrubs_payload_from_context_batch_standalone_and_artifacts() {
+    const SENTINEL: &str = "LEGACY_SET_CONTEXT_SENTINEL_6aa4";
+    let args = SetValueArgs {
+        id: Some(1),
+        target: None,
+        timeout_ms: None,
+        max_nodes: None,
+        text: SENTINEL.into(),
+        return_: None,
+    };
+    let make = || {
+        let mut glass = started_instrumented_glass_with_errors(
+            semantic_control_tree(AxRole::TextField, "Account", Some("old"), false),
+            semantic_control_coverage(),
+            None,
+            None,
+            Some(format!("backend echoed {SENTINEL}")),
+        )
+        .0;
+        glass.a11y_snapshot(None).unwrap();
+        glass
+    };
+
+    let mut contextual_glass = make();
+    let contextual =
+        set_value_with(&mut contextual_glass, &args, ToolContext::UNBOUNDED).unwrap_err();
+    assert_eq!(contextual.code, "transport_failure");
+    assert!(!contextual.message.contains(SENTINEL));
+
+    let mut standalone_glass = make();
+    let standalone = set_value(&mut standalone_glass, &args).unwrap_err();
+    assert!(
+        standalone
+            .render_text_blocks()
+            .iter()
+            .all(|b| !b.contains(SENTINEL))
+    );
+    assert_forced_artifacts_exclude_payload(standalone, "glass_set_value", SENTINEL);
+
+    let mut batch_glass = make();
+    let batch = do_actions(
+        &mut batch_glass,
+        &DoArgs {
+            actions: vec![Action::SetValue(args)],
+            then: None,
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        batch
+            .render_text_blocks()
+            .iter()
+            .all(|b| !b.contains(SENTINEL))
+    );
 }
 
 fn semantic_success_with_total_text_bytes(total: usize) -> crate::tools::ToolOutput {

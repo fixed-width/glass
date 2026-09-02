@@ -220,15 +220,14 @@ pub(crate) fn type_text_with(
         crate::tools::semantic_action::ValidatedType::Untargeted => {
             glass
                 .key_by(&KeyEvent::Text(a.text.clone()), context.deadline)
-                .map_err(|e| ContextualError::from_caller_bound(e, context))?;
+                .map_err(|e| ContextualError::from_caller_bound(e, context).scrub_message())?;
             let (observed, extra, timed_out_by) =
-                crate::tools::resolve_return_with(glass, a.return_.as_deref(), context).map_err(
-                    |error| {
+                crate::tools::resolve_return_with(glass, a.return_.as_deref(), context, true)
+                    .map_err(|error| {
                         error
                             .after_dispatch()
                             .annotate("text was typed; return observe failed")
-                    },
-                )?;
+                    })?;
             let mut result = serde_json::json!({});
             if let Some(observed) = observed {
                 result["observed"] = observed;
@@ -249,16 +248,20 @@ pub(crate) fn type_text_with(
                 owner: outcome.bound.owner,
                 allow_wait: outcome.bound.allow_wait,
             };
-            let (observed, extra, timed_out_by) =
-                crate::tools::resolve_return_with(glass, a.return_.as_deref(), action_context)
-                    .map_err(|error| {
-                        semantic_return_error(
-                            "glass_type",
-                            &outcome,
-                            error,
-                            "text was typed; return observe failed",
-                        )
-                    })?;
+            let (observed, extra, timed_out_by) = crate::tools::resolve_return_with(
+                glass,
+                a.return_.as_deref(),
+                action_context,
+                false,
+            )
+            .map_err(|error| {
+                semantic_return_error(
+                    "glass_type",
+                    &outcome,
+                    error,
+                    "text was typed; return observe failed",
+                )
+            })?;
             Ok(ContextualOutput::with_timeout(
                 crate::tools::semantic_action::success_output(
                     "glass_type",

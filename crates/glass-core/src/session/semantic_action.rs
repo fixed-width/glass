@@ -221,6 +221,8 @@ pub struct SemanticActionError {
     pub focus: Option<MutationReport>,
     pub action_dispatch: DispatchStatus,
     pub candidates: Vec<SemanticMatch>,
+    /// The resolved element for failures that occur after unique target resolution.
+    pub target: Option<Box<ElementInfo>>,
     pub bound: ActionDeadline,
     pub retry: RetryGuidance,
     pub source: Option<GlassError>,
@@ -235,6 +237,11 @@ impl std::fmt::Display for SemanticActionError {
 impl std::error::Error for SemanticActionError {}
 
 impl SemanticActionError {
+    fn with_target(mut self, target: ElementInfo) -> Self {
+        self.target = Some(Box::new(target));
+        self
+    }
+
     fn proves_pre_dispatch_native_unavailable(&self) -> bool {
         self.action_dispatch == DispatchStatus::NotDispatched
             && self
@@ -383,6 +390,7 @@ fn empty_error(
         focus: None,
         action_dispatch: DispatchStatus::NotDispatched,
         candidates: Vec::new(),
+        target: None,
         bound,
         retry,
         source,
@@ -521,6 +529,7 @@ fn classified_resolution_error(
         focus: None,
         action_dispatch: DispatchStatus::NotDispatched,
         candidates: observation.result.matches,
+        target: None,
         bound,
         retry,
         source: None,
@@ -758,6 +767,7 @@ fn focus_dispatch(source: &GlassError, dispatch_started: bool) -> DispatchStatus
 
 fn focus_source_error(
     source: GlassError,
+    target: ElementInfo,
     resolution: Option<ResolutionReport>,
     actionability: ActionabilityReport,
     method: ActionMethod,
@@ -767,6 +777,7 @@ fn focus_source_error(
     let dispatch = focus_dispatch(&source, dispatch_started);
     let mut error = source_error(source, bound);
     error.summary = "semantic target focus failed";
+    error.target = Some(Box::new(target));
     error.resolution = resolution;
     error.actionability = actionability;
     error.focus = Some(MutationReport {
@@ -783,6 +794,7 @@ fn focus_source_error(
 
 fn focus_unconfirmed_error(
     source: Option<GlassError>,
+    target: ElementInfo,
     resolution: ResolutionReport,
     mut actionability: ActionabilityReport,
     coverage: AxStateCoverage,
@@ -799,7 +811,8 @@ fn focus_unconfirmed_error(
         RetryGuidance::Reobserve,
         source,
         DispatchStatus::NotDispatched,
-    );
+    )
+    .with_target(target);
     error.focus = Some(MutationReport {
         method,
         dispatch: DispatchStatus::Dispatched,
@@ -813,6 +826,7 @@ fn key_source_error(source: GlassError, focused: ConfirmedFocus) -> SemanticActi
         source.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched);
     let mut error = source_error(source, focused.bound);
     error.summary = "semantic targeted typing failed";
+    error.target = Some(Box::new(focused.element.clone()));
     error.resolution = Some(focused.resolution);
     error.actionability = focused.actionability;
     error.focus = Some(focused.focus);
@@ -848,6 +862,7 @@ fn actionability_error(
         focus: None,
         action_dispatch: dispatch,
         candidates: Vec::new(),
+        target: None,
         bound,
         retry,
         source,
@@ -856,6 +871,7 @@ fn actionability_error(
 
 fn action_source_error(
     source: GlassError,
+    target: Option<ElementInfo>,
     resolution: Option<ResolutionReport>,
     actionability: ActionabilityReport,
     bound: ActionDeadline,
@@ -874,6 +890,7 @@ fn action_source_error(
         );
     let mut error = source_error(source, bound);
     error.summary = "semantic action failed";
+    error.target = target.map(Box::new);
     error.resolution = resolution;
     error.actionability = actionability;
     error.action_dispatch = if proves_not_dispatched {
@@ -901,6 +918,7 @@ fn action_source_error(
 
 fn set_value_source_error(
     source: GlassError,
+    target: Option<ElementInfo>,
     resolution: Option<ResolutionReport>,
     actionability: ActionabilityReport,
     bound: ActionDeadline,
@@ -943,6 +961,7 @@ fn set_value_source_error(
     };
     let mut error = source_error(source, bound);
     error.summary = "semantic set-value action failed";
+    error.target = target.map(Box::new);
     error.resolution = resolution;
     error.actionability = actionability;
     error.action_dispatch = if possible_dispatch || !proven_pre_dispatch {
@@ -1229,7 +1248,8 @@ impl Glass {
             poll.timed_out_by,
         );
         if !poll.satisfied {
-            if poll.observation.candidate.is_some() {
+            if let Some(candidate) = &poll.observation.candidate {
+                let target = candidate.element.clone();
                 return Err(actionability_error(
                     SemanticActionFailureKind::UnstableTarget,
                     "semantic pointer target did not remain stable",
@@ -1241,7 +1261,8 @@ impl Glass {
                     RetryGuidance::WaitOrRefine,
                     None,
                     DispatchStatus::NotDispatched,
-                ));
+                )
+                .with_target(target));
             }
             let mut error = classified_resolution_error(poll.observation.resolution, report, bound);
             error.actionability = poll.observation.actionability.unwrap_or_default();
@@ -1304,10 +1325,12 @@ impl Glass {
         resolved: ResolvedSemanticTarget,
     ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
         let window = {
-            let active = self
-                .active
-                .as_ref()
-                .ok_or_else(|| source_error(GlassError::NoActiveSession, resolved.bound))?;
+            let active = self.active.as_ref().ok_or_else(|| {
+                let mut error = source_error(GlassError::NoActiveSession, resolved.bound);
+                error.target = Some(Box::new(resolved.element.clone()));
+                error.resolution = Some(resolved.resolution.clone());
+                error
+            })?;
             (active.geometry.width, active.geometry.height)
         };
         let mut actionability = ActionabilityReport::evaluate_click(
@@ -1329,13 +1352,15 @@ impl Glass {
                 RetryGuidance::Reobserve,
                 None,
                 DispatchStatus::NotDispatched,
-            ));
+            )
+            .with_target(resolved.element.clone()));
         }
         let actuated = self
             .try_native_invoke(resolved.element.id, resolved.bound.deadline)
             .map_err(|source| {
                 action_source_error(
                     source,
+                    Some(resolved.element.clone()),
                     Some(resolved.resolution.clone()),
                     actionability.clone(),
                     resolved.bound,
@@ -1376,6 +1401,7 @@ impl Glass {
             .map_err(|source| {
                 action_source_error(
                     source,
+                    Some(resolved.candidate.element.clone()),
                     Some(resolved.resolution.clone()),
                     sample_actionability,
                     resolved.bound,
@@ -1404,7 +1430,8 @@ impl Glass {
                 RetryGuidance::Reobserve,
                 None,
                 DispatchStatus::NotDispatched,
-            ));
+            )
+            .with_target(resolved.candidate.element.clone()));
         }
         let probe_point = match &resolved.candidate.plan {
             PlannedPointerInput::Click { point } => *point,
@@ -1419,6 +1446,7 @@ impl Glass {
             .map_err(|source| {
                 action_source_error(
                     source,
+                    Some(resolved.candidate.element.clone()),
                     Some(resolved.resolution.clone()),
                     actionability.clone(),
                     resolved.bound,
@@ -1444,7 +1472,8 @@ impl Glass {
                 RetryGuidance::Reobserve,
                 None,
                 DispatchStatus::NotDispatched,
-            ));
+            )
+            .with_target(resolved.candidate.element.clone()));
         }
         self.click_element_pointer_only(
             resolved.candidate.element.id,
@@ -1454,6 +1483,7 @@ impl Glass {
         .map_err(|source| {
             action_source_error(
                 source,
+                Some(resolved.candidate.element.clone()),
                 Some(resolved.resolution.clone()),
                 actionability.clone(),
                 resolved.bound,
@@ -1556,7 +1586,7 @@ impl Glass {
                 let actuated = self
                     .try_native_invoke(*id, bound.deadline)
                     .map_err(|source| {
-                        action_source_error(source, None, actionability, bound, true)
+                        action_source_error(source, None, None, actionability, bound, true)
                     })?;
                 Ok(self.legacy_click_outcome(
                     *id,
@@ -1608,7 +1638,7 @@ impl Glass {
                 let actionability = self.legacy_click_actionability(*id, true);
                 self.click_element_pointer_only(*id, None, bound.deadline)
                     .map_err(|source| {
-                        action_source_error(source, None, actionability, bound, true)
+                        action_source_error(source, None, None, actionability, bound, true)
                     })?;
                 Ok(self.legacy_click_outcome(
                     *id,
@@ -1779,9 +1809,11 @@ impl Glass {
                         set_value_actionability(element, *coverage, *window, true)
                     })
                     .unwrap_or_default();
-                let execution = self
-                    .set_value_inner(*id, text, bound.deadline)
-                    .map_err(|source| set_value_source_error(source, None, actionability, bound))?;
+                let execution =
+                    self.set_value_inner(*id, text, bound.deadline)
+                        .map_err(|source| {
+                            set_value_source_error(source, None, None, actionability, bound)
+                        })?;
                 let (element, coverage, window) = self
                     .legacy_set_value_snapshot(*id)
                     .or(before)
@@ -1835,6 +1867,7 @@ impl Glass {
                     .map_err(|source| {
                         set_value_source_error(
                             source,
+                            Some(resolved.element.clone()),
                             Some(resolved.resolution.clone()),
                             actionability,
                             resolved.bound,
@@ -2065,6 +2098,7 @@ impl Glass {
             .map_err(|source| {
                 focus_source_error(
                     source,
+                    resolved.element.clone(),
                     Some(resolved.resolution.clone()),
                     actionability.clone(),
                     ActionMethod::NativeAction { actuated: None },
@@ -2079,6 +2113,7 @@ impl Glass {
             .map_err(|source| {
                 focus_unconfirmed_error(
                     Some(source),
+                    resolved.element.clone(),
                     resolved.resolution.clone(),
                     actionability.clone(),
                     resolved.coverage,
@@ -2091,6 +2126,7 @@ impl Glass {
             .map_err(|error| {
                 focus_unconfirmed_error(
                     error.source,
+                    resolved.element.clone(),
                     resolved.resolution.clone(),
                     actionability.clone(),
                     resolved.coverage,
@@ -2142,7 +2178,8 @@ impl Glass {
                 RetryGuidance::Reobserve,
                 None,
                 DispatchStatus::NotDispatched,
-            ));
+            )
+            .with_target(resolved.candidate.element.clone()));
         }
         let target = resolved.candidate.target.clone();
         let element = resolved.candidate.element.clone();
@@ -2173,6 +2210,7 @@ impl Glass {
             .map_err(|error| {
                 focus_unconfirmed_error(
                     error.source,
+                    focused.target.clone(),
                     focused
                         .resolution
                         .clone()

@@ -354,6 +354,22 @@ fn merge_object(target: &mut Value, source: Value) {
     target.extend(source);
 }
 
+pub(crate) fn mutation_provenance(
+    focus: Option<&MutationReport>,
+    action_dispatch: DispatchStatus,
+) -> (glass_core::BoundDispatch, bool) {
+    let may_have_dispatched = action_dispatch != DispatchStatus::NotDispatched
+        || focus.is_some_and(|report| report.dispatch != DispatchStatus::NotDispatched);
+    (
+        if may_have_dispatched {
+            glass_core::BoundDispatch::MayHaveDispatched
+        } else {
+            glass_core::BoundDispatch::NotDispatched
+        },
+        may_have_dispatched,
+    )
+}
+
 pub(crate) fn success_output(
     tool: &'static str,
     outcome: &SemanticActionOutcome,
@@ -424,9 +440,11 @@ fn semantic_category(error: &SemanticActionError) -> SafeErrorCategory {
 }
 
 fn failure_result(error: &SemanticActionError) -> Value {
+    let (_, side_effects_may_have_occurred) =
+        mutation_provenance(error.focus.as_ref(), error.action_dispatch);
     let mut result = json!({
         "dispatch": error.action_dispatch.as_str(),
-        "side_effects_may_have_occurred": error.action_dispatch != DispatchStatus::NotDispatched,
+        "side_effects_may_have_occurred": side_effects_may_have_occurred,
         "retry": error.retry.as_str(),
         "actionability": actionability_json(&error.actionability),
         "candidate_count": error.candidates.len(),
@@ -445,33 +463,22 @@ pub(crate) fn semantic_error(tool: &'static str, error: SemanticActionError) -> 
     let include_text = tool != "glass_type";
     let mut siblings = Vec::new();
     if !error.candidates.is_empty() {
-        let body = if error.candidates.len() == 1
-            && matches!(
-                error.kind,
-                SemanticActionFailureKind::UnprovenSelectorState
-                    | SemanticActionFailureKind::NotActionable
-                    | SemanticActionFailureKind::UnstableTarget
-                    | SemanticActionFailureKind::FocusUnconfirmed
-            ) {
-            json!({ "target": element_json(&error.candidates[0].element, include_text) })
-        } else {
-            json!({ "candidates": candidates_json(&error.candidates, include_text) })
-        };
-        siblings.push(OutContent::untrusted_observation(&body.to_string()));
+        siblings.push(OutContent::untrusted_observation(
+            &json!({ "candidates": candidates_json(&error.candidates, include_text) }).to_string(),
+        ));
+    } else if let Some(target) = &error.target {
+        siblings.push(OutContent::untrusted_observation(
+            &json!({ "target": element_json(target, include_text) }).to_string(),
+        ));
     }
-    let bound_dispatch = Some(match error.action_dispatch {
-        DispatchStatus::NotDispatched => glass_core::BoundDispatch::NotDispatched,
-        DispatchStatus::Dispatched | DispatchStatus::MayHaveDispatched => {
-            glass_core::BoundDispatch::MayHaveDispatched
-        }
-    });
+    let (bound_dispatch, _) = mutation_provenance(error.focus.as_ref(), error.action_dispatch);
     ContextualError {
         code: category.code(),
         message: category.summary().into(),
         category,
         safe_summary: category.summary(),
         sequence_deadline_exceeded: category == SafeErrorCategory::SequenceDeadlineExceeded,
-        bound_dispatch,
+        bound_dispatch: Some(bound_dispatch),
         result: Some(failure_result(&error)),
         siblings,
         post_write: false,
@@ -479,4 +486,4 @@ pub(crate) fn semantic_error(tool: &'static str, error: SemanticActionError) -> 
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
