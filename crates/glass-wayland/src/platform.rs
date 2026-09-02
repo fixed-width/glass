@@ -8,12 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, BoundDispatch, Deadline, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region,
-    Result, Stream, TEARDOWN_BUDGET, Whose, WindowGeometry, WindowId, WindowInfo, WindowOp,
+    AppSpec, BoundDispatch, Deadline, Frame, GlassError, HostPathProtectionMode, KeyEvent,
+    Platform, PointerEvent, ProtectedHostPath, Region, Result, SandboxLevel, Stream,
+    TEARDOWN_BUDGET, Whose, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 use glass_exec_unix::{Resolved, resolve_path};
 use glass_pipe_unix::LineTap;
-use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE};
+use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, ProcessIdentitySet};
+use glass_sandbox_linux::{BwrapStatusPipe, BwrapStatusReader};
 use smithay_client_toolkit::delegate_dispatch2;
 use smithay_client_toolkit::delegate_registry;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -38,17 +40,11 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1:
 use std::collections::HashMap;
 
 use crate::clipboard::remaining_timespec;
-use crate::command::{LogSink, build_sway_command, sway_config};
+use crate::command::{LogSink, build_sway_command_with_status, sway_config};
 use crate::input::evdev_button;
 use crate::swayipc::{Ipc, Window as SwayWindow};
 
-// glass-mcp gives the whole of teardown `glass_core::TEARDOWN_BUDGET` and then exits regardless, on a
-// `spawn_blocking` thread that cannot be cancelled — so an ask-then-signal ladder that fills the
-// budget would never get to the signal, and sway (plus Xwayland and the app) would outlive glass.
-//
-// This binds the ladder only. The a11y bus teardown that follows it in the same budget still
-// reaps at `REAP_GRACE`, so a helper that ignores SIGTERM can take the whole teardown past the
-// budget; that is pre-existing and not what this assertion is about.
+// Keep the close-request and signal ladder within the non-cancellable teardown budget.
 const _: () = assert!(
     CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis() < TEARDOWN_BUDGET.as_millis(),
     "the close request + compositor reap must finish inside glass_core::TEARDOWN_BUDGET"
@@ -168,6 +164,8 @@ fn recovery_needs_settle(recovered: usize) -> bool {
 
 struct ActiveSession {
     child: Child,
+    /// Host PID reported by Bubblewrap for contained launches, or sway's host PID for direct ones.
+    ownership_root: u32,
     /// sway's stdout/stderr readers, dropped when the session is torn down. Everything sway
     /// spawns inherits its write ends, so an EOF-only reader parks on a survivor's pipe
     /// (glass#477).
@@ -200,6 +198,7 @@ pub struct WaylandPlatform {
     active: Option<ActiveSession>,
     clipboard_owner: Option<crate::clipboard::ClipboardOwner>,
     dbus: Option<glass_dbus_linux::PrivateBus>,
+    protected_host_paths: Vec<ProtectedHostPath>,
 }
 
 impl WaylandPlatform {
@@ -211,6 +210,7 @@ impl WaylandPlatform {
             active: None,
             clipboard_owner: None,
             dbus: None,
+            protected_host_paths: Vec::new(),
         })
     }
 
@@ -232,7 +232,7 @@ impl WaylandPlatform {
             // Snapshot the launch (sway, Xwayland, the app and anything it forked) before any of
             // it exits: once sway is reaped its descendants are reparented to init and can no
             // longer be found from its pid.
-            let tree = glass_proc_linux::proc_tree_pids(s.child.id());
+            let tree = wayland_host_tree(&s.child, s.ownership_root);
             let app = app_pids(&tree, s.child.id());
             let asked = request_close(&mut s.ipc);
             // Wait on the app's processes, not on sway's window list: an empty list only means
@@ -258,6 +258,199 @@ impl WaylandPlatform {
             glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
         }
         self.dbus = None;
+    }
+}
+
+struct PendingWaylandSession {
+    child: Child,
+    status: Option<BwrapStatusReader>,
+    ownership_root: Option<u32>,
+}
+
+impl PendingWaylandSession {
+    fn poll_status(&mut self) -> Result<()> {
+        let Some(status) = self.status.as_mut() else {
+            return Ok(());
+        };
+        match status.poll_child_pid() {
+            Ok(Some(pid)) => {
+                self.ownership_root = Some(pid);
+                self.status = None;
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(error) => {
+                self.status = None;
+                Err(GlassError::SandboxUnavailable(format!(
+                    "could not read Bubblewrap child status: {error}"
+                )))
+            }
+        }
+    }
+
+    fn status_confirmed(&self) -> bool {
+        self.status.is_none() && self.ownership_root.is_some()
+    }
+}
+
+fn wayland_host_tree(child: &Child, ownership_root: u32) -> Vec<u32> {
+    let mut tree = glass_proc_linux::proc_tree_pids(child.id());
+    tree.extend(ProcessIdentitySet::from_host_root(ownership_root).host_pids());
+    tree.sort_unstable();
+    tree.dedup();
+    tree
+}
+
+struct LaunchCleanupOutcome {
+    status_error: Option<GlassError>,
+    survivors: Vec<u32>,
+}
+
+fn reap_pending(pending: &mut PendingWaylandSession) -> LaunchCleanupOutcome {
+    // Poll buffered status before snapshotting so reparenting cannot hide its host PID from reaping.
+    // Malformed status still falls back to sway's known host tree.
+    let status_error = pending.poll_status().err();
+    reap_pending_after_status_poll(pending, status_error)
+}
+
+fn reap_pending_after_status_poll(
+    pending: &mut PendingWaylandSession,
+    status_error: Option<GlassError>,
+) -> LaunchCleanupOutcome {
+    let mut tree = glass_proc_linux::proc_tree_pids(pending.child.id());
+    if let Some(root) = pending.ownership_root {
+        tree.extend(ProcessIdentitySet::from_host_root(root).host_pids());
+    }
+    tree.sort_unstable();
+    tree.dedup();
+    let survivors =
+        glass_proc_linux::reap_launch(&mut pending.child, &tree, glass_proc_linux::REAP_GRACE);
+    LaunchCleanupOutcome {
+        status_error,
+        survivors,
+    }
+}
+
+fn launch_cleanup_error(outcome: LaunchCleanupOutcome) -> Option<GlassError> {
+    let survivor_error = (!outcome.survivors.is_empty()).then(|| {
+        GlassError::Backend(format!(
+            "failed-launch cleanup left surviving host PIDs: {}",
+            outcome
+                .survivors
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    });
+    match (outcome.status_error, survivor_error) {
+        (None, None) => None,
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (Some(status), Some(survivors)) => Some(GlassError::cleanup_failed(
+            "reaping a failed Wayland launch",
+            status,
+            survivors,
+        )),
+    }
+}
+
+fn failed_launch_error(pending: &mut PendingWaylandSession, primary: GlassError) -> GlassError {
+    failed_launch_error_from_outcome(primary, reap_pending(pending))
+}
+
+fn failed_launch_error_from_outcome(
+    primary: GlassError,
+    outcome: LaunchCleanupOutcome,
+) -> GlassError {
+    match launch_cleanup_error(outcome) {
+        Some(cleanup) => {
+            GlassError::cleanup_failed("stopping a failed Wayland launch", primary, cleanup)
+        }
+        None => primary,
+    }
+}
+
+fn launch_ready(
+    status_confirmed: bool,
+    window_discovered: bool,
+    deadline: Instant,
+    observed_at: Instant,
+) -> bool {
+    status_confirmed && window_discovered && observed_at < deadline
+}
+
+fn time_remains(observed_at: Instant, deadline: Instant) -> bool {
+    observed_at < deadline
+}
+
+fn recover_after_grace(
+    launched_at: Instant,
+    timeout_ms: u64,
+    observed_at: Instant,
+    listed: bool,
+    recover: impl FnOnce(),
+) {
+    if observed_at >= launched_at + start_recovery_after(timeout_ms) && listed {
+        recover();
+    }
+}
+
+fn launch_with_retry<T>(
+    deadline: Instant,
+    timeout_ms: u64,
+    mut attempt: impl FnMut(Instant) -> Result<T>,
+) -> Result<T> {
+    const ATTEMPTS: u32 = 2;
+    let mut last_error = None;
+    for _ in 0..ATTEMPTS {
+        if Instant::now() >= deadline {
+            return Err(last_error.unwrap_or(GlassError::Timeout(timeout_ms)));
+        }
+        match attempt(deadline) {
+            Ok(value) => return Ok(value),
+            Err(error @ (GlassError::Timeout(_) | GlassError::Backend(_))) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or(GlassError::Timeout(timeout_ms)))
+}
+
+fn launch_deadline_error(
+    pending: &mut PendingWaylandSession,
+    timeout_ms: u64,
+    unrecovered_x11_windows: usize,
+) -> GlassError {
+    let status_error = pending.poll_status().err();
+    let primary = if !pending.status_confirmed() {
+        GlassError::SandboxUnavailable("Bubblewrap did not report a contained child PID".into())
+    } else if unrecovered_x11_windows > 0 {
+        GlassError::Backend(format!(
+            "the app mapped {unrecovered_x11_windows} X11 window(s) the compositor never \
+             surfaced; glass re-mapped them and they still did not appear within {timeout_ms}ms. \
+             The session's Xwayland may be wedged — retry the launch."
+        ))
+    } else {
+        GlassError::Timeout(timeout_ms)
+    };
+    failed_launch_error_from_outcome(
+        primary,
+        reap_pending_after_status_poll(pending, status_error),
+    )
+}
+
+fn open_session_failure(
+    pending: &mut PendingWaylandSession,
+    error: GlassError,
+    timeout_ms: u64,
+    observed_at: Instant,
+    deadline: Instant,
+) -> GlassError {
+    if !time_remains(observed_at, deadline) {
+        launch_deadline_error(pending, timeout_ms, 0)
+    } else {
+        failed_launch_error(pending, error)
     }
 }
 
@@ -870,6 +1063,10 @@ const _: () = assert!(
     "a servicing slice must not become a wait in its own right"
 );
 
+fn compositor_service_deadline(deadline: Instant, now: Instant) -> Instant {
+    deadline.min(now + COMPOSITOR_SERVICE_SLICE)
+}
+
 /// Set by the compositor's answer to `wl_display.sync`, which is what a roundtrip waits for.
 pub(crate) type SyncDone = Arc<std::sync::atomic::AtomicBool>;
 
@@ -989,25 +1186,6 @@ where
             )))
         }
     }
-}
-
-/// [`roundtrip_until`] with the standard budget, for the callers with no deadline of their own.
-pub(crate) fn roundtrip<S>(
-    conn: &Connection,
-    queue: &mut EventQueue<S>,
-    state: &mut S,
-    who: &str,
-) -> Result<()>
-where
-    S: Dispatch<wl_callback::WlCallback, SyncDone> + 'static,
-{
-    roundtrip_until(
-        conn,
-        queue,
-        state,
-        Instant::now() + COMPOSITOR_SYNC_BUDGET,
-        who,
-    )
 }
 
 fn roundtrip_by<S>(
@@ -1274,7 +1452,7 @@ impl Dispatch<ZwpVirtualKeyboardV1, ()> for State {
 fn open_session(
     socket: &Path,
     runtime_dir: &Path,
-    setup_budget: Duration,
+    deadline: Instant,
 ) -> Result<(
     Connection,
     EventQueue<State>,
@@ -1286,8 +1464,11 @@ fn open_session(
     Ipc,
     (u32, u32),
 )> {
-    let (conn, globals, mut queue): (_, _, EventQueue<State>) =
-        connect_bounded(socket, setup_budget, "session bring-up")?;
+    let (conn, globals, mut queue): (_, _, EventQueue<State>) = connect_bounded(
+        socket,
+        deadline.saturating_duration_since(Instant::now()),
+        "session bring-up",
+    )?;
 
     let advertised: Vec<String> = globals
         .contents()
@@ -1320,7 +1501,7 @@ fn open_session(
         .bind(&qh, 1..=1, ())
         .map_err(|e| GlassError::Backend(format!("bind virtual keyboard: {e}")))?;
 
-    roundtrip(&conn, &mut queue, &mut state, "session bring-up")?;
+    roundtrip_until(&conn, &mut queue, &mut state, deadline, "session bring-up")?;
 
     let output = state
         .output
@@ -1343,11 +1524,15 @@ fn open_session(
 
     // The sway IPC socket appears in the private runtime dir alongside the wayland
     // socket; retry briefly in case it lands a moment later.
-    let deadline = Instant::now() + Duration::from_millis(2000);
     let ipc = loop {
         match Ipc::connect(runtime_dir) {
             Ok(c) => break c,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(40)),
+            Err(_) if time_remains(Instant::now(), deadline) => {
+                std::thread::sleep(
+                    Duration::from_millis(40)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
             Err(e) => return Err(e),
         }
     };
@@ -1401,93 +1586,131 @@ fn bring_up_session(
     logs: &LogSink,
     spec: &AppSpec,
     a11y: Option<glass_core::A11yBind>,
+    protected_host_paths: &[ProtectedHostPath],
+    deadline: Instant,
 ) -> Result<(ActiveSession, WindowGeometry)> {
     let runtime_dir = tempfile::Builder::new()
         .prefix("glass-wl.")
         .tempdir()
         .map_err(GlassError::Io)?;
 
+    let status_pipe = match spec.sandbox {
+        SandboxLevel::Off => None,
+        SandboxLevel::Default | SandboxLevel::Strict => {
+            Some(BwrapStatusPipe::new().map_err(|error| {
+                GlassError::SandboxUnavailable(format!(
+                    "could not create Bubblewrap status pipe: {error}"
+                ))
+            })?)
+        }
+    };
+    let status_fd = status_pipe.as_ref().map(BwrapStatusPipe::writer_fd);
     let config = runtime_dir.path().join("sway.cfg");
     std::fs::write(
         &config,
-        sway_config(spec, runtime_dir.path(), a11y.map(|a| a.dir)),
+        sway_config(
+            spec,
+            runtime_dir.path(),
+            a11y.map(|a| a.dir),
+            status_fd,
+            protected_host_paths,
+        )?,
     )
     .map_err(GlassError::Io)?;
-    let mut cmd = build_sway_command(
+    let mut cmd = build_sway_command_with_status(
         sway,
         &config,
         spec,
         runtime_dir.path(),
         a11y.map(|a| a.addr),
-    );
+        status_fd,
+    )?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| GlassError::AppNotStarted(format!("spawn sway: {e}")))?;
+    let direct_root = (spec.sandbox == SandboxLevel::Off).then_some(child.id());
+    let mut pending = PendingWaylandSession {
+        child,
+        status: status_pipe.map(BwrapStatusPipe::into_reader),
+        ownership_root: direct_root,
+    };
     // Declared before the discovery loop below, so each of its `return Err(...)` paths drops the
     // taps *after* its own reap — the order teardown uses, so the final drain sees what sway wrote
     // on the way out. `Stdio::piped()` guarantees both are `Some`; skipping one that is not would
     // silently stop capturing it.
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let taps = vec![
-        tap_or_reap(
-            stdout,
-            Stream::Stdout,
-            "glass-sway-stdout",
-            logs,
-            &mut child,
-        )?,
-        tap_or_reap(
-            stderr,
-            Stream::Stderr,
-            "glass-sway-stderr",
-            logs,
-            &mut child,
-        )?,
-    ];
+    let stdout = pending.child.stdout.take().expect("stdout was piped");
+    let stderr = pending.child.stderr.take().expect("stderr was piped");
+    let stdout_tap = match tap_or_reap(
+        stdout,
+        Stream::Stdout,
+        "glass-sway-stdout",
+        logs,
+        &mut pending.child,
+    ) {
+        Ok(tap) => tap,
+        Err(error) => {
+            return Err(failed_launch_error(&mut pending, error));
+        }
+    };
+    let stderr_tap = match tap_or_reap(
+        stderr,
+        Stream::Stderr,
+        "glass-sway-stderr",
+        logs,
+        &mut pending.child,
+    ) {
+        Ok(tap) => tap,
+        Err(error) => {
+            return Err(failed_launch_error(&mut pending, error));
+        }
+    };
+    let taps = vec![stdout_tap, stderr_tap];
 
-    let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
     let socket = loop {
-        if let Some(s) = find_wayland_socket(runtime_dir.path()) {
+        if !time_remains(Instant::now(), deadline) {
+            return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
+        }
+        if let Err(error) = pending.poll_status() {
+            return Err(failed_launch_error(&mut pending, error));
+        }
+        if let Some(s) = find_wayland_socket(runtime_dir.path())
+            && time_remains(Instant::now(), deadline)
+        {
             break s;
         }
-        if let Ok(Some(status)) = child.try_wait() {
+        if let Ok(Some(status)) = pending.child.try_wait() {
             // sway exited — but on an *unclean* exit Xwayland, which sway forks into its own
             // group, can outlive it and hold the X display in the global namespace, breaking the
             // next session. (The app sway `exec`s is `setsid`ed out of that group — see
             // `kill_session` — and is covered by the `reap_launch` tree walk there.)
-            glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
-            return Err(GlassError::app_exited_during_discovery(
-                status.code(),
-                spec.sandbox,
-            ));
+            let primary = GlassError::app_exited_during_discovery(status.code(), spec.sandbox);
+            return Err(failed_launch_error(&mut pending, primary));
         }
-        if Instant::now() >= deadline {
-            glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
-            return Err(GlassError::Timeout(spec.timeout_ms));
-        }
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(
+            Duration::from_millis(40).min(deadline.saturating_duration_since(Instant::now())),
+        );
     };
 
+    if !time_remains(Instant::now(), deadline) {
+        return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
+    }
     let (conn, mut queue, mut state, manager, output, pointer, keyboard, mut ipc, output_size) =
-        // What is left of the launch the caller asked for — `timeout_ms` is the knob for a slow
-        // machine — but never less than one sync's worth: the socket wait above shares this
-        // deadline, so a compositor slow to create its socket would otherwise leave the setup
-        // that follows a few milliseconds and fail a launch that was merely late.
-        match open_session(
-            &socket,
-            runtime_dir.path(),
-            deadline
-                .saturating_duration_since(Instant::now())
-                .max(COMPOSITOR_SYNC_BUDGET),
-        ) {
+        match open_session(&socket, runtime_dir.path(), deadline) {
             Ok(v) => v,
             Err(e) => {
-                glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
-                return Err(e);
+                return Err(open_session_failure(
+                    &mut pending,
+                    e,
+                    spec.timeout_ms,
+                    Instant::now(),
+                    deadline,
+                ));
             }
         };
+    if Instant::now() >= deadline {
+        return Err(launch_deadline_error(&mut pending, spec.timeout_ms, 0));
+    }
     let socket_path = socket;
 
     // Discover the initially-focused window (the app's first toplevel), so
@@ -1496,7 +1719,6 @@ fn bring_up_session(
     let mut next_id = 0u64;
     let mut recovery = crate::xwayland::Recovery::new(runtime_dir.path());
     let (active, active_rect) = {
-        let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
         // An X11 app's only window can reach Xwayland's X server and never reach the compositor
         // (see `crate::xwayland`), and no amount of further waiting brings it — so once the app
         // has had a fair chance to show a window, stop only waiting and go look on the X side.
@@ -1506,8 +1728,20 @@ fn bring_up_session(
         // a slow toolkit under load can sit there for a while. Waiting out half the budget makes
         // an arriving window very unlikely to be mistaken for a lost one, and still leaves the
         // other half to notice, re-map, and see the window appear.
-        let start_grace = Instant::now() + start_recovery_after(spec.timeout_ms);
+        let launched_at = Instant::now();
+        let mut discovered = None;
         loop {
+            if Instant::now() >= deadline {
+                let unrecovered = recovery.unrecovered();
+                return Err(launch_deadline_error(
+                    &mut pending,
+                    spec.timeout_ms,
+                    unrecovered,
+                ));
+            }
+            if let Err(error) = pending.poll_status() {
+                return Err(failed_launch_error(&mut pending, error));
+            }
             // A slice per pass, not the launch's whole budget: this loop is also watching for
             // sway exiting and for a window Xwayland lost. The error is dropped because a slice
             // this short is missed by a compositor that is merely loaded.
@@ -1515,7 +1749,7 @@ fn bring_up_session(
                 &conn,
                 &mut queue,
                 &mut state,
-                Instant::now() + COMPOSITOR_SERVICE_SLICE,
+                compositor_service_deadline(deadline, Instant::now()),
                 "launch",
             );
             // Distinguish "sway says no windows" from "sway did not answer": an unanswered
@@ -1523,48 +1757,49 @@ fn bring_up_session(
             // cross-check below would make every window the app really has look lost.
             let listed = ipc.windows();
             let wins = listed.as_deref().unwrap_or_default();
-            if let Some(w) = wins.iter().find(|w| w.focused).or_else(|| wins.first()) {
+            if discovered.is_none()
+                && let Some(w) = wins.iter().find(|w| w.focused).or_else(|| wins.first())
+            {
                 mint_id(&mut ids, &mut next_id, &w.identifier);
-                break (Some(w.identifier.clone()), rect_to_geom(&w.rect));
+                discovered = Some((Some(w.identifier.clone()), rect_to_geom(&w.rect)));
+            }
+            if launch_ready(
+                pending.status_confirmed(),
+                discovered.is_some(),
+                deadline,
+                Instant::now(),
+            ) && let Some(window) = discovered.take()
+            {
+                break window;
             }
             let now = Instant::now();
-            if now >= start_grace && listed.is_ok() {
+            recover_after_grace(launched_at, spec.timeout_ms, now, listed.is_ok(), || {
                 recovery.recover_if_due(now, &x11_ids(wins));
-            }
-            if let Ok(Some(status)) = child.try_wait() {
+            });
+            if let Ok(Some(status)) = pending.child.try_wait() {
                 // Reap the whole group (see the socket-wait loop above): an
                 // unclean sway exit can orphan Xwayland + the app otherwise.
-                glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
-                return Err(GlassError::app_exited_during_discovery(
-                    status.code(),
-                    spec.sandbox,
-                ));
+                let primary = GlassError::app_exited_during_discovery(status.code(), spec.sandbox);
+                return Err(failed_launch_error(&mut pending, primary));
             }
-            if Instant::now() >= deadline {
-                glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
-                // Say what glass saw. A launch that gives up after re-mapping a window the app
-                // really had is a different problem from an app that never opened one, and a
-                // bare timeout would send the reader looking at the app.
-                let unrecovered = recovery.unrecovered();
-                if unrecovered > 0 {
-                    return Err(GlassError::Backend(format!(
-                        "the app mapped {unrecovered} X11 window(s) the compositor never \
-                         surfaced; glass re-mapped them and they still did not appear within \
-                         {}ms. The session's Xwayland may be wedged — retry the launch.",
-                        spec.timeout_ms
-                    )));
-                }
-                return Err(GlassError::Timeout(spec.timeout_ms));
-            }
-            std::thread::sleep(Duration::from_millis(40));
+            std::thread::sleep(
+                Duration::from_millis(40).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     };
     // The caller's first enumeration must cross-check rather than fall inside the interval this
     // discovery loop already spent.
     recovery.rearm();
     let geometry = active_rect.clone();
+    let Some(ownership_root) = pending.ownership_root else {
+        let primary = GlassError::SandboxUnavailable(
+            "Bubblewrap status channel closed without a contained child PID".into(),
+        );
+        return Err(failed_launch_error(&mut pending, primary));
+    };
     let session = ActiveSession {
-        child,
+        child: pending.child,
+        ownership_root,
         taps,
         _runtime_dir: runtime_dir,
         socket_path,
@@ -1829,6 +2064,10 @@ fn modifier_mask(mods: &[glass_core::keys::Modifier]) -> u32 {
             Modifier::Super => 0b100_0000,
         }
     })
+}
+
+fn click_needs_keyboard(mask: u32) -> bool {
+    mask != 0
 }
 
 /// Lets `glass_core::run_drag` drive a Wayland drag through the virtual-pointer
@@ -2122,7 +2361,17 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
 }
 
 impl Platform for WaylandPlatform {
+    fn configure_protected_host_paths(
+        &mut self,
+        paths: &[ProtectedHostPath],
+    ) -> Result<HostPathProtectionMode> {
+        glass_sandbox_linux::validate_protected_paths(paths)?;
+        self.protected_host_paths = paths.to_vec();
+        Ok(HostPathProtectionMode::SandboxRules)
+    }
+
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
+        glass_sandbox_linux::validate_protected_paths(&self.protected_host_paths)?;
         ensure_sandbox_available(spec.sandbox, glass_sandbox_linux::availability)?;
 
         // Run the build step (if any) before the compositor starts. The build is
@@ -2147,31 +2396,31 @@ impl Platform for WaylandPlatform {
             None
         };
 
-        const ATTEMPTS: u32 = 2;
-        let mut last_err = GlassError::Timeout(spec.timeout_ms);
-        for attempt in 0..ATTEMPTS {
+        let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
+        let result = launch_with_retry(deadline, spec.timeout_ms, |deadline| {
             let a11y = self.dbus.as_ref().map(|b| glass_core::A11yBind {
                 addr: b.session_bus_address(),
                 dir: b.runtime_dir(),
             });
-            match bring_up_session(&self.sway, &self.logs, spec, a11y) {
-                Ok((session, geometry)) => {
-                    self.active = Some(session);
-                    return Ok(geometry);
-                }
-                Err(e @ (GlassError::Timeout(_) | GlassError::Backend(_)))
-                    if attempt + 1 < ATTEMPTS =>
-                {
-                    last_err = e;
-                }
-                Err(e) => {
-                    self.dbus = None; // reap the private bus on a hard failure
-                    return Err(e);
-                }
+            bring_up_session(
+                &self.sway,
+                &self.logs,
+                spec,
+                a11y,
+                &self.protected_host_paths,
+                deadline,
+            )
+        });
+        match result {
+            Ok((session, geometry)) => {
+                self.active = Some(session);
+                Ok(geometry)
+            }
+            Err(error) => {
+                self.dbus = None;
+                Err(error)
             }
         }
-        self.dbus = None; // reap the private bus after exhausted retries
-        Err(last_err)
     }
 
     /// Ignores the deadline — the close-then-reap ladder above is asserted against
@@ -2356,7 +2605,8 @@ impl Platform for WaylandPlatform {
                 } => {
                     position(session, x, y)?;
                     let mask = modifier_mask(modifiers);
-                    if mask != 0 {
+                    let needs_keyboard = click_needs_keyboard(mask);
+                    if needs_keyboard {
                         upload_keymap_by(
                             session,
                             &kb,
@@ -2368,7 +2618,7 @@ impl Platform for WaylandPlatform {
                         dispatch.mark();
                     }
                     let mut held = Held {
-                        modifiers: mask != 0,
+                        modifiers: needs_keyboard,
                         ..Held::default()
                     };
                     let b = evdev_button(button);
@@ -2636,7 +2886,9 @@ impl Platform for WaylandPlatform {
     /// authoritative app pid here — sway's pid isn't the app's.)
     fn app_pids(&self) -> Vec<u32> {
         match &self.active {
-            Some(s) => glass_proc_linux::proc_tree_pids(s.child.id()),
+            Some(s) => ProcessIdentitySet::from_host_root(s.ownership_root)
+                .matching_pids()
+                .to_vec(),
             None => Vec::new(),
         }
     }
@@ -2712,6 +2964,7 @@ mod pure_tests {
             active: None,
             clipboard_owner: None,
             dbus: None,
+            protected_host_paths: Vec::new(),
         };
         let events = [
             PointerEvent::Click {
@@ -3912,6 +4165,16 @@ mod pure_tests {
         assert_eq!(find_wayland_socket(dir.path()), None);
     }
 
+    #[test]
+    fn a_plain_click_does_not_configure_the_virtual_keyboard() {
+        assert!(!click_needs_keyboard(0));
+    }
+
+    #[test]
+    fn a_modified_click_configures_the_virtual_keyboard() {
+        assert!(click_needs_keyboard(0b100));
+    }
+
     /// The XKB real-modifier bits, in the order `include "complete"` assigns them.
     #[test]
     fn each_modifier_is_its_own_xkb_bit() {
@@ -5010,6 +5273,11 @@ mod session_tests {
             count: 1,
             modifiers,
         };
+        // Drain one plain click because sway may deliver its initial keyboard state with the first focused input.
+        s.platform()
+            .send_pointer(&click(vec![]))
+            .expect("prime input");
+        s.wait_for_log(" 272 0");
         s.platform().send_pointer(&click(vec![])).expect("plain");
         let plain = s.wait_for_log(" 272 0");
         assert!(
@@ -5206,14 +5474,23 @@ mod session_tests {
             .expect("chord");
         // An app reads ctrl+a as ctrl+a only if control is already down when the key arrives, so
         // the ordering is the claim: down, key, released.
-        let lines = s.wait_for_log("input: mods 0");
-        let at = |needle: &str| {
-            lines
-                .iter()
-                .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("no {needle:?} in {lines:#?}"))
-        };
-        let (down, key, up) = (at("input: mods 4"), at("input: key"), at("input: mods 0"));
+        let lines = s.wait_for_log_sequence(&["input: mods 4", "input: key", "input: mods 0"]);
+        let down = lines
+            .iter()
+            .position(|line| line.contains("input: mods 4"))
+            .expect("control down");
+        let key = lines
+            .iter()
+            .enumerate()
+            .skip(down + 1)
+            .find_map(|(index, line)| line.contains("input: key").then_some(index))
+            .expect("key after control down");
+        let up = lines
+            .iter()
+            .enumerate()
+            .skip(key + 1)
+            .find_map(|(index, line)| line.contains("input: mods 0").then_some(index))
+            .expect("control up after key");
         assert!(
             down < key && key < up,
             "control must be held before the key and released after it: {lines:#?}"
@@ -5402,7 +5679,7 @@ mod session_tests {
             sink.modifiers(true).expect("hold chord modifier");
             sink.key(true).expect("hold chord key");
         }
-        let chord = s.wait_for_log("input: mods 0");
+        let chord = s.wait_for_log_sequence(&["input: key", "input: mods 0"]);
         assert!(
             chord
                 .iter()
@@ -5433,7 +5710,7 @@ mod session_tests {
             };
             sink.modifiers(true).expect("hold scroll modifier");
         }
-        let scroll = s.wait_for_log("input: mods 0");
+        let scroll = s.wait_for_log_sequence(&["input: mods 4", "input: mods 0"]);
         assert!(
             scroll.iter().any(|line| line.ends_with("input: mods 4")),
             "the scroll modifier was held before drop: {scroll:#?}"
@@ -5872,7 +6149,7 @@ mod session_tests {
             .expect("scroll");
         // Waits for the *release*, which the sink emits after the wheel — waiting for the axis
         // would assert on a line that had not arrived yet.
-        let lines = s.wait_for_log("mods 0");
+        let lines = s.wait_for_log_sequence(&["input: mods 4", "input: axis", "input: mods 0"]);
         let mods: Vec<&String> = lines.iter().filter(|l| l.contains("input: mods")).collect();
         assert!(
             mods.iter().any(|l| l.ends_with("mods 4")),
@@ -5986,7 +6263,708 @@ mod session_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{nudge_x, parse_sway_version, start_recovery_after};
+    use super::{
+        BwrapStatusPipe, LaunchCleanupOutcome, PendingWaylandSession, WaylandPlatform,
+        compositor_service_deadline, failed_launch_error, find_wayland_socket,
+        launch_cleanup_error, launch_deadline_error, launch_ready, launch_with_retry, nudge_x,
+        open_session, open_session_failure, parse_sway_version, reap_pending, recover_after_grace,
+        start_recovery_after, time_remains, wayland_host_tree,
+    };
+    use crate::command::{build_sway_command, sway_config};
+    use glass_core::{
+        AppSpec, HostPathProtectionMode, Platform as _, ProtectedHostPath, SandboxLevel,
+    };
+    use std::io::Write as _;
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Child, Command, Stdio};
+
+    struct PendingCleanup<'a>(Option<&'a mut PendingWaylandSession>);
+
+    impl PendingCleanup<'_> {
+        fn reap(&mut self) -> LaunchCleanupOutcome {
+            reap_pending(self.0.as_deref_mut().expect("armed cleanup guard"))
+        }
+
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for PendingCleanup<'_> {
+        fn drop(&mut self) {
+            if let Some(pending) = self.0.as_deref_mut() {
+                let _ = reap_pending(pending);
+            }
+        }
+    }
+
+    struct ProcessGroupCleanup(Child);
+
+    impl Drop for ProcessGroupCleanup {
+        fn drop(&mut self) {
+            glass_proc_linux::reap_group(&mut self.0, glass_proc_linux::REAP_GRACE);
+        }
+    }
+
+    #[test]
+    fn a_deadline_observed_at_its_exact_instant_has_no_time_remaining() {
+        let deadline = std::time::Instant::now();
+
+        assert!(!time_remains(deadline, deadline));
+    }
+
+    #[test]
+    fn compositor_service_deadline_is_limited_to_one_slice() {
+        let now = std::time::Instant::now();
+        let shared_deadline = now + std::time::Duration::from_secs(1);
+
+        assert_eq!(
+            compositor_service_deadline(shared_deadline, now),
+            now + super::COMPOSITOR_SERVICE_SLICE
+        );
+    }
+
+    #[test]
+    fn compositor_service_deadline_is_limited_to_the_shared_deadline() {
+        let now = std::time::Instant::now();
+        let shared_deadline = now + super::COMPOSITOR_SERVICE_SLICE / 2;
+
+        assert_eq!(
+            compositor_service_deadline(shared_deadline, now),
+            shared_deadline
+        );
+    }
+
+    #[test]
+    fn recovery_is_not_attempted_just_before_its_grace_boundary() {
+        let launched_at = std::time::Instant::now();
+        let grace = std::time::Duration::from_secs(5);
+        let mut attempts = 0;
+
+        recover_after_grace(
+            launched_at,
+            10_000,
+            launched_at + grace - std::time::Duration::from_nanos(1),
+            true,
+            || attempts += 1,
+        );
+
+        assert_eq!(attempts, 0);
+    }
+
+    #[test]
+    fn recovery_is_attempted_at_its_grace_boundary() {
+        let launched_at = std::time::Instant::now();
+        let grace = std::time::Duration::from_secs(5);
+        let mut attempts = 0;
+
+        recover_after_grace(launched_at, 10_000, launched_at + grace, true, || {
+            attempts += 1
+        });
+
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn valid_protected_paths_are_enforced_with_sandbox_rules() {
+        let protected = tempfile::tempdir().expect("protected directory");
+        let mut platform = WaylandPlatform {
+            sway: std::path::PathBuf::new(),
+            logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            active: None,
+            clipboard_owner: None,
+            dbus: None,
+            protected_host_paths: Vec::new(),
+        };
+
+        let mode = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(protected.path())])
+            .expect("valid protected path");
+
+        assert_eq!(mode, HostPathProtectionMode::SandboxRules);
+    }
+
+    #[test]
+    fn a_missing_protected_path_is_rejected() {
+        let mut platform = WaylandPlatform {
+            sway: std::path::PathBuf::new(),
+            logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            active: None,
+            clipboard_owner: None,
+            dbus: None,
+            protected_host_paths: Vec::new(),
+        };
+        let missing = tempfile::tempdir()
+            .expect("temporary parent")
+            .path()
+            .join("missing");
+
+        let error = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(missing)])
+            .expect_err("a nonexistent protected path cannot be enforced");
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::SandboxUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn launch_retry_does_not_start_after_the_operation_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let mut attempts = Vec::new();
+
+        let error = launch_with_retry(deadline, 20, |attempt_deadline| {
+            attempts.push(attempt_deadline);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            Err::<(), _>(glass_core::GlassError::Backend("retryable".into()))
+        })
+        .expect_err("an expired launch budget cannot be retried");
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::Backend(ref message) if message == "retryable"
+        ));
+        assert_eq!(attempts, [deadline]);
+    }
+
+    #[test]
+    fn launch_retry_can_succeed_within_the_operation_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut attempts = Vec::new();
+
+        let value = launch_with_retry(deadline, 1_000, |attempt_deadline| {
+            attempts.push(attempt_deadline);
+            if attempts.len() == 1 {
+                Err(glass_core::GlassError::Backend("retryable".into()))
+            } else {
+                Ok(42)
+            }
+        })
+        .expect("a retry within the shared budget succeeds");
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts, [deadline, deadline]);
+    }
+
+    #[test]
+    fn launch_retry_returns_the_second_retryable_failure_without_a_third_attempt() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut attempts = 0;
+
+        let error = launch_with_retry(deadline, 1_000, |_| {
+            attempts += 1;
+            Err::<(), _>(glass_core::GlassError::Backend(format!(
+                "failure {attempts}"
+            )))
+        })
+        .expect_err("only one retry is allowed");
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::Backend(ref message) if message == "failure 2"
+        ));
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn wayland_host_tree_includes_the_child_and_reported_host_root_tree() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn process-tree fixture");
+        let child = ProcessGroupCleanup(child);
+        let host_root = Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn reported host-root fixture");
+        let host_root = ProcessGroupCleanup(host_root);
+        let host_tree = (0..100)
+            .find_map(|_| {
+                let tree = glass_proc_linux::proc_tree_pids(host_root.0.id());
+                (tree.len() > 1).then_some(tree).or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    None
+                })
+            })
+            .expect("reported host root must have a descendant");
+
+        let tree = wayland_host_tree(&child.0, host_root.0.id());
+
+        assert!(
+            tree.contains(&child.0.id()),
+            "compositor missing from {tree:?}"
+        );
+        assert!(
+            host_tree.iter().all(|pid| tree.contains(pid)),
+            "reported host tree {host_tree:?} missing from {tree:?}"
+        );
+    }
+
+    #[test]
+    fn failed_launch_reports_primary_and_final_status_read_failure() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded cleanup fixture");
+        let pipe = BwrapStatusPipe::new().expect("status pipe");
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", pipe.writer_fd()))
+            .expect("duplicate status writer");
+        let mut pending = PendingWaylandSession {
+            child,
+            status: Some(pipe.into_reader()),
+            ownership_root: None,
+        };
+        for _ in 0..16 {
+            writer
+                .write_all(&[b'x'; 4096])
+                .expect("fill malformed status");
+            pending
+                .poll_status()
+                .expect("status remains below its parser bound");
+        }
+        writer.write_all(b"x").expect("exceed parser bound");
+        drop(writer);
+
+        let error = failed_launch_error(
+            &mut pending,
+            glass_core::GlassError::Backend("primary launch failure".into()),
+        );
+
+        assert!(
+            error.to_string().contains("primary launch failure"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("could not read Bubblewrap child status"),
+            "{error}"
+        );
+        assert!(!pending.status_confirmed());
+    }
+
+    #[test]
+    fn launch_cleanup_error_lists_every_surviving_host_pid() {
+        let outcome = LaunchCleanupOutcome {
+            status_error: None,
+            survivors: vec![41, 73],
+        };
+
+        let error = launch_cleanup_error(outcome).expect("survivors are a cleanup failure");
+
+        assert!(error.to_string().contains("41, 73"), "{error}");
+    }
+
+    #[test]
+    fn successful_failed_launch_cleanup_preserves_the_primary_error_unchanged() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded cleanup fixture");
+        let child_pid = child.id();
+        let mut pending = PendingWaylandSession {
+            child,
+            status: None,
+            ownership_root: Some(child_pid),
+        };
+
+        let error = failed_launch_error(
+            &mut pending,
+            glass_core::GlassError::Backend("primary launch failure".into()),
+        );
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::Backend(ref message) if message == "primary launch failure"
+        ));
+    }
+
+    #[test]
+    fn open_session_failure_reports_the_shared_deadline_when_observed_at_deadline() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded cleanup fixture");
+        let child_pid = child.id();
+        let mut pending = PendingWaylandSession {
+            child,
+            status: None,
+            ownership_root: Some(child_pid),
+        };
+        let mut cleanup = PendingCleanup(Some(&mut pending));
+        let deadline = std::time::Instant::now();
+
+        let error = open_session_failure(
+            cleanup.0.as_deref_mut().expect("armed cleanup guard"),
+            glass_core::GlassError::Backend("open session failed".into()),
+            20,
+            deadline,
+            deadline,
+        );
+
+        assert!(
+            matches!(error, glass_core::GlassError::Timeout(20)),
+            "{error}"
+        );
+        assert!(
+            !glass_proc_linux::any_alive(&[child_pid]),
+            "session failure cleanup left child {child_pid} alive"
+        );
+        cleanup.disarm();
+    }
+
+    #[test]
+    fn open_session_failure_preserves_the_cause_just_before_deadline() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded cleanup fixture");
+        let child_pid = child.id();
+        let mut pending = PendingWaylandSession {
+            child,
+            status: None,
+            ownership_root: Some(child_pid),
+        };
+        let mut cleanup = PendingCleanup(Some(&mut pending));
+        let deadline = std::time::Instant::now();
+
+        let error = open_session_failure(
+            cleanup.0.as_deref_mut().expect("armed cleanup guard"),
+            glass_core::GlassError::Backend("open session failed".into()),
+            20,
+            deadline - std::time::Duration::from_nanos(1),
+            deadline,
+        );
+
+        assert!(matches!(
+            error,
+            glass_core::GlassError::Backend(ref message) if message == "open session failed"
+        ));
+        assert!(
+            !glass_proc_linux::any_alive(&[child_pid]),
+            "session failure cleanup left child {child_pid} alive"
+        );
+        cleanup.disarm();
+    }
+
+    #[test]
+    fn launch_deadline_uses_buffered_valid_status_before_classifying_the_primary() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded cleanup fixture");
+        let child_pid = child.id();
+        let pipe = BwrapStatusPipe::new().expect("status pipe");
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", pipe.writer_fd()))
+            .expect("duplicate status writer");
+        writer
+            .write_all(format!("{{\"child-pid\":{child_pid}}}\n").as_bytes())
+            .expect("buffer valid child status");
+        drop(writer);
+        let mut pending = PendingWaylandSession {
+            child,
+            status: Some(pipe.into_reader()),
+            ownership_root: None,
+        };
+        let mut cleanup = PendingCleanup(Some(&mut pending));
+
+        let error = launch_deadline_error(
+            cleanup.0.as_deref_mut().expect("armed cleanup guard"),
+            20,
+            0,
+        );
+        cleanup.disarm();
+
+        assert!(
+            matches!(error, glass_core::GlassError::Timeout(20)),
+            "{error}"
+        );
+        assert!(
+            !glass_proc_linux::any_alive(&[child_pid]),
+            "deadline cleanup left child {child_pid} alive"
+        );
+    }
+
+    #[test]
+    fn launch_deadline_reports_unrecovered_x11_windows() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn deadline fixture");
+        let root = child.id();
+        let mut pending = PendingWaylandSession {
+            child,
+            status: None,
+            ownership_root: Some(root),
+        };
+        let mut cleanup = PendingCleanup(Some(&mut pending));
+
+        let error = launch_deadline_error(
+            cleanup.0.as_deref_mut().expect("armed cleanup guard"),
+            20,
+            1,
+        );
+        cleanup.disarm();
+
+        assert!(
+            matches!(error, glass_core::GlassError::Backend(ref message) if message.contains("mapped 1 X11 window")),
+            "{error}"
+        );
+    }
+
+    fn live_process_start_time(pid: u32) -> Result<Option<u64>, String> {
+        let path = format!("/proc/{pid}/stat");
+        let stat = match std::fs::read_to_string(&path) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("read {path}: {error}")),
+        };
+        let (_, fields) = stat
+            .rsplit_once(')')
+            .ok_or_else(|| format!("malformed {path}: missing command terminator"))?;
+        let mut fields = fields.split_whitespace();
+        let state = fields
+            .next()
+            .ok_or_else(|| format!("malformed {path}: missing process state"))?;
+        if state == "Z" {
+            return Ok(None);
+        }
+        let start_time = fields
+            .nth(18)
+            .ok_or_else(|| format!("malformed {path}: missing start time"))?
+            .parse()
+            .map_err(|error| format!("malformed {path}: invalid start time: {error}"))?;
+        Ok(Some(start_time))
+    }
+
+    fn matching_live_processes(identities: &[(u32, u64)]) -> Result<Vec<u32>, String> {
+        identities
+            .iter()
+            .map(|&(pid, start_time)| {
+                live_process_start_time(pid)
+                    .map(|observed| (observed == Some(start_time)).then_some(pid))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|matches| matches.into_iter().flatten().collect())
+    }
+
+    #[test]
+    fn reap_pending_reaps_a_late_reported_separate_session_tree() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let target_pid = dir.path().join("target-pid");
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("setsid sh -c 'sleep 30 & wait' & echo $! > \"$1\"")
+            .arg("sh")
+            .arg(&target_pid)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn compositor fixture");
+        let child_pid = child.id();
+        let pipe = BwrapStatusPipe::new().expect("status pipe");
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", pipe.writer_fd()))
+            .expect("duplicate status writer");
+        let target = (0..100)
+            .find_map(|_| {
+                std::fs::read_to_string(&target_pid)
+                    .ok()
+                    .and_then(|pid| pid.trim().parse().ok())
+                    .or_else(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        None
+                    })
+            })
+            .expect("separate-session target pid");
+        writer
+            .write_all(format!("{{\"child-pid\":{target}}}\n").as_bytes())
+            .expect("buffer status");
+        drop(writer);
+        let mut pending = PendingWaylandSession {
+            child,
+            status: Some(pipe.into_reader()),
+            ownership_root: None,
+        };
+        let mut cleanup = PendingCleanup(Some(&mut pending));
+        let target_tree = (0..300)
+            .find_map(|_| {
+                let tree = glass_proc_linux::proc_tree_pids(target);
+                (tree.len() > 1).then_some(tree).or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    None
+                })
+            })
+            .expect("target fixture must have a descendant");
+        let mut cleanup_tree = glass_proc_linux::proc_tree_pids(child_pid);
+        cleanup_tree.extend(target_tree);
+        cleanup_tree.sort_unstable();
+        cleanup_tree.dedup();
+        // Linux may reuse a PID before this highly concurrent test observes cleanup completion.
+        let cleanup_identities = cleanup_tree
+            .into_iter()
+            .filter_map(|pid| {
+                live_process_start_time(pid)
+                    .expect("inspect live cleanup fixture identity")
+                    .map(|start_time| (pid, start_time))
+            })
+            .collect::<Vec<_>>();
+
+        let outcome = cleanup.reap();
+        cleanup.disarm();
+
+        assert!(outcome.status_error.is_none(), "{:?}", outcome.status_error);
+        // A delivered signal takes effect only when its target is next scheduled.
+        let settle_deadline = std::time::Instant::now() + glass_proc_linux::REAP_GRACE;
+        let survivors = loop {
+            let survivors = matching_live_processes(&cleanup_identities)
+                .expect("inspect cleanup identities after cleanup");
+            if survivors.is_empty() || std::time::Instant::now() >= settle_deadline {
+                break survivors;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(
+            survivors.is_empty(),
+            "cleanup tree survived reaping: {survivors:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor; needs sway >=1.12 and Mesa"]
+    fn open_session_ipc_discovery_stops_at_the_shared_deadline() {
+        let runtime_dir = tempfile::Builder::new()
+            .prefix("glass-wl-deadline.")
+            .tempdir()
+            .expect("private runtime directory");
+        let config = runtime_dir.path().join("sway.cfg");
+        let spec = AppSpec {
+            build: None,
+            run: vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 5_000,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        };
+        std::fs::write(
+            &config,
+            sway_config(&spec, runtime_dir.path(), None, None, &[]).expect("sway config"),
+        )
+        .expect("write sway config");
+        let platform = WaylandPlatform::new().expect("sway >=1.12");
+        let mut command =
+            build_sway_command(&platform.sway, &config, &spec, runtime_dir.path(), None);
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let child = command.spawn().expect("start private sway");
+        let mut pending = PendingWaylandSession {
+            child,
+            status: None,
+            ownership_root: None,
+        };
+        let mut cleanup = PendingCleanup(Some(&mut pending));
+
+        let setup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (socket, ipc_socket) = loop {
+            let socket = find_wayland_socket(runtime_dir.path());
+            let ipc_socket = std::fs::read_dir(runtime_dir.path())
+                .expect("read private runtime directory")
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("sway-ipc.") && name.ends_with(".sock")
+                        })
+                });
+            if let (Some(socket), Some(ipc_socket)) = (socket, ipc_socket) {
+                break (socket, ipc_socket);
+            }
+            assert!(
+                std::time::Instant::now() < setup_deadline,
+                "private sway did not publish both sockets"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        super::Ipc::connect(runtime_dir.path())
+            .expect("published IPC socket must accept connections");
+        std::fs::remove_file(&ipc_socket).expect("unlink IPC socket");
+
+        let budget = std::time::Duration::from_millis(250);
+        let started = std::time::Instant::now();
+        let error = match open_session(&socket, runtime_dir.path(), started + budget) {
+            Ok(_) => panic!("IPC discovery succeeded after its socket was unlinked"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+
+        cleanup.reap();
+        cleanup.disarm();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(150)
+                && elapsed < std::time::Duration::from_millis(900),
+            "session setup ignored its 250ms shared deadline and took {elapsed:?}: {error}"
+        );
+    }
+
+    #[test]
+    fn launch_ready_accepts_status_and_window_just_before_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1);
+
+        assert!(launch_ready(
+            true,
+            true,
+            deadline,
+            deadline - std::time::Duration::from_nanos(1)
+        ));
+    }
+
+    #[test]
+    fn launch_ready_rejects_status_and_window_observed_at_deadline() {
+        let deadline = std::time::Instant::now();
+
+        assert!(!launch_ready(true, true, deadline, deadline));
+    }
+
+    #[test]
+    fn launch_ready_rejects_a_missing_status_or_window() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1);
+        let observed_at = deadline - std::time::Duration::from_nanos(1);
+
+        assert!(!launch_ready(false, true, deadline, observed_at));
+        assert!(!launch_ready(true, false, deadline, observed_at));
+    }
 
     /// A launch spends half its budget waiting for the compositor before suspecting a window was
     /// lost, so a slow app that is merely still starting is not interfered with.

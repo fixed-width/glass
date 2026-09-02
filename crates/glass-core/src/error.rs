@@ -53,6 +53,9 @@ pub enum GlassError {
     #[error("no active session — call glass_start to launch an app first")]
     NoActiveSession,
 
+    #[error("cannot change protected host paths while a session is active")]
+    ProtectedPathsWhileActive,
+
     #[error("app failed to start: {0}")]
     AppNotStarted(String),
 
@@ -315,6 +318,15 @@ pub enum GlassError {
         cleanup: Box<GlassError>,
     },
 
+    /// Both an operation and generic mandatory cleanup failed.
+    #[error("{primary}; cleanup failed while {operation}: {cleanup}")]
+    CleanupFailed {
+        operation: &'static str,
+        #[source]
+        primary: Box<GlassError>,
+        cleanup: Box<GlassError>,
+    },
+
     /// An unchanged failure from work proven not to have dispatched.
     #[error(transparent)]
     BeforeDispatch(Box<GlassError>),
@@ -379,7 +391,8 @@ impl GlassError {
             GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => error.cause(),
             GlassError::AxWriteUnconfirmedCaused { source, .. } => source.cause(),
             GlassError::WindowRestoreFailed { primary, .. } => primary.cause(),
-            GlassError::InputCleanupFailed { primary, .. } => primary.cause(),
+            GlassError::InputCleanupFailed { primary, .. }
+            | GlassError::CleanupFailed { primary, .. } => primary.cause(),
             error => error,
         }
     }
@@ -401,6 +414,9 @@ impl GlassError {
                 primary.set_value_failed_after_writing() || restore.set_value_failed_after_writing()
             }
             GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            }
+            | GlassError::CleanupFailed {
                 primary, cleanup, ..
             } => {
                 primary.set_value_failed_after_writing() || cleanup.set_value_failed_after_writing()
@@ -502,6 +518,19 @@ impl GlassError {
         }
     }
 
+    /// Preserve both a primary operation failure and a mandatory cleanup failure.
+    pub fn cleanup_failed(
+        operation: &'static str,
+        primary: GlassError,
+        cleanup: GlassError,
+    ) -> GlassError {
+        GlassError::CleanupFailed {
+            operation,
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        }
+    }
+
     /// Which of glass's own bounds ended this call, if one did rather than the tool answering.
     ///
     /// The question a backend asks before retrying, before offering a wedged-tool remedy, and
@@ -519,6 +548,9 @@ impl GlassError {
             }
             GlassError::InputCleanupFailed {
                 primary, cleanup, ..
+            }
+            | GlassError::CleanupFailed {
+                primary, cleanup, ..
             } => primary.bound().or_else(|| cleanup.bound()),
             _ => None,
         }
@@ -535,6 +567,9 @@ impl GlassError {
                 primary.bound_owner().or_else(|| restore.bound_owner())
             }
             GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            }
+            | GlassError::CleanupFailed {
                 primary, cleanup, ..
             } => primary.bound_owner().or_else(|| cleanup.bound_owner()),
             _ => None,
@@ -567,6 +602,17 @@ impl GlassError {
                 }
             }
             GlassError::InputCleanupFailed { .. } => Some(BoundDispatch::MayHaveDispatched),
+            GlassError::CleanupFailed {
+                primary, cleanup, ..
+            } => match (primary.bound_dispatch(), cleanup.bound_dispatch()) {
+                (Some(BoundDispatch::MayHaveDispatched), _)
+                | (_, Some(BoundDispatch::MayHaveDispatched)) => {
+                    Some(BoundDispatch::MayHaveDispatched)
+                }
+                (Some(BoundDispatch::NotDispatched), _)
+                | (_, Some(BoundDispatch::NotDispatched)) => Some(BoundDispatch::NotDispatched),
+                (None, None) => None,
+            },
             _ => None,
         }
     }
@@ -589,6 +635,9 @@ impl GlassError {
                 primary.tool_said().or_else(|| restore.tool_said())
             }
             GlassError::InputCleanupFailed {
+                primary, cleanup, ..
+            }
+            | GlassError::CleanupFailed {
                 primary, cleanup, ..
             } => primary.tool_said().or_else(|| cleanup.tool_said()),
             _ => None,
@@ -652,6 +701,22 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_failure_preserves_primary_and_cleanup_metadata() {
+        let error = GlassError::cleanup_failed(
+            "stopping failed launch",
+            GlassError::caller_deadline_elapsed("launch"),
+            GlassError::ToolFailed {
+                call: "reap".into(),
+                said: "survivors".into(),
+            },
+        );
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.tool_said(), Some("survivors"));
+    }
+
+    #[test]
     fn caller_deadline_errors_preserve_dispatch_uncertainty() {
         let error = GlassError::caller_deadline_elapsed("capture");
         assert_eq!(
@@ -704,6 +769,17 @@ mod tests {
     }
 
     #[test]
+    fn generic_cleanup_failure_preserves_dispatch_provenance() {
+        let error = GlassError::cleanup_failed(
+            "stopping launch",
+            GlassError::deadline_not_started("launch"),
+            GlassError::Backend("reap failed".into()),
+        );
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
     fn before_dispatch_preserves_an_ordinary_cause_and_marks_no_dispatch() {
         let error = GlassError::Backend("could not spawn helper".into()).before_dispatch();
 
@@ -711,6 +787,46 @@ mod tests {
         assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
         assert!(
             matches!(error.cause(), GlassError::Backend(message) if message == "could not spawn helper")
+        );
+    }
+
+    #[test]
+    fn before_dispatch_annotates_an_unbounded_generic_cleanup_failure() {
+        let error = GlassError::cleanup_failed(
+            "stopping launch",
+            GlassError::Backend("primary".into()),
+            GlassError::ToolFailed {
+                call: "cleanup".into(),
+                said: " residue ".into(),
+            },
+        )
+        .before_dispatch();
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert_eq!(
+            error.to_string(),
+            "backend error: primary; cleanup failed while stopping launch: backend error: `cleanup` failed:  residue "
+        );
+        assert!(matches!(error.cause(), GlassError::Backend(message) if message == "primary"));
+        assert_eq!(error.tool_said(), Some("residue"));
+        assert_eq!(error.bound(), None);
+        assert_eq!(error.bound_owner(), None);
+        assert!(!error.set_value_failed_after_writing());
+        let GlassError::BeforeDispatch(inner) = error else {
+            panic!("the complete cleanup failure must carry the dispatch annotation");
+        };
+        let GlassError::CleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = *inner
+        else {
+            panic!("the structured cleanup failure must remain intact");
+        };
+        assert_eq!(operation, "stopping launch");
+        assert!(matches!(*primary, GlassError::Backend(message) if message == "primary"));
+        assert!(
+            matches!(*cleanup, GlassError::ToolFailed { call, said } if call == "cleanup" && said == " residue ")
         );
     }
 
@@ -776,6 +892,49 @@ mod tests {
         assert_eq!(
             error.bound_dispatch(),
             Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn after_dispatch_annotates_an_unbounded_generic_cleanup_failure() {
+        let error = GlassError::cleanup_failed(
+            "stopping launch",
+            GlassError::Backend("primary".into()),
+            GlassError::ToolFailed {
+                call: "cleanup".into(),
+                said: " residue ".into(),
+            },
+        )
+        .after_dispatch();
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(
+            error.to_string(),
+            "backend error: primary; cleanup failed while stopping launch: backend error: `cleanup` failed:  residue "
+        );
+        assert!(matches!(error.cause(), GlassError::Backend(message) if message == "primary"));
+        assert_eq!(error.tool_said(), Some("residue"));
+        assert_eq!(error.bound(), None);
+        assert_eq!(error.bound_owner(), None);
+        assert!(!error.set_value_failed_after_writing());
+        let GlassError::AfterDispatch(inner) = error else {
+            panic!("the complete cleanup failure must carry the dispatch annotation");
+        };
+        let GlassError::CleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = *inner
+        else {
+            panic!("the structured cleanup failure must remain intact");
+        };
+        assert_eq!(operation, "stopping launch");
+        assert!(matches!(*primary, GlassError::Backend(message) if message == "primary"));
+        assert!(
+            matches!(*cleanup, GlassError::ToolFailed { call, said } if call == "cleanup" && said == " residue ")
         );
     }
 

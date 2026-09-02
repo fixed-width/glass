@@ -13,7 +13,7 @@ use glass_core::platform::{
     AppSpec, KeyEvent, Platform, PointerEvent, SandboxLevel, WindowGeometry, WindowId, WindowInfo,
     WindowOp,
 };
-use glass_core::{Deadline, GlassError, Result};
+use glass_core::{Deadline, GlassError, HostPathProtectionMode, ProtectedHostPath, Result};
 
 use crate::adoption_log::adoption_line;
 use crate::axwindow;
@@ -109,6 +109,8 @@ pub struct MacosPlatform {
     /// `Drop` must reap it: `Fresh` when `ffi::launch_bundle` started the app (glass terminates
     /// it), `PreExisting` when it was already running (glass leaves it).
     adopted: Option<Adopted>,
+    /// Validated host destinations denied to contained target processes.
+    protected_host_paths: Vec<ProtectedHostPath>,
 }
 
 /// A LaunchServices-adopted app tracked by `start_bundle`'s handoff path, paired with how
@@ -153,6 +155,7 @@ impl MacosPlatform {
             clipboard_route: ClipboardRoute::default(),
             clip: None,
             adopted: None,
+            protected_host_paths: Vec::new(),
         })
     }
 
@@ -378,7 +381,7 @@ impl MacosPlatform {
             mut child,
             clip,
             taps,
-        } = process::spawn(&direct, self.logs.clone())?;
+        } = process::spawn(&direct, self.logs.clone(), &self.protected_host_paths)?;
         let pid = child.id();
         match Self::discover_window(&mut child, pid, spec.timeout_ms) {
             Ok(m) => {
@@ -645,6 +648,15 @@ fn resize_was_refused(
 }
 
 impl Platform for MacosPlatform {
+    fn configure_protected_host_paths(
+        &mut self,
+        paths: &[ProtectedHostPath],
+    ) -> Result<HostPathProtectionMode> {
+        glass_sandbox_macos::profile::validate_protected_paths(paths)?;
+        self.protected_host_paths = paths.to_vec();
+        Ok(HostPathProtectionMode::SandboxRules)
+    }
+
     /// Run the optional build step, spawn the app, then confirm a window appears for its pid
     /// within `spec.timeout_ms` via ScreenCaptureKit's `SCShareableContent` enumeration —
     /// alternated with `child.try_wait()` so a crashed launch fails fast with
@@ -669,7 +681,7 @@ impl Platform for MacosPlatform {
                 mut child,
                 clip,
                 taps,
-            } = process::spawn(spec, self.logs.clone())?;
+            } = process::spawn(spec, self.logs.clone(), &self.protected_host_paths)?;
             let pid = child.id();
             match Self::discover_window(&mut child, pid, spec.timeout_ms) {
                 Ok(m) => {
@@ -1066,6 +1078,43 @@ impl Drop for MacosPlatform {
 mod tests {
     use super::*;
 
+    fn test_platform() -> MacosPlatform {
+        MacosPlatform {
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app_pid: None,
+            child: None,
+            taps: Vec::new(),
+            active_window: None,
+            clipboard_route: ClipboardRoute::default(),
+            clip: None,
+            adopted: None,
+            protected_host_paths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn protected_host_path_configuration_validates_before_storing() {
+        let root = std::env::temp_dir().join(format!(
+            "glass-macos-platform-protected-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let lease = root.join("lease");
+        std::fs::write(&lease, "lease").unwrap();
+        let paths = [
+            ProtectedHostPath::directory(&root),
+            ProtectedHostPath::file(&lease),
+        ];
+        let mut platform = test_platform();
+
+        let mode = platform.configure_protected_host_paths(&paths).unwrap();
+
+        std::fs::remove_file(lease).unwrap();
+        std::fs::remove_dir(root).unwrap();
+        assert_eq!(mode, HostPathProtectionMode::SandboxRules);
+        assert_eq!(platform.protected_host_paths, paths);
+    }
+
     #[test]
     fn drain_logs_takes_then_empties() {
         // Build without preflight (which would require grants) by constructing the struct
@@ -1079,6 +1128,7 @@ mod tests {
             clipboard_route: ClipboardRoute::default(),
             clip: None,
             adopted: None,
+            protected_host_paths: Vec::new(),
         };
         assert_eq!(p.drain_logs().len(), 1);
         assert!(p.drain_logs().is_empty());
@@ -1095,6 +1145,7 @@ mod tests {
             clipboard_route: ClipboardRoute::default(),
             clip: None,
             adopted: None,
+            protected_host_paths: Vec::new(),
         };
         assert_eq!(p.app_pid(), Some(42));
     }
@@ -1113,6 +1164,7 @@ mod tests {
             clipboard_route: ClipboardRoute::default(),
             clip: None,
             adopted: None,
+            protected_host_paths: Vec::new(),
         };
         assert!(p.stop_app().is_ok());
         assert!(p.stop_app().is_ok(), "a second call must also be Ok");
@@ -1133,6 +1185,7 @@ mod tests {
             clipboard_route: ClipboardRoute::default(),
             clip: None,
             adopted: None,
+            protected_host_paths: Vec::new(),
         };
         assert!(p.stop_app().is_ok());
         assert_eq!(p.active_window, None);
@@ -1153,6 +1206,7 @@ mod tests {
             clipboard_route: ClipboardRoute::Private("tech.fixedwidth.glass.clip.42.1.1".into()),
             clip: None,
             adopted: None,
+            protected_host_paths: Vec::new(),
         };
         assert!(p.stop_app().is_ok());
         assert_eq!(p.clipboard_route, ClipboardRoute::default());
@@ -1174,6 +1228,7 @@ mod tests {
                 name: "tech.fixedwidth.glass.clip.42.1.1".into(),
             }),
             adopted: None,
+            protected_host_paths: Vec::new(),
         };
         assert!(p.stop_app().is_ok());
         assert!(p.clip.is_none());
@@ -1197,6 +1252,7 @@ mod tests {
                 pid: 999_999,
                 disposition: crate::bundle::Disposition::Fresh,
             }),
+            protected_host_paths: Vec::new(),
         };
         assert!(p.stop_app().is_ok());
         assert!(p.adopted.is_none());
@@ -1221,6 +1277,7 @@ mod tests {
                 pid: 999_999,
                 disposition: crate::bundle::Disposition::PreExisting,
             }),
+            protected_host_paths: Vec::new(),
         };
         assert!(p.stop_app().is_ok());
         assert!(p.adopted.is_none());
@@ -1242,6 +1299,7 @@ mod tests {
             clipboard_route: ClipboardRoute::default(),
             clip: None,
             adopted: None,
+            protected_host_paths: Vec::new(),
         };
         let spec = AppSpec {
             build: None,
@@ -1291,6 +1349,7 @@ mod tests {
             clipboard_route: ClipboardRoute::Unsupported,
             clip: None,
             adopted: None,
+            protected_host_paths: Vec::new(),
         };
         assert!(matches!(p.get_clipboard(), Err(GlassError::Unsupported(_))));
         assert!(matches!(
@@ -1314,6 +1373,7 @@ mod tests {
             clipboard_route: ClipboardRoute::RealGeneral,
             clip: None,
             adopted: None,
+            protected_host_paths: Vec::new(),
         };
         assert!(!matches!(
             p.get_clipboard(),

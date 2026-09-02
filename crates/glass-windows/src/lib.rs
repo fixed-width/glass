@@ -18,6 +18,8 @@ pub mod containment; // Windows containment provider seam (pure config is host-t
 pub mod discovery; // pure window-discovery poll-loop decision — cross-platform, host-tested
 pub mod doctor; // pure check-mapping cross-platform; Windows fact-gathering is cfg(windows)
 pub mod dpi; // pure coordinate math — cross-platform, unit-tested on any host
+#[cfg(windows)]
+mod host_fs;
 pub mod jobcfg; // pure SandboxLevel -> job-limit descriptor — unit-tested on any host
 pub mod jobpids; // pure JOBOBJECT_BASIC_PROCESS_ID_LIST byte parser — host-tested
 pub mod logtap; // pure line splitting — cross-platform, host-tested; the reader is cfg(windows)
@@ -26,6 +28,15 @@ pub mod onbox_support; // env-resolved paths shared by the on-box examples + tes
 pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on any host
 pub mod teardown; // pure graceful-close decisions — cross-platform, unit-tested on any host
 pub mod vkmap; // pure named-keysym->VK map — cross-platform, host-tested
+
+#[cfg(windows)]
+pub use host_fs::{
+    DirectoryEntryHandle, DirectoryEntryRecord, HostFsError, directory_entry_handles,
+    directory_entry_names, directory_entry_records, file_matches_path_no_reparse,
+    open_deletable_directory_no_reparse, open_directory_beneath, open_directory_entry,
+    open_directory_no_reparse, open_entry_child, open_file_beneath, open_file_child,
+    path_has_private_dacl, remove_by_handle, restrict_path_to_current_user, same_file_object,
+};
 
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
 pub const BACKEND: &str = "windows";
@@ -162,8 +173,8 @@ mod backend {
     use glass_core::frame::{Frame, Region};
     use glass_core::logbuf::Stream;
     use glass_core::platform::{
-        AppSpec, KeyEvent, Platform, PointerEvent, WindowGeometry, WindowHint, WindowId,
-        WindowInfo, WindowOp,
+        AppSpec, HostPathProtectionMode, KeyEvent, Platform, PointerEvent, ProtectedHostPath,
+        WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
     };
     use glass_core::{GlassError, Result};
 
@@ -190,6 +201,7 @@ mod backend {
         /// [`crate::util::raw_to_hwnd`] at the point of use. `None` until window
         /// discovery or `select_window` sets it.
         active_hwnd: Option<isize>,
+        protected_host_paths: Vec<ProtectedHostPath>,
     }
 
     impl WindowsPlatform {
@@ -199,6 +211,7 @@ mod backend {
                 app: None,
                 logs: Arc::new(Mutex::new(Vec::new())),
                 active_hwnd: None,
+                protected_host_paths: Vec::new(),
             })
         }
 
@@ -277,11 +290,20 @@ mod backend {
     }
 
     impl Platform for WindowsPlatform {
+        fn configure_protected_host_paths(
+            &mut self,
+            paths: &[ProtectedHostPath],
+        ) -> Result<HostPathProtectionMode> {
+            self.protected_host_paths = crate::containment::validate_protected_host_paths(paths)?;
+            Ok(HostPathProtectionMode::SandboxRules)
+        }
+
         fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
             // Resolve the containment provider before doing any work. `off` → Unconfined
             // (today's direct spawn); `default`/`strict` require an in-OS provider and
             // fail closed while Sandboxie availability is stubbed false (a later task).
-            let containment = crate::containment::resolve_containment(spec)?;
+            let containment =
+                crate::containment::resolve_containment(spec, &self.protected_host_paths)?;
             containment.run_build(spec)?;
             // Validate a usable display before launching — reject a degenerate 0x0
             // (headless / Session-0) where no window can ever appear.

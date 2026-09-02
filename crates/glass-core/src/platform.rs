@@ -6,6 +6,49 @@ use crate::frame::{Frame, Region};
 use crate::keys::Modifier;
 use crate::logbuf::Stream;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtectedHostPathKind {
+    Directory,
+    File,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProtectedHostPath {
+    pub path: PathBuf,
+    pub kind: ProtectedHostPathKind,
+}
+
+impl ProtectedHostPath {
+    pub fn directory(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            kind: ProtectedHostPathKind::Directory,
+        }
+    }
+
+    pub fn file(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            kind: ProtectedHostPathKind::File,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HostPathProtectionMode {
+    #[default]
+    SandboxRules,
+    SeparateFilesystem,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostPathAccess {
+    NoActiveTarget,
+    DeniedBySandbox,
+    NotGuaranteedSandboxOff,
+    HostFilesystemUnreachable,
+}
+
 /// The wall-clock budget the whole of teardown gets when the *process* is going away — the
 /// server's stdin closed or a termination signal arrived. `glass-mcp`'s shutdown path spends it
 /// on `Glass::shutdown` and then exits regardless, so anything a [`Platform::stop_app`] impl was
@@ -293,6 +336,19 @@ pub struct AppSpec {
 /// The OS/display-server seam. Backends (e.g. `glass-x11`) implement this; no
 /// glass-core code depends on a concrete backend. Must stay object-safe.
 pub trait Platform {
+    fn configure_protected_host_paths(
+        &mut self,
+        paths: &[ProtectedHostPath],
+    ) -> Result<HostPathProtectionMode> {
+        if paths.is_empty() {
+            Ok(HostPathProtectionMode::SandboxRules)
+        } else {
+            Err(GlassError::SandboxUnavailable(
+                "this backend does not support protected host paths".into(),
+            ))
+        }
+    }
+
     /// Run the optional build step, spawn the app, locate its window, and
     /// return the window's geometry.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry>;

@@ -5,12 +5,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, BoundDispatch, BoundKind, Deadline, Frame, GlassError, KeyEvent, Platform,
-    PointerEvent, Region, Result, Stream, TEARDOWN_BUDGET, Whose, WindowGeometry, WindowHint,
-    WindowId, WindowInfo, WindowOp,
+    AppSpec, BoundDispatch, BoundKind, Deadline, Frame, GlassError, HostPathProtectionMode,
+    KeyEvent, Platform, PointerEvent, ProtectedHostPath, Region, Result, SandboxLevel, Stream,
+    TEARDOWN_BUDGET, Whose, WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
 };
 use glass_pipe_unix::LineTap;
-use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, proc_tree_pids};
+use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, ProcessIdentitySet, proc_tree_pids};
+use glass_sandbox_linux::{BwrapStatusPipe, BwrapStatusReader};
 use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
 use x11rb::errors::ReplyError;
@@ -282,7 +283,8 @@ pub struct X11Platform {
     screen_num: usize,
     root: Window,
     display: String,
-    child: Option<Child>,
+    child: Option<LaunchedChild>,
+    protected_host_paths: Vec<ProtectedHostPath>,
     window: Option<Window>,
     logs: LogSink,
     /// The launched app's stdout/stderr readers, dropped in `kill_child`. The app's write ends
@@ -298,6 +300,83 @@ pub struct X11Platform {
     clipboard_owner: Option<crate::clipboard::ClipboardOwner>,
     #[cfg(test)]
     window_process_tree_delay: Duration,
+}
+
+struct ContainedChild {
+    child: Child,
+    status: BwrapStatusReader,
+}
+
+enum LaunchedChild {
+    Direct(Child),
+    Contained { child: Child, host_root: u32 },
+}
+
+impl LaunchedChild {
+    fn child(&self) -> &Child {
+        match self {
+            Self::Direct(child) | Self::Contained { child, .. } => child,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        match self {
+            Self::Direct(child) | Self::Contained { child, .. } => child,
+        }
+    }
+
+    fn ownership_root(&self) -> u32 {
+        match self {
+            Self::Direct(child) => child.id(),
+            Self::Contained { host_root, .. } => *host_root,
+        }
+    }
+
+    fn into_child(self) -> Child {
+        match self {
+            Self::Direct(child) | Self::Contained { child, .. } => child,
+        }
+    }
+}
+
+fn pid_matches(window_pid: u32, identities: &ProcessIdentitySet) -> bool {
+    identities
+        .matching_pids()
+        .binary_search(&window_pid)
+        .is_ok()
+}
+
+fn require_contained_root(child: &mut ContainedChild, deadline: Instant) -> Result<u32> {
+    loop {
+        match child.status.poll_child_pid() {
+            Ok(Some(pid)) => return Ok(pid),
+            Ok(None) => {}
+            Err(error) => {
+                glass_proc_linux::reap_group(&mut child.child, glass_proc_linux::REAP_GRACE);
+                return Err(GlassError::SandboxUnavailable(format!(
+                    "could not read bubblewrap child status: {error}"
+                )));
+            }
+        }
+        if Instant::now() >= deadline {
+            glass_proc_linux::reap_group(&mut child.child, glass_proc_linux::REAP_GRACE);
+            return Err(GlassError::SandboxUnavailable(
+                "bubblewrap did not report a contained child PID".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn dispatch_launch<T, C>(
+    timeout_ms: u64,
+    origin: Instant,
+    context: &mut C,
+    dispatch: impl FnOnce(&mut C, Instant) -> Result<T>,
+    cleanup: impl FnOnce(&mut C),
+) -> Result<T> {
+    let deadline = origin + Duration::from_millis(timeout_ms.max(1));
+    dispatch(context, deadline).inspect_err(|_| cleanup(context))
 }
 
 /// What display the X11 backend should use, derived from `GLASS_DISPLAY`.
@@ -410,6 +489,7 @@ impl X11Platform {
             root,
             display,
             child: None,
+            protected_host_paths: Vec::new(),
             window: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             taps: Vec::new(),
@@ -545,7 +625,7 @@ impl X11Platform {
     /// Every mapped top-level window matching the app's PID set (the `WindowHint`
     /// is a startup disambiguator, not a list filter). Dedups `_NET_CLIENT_LIST` ∪
     /// root children, mirroring `scan_for_window`.
-    fn scan_all_windows(&self, pids: &[u32]) -> Result<Vec<Window>> {
+    fn scan_all_windows(&self, identities: &ProcessIdentitySet) -> Result<Vec<Window>> {
         let pid_atom = self.intern(b"_NET_WM_PID")?;
         let client_list_atom = self.intern(b"_NET_CLIENT_LIST")?;
         let root_children = self
@@ -565,14 +645,14 @@ impl X11Platform {
             if !seen.insert(win) {
                 continue;
             }
-            if self.window_matches(win, pids, pid_atom, None)? {
+            if self.window_matches(win, identities, pid_atom, None)? {
                 out.push(win);
             }
         }
         Ok(out)
     }
 
-    fn spawn(&mut self, spec: &AppSpec) -> Result<()> {
+    fn spawn(&mut self, spec: &AppSpec, deadline: Instant) -> Result<()> {
         // `start_app` sets `self.dbus` before calling `spawn`, so reading it here
         // injects the private session-bus address into the launched app's env.
         // For sandboxed launches, also bind the private bus dir into bwrap so the
@@ -581,7 +661,26 @@ impl X11Platform {
             addr: b.session_bus_address(),
             dir: b.runtime_dir(),
         });
-        let mut cmd = build_command(spec, &self.display, a11y);
+        let status_pipe = match spec.sandbox {
+            SandboxLevel::Off => None,
+            SandboxLevel::Default | SandboxLevel::Strict => {
+                Some(BwrapStatusPipe::new().map_err(|error| {
+                    GlassError::SandboxUnavailable(format!(
+                        "could not create bubblewrap status pipe: {error}"
+                    ))
+                })?)
+            }
+        };
+        let mut cmd = build_command(
+            spec,
+            &self.display,
+            a11y,
+            status_pipe.as_ref().map(BwrapStatusPipe::writer_fd),
+            match spec.sandbox {
+                SandboxLevel::Off => &[],
+                SandboxLevel::Default | SandboxLevel::Strict => &self.protected_host_paths,
+            },
+        )?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
             .spawn()
@@ -590,7 +689,7 @@ impl X11Platform {
         // silently stop capturing it, the fallback this crate's contract forbids.
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
-        self.taps = vec![
+        let taps = vec![
             tap_or_reap(
                 stdout,
                 Stream::Stdout,
@@ -608,7 +707,21 @@ impl X11Platform {
                 spec,
             )?,
         ];
-        self.child = Some(child);
+        self.child = Some(match status_pipe {
+            None => LaunchedChild::Direct(child),
+            Some(pipe) => {
+                let mut contained = ContainedChild {
+                    child,
+                    status: pipe.into_reader(),
+                };
+                let host_root = require_contained_root(&mut contained, deadline)?;
+                LaunchedChild::Contained {
+                    child: contained.child,
+                    host_root,
+                }
+            }
+        });
+        self.taps = taps;
         Ok(())
     }
 
@@ -649,7 +762,8 @@ impl X11Platform {
         // `scan_all_windows` is the same enumeration `list_windows` uses, so the set asked to
         // close is exactly the set glass reports as the app's windows — mapped top-levels whose
         // `_NET_WM_PID` is in the launched process tree.
-        let wins = match self.scan_all_windows(&proc_tree_pids(root_pid)) {
+        let identities = ProcessIdentitySet::from_host_root(root_pid);
+        let wins = match self.scan_all_windows(&identities) {
             Ok(wins) => wins,
             Err(e) => return Asked::blocked(format!("glass could not enumerate its windows: {e}")),
         };
@@ -782,12 +896,14 @@ impl X11Platform {
     }
 
     fn kill_child(&mut self) {
-        if let Some(mut child) = self.child.take() {
+        if let Some(launched) = self.child.take() {
+            let ownership_root = launched.ownership_root();
+            let mut child = launched.into_child();
             // Snapshot the launch's process tree before any of it exits. Waiting on the child
             // reaps it, which reparents its descendants to init and takes them out of the
             // subtree — after that there is no way to enumerate them again.
             let tree = proc_tree_pids(child.id());
-            let asked = self.request_close_bounded(child.id());
+            let asked = self.request_close_bounded(ownership_root);
             let closed_itself = asked.await_child_exit(&mut child, CLOSE_GRACE);
             // The sweep runs either way: an app that closed itself can still have forked children
             // it never cleaned up, and on the graceful path the signals land on processes that
@@ -818,24 +934,28 @@ impl X11Platform {
     /// process. The actual app is bwrap's child. `proc_tree_pids` collects the
     /// full descendant set so `_NET_WM_PID` matching works for both direct
     /// launches and bwrap-wrapped launches.
-    fn discover_window(&mut self, spec: &AppSpec) -> Result<Window> {
-        let root_pid = self.child.as_ref().map(|c| c.id());
+    fn discover_window(&mut self, spec: &AppSpec, deadline: Instant) -> Result<Window> {
+        let root_pid = self.child.as_ref().map(LaunchedChild::ownership_root);
         let pid_atom = self.intern(b"_NET_WM_PID")?;
         let client_list_atom = self.intern(b"_NET_CLIENT_LIST")?;
 
-        let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
         loop {
             // Re-collect the pid set each iteration: a sandboxed launch's bwrap
             // child (the real app) appears in /proc shortly after bwrap starts.
-            let pids: Vec<u32> = root_pid.map(proc_tree_pids).unwrap_or_default();
-            if let Some(win) =
-                self.scan_for_window(&pids, pid_atom, client_list_atom, spec.window_hint.as_ref())?
-            {
+            let identities = root_pid
+                .map(ProcessIdentitySet::from_host_root)
+                .unwrap_or_default();
+            if let Some(win) = self.scan_for_window(
+                &identities,
+                pid_atom,
+                client_list_atom,
+                spec.window_hint.as_ref(),
+            )? {
                 self.window = Some(win);
                 return Ok(win);
             }
             if let Some(child) = self.child.as_mut()
-                && let Ok(Some(status)) = child.try_wait()
+                && let Ok(Some(status)) = child.child_mut().try_wait()
             {
                 return Err(GlassError::app_exited_during_discovery(
                     status.code(),
@@ -851,7 +971,7 @@ impl X11Platform {
 
     fn scan_for_window(
         &self,
-        pids: &[u32],
+        identities: &ProcessIdentitySet,
         pid_atom: Atom,
         client_list_atom: Atom,
         hint: Option<&WindowHint>,
@@ -875,7 +995,7 @@ impl X11Platform {
             if !seen.insert(win) {
                 continue;
             }
-            if self.window_matches(win, pids, pid_atom, hint)? {
+            if self.window_matches(win, identities, pid_atom, hint)? {
                 return Ok(Some(win));
             }
         }
@@ -896,7 +1016,7 @@ impl X11Platform {
     fn window_matches(
         &self,
         win: Window,
-        pids: &[u32],
+        identities: &ProcessIdentitySet,
         pid_atom: Atom,
         hint: Option<&WindowHint>,
     ) -> Result<bool> {
@@ -910,14 +1030,14 @@ impl X11Platform {
         if !mapped {
             return Ok(false);
         }
-        if !pids.is_empty()
+        if !identities.matching_pids().is_empty()
             && let Some(reply) = self
                 .conn
                 .get_property(false, win, pid_atom, AtomEnum::CARDINAL, 0, 1)
                 .ok()
                 .and_then(|c| c.reply().ok())
             && let Some(win_pid) = reply.value32().and_then(|mut v| v.next())
-            && pids.contains(&win_pid)
+            && pid_matches(win_pid, identities)
         {
             return Ok(true);
         }
@@ -1351,6 +1471,15 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
 }
 
 impl Platform for X11Platform {
+    fn configure_protected_host_paths(
+        &mut self,
+        paths: &[ProtectedHostPath],
+    ) -> Result<HostPathProtectionMode> {
+        glass_sandbox_linux::validate_protected_paths(paths)?;
+        self.protected_host_paths = paths.to_vec();
+        Ok(HostPathProtectionMode::SandboxRules)
+    }
+
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         ensure_sandbox_available(spec.sandbox, glass_sandbox_linux::availability)?;
         glass_sandbox_linux::run_build(spec)?;
@@ -1369,12 +1498,19 @@ impl Platform for X11Platform {
         } else {
             None
         };
-        if let Err(e) = self.spawn(spec) {
-            self.kill_child(); // reap the private bus (and any child) on a failed spawn
-            return Err(e);
-        }
+        let launch_origin = Instant::now();
+        let deadline = dispatch_launch(
+            spec.timeout_ms,
+            launch_origin,
+            self,
+            |platform, deadline| {
+                platform.spawn(spec, deadline)?;
+                Ok(deadline)
+            },
+            X11Platform::kill_child,
+        )?;
         match self
-            .discover_window(spec)
+            .discover_window(spec, deadline)
             .and_then(|_| self.window_geometry())
         {
             Ok(geo) => {
@@ -1429,13 +1565,13 @@ impl Platform for X11Platform {
     ) -> Result<Frame> {
         run_x11_call_by(deadline, "window capture", |dispatch| {
             // Validate `id` without retargeting the active window.
-            let pids: Vec<u32> = self
+            let identities = self
                 .child
                 .as_ref()
-                .map(|c| proc_tree_pids(c.id()))
+                .map(|child| ProcessIdentitySet::from_host_root(child.ownership_root()))
                 .unwrap_or_default();
             let target = id.0 as Window;
-            if !self.scan_all_windows(&pids)?.contains(&target) {
+            if !self.scan_all_windows(&identities)?.contains(&target) {
                 return Err(GlassError::WindowNotFound);
             }
             let geo = self.geometry_of(target)?;
@@ -1657,10 +1793,10 @@ impl Platform for X11Platform {
     fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
         self.run_window_call_by(deadline, "X11 window list", |platform, dispatch| {
             platform.require_window()?; // no active app -> WindowNotFound, not an empty list
-            let pids: Vec<u32> = platform
+            let identities = platform
                 .child
                 .as_ref()
-                .map(|c| proc_tree_pids(c.id()))
+                .map(|child| ProcessIdentitySet::from_host_root(child.ownership_root()))
                 .unwrap_or_default();
             #[cfg(test)]
             std::thread::sleep(platform.window_process_tree_delay);
@@ -1670,7 +1806,7 @@ impl Platform for X11Platform {
             let active = platform.window;
             dispatch.mark();
             let mut out = Vec::new();
-            for win in platform.scan_all_windows(&pids)? {
+            for win in platform.scan_all_windows(&identities)? {
                 out.push(WindowInfo {
                     id: WindowId(win as u64),
                     title: platform.window_name(win),
@@ -1685,10 +1821,10 @@ impl Platform for X11Platform {
 
     fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
         self.run_window_call_by(deadline, "X11 window selection", |platform, dispatch| {
-            let pids: Vec<u32> = platform
+            let identities = platform
                 .child
                 .as_ref()
-                .map(|c| proc_tree_pids(c.id()))
+                .map(|child| ProcessIdentitySet::from_host_root(child.ownership_root()))
                 .unwrap_or_default();
             #[cfg(test)]
             std::thread::sleep(platform.window_process_tree_delay);
@@ -1697,7 +1833,7 @@ impl Platform for X11Platform {
             }
             let target = id.0 as Window;
             dispatch.mark();
-            if !platform.scan_all_windows(&pids)?.contains(&target) {
+            if !platform.scan_all_windows(&identities)?.contains(&target) {
                 return Err(GlassError::WindowNotFound);
             }
             let previous = platform.window;
@@ -1729,7 +1865,7 @@ impl Platform for X11Platform {
     }
 
     fn app_pid(&self) -> Option<u32> {
-        self.child.as_ref().map(|c| c.id())
+        self.child.as_ref().map(|child| child.child().id())
     }
 
     /// The app's full process subtree, not just the spawned child. For a
@@ -1740,7 +1876,9 @@ impl Platform for X11Platform {
     /// launch. Mirrors the `proc_tree_pids` set used by window discovery.
     fn app_pids(&self) -> Vec<u32> {
         match &self.child {
-            Some(c) => proc_tree_pids(c.id()),
+            Some(child) => ProcessIdentitySet::from_host_root(child.ownership_root())
+                .matching_pids()
+                .to_vec(),
             None => Vec::new(),
         }
     }
@@ -1837,15 +1975,265 @@ fn button_number(button: glass_core::MouseButton) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        X11DeadlineWatch, X11Dispatch, hint_matches, legacy_window_selection,
-        modifier_keycodes_dispatched, rollback_bounded_window_selection, run_clicks_by,
+        ContainedChild, LaunchedChild, X11DeadlineWatch, X11Dispatch, dispatch_launch,
+        hint_matches, legacy_window_selection, modifier_keycodes_dispatched, pid_matches,
+        require_contained_root, rollback_bounded_window_selection, run_clicks_by,
         run_scroll_buttons_by, run_x11_call_by, run_x11_type_by,
     };
     use glass_core::{
         BoundDispatch, BoundKind, Deadline, GlassError, Result, TypeSink, Whose, WindowHint,
     };
     use std::cell::{Cell, RefCell};
+    use std::io::Write as _;
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
+
+    struct LaunchedCleanup(LaunchedChild);
+
+    impl Drop for LaunchedCleanup {
+        fn drop(&mut self) {
+            glass_proc_linux::reap_group(self.0.child_mut(), glass_proc_linux::REAP_GRACE);
+        }
+    }
+
+    struct DelayedDescendantArtifacts {
+        directory: tempfile::TempDir,
+    }
+
+    impl DelayedDescendantArtifacts {
+        fn new() -> Self {
+            Self {
+                directory: tempfile::tempdir().expect("create delayed-descendant artifacts"),
+            }
+        }
+
+        fn directory(&self) -> &std::path::Path {
+            self.directory.path()
+        }
+
+        fn readiness(&self) -> std::path::PathBuf {
+            self.directory.path().join("readiness")
+        }
+
+        fn staging(&self) -> std::path::PathBuf {
+            self.directory.path().join("readiness.tmp")
+        }
+    }
+
+    #[test]
+    fn delayed_descendant_artifacts_are_removed_during_unwinding() {
+        let owned_paths = RefCell::new(None);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let artifacts = DelayedDescendantArtifacts::new();
+            let paths = (
+                artifacts.directory().to_path_buf(),
+                artifacts.readiness().to_path_buf(),
+                artifacts.staging().to_path_buf(),
+            );
+            std::fs::write(&paths.1, "ready").expect("write published readiness");
+            std::fs::write(&paths.2, "staging").expect("write staging readiness");
+            *owned_paths.borrow_mut() = Some(paths);
+            panic!("force artifact cleanup");
+        }));
+
+        assert!(panic.is_err());
+        let (directory, readiness, staging) = owned_paths
+            .into_inner()
+            .expect("paths recorded before unwinding");
+        assert!(!directory.exists());
+        assert!(!readiness.exists());
+        assert!(!staging.exists());
+    }
+
+    struct ContainedCleanup(ContainedChild);
+
+    impl Drop for ContainedCleanup {
+        fn drop(&mut self) {
+            glass_proc_linux::reap_group(&mut self.0.child, glass_proc_linux::REAP_GRACE);
+        }
+    }
+
+    #[test]
+    fn namespaced_net_wm_pid_matches_the_host_process_tree() {
+        let identities = glass_proc_linux::ProcessIdentitySet::from_pairs([(4242, Some(2))]);
+        assert!(pid_matches(2, &identities));
+        assert!(pid_matches(4242, &identities));
+        assert!(!pid_matches(9, &identities));
+    }
+
+    #[test]
+    fn a_contained_launch_uses_the_reported_host_root_for_ownership() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ownership fixture");
+        let launched = LaunchedCleanup(LaunchedChild::Contained {
+            child,
+            host_root: 42_424,
+        });
+
+        assert_eq!(launched.0.ownership_root(), 42_424);
+    }
+
+    #[test]
+    fn contained_status_returns_the_reported_child_pid() {
+        let pipe = glass_sandbox_linux::BwrapStatusPipe::new().expect("status pipe");
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", pipe.writer_fd()))
+            .expect("duplicate status writer");
+        writer
+            .write_all(b"{\"child-pid\":42424}\n")
+            .expect("write status");
+        drop(writer);
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn status fixture");
+        let mut contained = ContainedCleanup(ContainedChild {
+            child,
+            status: pipe.into_reader(),
+        });
+
+        let reported =
+            require_contained_root(&mut contained.0, Instant::now() + Duration::from_secs(1))
+                .expect("valid status");
+
+        assert_eq!(reported, 42_424);
+    }
+
+    #[test]
+    fn expired_contained_status_is_rejected_and_reaped() {
+        let pipe = glass_sandbox_linux::BwrapStatusPipe::new().expect("status pipe");
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn status fixture");
+        let pid = child.id();
+        let mut contained = ContainedCleanup(ContainedChild {
+            child,
+            status: pipe.into_reader(),
+        });
+
+        let error = require_contained_root(&mut contained.0, Instant::now())
+            .expect_err("expired status wait must fail");
+
+        assert!(matches!(error, GlassError::SandboxUnavailable(_)));
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn a_zero_timeout_reaches_launch_dispatch_before_timeout_cleanup() {
+        let origin = Instant::now();
+        let events = RefCell::new(Vec::new());
+
+        let error = dispatch_launch(
+            0,
+            origin,
+            &mut (),
+            |(), deadline| {
+                events.borrow_mut().push("dispatch");
+                assert_eq!(deadline, origin + Duration::from_millis(1));
+                Err::<(), _>(GlassError::Timeout(0))
+            },
+            |()| events.borrow_mut().push("cleanup"),
+        )
+        .expect_err("the controlled dispatch reports timeout");
+
+        assert!(matches!(error, GlassError::Timeout(0)));
+        assert_eq!(*events.borrow(), ["dispatch", "cleanup"]);
+    }
+
+    #[test]
+    fn later_identity_snapshot_discovers_a_descendant_created_after_launch() {
+        let artifacts = DelayedDescendantArtifacts::new();
+        let readiness = artifacts.readiness();
+        let child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "sleep 5 & original=$!; sleep 0.8 & delay=$!; printf '%s %s\n' \"$original\" \"$delay\" > \"${READY_FILE}.tmp\"; mv \"${READY_FILE}.tmp\" \"$READY_FILE\"; wait \"$delay\"; kill \"$original\"; wait \"$original\" 2>/dev/null; sleep 5 & wait",
+            ])
+            .env("READY_FILE", &readiness)
+            .process_group(0)
+            .spawn()
+            .expect("spawn delayed-descendant fixture");
+        let launched = LaunchedCleanup(LaunchedChild::Direct(child));
+        let root = launched.0.ownership_root();
+        let readiness_deadline = Instant::now() + Duration::from_secs(3);
+        let ready_pids = loop {
+            if let Ok(contents) = std::fs::read_to_string(&readiness) {
+                break contents
+                    .split_whitespace()
+                    .map(|pid| pid.parse::<u32>().expect("readiness PID is numeric"))
+                    .collect::<Vec<_>>();
+            }
+            assert!(
+                Instant::now() < readiness_deadline,
+                "fixture did not publish readiness within 3s at {}",
+                readiness.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            ready_pids.len(),
+            2,
+            "readiness must name both pre-delay children"
+        );
+
+        let baseline_deadline = Instant::now() + Duration::from_secs(3);
+        let initial = loop {
+            let identities = glass_proc_linux::ProcessIdentitySet::from_host_root(root);
+            if ready_pids
+                .iter()
+                .all(|pid| identities.host_pids().contains(pid))
+            {
+                break identities;
+            }
+            assert!(
+                Instant::now() < baseline_deadline,
+                "pre-delay children did not enter the baseline within 3s; ready PIDs: {ready_pids:?}, latest identities: {:?}",
+                identities.host_pids()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let replacement_deadline = Instant::now() + Duration::from_secs(3);
+        let refreshed = loop {
+            let identities = glass_proc_linux::ProcessIdentitySet::from_host_root(root);
+            if identities
+                .host_pids()
+                .iter()
+                .any(|pid| !initial.host_pids().contains(pid))
+            {
+                break identities;
+            }
+            assert!(
+                Instant::now() < replacement_deadline,
+                "no new descendant appeared within 3s; initial identities: {:?}, latest identities: {:?}",
+                initial.host_pids(),
+                identities.host_pids()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            refreshed
+                .host_pids()
+                .iter()
+                .any(|pid| !initial.host_pids().contains(pid)),
+            "refreshed identities did not include a newly created descendant"
+        );
+    }
 
     #[test]
     fn modifier_and_selection_helpers_distinguish_empty_and_bounded_cases() {
@@ -2289,6 +2677,37 @@ mod display_tests {
     use super::*;
     use crate::testx::TestX;
 
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn valid_protected_paths_are_enforced_with_sandbox_rules() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let protected = tempfile::tempdir().expect("protected directory");
+
+        let mode = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(protected.path())])
+            .expect("valid protected path");
+
+        assert_eq!(mode, HostPathProtectionMode::SandboxRules);
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn a_missing_protected_path_is_rejected() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let missing = tempfile::tempdir()
+            .expect("temporary parent")
+            .path()
+            .join("missing");
+
+        let error = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(missing)])
+            .expect_err("a nonexistent protected path cannot be enforced");
+
+        assert!(matches!(error, GlassError::SandboxUnavailable(_)));
+    }
+
     /// A pid no window on a fresh private display can be carrying.
     const OTHER_PID: u32 = 999_999;
 
@@ -2460,12 +2879,22 @@ mod display_tests {
         let pid_atom = plat.intern(b"_NET_WM_PID").expect("intern");
         let win = x.window().owned_by(4242).create();
         assert!(
-            plat.window_matches(win, &[4242], pid_atom, None)
-                .expect("match")
+            plat.window_matches(
+                win,
+                &ProcessIdentitySet::from_pairs([(4242, None)]),
+                pid_atom,
+                None
+            )
+            .expect("match")
         );
         assert!(
             !plat
-                .window_matches(win, &[OTHER_PID], pid_atom, None)
+                .window_matches(
+                    win,
+                    &ProcessIdentitySet::from_pairs([(OTHER_PID, None)]),
+                    pid_atom,
+                    None
+                )
                 .expect("match"),
             "another process's window is not the app's"
         );
@@ -2482,7 +2911,12 @@ mod display_tests {
         let hidden = x.window().owned_by(4242).unmapped().create();
         assert!(
             !plat
-                .window_matches(hidden, &[4242], pid_atom, None)
+                .window_matches(
+                    hidden,
+                    &ProcessIdentitySet::from_pairs([(4242, None)]),
+                    pid_atom,
+                    None
+                )
                 .expect("match")
         );
     }
@@ -2500,7 +2934,7 @@ mod display_tests {
             class: None,
         };
         assert!(
-            plat.window_matches(win, &[], pid_atom, Some(&hint))
+            plat.window_matches(win, &ProcessIdentitySet::default(), pid_atom, Some(&hint))
                 .expect("match")
         );
         let wrong = WindowHint {
@@ -2509,7 +2943,7 @@ mod display_tests {
         };
         assert!(
             !plat
-                .window_matches(win, &[], pid_atom, Some(&wrong))
+                .window_matches(win, &ProcessIdentitySet::default(), pid_atom, Some(&wrong))
                 .expect("match")
         );
     }
@@ -2522,7 +2956,9 @@ mod display_tests {
         let main = x.window().owned_by(4242).named("main").create();
         let dialog = x.window().owned_by(4242).named("dialog").create();
         let _stranger = x.window().owned_by(OTHER_PID).named("stranger").create();
-        let mut found = plat.scan_all_windows(&[4242]).expect("scan");
+        let mut found = plat
+            .scan_all_windows(&ProcessIdentitySet::from_pairs([(4242, None)]))
+            .expect("scan");
         found.sort_unstable();
         let mut want = vec![main, dialog];
         want.sort_unstable();
@@ -2538,7 +2974,11 @@ mod display_tests {
         let plat = x.platform();
         let win = x.window().owned_by(4242).create();
         x.set_client_list(&[win]);
-        assert_eq!(plat.scan_all_windows(&[4242]).expect("scan"), vec![win]);
+        assert_eq!(
+            plat.scan_all_windows(&ProcessIdentitySet::from_pairs([(4242, None)]))
+                .expect("scan"),
+            vec![win]
+        );
     }
 
     // --- XTEST input -----------------------------------------------------------------
@@ -3076,12 +3516,31 @@ mod display_tests {
 
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         assert_eq!(plat.app_pid(), Some(pid));
         assert!(
             plat.app_pids().contains(&pid),
             "the process tree must include the launched child itself"
         );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server and process tree; needs Xvfb"]
+    fn app_pids_refresh_discovers_a_descendant_created_after_launch() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let child = std::process::Command::new("sh")
+            .args(["-c", "sleep 0.2; sleep 5 & wait"])
+            .spawn()
+            .unwrap();
+        platform.child = Some(LaunchedChild::Direct(child));
+
+        let initial = platform.app_pids();
+        std::thread::sleep(Duration::from_millis(400));
+        let refreshed = platform.app_pids();
+
+        assert!(refreshed.iter().any(|pid| !initial.contains(pid)));
+        platform.kill_child();
     }
 
     #[test]
@@ -3424,7 +3883,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         let main = x
             .window()
             .owned_by(pid)
@@ -3467,7 +3926,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         let win = x.window().owned_by(pid).create();
         plat.window = Some(win);
         plat.window_process_tree_delay = Duration::from_millis(40);
@@ -3500,7 +3959,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         let win = x.window().owned_by(pid).create();
         plat.window = Some(win);
 
@@ -3547,7 +4006,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         let mine = x.window().owned_by(pid).at(9, 8).sized(70, 60).create();
         let stranger = x.window().owned_by(999_999).create();
         plat.window = Some(mine);
@@ -3579,7 +4038,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         let win = x.window().owned_by(pid).create();
         plat.window = Some(win);
         plat.window_process_tree_delay = Duration::from_millis(40);
@@ -3612,7 +4071,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         let win = x.window().owned_by(pid).create();
         plat.window = Some(win);
         let paused = PausedXServer::new(x.server_pid());
@@ -3655,7 +4114,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         let win = x.window().owned_by(pid).create();
         plat.window = Some(win);
         plat.window_process_tree_delay = Duration::from_millis(350);
@@ -3700,7 +4159,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         // Away from the origin, and filled: a capture that ignored the window's position would
         // read the root's black from (0,0) and still be the right size.
         let win = x
@@ -3887,7 +4346,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         let polite = x.window().owned_by(pid).accepting_delete().create();
         plat.window = Some(polite);
 
@@ -3906,7 +4365,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         assert!(
             !plat.request_close(pid).any(),
             "there was no window to ask, so nothing was asked"
@@ -3922,7 +4381,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
         let polite = x.window().owned_by(pid).accepting_delete().create();
         plat.window = Some(polite);
 
@@ -3940,7 +4399,7 @@ mod display_tests {
         let mut plat = x.platform();
         let child = spawn_stand_in();
         let pid = child.id();
-        plat.child = Some(child);
+        plat.child = Some(LaunchedChild::Direct(child));
 
         plat.stop_app().expect("stop");
         assert_eq!(plat.app_pid(), None, "the child must be forgotten");
@@ -3960,7 +4419,7 @@ mod display_tests {
             let mut plat = x.platform();
             let child = spawn_stand_in();
             let pid = child.id();
-            plat.child = Some(child);
+            plat.child = Some(LaunchedChild::Direct(child));
             pid
         };
         assert!(
@@ -4003,7 +4462,7 @@ mod display_tests {
         // load cannot read as a deadline that was not honoured.
         let x = TestX::start();
         let mut plat = x.platform();
-        plat.child = Some(spawn_stand_in());
+        plat.child = Some(LaunchedChild::Direct(spawn_stand_in()));
         let spec = AppSpec {
             build: None,
             run: vec!["sleep".to_string(), "30".to_string()],
@@ -4016,7 +4475,10 @@ mod display_tests {
         };
         let started = Instant::now();
         let err = plat
-            .discover_window(&spec)
+            .discover_window(
+                &spec,
+                Instant::now() + Duration::from_millis(spec.timeout_ms.max(1)),
+            )
             .expect_err("the stand-in never maps a window");
         let waited = started.elapsed();
         assert!(matches!(err, GlassError::Timeout(400)), "{err:?}");
@@ -4209,13 +4671,23 @@ mod display_tests {
         let list_atom = plat.intern(b"_NET_CLIENT_LIST").expect("intern");
         let win = x.window().owned_by(4242).create();
         assert_eq!(
-            plat.scan_for_window(&[4242], pid_atom, list_atom, None)
-                .expect("scan"),
+            plat.scan_for_window(
+                &ProcessIdentitySet::from_pairs([(4242, None)]),
+                pid_atom,
+                list_atom,
+                None
+            )
+            .expect("scan"),
             Some(win)
         );
         assert_eq!(
-            plat.scan_for_window(&[OTHER_PID], pid_atom, list_atom, None)
-                .expect("scan"),
+            plat.scan_for_window(
+                &ProcessIdentitySet::from_pairs([(OTHER_PID, None)]),
+                pid_atom,
+                list_atom,
+                None
+            )
+            .expect("scan"),
             None
         );
     }

@@ -11,10 +11,141 @@
 mod common;
 
 use common::Xvfb;
-use glass_core::{AppSpec, Platform};
+use glass_core::{AppSpec, Backend, BaselineStore, Glass, Platform, PlatformFactory};
 use glass_x11::X11Platform;
 
 const TESTAPP: &str = env!("CARGO_BIN_EXE_glass-testapp");
+
+fn assert_artifact_reads_denied(level: glass_core::SandboxLevel) {
+    let temp = tempfile::tempdir().unwrap();
+    let artifacts = temp.path().join("artifacts");
+    let marker = artifacts.join("marker");
+    let lease = temp.path().join("artifacts.lease");
+    std::fs::create_dir(&artifacts).unwrap();
+    std::fs::write(&marker, b"host marker").unwrap();
+    std::fs::write(&lease, b"host lease").unwrap();
+
+    let xvfb = Xvfb::start();
+    let mut platform = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    let mode = platform
+        .configure_protected_host_paths(&[
+            glass_core::ProtectedHostPath::directory(&artifacts),
+            glass_core::ProtectedHostPath::file(&lease),
+        ])
+        .expect("valid protected paths");
+    assert_eq!(mode, glass_core::HostPathProtectionMode::SandboxRules);
+
+    let proc_root_marker = std::path::PathBuf::from("/proc")
+        .join(std::process::id().to_string())
+        .join("root")
+        .join(marker.strip_prefix("/").unwrap());
+    let script = temp.path().join("check-artifacts.sh");
+    std::fs::write(
+        &script,
+        b"#!/bin/sh\nfor path in \"$1\" \"$2\" \"$3\"; do if cat \"$path\" >/dev/null 2>&1; then echo READ_ALLOWED; else echo READ_DENIED; fi; done\nexec \"$4\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let spec = AppSpec {
+        run: vec![
+            script.into_os_string().into_string().unwrap(),
+            marker.clone().into_os_string().into_string().unwrap(),
+            proc_root_marker.into_os_string().into_string().unwrap(),
+            lease.clone().into_os_string().into_string().unwrap(),
+            TESTAPP.into(),
+        ],
+        env: vec![],
+        cwd: Some(temp.path().to_path_buf()),
+        timeout_ms: 8000,
+        sandbox: level,
+        ..app_spec()
+    };
+    if let Err(error) = platform.start_app(&spec) {
+        panic!(
+            "contained launch failed: {error}; logs: {:?}",
+            platform.drain_logs()
+        );
+    }
+    let mut denied = 0;
+    for _ in 0..80 {
+        for (_, line) in platform.drain_logs() {
+            denied += usize::from(line.contains("READ_DENIED"));
+            assert!(
+                !line.contains("READ_ALLOWED"),
+                "target read a protected path"
+            );
+        }
+        if denied == 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(denied, 3);
+    assert_eq!(std::fs::read(&marker).unwrap(), b"host marker");
+    platform.stop_app().unwrap();
+}
+
+#[test]
+#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh artifact"]
+fn artifact_paths_are_hidden_from_default_x11_target() {
+    assert_artifact_reads_denied(glass_core::SandboxLevel::Default);
+}
+
+#[test]
+#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh artifact"]
+fn artifact_paths_are_hidden_from_strict_x11_target() {
+    assert_artifact_reads_denied(glass_core::SandboxLevel::Strict);
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh artifact"]
+fn invalid_artifact_path_fails_before_target_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let launched = temp.path().join("launched");
+    let launch_script = temp.path().join("launch.sh");
+    std::fs::write(&launch_script, b"#!/bin/sh\ntouch \"$1\"\nexec \"$2\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&launch_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let xvfb = Xvfb::start();
+    let display = xvfb.display.clone();
+    let factory: PlatformFactory = Box::new(move |_backend| {
+        Ok(Backend::display_only(Box::new(X11Platform::connect(
+            Some(&display),
+        )?)))
+    });
+    let mut glass = Glass::new(
+        factory,
+        "x11".into(),
+        BaselineStore::new(temp.path().join("baselines")),
+        100,
+    );
+    glass
+        .set_protected_host_paths(vec![glass_core::ProtectedHostPath::file(
+            temp.path().join("missing"),
+        )])
+        .unwrap();
+    let spec = AppSpec {
+        run: vec![
+            launch_script.into_os_string().into_string().unwrap(),
+            launched.clone().into_os_string().into_string().unwrap(),
+            TESTAPP.into(),
+        ],
+        timeout_ms: 5000,
+        ..app_spec()
+    };
+
+    let error = glass
+        .start(&spec)
+        .expect_err("missing protected path must prevent launch");
+    assert!(matches!(
+        error,
+        glass_core::GlassError::SandboxUnavailable(_)
+    ));
+    assert!(!launched.exists());
+}
 
 fn app_spec() -> AppSpec {
     AppSpec {
@@ -1165,9 +1296,8 @@ fn clipboard_owner_refuses_text_too_large_for_one_x11_property_write() {
 /// glass spawned is `bwrap`, not the app — so the window belongs to a descendant pid. If that
 /// walk failed, teardown would silently fall back to signalling every sandboxed app.
 ///
-/// The walk works only because the sandbox deliberately does not unshare the PID namespace: in
-/// one, the app would publish a namespace-relative `_NET_WM_PID` that matches nothing glass can
-/// see. Revisiting that decision breaks this test, which is the intent.
+/// PID namespaces make the app publish a namespace-relative `_NET_WM_PID` that Glass correlates
+/// with refreshed host and namespace identities.
 #[test]
 #[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
 fn sandbox_default_app_is_still_asked_to_close() {

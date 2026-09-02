@@ -75,6 +75,23 @@ clipboard tools return `Unsupported`. That is fail-closed at the profile level, 
 to the shared system clipboard. Only shared-desktop modes (`GLASS_DISPLAY=:0`, or the Windows/macOS
 backend at `sandbox:off`) touch your real clipboard.
 
+## Artifact boundary
+
+Glass may move oversized tool text into ephemeral server-host artifacts. For desktop launches at
+`default` or `strict`, the launched target process tree is denied access to both the current
+artifact process directory and its lease file.
+
+The mechanism follows each platform's containment model. Verified Linux launches use a PID namespace
+and a private `/proc`, in addition to hiding the artifact paths, so the target cannot use a host PID
+with `/proc/<pid>/root/...` to bypass the path boundary. The macOS implementation adds final Seatbelt
+denies for the protected paths. The Windows implementation adds Sandboxie closed-path rules and gives
+process-owned artifact paths owner-only DACLs. Android and iOS targets cannot address paths on the
+server host.
+
+This guarantee is deliberately scoped to the launched target. `sandbox:off` provides no desktop
+artifact-access guarantee, and build commands and unrelated same-user processes on the host are
+outside the launched-target boundary.
+
 ## Known limits
 
 The containment is real but not airtight, and it's honest about the edges:
@@ -95,5 +112,8 @@ The containment is real but not airtight, and it's honest about the edges:
   contained Windows app can still read files under `%USERPROFILE%`, including secrets like SSH keys.
   Treat the Windows sandbox as write-and-network containment; use `sandbox:off` deliberately, and
   don't rely on it to hide read-side secrets.
+- **Artifact-path enforcement still requires native platform validation on macOS and Windows.** The
+  Seatbelt and Sandboxie mechanisms are implemented, but their end-to-end denial behavior must be
+  validated on those operating systems.
 
 `glass-mcp doctor` reports the live containment-runtime availability for your host.

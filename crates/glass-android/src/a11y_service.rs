@@ -442,6 +442,8 @@ pub struct ServiceA11y {
     #[cfg(test)]
     before_set_text_delay: std::time::Duration,
     #[cfg(test)]
+    retire_before_set_text: bool,
+    #[cfg(test)]
     before_verification_read_delay: std::time::Duration,
     #[cfg(test)]
     check_poll: std::time::Duration,
@@ -458,6 +460,8 @@ impl ServiceA11y {
             write_verify_budget: WRITE_VERIFY_BUDGET,
             #[cfg(test)]
             before_set_text_delay: std::time::Duration::ZERO,
+            #[cfg(test)]
+            retire_before_set_text: false,
             #[cfg(test)]
             before_verification_read_delay: std::time::Duration::ZERO,
             #[cfg(test)]
@@ -769,6 +773,10 @@ impl Accessibility for ServiceA11y {
         let device_ref = rt.device_ref(resolved_editable_target(&rt.tree, target)?.id)?;
         #[cfg(test)]
         std::thread::sleep(self.before_set_text_delay);
+        #[cfg(test)]
+        if std::mem::take(&mut self.retire_before_set_text) {
+            self.client.conn.lock().expect("lock").poison();
+        }
         require_semantic_time(ctx.deadline, "Android accessibility set_text", false)?;
         match self
             .client
@@ -3394,35 +3402,9 @@ mod tests {
         a11y.client.conn.lock().expect("lock").poison();
     }
 
-    /// Break the current connection after its guard tree is served but before `set_text` starts.
-    /// `before_set_text_delay` makes the ordering deterministic rather than scheduler-dependent.
-    fn break_set_text_write_after_guard(
-        a11y: &mut ServiceA11y,
-        ops: &Arc<Mutex<Vec<String>>>,
-    ) -> std::thread::JoinHandle<()> {
-        let write_half = a11y
-            .client
-            .conn
-            .lock()
-            .expect("lock")
-            .writer
-            .try_clone()
-            .expect("clone write half");
-        a11y.before_set_text_delay = std::time::Duration::from_millis(100);
-        let seen_ops = Arc::clone(ops);
-        std::thread::spawn(move || {
-            let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            while !ops_of(&seen_ops).iter().any(|op| op == "conn1:tree") {
-                assert!(
-                    std::time::Instant::now() < until,
-                    "the guard tree was never served"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            write_half
-                .shutdown(std::net::Shutdown::Write)
-                .expect("shutdown write half");
-        })
+    /// Retire the connection after the guard tree but before `set_text` dispatch.
+    fn break_set_text_write_after_guard(a11y: &mut ServiceA11y) {
+        a11y.retire_before_set_text = true;
     }
 
     fn assert_generic_semantic_caller_timeout(
@@ -4459,7 +4441,7 @@ mod tests {
                 ]
             })
         };
-        let (port, ops) = fake_service_ex(
+        let (port, _ops) = fake_service_ex(
             vec![field("old"), field("old"), field("new")],
             vec![OnAction::Ok],
             vec![
@@ -4471,10 +4453,9 @@ mod tests {
         let mut a = ServiceA11y::new(client, "com.example.app".to_string());
         let t = built(&field("old"));
         let target = target_for(&t, AxNodeId(1));
-        let breaker = break_set_text_write_after_guard(&mut a, &ops);
+        break_set_text_write_after_guard(&mut a);
         a.set_value(&ctx(), &target, "new")
             .expect("the caller's configured package must match the fresh tree's fixed reply");
-        breaker.join().expect("connection breaker");
     }
 
     #[test]
@@ -4657,34 +4638,12 @@ mod tests {
         written["children"][1]["text"] = json!("new");
         let (port, ops) = fake_service(vec![initial.clone(), reordered, written], OnAction::Ok);
         let client = ServiceClient::connect(port).expect("connect to the fake service");
-        let write_half = client
-            .conn
-            .lock()
-            .expect("lock")
-            .writer
-            .try_clone()
-            .expect("clone write half");
         let mut a = ServiceA11y::new(client, "com.example.app".to_string());
-        a.before_set_text_delay = std::time::Duration::from_millis(100);
         let target = target_for(&built(&initial), AxNodeId(1));
-        let seen_ops = Arc::clone(&ops);
-        let breaker = std::thread::spawn(move || {
-            let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            while !ops_of(&seen_ops).iter().any(|op| op == "conn1:tree") {
-                assert!(
-                    std::time::Instant::now() < until,
-                    "the guard tree was never served"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            write_half
-                .shutdown(std::net::Shutdown::Write)
-                .expect("shutdown write half");
-        });
+        break_set_text_write_after_guard(&mut a);
 
         a.set_value(&ctx(), &target, "new")
             .expect("a provably unsent write may be re-resolved once");
-        breaker.join().expect("connection breaker");
         assert_eq!(
             ops_of(&ops),
             vec![
@@ -5017,11 +4976,10 @@ mod tests {
         let target = target_for(&t, AxNodeId(1));
 
         // conn2 would make an unauthorized retry falsely succeed.
-        let breaker = break_set_text_write_after_guard(&mut a, &ops);
+        break_set_text_write_after_guard(&mut a);
         let e = a
             .set_value(&ctx(), &target, "new")
             .expect_err("the fresh tree names the asked-about app, not the dialog target");
-        breaker.join().expect("connection breaker");
         let msg = e.to_string();
         assert!(msg.contains("com.other.app"), "{msg}");
         assert!(msg.contains("com.example.app"), "{msg}");
@@ -5049,10 +5007,9 @@ mod tests {
         let mut a = ServiceA11y::new(client, "com.example.app".to_string());
         let t = built(&editable_field("old"));
         let target = target_for(&t, AxNodeId(1));
-        let breaker = break_set_text_write_after_guard(&mut a, &ops);
+        break_set_text_write_after_guard(&mut a);
 
         let result = a.set_value(&ctx(), &target, "new");
-        breaker.join().expect("connection breaker");
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string(), "conn2:tree".to_string()],
@@ -5079,10 +5036,9 @@ mod tests {
         let mut a = ServiceA11y::new(client, "com.example.app".to_string());
         let t = built(&editable_field("old"));
         let target = target_for(&t, AxNodeId(1));
-        let breaker = break_set_text_write_after_guard(&mut a, &ops);
+        break_set_text_write_after_guard(&mut a);
 
         let result = a.set_value(&ctx(), &target, "new");
-        breaker.join().expect("connection breaker");
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string(), "conn2:tree".to_string()],
@@ -5112,11 +5068,10 @@ mod tests {
         let mut a = ServiceA11y::new(client, "com.example.app".to_string());
         let t = built(&editable_field("old"));
         let target = target_for(&t, AxNodeId(1));
-        let breaker = break_set_text_write_after_guard(&mut a, &ops);
+        break_set_text_write_after_guard(&mut a);
 
         a.set_value(&ctx(), &target, "new")
             .expect("the acting app did not change, so one fresh-ref write may run");
-        breaker.join().expect("connection breaker");
         assert_eq!(
             ops_of(&ops),
             vec![

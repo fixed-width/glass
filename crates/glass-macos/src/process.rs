@@ -36,7 +36,7 @@ use std::os::fd::AsFd;
 
 use rustix::process::{Pid, Signal, kill_process};
 
-use glass_core::platform::{AppSpec, SandboxLevel};
+use glass_core::platform::{AppSpec, ProtectedHostPath, SandboxLevel};
 use glass_core::{GlassError, Result, Stream, TEARDOWN_BUDGET};
 use glass_sandbox_macos::{ProfileOpts, build_profile, launch_reallows};
 
@@ -195,7 +195,12 @@ const EXIT_POLL: Duration = Duration::from_millis(20);
 /// shim dylib resolved (see [`shim_dylib_path`]); `None` for `SandboxLevel::Off` or a
 /// non-injectable/unresolved target. The caller (`MacosPlatform::start_app`) holds it for a
 /// later clipboard-routing decision — this function only sets up the injection.
-pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Launch> {
+pub(crate) fn spawn(
+    spec: &AppSpec,
+    logs: LogSink,
+    protected_paths: &[ProtectedHostPath],
+) -> Result<Launch> {
+    glass_sandbox_macos::profile::validate_protected_paths(protected_paths)?;
     let mut cmd = Command::new(&spec.run[0]);
 
     // Apply the caller's env FIRST, so glass's own containment/injection vars are written LAST
@@ -312,9 +317,10 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Launch> {
             ro_binds: reallows.ro_binds,
             ro_files,
             rw_binds: vec![],
+            protected_paths: protected_paths.to_vec(),
             allow_pasteboard,
         };
-        let profile = build_profile(spec.sandbox, &opts);
+        let profile = build_profile(spec.sandbox, &opts)?;
         let profile_c = CString::new(profile).map_err(|e| {
             GlassError::SandboxUnavailable(format!("sandbox profile contains NUL: {e}"))
         })?;
@@ -609,7 +615,7 @@ mod tests {
             mut child,
             clip,
             taps: _taps,
-        } = spawn(&denied, logs.clone())
+        } = spawn(&denied, logs.clone(), &[])
             .unwrap_or_else(|e| panic!("sandboxed spawn should succeed: {e}"));
         // The probe is a plain, unsigned arm64 binary — always injectable — so a `None` here
         // means the shim never resolved (most likely `glass-clip-shim-macos` wasn't built; see
@@ -687,7 +693,7 @@ mod tests {
             mut child,
             clip,
             taps: _taps,
-        } = spawn(&launch, logs.clone()).unwrap_or_else(|e| {
+        } = spawn(&launch, logs.clone(), &[]).unwrap_or_else(|e| {
             panic!(
                 "sandboxed spawn of a launch target under $HOME (cwd outside $HOME) should \
                  succeed: {e}"
@@ -716,6 +722,100 @@ mod tests {
         );
     }
 
+    struct ArtifactProbeFixture {
+        process_dir: PathBuf,
+        marker: PathBuf,
+        lease: PathBuf,
+        marker_text: String,
+    }
+
+    impl ArtifactProbeFixture {
+        fn new() -> Self {
+            let nonce = format!(
+                "{}-{}",
+                std::process::id(),
+                CLIP_TOKEN.fetch_add(1, Ordering::Relaxed)
+            );
+            let root = std::env::temp_dir().join("glass-macos-artifact-probe");
+            let process_dir = root.join(&nonce);
+            let lease = root.join(format!("{nonce}.lease"));
+            let marker = process_dir.join("marker");
+            let marker_text = format!("artifact-marker-{nonce}");
+            std::fs::create_dir_all(&process_dir).expect("create artifact process directory");
+            std::fs::write(&marker, &marker_text).expect("write artifact marker");
+            std::fs::write(&lease, "lease").expect("write artifact lease");
+            Self {
+                process_dir,
+                marker,
+                lease,
+                marker_text,
+            }
+        }
+    }
+
+    impl Drop for ArtifactProbeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.process_dir);
+            let _ = std::fs::remove_file(&self.lease);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires macOS Seatbelt"]
+    #[cfg(target_os = "macos")]
+    fn protected_artifact_and_lease_are_denied_on_box() {
+        let fixture = ArtifactProbeFixture::new();
+        assert_eq!(
+            std::fs::read_to_string(&fixture.marker).unwrap(),
+            fixture.marker_text
+        );
+        assert_eq!(std::fs::read_to_string(&fixture.lease).unwrap(), "lease");
+        let probe = sandbox_probe_path();
+        let probe_arg = probe
+            .to_str()
+            .expect("sandbox probe path is valid UTF-8")
+            .to_owned();
+        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
+            let mut launch = spec(&[
+                &probe_arg,
+                "--protected-reads",
+                "ARTIFACT_MARKER",
+                "ARTIFACT_LEASE",
+            ]);
+            launch.sandbox = level;
+            launch.env = vec![
+                (
+                    "ARTIFACT_MARKER".into(),
+                    fixture
+                        .marker
+                        .to_str()
+                        .expect("marker path is valid UTF-8")
+                        .into(),
+                ),
+                (
+                    "ARTIFACT_LEASE".into(),
+                    fixture
+                        .lease
+                        .to_str()
+                        .expect("lease path is valid UTF-8")
+                        .into(),
+                ),
+            ];
+            let protected = [
+                ProtectedHostPath::directory(&fixture.process_dir),
+                ProtectedHostPath::file(&fixture.lease),
+            ];
+            let Launch { mut child, .. } =
+                spawn(&launch, empty_sink(), &protected).expect("spawn protected artifact probe");
+            assert!(child.wait().expect("wait for artifact probe").success());
+        }
+        assert_eq!(
+            std::fs::read_to_string(&fixture.marker).unwrap(),
+            fixture.marker_text
+        );
+        assert_eq!(std::fs::read_to_string(&fixture.lease).unwrap(), "lease");
+    }
+
     /// glass#477: the launch's readers are the caller's to end, and the last thing the app said
     /// survives that ending.
     ///
@@ -736,6 +836,7 @@ mod tests {
         } = spawn(
             &spec(&["/bin/sh", "-c", "echo 'the last line'; sleep 30 &"]),
             Arc::clone(&logs),
+            &[],
         )
         .expect("spawn /bin/sh");
 
@@ -776,6 +877,7 @@ mod tests {
         } = spawn(
             &spec(&["/bin/sh", "-c", "echo out; echo err 1>&2"]),
             logs.clone(),
+            &[],
         )
         .expect("spawn /bin/sh");
         child.wait().expect("wait for /bin/sh to exit");
@@ -797,7 +899,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn spawn_missing_program_returns_app_not_started() {
-        let err = spawn(&spec(&["/no/such/glass-test-binary"]), empty_sink())
+        let err = spawn(&spec(&["/no/such/glass-test-binary"]), empty_sink(), &[])
             .expect_err("missing program must fail to spawn");
         assert!(
             matches!(err, GlassError::AppNotStarted(_)),
@@ -853,7 +955,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn terminate_kills_a_long_running_child() {
         let Launch { mut child, .. } =
-            spawn(&spec(&["/bin/sleep", "100"]), empty_sink()).expect("spawn /bin/sleep");
+            spawn(&spec(&["/bin/sleep", "100"]), empty_sink(), &[]).expect("spawn /bin/sleep");
         terminate(&mut child);
         let status = child.try_wait().expect("try_wait after terminate");
         assert!(status.is_some(), "child should have exited after terminate");
@@ -918,6 +1020,7 @@ mod tests {
         } = spawn(
             &spec(&[fixture.to_string_lossy().as_ref()]),
             Arc::clone(&sink),
+            &[],
         )
         .expect("spawn the AppKit fixture");
         std::thread::sleep(FIXTURE_LAUNCH_SETTLE);
@@ -955,7 +1058,7 @@ mod tests {
             mut child,
             taps: _taps,
             ..
-        } = spawn(&spec, Arc::clone(&sink)).expect("spawn the AppKit fixture");
+        } = spawn(&spec, Arc::clone(&sink), &[]).expect("spawn the AppKit fixture");
         std::thread::sleep(FIXTURE_LAUNCH_SETTLE);
 
         let started = Instant::now();
@@ -993,7 +1096,7 @@ mod tests {
         // than spent — otherwise asking first would add `QUIT_GRACE` to the teardown of every
         // app glass cannot ask, which is every console-shaped one.
         let Launch { mut child, .. } =
-            spawn(&spec(&["/bin/sleep", "100"]), empty_sink()).expect("spawn /bin/sleep");
+            spawn(&spec(&["/bin/sleep", "100"]), empty_sink(), &[]).expect("spawn /bin/sleep");
         let started = Instant::now();
         terminate(&mut child);
         let elapsed = started.elapsed();
@@ -1015,7 +1118,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn terminate_is_idempotent_on_an_already_exited_child() {
         let Launch { mut child, .. } =
-            spawn(&spec(&["/bin/echo", "hi"]), empty_sink()).expect("spawn /bin/echo");
+            spawn(&spec(&["/bin/echo", "hi"]), empty_sink(), &[]).expect("spawn /bin/echo");
         child.wait().expect("wait for /bin/echo to exit");
         // Already reaped; terminate must not panic or hang.
         terminate(&mut child);

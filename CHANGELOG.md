@@ -21,6 +21,10 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 - `glass_find_elements` performs a fresh bounded accessibility search across native and published web content, returning up to 20 ranked actionable matches with semantic scope, optional publication waiting, compact context, explicit incompleteness, secure-value exclusion, and an 8 KiB total response ceiling.
+- Tool responses now share an 8 KiB text ceiling, with oversized logical blocks recoverable exactly through read-only `glass-artifact://` MCP resources backed by secure, ephemeral server-process artifacts.
+
+### Changed
+- Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
 
 ## [1.7.0] - 2026-08-31
 

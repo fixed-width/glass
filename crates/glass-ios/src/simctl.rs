@@ -178,6 +178,7 @@ dir=$(dirname \"$0\")
 # Before the argv line, so a test that waits for the call can then read this without racing it.
 printf '%s' \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$dir/pgid\"
 printf '%s\\n' \"$*\" >> \"$dir/calls\"
+env | grep '^SIMCTL_CHILD_' >> \"$dir/environments\" || true
 # `$2` is the simctl verb, since `$1` is always `simctl`.
 # Recorded before sleeping, so a test can see the call while this one is still running.
 [ -f \"$dir/slow-$2\" ] && sleep \"$(cat \"$dir/slow-$2\")\"
@@ -267,6 +268,15 @@ impl FakeSimctl {
             "the fake xcrun's directory is gone; it was dropped before what it recorded was read"
         );
         std::fs::read_to_string(self.dir.path().join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The launch environment entries observed by the fake xcrun process.
+    pub(crate) fn environments(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.path().join("environments"))
             .unwrap_or_default()
             .lines()
             .map(str::to_string)

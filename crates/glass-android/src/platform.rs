@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use glass_core::Deadline;
 use glass_core::Platform;
 use glass_core::{
-    AppSpec, Frame, GlassError, KeyEvent, PointerEvent, Region, Result, Stream, WindowGeometry,
-    WindowId, WindowInfo, WindowOp,
+    AppSpec, Frame, GlassError, HostPathProtectionMode, KeyEvent, PointerEvent, ProtectedHostPath,
+    Region, Result, Stream, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 
 use crate::a11y::AndroidA11y;
@@ -335,6 +335,13 @@ fn reap_failed_launch(adb: &Adb, package: &str, e: GlassError) -> GlassError {
 }
 
 impl Platform for AndroidPlatform {
+    fn configure_protected_host_paths(
+        &mut self,
+        _paths: &[ProtectedHostPath],
+    ) -> Result<HostPathProtectionMode> {
+        Ok(HostPathProtectionMode::SeparateFilesystem)
+    }
+
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         run_build(spec, &self.logs)?;
         let target = parse_launch(&spec.run)?;
@@ -638,6 +645,74 @@ mod platform_tests {
         "    mOwnerUid=1000 showForAllUsers=false package=com.example.app appop=NONE\n",
         "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
     );
+
+    const PROTECTED_PATH_SENTINEL: &str =
+        "/host-vault-orchid-731/device-boundary-cobalt-842/report-ember-953.txt";
+    const PROTECTED_PATH_COMPONENTS: [&str; 3] = [
+        "host-vault-orchid-731",
+        "device-boundary-cobalt-842",
+        "report-ember-953.txt",
+    ];
+
+    fn assert_protected_path_absent(observed: impl IntoIterator<Item = String>) {
+        for value in observed {
+            assert!(!value.contains(PROTECTED_PATH_SENTINEL), "{value}");
+            for component in PROTECTED_PATH_COMPONENTS {
+                assert!(!value.contains(component), "{value}");
+            }
+        }
+    }
+
+    #[test]
+    fn protected_host_paths_never_reach_successful_android_launch_commands_or_logs() {
+        let fake = launchable();
+        let mut platform = platform_over(&fake);
+
+        let mode = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::file(PROTECTED_PATH_SENTINEL)])
+            .unwrap();
+        platform.start_app(&spec()).expect("the launch succeeds");
+        assert!(fake.wait_called("logcat -v threadtime --pid=4321", Duration::from_secs(5)));
+        let logs = platform
+            .drain_logs()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>();
+        drop(platform);
+
+        assert_eq!(mode, HostPathProtectionMode::SeparateFilesystem);
+        assert_protected_path_absent(fake.calls());
+        assert_protected_path_absent(logs);
+    }
+
+    #[test]
+    fn protected_host_paths_never_reach_failed_android_launch_commands_logs_or_error() {
+        let fake = FakeAdb::new(&[(
+            "shell am start *",
+            Answer::says("Starting: Intent {...}\nError: Activity not started\n"),
+        )]);
+        let mut platform = platform_over(&fake);
+
+        let mode = platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(
+                PROTECTED_PATH_SENTINEL,
+            )])
+            .unwrap();
+        let error = platform
+            .start_app(&spec())
+            .expect_err("the device refuses the launch");
+        let logs = platform
+            .drain_logs()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>();
+        drop(platform);
+
+        assert_eq!(mode, HostPathProtectionMode::SeparateFilesystem);
+        assert_protected_path_absent(fake.calls());
+        assert_protected_path_absent(logs);
+        assert_protected_path_absent([error.to_string()]);
+    }
 
     /// The same dump with the dialog gone — the app's window list after it is dismissed.
     const WINDOWS_WITHOUT_THE_DIALOG: &str = concat!(

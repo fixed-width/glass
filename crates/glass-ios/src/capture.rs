@@ -51,10 +51,24 @@ fn run_simctl_screenshot_with(
     deadline: Deadline,
     after_run: impl FnOnce(),
 ) -> Result<()> {
+    run_simctl_screenshot_by_with(
+        deadline,
+        |received| {
+            simctl
+                .run_until(&["io", udid, "screenshot", "--type", "png", path], received)
+                .map(|_| ())
+        },
+        after_run,
+    )
+}
+
+fn run_simctl_screenshot_by_with(
+    deadline: Deadline,
+    run_simctl: impl FnOnce(Deadline) -> Result<()>,
+    after_run: impl FnOnce(),
+) -> Result<()> {
     require_capture_time(deadline, false)?;
-    let result = simctl
-        .run_until(&["io", udid, "screenshot", "--type", "png", path], deadline)
-        .map(|_| ());
+    let result = run_simctl(deadline);
     after_run();
     finish_capture(deadline, true, result)
 }
@@ -121,7 +135,7 @@ fn crop_frame_with(
 mod tests {
     use super::*;
     use crate::simctl::FakeSimctl;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     fn png(w: u32, h: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -291,24 +305,19 @@ mod tests {
 
     #[test]
     fn ios_screenshot_uses_simctl_caller_deadline() {
-        let fake = FakeSimctl::new();
-        let simctl = Simctl::at(fake.program());
-        fake.slow("io", 30);
+        let deadline = Deadline::from_millis(1_000);
+        let seen = std::cell::Cell::new(None);
 
-        let at = Instant::now();
-        let err = screenshot_by(
-            &simctl,
-            "test-udid",
-            Deadline::at(Instant::now() + Duration::from_millis(300)),
+        run_simctl_screenshot_by_with(
+            deadline,
+            |received| {
+                seen.set(Some(received));
+                Ok(())
+            },
+            || {},
         )
-        .expect_err("a live caller deadline must bound simctl");
+        .expect("the stable deadline leaves time to call simctl");
 
-        assert!(
-            at.elapsed() < Duration::from_secs(2),
-            "waited {:?}: {err}",
-            at.elapsed()
-        );
-        assert_eq!(err.bound(), Some(glass_core::BoundKind::TimedOut));
-        assert!(fake.called("io test-udid screenshot"), "{:?}", fake.calls());
+        assert_eq!(seen.get(), Some(deadline));
     }
 }

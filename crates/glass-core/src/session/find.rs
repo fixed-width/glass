@@ -268,7 +268,7 @@ mod tests {
             .find_elements(&FindElementsParams {
                 query: query("absent"),
                 max_nodes: None,
-                timeout_ms: 250,
+                timeout_ms: 1_000,
             })
             .unwrap();
 

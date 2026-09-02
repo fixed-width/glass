@@ -16,8 +16,8 @@ use crate::frame::{Frame, Region};
 use crate::logbuf::{LogBuffer, LogLine, Stream};
 use crate::marks::Mark;
 use crate::platform::{
-    AppSpec, KeyEvent, MouseButton, Platform, PointerEvent, WindowGeometry, WindowId, WindowInfo,
-    WindowOp,
+    AppSpec, HostPathAccess, HostPathProtectionMode, KeyEvent, MouseButton, Platform, PointerEvent,
+    ProtectedHostPath, SandboxLevel, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 use crate::stability::StabilityTracker;
 
@@ -52,6 +52,7 @@ struct ActiveSession {
     logs: LogBuffer,
     /// Best-effort active window for audit attribution (id from list_windows/select_window).
     active_window: Option<crate::audit::WindowRef>,
+    host_path_access: HostPathAccess,
 }
 
 impl ActiveSession {
@@ -98,6 +99,7 @@ pub struct Glass {
     active: Option<ActiveSession>,
     audit: Option<Box<dyn crate::audit::AuditSink>>,
     shutdown_hook: Option<Box<dyn FnOnce(Deadline) + Send>>,
+    protected_host_paths: Vec<ProtectedHostPath>,
 }
 
 impl Glass {
@@ -115,7 +117,24 @@ impl Glass {
             active: None,
             audit: None,
             shutdown_hook: None,
+            protected_host_paths: Vec::new(),
         }
+    }
+
+    pub fn set_protected_host_paths(&mut self, paths: Vec<ProtectedHostPath>) -> Result<()> {
+        if self.active.is_some() {
+            return Err(GlassError::ProtectedPathsWhileActive);
+        }
+        self.protected_host_paths = paths;
+        Ok(())
+    }
+
+    pub fn host_path_access(&self) -> HostPathAccess {
+        self.active
+            .as_ref()
+            .map_or(HostPathAccess::NoActiveTarget, |session| {
+                session.host_path_access
+            })
     }
 
     /// Install the audit sink. Every subsequent actuation is recorded through it.

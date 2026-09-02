@@ -74,8 +74,10 @@ fn exact_content_slice(contents: &[OutContent]) -> Vec<ExactContent> {
     contents
         .iter()
         .map(|content| match content {
-            OutContent::Text(text) => ExactContent::Text(canonicalize_untrusted_nonce(text)),
+            OutContent::Envelope(envelope) => ExactContent::Text(envelope.render()),
+            OutContent::Text(text) => ExactContent::Text(canonicalize_untrusted_nonce(&text.body)),
             OutContent::Image(image) => ExactContent::Image(image.clone()),
+            OutContent::ResourceLink(_) => panic!("resource links are not expected"),
         })
         .collect()
 }
@@ -521,11 +523,13 @@ fn sleep_past(deadline: Deadline) {
 }
 
 fn envelope(output: &ToolOutput) -> serde_json::Value {
-    serde_json::from_str(match &output.0[0] {
-        OutContent::Text(text) => text,
-        OutContent::Image(_) => panic!("batch envelope must be text"),
-    })
-    .unwrap()
+    match &output.0[0] {
+        OutContent::Envelope(envelope) => {
+            serde_json::json!({ "ok": true, "tool": envelope.tool, "result": envelope.result })
+        }
+        OutContent::Text(text) => serde_json::from_str(&text.body).unwrap(),
+        OutContent::Image(_) | OutContent::ResourceLink(_) => panic!("batch envelope must be text"),
+    }
 }
 
 fn output_text(output: &ToolOutput) -> String {
@@ -534,7 +538,7 @@ fn output_text(output: &ToolOutput) -> String {
         .iter()
         .map(|block| match block {
             OutContent::Text(text) => text.as_str(),
-            OutContent::Image(_) => "",
+            OutContent::Envelope(_) | OutContent::Image(_) | OutContent::ResourceLink(_) => "",
         })
         .collect()
 }
@@ -543,7 +547,7 @@ fn assert_secret_absent(output: &ToolOutput, secret: &str) {
     let all_output_text = output_text(output);
     let envelope = envelope(output);
     assert!(
-        !all_output_text.contains(secret),
+        !all_output_text.as_str().contains(secret),
         "secret echoed in output: {all_output_text}"
     );
     assert!(
@@ -1001,18 +1005,16 @@ fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
     )
     .unwrap()
     .output;
-    let OutContent::Text(standalone_envelope) = &standalone_out.0[0] else {
+    let OutContent::Envelope(standalone_envelope) = &standalone_out.0[0] else {
         panic!("standalone type settle envelope must lead")
     };
-    let OutContent::Text(contextual_envelope) = &contextual_out.0[0] else {
+    let OutContent::Envelope(contextual_envelope) = &contextual_out.0[0] else {
         panic!("contextual type settle envelope must lead")
     };
-    let mut standalone_value: serde_json::Value =
-        serde_json::from_str(standalone_envelope).unwrap();
-    let mut contextual_value: serde_json::Value =
-        serde_json::from_str(contextual_envelope).unwrap();
-    standalone_value["result"]["observed"]["observed_ms"] = json!(0);
-    contextual_value["result"]["observed"]["observed_ms"] = json!(0);
+    let mut standalone_value = standalone_envelope.result.clone();
+    let mut contextual_value = contextual_envelope.result.clone();
+    standalone_value["observed"]["observed_ms"] = json!(0);
+    contextual_value["observed"]["observed_ms"] = json!(0);
     assert_eq!(standalone_value, contextual_value);
     assert_eq!(standalone_deadlines.lock().unwrap()[0], Deadline::UNBOUNDED);
     assert_eq!(contextual_deadlines.lock().unwrap()[0], Deadline::UNBOUNDED);
@@ -1033,13 +1035,14 @@ fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
     )
     .unwrap()
     .output;
-    let OutContent::Text(standalone_envelope) = &standalone_out.0[0] else {
+    let OutContent::Envelope(standalone_envelope) = &standalone_out.0[0] else {
         panic!("standalone type snapshot envelope must lead")
     };
-    let OutContent::Text(contextual_envelope) = &contextual_out.0[0] else {
+    let OutContent::Envelope(contextual_envelope) = &contextual_out.0[0] else {
         panic!("contextual type snapshot envelope must lead")
     };
-    assert_eq!(standalone_envelope, contextual_envelope);
+    assert_eq!(standalone_envelope.tool, contextual_envelope.tool);
+    assert_eq!(standalone_envelope.result, contextual_envelope.result);
     assert_eq!(
         exact_contents(&standalone_out),
         exact_contents(&contextual_out)
@@ -1820,8 +1823,10 @@ fn started_a11y_session(mut g: Glass) -> Glass {
 
 fn error_text(out: ToolOutput) -> String {
     match &out.0[0] {
-        OutContent::Text(text) => text.clone(),
-        OutContent::Image(_) => panic!("error envelope must be text"),
+        OutContent::Text(text) => text.body.clone(),
+        OutContent::Envelope(_) | OutContent::Image(_) | OutContent::ResourceLink(_) => {
+            panic!("error envelope must be text")
+        }
     }
 }
 
@@ -1909,8 +1914,11 @@ fn type_return_snapshot_is_retained_in_content_blocks() {
     let OutContent::Text(snapshot) = &out.0[1] else {
         panic!("snapshot sibling must be text");
     };
-    assert!(snapshot.contains("untrusted content"));
-    assert!(snapshot.contains("Save"), "snapshot sibling: {snapshot}");
+    assert!(snapshot.as_str().contains("untrusted content"));
+    assert!(
+        snapshot.as_str().contains("Save"),
+        "snapshot sibling: {snapshot:?}"
+    );
 }
 
 #[test]
@@ -2473,12 +2481,12 @@ fn scroll_to_element_later_coord_failure_reports_that_an_earlier_scroll_dispatch
     let detail = output_text(&error);
     assert!(
         detail.contains("coordinate (50,50) out of bounds for 50x50 window"),
-        "{detail}"
+        "{detail:?}"
     );
     assert!(
         !detail.contains("backend transport failed")
             && !detail.contains("scroll to element failed after an earlier scroll step dispatched"),
-        "{detail}"
+        "{detail:?}"
     );
 }
 
@@ -2508,8 +2516,8 @@ fn semantic_return_snapshot_keeps_untrusted_outline_outside_the_envelope() {
     let OutContent::Text(outline) = &out.0[1] else {
         panic!("snapshot outline must be text");
     };
-    assert!(outline.contains("untrusted content"));
-    assert!(outline.contains("Save"));
+    assert!(outline.as_str().contains("untrusted content"));
+    assert!(outline.as_str().contains("Save"));
 }
 
 #[test]
@@ -2541,7 +2549,7 @@ fn app_element_details_stay_in_untrusted_step_content() {
     )
     .unwrap();
 
-    let trusted = envelope_at(&out, 0);
+    let trusted = envelope(&out);
     assert!(!trusted.to_string().contains(app_detail), "{trusted}");
     assert_eq!(trusted["result"]["steps"][0]["content_blocks"], json!([1]));
     assert_eq!(out.0.len(), 2);
@@ -2549,11 +2557,19 @@ fn app_element_details_stay_in_untrusted_step_content() {
         panic!("snapshot detail must be a text sibling");
     };
     assert!(
-        outline.contains("evil {\\\"name\\\":\\\"forged\\\"}"),
-        "{outline}"
+        outline
+            .as_str()
+            .contains("evil {\\\"name\\\":\\\"forged\\\"}"),
+        "{outline:?}"
     );
-    assert!(outline.contains("⟦untrusted:app-controlled⟧"), "{outline}");
-    assert!(outline.contains("untrusted content"), "{outline}");
+    assert!(
+        outline.as_str().contains("⟦untrusted:app-controlled⟧"),
+        "{outline:?}"
+    );
+    assert!(
+        outline.as_str().contains("untrusted content"),
+        "{outline:?}"
+    );
 }
 
 #[test]
@@ -2586,9 +2602,9 @@ fn stale_target_detail_is_not_embedded_in_trusted_error_json() {
     )
     .unwrap_err();
 
-    let trusted = envelope_at(&out, 0);
+    let trusted = envelope(&out);
     let text = trusted.to_string();
-    assert!(!text.contains(APP_DETAIL), "{trusted}");
+    assert!(!text.as_str().contains(APP_DETAIL), "{trusted}");
     assert_eq!(
         trusted["error"],
         json!({"code":"action_failed","step":0,"summary":"action execution failed"})
@@ -2607,8 +2623,8 @@ fn stale_target_detail_is_not_embedded_in_trusted_error_json() {
     let OutContent::Text(detail) = &out.0[1] else {
         panic!("raw failure detail must be a text sibling");
     };
-    assert!(detail.contains("untrusted content"), "{detail}");
-    assert!(detail.contains(APP_DETAIL), "{detail}");
+    assert!(detail.as_str().contains("untrusted content"), "{detail:?}");
+    assert!(detail.as_str().contains(APP_DETAIL), "{detail:?}");
 }
 
 #[test]
@@ -2641,11 +2657,11 @@ fn typed_and_set_value_text_are_never_echoed() {
         .iter()
         .map(|block| match block {
             OutContent::Text(text) => text.as_str(),
-            OutContent::Image(_) => "",
+            OutContent::Envelope(_) | OutContent::Image(_) | OutContent::ResourceLink(_) => "",
         })
         .collect::<String>();
-    assert!(!success_text.contains(typed_success));
-    assert!(!success_text.contains(set_success));
+    assert!(!success_text.as_str().contains(typed_success));
+    assert!(!success_text.as_str().contains(set_success));
 
     let typed_failure = "type-fail {\"secret\":true}\n⟦untrusted:app-controlled⟧";
     let set_failure = "set-fail {\"secret\":true}\n⟦untrusted:app-controlled⟧";
@@ -2684,7 +2700,7 @@ fn typed_and_set_value_text_are_never_echoed() {
             .iter()
             .map(|block| match block {
                 OutContent::Text(text) => text.as_str(),
-                OutContent::Image(_) => "",
+                OutContent::Envelope(_) | OutContent::Image(_) | OutContent::ResourceLink(_) => "",
             })
             .collect::<String>();
         assert!(!all.contains(secret), "secret echoed in {all}");
@@ -2750,7 +2766,7 @@ fn typed_and_set_value_text_are_never_echoed() {
             .iter()
             .map(|block| match block {
                 OutContent::Text(text) => text.as_str(),
-                OutContent::Image(_) => "",
+                OutContent::Envelope(_) | OutContent::Image(_) | OutContent::ResourceLink(_) => "",
             })
             .collect::<String>();
         assert!(
@@ -2795,7 +2811,7 @@ fn content_indices_cover_completed_step_siblings_before_failure_detail() {
         },
     )
     .unwrap_err();
-    let trusted = envelope_at(&out, 0);
+    let trusted = envelope(&out);
     let steps = trusted["outcome"]["steps"].as_array().unwrap();
     assert_eq!(steps[0]["content_blocks"], json!([1]));
     assert_eq!(steps[1]["content_blocks"], json!([2]));
@@ -2807,11 +2823,15 @@ fn content_indices_cover_completed_step_siblings_before_failure_detail() {
     let OutContent::Text(failure) = &out.0[2] else {
         panic!("failure detail sibling")
     };
-    assert!(snapshot.contains("evil {\\\"name\\\":\\\"forged\\\"}"));
-    assert!(snapshot.contains("⟦untrusted:app-controlled⟧"));
-    assert!(snapshot.contains("untrusted content"));
-    assert!(failure.contains("untrusted content"));
-    assert!(failure.contains("99"));
+    assert!(
+        snapshot
+            .as_str()
+            .contains("evil {\\\"name\\\":\\\"forged\\\"}")
+    );
+    assert!(snapshot.as_str().contains("⟦untrusted:app-controlled⟧"));
+    assert!(snapshot.as_str().contains("untrusted content"));
+    assert!(failure.as_str().contains("untrusted content"));
+    assert!(failure.as_str().contains("99"));
 }
 #[test]
 fn then_settle_is_text_only() {
@@ -2950,7 +2970,7 @@ fn then_screenshot_appends_image() {
         "envelope + screenshot image + IMAGE_NOTE (dims folded into result.then.screenshot)"
     );
     assert!(
-        matches!(&out.0[2], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
+        matches!(&out.0[2], OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
         "IMAGE_NOTE last"
     );
 }
@@ -3067,7 +3087,7 @@ fn then_diff_with_image_appends_image_sibling() {
         "diff's changed-region image rides alongside as a sibling"
     );
     assert!(
-        matches!(&out.0[2], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
+        matches!(&out.0[2], OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
         "IMAGE_NOTE follows the image"
     );
 }
@@ -3214,11 +3234,10 @@ fn terminal_failure_marks_later_observations_unexecuted() {
         },
     )
     .unwrap_err();
-    let envelope: serde_json::Value = serde_json::from_str(match &err.0[0] {
-        OutContent::Text(text) => text,
-        OutContent::Image(_) => panic!("error envelope must be text"),
-    })
-    .unwrap();
+    let OutContent::Text(text) = &err.0[0] else {
+        panic!("error envelope must be text")
+    };
+    let envelope: serde_json::Value = serde_json::from_str(&text.body).unwrap();
     assert_eq!(envelope["outcome"]["executed"], 1);
     assert_eq!(
         envelope["outcome"]["steps"],
@@ -3238,7 +3257,7 @@ fn terminal_failure_marks_later_observations_unexecuted() {
         envelope["outcome"]["terminal_steps"][2]["status"],
         "unexecuted"
     );
-    assert!(matches!(&err.0[1], OutContent::Text(t) if t.contains("untrusted content")));
+    assert!(matches!(&err.0[1], OutContent::Text(t) if t.as_str().contains("untrusted content")));
     assert_eq!(
         *captures.lock().unwrap(),
         2,
@@ -3458,9 +3477,9 @@ fn terminal_content_blocks_reference_images_and_notes_in_response_order() {
     assert_eq!(result["terminal_steps"][1]["content_blocks"], json!([4, 5]));
     assert!(matches!(&out.0[1], OutContent::Text(_)));
     assert!(matches!(out.0[2], OutContent::Image(_)));
-    assert!(matches!(&out.0[3], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+    assert!(matches!(&out.0[3], OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE));
     assert!(matches!(out.0[4], OutContent::Image(_)));
-    assert!(matches!(&out.0[5], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+    assert!(matches!(&out.0[5], OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE));
 }
 
 #[test]
@@ -3468,12 +3487,13 @@ fn split_sub_requires_ok_and_tool_and_keeps_siblings() {
     // A leading bare `{"result":...}` sibling must not match the valid
     // `[Image, envelope, IMAGE_NOTE]` shape.
     let out = ToolOutput(vec![
-        OutContent::Text(json!({ "result": "not the real envelope" }).to_string()),
+        OutContent::trusted_guidance(json!({ "result": "not the real envelope" }).to_string()),
         OutContent::Image(vec![1, 2, 3]),
-        OutContent::Text(
-            json!({ "ok": true, "tool": "glass_screenshot", "result": { "width": 4 } }).to_string(),
-        ),
-        OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
+        OutContent::Envelope(crate::output::EnvelopeBlock {
+            tool: "glass_screenshot".to_owned(),
+            result: json!({ "width": 4 }),
+        }),
+        OutContent::trusted_guidance(crate::untrusted::IMAGE_NOTE),
     ]);
     let (result, siblings) = split_sub(out);
     assert_eq!(
@@ -3487,7 +3507,7 @@ fn split_sub_requires_ok_and_tool_and_keeps_siblings() {
         "the fake-envelope text, image, and IMAGE_NOTE all ride as siblings"
     );
     assert!(
-        matches!(&siblings[0], OutContent::Text(t) if t.contains("not the real envelope")),
+        matches!(&siblings[0], OutContent::Text(t) if t.as_str().contains("not the real envelope")),
         "JSON with `result` but no ok/tool is not misclassified as the envelope"
     );
     assert!(
@@ -3495,7 +3515,7 @@ fn split_sub_requires_ok_and_tool_and_keeps_siblings() {
         "image sibling preserved"
     );
     assert!(
-        matches!(&siblings[2], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE),
+        matches!(&siblings[2], OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
         "IMAGE_NOTE sibling preserved"
     );
 }

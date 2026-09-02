@@ -465,6 +465,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use crate::artifacts::{ArtifactStore, FaultStage};
+    use crate::output::{OutContent, TargetAccess, ToolEffect, ToolOutput};
+    use crate::output_policy::{OutputPolicy, ToolCallOutcome};
+
     #[derive(Clone)]
     struct Buf(Arc<Mutex<Vec<u8>>>);
     impl Write for Buf {
@@ -496,6 +500,92 @@ mod tests {
                 title: Some("W".into()),
             }),
         }
+    }
+
+    #[test]
+    fn externalized_body_is_readable_but_absent_from_audit_and_diagnostics() {
+        let marker = "artifact-body-secret-marker".repeat(512);
+        let successful_root = tempfile::tempdir().expect("successful store root");
+        let successful_store =
+            ArtifactStore::for_test(successful_root.path(), 1 << 30).expect("successful store");
+        let outcome = || ToolCallOutcome {
+            tool: "glass_logs",
+            effect: ToolEffect::ReadOnly,
+            is_error: false,
+            target_access: TargetAccess::NoActiveTarget,
+            output: ToolOutput::result_with(
+                "glass_logs",
+                serde_json::json!({}),
+                vec![OutContent::untrusted_observation(&marker)],
+            ),
+        };
+        let applied = OutputPolicy::new(successful_store.clone()).apply(outcome());
+        let descriptor = applied
+            .output
+            .0
+            .iter()
+            .find_map(|content| match content {
+                OutContent::ResourceLink(descriptor) => Some(descriptor),
+                _ => None,
+            })
+            .expect("externalized descriptor");
+        let artifact = successful_store
+            .read(descriptor.uri())
+            .expect("read-only artifact path");
+
+        let audit_buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = JsonlSink::with_writer(Box::new(Buf(audit_buf.clone())), AuditConfig::default());
+        sink.record(
+            &Actuation::Pointer {
+                event: &PointerEvent::Click {
+                    x: 4,
+                    y: 5,
+                    button: MouseButton::Left,
+                    count: 1,
+                    modifiers: vec![],
+                },
+            },
+            &win_ctx(),
+            &ok(),
+            Duration::from_millis(1),
+        );
+        let audit_jsonl = String::from_utf8(audit_buf.lock().unwrap().clone()).unwrap();
+        let audit_record: serde_json::Value = serde_json::from_str(&audit_jsonl).unwrap();
+        let audit_keys = audit_record
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let failing_root = tempfile::tempdir().expect("failing store root");
+        let failing_store = ArtifactStore::for_test_with_fault(
+            failing_root.path(),
+            1 << 30,
+            FaultStage::TempWritten(0),
+        )
+        .expect("failing store");
+        let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let failing_policy =
+            OutputPolicy::with_diagnostic_for_test(failing_store, diagnostics.clone());
+        let _ = failing_policy.apply(outcome());
+        let diagnostic = diagnostics.lock().unwrap().join("\n");
+
+        assert!(artifact.text.contains(&marker));
+        assert_eq!(audit_record["v"], 1);
+        assert_eq!(
+            audit_keys,
+            [
+                "action", "args", "result", "seq", "session", "target", "ts", "v"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(audit_jsonl.contains("\"action\":\"click\""));
+        assert!(!audit_jsonl.contains("artifact_id"));
+        assert!(!audit_jsonl.contains("externalization"));
+        assert!(!audit_jsonl.contains(&marker));
+        assert!(!diagnostic.contains(&marker));
     }
 
     #[test]
@@ -1076,13 +1166,17 @@ mod tests {
             x: None,
             y: None,
             step: Some(7),
-            timeout_ms: Some(1),
+            timeout_ms: Some(1_000),
         };
 
         let mut standalone = session(&standalone_path);
         tools::click_element(&mut standalone, &click).unwrap();
         tools::set_value(&mut standalone, &value).unwrap();
         let standalone_scroll = tools::scroll_to_element(&mut standalone, &scroll).unwrap();
+        assert!(matches!(
+            standalone_scroll.0.first(),
+            Some(crate::output::OutContent::Envelope(_))
+        ));
         assert_eq!(
             crate::tools::testutil::assert_envelope(&standalone_scroll, "glass_scroll_to_element")
                 ["matched"],
@@ -1104,21 +1198,25 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(
-            crate::tools::testutil::envelope_at(&batch_error, 0)["error"]["code"],
-            "predicate_not_matched"
-        );
+        let Some(crate::output::OutContent::Text(batch_error_text)) = batch_error.0.first() else {
+            panic!("glass_do failure must be trusted error text")
+        };
+        assert_eq!(batch_error_text.trust, crate::output::TextTrust::Trusted);
+        assert_eq!(batch_error_text.role, crate::output::TextRole::ErrorDetail);
+        let batch_error_value: serde_json::Value =
+            serde_json::from_str(&batch_error_text.body).unwrap();
+        assert_eq!(batch_error_value["error"]["code"], "predicate_not_matched");
 
         let standalone_records = records(&standalone_path);
         let batch_records = records(&batch_path);
         assert_eq!(batch_records, standalone_records);
-        assert_eq!(standalone_records.len(), 4);
+        assert_eq!(standalone_records.len(), 5);
         assert_eq!(
             standalone_records
                 .iter()
                 .map(|record| record["action"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["launch", "click_element", "set_value", "scroll"]
+            vec!["launch", "click_element", "set_value", "scroll", "scroll"]
         );
         for record in &standalone_records {
             assert_eq!(record["result"]["ok"], true, "{record}");
@@ -1143,6 +1241,11 @@ mod tests {
         assert_eq!(
             standalone_records[3]["args"],
             json!({ "x": 50, "y": 50, "dx": 0, "dy": 7, "modifiers": [] })
+        );
+        assert_eq!(standalone_records[4]["action"], "scroll");
+        assert_eq!(
+            standalone_records[4]["args"],
+            json!({ "x": 50, "y": 50, "dx": 0, "dy": -7, "modifiers": [] })
         );
         for records in [&standalone_records, &batch_records] {
             assert!(!records.iter().any(|record| record["action"] == "glass_do"));

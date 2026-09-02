@@ -1,22 +1,8 @@
 //! Linux process-tree introspection via `/proc`.
 //!
-//! A small, backend-agnostic utility shared by the Linux display backends
-//! (`glass-x11`, `glass-wayland`): given the pid glass spawned, enumerate that
-//! process **and all its descendants**. Both backends need this because the
-//! process they spawn is frequently *not* the app — it's a wrapper (a `bwrap`
-//! sandbox, sway's `exec`, a shell launcher), and the real app is a descendant
-//! with a different pid. The full set is used to correlate windows
-//! (`_NET_WM_PID`) and the accessibility tree (the AT-SPI connection pid) back
-//! to the launch.
+//! Tracks Linux process trees for display backends.
 //!
-//! This is deliberately *not* in `glass-core` (it is OS-specific `/proc` I/O,
-//! which belongs behind the `Platform` seam, not in the portable core) nor in
-//! the sandbox crate (it is generic process introspection, unrelated to
-//! bubblewrap). The Windows peer (`descendant_pids`, Toolhelp-based) lives with
-//! the Windows backend for the same reason — the OS APIs can't share an impl.
-//!
-//! It also holds what both backends need *around* a spawned process: reaping it and its
-//! descendants, and reading its stderr under a cap and a stop ([`StderrTail`]).
+//! It correlates descendants to launched apps, reaps them, and tails bounded stderr.
 
 #![cfg(target_os = "linux")]
 
@@ -33,49 +19,24 @@ use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 /// Grace period a process gets to exit after SIGTERM before SIGKILL.
 pub const REAP_GRACE: Duration = Duration::from_secs(2);
 
-/// How long an app that was *asked* to close gets to leave through its own shutdown path
-/// before glass falls back to signalling it.
-///
-/// A signalled toolkit app runs no shutdown path at all, because the toolkit installs no
-/// `SIGTERM` handler and the default disposition kills the process outright: verified with GTK 4
-/// on both Linux backends, where a signalled client recorded nothing on the way out and an asked
-/// one ran its close and shutdown handlers (Qt is believed to behave the same way; that was not
-/// tested). Asking first — an X11 `WM_DELETE_WINDOW` client message, or a close request through
-/// the compositor under Wayland — is what lets the app flush its state.
-///
-/// The value also has to leave room for the signal ladder inside the budget teardown gets as a
-/// whole; each backend asserts that against `glass_core::TEARDOWN_BUDGET` at compile time.
+/// Grace period after a close request lets an app flush state before signaling within the teardown budget.
 pub const CLOSE_GRACE: Duration = Duration::from_millis(1500);
 
-/// SIGTERM→SIGKILL grace for an app that was already asked to close and did not.
-///
-/// Shorter than [`REAP_GRACE`] on purpose: this runs *after* [`CLOSE_GRACE`] is already spent,
-/// and the two together have to fit in the budget glass-mcp gives teardown as a whole. An app
-/// that ignored the close request has had its chance to shut down cleanly; what is left is
-/// making sure it is gone.
+/// SIGTERM-to-SIGKILL grace after [`CLOSE_GRACE`] expires.
 pub const APP_REAP_GRACE: Duration = Duration::from_millis(1000);
 
-/// How a launched app actually went away, so the backend can say so rather than reporting
-/// every teardown as an unqualified success. Signalling an app that was never asked destroys
-/// whatever it would have flushed on exit, and the user only learns of it the next time the
-/// app starts up in a recovered/crashed state.
+/// How a launched app exited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Closed {
     /// Asked, and the app left on its own before the grace ran out.
     Gracefully,
-    /// Nothing was asked, so the app was signalled without a chance to shut down. `reason` says
-    /// why when there is something to say — windows that were there but could not be asked, or
-    /// an enumeration that failed. `None` means there was simply no window to ask (a teardown
-    /// after a failed launch, or a windowless process), which is not worth reporting.
+    /// Signaled without a close request and `reason` describes unaskable windows or failed enumeration.
     SignalledUnasked { reason: Option<String> },
-    /// Asked, but still running when [`CLOSE_GRACE`] ran out (a modal save prompt, or a hang),
-    /// so it was signalled anyway.
+    /// Signaled after [`CLOSE_GRACE`] expired.
     SignalledAfterGrace,
 }
 
-/// The result of asking an app's windows to close: how many the request reached, and why the
-/// rest could not be asked. Backends build one of these and hand it to [`Asked::outcome`], so
-/// the counts are never two bare numbers a caller could swap.
+/// The number of windows asked to close and why others could not be asked.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Asked {
     asked: usize,
@@ -83,8 +44,7 @@ pub struct Asked {
 }
 
 impl Asked {
-    /// Nothing to ask: the app has no window. Reported as nothing at all — there was no
-    /// shutdown path to miss.
+    /// No windows were available to close.
     pub const fn none() -> Asked {
         Asked {
             asked: 0,
@@ -92,9 +52,7 @@ impl Asked {
         }
     }
 
-    /// `total` windows were found and `asked` of them accepted a close request. `why_not`
-    /// describes the rest in the backend's own terms — the caller knows whether they lacked a
-    /// protocol, sat outside the launched process tree, or were refused by a compositor.
+    /// Records `asked` close requests out of `total` and `why_not` describes the rest.
     pub fn counted(total: usize, asked: usize, why_not: impl FnOnce(usize) -> String) -> Asked {
         let unaskable = total.saturating_sub(asked);
         Asked {
@@ -354,6 +312,62 @@ pub fn proc_tree_pids(root_pid: u32) -> Vec<u32> {
     collect_descendants(root_pid, &parent_of)
 }
 
+/// Host and namespace-visible identities for one live process tree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessIdentitySet {
+    host_pids: Vec<u32>,
+    matching_pids: Vec<u32>,
+}
+
+/// Parse the PID visible in the innermost namespace from a Linux status file.
+pub fn namespace_pid_from_status(status: &str) -> Option<u32> {
+    status.lines().find_map(|line| {
+        line.strip_prefix("NSpid:")?
+            .split_whitespace()
+            .last()?
+            .parse()
+            .ok()
+    })
+}
+
+impl ProcessIdentitySet {
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (u32, Option<u32>)>) -> Self {
+        let mut host_pids = Vec::new();
+        let mut matching_pids = Vec::new();
+        for (host, namespace) in pairs {
+            host_pids.push(host);
+            matching_pids.push(host);
+            matching_pids.extend(namespace);
+        }
+        host_pids.sort_unstable();
+        host_pids.dedup();
+        matching_pids.sort_unstable();
+        matching_pids.dedup();
+        Self {
+            host_pids,
+            matching_pids,
+        }
+    }
+
+    pub fn from_host_root(root: u32) -> Self {
+        Self::from_pairs(proc_tree_pids(root).into_iter().map(|host| {
+            let namespace = std::fs::read_to_string(format!("/proc/{host}/status"))
+                .ok()
+                .as_deref()
+                .and_then(namespace_pid_from_status);
+            (host, namespace)
+        }))
+    }
+
+    pub fn host_pids(&self) -> &[u32] {
+        &self.host_pids
+    }
+
+    pub fn matching_pids(&self) -> &[u32] {
+        &self.matching_pids
+    }
+}
+
 /// Collect `root` and all its descendants given a child→parent-pid map.
 /// Cycle-safe (a `seen` set guarantees termination even if the map contains a
 /// cycle, e.g. from PID reuse mid-scan).
@@ -373,6 +387,46 @@ fn collect_descendants(root: u32, parent_of: &HashMap<u32, u32>) -> Vec<u32> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{ProcessIdentitySet, namespace_pid_from_status};
+
+    #[test]
+    fn nspid_uses_the_innermost_namespace_pid() {
+        let status = "Name:\tapp\nPid:\t4242\nNSpid:\t4242\t2\n";
+        assert_eq!(namespace_pid_from_status(status), Some(2));
+    }
+
+    #[test]
+    fn malformed_or_missing_nspid_is_ignored() {
+        for status in ["Name:\tapp\n", "NSpid:\t4242\tbad\n", "NSpid:\t\n"] {
+            assert_eq!(namespace_pid_from_status(status), None);
+        }
+    }
+
+    #[test]
+    fn identity_set_sorts_and_deduplicates_host_and_matching_pids() {
+        let set = ProcessIdentitySet::from_pairs([
+            (4243, Some(3)),
+            (4242, Some(2)),
+            (7, Some(7)),
+            (4242, Some(2)),
+        ]);
+        assert_eq!(set.host_pids(), &[7, 4242, 4243]);
+        assert_eq!(set.matching_pids(), &[2, 3, 7, 4242, 4243]);
+    }
+
+    #[test]
+    fn identity_set_from_a_live_root_contains_that_process() {
+        let root = std::process::id();
+
+        let set = ProcessIdentitySet::from_host_root(root);
+
+        assert!(set.host_pids().contains(&root));
+        assert!(set.matching_pids().contains(&root));
+    }
 }
 
 #[cfg(test)]

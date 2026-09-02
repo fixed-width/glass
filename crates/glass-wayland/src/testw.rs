@@ -33,6 +33,22 @@ pub(crate) const CONNECTED_LINE: &str = "testw: connected";
 /// Printed by the fixture when it acts on a close request, rather than being signalled.
 pub(crate) const CLOSING_LINE: &str = "testw: closing";
 
+fn logs_contain_sequence(lines: &[String], needles: &[&str]) -> bool {
+    let mut remaining = needles.iter();
+    let Some(mut needle) = remaining.next() else {
+        return true;
+    };
+    for line in lines {
+        if line.contains(*needle) {
+            let Some(next) = remaining.next() else {
+                return true;
+            };
+            needle = next;
+        }
+    }
+    false
+}
+
 /// How long a harness wait may spin before the test fails outright, and how long a launch gives
 /// the compositor. Both bound a hang; neither paces anything, and a passing test on an idle
 /// machine reaches neither.
@@ -206,16 +222,20 @@ impl Session {
     /// along the way. Drains are destructive, so the caller gets the accumulated set rather than
     /// whatever happened to arrive in the last poll.
     pub(crate) fn wait_for_log(&mut self, needle: &str) -> Vec<String> {
+        self.wait_for_log_sequence(&[needle])
+    }
+
+    pub(crate) fn wait_for_log_sequence(&mut self, needles: &[&str]) -> Vec<String> {
         let deadline = Instant::now() + SETTLE_BUDGET;
         let mut seen: Vec<String> = Vec::new();
         loop {
             seen.extend(self.platform.drain_logs().into_iter().map(|(_, l)| l));
-            if seen.iter().any(|l| l.contains(needle)) {
+            if logs_contain_sequence(&seen, needles) {
                 return seen;
             }
             assert!(
                 Instant::now() < deadline,
-                "the app never logged {needle:?}; it said: {seen:#?}"
+                "the app never logged {needles:?} in order; it said: {seen:#?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -755,6 +775,26 @@ mod app {
 
 mod harness_tests {
     use super::*;
+
+    #[test]
+    fn an_earlier_matching_line_does_not_complete_a_later_sequence() {
+        let lines = [
+            "input: mods 0".to_string(),
+            "input: mods 4".to_string(),
+            "input: key 1 1".to_string(),
+            "input: key 1 0".to_string(),
+            "input: mods 0".to_string(),
+        ];
+
+        assert!(logs_contain_sequence(
+            &lines,
+            &["input: mods 4", "input: key", "input: mods 0"]
+        ));
+        assert!(!logs_contain_sequence(
+            &lines[..4],
+            &["input: mods 4", "input: key", "input: mods 0"]
+        ));
+    }
 
     #[test]
     fn parses_a_window_list() {

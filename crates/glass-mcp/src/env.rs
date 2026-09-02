@@ -84,6 +84,13 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
         secret: false,
     },
     EnvVarDoc {
+        name: "GLASS_ARTIFACT_DIR",
+        scope: EnvScope::All,
+        purpose: "Absolute artifact cache-root override; relative paths are rejected",
+        default: "platform cache directory/glass/artifacts",
+        secret: false,
+    },
+    EnvVarDoc {
         name: "GLASS_DISPLAY",
         scope: EnvScope::X11,
         purpose: "X11 display to use; :0 drives the real desktop",
@@ -572,6 +579,7 @@ mod tests {
             "GLASS_BACKEND",
             "GLASS_SANDBOX",
             "GLASS_SANDBOX_FLOOR",
+            "GLASS_ARTIFACT_DIR",
             "GLASS_DISPLAY",
             "GLASS_XVFB_SCREEN",
             "GLASS_XVFB",

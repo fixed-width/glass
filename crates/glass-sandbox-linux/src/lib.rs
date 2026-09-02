@@ -1,10 +1,13 @@
 //! Linux process containment for glass via bubblewrap (`bwrap`).
 //!
-//! `wrap_argv` is pure (builds an argv, touches nothing) so it is unit-tested by
-//! asserting the arguments. `availability` runs `bwrap` to prove a user namespace
-//! can be created. Callers handle `SandboxLevel::Off` themselves (never wrap).
+//! Validates protected paths, probes required Bubblewrap capabilities, and builds contained launch
+//! arguments. Callers bypass this crate for `SandboxLevel::Off`.
 
 #![cfg(target_os = "linux")]
+
+mod status;
+
+pub use status::{BwrapStatusPipe, BwrapStatusReader};
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -12,18 +15,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use glass_core::{AppSpec, BoundKind, Check, CheckStatus, GlassError, Result, SandboxLevel};
+use glass_core::{
+    AppSpec, BoundKind, Check, CheckStatus, GlassError, ProtectedHostPath, ProtectedHostPathKind,
+    Result, SandboxLevel,
+};
 use glass_exec_unix::{Resolved, resolve_bin, resolve_on_path_in};
 use glass_sandbox_unix::{abs_token, canon, dir_of};
 
-/// App-level environment that makes GUI toolkits present frames without X11 MIT-SHM. glass's
-/// containment breaks shared-memory rendering on the headless display: `wrap_argv` passes
-/// `--unshare-ipc`, which isolates the SysV IPC namespace so MIT-SHM can't attach to the
-/// out-of-sandbox X server. That is the operative cause — GTK4's GL renderer, and even the Mesa
-/// software (llvmpipe) path it falls back to once `--dev /dev` also withholds `/dev/dri`, both need
-/// MIT-SHM to present, so the window stays black. These vars pick a renderer that presents via
-/// plain X instead (GTK4's cairo renderer; Qt's non-SHM / software paths); each is a no-op for a
-/// toolkit that does not read it.
+/// Renderer environment for contained X11 apps because `--unshare-ipc` prevents MIT-SHM display access.
 pub const SOFTWARE_RENDER_ENV: &[(&str, &str)] = &[
     ("GSK_RENDERER", "cairo"),        // GTK4
     ("QT_X11_NO_MITSHM", "1"),        // Qt (X11 widgets)
@@ -79,6 +78,10 @@ pub struct WrapOpts {
     pub ro_binds: Vec<PathBuf>,
     /// Existing paths re-exposed read-write AFTER the `/tmp` tmpfs (e.g. the Wayland runtime dir).
     pub rw_binds: Vec<PathBuf>,
+    /// Inheritable descriptor receiving Bubblewrap's JSON status stream.
+    pub status_fd: Option<i32>,
+    /// Host paths masked after every launch-specific bind.
+    pub protected_paths: Vec<ProtectedHostPath>,
 }
 
 /// Read-only binds that make the LITERAL launch target reachable inside the namespace: the
@@ -205,20 +208,12 @@ pub fn ephemeral_home() -> OsString {
 }
 
 /// Build the full argv for a contained launch: `bwrap … -- <program> <args…>`.
-pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Vec<OsString> {
+pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Result<Vec<OsString>> {
+    validate_protected_paths(&opts.protected_paths)?;
     let mut v: Vec<OsString> = vec![OsString::from(bwrap_bin())];
     for f in [
         "--unshare-user",
         "--unshare-ipc",
-        // NOTE: --unshare-pid is intentionally OMITTED: a PID namespace makes the child's
-        // std::process::id() return a namespace-relative PID (often 2), which is what it
-        // would write into _NET_WM_PID — glass's window discovery then can't match the child,
-        // since it holds the host PID.
-        //
-        // Security note: without a PID namespace the contained process can see host PIDs in
-        // /proc and can signal same-UID processes, glass-mcp included. Accepted trade-off —
-        // filesystem and network containment are the goals. Passing _NET_WM_PID out-of-band
-        // (bwrap --json-status-fd) would restore PID-namespace isolation.
         "--unshare-uts",
         "--unshare-cgroup-try",
         "--die-with-parent",
@@ -232,6 +227,9 @@ pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Vec<OsS
         "ALL",
     ] {
         v.push(OsString::from(f));
+    }
+    if opts.status_fd.is_some() {
+        v.push(OsString::from("--unshare-pid"));
     }
     if opts.level == SandboxLevel::Strict {
         v.push(OsString::from("--unshare-net"));
@@ -248,6 +246,10 @@ pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Vec<OsS
         "/tmp",
     ] {
         v.push(OsString::from(f));
+    }
+    if let Some(fd) = opts.status_fd {
+        v.push(OsString::from("--json-status-fd"));
+        v.push(OsString::from(fd.to_string()));
     }
     v.push(OsString::from("--tmpfs"));
     v.push(opts.home.clone());
@@ -284,13 +286,56 @@ pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Vec<OsS
         v.push(OsString::from("--chdir"));
         v.push(cwd.clone().into_os_string());
     }
+    for protected in &opts.protected_paths {
+        match protected.kind {
+            ProtectedHostPathKind::Directory => {
+                v.push(OsString::from("--tmpfs"));
+                v.push(protected.path.clone().into_os_string());
+            }
+            ProtectedHostPathKind::File => {
+                v.push(OsString::from("--ro-bind"));
+                v.push(OsString::from("/dev/null"));
+                v.push(protected.path.clone().into_os_string());
+            }
+        }
+    }
     v.push(OsString::from("--setenv"));
     v.push(OsString::from("HOME"));
     v.push(opts.home.clone());
     v.push(OsString::from("--"));
     v.push(program.to_os_string());
     v.extend(args.iter().cloned());
-    v
+    Ok(v)
+}
+
+/// Validate protected host paths before a target command is launched.
+pub fn validate_protected_paths(paths: &[ProtectedHostPath]) -> Result<()> {
+    for protected in paths {
+        let path = &protected.path;
+        if !path.is_absolute() || path == Path::new("/") {
+            return Err(GlassError::SandboxUnavailable(format!(
+                "protected host path must be absolute and cannot be /: {}",
+                path.display()
+            )));
+        }
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            GlassError::SandboxUnavailable(format!(
+                "cannot establish protected host path type for {}: {error}",
+                path.display()
+            ))
+        })?;
+        let matches = match protected.kind {
+            ProtectedHostPathKind::Directory => metadata.is_dir(),
+            ProtectedHostPathKind::File => metadata.is_file(),
+        };
+        if !matches {
+            return Err(GlassError::SandboxUnavailable(format!(
+                "protected host path type does not match {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Build the (unsandboxed) command for `spec.build`, or `None` if there's no build step.
@@ -359,6 +404,8 @@ enum NoSandbox {
     Unreadable(String),
     /// bwrap ran and exited non-zero, including without saying why.
     Refused(String),
+    /// bwrap ran but did not provide the process-isolation status contract glass requires.
+    Unsupported(String),
     /// bwrap had not exited when its budget ran out, so it was sent SIGKILL — which one wedged in
     /// the kernel does not take until it surfaces. Only the direct child is signalled; anything it
     /// had already forked outlives it.
@@ -388,6 +435,7 @@ impl NoSandbox {
             | NoSandbox::NotLookedUp(why)
             | NoSandbox::Unreadable(why)
             | NoSandbox::Refused(why)
+            | NoSandbox::Unsupported(why)
             | NoSandbox::TimedOut(why)
             | NoSandbox::Unfinished(why) => why,
         }
@@ -401,6 +449,9 @@ impl NoSandbox {
             NoSandbox::NotLookedUp(_) => NAME_BWRAP,
             NoSandbox::Unreadable(_) => READ_BWRAP,
             NoSandbox::Refused(_) => refusal_remedy(apparmor_restricted),
+            NoSandbox::Unsupported(_) => {
+                "install or upgrade bubblewrap to a version supporting --unshare-pid, --proc, and --json-status-fd; or run with sandbox:\"off\" (GLASS_SANDBOX=off) to launch unconfined"
+            }
             NoSandbox::TimedOut(_) => CHECK_THE_MOUNTS,
             NoSandbox::Unfinished(_) => NOTHING_LEARNED,
         }
@@ -465,11 +516,28 @@ const _: () = assert!(USERNS_PROBE_BUDGET.as_secs() >= 5 && USERNS_PROBE_BUDGET.
 /// never answered.
 fn userns_probe(bwrap: &Path, budget: Duration) -> Probed {
     let mut cmd = Command::new(bwrap);
-    cmd.args(["--unshare-user", "--ro-bind", "/", "/", "--", "true"]);
+    cmd.args([
+        "--unshare-user",
+        "--unshare-pid",
+        "--ro-bind",
+        "/",
+        "/",
+        "--proc",
+        "/proc",
+        "--json-status-fd",
+        "1",
+        "--",
+        "true",
+    ]);
     let at = bwrap.display();
     let started = Instant::now();
     match glass_core::run_bounded(&mut cmd, budget, "bwrap:userns") {
-        Ok(o) if o.status.success() => Ok(started.elapsed()),
+        Ok(o) if o.status.success() && child_pid_from_status_output(&o.stdout).is_some() => {
+            Ok(started.elapsed())
+        }
+        Ok(o) if o.status.success() => Err(NoSandbox::Unsupported(format!(
+            "bubblewrap ({at}) did not report a positive child PID; glass requires PID namespaces, private /proc, and --json-status-fd support"
+        ))),
         Ok(o) => Err(NoSandbox::Refused(
             match String::from_utf8_lossy(&o.stderr).trim() {
                 // Nothing said establishes nothing about namespaces — a signal death (the OOM
@@ -486,6 +554,14 @@ fn userns_probe(bwrap: &Path, budget: Duration) -> Probed {
         }
         Err(e) => Err(NoSandbox::Unfinished(format!("bubblewrap ({at}): {e}"))),
     }
+}
+
+fn child_pid_from_status_output(output: &[u8]) -> Option<u32> {
+    output.split(|byte| *byte == b'\n').find_map(|line| {
+        let value = serde_json::from_slice::<serde_json::Value>(line).ok()?;
+        let pid = value.get("child-pid")?.as_u64()?;
+        u32::try_from(pid).ok().filter(|pid| *pid > 0)
+    })
 }
 
 /// Read whether AppArmor restricts unprivileged user namespaces (Ubuntu 23.10+).
@@ -556,6 +632,77 @@ mod tests {
             cwd: Some(PathBuf::from("/work")),
             ro_binds: vec![PathBuf::from("/tmp/.X11-unix")],
             rw_binds: vec![],
+            status_fd: None,
+            protected_paths: vec![],
+        }
+    }
+
+    #[test]
+    fn contained_argv_unshares_pid_mounts_private_proc_and_reports_status() {
+        let pipe = BwrapStatusPipe::new().unwrap();
+        let mut o = opts(SandboxLevel::Default);
+        o.status_fd = Some(pipe.writer_fd());
+        let argv = wrap_argv(OsStr::new("/bin/app"), &[], &o).unwrap();
+        let args = argv_strings(&argv);
+        assert!(args.contains(&"--unshare-pid".into()));
+        assert!(args.windows(2).any(|w| w == ["--proc", "/proc"]));
+        assert!(
+            args.windows(2)
+                .any(|w| { w[0] == "--json-status-fd" && w[1] == pipe.writer_fd().to_string() })
+        );
+    }
+
+    #[test]
+    fn protected_directory_and_file_masks_are_final() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("artifacts");
+        let lease = temp.path().join("artifacts.lease");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&lease, b"lease").unwrap();
+        let mut o = opts(SandboxLevel::Default);
+        o.cwd = Some(temp.path().to_path_buf());
+        o.ro_binds.push(directory.clone());
+        o.protected_paths = vec![
+            ProtectedHostPath::directory(&directory),
+            ProtectedHostPath::file(&lease),
+        ];
+        let argv = wrap_argv(OsStr::new("/bin/app"), &[], &o).unwrap();
+        let directory_os = directory.as_os_str();
+        let lease_os = lease.as_os_str();
+        let cwd_position = argv
+            .iter()
+            .position(|arg| arg == temp.path().as_os_str())
+            .unwrap();
+        let directory_position = argv.iter().rposition(|arg| arg == directory_os).unwrap();
+        let lease_position = argv.iter().rposition(|arg| arg == lease_os).unwrap();
+        assert!(directory_position > cwd_position);
+        assert!(lease_position > cwd_position);
+        assert_eq!(argv[directory_position - 1], OsStr::new("--tmpfs"));
+        assert_eq!(argv[lease_position - 2], OsStr::new("--ro-bind"));
+        assert_eq!(argv[lease_position - 1], OsStr::new("/dev/null"));
+    }
+
+    #[test]
+    fn invalid_protected_paths_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("directory");
+        let file = temp.path().join("file");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, b"file").unwrap();
+        let cases = [
+            ProtectedHostPath::file("relative"),
+            ProtectedHostPath::directory("/"),
+            ProtectedHostPath::file(temp.path().join("missing")),
+            ProtectedHostPath::file(&directory),
+            ProtectedHostPath::directory(&file),
+        ];
+        for protected in cases {
+            let mut o = opts(SandboxLevel::Default);
+            o.protected_paths = vec![protected];
+            assert!(matches!(
+                wrap_argv(OsStr::new("/bin/app"), &[], &o),
+                Err(GlassError::SandboxUnavailable(_))
+            ));
         }
     }
 
@@ -565,7 +712,8 @@ mod tests {
             OsStr::new("/bin/app"),
             &[OsString::from("--flag")],
             &opts(SandboxLevel::Default),
-        );
+        )
+        .unwrap();
         let s = argv_strings(&argv);
         assert_eq!(s[0], "bwrap");
         assert!(s.contains(&"--unshare-user".into()));
@@ -596,7 +744,7 @@ mod tests {
 
     #[test]
     fn strict_adds_unshare_net() {
-        let argv = wrap_argv(OsStr::new("app"), &[], &opts(SandboxLevel::Strict));
+        let argv = wrap_argv(OsStr::new("app"), &[], &opts(SandboxLevel::Strict)).unwrap();
         assert!(argv_strings(&argv).contains(&"--unshare-net".into()));
     }
 
@@ -604,7 +752,7 @@ mod tests {
     fn rw_binds_emit_bind_try_after_tmpfs_tmp() {
         let mut o = opts(SandboxLevel::Default);
         o.rw_binds = vec![PathBuf::from("/run/glass-rt")];
-        let s = argv_strings(&wrap_argv(OsStr::new("app"), &[], &o));
+        let s = argv_strings(&wrap_argv(OsStr::new("app"), &[], &o).unwrap());
         let tmpfs_tmp = s.windows(2).position(|w| w == ["--tmpfs", "/tmp"]).unwrap();
         let rwbind = s
             .windows(3)
@@ -634,8 +782,10 @@ mod tests {
             cwd: Some(PathBuf::from("/home/u")),
             ro_binds: vec![],
             rw_binds: vec![],
+            status_fd: None,
+            protected_paths: vec![],
         };
-        let s = argv_strings(&wrap_argv(OsStr::new("app"), &[], &o));
+        let s = argv_strings(&wrap_argv(OsStr::new("app"), &[], &o).unwrap());
         // The bind sequence --bind /home/u /home/u must NOT appear.
         assert!(
             !s.windows(3).any(|w| w == ["--bind", "/home/u", "/home/u"]),
@@ -659,8 +809,10 @@ mod tests {
             cwd: Some(PathBuf::from("/home/u/proj")),
             ro_binds: vec![],
             rw_binds: vec![],
+            status_fd: None,
+            protected_paths: vec![],
         };
-        let s = argv_strings(&wrap_argv(OsStr::new("app"), &[], &o));
+        let s = argv_strings(&wrap_argv(OsStr::new("app"), &[], &o).unwrap());
         assert!(
             s.windows(3)
                 .any(|w| w == ["--bind", "/home/u/proj", "/home/u/proj"]),
@@ -684,8 +836,10 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             ro_binds: vec![],
             rw_binds: vec![],
+            status_fd: None,
+            protected_paths: vec![],
         };
-        let s = argv_strings(&wrap_argv(OsStr::new("app"), &[], &o));
+        let s = argv_strings(&wrap_argv(OsStr::new("app"), &[], &o).unwrap());
         assert!(
             !s.windows(3).any(|w| w == ["--bind", "/tmp", "/tmp"]),
             "cwd==/tmp must not emit --bind /tmp /tmp; got: {s:?}"
@@ -1296,8 +1450,8 @@ mod tests {
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\n[ $# -eq 6 ] || exit 3\n\
-                 [ \"$*\" = '--unshare-user --ro-bind / / -- true' ] || exit 3\n{body}"
+                "#!/bin/sh\n[ $# -eq 11 ] || exit 3\n\
+                 [ \"$*\" = '--unshare-user --unshare-pid --ro-bind / / --proc /proc --json-status-fd 1 -- true' ] || exit 3\n{body}"
             ),
         )
         .expect("write the fake bwrap");
@@ -1358,10 +1512,21 @@ mod tests {
     #[test]
     fn a_bwrap_that_answers_clears_the_probe() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let bin = fake_bwrap(dir.path(), "exit 0\n");
+        let bin = fake_bwrap(dir.path(), "echo '{\"child-pid\":2}'\nexit 0\n");
         let took = userns_probe(&bin, USERNS_PROBE_BUDGET)
             .expect("a bwrap that answered the probe's own question must clear it");
         assert!(took < USERNS_PROBE_BUDGET, "{took:?}");
+    }
+
+    #[test]
+    fn a_successful_bwrap_without_child_status_fails_with_upgrade_remedy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = fake_bwrap(dir.path(), "exit 0\n");
+        let Err(no) = userns_probe(&bin, USERNS_PROBE_BUDGET) else {
+            panic!("success without child status must fail closed");
+        };
+        assert!(matches!(no, NoSandbox::Unsupported(_)));
+        assert!(no.remedy(false).contains("upgrade bubblewrap"));
     }
 
     /// What bubblewrap itself says is the actionable part — "cannot create a user namespace" alone

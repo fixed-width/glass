@@ -1,10 +1,11 @@
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use glass_core::{AppSpec, SandboxLevel, Stream};
+use glass_core::{AppSpec, ProtectedHostPath, Result, SandboxLevel, Stream};
 use glass_sandbox_linux::{WrapOpts, ephemeral_home, wrap_argv};
 
 pub type LogSink = Arc<Mutex<Vec<(Stream, String)>>>;
@@ -37,29 +38,20 @@ fn output_resolution() -> (u32, u32) {
         .unwrap_or((OUTPUT_WIDTH, OUTPUT_HEIGHT))
 }
 
-/// Render a minimal per-session sway config: one headless output sized by
-/// [`output_resolution`],
-/// no window borders, every window floating (so toplevels keep their natural size
-/// for true per-window capture/geometry), and an `exec` that launches the target
-/// app. `spec.run` args are shell-quoted because sway runs `exec` through
-/// `/bin/sh -c`.
-///
-/// When `spec.sandbox` is not `Off`, the `exec` argv is wrapped in a `bwrap`
-/// invocation so the launched process runs in a sandboxed user namespace. The
-/// Wayland socket dir (`runtime_dir`) is re-exposed read-write inside the
-/// namespace so the app can still connect to sway.
-pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Path>) -> String {
-    let argv: Vec<String> = match spec.sandbox {
-        SandboxLevel::Off => spec.run.to_vec(),
+/// Renders a per-session sway config with a headless output and target `exec`.
+pub fn sway_config(
+    spec: &AppSpec,
+    runtime_dir: &Path,
+    a11y_bind_dir: Option<&Path>,
+    status_fd: Option<i32>,
+    protected_paths: &[ProtectedHostPath],
+) -> Result<Vec<u8>> {
+    let argv: Vec<OsString> = match spec.sandbox {
+        SandboxLevel::Off => spec.run.iter().map(OsString::from).collect(),
         level => {
             let prog = OsString::from(&spec.run[0]);
             let args: Vec<OsString> = spec.run[1..].iter().map(OsString::from).collect();
-            // Default the working directory to glass's own cwd when the spec sets none, so a
-            // contained launch with no `cwd` still gets `--chdir` + a guarded rw bind of that
-            // directory and any relative launch token resolves against it. Computed ONCE and
-            // shared by both consumers verbatim. If `current_dir()` fails, both see `None` —
-            // no `--chdir`/bind, and relative tokens are skipped rather than resolved against
-            // a wrong root.
+            // Compute the fallback cwd once so contained launch paths share one resolution root.
             let effective_cwd = spec.cwd.clone().or_else(|| {
                 std::env::current_dir()
                     .inspect_err(|e| {
@@ -93,32 +85,32 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
                 cwd: effective_cwd,
                 ro_binds,
                 rw_binds: vec![runtime_dir.to_path_buf()],
+                status_fd,
+                protected_paths: protected_paths.to_vec(),
             };
-            let wrapped = wrap_argv(&prog, &args, &opts);
-            // sway's config is a text file, so argv elements must be Strings.
-            // Every element here is an ASCII bwrap flag, a glass-owned path
-            // (runtime_dir / ephemeral HOME / the program), or spec.run (already
-            // String) — all valid UTF-8 in practice; to_string_lossy is the
-            // pragmatic conversion (a non-UTF-8 path would make bwrap fail
-            // loudly, not escape silently).
-            wrapped
-                .into_iter()
-                .map(|s| s.to_string_lossy().into_owned())
-                .collect()
+            wrap_argv(&prog, &args, &opts)?
         }
     };
-    let exec = argv
-        .iter()
-        .map(|a| shell_quote(a))
-        .collect::<Vec<_>>()
-        .join(" ");
+    Ok(render_sway_config(&argv))
+}
+
+fn render_sway_config(argv: &[OsString]) -> Vec<u8> {
     let (out_w, out_h) = output_resolution();
-    format!(
+    let mut config = format!(
         "output HEADLESS-1 resolution {out_w}x{out_h}\n\
          default_border none\n\
          for_window [title=\".*\"] floating enable\n\
-         exec {exec}\n"
+         exec "
     )
+    .into_bytes();
+    for (index, argument) in argv.iter().enumerate() {
+        if index > 0 {
+            config.push(b' ');
+        }
+        shell_quote(argument, &mut config);
+    }
+    config.push(b'\n');
+    config
 }
 
 /// Ask the kernel to signal the compositor if the *thread* that launched it dies — this crate's
@@ -151,9 +143,17 @@ fn die_with_launcher(cmd: &mut Command) {
 #[cfg(not(test))]
 fn die_with_launcher(_: &mut Command) {}
 
-/// Single-quote a string for a `/bin/sh` command line (escape embedded quotes).
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+/// Single-quote an OS-native argument for `/bin/sh`, escaping embedded apostrophes.
+fn shell_quote(argument: &std::ffi::OsStr, output: &mut Vec<u8>) {
+    output.push(b'\'');
+    for byte in argument.as_bytes() {
+        if *byte == b'\'' {
+            output.extend_from_slice(b"'\\''");
+        } else {
+            output.push(*byte);
+        }
+    }
+    output.push(b'\'');
 }
 
 /// Build `sway --unsupported-gpu -c <config>` headless, with a private
@@ -161,6 +161,47 @@ fn shell_quote(s: &str) -> String {
 /// start on proprietary-Nvidia hosts; it is harmless under the headless backend.
 /// `spec.env` is applied last so a caller can still override anything.
 pub fn build_sway_command(
+    sway: &Path,
+    config: &Path,
+    spec: &AppSpec,
+    runtime_dir: &Path,
+    dbus_addr: Option<&str>,
+) -> Command {
+    build_sway_command_inner(sway, config, spec, runtime_dir, dbus_addr)
+}
+
+/// Builds sway with an inheritable Bubblewrap status descriptor preserved through sway's exec.
+pub fn build_sway_command_with_status(
+    sway: &Path,
+    config: &Path,
+    spec: &AppSpec,
+    runtime_dir: &Path,
+    dbus_addr: Option<&str>,
+    status_fd: Option<i32>,
+) -> Result<Command> {
+    match (spec.sandbox, status_fd) {
+        (SandboxLevel::Off, None) | (SandboxLevel::Default | SandboxLevel::Strict, Some(0..)) => {}
+        (SandboxLevel::Off, Some(_)) => {
+            return Err(glass_core::GlassError::Backend(
+                "sandbox-off sway launch received a Bubblewrap status descriptor".into(),
+            ));
+        }
+        (SandboxLevel::Default | SandboxLevel::Strict, _) => {
+            return Err(glass_core::GlassError::SandboxUnavailable(
+                "contained sway launch requires an inheritable Bubblewrap status descriptor".into(),
+            ));
+        }
+    }
+    Ok(build_sway_command_inner(
+        sway,
+        config,
+        spec,
+        runtime_dir,
+        dbus_addr,
+    ))
+}
+
+fn build_sway_command_inner(
     sway: &Path,
     config: &Path,
     spec: &AppSpec,
@@ -210,7 +251,208 @@ pub fn build_sway_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    fn invalid_component(prefix: &[u8]) -> OsString {
+        let mut bytes = prefix.to_vec();
+        bytes.push(0xff);
+        OsString::from_vec(bytes)
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn position_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn rposition_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .rposition(|window| window == needle)
+    }
+
+    #[test]
+    fn shell_quote_preserves_apostrophe_invalid_utf8_whitespace_and_newline() {
+        let argument = OsString::from_vec(b"arg-'\xff space\nnext".to_vec());
+        let mut command = b"printf '%s' ".to_vec();
+        shell_quote(argument.as_os_str(), &mut command);
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(OsString::from_vec(command))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, argument.as_bytes());
+    }
+
+    #[test]
+    fn config_renderer_preserves_non_utf8_home_argument() {
+        let home = OsString::from_vec(b"/home/user-\xff".to_vec());
+        let argv = vec![
+            OsString::from("bwrap"),
+            OsString::from("--setenv"),
+            OsString::from("HOME"),
+            home.clone(),
+            OsString::from("--"),
+            OsString::from("app"),
+        ];
+        let config = render_sway_config(&argv);
+        assert!(contains_bytes(&config, home.as_bytes()));
+    }
+
+    fn test_sway_config(
+        spec: &AppSpec,
+        runtime_dir: &Path,
+        a11y_bind_dir: Option<&Path>,
+    ) -> String {
+        String::from_utf8(sway_config(spec, runtime_dir, a11y_bind_dir, None, &[]).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn sway_config_passes_the_inherited_status_fd_to_bwrap() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        let protected = temp.path().join("protected");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::create_dir(&protected).unwrap();
+        let pipe = glass_sandbox_linux::BwrapStatusPipe::new().unwrap();
+        let mut s = spec(&["/bin/app"]);
+        s.sandbox = SandboxLevel::Default;
+
+        let config = sway_config(
+            &s,
+            &runtime,
+            None,
+            Some(pipe.writer_fd()),
+            &[ProtectedHostPath::directory(&protected)],
+        )
+        .unwrap();
+
+        assert!(contains_bytes(&config, b"'--unshare-pid'"));
+        assert!(contains_bytes(
+            &config,
+            format!("'--json-status-fd' '{}'", pipe.writer_fd()).as_bytes()
+        ));
+    }
+
+    #[test]
+    fn sway_command_passes_the_status_writer_through_a_spawned_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("sway-probe");
+        std::fs::write(
+            &probe,
+            b"#!/bin/sh\npython3 -c 'import os; os.write(int(os.environ[\"TEST_STATUS_FD\"]), b\"{\\\"child-pid\\\":42}\\n\")'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = temp.path().join("sway.cfg");
+        std::fs::write(&config, b"").unwrap();
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let pipe = glass_sandbox_linux::BwrapStatusPipe::new().unwrap();
+        let mut s = spec(&["/bin/app"]);
+        s.sandbox = SandboxLevel::Default;
+        s.env
+            .push(("TEST_STATUS_FD".into(), pipe.writer_fd().to_string()));
+
+        let mut command = build_sway_command_with_status(
+            &probe,
+            &config,
+            &s,
+            &runtime,
+            None,
+            Some(pipe.writer_fd()),
+        )
+        .unwrap();
+        let mut child = command.spawn().unwrap();
+        let mut reader = pipe.into_reader();
+        child.wait().unwrap();
+
+        assert_eq!(reader.poll_child_pid().unwrap(), Some(42));
+    }
+
+    #[test]
+    fn sandbox_config_threads_real_status_fd_and_places_masks_after_display_and_a11y_binds() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        let a11y = temp.path().join("a11y");
+        let protected = temp.path().join("protected");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::create_dir(&a11y).unwrap();
+        std::fs::create_dir(&protected).unwrap();
+        let pipe = glass_sandbox_linux::BwrapStatusPipe::new().unwrap();
+        let mut s = spec(&["/bin/app"]);
+        s.sandbox = SandboxLevel::Default;
+        let config = sway_config(
+            &s,
+            &runtime,
+            Some(&a11y),
+            Some(pipe.writer_fd()),
+            &[ProtectedHostPath::directory(&protected)],
+        )
+        .unwrap();
+        let status = position_bytes(&config, b"'--json-status-fd'").unwrap();
+        let runtime_bind = rposition_bytes(&config, runtime.as_os_str().as_bytes()).unwrap();
+        let a11y_bind = rposition_bytes(&config, a11y.as_os_str().as_bytes()).unwrap();
+        let mask = rposition_bytes(&config, protected.as_os_str().as_bytes()).unwrap();
+        assert!(contains_bytes(
+            &config[status..],
+            format!("'{}'", pipe.writer_fd()).as_bytes()
+        ));
+        assert!(mask > runtime_bind);
+        assert!(mask > a11y_bind);
+    }
+
+    #[test]
+    fn sandbox_config_preserves_non_utf8_path_bytes_in_binds_and_final_masks() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join(invalid_component(b"runtime-"));
+        let cwd = temp.path().join(invalid_component(b"cwd-"));
+        let a11y = temp.path().join(invalid_component(b"a11y-"));
+        let protected_dir = temp.path().join(invalid_component(b"protected-dir-"));
+        let protected_file = temp.path().join(invalid_component(b"protected-file-"));
+        for dir in [&runtime, &cwd, &a11y, &protected_dir] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(&protected_file, b"lease").unwrap();
+
+        let alias_dir = temp.path().join("protected-dir-�");
+        let alias_file = temp.path().join("protected-file-�");
+        std::fs::create_dir(&alias_dir).unwrap();
+        std::fs::write(&alias_file, b"alias").unwrap();
+
+        let mut s = spec(&["/bin/app"]);
+        s.sandbox = SandboxLevel::Default;
+        s.cwd = Some(cwd.clone());
+        let config = sway_config(
+            &s,
+            &runtime,
+            Some(&a11y),
+            None,
+            &[
+                ProtectedHostPath::directory(&protected_dir),
+                ProtectedHostPath::file(&protected_file),
+            ],
+        )
+        .unwrap();
+        for path in [&runtime, &cwd, &a11y, &protected_dir, &protected_file] {
+            assert!(
+                contains_bytes(&config, path.as_os_str().as_bytes()),
+                "config changed path bytes for {path:?}"
+            );
+        }
+        assert!(!contains_bytes(&config, alias_dir.as_os_str().as_bytes()));
+        assert!(!contains_bytes(&config, alias_file.as_os_str().as_bytes()));
+    }
 
     fn spec(run: &[&str]) -> AppSpec {
         AppSpec {
@@ -251,7 +493,7 @@ mod tests {
     #[test]
     fn sway_config_has_output_border_and_quoted_exec() {
         // sandbox: Off — exec must be the bare app argv, not wrapped in bwrap.
-        let cfg = sway_config(
+        let cfg = test_sway_config(
             &spec(&["glass-testapp", "--windows", "2"]),
             std::path::Path::new("/run/glass-rt"),
             None,
@@ -273,7 +515,7 @@ mod tests {
         use glass_core::SandboxLevel;
         let mut s = spec(&["glass-testapp", "--windows", "2"]);
         s.sandbox = SandboxLevel::Default;
-        let cfg = sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
+        let cfg = test_sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
         assert!(cfg.contains("exec 'bwrap'"), "{cfg}");
         assert!(
             cfg.contains("'--bind-try' '/run/glass-rt' '/run/glass-rt'"),
@@ -293,7 +535,7 @@ mod tests {
         use glass_core::SandboxLevel;
         let mut s = spec(&["glass-testapp"]);
         s.sandbox = SandboxLevel::Default;
-        let cfg = sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
+        let cfg = test_sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
         assert!(
             cfg.contains("'--ro-bind-try' '/tmp/.X11-unix' '/tmp/.X11-unix'"),
             "{cfg}"
@@ -302,7 +544,7 @@ mod tests {
 
     #[test]
     fn sway_config_exec_unwrapped_when_off() {
-        let cfg = sway_config(&spec(&["app"]), std::path::Path::new("/run/glass-rt"), None);
+        let cfg = test_sway_config(&spec(&["app"]), std::path::Path::new("/run/glass-rt"), None);
         assert!(cfg.contains("exec 'app'"), "{cfg}");
         assert!(!cfg.contains("bwrap"), "{cfg}");
     }
@@ -433,7 +675,7 @@ mod tests {
         let asset_s = asset.to_string_lossy();
         let mut s = spec(&["/bin/cat", asset_s.as_ref()]);
         s.sandbox = SandboxLevel::Default;
-        let cfg = sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
+        let cfg = test_sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
         let argdir = dir.path().canonicalize().unwrap();
         let needle = format!("'--ro-bind-try' '{d}' '{d}'", d = argdir.to_string_lossy());
         assert!(
@@ -453,7 +695,7 @@ mod tests {
         let mut s = spec(&["/bin/app"]);
         s.sandbox = SandboxLevel::Default;
         s.cwd = None;
-        let cfg = sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
+        let cfg = test_sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
         let cwd_s = cwd.to_string_lossy();
         assert!(
             cfg.contains(&format!("'--chdir' '{cwd_s}'")),
@@ -479,7 +721,7 @@ mod tests {
     fn sway_config_binds_a11y_dir_when_sandboxed() {
         let mut s = spec(&["app"]);
         s.sandbox = glass_core::SandboxLevel::Default;
-        let cfg = sway_config(
+        let cfg = test_sway_config(
             &s,
             std::path::Path::new("/run/glass-rt"),
             Some(std::path::Path::new("/tmp/glass-a11y-xyz")),

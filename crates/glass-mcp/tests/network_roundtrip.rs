@@ -7,12 +7,31 @@ use std::time::Duration;
 
 use glass_mcp::serve::config::ServeConfig;
 use rmcp::ServiceExt;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ErrorCode};
+use rmcp::model::{SubscribeRequestParams, UnsubscribeRequestParams};
+use rmcp::service::ServiceError;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 
 /// Bind 127.0.0.1:0, start serve in the background, return the bound URL.
-async fn start_server(token: Option<&str>) -> String {
+struct TestServer {
+    url: String,
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+impl TestServer {
+    async fn shutdown(self) {
+        self.cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(8), self.task)
+            .await
+            .expect("server shutdown bounded")
+            .expect("join server")
+            .expect("server shutdown");
+    }
+}
+
+async fn start_server(token: Option<&str>) -> TestServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let cfg = ServeConfig {
@@ -21,12 +40,19 @@ async fn start_server(token: Option<&str>) -> String {
     };
     let glass = glass_mcp::boot(None);
     let report = glass_mcp::audit::report_from_config(None, |_| None);
-    tokio::spawn(async move {
-        let _ = glass_mcp::serve::run_on(listener, cfg, glass, report).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let shutdown = cancel.clone();
+    let task = tokio::spawn(async move {
+        glass_mcp::serve::run_on_until(listener, cfg, glass, report, async move {
+            shutdown.cancelled().await;
+        })
+        .await
     });
-    // Give the listener a beat to start accepting.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{addr}/")
+    TestServer {
+        url: format!("http://{addr}/"),
+        cancel,
+        task,
+    }
 }
 
 /// Build an rmcp Streamable-HTTP client transport for `url`, optionally bearing `token`.
@@ -45,10 +71,21 @@ fn client_transport(
     StreamableHttpClientTransport::from_config(cfg)
 }
 
+fn assert_method_not_found(error: ServiceError) {
+    match error {
+        ServiceError::McpError(error) => assert_eq!(
+            error.code,
+            ErrorCode::METHOD_NOT_FOUND,
+            "unexpected MCP error: {error:?}"
+        ),
+        other => panic!("expected MCP method-not-found error, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn doctor_round_trips_over_http() {
-    let url = start_server(Some("tok")).await;
-    let client = ().serve(client_transport(&url, Some("tok"))).await.expect("initialize");
+    let server = start_server(Some("tok")).await;
+    let client = ().serve(client_transport(&server.url, Some("tok"))).await.expect("initialize");
     let result = client
         .call_tool(CallToolRequestParams::new("glass_doctor"))
         .await
@@ -65,12 +102,13 @@ async fn doctor_round_trips_over_http() {
         "unexpected doctor result: {text}"
     );
     client.cancel().await.ok();
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn empty_glass_do_is_a_structured_error_over_http() {
-    let url = start_server(Some("tok")).await;
-    let client = ().serve(client_transport(&url, Some("tok"))).await.expect("initialize");
+    let server = start_server(Some("tok")).await;
+    let client = ().serve(client_transport(&server.url, Some("tok"))).await.expect("initialize");
     let arguments = serde_json::json!({ "actions": [] })
         .as_object()
         .unwrap()
@@ -96,24 +134,29 @@ async fn empty_glass_do_is_a_structured_error_over_http() {
         "an invalid sequence must not carry a success result: {envelope}"
     );
     client.cancel().await.ok();
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn rejects_missing_token() {
-    let url = start_server(Some("tok")).await;
+    let server = start_server(Some("tok")).await;
     // No auth header → initialize should fail (transport returns 401).
-    let res = ().serve(client_transport(&url, None)).await;
+    let res = ().serve(client_transport(&server.url, None)).await;
     assert!(res.is_err(), "initialize without a token must fail");
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn second_client_takes_over() {
-    let url = start_server(Some("tok")).await;
-    let c1 = ().serve(client_transport(&url, Some("tok"))).await.expect("first client");
+    let server = start_server(Some("tok")).await;
+    let c1 = ().serve(client_transport(&server.url, Some("tok"))).await.expect("first client");
     // A second client takes over the single live slot instead of being rejected —
     // this is the reconnect path (a client that dropped without a clean DELETE
     // would otherwise be locked out of its own server until the zombie expired).
-    let c2 = ().serve(client_transport(&url, Some("tok"))).await.expect("second client takes over");
+    let c2 =
+        ().serve(client_transport(&server.url, Some("tok")))
+            .await
+            .expect("second client takes over");
     // The newcomer is fully live over the taken-over slot.
     c2.call_tool(CallToolRequestParams::new("glass_doctor"))
         .await
@@ -125,4 +168,42 @@ async fn second_client_takes_over() {
     // session_gate unit tests; this test's job is the real-path reconnect admission.
     let _ = c1;
     c2.cancel().await.ok();
+    drop(c1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn resources_are_read_only_without_lists_templates_or_subscriptions() {
+    let server = start_server(Some("tok")).await;
+    let client = ().serve(client_transport(&server.url, Some("tok"))).await.expect("initialize");
+
+    assert!(
+        client
+            .list_resources(None)
+            .await
+            .expect("list resources")
+            .resources
+            .is_empty()
+    );
+    assert!(
+        client
+            .list_resource_templates(None)
+            .await
+            .expect("list resource templates")
+            .resource_templates
+            .is_empty()
+    );
+    let subscribe = client
+        .subscribe(SubscribeRequestParams::new("glass-artifact://server/id"))
+        .await
+        .expect_err("subscriptions are unsupported");
+    let unsubscribe = client
+        .unsubscribe(UnsubscribeRequestParams::new("glass-artifact://server/id"))
+        .await
+        .expect_err("unsubscriptions are unsupported");
+    assert_method_not_found(subscribe);
+    assert_method_not_found(unsubscribe);
+
+    client.cancel().await.ok();
+    server.shutdown().await;
 }

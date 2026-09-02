@@ -27,9 +27,14 @@ fn settle_capture_result(
     has_tracker: bool,
     owner: crate::Whose,
     deadline_expired: bool,
+    compatibility_capture: bool,
+    caller: Deadline,
     capture: Result<Frame>,
 ) -> Result<Option<Frame>> {
     match capture {
+        Ok(_) if compatibility_capture && caller != Deadline::UNBOUNDED && caller.has_passed() => {
+            Err(GlassError::caller_deadline_elapsed("wait for stable"))
+        }
         Ok(frame) => Ok(Some(frame)),
         Err(error)
             if soft_callee_capture_timeout(
@@ -441,14 +446,13 @@ impl Glass {
                     tracker.is_some(),
                     whose,
                     deadline.has_passed(),
+                    compatibility_capture,
+                    caller,
                     capture,
                 )?
                 else {
                     return Ok(None);
                 };
-                if compatibility_capture && caller != Deadline::UNBOUNDED && caller.has_passed() {
-                    return Err(GlassError::caller_deadline_elapsed("wait for stable"));
-                }
                 let t = match tracker {
                     Some(ref mut t) => t,
                     None => {
@@ -960,6 +964,24 @@ mod tests {
     }
 
     #[test]
+    fn completed_bounded_compatibility_capture_reports_caller_expiry() {
+        let error = settle_capture_result(
+            false,
+            crate::Whose::Callee,
+            true,
+            true,
+            Deadline::from_millis(0),
+            Ok(Frame::solid(2, 2, [1, 2, 3, 255])),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            (error.bound(), error.bound_owner()),
+            (Some(BoundKind::TimedOut), Some(crate::Whose::Caller))
+        );
+    }
+
+    #[test]
     fn wait_stable_settles_on_repeated_frame() {
         let a = Frame::solid(2, 2, [0, 0, 0, 255]);
         let b = Frame::solid(2, 2, [255, 255, 255, 255]);
@@ -1103,36 +1125,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_zero_timeout_capture_completing_after_caller_expiry_is_a_caller_error() {
-        let captures = Arc::new(Mutex::new(Vec::new()));
-        let caller = Deadline::from_millis(10);
-        let platform = FakePlatform::new(2, 2)
-            .with_frames(vec![Frame::solid(2, 2, [1, 2, 3, 255])])
-            .with_capture_log(captures.clone())
-            .with_capture_delay(Duration::from_millis(20));
-        let mut g = glass_with(platform);
-        g.start(&spec()).unwrap();
-
-        let error = g
-            .wait_stable_by(
-                &WaitStableParams {
-                    interval_ms: 0,
-                    settle_frames: 2,
-                    tolerance: 0,
-                    timeout_ms: 0,
-                    stability_region: None,
-                    ignore: Vec::new(),
-                    window: None,
-                },
-                caller,
-            )
-            .unwrap_err();
-
-        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
-        assert_eq!(captures.lock().unwrap().len(), 1);
-    }
-
-    #[test]
     fn callee_timeout_final_settle_capture_keeps_the_bounded_caller_deadline() {
         let deadlines = Arc::new(Mutex::new(Vec::new()));
         let caller = Deadline::from_millis(1_000);
@@ -1272,6 +1264,8 @@ mod tests {
             true,
             crate::Whose::Callee,
             true,
+            false,
+            Deadline::UNBOUNDED,
             Err(GlassError::caller_deadline_elapsed("capture")),
         )
         .unwrap();

@@ -92,6 +92,12 @@ pub(crate) struct FakePlatform {
     /// Makes `stop_app_by` spend its whole deadline, standing in for a device that stopped
     /// answering.
     stop_burns_deadline: bool,
+    protected_path_mode: HostPathProtectionMode,
+    fail_protected_path_configuration: bool,
+    fail_start: bool,
+    fail_stop: bool,
+    lifecycle_log: Option<Arc<Mutex<Vec<&'static str>>>>,
+    protected_paths_log: Option<Arc<Mutex<Vec<Vec<ProtectedHostPath>>>>>,
 }
 
 impl FakePlatform {
@@ -105,6 +111,33 @@ impl FakePlatform {
             },
             ..Default::default()
         }
+    }
+    pub(crate) fn with_protection_mode(mut self, mode: HostPathProtectionMode) -> Self {
+        self.protected_path_mode = mode;
+        self
+    }
+    pub(crate) fn failing_protected_path_configuration(mut self) -> Self {
+        self.fail_protected_path_configuration = true;
+        self
+    }
+    pub(crate) fn failing_start(mut self) -> Self {
+        self.fail_start = true;
+        self
+    }
+    pub(crate) fn failing_stop(mut self) -> Self {
+        self.fail_stop = true;
+        self
+    }
+    pub(crate) fn with_lifecycle_log(mut self, log: Arc<Mutex<Vec<&'static str>>>) -> Self {
+        self.lifecycle_log = Some(log);
+        self
+    }
+    pub(crate) fn with_protected_paths_log(
+        mut self,
+        log: Arc<Mutex<Vec<Vec<ProtectedHostPath>>>>,
+    ) -> Self {
+        self.protected_paths_log = Some(log);
+        self
     }
     pub(crate) fn with_frames(mut self, frames: Vec<Frame>) -> Self {
         self.frames = frames.into();
@@ -267,7 +300,31 @@ impl FakePlatform {
 }
 
 impl Platform for FakePlatform {
+    fn configure_protected_host_paths(
+        &mut self,
+        paths: &[ProtectedHostPath],
+    ) -> Result<HostPathProtectionMode> {
+        if let Some(log) = &self.lifecycle_log {
+            log.lock().unwrap().push("configure");
+        }
+        if let Some(log) = &self.protected_paths_log {
+            log.lock().unwrap().push(paths.to_vec());
+        }
+        if self.fail_protected_path_configuration {
+            Err(GlassError::SandboxUnavailable(
+                "scripted protected path configuration failure".into(),
+            ))
+        } else {
+            Ok(self.protected_path_mode)
+        }
+    }
     fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
+        if let Some(log) = &self.lifecycle_log {
+            log.lock().unwrap().push("start");
+        }
+        if self.fail_start {
+            return Err(GlassError::AppNotStarted("scripted start failure".into()));
+        }
         self.started = true;
         Ok(self.geometry.clone())
     }
@@ -276,7 +333,11 @@ impl Platform for FakePlatform {
         if let Some(c) = &self.stop_count {
             *c.lock().unwrap() += 1;
         }
-        Ok(())
+        if self.fail_stop {
+            Err(GlassError::Backend("scripted stop failure".into()))
+        } else {
+            Ok(())
+        }
     }
     fn stop_app_by(&mut self, deadline: crate::Deadline) -> Result<()> {
         if let Some(at) = &self.stop_deadline {

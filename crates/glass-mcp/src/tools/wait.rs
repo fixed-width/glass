@@ -101,9 +101,7 @@ fn element_sibling(element: Option<glass_core::ElementInfo>) -> Vec<OutContent> 
                 "bounds": e.bounds.map(|b| json!({ "x": b.x, "y": b.y, "width": b.width, "height": b.height })),
                 "states": e.states.active(),
             });
-            vec![OutContent::Text(crate::untrusted::wrap_untrusted(
-                &json.to_string(),
-            ))]
+            vec![OutContent::untrusted_observation(&json.to_string())]
         }
         None => vec![],
     }
@@ -264,9 +262,7 @@ pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
                 "stream": match l.stream { Stream::Stdout => "stdout", Stream::Stderr => "stderr" },
                 "text": l.text,
             });
-            vec![OutContent::Text(crate::untrusted::wrap_untrusted(
-                &json.to_string(),
-            ))]
+            vec![OutContent::untrusted_observation(&json.to_string())]
         }
         None => vec![],
     };
@@ -506,17 +502,16 @@ mod tests {
         let out = scroll_to_element(&mut g, &a).unwrap();
         // `scrolled` is glass-computed and stays in the trusted result.
         match &out.0[0] {
-            OutContent::Text(t) => {
-                let v: serde_json::Value =
-                    serde_json::from_str(t).expect("envelope must be valid JSON");
-                assert_eq!(v["result"]["matched"], json!(true), "envelope: {v}");
+            OutContent::Envelope(envelope) => {
+                let v = &envelope.result;
+                assert_eq!(v["matched"], json!(true), "envelope: {v}");
                 assert_eq!(
-                    v["result"]["scrolled"]["direction"],
+                    v["scrolled"]["direction"],
                     json!("down"),
                     "resolved direction must be serialized in result; got: {v}"
                 );
                 assert!(
-                    v["result"]["element"].is_null(),
+                    v["element"].is_null(),
                     "app element must not ride in the trusted result: {v}"
                 );
             }
@@ -526,14 +521,17 @@ mod tests {
         match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
-                    t.starts_with(crate::untrusted::NOTE),
-                    "must be marked untrusted: {t}"
+                    t.as_str().starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t:?}"
                 );
                 assert!(
-                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "enveloped: {t}"
+                    t.as_str().contains("⟦untrusted:") && t.as_str().contains("⟦/untrusted:"),
+                    "enveloped: {t:?}"
                 );
-                assert!(t.contains("\"name\":\"Save\""), "app-controlled name: {t}");
+                assert!(
+                    t.as_str().contains("\"name\":\"Save\""),
+                    "app-controlled name: {t:?}"
+                );
             }
             _ => panic!("expected untrusted element sibling"),
         }
@@ -556,8 +554,12 @@ mod tests {
         let OutContent::Text(sibling) = &out.0[1] else {
             panic!("expected untrusted element sibling")
         };
-        assert!(sibling.contains(&format!("\"id\":{expected_id}")));
-        assert!(sibling.contains("\"description\":\"Search settings\""));
+        assert!(sibling.as_str().contains(&format!("\"id\":{expected_id}")));
+        assert!(
+            sibling
+                .as_str()
+                .contains("\"description\":\"Search settings\"")
+        );
     }
 
     /// Like `fake_tree()`'s "Save" but placed off-screen to the right of the
@@ -620,16 +622,15 @@ mod tests {
             "no match -> single envelope block, no untrusted sibling"
         );
         match &out.0[0] {
-            OutContent::Text(t) => {
-                let v: serde_json::Value =
-                    serde_json::from_str(t).expect("envelope must be valid JSON");
+            OutContent::Envelope(envelope) => {
+                let v = &envelope.result;
                 assert_eq!(
-                    v["result"]["matched"],
+                    v["matched"],
                     json!(false),
                     "off-screen target never realizes in the static tree; got: {v}"
                 );
                 assert_eq!(
-                    v["result"]["scrolled"]["direction"],
+                    v["scrolled"]["direction"],
                     json!("right"),
                     "resolved direction must be inferred from the off-screen bounds; got: {v}"
                 );
@@ -653,8 +654,8 @@ mod tests {
             panic!("expected untrusted element sibling")
         };
         assert!(
-            sibling.contains("\"description\":\"Bold\""),
-            "the element's only label must be reported: {sibling}"
+            sibling.as_str().contains("\"description\":\"Bold\""),
+            "the element's only label must be reported: {sibling:?}"
         );
     }
 
@@ -730,15 +731,13 @@ mod tests {
         // Trusted scalars ride in the envelope result; the app-controlled element
         // does NOT.
         match &out.0[0] {
-            OutContent::Text(t) => {
-                let v: serde_json::Value =
-                    serde_json::from_str(t).expect("envelope must be valid JSON");
-                assert_eq!(v["ok"], json!(true), "envelope: {v}");
-                assert_eq!(v["tool"], json!("glass_wait_for_element"), "envelope: {v}");
-                assert_eq!(v["result"]["matched"], json!(true), "envelope: {v}");
-                assert!(v["result"]["elapsed_ms"].is_number(), "envelope: {v}");
+            OutContent::Envelope(envelope) => {
+                let v = &envelope.result;
+                assert_eq!(envelope.tool, "glass_wait_for_element");
+                assert_eq!(v["matched"], json!(true), "envelope: {v}");
+                assert!(v["elapsed_ms"].is_number(), "envelope: {v}");
                 assert!(
-                    v["result"]["element"].is_null(),
+                    v["element"].is_null(),
                     "app element must not ride in the trusted result: {v}"
                 );
             }
@@ -748,15 +747,18 @@ mod tests {
         match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
-                    t.starts_with(crate::untrusted::NOTE),
-                    "must be marked untrusted: {t}"
+                    t.as_str().starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t:?}"
                 );
                 assert!(
-                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "enveloped: {t}"
+                    t.as_str().contains("⟦untrusted:") && t.as_str().contains("⟦/untrusted:"),
+                    "enveloped: {t:?}"
                 );
-                assert!(t.contains("\"id\":1"), "element id: {t}");
-                assert!(t.contains("\"name\":\"Save\""), "app-controlled name: {t}");
+                assert!(t.as_str().contains("\"id\":1"), "element id: {t:?}");
+                assert!(
+                    t.as_str().contains("\"name\":\"Save\""),
+                    "app-controlled name: {t:?}"
+                );
             }
             _ => panic!("expected untrusted element sibling"),
         }
@@ -817,12 +819,9 @@ mod tests {
             "no match -> single envelope block, no untrusted sibling"
         );
         match &out.0[0] {
-            OutContent::Text(t) => {
-                let v: serde_json::Value =
-                    serde_json::from_str(t).expect("envelope must be valid JSON");
-                assert_eq!(v["ok"], json!(true), "envelope: {v}");
-                assert_eq!(v["tool"], json!("glass_wait_for_element"), "envelope: {v}");
-                assert_eq!(v["result"]["matched"], json!(false), "envelope: {v}");
+            OutContent::Envelope(envelope) => {
+                assert_eq!(envelope.tool, "glass_wait_for_element");
+                assert_eq!(envelope.result["matched"], json!(false));
             }
             _ => panic!("expected text"),
         }
@@ -867,10 +866,10 @@ mod tests {
         let mut g = started_frames(vec![black, white]);
         let out = wait_for_region(&mut g, &region_args()).unwrap();
         assert_eq!(out.0.len(), 1, "no include_image -> text only");
-        match out.0.last().unwrap() {
-            OutContent::Text(t) => assert!(t.contains("\"matched\":true"), "got: {t}"),
-            _ => panic!("expected text"),
-        }
+        assert_eq!(
+            crate::tools::testutil::assert_envelope(&out, "glass_wait_for_region")["matched"],
+            true
+        );
     }
 
     #[test]
@@ -901,21 +900,19 @@ mod tests {
         });
         let out = wait_for_region(&mut g, &a).unwrap();
         match out.0.last().unwrap() {
-            OutContent::Text(t) => {
-                let v: serde_json::Value = serde_json::from_str(t).unwrap();
-                assert_eq!(v["ok"], json!(true), "envelope: {v}");
-                assert_eq!(v["tool"], json!("glass_wait_for_region"), "envelope: {v}");
-                assert_eq!(v["result"]["matched"], true, "got: {t}");
+            OutContent::Envelope(envelope) => {
+                let v = &envelope.result;
+                assert_eq!(v["matched"], true, "got: {v}");
                 assert_eq!(
-                    v["result"]["bbox"]["x"], 2,
-                    "bbox x must be window-relative; got: {t}"
+                    v["bbox"]["x"], 2,
+                    "bbox x must be window-relative; got: {v}"
                 );
                 assert_eq!(
-                    v["result"]["bbox"]["y"], 2,
-                    "bbox y must be window-relative; got: {t}"
+                    v["bbox"]["y"], 2,
+                    "bbox y must be window-relative; got: {v}"
                 );
-                assert_eq!(v["result"]["bbox"]["width"], 2, "got: {t}");
-                assert_eq!(v["result"]["bbox"]["height"], 2, "got: {t}");
+                assert_eq!(v["bbox"]["width"], 2, "got: {v}");
+                assert_eq!(v["bbox"]["height"], 2, "got: {v}");
             }
             _ => panic!("expected text"),
         }
@@ -1002,13 +999,10 @@ mod tests {
             height: 1,
         }]);
         let out = wait_for_region(&mut g, &a).unwrap();
-        match out.0.last().unwrap() {
-            OutContent::Text(t) => assert!(
-                t.contains("\"matched\":false"),
-                "the only real difference (the corner) is masked, so nothing should register as a change: {t}"
-            ),
-            _ => panic!("expected text"),
-        }
+        assert_eq!(
+            crate::tools::testutil::assert_envelope(&out, "glass_wait_for_region")["matched"],
+            false
+        );
         assert_eq!(
             *log.lock().unwrap(),
             2,
@@ -1034,12 +1028,12 @@ mod tests {
         }]);
         let out = wait_for_region(&mut g, &a).unwrap();
         match out.0.last().unwrap() {
-            OutContent::Text(t) => {
-                let v: serde_json::Value = serde_json::from_str(t).unwrap();
+            OutContent::Envelope(envelope) => {
+                let v = &envelope.result;
                 assert_eq!(
-                    v["result"]["ignored_pixels"],
+                    v["ignored_pixels"],
                     json!(4),
-                    "the whole-window mask excludes all 4 pixels: {t}"
+                    "the whole-window mask excludes all 4 pixels: {v}"
                 );
             }
             _ => panic!("expected text"),
@@ -1076,15 +1070,13 @@ mod tests {
         let out = wait_for_log(&mut g, &a).unwrap();
         // Trusted scalars ride in the envelope result; the app-controlled line does NOT.
         match &out.0[0] {
-            OutContent::Text(t) => {
-                let v: serde_json::Value =
-                    serde_json::from_str(t).expect("envelope must be valid JSON");
-                assert_eq!(v["ok"], json!(true), "envelope: {v}");
-                assert_eq!(v["tool"], json!("glass_wait_for_log"), "envelope: {v}");
-                assert_eq!(v["result"]["matched"], json!(true), "envelope: {v}");
-                assert!(v["result"]["cursor"].is_number(), "cursor scalar: {v}");
+            OutContent::Envelope(envelope) => {
+                let v = &envelope.result;
+                assert_eq!(envelope.tool, "glass_wait_for_log");
+                assert_eq!(v["matched"], json!(true), "envelope: {v}");
+                assert!(v["cursor"].is_number(), "cursor scalar: {v}");
                 assert!(
-                    v["result"]["line"].is_null(),
+                    v["line"].is_null(),
                     "app line must not ride in the trusted result: {v}"
                 );
             }
@@ -1094,16 +1086,16 @@ mod tests {
         match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
-                    t.starts_with(crate::untrusted::NOTE),
-                    "must be marked untrusted: {t}"
+                    t.as_str().starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t:?}"
                 );
                 assert!(
-                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "enveloped: {t}"
+                    t.as_str().contains("⟦untrusted:") && t.as_str().contains("⟦/untrusted:"),
+                    "enveloped: {t:?}"
                 );
                 assert!(
-                    t.contains("\"text\":\"build done\""),
-                    "app-controlled log text: {t}"
+                    t.as_str().contains("\"text\":\"build done\""),
+                    "app-controlled log text: {t:?}"
                 );
             }
             _ => panic!("expected untrusted line sibling"),
@@ -1158,12 +1150,9 @@ mod tests {
             "no match -> single envelope block, no untrusted sibling"
         );
         match &out.0[0] {
-            OutContent::Text(t) => {
-                let v: serde_json::Value =
-                    serde_json::from_str(t).expect("envelope must be valid JSON");
-                assert_eq!(v["ok"], json!(true), "envelope: {v}");
-                assert_eq!(v["tool"], json!("glass_wait_for_log"), "envelope: {v}");
-                assert_eq!(v["result"]["matched"], json!(false), "envelope: {v}");
+            OutContent::Envelope(envelope) => {
+                assert_eq!(envelope.tool, "glass_wait_for_log");
+                assert_eq!(envelope.result["matched"], json!(false));
             }
             _ => panic!("expected text"),
         }
@@ -1183,10 +1172,11 @@ mod tests {
             "matched + include_image -> [Image, Text, IMAGE_NOTE]"
         );
         assert!(matches!(out.0[0], OutContent::Image(_)), "image first");
-        match &out.0[1] {
-            OutContent::Text(t) => assert!(t.contains("\"matched\":true"), "got: {t}"),
-            _ => panic!("expected text second"),
-        }
+        let OutContent::Envelope(envelope) = &out.0[1] else {
+            panic!("metadata envelope must follow the image")
+        };
+        assert_eq!(envelope.tool, "glass_wait_for_region");
+        assert_eq!(envelope.result["matched"], true);
     }
 
     // ── untrusted-marking tests ────────────────────────────────────────────
@@ -1205,16 +1195,15 @@ mod tests {
             "expected [Image, meta, IMAGE_NOTE], got {} items",
             out.0.len()
         );
-        let has_note = out
-            .0
-            .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        let has_note = out.0.iter().any(
+            |c| matches!(c, OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
+        );
         assert!(
             has_note,
             "IMAGE_NOTE must be present when image is returned"
         );
         // scalar meta is NOT enveloped
-        let meta_enveloped = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t.contains("matched") && t.contains("⟦untrusted:")));
+        let meta_enveloped = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t.as_str().contains("matched") && t.as_str().contains("⟦untrusted:")));
         assert!(!meta_enveloped, "scalar meta must NOT be enveloped");
     }
 
@@ -1225,15 +1214,14 @@ mod tests {
         let mut g = started_frames(vec![black, white]);
         // include_image defaults to None (false) -> no image -> no note
         let out = wait_for_region(&mut g, &region_args()).unwrap();
-        let has_note = out
-            .0
-            .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        let has_note = out.0.iter().any(
+            |c| matches!(c, OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE),
+        );
         assert!(!has_note, "no IMAGE_NOTE when no image is produced");
         let has_envelope = out
             .0
             .iter()
-            .any(|c| matches!(c, OutContent::Text(t) if t.contains("⟦untrusted:")));
+            .any(|c| matches!(c, OutContent::Text(t) if t.as_str().contains("⟦untrusted:")));
         assert!(!has_envelope, "no envelope on scalar-only result");
     }
 }

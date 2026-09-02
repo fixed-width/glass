@@ -1,0 +1,14 @@
+[test-groups.wayland-compositor]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = '''
+package(glass-wayland) and (
+    test(/^platform::session_tests::/)
+    or test(/^xwayland::session_tests::/)
+    or test(/^testw::harness_tests::/)
+    or test(=doctor::tests::the_deep_check_really_starts_and_stops_a_compositor)
+    or binary(session_releases_pipes)
+)
+'''
+test-group = "wayland-compositor"

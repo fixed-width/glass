@@ -238,17 +238,17 @@ fn a11y_snapshot_returns_outline_text() {
     match &out.0[1] {
         OutContent::Text(t) => {
             assert!(
-                t.starts_with(crate::untrusted::NOTE),
-                "must be marked untrusted: {t}"
+                t.as_str().starts_with(crate::untrusted::NOTE),
+                "must be marked untrusted: {t:?}"
             );
             assert!(
-                t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                "enveloped: {t}"
+                t.as_str().contains("⟦untrusted:") && t.as_str().contains("⟦/untrusted:"),
+                "enveloped: {t:?}"
             );
-            assert!(t.contains("#0 Window"), "outline: {t}");
+            assert!(t.as_str().contains("#0 Window"), "outline: {t:?}");
             assert!(
-                t.contains("#1 Button \"Save\" (10,10 20x20)"),
-                "outline: {t}"
+                t.as_str().contains("#1 Button \"Save\" (10,10 20x20)"),
+                "outline: {t:?}"
             );
         }
         _ => panic!("expected text"),
@@ -274,10 +274,10 @@ fn a11y_snapshot_appends_pixel_hint_when_treeless() {
     // [0]=envelope, [1]=untrusted root-only outline, [2]=glass's trusted pixel hint.
     match &out.0[2] {
         OutContent::Text(t) => {
-            assert!(t.contains("glass_screenshot"), "pixel hint: {t}");
+            assert!(t.as_str().contains("glass_screenshot"), "pixel hint: {t:?}");
             assert!(
-                !t.starts_with(crate::untrusted::NOTE),
-                "the hint is glass's own guidance, not untrusted app content: {t}"
+                !t.as_str().starts_with(crate::untrusted::NOTE),
+                "the hint is glass's own guidance, not untrusted app content: {t:?}"
             );
         }
         _ => panic!("expected the pixel-hint text"),
@@ -313,30 +313,31 @@ fn a11y_snapshot_truncation_steer_is_a_trusted_block_outside_the_untrusted_envel
     match &out.0[1] {
         OutContent::Text(t) => {
             assert!(
-                t.starts_with(crate::untrusted::NOTE)
-                    && t.contains("⟦untrusted:")
-                    && t.contains("⟦/untrusted:"),
-                "the outline itself stays untrusted-wrapped: {t}"
+                t.as_str().starts_with(crate::untrusted::NOTE)
+                    && t.as_str().contains("⟦untrusted:")
+                    && t.as_str().contains("⟦/untrusted:"),
+                "the outline itself stays untrusted-wrapped: {t:?}"
             );
             assert!(
-                !t.contains("truncated"),
+                !t.as_str().contains("truncated"),
                 "the truncation notice must NOT be baked into the untrusted-wrapped \
-                 outline body: {t}"
+                 outline body: {t:?}"
             );
         }
         _ => panic!("expected the wrapped outline text"),
     }
     match &out.0[2] {
         OutContent::Text(t) => {
-            assert!(t.contains("truncated"), "truncation steer: {t}");
+            assert!(t.as_str().contains("truncated"), "truncation steer: {t:?}");
             assert!(
-                t.contains("glass_screenshot"),
-                "the steer names the pixel fallback: {t}"
+                t.as_str().contains("glass_screenshot"),
+                "the steer names the pixel fallback: {t:?}"
             );
             assert!(
-                !t.starts_with(crate::untrusted::NOTE) && !t.contains("⟦untrusted:"),
+                !t.as_str().starts_with(crate::untrusted::NOTE)
+                    && !t.as_str().contains("⟦untrusted:"),
                 "the steer is glass's own trusted guidance, outside the untrusted \
-                 markers entirely: {t}"
+                 markers entirely: {t:?}"
             );
         }
         _ => panic!("expected the trusted truncation-steer text"),
@@ -367,11 +368,11 @@ fn a11y_snapshot_discloses_an_unpublished_document_as_a_trusted_block() {
     match (&out.0[1], &out.0[2]) {
         (OutContent::Text(body), OutContent::Text(steer)) => {
             assert!(
-                !body.contains("has no readable content"),
-                "guidance must not be inside the untrusted body: {body}"
+                !body.as_str().contains("has no readable content"),
+                "guidance must not be inside the untrusted body: {body:?}"
             );
-            assert!(steer.contains("Document"), "{steer}");
-            assert!(steer.contains("glass_screenshot"), "{steer}");
+            assert!(steer.as_str().contains("Document"), "{steer:?}");
+            assert!(steer.as_str().contains("glass_screenshot"), "{steer:?}");
         }
         other => panic!("unexpected blocks: {other:?}"),
     }
@@ -403,14 +404,15 @@ fn a11y_snapshot_discloses_withheld_content_as_a_trusted_block() {
     match (&out.0[1], &out.0[2]) {
         (OutContent::Text(body), OutContent::Text(steer)) => {
             assert!(
-                !body.contains("placeholder"),
-                "the steer must not be inside the untrusted body: {body}"
+                !body.as_str().contains("placeholder"),
+                "the steer must not be inside the untrusted body: {body:?}"
             );
-            assert!(steer.contains("has not exposed"), "{steer}");
-            assert!(steer.contains("glass_screenshot"), "{steer}");
+            assert!(steer.as_str().contains("has not exposed"), "{steer:?}");
+            assert!(steer.as_str().contains("glass_screenshot"), "{steer:?}");
             assert!(
-                !steer.starts_with(crate::untrusted::NOTE) && !steer.contains("⟦untrusted:"),
-                "glass's own guidance stays outside the untrusted markers: {steer}"
+                !steer.as_str().starts_with(crate::untrusted::NOTE)
+                    && !steer.as_str().contains("⟦untrusted:"),
+                "glass's own guidance stays outside the untrusted markers: {steer:?}"
             );
         }
         other => panic!("unexpected blocks: {other:?}"),
@@ -624,15 +626,13 @@ fn a11y_marks_returns_image_and_legend() {
         matches!(out.0[0], OutContent::Image(_)),
         "first item is the image"
     );
-    let OutContent::Text(t) = &out.0[1] else {
-        panic!("expected envelope text as the second item")
+    let OutContent::Envelope(envelope) = &out.0[1] else {
+        panic!("expected envelope as the second item")
     };
-    let v: serde_json::Value = serde_json::from_str(t).expect("envelope must be valid JSON");
-    assert_eq!(v["ok"], json!(true), "envelope: {v}");
-    assert_eq!(v["tool"], json!("glass_a11y_marks"), "envelope: {v}");
-    assert_eq!(v["result"]["count"], json!(1), "envelope: {v}");
+    assert_eq!(envelope.tool, "glass_a11y_marks");
+    assert_eq!(envelope.result["count"], json!(1));
     match &out.0[2] {
-        OutContent::Text(t) => assert!(t.contains("#1 Button \"Save\""), "legend: {t}"),
+        OutContent::Text(t) => assert!(t.as_str().contains("#1 Button \"Save\""), "legend: {t:?}"),
         _ => panic!("expected legend text"),
     }
 }
@@ -671,14 +671,17 @@ fn a11y_marks_legend_spells_a_description_apart_from_a_name() {
     };
     // A real name rides in the quoted slot a `name:` selector matches; a description
     // rides in `desc="…"`, exactly as the outline spells it.
-    assert!(legend.contains("#1 Button \"Save\""), "legend: {legend}");
     assert!(
-        legend.contains("#2 Button desc=\"Bold\""),
-        "legend: {legend}"
+        legend.as_str().contains("#1 Button \"Save\""),
+        "legend: {legend:?}"
     );
     assert!(
-        !legend.contains("Button \"Bold\""),
-        "a description must never render as a name: {legend}"
+        legend.as_str().contains("#2 Button desc=\"Bold\""),
+        "legend: {legend:?}"
+    );
+    assert!(
+        !legend.as_str().contains("Button \"Bold\""),
+        "a description must never render as a name: {legend:?}"
     );
 }
 
@@ -713,28 +716,25 @@ fn a11y_marks_legend_untrusted_wrapped_and_image_note_present() {
     );
     // the trusted envelope comes right after the image
     match &out.0[1] {
-        OutContent::Text(t) => {
-            let v: serde_json::Value =
-                serde_json::from_str(t).expect("envelope must be valid JSON");
-            assert_eq!(v["ok"], json!(true), "envelope: {v}");
-            assert_eq!(v["tool"], json!("glass_a11y_marks"), "envelope: {v}");
+        OutContent::Envelope(envelope) => {
+            assert_eq!(envelope.tool, "glass_a11y_marks");
         }
-        _ => panic!("expected envelope text as second item"),
+        _ => panic!("expected envelope as second item"),
     }
     // legend must be untrusted-wrapped
     match &out.0[2] {
         OutContent::Text(t) => {
             assert!(
-                t.starts_with(crate::untrusted::NOTE),
-                "legend must start with NOTE: {t}"
+                t.as_str().starts_with(crate::untrusted::NOTE),
+                "legend must start with NOTE: {t:?}"
             );
             assert!(
-                t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                "legend must be untrusted-wrapped: {t}"
+                t.as_str().contains("⟦untrusted:") && t.as_str().contains("⟦/untrusted:"),
+                "legend must be untrusted-wrapped: {t:?}"
             );
             assert!(
-                t.contains("#1 Button"),
-                "legend must still contain element: {t}"
+                t.as_str().contains("#1 Button"),
+                "legend must still contain element: {t:?}"
             );
         }
         _ => panic!("expected legend text as third item"),
@@ -743,7 +743,7 @@ fn a11y_marks_legend_untrusted_wrapped_and_image_note_present() {
     let has_note = out
         .0
         .iter()
-        .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        .any(|c| matches!(c, OutContent::Text(t) if t.as_str() == crate::untrusted::IMAGE_NOTE));
     assert!(has_note, "IMAGE_NOTE must be present in a11y_marks output");
 }
 
@@ -929,12 +929,12 @@ fn return_snapshot_appends_tree_and_refreshes_cache() {
     match &out.0[1] {
         OutContent::Text(t) => {
             assert!(
-                t.starts_with(crate::untrusted::NOTE),
-                "must be marked untrusted: {t}"
+                t.as_str().starts_with(crate::untrusted::NOTE),
+                "must be marked untrusted: {t:?}"
             );
             assert!(
-                t.contains("#1 Button \"Save\""),
-                "a11y outline appended: {t}"
+                t.as_str().contains("#1 Button \"Save\""),
+                "a11y outline appended: {t:?}"
             );
         }
         _ => panic!("expected a11y outline text"),
@@ -981,11 +981,11 @@ fn return_snapshot_discloses_an_unpublished_document_the_same_way_a_snapshot_doe
         },
     )
     .unwrap();
-    let texts: Vec<&String> = out
+    let texts: Vec<&str> = out
         .0
         .iter()
         .filter_map(|c| match c {
-            OutContent::Text(t) => Some(t),
+            OutContent::Text(t) => Some(t.as_str()),
             _ => None,
         })
         .collect();
@@ -995,9 +995,9 @@ fn return_snapshot_discloses_an_unpublished_document_the_same_way_a_snapshot_doe
         .unwrap_or_else(|| panic!("the fold owes the document guidance: {texts:?}"));
     assert!(
         !steer.starts_with(crate::untrusted::NOTE) && !steer.contains("⟦untrusted:"),
-        "glass's own guidance, outside the untrusted envelope: {steer}"
+        "glass's own guidance, outside the untrusted envelope: {steer:?}"
     );
-    assert!(steer.contains("glass_screenshot"), "{steer}");
+    assert!(steer.contains("glass_screenshot"), "{steer:?}");
     // Parity with `a11y_snapshot`: a fifth steer added to one call site and not the
     // other fails here too.
     for expected in a11y_steers(&tree) {
@@ -1103,7 +1103,7 @@ fn set_value_return_snapshot() {
     let v = assert_envelope(&out, "glass_set_value");
     assert_eq!(v["id"], json!(1), "envelope: {v}");
     assert!(
-        matches!(&out.0[1], OutContent::Text(t) if t.starts_with(crate::untrusted::NOTE) && t.contains("#1 Button")),
+        matches!(&out.0[1], OutContent::Text(t) if t.as_str().starts_with(crate::untrusted::NOTE) && t.as_str().contains("#1 Button")),
         "outline appended"
     );
 }
@@ -1172,7 +1172,7 @@ fn type_return_snapshot_appends_outline() {
     );
     assert_envelope(&out, "glass_type");
     assert!(
-        matches!(&out.0[1], OutContent::Text(t) if t.starts_with(crate::untrusted::NOTE) && t.contains("#1 Button")),
+        matches!(&out.0[1], OutContent::Text(t) if t.as_str().starts_with(crate::untrusted::NOTE) && t.as_str().contains("#1 Button")),
         "outline appended"
     );
     // the snapshot refreshed last_ax -> a follow-up id-based action still resolves
@@ -1276,24 +1276,24 @@ fn list_and_select_window_tools() {
         _ => panic!("expected text"),
     };
     assert!(
-        text.starts_with(crate::untrusted::NOTE),
-        "must be marked untrusted: {text}"
+        text.as_str().starts_with(crate::untrusted::NOTE),
+        "must be marked untrusted: {text:?}"
     );
     assert!(
-        text.contains("⟦untrusted:") && text.contains("⟦/untrusted:"),
-        "enveloped: {text}"
+        text.as_str().contains("⟦untrusted:") && text.as_str().contains("⟦/untrusted:"),
+        "enveloped: {text:?}"
     );
     assert!(
-        text.contains("\"id\":0"),
-        "json should list window id 0: {text}"
+        text.as_str().contains("\"id\":0"),
+        "json should list window id 0: {text:?}"
     );
     assert!(
-        text.contains("\"active\":true"),
-        "json should mark active: {text}"
+        text.as_str().contains("\"active\":true"),
+        "json should mark active: {text:?}"
     );
     assert!(
-        text.contains("\"width\":320"),
-        "json should include geometry width: {text}"
+        text.as_str().contains("\"width\":320"),
+        "json should include geometry width: {text:?}"
     );
 
     let out = select_window(&mut g, &SelectWindowArgs { id: 0 }).unwrap();
@@ -1306,13 +1306,11 @@ fn list_and_select_window_tools() {
 #[test]
 fn result_envelope_is_leading_and_shaped() {
     let out = ToolOutput::result("glass_stop", serde_json::json!({}));
-    let OutContent::Text(t) = &out.0[0] else {
-        panic!("expected text")
+    let OutContent::Envelope(envelope) = &out.0[0] else {
+        panic!("expected envelope")
     };
-    let v: serde_json::Value = serde_json::from_str(t).unwrap();
-    assert_eq!(v["ok"], serde_json::json!(true));
-    assert_eq!(v["tool"], serde_json::json!("glass_stop"));
-    assert_eq!(v["result"], serde_json::json!({}));
+    assert_eq!(envelope.tool, "glass_stop");
+    assert_eq!(envelope.result, serde_json::json!({}));
 }
 
 #[test]
@@ -1322,6 +1320,181 @@ fn result_with_puts_envelope_first_then_extra() {
         serde_json::json!({ "width": 4, "height": 4 }),
         vec![OutContent::Image(vec![1, 2, 3])],
     );
-    assert!(matches!(out.0[0], OutContent::Text(_)), "envelope leads");
+    assert!(
+        matches!(out.0[0], OutContent::Envelope(_)),
+        "envelope leads"
+    );
     assert!(matches!(out.0[1], OutContent::Image(_)), "extra follows");
+}
+
+#[test]
+fn production_application_text_conduits_have_explicit_trust_roles() {
+    use glass_core::Stream;
+
+    fn start(glass: &mut Glass) {
+        glass
+            .start(&AppSpec {
+                build: None,
+                run: vec!["app".into()],
+                cwd: None,
+                env: vec![],
+                window_hint: None,
+                timeout_ms: 1,
+                sandbox: SandboxLevel::Off,
+                a11y: true,
+            })
+            .unwrap();
+    }
+
+    fn text_roles(output: &ToolOutput) -> Vec<(crate::output::TextTrust, crate::output::TextRole)> {
+        output
+            .0
+            .iter()
+            .filter_map(|content| match content {
+                OutContent::Text(text) => Some((text.trust, text.role)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let stable = vec![Frame::solid(100, 100, [0, 0, 0, 255]); 5];
+    let mut semantic =
+        glass_with_a11y(FakePlatform::new(100, 100).with_frames(stable), fake_tree());
+    start(&mut semantic);
+    let snapshot = a11y_snapshot(&mut semantic, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+    let automatic = click_element(
+        &mut semantic,
+        &ClickElementArgs {
+            id: 1,
+            return_: Some("snapshot".into()),
+        },
+    )
+    .unwrap();
+    let find = find_elements(
+        &mut semantic,
+        &FindElementsArgs {
+            query: Some("Save".into()),
+            role: None,
+            states: None,
+            within: None,
+            max_results: None,
+            max_nodes: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+    let marks = a11y_marks(&mut semantic).unwrap();
+    let wait_element = wait_for_element(
+        &mut semantic,
+        &WaitForElementArgs {
+            name: Some("Save".into()),
+            description: None,
+            role: None,
+            condition: None,
+            value: None,
+            value_contains: None,
+            interval_ms: Some(0),
+            timeout_ms: Some(1000),
+        },
+    )
+    .unwrap();
+
+    let mut ordinary = glass_with(
+        FakePlatform::new(100, 100).with_logs(vec![(Stream::Stdout, "application log")]),
+    );
+    start(&mut ordinary);
+    let logs = logs(
+        &mut ordinary,
+        &LogsArgs {
+            cursor: None,
+            max_lines: None,
+            stream: None,
+            contains: None,
+        },
+    )
+    .unwrap();
+    clipboard_set(
+        &mut ordinary,
+        &ClipboardSetArgs {
+            text: "application clipboard".into(),
+        },
+    )
+    .unwrap();
+    let clipboard = clipboard_get(&mut ordinary).unwrap();
+    let windows = list_windows(&mut ordinary).unwrap();
+    let mut waiting = glass_with(
+        FakePlatform::new(100, 100).with_logs(vec![(Stream::Stdout, "application wait log")]),
+    );
+    start(&mut waiting);
+    let wait_log = wait_for_log(
+        &mut waiting,
+        &WaitForLogArgs {
+            contains: "application".into(),
+            stream: None,
+            cursor: Some(0),
+            interval_ms: Some(0),
+            timeout_ms: Some(1000),
+        },
+    )
+    .unwrap();
+
+    let mut failed = glass_with_a11y_invoke_error(
+        FakePlatform::new(100, 100),
+        fake_tree(),
+        "application batch detail",
+    );
+    start(&mut failed);
+    a11y_snapshot(&mut failed, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+    let batch_error = do_actions(
+        &mut failed,
+        &DoArgs {
+            actions: vec![Action::ClickElement(ClickElementArgs {
+                id: 1,
+                return_: None,
+            })],
+            then: None,
+            timeout_ms: None,
+            encoded_argument_bytes: 0,
+        },
+    )
+    .unwrap_err();
+
+    use crate::output::{TextRole, TextTrust};
+    let untrusted_observation = vec![(TextTrust::UntrustedApplication, TextRole::Observation)];
+    for (name, output, expected) in [
+        (
+            "explicit accessibility snapshot",
+            snapshot,
+            untrusted_observation.clone(),
+        ),
+        (
+            "automatic return snapshot",
+            automatic,
+            untrusted_observation.clone(),
+        ),
+        ("find", find, untrusted_observation.clone()),
+        ("logs", logs, untrusted_observation.clone()),
+        ("clipboard get", clipboard, untrusted_observation.clone()),
+        ("list windows", windows, untrusted_observation.clone()),
+        (
+            "accessibility marks",
+            marks,
+            vec![
+                (TextTrust::UntrustedApplication, TextRole::Observation),
+                (TextTrust::Trusted, TextRole::Guidance),
+            ],
+        ),
+        ("wait element", wait_element, untrusted_observation.clone()),
+        ("wait log", wait_log, untrusted_observation),
+        (
+            "batch error detail",
+            batch_error,
+            vec![
+                (TextTrust::Trusted, TextRole::ErrorDetail),
+                (TextTrust::UntrustedApplication, TextRole::Observation),
+            ],
+        ),
+    ] {
+        assert_eq!(text_roles(&output), expected, "{name}");
+    }
 }
