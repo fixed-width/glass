@@ -101,6 +101,12 @@ and sets editable fields via the real `ACTION_SET_TEXT`; glass enables it and re
 prior accessibility state on teardown. Without `glass-a11y.apk`, glass uses the `uiautomator` reader.
 Set `GLASS_ANDROID_A11Y=off` to force `uiautomator` even when the APK is present.
 
+The service must advertise accessibility node schema 2. Older APKs do not publish focus,
+visibility, focusability, or password state, so glass rejects them before requesting a tree and
+prints that it selected `uiautomator`. Until the APK is upgraded, Compose-rich snapshots, native
+accessibility focus, and `ACTION_SET_TEXT` are unavailable; pointer focus and keystroke-based value
+entry continue through the fallback reader.
+
 A click or `set_value` through this reader tolerates a control that moved. A screen whose open
 transition is playing reports its content at an offset that decays over about half a second, so
 glass can read the element tens of pixels from where your snapshot had it; where its role, name,

@@ -4,8 +4,13 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.os.Bundle;
+import android.os.SystemClock;
+import android.text.Editable;
+import android.text.InputType;
+import android.text.TextWatcher;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
@@ -48,6 +53,15 @@ import android.widget.Toolbar;
  * strip real apps use would change the evidence rather than modernize it.
  */
 public class MainActivity extends Activity {
+    private TextView semanticStatus;
+    private TextView semanticFocusStatus;
+    private Button movingSemantic;
+    private int semanticSaveCount;
+    private int semanticTypeCount;
+    private int semanticMoveCount;
+    private int duplicateSemanticCount;
+    private int semanticFocusClickCount;
+    private int semanticMovementGeneration;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -63,6 +77,8 @@ public class MainActivity extends Activity {
         toolbar.setContentDescription("the toolbar");
         toolbar.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
         root.addView(toolbar, matchWrap());
+
+        addSemanticControls(root);
 
         root.addView(tabs(), matchHeight(dp(130)));
         root.addView(label("list"), matchWrap());
@@ -109,6 +125,184 @@ public class MainActivity extends Activity {
         ScrollView scroller = new ScrollView(this);
         scroller.addView(root);
         setContentView(scroller);
+    }
+
+    /** Controls used by the semantic-action device acceptance suite. */
+    private void addSemanticControls(LinearLayout root) {
+        semanticStatus = new TextView(this);
+        semanticStatus.setContentDescription("Semantic Status");
+        updateSemanticStatus();
+        root.addView(semanticStatus, matchWrap());
+
+        Button save = new Button(this);
+        save.setText("Semantic Save");
+        save.setContentDescription("Semantic Save");
+        save.setOnClickListener(
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        semanticSaveCount++;
+                        updateSemanticStatus();
+                    }
+                });
+        root.addView(save, matchWrap());
+
+        Button disabled = new Button(this);
+        disabled.setText("Disabled semantic");
+        disabled.setContentDescription("Disabled semantic");
+        disabled.setEnabled(false);
+        root.addView(disabled, matchWrap());
+
+        for (int i = 0; i < 2; i++) {
+            Button duplicate = new Button(this);
+            duplicate.setText("Duplicate semantic");
+            duplicate.setContentDescription("Duplicate semantic");
+            duplicate.setOnClickListener(
+                    new View.OnClickListener() {
+                        @Override
+                        public void onClick(View view) {
+                            duplicateSemanticCount++;
+                            updateSemanticStatus();
+                        }
+                    });
+            root.addView(duplicate, matchWrap());
+        }
+
+        movingSemantic = new Button(this);
+        movingSemantic.setText("Moving semantic");
+        movingSemantic.setContentDescription("Moving semantic");
+        movingSemantic.setOnClickListener(
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        semanticMoveCount++;
+                        updateSemanticStatus();
+                    }
+                });
+        root.addView(movingSemantic, matchWrap());
+
+        Button restart = new Button(this);
+        restart.setText("Restart movement");
+        restart.setContentDescription("Restart movement");
+        restart.setOnClickListener(
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        startSemanticMovement();
+                    }
+                });
+        root.addView(restart, matchWrap());
+
+        EditText field = new EditText(this);
+        semanticFocusStatus = new TextView(this);
+        semanticFocusStatus.setContentDescription("Semantic Focus Status");
+        updateSemanticFocusStatus(false, false);
+        root.addView(semanticFocusStatus, matchWrap());
+
+        field.setContentDescription("Semantic Field");
+        field.setText("seed");
+        field.setFocusable(true);
+        field.setFocusableInTouchMode(true);
+        field.setOnClickListener(
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        view.requestFocus();
+                    }
+                });
+        field.setOnFocusChangeListener(
+                new View.OnFocusChangeListener() {
+                    @Override
+                    public void onFocusChange(View view, boolean focused) {
+                        updateSemanticFocusStatus(true, focused);
+                    }
+                });
+        field.setAccessibilityDelegate(
+                new View.AccessibilityDelegate() {
+                    @Override
+                    public boolean performAccessibilityAction(
+                            View host, int action, Bundle arguments) {
+                        if (action == AccessibilityNodeInfo.ACTION_CLICK) {
+                            semanticFocusClickCount++;
+                            boolean requested = host.requestFocus();
+                            updateSemanticFocusStatus(requested, host.hasFocus());
+                            return requested;
+                        }
+                        return super.performAccessibilityAction(host, action, arguments);
+                    }
+                });
+        field.addTextChangedListener(
+                new TextWatcher() {
+                    @Override
+                    public void beforeTextChanged(
+                            CharSequence text, int start, int count, int after) {}
+
+                    @Override
+                    public void onTextChanged(
+                            CharSequence text, int start, int before, int count) {}
+
+                    @Override
+                    public void afterTextChanged(Editable editable) {
+                        semanticTypeCount++;
+                        updateSemanticStatus();
+                    }
+                });
+        root.addView(field, matchWrap());
+
+        EditText password = new EditText(this);
+        password.setContentDescription("Semantic Password");
+        password.setInputType(
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        password.setText("PASSWORD_SENTINEL");
+        root.addView(password, matchWrap());
+
+        movingSemantic.post(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        startSemanticMovement();
+                    }
+                });
+    }
+
+    private void startSemanticMovement() {
+        final int generation = ++semanticMovementGeneration;
+        final long started = SystemClock.uptimeMillis();
+        final float distance = dp(120);
+        movingSemantic.setTranslationX(0);
+        movingSemantic.post(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        if (generation != semanticMovementGeneration) return;
+                        long elapsed = SystemClock.uptimeMillis() - started;
+                        float fraction = Math.min(1f, elapsed / 300f);
+                        movingSemantic.setTranslationX(distance * fraction);
+                        if (elapsed < 300) movingSemantic.postDelayed(this, 16);
+                    }
+                });
+    }
+
+    private void updateSemanticStatus() {
+        semanticStatus.setText(
+                "save="
+                        + semanticSaveCount
+                        + " type="
+                        + semanticTypeCount
+                        + " move="
+                        + semanticMoveCount
+                        + " duplicate="
+                        + duplicateSemanticCount);
+    }
+
+    private void updateSemanticFocusStatus(boolean requested, boolean focused) {
+        semanticFocusStatus.setText(
+                "focus_click="
+                        + semanticFocusClickCount
+                        + " request="
+                        + requested
+                        + " focused="
+                        + focused);
     }
 
     /** A framework {@link PopupMenu} with two entries, opened by tapping the button. */

@@ -11,7 +11,9 @@ use glass_android::{
     A11yServiceRegistry, AgentRegistry, AndroidPlatform, EmulatorRegistry, ServiceA11y,
 };
 use glass_core::Deadline;
-use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, WalkLimits};
+use glass_core::accessibility::{
+    Accessibility, AxContext, AxNode, AxStateCoverage, AxTarget, PointerHit, WalkLimits,
+};
 use glass_core::{AppSpec, Platform, SandboxLevel, WindowGeometry};
 
 mod common;
@@ -308,4 +310,158 @@ fn native_invoke_actuates_the_fixture() {
 
     p.stop_app().ok();
     drop(p);
+}
+
+#[test]
+#[ignore = "requires a booted AVD + GLASS_ADB + GLASS_ANDROID_A11Y_APK + GLASS_ANDROID_ROLE_FIXTURE_APK"]
+fn companion_semantic_fixture_focuses_one_editable_and_exposes_duplicate_inputs() {
+    let _device = DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    let apk = std::env::var("GLASS_ANDROID_A11Y_APK").expect("set GLASS_ANDROID_A11Y_APK");
+    let fixture = std::env::var("GLASS_ANDROID_ROLE_FIXTURE_APK")
+        .expect("set GLASS_ANDROID_ROLE_FIXTURE_APK");
+    let agents = AgentRegistry::new();
+    let _stop_agent = common::StopAgent(&agents);
+    let mut platform =
+        AndroidPlatform::from_env(&EmulatorRegistry::new(), &agents).expect("attach");
+    let adb = platform.resolved_adb();
+    platform
+        .start_app(&AppSpec {
+            build: None,
+            run: vec![
+                fixture,
+                "tech.fixedwidth.glassrolefixture/.MainActivity".to_string(),
+            ],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 10_000,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .expect("launch role fixture");
+    let registry = A11yServiceRegistry::new();
+    let _restore = common::RestoreServiceState(&registry);
+    let client = registry
+        .ensure(&adb, &apk)
+        .expect("install + enable + connect");
+    let mut a11y = ServiceA11y::new(client, "tech.fixedwidth.glassrolefixture".to_string());
+    let ctx = AxContext {
+        pids: vec![],
+        window: WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1080,
+            height: 2400,
+        },
+        window_handle: None,
+        a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
+        deadline: Deadline::from_millis(10_000),
+    };
+
+    fn matches<'a>(node: &'a AxNode, name: &str, out: &mut Vec<&'a AxNode>) {
+        if node.name.as_deref() == Some(name) || node.description.as_deref() == Some(name) {
+            out.push(node);
+        }
+        for child in &node.children {
+            matches(child, name, out);
+        }
+    }
+    fn target(node: &AxNode) -> AxTarget {
+        AxTarget {
+            id: node.id,
+            role: node.role,
+            name: node.name.clone(),
+            bounds: node.bounds,
+            value: node.value.clone(),
+        }
+    }
+
+    let mut tree = a11y.snapshot(&ctx).expect("semantic companion snapshot");
+    tree.assign_ids();
+    assert!(!tree.to_outline().contains("PASSWORD_SENTINEL"));
+    let mut saves = Vec::new();
+    matches(&tree.root, "Semantic Save", &mut saves);
+    assert_eq!(saves.len(), 1, "unique input:\n{}", tree.to_outline());
+    let mut duplicates = Vec::new();
+    matches(&tree.root, "Duplicate semantic", &mut duplicates);
+    assert_eq!(
+        duplicates.len(),
+        2,
+        "duplicate input:\n{}",
+        tree.to_outline()
+    );
+    let mut fields = Vec::new();
+    matches(&tree.root, "Semantic Field", &mut fields);
+    let field = fields.as_slice().first().copied().expect("semantic field");
+    let mut passwords = Vec::new();
+    matches(&tree.root, "Semantic Password", &mut passwords);
+    let password = passwords.first().copied().expect("semantic password");
+    assert!(password.states.secure);
+    assert_ne!(password.value.as_deref(), Some("PASSWORD_SENTINEL"));
+    let original_value = field.value.clone();
+    a11y.focus(&ctx, &target(field))
+        .expect("one companion focus click");
+
+    let started = std::time::Instant::now();
+    let (focused, focus_status) = loop {
+        let mut after = a11y.snapshot(&ctx).expect("fresh focus confirmation tree");
+        after.assign_ids();
+        let mut focused_fields = Vec::new();
+        matches(&after.root, "Semantic Field", &mut focused_fields);
+        let focused = focused_fields
+            .as_slice()
+            .first()
+            .copied()
+            .expect("focused semantic field");
+        let mut statuses = Vec::new();
+        matches(&after.root, "Semantic Focus Status", &mut statuses);
+        let status = statuses.as_slice().first().copied().expect("focus status");
+        if focused.states.focused {
+            break (focused.clone(), status.name.clone());
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "fresh trees never confirmed focus: {}",
+            after.to_outline()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(
+        focus_status.as_deref(),
+        Some("focus_click=1 request=true focused=true")
+    );
+    assert_eq!(
+        focused.value, original_value,
+        "focus must not type or clear"
+    );
+    assert_eq!(
+        a11y.pointer_target_at(&ctx, &target(&focused), (0, 0))
+            .expect("honest hit probe"),
+        PointerHit::Inconclusive
+    );
+    assert_eq!(
+        a11y.state_coverage(),
+        AxStateCoverage {
+            enabled: true,
+            visible: true,
+            checkable: true,
+            checked: true,
+            selected: false,
+            expanded: false,
+            focused: true,
+            focusable: true,
+            editable: true,
+        }
+    );
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    let quiet = a11y.snapshot(&ctx).expect("quiet focus tree");
+    let mut statuses = Vec::new();
+    matches(&quiet.root, "Semantic Focus Status", &mut statuses);
+    assert_eq!(
+        statuses.first().and_then(|status| status.name.as_deref()),
+        Some("focus_click=1 request=true focused=true"),
+        "focus handler changed during the quiet window"
+    );
+    platform.stop_app().ok();
 }
