@@ -514,8 +514,12 @@ fn set_value_on_button_is_not_editable() {
     let button = find_role(&tree.root, glass_core::AxRole::Button).expect("button");
     let err = glass.set_value(button.id, "x").unwrap_err();
     assert!(
-        matches!(err, glass_core::GlassError::AxElementNotEditable(_)),
+        matches!(err.cause(), glass_core::GlassError::AxElementNotEditable(id) if *id == button.id.0),
         "got: {err:?}"
+    );
+    assert_eq!(
+        err.bound_dispatch(),
+        Some(glass_core::BoundDispatch::NotDispatched)
     );
     glass.stop().expect("stop");
 }
