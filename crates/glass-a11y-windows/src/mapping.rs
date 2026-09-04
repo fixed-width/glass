@@ -156,8 +156,14 @@ pub(crate) fn classify_uia_hit_path(
     let Some(hit) = hit_path.first() else {
         return PointerHit::Inconclusive;
     };
-    if hit == target || hit_path.iter().skip(1).any(|ancestor| ancestor == target) {
+    if hit == target {
         PointerHit::Target
+    } else if hit_path.iter().skip(1).any(|ancestor| ancestor == target) {
+        if hit_is_interactable {
+            PointerHit::Other
+        } else {
+            PointerHit::Target
+        }
     } else if hit_is_interactable && target_path.iter().skip(1).any(|ancestor| ancestor == hit) {
         PointerHit::AcceptedAncestor
     } else {
@@ -352,6 +358,11 @@ mod tests {
                     Some(&[&descendant[..], &target[..], &root[..]]),
                     false,
                 ),
+                classify_uia_hit_path(
+                    &target_path,
+                    Some(&[&descendant[..], &target[..], &root[..]]),
+                    true,
+                ),
                 classify_uia_hit_path(&target_path, Some(&[&root[..]]), true),
                 classify_uia_hit_path(&target_path, Some(&[&unrelated[..], &root[..]]), true,),
                 classify_uia_hit_path(&target_path, None, false),
@@ -359,6 +370,7 @@ mod tests {
             [
                 glass_core::PointerHit::Target,
                 glass_core::PointerHit::Target,
+                glass_core::PointerHit::Other,
                 glass_core::PointerHit::AcceptedAncestor,
                 glass_core::PointerHit::Other,
                 glass_core::PointerHit::Inconclusive,

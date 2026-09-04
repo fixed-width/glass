@@ -168,7 +168,14 @@ fn run_mutation_job(
     job: impl FnOnce(&A11yMutationDispatch) -> Result<()>,
 ) -> Result<()> {
     let _completion = MutationCompletion(dispatch.duplicate());
-    job(&dispatch)
+    let result = job(&dispatch);
+    let was_dispatched = dispatch.cancel_or_dispatched();
+    match result {
+        Err(error) if !was_dispatched && !error.invoke_fallback_eligible() => {
+            Err(error.before_dispatch())
+        }
+        result => result,
+    }
 }
 
 /// A bounded call, for the message its failure carries.
@@ -704,6 +711,74 @@ mod tests {
         let r: Result<()> =
             reader().set_value(0, Deadline::UNBOUNDED, |_| Err(GlassError::AxUnsupported));
         assert!(matches!(r, Err(GlassError::AxUnsupported)), "{r:?}");
+    }
+
+    #[test]
+    fn focus_property_error_before_the_dispatch_gate_is_not_dispatched() {
+        let error = reader()
+            .focus(Deadline::UNBOUNDED, |_| {
+                Err(GlassError::AccessibilityUnavailable(
+                    "scripted focus property HRESULT".into(),
+                ))
+            })
+            .expect_err("the scripted focus property read fails");
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(
+            matches!(error.cause(), GlassError::AccessibilityUnavailable(message) if message == "scripted focus property HRESULT"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn invoke_pattern_error_before_the_dispatch_gate_is_not_dispatched() {
+        let error = reader()
+            .invoke(Deadline::UNBOUNDED, |_| {
+                Err(GlassError::AccessibilityUnavailable(
+                    "scripted invoke pattern HRESULT".into(),
+                ))
+            })
+            .expect_err("the scripted invoke pattern lookup fails");
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(
+            matches!(error.cause(), GlassError::AccessibilityUnavailable(message) if message == "scripted invoke pattern HRESULT"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn set_value_pattern_error_before_the_dispatch_gate_is_not_dispatched() {
+        let error = reader()
+            .set_value(7, Deadline::UNBOUNDED, |_| {
+                Err(GlassError::AccessibilityUnavailable(
+                    "scripted set-value pattern HRESULT".into(),
+                ))
+            })
+            .expect_err("the scripted set-value pattern lookup fails");
+
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(!error.set_value_failed_after_writing(), "{error:?}");
+        assert!(
+            matches!(error.cause(), GlassError::AccessibilityUnavailable(message) if message == "scripted set-value pattern HRESULT"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn pre_dispatch_native_unavailable_keeps_its_typed_fallback_cause() {
+        for error in [
+            reader()
+                .invoke(Deadline::UNBOUNDED, |_| Err(GlassError::AxUnsupported))
+                .expect_err("unsupported invoke"),
+            reader()
+                .invoke(Deadline::UNBOUNDED, |_| {
+                    Err(GlassError::AxActionUnavailable(9))
+                })
+                .expect_err("unavailable invoke"),
+        ] {
+            assert!(error.invoke_fallback_eligible(), "{error:?}");
+        }
     }
 
     #[test]
