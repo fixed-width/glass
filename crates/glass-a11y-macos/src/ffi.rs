@@ -355,9 +355,12 @@ fn element_at_position_by(
             Err(ax_err("AXUIElementCopyElementAtPosition", err))
         };
     }
-    let Some(raw) = NonNull::new(raw.cast_mut()) else {
-        return Ok(None);
-    };
+    let raw = NonNull::new(raw.cast_mut()).ok_or_else(|| {
+        GlassError::Backend(
+            "AXUIElementCopyElementAtPosition: AX reported success but returned a null element"
+                .into(),
+        )
+    })?;
     // SAFETY: AXUIElementCopyElementAtPosition returned a copied (+1) element.
     Ok(Some(unsafe { CFRetained::from_raw(raw) }))
 }
@@ -554,6 +557,7 @@ mod tests {
         set_bool_attribute_by,
     };
     use crate::doctor::SystemWideProbe;
+    use glass_core::GlassError;
     use objc2_application_services::{AXError, AXUIElement};
     use objc2_core_foundation::{CFBoolean, CFRetained};
     use std::cell::Cell;
@@ -723,6 +727,14 @@ mod tests {
             element_at_position_by(0.0, 0.0, |_, _, _| AXError::AttributeUnsupported).is_err(),
             "unsupported hit testing is a failure, not an inconclusive no-hit"
         );
+    }
+
+    #[test]
+    fn element_at_position_success_with_null_is_a_contract_failure() {
+        let error = element_at_position_by(0.0, 0.0, |_, _, _| AXError::Success)
+            .expect_err("AX success without a copied element must fail closed");
+        assert!(matches!(error, GlassError::Backend(_)), "{error}");
+        assert!(error.to_string().contains("null"), "{error}");
     }
 
     #[test]

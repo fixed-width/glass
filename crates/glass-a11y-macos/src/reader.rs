@@ -186,7 +186,7 @@ impl Accessibility for MacosA11y {
             return Ok(PointerHit::Inconclusive);
         };
 
-        classify_pointer_hit(&target_el, target_role, hit, ctx.limits.depth, deadline)
+        classify_pointer_hit(target_el, target_role, hit, ctx.limits.depth, deadline)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -345,61 +345,65 @@ fn same_element(a: &AXUIElement, b: &AXUIElement, deadline: SemanticDeadline) ->
     deadline.observe(|| ffi::same_element(a, b))
 }
 
-fn contains_element(
-    elements: &[CFRetained<AXUIElement>],
-    candidate: &AXUIElement,
-    deadline: SemanticDeadline,
+fn contains_element_by<N>(
+    elements: &[N],
+    candidate: &N,
+    same: &mut impl FnMut(&N, &N) -> Result<bool>,
 ) -> Result<bool> {
     for element in elements {
-        if same_element(element, candidate, deadline)? {
+        if same(element, candidate)? {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn first_interactable_ancestor(
-    target: &AXUIElement,
+fn first_interactable_ancestor_by<N: Clone>(
+    target: &N,
     depth_limit: usize,
-    deadline: SemanticDeadline,
-) -> Result<Option<CFRetained<AXUIElement>>> {
-    let mut current = deadline.observe(|| ffi::parent(target))??;
+    same: &mut impl FnMut(&N, &N) -> Result<bool>,
+    role: &mut impl FnMut(&N) -> Result<AxRole>,
+    parent: &mut impl FnMut(&N) -> Result<Option<N>>,
+) -> Result<Option<N>> {
+    let mut current = parent(target)?;
     let mut seen = Vec::new();
     for _ in 0..depth_limit {
-        let Some(parent) = current else {
+        let Some(ancestor) = current else {
             return Ok(None);
         };
-        if contains_element(&seen, &parent, deadline)? {
+        if contains_element_by(&seen, &ancestor, same)? {
             return Err(GlassError::Backend("cyclic AX target ancestry".into()));
         }
-        if checked_role(&parent, deadline)?.is_interactable() {
-            return Ok(Some(parent));
+        if role(&ancestor)?.is_interactable() {
+            return Ok(Some(ancestor));
         }
-        seen.push(parent.clone());
-        current = deadline.observe(|| ffi::parent(&parent))??;
+        seen.push(ancestor.clone());
+        current = parent(&ancestor)?;
     }
     Err(GlassError::Backend(format!(
         "AX target ancestry exceeded the configured depth limit ({depth_limit})"
     )))
 }
 
-fn classify_pointer_hit(
-    target: &AXUIElement,
+fn classify_pointer_hit_by<N: Clone>(
+    target: &N,
     target_role: AxRole,
-    hit: CFRetained<AXUIElement>,
+    hit: N,
     depth_limit: usize,
-    deadline: SemanticDeadline,
+    same: &mut impl FnMut(&N, &N) -> Result<bool>,
+    role: &mut impl FnMut(&N) -> Result<AxRole>,
+    parent: &mut impl FnMut(&N) -> Result<Option<N>>,
 ) -> Result<PointerHit> {
-    if same_element(&hit, target, deadline)? {
+    if same(&hit, target)? {
         return Ok(PointerHit::Target);
     }
     let accepted_ancestor = if target_role.is_interactable() {
         None
     } else {
-        first_interactable_ancestor(target, depth_limit, deadline)?
+        first_interactable_ancestor_by(target, depth_limit, same, role, parent)?
     };
     if let Some(ancestor) = &accepted_ancestor
-        && same_element(&hit, ancestor, deadline)?
+        && same(&hit, ancestor)?
     {
         return Ok(PointerHit::AcceptedAncestor);
     }
@@ -407,24 +411,42 @@ fn classify_pointer_hit(
     let mut current = hit;
     let mut seen = Vec::new();
     for _ in 0..=depth_limit {
-        if same_element(&current, target, deadline)? {
+        if same(&current, target)? {
             return Ok(PointerHit::Target);
         }
-        if checked_role(&current, deadline)?.is_interactable() {
+        if role(&current)?.is_interactable() {
             return Ok(PointerHit::Other);
         }
-        if contains_element(&seen, &current, deadline)? {
+        if contains_element_by(&seen, &current, same)? {
             return Err(GlassError::Backend("cyclic AX hit ancestry".into()));
         }
         seen.push(current.clone());
-        let Some(parent) = deadline.observe(|| ffi::parent(&current))?? else {
+        let Some(next) = parent(&current)? else {
             return Ok(PointerHit::Other);
         };
-        current = parent;
+        current = next;
     }
     Err(GlassError::Backend(format!(
         "AX hit ancestry exceeded the configured depth limit ({depth_limit})"
     )))
+}
+
+fn classify_pointer_hit(
+    target: CFRetained<AXUIElement>,
+    target_role: AxRole,
+    hit: CFRetained<AXUIElement>,
+    depth_limit: usize,
+    deadline: SemanticDeadline,
+) -> Result<PointerHit> {
+    classify_pointer_hit_by(
+        &target,
+        target_role,
+        hit,
+        depth_limit,
+        &mut |a, b| same_element(a, b, deadline),
+        &mut |element| checked_role(element, deadline),
+        &mut |element| deadline.observe(|| ffi::parent(element))?,
+    )
 }
 
 struct WriteVerification<'a> {
@@ -1058,6 +1080,7 @@ fn gather_states(
 mod tests {
     use super::*;
     use glass_core::{BoundDispatch, BoundKind, Deadline, WalkLimits, Whose};
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1067,6 +1090,115 @@ mod tests {
         Gate,
         NativeCall,
         Finish,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum HitNode {
+        Target,
+        ContentDescendant,
+        ActionableDescendant,
+        ContainerAncestor,
+        ButtonAncestor,
+    }
+
+    #[test]
+    fn non_actionable_hit_descendant_walks_to_the_target() {
+        let mut same = |left: &HitNode, right: &HitNode| Ok(left == right);
+        let mut role = |node: &HitNode| {
+            Ok(match node {
+                HitNode::Target | HitNode::ActionableDescendant | HitNode::ButtonAncestor => {
+                    AxRole::Button
+                }
+                HitNode::ContentDescendant | HitNode::ContainerAncestor => AxRole::Group,
+            })
+        };
+        let mut parent = |node: &HitNode| {
+            Ok(match node {
+                HitNode::ContentDescendant => Some(HitNode::Target),
+                _ => None,
+            })
+        };
+
+        let hit = classify_pointer_hit_by(
+            &HitNode::Target,
+            AxRole::Button,
+            HitNode::ContentDescendant,
+            4,
+            &mut same,
+            &mut role,
+            &mut parent,
+        )
+        .expect("a content descendant has a checked path to the target");
+
+        assert_eq!(hit, PointerHit::Target);
+    }
+
+    #[test]
+    fn exact_first_interactable_target_ancestor_is_accepted() {
+        let mut same = |left: &HitNode, right: &HitNode| Ok(left == right);
+        let mut role = |node: &HitNode| {
+            Ok(match node {
+                HitNode::ButtonAncestor | HitNode::ActionableDescendant => AxRole::Button,
+                HitNode::Target | HitNode::ContentDescendant | HitNode::ContainerAncestor => {
+                    AxRole::Group
+                }
+            })
+        };
+        let mut parent = |node: &HitNode| {
+            Ok(match node {
+                HitNode::Target => Some(HitNode::ContainerAncestor),
+                HitNode::ContainerAncestor => Some(HitNode::ButtonAncestor),
+                _ => None,
+            })
+        };
+
+        let hit = classify_pointer_hit_by(
+            &HitNode::Target,
+            AxRole::Group,
+            HitNode::ButtonAncestor,
+            4,
+            &mut same,
+            &mut role,
+            &mut parent,
+        )
+        .expect("the exact first interactable target ancestor is supported");
+
+        assert_eq!(hit, PointerHit::AcceptedAncestor);
+    }
+
+    #[test]
+    fn independent_actionable_descendant_is_rejected_before_ancestry_acceptance() {
+        let parent_reads = Cell::new(0);
+        let mut same = |left: &HitNode, right: &HitNode| Ok(left == right);
+        let mut role = |node: &HitNode| {
+            Ok(match node {
+                HitNode::ActionableDescendant | HitNode::Target | HitNode::ButtonAncestor => {
+                    AxRole::Button
+                }
+                HitNode::ContentDescendant | HitNode::ContainerAncestor => AxRole::Group,
+            })
+        };
+        let mut parent = |node: &HitNode| {
+            parent_reads.set(parent_reads.get() + 1);
+            Ok(match node {
+                HitNode::ActionableDescendant => Some(HitNode::Target),
+                _ => None,
+            })
+        };
+
+        let hit = classify_pointer_hit_by(
+            &HitNode::Target,
+            AxRole::Button,
+            HitNode::ActionableDescendant,
+            4,
+            &mut same,
+            &mut role,
+            &mut parent,
+        )
+        .expect("an actionable descendant is a supported negative hit result");
+
+        assert_eq!(hit, PointerHit::Other);
+        assert_eq!(parent_reads.get(), 0);
     }
 
     #[derive(Debug)]
