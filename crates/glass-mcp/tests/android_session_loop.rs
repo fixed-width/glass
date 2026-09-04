@@ -673,16 +673,6 @@ async fn android_semantic_actions_are_conservative_and_exactly_once() {
         "the 300ms fixture motion produced no observed bounds change: {movement_samples:?}"
     );
 
-    call(
-        &client,
-        "glass_click_element",
-        json!({
-            "target": {"query": "Restart movement", "role": "Button"},
-            "mode": "native",
-            "timeout_ms": 5_000,
-        }),
-    )
-    .await;
     let moving = call(
         &client,
         "glass_click_element",
