@@ -55,6 +55,7 @@ pub(crate) mod attr {
     pub(crate) const SIZE: &str = "AXSize";
     pub(crate) const ENABLED: &str = "AXEnabled";
     pub(crate) const FOCUSED: &str = "AXFocused";
+    pub(crate) const PARENT: &str = "AXParent";
 }
 
 // `AXIsProcessTrusted` is a plain C predicate not surfaced by the objc2 bindings, declared
@@ -93,7 +94,7 @@ pub(crate) fn app_element(pid: i32) -> CFRetained<AXUIElement> {
 /// `AXUIElementCopyAttributeValue(el, attr_name, ...)` in its "any non-`Success` is an error"
 /// form: it collapses *every* non-`Success` `AXError` — an absent attribute included — into a
 /// structured [`GlassError::Backend`]. The value accessors that treat "absent" as "no value"
-/// (`attribute_string`/`attribute_bool`) reach it through `.ok()`, so the distinction doesn't
+/// (`attribute_string`) reach it through `.ok()`, so the distinction doesn't
 /// matter to them; callers that must tell "absent" from "real failure" apart use
 /// [`copy_attribute_checked`] directly.
 pub(crate) fn copy_attribute(el: &AXUIElement, attr_name: &str) -> Result<CFRetained<CFType>> {
@@ -116,13 +117,12 @@ fn is_absent_error(err: AXError) -> bool {
 /// *legitimately absent* ([`is_absent_error`]), and `Err` for any *real* AX failure. Wraps the
 /// already-retained (+1, per Core Foundation's Copy/Create rule) raw result in a
 /// `CFRetained<CFType>` so it is released automatically when dropped.
-fn copy_attribute_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<CFRetained<CFType>>> {
-    let attr = CFString::from_str(attr_name);
+fn copy_attribute_checked_by(
+    attr_name: &str,
+    call: impl FnOnce(NonNull<*const CFType>) -> AXError,
+) -> Result<Option<CFRetained<CFType>>> {
     let mut raw: *const CFType = std::ptr::null();
-    // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
-    // `AXUIElementCopyAttributeValue`'s documented signature (mirrors
-    // `axwindow::copy_attribute`).
-    let err = unsafe { el.copy_attribute_value(&attr, NonNull::from(&mut raw)) };
+    let err = call(NonNull::from(&mut raw));
     if err != AXError::Success {
         return if is_absent_error(err) {
             Ok(None)
@@ -135,10 +135,18 @@ fn copy_attribute_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<CF
             "{attr_name}: AX reported success but returned a null value"
         ))
     })?;
-    // SAFETY: `AXUIElementCopyAttributeValue` follows Core Foundation's Copy/Create
-    // ownership rule — an already-retained (+1) `CFTypeRef` on success — so
-    // `CFRetained::from_raw` takes ownership without an extra retain (mirrors `axwindow`).
+    // SAFETY: The injected Copy call returned an already-retained (+1) value on success.
     Ok(Some(unsafe { CFRetained::from_raw(nn) }))
+}
+
+fn copy_attribute_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<CFRetained<CFType>>> {
+    let attr = CFString::from_str(attr_name);
+    // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
+    // `AXUIElementCopyAttributeValue`'s documented signature (mirrors
+    // `axwindow::copy_attribute`).
+    copy_attribute_checked_by(attr_name, |raw| unsafe {
+        el.copy_attribute_value(&attr, raw)
+    })
 }
 
 /// One system-wide accessibility read, for the doctor: does the AX API answer at all?
@@ -244,46 +252,152 @@ pub(crate) fn attribute_string_checked(
     }
 }
 
-/// Read `el`'s `attr_name` as a `bool` (`CFBoolean`), or `None` when the attribute is absent
-/// or isn't a boolean.
-pub(crate) fn attribute_bool(el: &AXUIElement, attr_name: &str) -> Option<bool> {
-    let value = copy_attribute(el, attr_name).ok()?;
-    value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool)
+fn attribute_bool_checked_by(
+    attr_name: &str,
+    call: impl FnOnce(NonNull<*const CFType>) -> AXError,
+) -> Result<Option<bool>> {
+    match copy_attribute_checked_by(attr_name, call)? {
+        Some(value) => Ok(value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool)),
+        None => Ok(None),
+    }
 }
 
-/// Read `el`'s `attr_name` as an `i64` (`CFNumber`), or `None` when the attribute is absent,
-/// isn't a `CFNumber`, or holds a value that doesn't fit an `i64`. A checkbox/radio/switch
-/// exposes `AXValue` as a `CFNumber` (`0`/`1` for off/on), which `attribute_string`/
-/// `attribute_bool` cannot read — this is how the reader learns the checked state. Absence
-/// collapses to `None` (via `copy_attribute(...).ok()`), like the siblings.
-pub(crate) fn attribute_i64(el: &AXUIElement, attr_name: &str) -> Option<i64> {
-    let value = copy_attribute(el, attr_name).ok()?;
-    let num = value.downcast_ref::<CFNumber>()?;
-    let mut out: i64 = 0;
-    // SAFETY: `num` was downcast-verified to be a real `CFNumber`; `out` is a valid, correctly
-    // sized `i64` slot matching the requested `SInt64Type`. `CFNumberGetValue` writes at most 8
-    // bytes into `out` and returns false (→ `None`) when the stored value isn't exactly
-    // representable as an `i64` — the same out-param idiom `ax_position`/`ax_size` use for
-    // `AXValue`.
-    let ok = unsafe { num.value(CFNumberType::SInt64Type, (&mut out as *mut i64).cast()) };
-    ok.then_some(out)
-}
-
-/// Whether `attr_name` is writable on `el` (`AXUIElement::is_attribute_settable`). `false`
-/// on any AX error, including the attribute being absent — the reader uses this for
-/// `editable` (settable `AXValue`) and `focusable` (settable `AXFocused`).
-pub(crate) fn is_settable(el: &AXUIElement, attr_name: &str) -> bool {
+/// Read a boolean AX attribute without collapsing transport and stale-element failures into
+/// absence.
+pub(crate) fn attribute_bool_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<bool>> {
     let attr = CFString::from_str(attr_name);
-    let mut settable: u8 = 0;
-    // SAFETY: `el` is a live `AXUIElement`; `attr` is a valid `CFString`; `settable` is a
-    // valid local out-param matching `is_attribute_settable`'s documented `Boolean *`
-    // parameter (mirrors `copy_attribute`'s `NonNull`-out-param pattern above).
-    let err = unsafe { el.is_attribute_settable(&attr, NonNull::from(&mut settable)) };
-    err == AXError::Success && settable != 0
+    attribute_bool_checked_by(attr_name, |raw| unsafe {
+        el.copy_attribute_value(&attr, raw)
+    })
+}
+
+fn attribute_i64_checked_by(
+    attr_name: &str,
+    call: impl FnOnce(NonNull<*const CFType>) -> AXError,
+) -> Result<Option<i64>> {
+    let Some(value) = copy_attribute_checked_by(attr_name, call)? else {
+        return Ok(None);
+    };
+    let Some(num) = value.downcast_ref::<CFNumber>() else {
+        return Ok(None);
+    };
+    let mut out: i64 = 0;
+    // SAFETY: `num` was downcast-verified and `out` matches `SInt64Type`.
+    let ok = unsafe { num.value(CFNumberType::SInt64Type, (&mut out as *mut i64).cast()) };
+    Ok(ok.then_some(out))
+}
+
+/// Read an integer AX attribute while preserving genuine AX failures.
+pub(crate) fn attribute_i64_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<i64>> {
+    let attr = CFString::from_str(attr_name);
+    attribute_i64_checked_by(attr_name, |raw| unsafe {
+        el.copy_attribute_value(&attr, raw)
+    })
+}
+
+fn is_settable_checked_by(
+    attr_name: &str,
+    call: impl FnOnce(NonNull<u8>) -> AXError,
+) -> Result<bool> {
+    let mut settable = 0;
+    let err = call(NonNull::from(&mut settable));
+    if err == AXError::Success {
+        Ok(settable != 0)
+    } else if is_absent_error(err) {
+        Ok(false)
+    } else {
+        Err(ax_err(attr_name, err))
+    }
+}
+
+/// Test whether an AX attribute is writable, distinguishing an unsupported attribute from a
+/// failed AX request.
+pub(crate) fn is_settable_checked(el: &AXUIElement, attr_name: &str) -> Result<bool> {
+    let attr = CFString::from_str(attr_name);
+    is_settable_checked_by(attr_name, |settable| unsafe {
+        el.is_attribute_settable(&attr, settable)
+    })
+}
+
+fn set_bool_attribute_by(
+    attr_name: &str,
+    value: bool,
+    call: impl FnOnce(&CFString, &CFType) -> AXError,
+) -> Result<()> {
+    let attr = CFString::from_str(attr_name);
+    let value = CFBoolean::new(value);
+    let err = call(&attr, value);
+    if err == AXError::Success {
+        Ok(())
+    } else {
+        Err(ax_err(attr_name, err))
+    }
+}
+
+/// Write a Core Foundation boolean to an AX attribute.
+pub(crate) fn set_bool_attribute(el: &AXUIElement, attr_name: &str, value: bool) -> Result<()> {
+    set_bool_attribute_by(attr_name, value, |attr, value| unsafe {
+        el.set_attribute_value(attr, value)
+    })
+}
+
+fn element_at_position_by(
+    x: f32,
+    y: f32,
+    call: impl FnOnce(f32, f32, NonNull<*const AXUIElement>) -> AXError,
+) -> Result<Option<CFRetained<AXUIElement>>> {
+    let mut raw: *const AXUIElement = std::ptr::null();
+    let err = call(x, y, NonNull::from(&mut raw));
+    if err != AXError::Success {
+        return if err == AXError::NoValue {
+            Ok(None)
+        } else {
+            Err(ax_err("AXUIElementCopyElementAtPosition", err))
+        };
+    }
+    let Some(raw) = NonNull::new(raw.cast_mut()) else {
+        return Ok(None);
+    };
+    // SAFETY: AXUIElementCopyElementAtPosition returned a copied (+1) element.
+    Ok(Some(unsafe { CFRetained::from_raw(raw) }))
+}
+
+/// Return the application element at a point in global AX coordinates.
+pub(crate) fn element_at_position(
+    app: &AXUIElement,
+    x: f32,
+    y: f32,
+) -> Result<Option<CFRetained<AXUIElement>>> {
+    element_at_position_by(x, y, |x, y, raw| unsafe {
+        app.copy_element_at_position(x, y, raw)
+    })
+}
+
+fn parent_by(
+    call: impl FnOnce(NonNull<*const CFType>) -> AXError,
+) -> Result<Option<CFRetained<AXUIElement>>> {
+    let Some(value) = copy_attribute_checked_by(attr::PARENT, call)? else {
+        return Ok(None);
+    };
+    value
+        .downcast::<AXUIElement>()
+        .map(Some)
+        .map_err(|_| GlassError::Backend("AXParent did not return an AXUIElement".into()))
+}
+
+/// Return an element's parent, preserving AX failures and validating the copied type.
+pub(crate) fn parent(el: &AXUIElement) -> Result<Option<CFRetained<AXUIElement>>> {
+    let attr = CFString::from_str(attr::PARENT);
+    parent_by(|raw| unsafe { el.copy_attribute_value(&attr, raw) })
+}
+
+/// Core Foundation equality for accessibility elements.
+pub(crate) fn same_element(a: &AXUIElement, b: &AXUIElement) -> bool {
+    a == b
 }
 
 /// Write `text` as `el`'s `AXValue` (`AXUIElement::set_attribute_value`). The caller
-/// (`reader::set_value`) gates this on [`is_settable`] first; this only performs the write —
+/// (`reader::set_value`) gates this on [`is_settable_checked`] first; this only performs the write —
 /// it does not read back to verify the value actually took (that honesty check is the
 /// caller's read-back poll, mirroring the Windows reader's `set_value` contract).
 pub(crate) fn set_string_value(el: &AXUIElement, text: &str) -> Result<()> {
@@ -434,9 +548,15 @@ fn ax_err(context: &str, err: AXError) -> GlassError {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_absent_error, probe_system_wide_attr};
+    use super::{
+        attr, attribute_bool_checked_by, attribute_i64_checked_by, element_at_position_by,
+        is_absent_error, is_settable_checked_by, parent_by, probe_system_wide_attr, same_element,
+        set_bool_attribute_by,
+    };
     use crate::doctor::SystemWideProbe;
-    use objc2_application_services::AXError;
+    use objc2_application_services::{AXError, AXUIElement};
+    use objc2_core_foundation::{CFBoolean, CFRetained};
+    use std::cell::Cell;
 
     // There is deliberately no live "the probe answers" test: on a granted process it answers and
     // on an untrusted one it does not, so the assertion would encode which binaries the running
@@ -517,5 +637,103 @@ mod tests {
                 "{err:?} must not be treated as absent"
             );
         }
+    }
+
+    #[test]
+    fn attribute_bool_checked_distinguishes_absence_from_real_ax_failure() {
+        assert_eq!(
+            attribute_bool_checked_by(attr::ENABLED, |_| AXError::NoValue)
+                .expect("absence is a normal state"),
+            None
+        );
+        let error = attribute_bool_checked_by(attr::ENABLED, |_| AXError::CannotComplete)
+            .expect_err("a failed AX read must propagate");
+        assert!(error.to_string().contains("AXEnabled"), "{error}");
+    }
+
+    #[test]
+    fn attribute_i64_checked_distinguishes_absence_from_real_ax_failure() {
+        assert_eq!(
+            attribute_i64_checked_by(attr::VALUE, |_| AXError::AttributeUnsupported)
+                .expect("absence is a normal state"),
+            None
+        );
+        let error = attribute_i64_checked_by(attr::VALUE, |_| AXError::InvalidUIElement)
+            .expect_err("a stale AX element must propagate");
+        assert!(error.to_string().contains("AXValue"), "{error}");
+    }
+
+    #[test]
+    fn is_settable_checked_distinguishes_false_from_real_ax_failure() {
+        assert!(
+            !is_settable_checked_by(attr::FOCUSED, |_| AXError::Success)
+                .expect("an explicit false result is valid")
+        );
+        assert!(
+            !is_settable_checked_by(attr::FOCUSED, |_| AXError::NoValue)
+                .expect("an absent attribute is not settable")
+        );
+        let error = is_settable_checked_by(attr::FOCUSED, |_| AXError::CannotComplete)
+            .expect_err("a failed settable query must propagate");
+        assert!(error.to_string().contains("AXFocused"), "{error}");
+    }
+
+    #[test]
+    fn set_bool_attribute_writes_cfboolean_true_to_axfocused() {
+        let called = Cell::new(false);
+        set_bool_attribute_by(attr::FOCUSED, true, |name, value| {
+            called.set(true);
+            assert_eq!(name.to_string(), attr::FOCUSED);
+            assert_eq!(
+                value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool),
+                Some(true)
+            );
+            AXError::Success
+        })
+        .expect("the injected AX write succeeds");
+        assert!(called.get());
+    }
+
+    #[test]
+    fn element_at_position_takes_global_points_and_owns_the_copied_element() {
+        let expected = unsafe { AXUIElement::new_application(42) };
+        let copied = CFRetained::into_raw(expected.clone());
+        let seen = Cell::new((0.0, 0.0));
+
+        let actual = element_at_position_by(120.5, -7.25, |x, y, out| {
+            seen.set((x, y));
+            // SAFETY: `out` is the wrapper's valid local result slot, and `copied` carries the
+            // +1 ownership that the simulated Copy call transfers into it.
+            unsafe { out.as_ptr().write(copied.as_ptr()) };
+            AXError::Success
+        })
+        .expect("the injected hit test succeeds")
+        .expect("the injected hit test returns an element");
+
+        assert_eq!(seen.get(), (120.5, -7.25));
+        assert!(same_element(&actual, &expected));
+        drop(actual);
+        assert!(same_element(&expected, &expected));
+        assert!(
+            element_at_position_by(0.0, 0.0, |_, _, _| AXError::NoValue)
+                .expect("NoValue means AX found no element")
+                .is_none()
+        );
+        assert!(
+            element_at_position_by(0.0, 0.0, |_, _, _| AXError::AttributeUnsupported).is_err(),
+            "unsupported hit testing is a failure, not an inconclusive no-hit"
+        );
+    }
+
+    #[test]
+    fn parent_attribute_distinguishes_absent_parent_from_real_ax_failure() {
+        assert!(
+            parent_by(|_| AXError::NoValue)
+                .expect("a root has no parent")
+                .is_none()
+        );
+        let error = parent_by(|_| AXError::CannotComplete)
+            .expect_err("a failed parent read must propagate");
+        assert!(error.to_string().contains("AXParent"), "{error}");
     }
 }

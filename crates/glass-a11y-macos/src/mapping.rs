@@ -5,7 +5,20 @@
 //! `"AXButton"`/`"AXTextField"`/... constants; the reader passes the string so this
 //! module needs no macOS-only dependency.
 
-use glass_core::{AxRole, AxStates, normalize_description};
+use glass_core::{AxRole, AxStateCoverage, AxStates, normalize_description};
+
+/// State fields backed by error-preserving AX reads in the macOS reader.
+pub const STATE_COVERAGE: AxStateCoverage = AxStateCoverage {
+    enabled: true,
+    visible: false,
+    checkable: true,
+    checked: true,
+    selected: false,
+    expanded: false,
+    focused: true,
+    focusable: true,
+    editable: true,
+};
 
 /// Every AX role string glass maps. AX role strings are canonical constants, so lookup is
 /// case-sensitive.
@@ -218,6 +231,18 @@ mod tests {
 
     use super::*;
     use glass_core::AxRole;
+
+    #[test]
+    #[expect(clippy::assertions_on_constants)]
+    fn macos_mapping_declares_only_the_ax_facts_the_reader_proves() {
+        assert!(!STATE_COVERAGE.visible);
+        assert!(!STATE_COVERAGE.selected);
+        assert!(!STATE_COVERAGE.expanded);
+        assert!(STATE_COVERAGE.enabled);
+        assert!(STATE_COVERAGE.focused);
+        assert!(STATE_COVERAGE.focusable);
+        assert!(STATE_COVERAGE.editable);
+    }
 
     #[test]
     fn maps_common_ax_roles() {
