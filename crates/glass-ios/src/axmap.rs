@@ -20,11 +20,28 @@
 //! key anywhere in the output), so [`AxStates::focused`] is always false from this
 //! backend — a known limitation.
 use glass_core::accessibility::{
-    AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, WalkBudget, WalkLimits,
+    AxNode, AxNodeId, AxRect, AxRole, AxStateCoverage, AxStates, AxTree, WalkBudget, WalkLimits,
     normalize_description, normalize_name,
 };
 use glass_core::{GlassError, Result, WindowGeometry};
 use serde_json::Value;
+
+/// State facts the idb schema can establish for every mapped node.
+///
+/// `AxStates::visible` remains true as a legacy outline approximation, but it is deliberately not
+/// covered: idb publishes off-window nodes without a visibility field, so that bit cannot prove a
+/// `visible`/`hidden` selector or pointer actionability.
+pub const STATE_COVERAGE: AxStateCoverage = AxStateCoverage {
+    enabled: true,
+    visible: false,
+    checkable: true,
+    checked: true,
+    selected: false,
+    expanded: false,
+    focused: false,
+    focusable: false,
+    editable: true,
+};
 
 /// Every iOS role string glass maps, as reported through `idb`.
 pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
@@ -325,6 +342,42 @@ mod tests {
         // The checkable roles the toggle-state derivation depends on.
         assert_eq!(ax_role("AXCheckBox"), AxRole::CheckBox);
         assert_eq!(ax_role("AXWhatever"), AxRole::Other);
+    }
+
+    #[test]
+    fn ios_mapping_never_claims_focus_coverage_idb_does_not_publish() {
+        assert_eq!(
+            STATE_COVERAGE,
+            AxStateCoverage {
+                enabled: true,
+                visible: false,
+                checkable: true,
+                checked: true,
+                selected: false,
+                expanded: false,
+                focused: false,
+                focusable: false,
+                editable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn idb_fixture_has_no_key_interpreted_as_focused_or_focusable() {
+        fn contains_key(value: &Value, sought: &str) -> bool {
+            match value {
+                Value::Object(fields) => {
+                    fields.contains_key(sought)
+                        || fields.values().any(|value| contains_key(value, sought))
+                }
+                Value::Array(values) => values.iter().any(|value| contains_key(value, sought)),
+                _ => false,
+            }
+        }
+
+        let fixture: Value = serde_json::from_str(FIXTURE).expect("fixture JSON");
+        assert!(!contains_key(&fixture, "focused"));
+        assert!(!contains_key(&fixture, "focusable"));
     }
 
     /// Read on the iOS 26.5 Simulator (2026-08-24, companions 1.5.0b3 and 1.1.8): a WKWebView
