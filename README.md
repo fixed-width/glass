@@ -19,9 +19,6 @@ or language. It has two Linux backends (**X11** and **Wayland**), a **Windows** 
 apps in the Simulator over `xcrun simctl`, with input and the accessibility tree via `idb_companion`,
 including a two-finger pinch), and a **macOS** backend, behind a platform-agnostic core.
 
-For browser, Electron and hybrid testing, see [Glass and Playwright](docs/explanation/glass-and-playwright.md)
-and the [renderer/packaged-app testing recipe](docs/how-to/test-electron-and-hybrid-apps.md).
-
 ## See it
 
 ![An agent debugging a GTK app under glass](docs/assets/hero-debug-loop.gif)
@@ -76,10 +73,6 @@ For a canvas or custom-rendered app with no accessibility tree, drive it by pixe
 `glass_screenshot`, `glass_click {x,y}`, and `glass_diff`, which returns `changed_pct` + a `bbox` as
 text, so routine checks between screenshots cost no vision tokens. Why the loop is shaped this way:
 [the build → see → interact → debug loop](docs/explanation/the-loop.md).
-
-For large windows, request `glass_screenshot {"max_width":1280}` or combine a crop with a size bound.
-The [image size controls](docs/how-to/capture-a-smaller-image.md) report native source coordinates and
-returned dimensions; visual comparisons still use native pixels.
 
 `glass_click_element` tries the platform's native accessibility action first — AT-SPI `Action` on
 Linux, UI Automation patterns on Windows, `AXPress` on macOS, and `ACTION_CLICK` on Android when

@@ -25,13 +25,13 @@ way it does? The explanations.
 
 **Connect and drive**
 
-- [Test an Electron or hybrid app](how-to/test-electron-and-hybrid-apps.md) — renderer checks and packaged-app acceptance
-- [Capture a smaller image](how-to/capture-a-smaller-image.md) — size bounds and native coordinate mapping
 - [Connect glass to your agent](how-to/connect-an-agent.md) — stdio and HTTP
-- [Run glass over the network](how-to/run-over-the-network.md) — agent and app on different machines
-- [Record and export session evidence](how-to/record-session-evidence.md) — retain requested results for offline review
 - [Drive glass well — the glass-drive skill](how-to/drive-glass-well.md)
+- [Run glass over the network](how-to/run-over-the-network.md) — agent and app on different machines
+- [Capture a smaller image](how-to/capture-a-smaller-image.md) — size bounds and native coordinate mapping
+- [Record and export session evidence](how-to/record-session-evidence.md) — retain requested results for offline review
 - [Drive a native iOS app in the Simulator](how-to/drive-an-ios-app.md) — launch, drive, and verify an iOS app
+- [Test an Electron or hybrid app](how-to/test-electron-and-hybrid-apps.md) — renderer checks and packaged-app acceptance
 
 **Contribute**
 
@@ -60,10 +60,10 @@ way it does? The explanations.
 
 ## Explanation — understand why
 
-- [Glass and Playwright](explanation/glass-and-playwright.md) — choose a test surface and understand its coverage
 - [The build → see → interact → debug loop](explanation/the-loop.md)
 - [Backends and display isolation](explanation/backends.md)
 - [Containment and sandboxing](explanation/containment.md)
 - [The macOS permission model](explanation/macos-permissions.md)
 - [The Windows access model](explanation/windows-permissions.md)
 - [Web content](explanation/web-content.md)
+- [Glass and Playwright](explanation/glass-and-playwright.md) — choose a test surface and understand its coverage
