@@ -427,6 +427,7 @@ mod tests {
         let new_paths = vec![ProtectedHostPath::file("new")];
         g.set_protected_host_paths(old_paths.clone()).unwrap();
         g.start(&spec()).unwrap();
+        assert_eq!(g.active_backend(), Some("x11"));
 
         assert!(matches!(
             g.start(&spec()).unwrap_err(),
@@ -434,9 +435,11 @@ mod tests {
         ));
         assert_eq!(*stops.lock().unwrap(), 1);
         assert_eq!(g.host_path_access(), HostPathAccess::NoActiveTarget);
+        assert_eq!(g.active_backend(), None);
 
         g.set_protected_host_paths(new_paths.clone()).unwrap();
-        g.start(&spec()).unwrap();
+        g.start_on("wayland", &spec()).unwrap();
+        assert_eq!(g.active_backend(), Some("wayland"));
 
         assert_eq!(*configured.lock().unwrap(), vec![old_paths, new_paths]);
         assert_eq!(
@@ -500,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn start_on_passes_backend_name_to_factory() {
+    fn start_on_tracks_the_backend_passed_to_the_factory_until_stop() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen2 = seen.clone();
         let factory: PlatformFactory = Box::new(move |backend| {
@@ -508,9 +511,14 @@ mod tests {
             Ok(Backend::display_only(Box::new(FakePlatform::new(10, 10))))
         });
         let mut g = glass_with_factory(factory);
+        assert_eq!(g.active_backend(), None);
         g.start(&spec()).unwrap(); // default ("x11")
+        assert_eq!(g.active_backend(), Some("x11"));
         g.start_on("wayland", &spec()).unwrap(); // explicit
+        assert_eq!(g.active_backend(), Some("wayland"));
         assert_eq!(*seen.lock().unwrap(), vec!["x11", "wayland"]);
+        g.stop().unwrap();
+        assert_eq!(g.active_backend(), None);
     }
 
     #[test]
@@ -539,7 +547,9 @@ mod tests {
         });
         let mut g = glass_with_factory(factory);
         g.start(&spec()).unwrap();
+        assert_eq!(g.active_backend(), Some("x11"));
         g.shutdown(soon());
+        assert_eq!(g.active_backend(), None);
         assert_eq!(
             *stops.lock().unwrap(),
             1,
