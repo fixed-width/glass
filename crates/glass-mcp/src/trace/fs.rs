@@ -6,6 +6,22 @@ use anyhow::{Context, ensure};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, DirBuilder, OpenOptions};
 
+pub(super) struct Lease(File);
+
+impl Lease {
+    pub(super) fn try_lock(file: File) -> anyhow::Result<Self> {
+        fs4::FileExt::try_lock(&file)?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // A fork can retain the open file description until exec, even with CLOEXEC.
+        let _ = fs4::FileExt::unlock(&self.0);
+    }
+}
+
 pub(super) fn open_directory(path: &Path) -> anyhow::Result<Dir> {
     ensure!(path.is_absolute(), "expected an absolute directory");
     let mut base = std::path::PathBuf::new();
@@ -181,4 +197,25 @@ pub(super) fn write_atomic(dir: &Dir, name: &str, bytes: &[u8]) -> anyhow::Resul
         let _ = dir.remove_file(&temporary);
     }
     result
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lease_release_does_not_wait_for_an_inherited_descriptor_to_close() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = open_directory(&root.path().canonicalize().unwrap()).unwrap();
+        let lease = Lease::try_lock(create_file(&dir, "writer.lease").unwrap()).unwrap();
+        let inherited = lease.0.try_clone().unwrap();
+        assert!(Lease::try_lock(open_file(&dir, "writer.lease", true).unwrap()).is_err());
+
+        drop(lease);
+
+        let next = Lease::try_lock(open_file(&dir, "writer.lease", true).unwrap())
+            .expect("the owner released its lock even while a fork-inherited descriptor survives");
+        assert_eq!(inherited.metadata().unwrap().len(), 0);
+        drop(next);
+    }
 }

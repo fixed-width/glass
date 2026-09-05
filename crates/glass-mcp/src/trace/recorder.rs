@@ -197,7 +197,7 @@ struct Inner {
     path: PathBuf,
     sender: mpsc::SyncSender<Pending>,
     shared: Arc<Shared>,
-    done: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    done: tokio::sync::watch::Receiver<bool>,
     next_client: AtomicU64,
 }
 
@@ -285,20 +285,20 @@ impl TraceRecorder {
             writer_gate: Mutex::new(None),
         });
         let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_EVENTS);
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
         let worker_shared = shared.clone();
         std::thread::Builder::new()
             .name("glass-trace".into())
             .spawn(move || {
                 writer(store, receiver, &worker_shared);
-                let _ = done_tx.send(());
+                let _ = done_tx.send(true);
             })?;
         let recorder = Self(Arc::new(Inner {
             root: root_path.clone(),
             path: root_path.join(name),
             sender,
             shared,
-            done: Mutex::new(Some(done_rx)),
+            done: done_rx,
             next_client: AtomicU64::new(1),
         }));
         recorder.record("inventory", None, 0, json!({}), |capture| {
@@ -438,13 +438,11 @@ impl TraceRecorder {
                 .unwrap_or_else(|e| e.into_inner());
             self.0.shared.closing.store(true, Ordering::Release);
         }
-        let done = self.0.done.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(done) = done
-            && !matches!(
-                tokio::time::timeout(Duration::from_secs(2), done).await,
-                Ok(Ok(()))
-            )
-        {
+        let mut done = self.0.done.clone();
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(2), done.wait_for(|finished| *finished)).await,
+            Ok(Ok(_))
+        ) {
             self.0.shared.timed_out.store(true, Ordering::Release);
             self.0.shared.errors.fetch_add(1, Ordering::Relaxed);
             self.0.shared.stop(FAILED, "writer shutdown timeout");
@@ -460,6 +458,15 @@ impl TraceRecorder {
         })
         .await
         .expect("trace writer drained");
+    }
+
+    #[cfg(test)]
+    pub(super) async fn writer_finished(&self) {
+        let mut done = self.0.done.clone();
+        tokio::time::timeout(Duration::from_secs(10), done.wait_for(|finished| *finished))
+            .await
+            .expect("trace writer finished")
+            .expect("trace writer completion published");
     }
 
     #[cfg(test)]

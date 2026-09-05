@@ -18,14 +18,12 @@ pub(super) struct Store {
     journal_hash: Sha256,
     manifest_bytes: u64,
     payloads: BTreeMap<String, Payload>,
-    _lease: File,
+    _lease: fs::Lease,
 }
 
 impl Store {
     pub fn new(directory: Dir, manifest: Manifest) -> anyhow::Result<Self> {
-        use fs4::FileExt;
-        let lease = fs::create_file(&directory, "writer.lease")?;
-        FileExt::try_lock(&lease)?;
+        let lease = fs::Lease::try_lock(fs::create_file(&directory, "writer.lease")?)?;
         let blobs = fs::create_directory(&directory, "blobs")?;
         let journal = fs::create_file(&directory, "events.jsonl")?;
         let mut store = Self {

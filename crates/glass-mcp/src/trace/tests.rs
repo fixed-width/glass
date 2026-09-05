@@ -132,6 +132,34 @@ async fn queue_and_call_limits_preserve_inspectable_prefixes() {
 }
 
 #[tokio::test]
+async fn concurrent_and_cancelled_close_wait_for_the_writer() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    let root = private_root();
+    let recorder = start_recorder(&root);
+    recorder.idle().await;
+    let (entered, release) = recorder.pause_next_write();
+    recorder.record("close_probe", None, 0, json!({}), |_| {});
+    entered
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    let mut first = Box::pin(recorder.close());
+    let mut second = Box::pin(recorder.close());
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(first.as_mut().poll(&mut context).is_pending());
+    assert!(second.as_mut().poll(&mut context).is_pending());
+    drop(first);
+    assert!(inspect(recorder.path()).is_err());
+
+    release.send(()).unwrap();
+    second.await;
+    assert!(inspect(recorder.path()).unwrap().complete);
+    recorder.close().await;
+}
+
+#[tokio::test]
 async fn stalled_writer_shutdown_is_bounded_and_never_claims_completeness() {
     let root = private_root();
     let recorder = start_recorder(&root);
@@ -141,21 +169,15 @@ async fn stalled_writer_shutdown_is_bounded_and_never_claims_completeness() {
     entered
         .recv_timeout(std::time::Duration::from_secs(2))
         .unwrap();
+    tokio::time::pause();
     tokio::time::timeout(std::time::Duration::from_secs(3), recorder.close())
         .await
         .unwrap();
+    tokio::time::resume();
     assert_eq!(recorder.status()["state"], "failed");
     release.send(()).unwrap();
-    let report = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            if let Ok(report) = inspect(recorder.path()) {
-                break report;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    recorder.writer_finished().await;
+    let report = inspect(recorder.path()).unwrap();
     assert_eq!(report.exit_code(), 2);
     assert_eq!(report.manifest["state"], "failed");
 }

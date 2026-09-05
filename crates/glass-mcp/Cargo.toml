@@ -98,7 +98,7 @@ tempfile.workspace = true
 image.workspace = true
 proptest.workspace = true
 rmcp = { version = "2.2", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 # Named directly in tests/network_roundtrip.rs (the client transport is generic over
 # the HTTP client). Pinned to rmcp's reqwest line so cargo unifies on one copy; plain
 # loopback HTTP needs no TLS provider, so keep default-features off.

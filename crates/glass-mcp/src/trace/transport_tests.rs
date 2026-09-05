@@ -99,8 +99,13 @@ impl Harness {
         )
         .await;
         let path = self.recorder.path().to_owned();
-        crate::cleanup_evidence(Some(self.recorder), self.server.artifact_store()).await;
-        let report = inspect(&path).unwrap();
+        crate::cleanup_evidence(Some(self.recorder.clone()), self.server.artifact_store()).await;
+        let report = inspect(&path).unwrap_or_else(|error| {
+            panic!(
+                "trace inspection after cleanup: {error:#}; recorder: {}",
+                self.recorder.status()
+            )
+        });
         (self.root, path, report)
     }
 }

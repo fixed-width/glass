@@ -1,11 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
 use cap_std::fs::Dir;
-use fs4::FileExt;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -38,7 +36,7 @@ impl Inspection {
 struct Validated {
     dir: Dir,
     blobs: Dir,
-    _lease: File,
+    _lease: fs::Lease,
     manifest: Manifest,
     payloads: BTreeMap<String, Payload>,
     report: Inspection,
@@ -60,7 +58,8 @@ fn validate(path: &Path) -> anyhow::Result<Validated> {
     let dir = fs::open_directory(&absolute(path)?)?;
     let lease = fs::open_file(&dir, "writer.lease", true)?;
     ensure!(lease.metadata()?.len() == 0, "invalid trace lease");
-    FileExt::try_lock(&lease).context("trace is held by an active writer or inspector")?;
+    let lease =
+        fs::Lease::try_lock(lease).context("trace is held by an active writer or inspector")?;
     let manifest_bytes = fs::read_bounded(&dir, "manifest.json", RESERVE_BYTES)?;
     let mut manifest: Manifest =
         serde_json::from_slice(&manifest_bytes).context("invalid trace manifest")?;
