@@ -34,6 +34,8 @@ jobs:
     # The Cargo workspace is at the repo root.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Test mutation gate wrapper
+        run: python3 -m unittest discover -s scripts/tests
       # rustup auto-installs the pinned toolchain + components from
       # rust-toolchain.toml (single source of truth for the nightly).
       - name: Install pinned toolchain

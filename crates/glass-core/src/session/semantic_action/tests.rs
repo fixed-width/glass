@@ -2083,7 +2083,7 @@ fn selector_pointer_row_toggle_probes_and_dispatches_the_same_trailing_control()
 
     glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Wi-Fi")), Some(500)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Wi-Fi")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap();
@@ -2218,7 +2218,7 @@ fn selector_pointer_popover_row_toggle_dispatches_the_translated_planned_segment
 
     glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Globex")), Some(500)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Globex")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap();

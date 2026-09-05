@@ -1,0 +1,8 @@
+{
+  "name": "glass-interaction-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "main": "main.js",
+  "scripts": {"package": "node package.js"},
+  "devDependencies": {"electron": "44.2.0"}
+}

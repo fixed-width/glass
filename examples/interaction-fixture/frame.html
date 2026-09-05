@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Inner fixture</title>
+<h2>Inner fixture</h2>
+<label>Inner count <input id="count" readonly aria-label="Inner count" value="0"></label>
+<button type="button" id="action">Frame action</button>
+<script>
+document.getElementById('action').addEventListener('click', () => {
+  const count = document.getElementById('count');
+  count.value = String(Number(count.value) + 1);
+});
+</script>
+</html>
