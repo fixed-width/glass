@@ -997,6 +997,10 @@ counts only as a warning: a non-default backend's problem never reads as `overal
 
 Mirrors the `glass-mcp doctor` CLI — see [reference/cli.md](cli.md).
 
+When session tracing is enabled, the MCP result also includes `trace` with recorder state,
+retained bytes/calls, limits and omission/error counts. The field is absent when tracing is off.
+See [session trace](session-trace.md) for scope and tool-result `_meta.glass.trace` status.
+
 ### `glass_capabilities`
 
 Report which operations can be performed **right now** on a backend — so you can check before you

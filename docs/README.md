@@ -27,6 +27,7 @@ way it does? The explanations.
 
 - [Connect glass to your agent](how-to/connect-an-agent.md) — stdio and HTTP
 - [Run glass over the network](how-to/run-over-the-network.md) — agent and app on different machines
+- [Record and export session evidence](how-to/record-session-evidence.md) — retain requested results for offline review
 - [Drive glass well — the glass-drive skill](how-to/drive-glass-well.md)
 - [Drive a native iOS app in the Simulator](how-to/drive-an-ios-app.md) — launch, drive, and verify an iOS app
 
@@ -53,6 +54,7 @@ way it does? The explanations.
 - [Platform support](reference/platforms.md) — the capability matrix and system requirements
 - [Accessibility roles by platform](reference/a11y-roles.md) — which roles each backend can produce
 - [Audit log](reference/audit-log.md) — the JSONL record schema and redaction
+- [Session trace](reference/session-trace.md) — capture scope, bounds, format and offline commands
 
 ## Explanation — understand why
 

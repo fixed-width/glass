@@ -50,6 +50,7 @@ pub(crate) mod shutdown;
 pub(crate) mod status;
 pub mod tool_profile;
 mod tools;
+pub mod trace;
 mod untrusted;
 #[cfg(feature = "self-update")]
 pub(crate) mod update;
@@ -416,6 +417,16 @@ pub(crate) async fn cleanup_artifacts(store: Option<crate::artifacts::ArtifactSt
     }
 }
 
+pub(crate) async fn cleanup_evidence(
+    trace: Option<crate::trace::TraceRecorder>,
+    store: Option<crate::artifacts::ArtifactStore>,
+) {
+    if let Some(trace) = trace {
+        trace.close().await;
+    }
+    cleanup_artifacts(store).await;
+}
+
 pub(crate) async fn finish_transport_lifecycle<T>(
     transport_result: T,
     teardown: impl std::future::Future<Output = ()>,
@@ -512,13 +523,29 @@ pub async fn run_stdio_with_profile(
     report: crate::audit::AuditReport,
     profile: tool_profile::ToolProfile,
 ) -> anyhow::Result<()> {
-    let server = GlassServer::new_with_profile(glass, report, profile);
+    run_stdio_configured(glass, report, profile, None).await
+}
+
+/// Serve stdio with optional persistent evidence recording.
+pub async fn run_stdio_configured(
+    glass: Glass,
+    report: crate::audit::AuditReport,
+    profile: tool_profile::ToolProfile,
+    config: Option<&trace::TraceConfig>,
+) -> anyhow::Result<()> {
+    let server = GlassServer::new_configured(glass, report, profile, config, "stdio")?;
     let sessions = server.sessions();
     let artifacts = server.artifact_store();
-    let service = server
-        .serve(stdio())
-        .await
-        .context("starting the MCP stdio service")?;
+    let trace = server.trace_recorder();
+    let service = match server.serve(stdio()).await {
+        Ok(service) => service,
+        Err(error) => {
+            shutdown::run_shutdown_with_trace(sessions, glass_core::TEARDOWN_BUDGET, trace.clone())
+                .await;
+            cleanup_evidence(trace, artifacts).await;
+            return Err(error).context("starting the MCP stdio service");
+        }
+    };
 
     let signal = async {
         shutdown::shutdown_signal().await;
@@ -528,8 +555,8 @@ pub async fn run_stdio_with_profile(
         service,
         signal,
         glass_core::TEARDOWN_BUDGET,
-        shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET),
-        cleanup_artifacts(artifacts),
+        shutdown::run_shutdown_with_trace(sessions, glass_core::TEARDOWN_BUDGET, trace.clone()),
+        cleanup_evidence(trace, artifacts),
     )
     .await;
     match transport_outcome {

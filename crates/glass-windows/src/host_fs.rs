@@ -523,6 +523,20 @@ fn open_relative(
     filename: &OsStr,
     directory_child: Option<bool>,
 ) -> Result<File, HostFsError> {
+    open_relative_with_access(
+        directory,
+        filename,
+        directory_child,
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE | DELETE,
+    )
+}
+
+fn open_relative_with_access(
+    directory: &File,
+    filename: &OsStr,
+    directory_child: Option<bool>,
+    access: windows::Win32::Storage::FileSystem::FILE_ACCESS_RIGHTS,
+) -> Result<File, HostFsError> {
     if !valid_child_name(filename) {
         return Err(HostFsError::Integrity);
     }
@@ -553,7 +567,7 @@ fn open_relative(
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE | DELETE,
+            access,
             &attributes,
             &mut status_block,
             None,
@@ -611,11 +625,81 @@ pub fn same_file_object(first: &File, second: &File) -> Result<bool, HostFsError
     Ok(file_identity(first)? == file_identity(second)?)
 }
 
+/// Reports whether a retained regular file has exactly one directory link.
+pub fn file_has_single_link(file: &File) -> Result<bool, HostFsError> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: The borrowed handle and correctly sized writable result remain valid for the query.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
+        .map_err(|_| HostFsError::Open)?;
+    Ok(information.nNumberOfLinks == 1)
+}
+
 fn is_reparse(metadata: &std::fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
 }
 
-/// Replaces a filesystem object's inherited permissions with full access for its owner and SYSTEM.
+/// Restrict an owned directory child through its retained parent handle.
+pub fn restrict_directory_child_to_current_user(
+    parent: &File,
+    name: &OsStr,
+) -> glass_core::Result<()> {
+    use windows::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC, WRITE_OWNER};
+    let file = open_relative_with_access(
+        parent,
+        name,
+        Some(true),
+        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+    )
+    .map_err(|_| GlassError::Backend("open private directory handle failed".into()))?;
+    restrict_file_to_current_user(&file)
+}
+
+/// Set the current user as owner and install the private DACL through an owned handle.
+pub fn restrict_file_to_current_user(file: &File) -> glass_core::Result<()> {
+    with_current_user_sid(|owner| {
+        use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+        // SAFETY: Both the borrowed file handle and token-owned SID remain live during the call.
+        unsafe {
+            SetSecurityInfo(
+                HANDLE(file.as_raw_handle()),
+                SE_FILE_OBJECT,
+                windows::Win32::Security::OWNER_SECURITY_INFORMATION,
+                Some(owner),
+                None,
+                None,
+                None,
+            )
+            .ok()
+            .map_err(|error| backend_error("set private handle owner", error))
+        }
+    })?;
+    let sddl = wide_text(PRIVATE_DACL);
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: The terminated SDDL and output pointer live through this call.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+        .map_err(|error| backend_error("convert private DACL", error))?;
+    }
+    // SAFETY: The borrowed file handle and allocated descriptor remain valid through the call.
+    let applied = unsafe {
+        windows::Win32::Security::SetKernelObjectSecurity(
+            HANDLE(file.as_raw_handle()),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    };
+    // SAFETY: The conversion API returned this LocalAlloc allocation.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    applied.map_err(|error| backend_error("apply private handle DACL", error))
+}
+
 pub fn restrict_path_to_current_user(path: &Path) -> glass_core::Result<()> {
     let path = wide(path);
     let sddl = wide_text(PRIVATE_DACL);
@@ -646,6 +730,106 @@ pub fn restrict_path_to_current_user(path: &Path) -> glass_core::Result<()> {
     applied
         .ok()
         .map_err(|error| backend_error("apply private DACL", error))
+}
+
+/// Checks ownership and the protected owner-and-SYSTEM DACL through a retained handle.
+pub fn file_is_private_to_current_user(file: &File) -> glass_core::Result<bool> {
+    use windows::Win32::Security::{
+        EqualSid, GetKernelObjectSecurity, GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION,
+    };
+
+    let information = DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION;
+    let mut needed = 0;
+    // SAFETY: The borrowed handle and zero-length size query are valid.
+    unsafe {
+        let _ = GetKernelObjectSecurity(
+            HANDLE(file.as_raw_handle()),
+            information.0,
+            None,
+            0,
+            &mut needed,
+        );
+    }
+    if needed == 0 || needed > 65536 {
+        return Err(GlassError::Backend(
+            "invalid private handle security size".into(),
+        ));
+    }
+    let mut storage = vec![0_u32; (needed as usize).div_ceil(4)];
+    let descriptor = PSECURITY_DESCRIPTOR(storage.as_mut_ptr().cast());
+    let capacity = needed;
+    // SAFETY: DWORD-aligned storage provides the requested descriptor capacity.
+    unsafe {
+        GetKernelObjectSecurity(
+            HANDLE(file.as_raw_handle()),
+            information.0,
+            Some(descriptor),
+            capacity,
+            &mut needed,
+        )
+        .map_err(|error| backend_error("read private handle security", error))?;
+    }
+    if needed > capacity {
+        return Err(GlassError::Backend("private handle security grew".into()));
+    }
+    // SAFETY: The successful query initialized `needed` bytes within storage.
+    let bytes = unsafe { std::slice::from_raw_parts(storage.as_ptr().cast(), needed as usize) };
+    if !descriptor_has_private_dacl(bytes) {
+        return Ok(false);
+    }
+    let mut owner = PSID::default();
+    let mut defaulted = windows::core::BOOL::default();
+    // SAFETY: The validated descriptor and output pointers remain live throughout this call.
+    unsafe {
+        GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted)
+            .map_err(|error| backend_error("read private handle owner", error))?;
+    }
+    // SAFETY: Both SIDs remain backed by their owning descriptor/token buffers.
+    with_current_user_sid(|user| Ok(unsafe { EqualSid(owner, user).is_ok() }))
+}
+
+fn with_current_user_sid<T>(
+    inspect: impl FnOnce(PSID) -> glass_core::Result<T>,
+) -> glass_core::Result<T> {
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = HANDLE::default();
+    // SAFETY: The current process pseudo-handle and token output pointer are valid.
+    unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(|error| backend_error("open current user token", error))?;
+    }
+    let result = (|| {
+        let mut needed = 0;
+        // SAFETY: The owned token handle supports the documented zero-length query.
+        unsafe {
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        }
+        if needed < std::mem::size_of::<TOKEN_USER>() as u32 || needed > 65536 {
+            return Err(GlassError::Backend(
+                "invalid current user token size".into(),
+            ));
+        }
+        let mut user = vec![0_usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+        // SAFETY: Pointer-aligned storage fits TOKEN_USER and its SID; both buffers outlive comparison.
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(user.as_mut_ptr().cast()),
+                needed,
+                &mut needed,
+            )
+            .map_err(|error| backend_error("read current user token", error))?;
+            let user = &*user.as_ptr().cast::<TOKEN_USER>();
+            inspect(user.User.Sid)
+        }
+    })();
+    // SAFETY: OpenProcessToken returned this owned handle; no later code uses it.
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+    }
+    result
 }
 
 /// Reports whether a filesystem object has the protected owner-and-SYSTEM DACL used by Glass.

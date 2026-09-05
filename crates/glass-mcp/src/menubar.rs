@@ -29,8 +29,8 @@
 //!    via `MainThreadMarker` (requires thread 0 — it is) and blocks thread 0 on
 //!    `NSApplication::run`. The server keeps serving on the workers while thread 0 pumps the
 //!    AppKit event loop.
-//! 4. "Quit glass" sends `terminate:` to `NSApp`, which exits the process (dropping the server
-//!    task with it).
+//! 4. With tracing enabled, "Quit glass" waits for bounded server teardown and evidence cleanup
+//!    before terminating AppKit. Trace-off mode retains the direct terminate action.
 
 use crate::serve::config::ServeConfig;
 
@@ -99,6 +99,10 @@ mod macos {
             Err(e) => return Err(anyhow::anyhow!("binding {}: {e}", cfg.addr)),
         };
 
+        let trace_enabled = cfg.trace.is_some() && listener.is_some();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
         if let Some(std_listener) = listener {
             // We're on the `#[tokio::main]` block_on thread, so the runtime context is
             // entered: `TcpListener::from_std` (reactor registration) and `tokio::spawn` both
@@ -117,14 +121,29 @@ mod macos {
             // CLI flag to thread through. Fail-closed: an unopenable audit log aborts here.
             let (sink, report) = crate::audit::resolve(None, |k| std::env::var(k).ok())?;
             let glass = crate::boot(sink);
+            let server = crate::server::GlassServer::new_configured(
+                glass,
+                report,
+                cfg.tool_profile,
+                cfg.trace.as_ref(),
+                "http",
+            )?;
 
             tokio::spawn(async move {
                 // Never swallow the server task's failure silently — surface it to the
                 // LaunchAgent's stderr log. (The menu bar stays up so the operator still has a
                 // Quit; wiring the failure into the status line is a future refinement.)
-                if let Err(e) = serve::run_on(listener, cfg, glass, report).await {
+                if let Err(e) = serve::run_server_on_until(listener, cfg, server, async move {
+                    tokio::select! {
+                        () = server_shutdown.cancelled() => {},
+                        () = crate::shutdown::shutdown_signal() => {},
+                    }
+                })
+                .await
+                {
                     eprintln!("glass: menu-bar server task exited with error: {e:#}");
                 }
+                let _ = finished_tx.send(());
             });
         }
 
@@ -133,46 +152,56 @@ mod macos {
         // LaunchAgent `kickstart -k`); their errors go loudly to stderr (the menu action
         // has no dialog surface), matching onboarding's best-effort osascript fallback.
         let endpoint_for_copy = endpoint;
-        glass_macos::menubar::run(glass_macos::menubar::MenuBarActions {
-            title: "glass \u{25CF}".to_string(),
-            status_line,
-            on_copy: Box::new(move || {
-                if let Err(e) = crate::onboarding::copy_to_clipboard(&endpoint_for_copy) {
-                    eprintln!("glass: menu 'Copy endpoint' failed: {e}");
-                }
-            }),
-            on_restart: Box::new(|| {
-                // This process *is* the LaunchAgent job, so `restart_launch_agent` uses
-                // `launchctl kickstart -k gui/<uid>/tech.fixedwidth.glass` rather than
-                // `bootout`+`bootstrap`: `kickstart -k` is a single request to launchd (a
-                // separate supervisor process) to kill-and-restart the job in place, so it's
-                // safe to call from inside the job being restarted and doesn't depend on
-                // `KeepAlive`. `bootout` would instead SIGTERM this very process, and with
-                // `KeepAlive=false` launchd would never bring it back.
-                if let Err(e) = crate::setup::restart_launch_agent() {
-                    eprintln!("glass: menu 'Restart' failed: {e}");
-                }
-            }),
-            on_uninstall: Box::new(|| {
-                // Confirm first, defaulting to Cancel so a stray click/Return never uninstalls.
-                // `uninstall_launch_agent` boots out (SIGTERM) this very process, so a dialog
-                // shown *after* it may not survive to be read — put the "drag to Trash" step in
-                // the confirmation itself. Only the exact "Uninstall" button proceeds.
-                let clicked = confirm_dialog(
-                    "Remove glass?\n\nThis stops glass from launching at login and shuts it \
-                     down now. To finish removing it, drag GlassMcp.app to the Trash.",
-                    "Uninstall",
-                );
-                if clicked == "Uninstall" {
-                    // Best-effort: a menu action has no further error surface, so log loudly to
-                    // stderr rather than crash the action if bootout/plist-removal fails. On
-                    // success this process is terminated as part of the uninstall.
-                    if let Err(e) = crate::setup::uninstall_launch_agent() {
-                        eprintln!("glass: menu 'Uninstall glass' failed: {e}");
+        let on_quit: Option<Box<dyn Fn()>> = trace_enabled.then(|| {
+            Box::new(move || {
+                shutdown.cancel();
+                let _ = finished_rx
+                    .recv_timeout(glass_core::TEARDOWN_BUDGET + std::time::Duration::from_secs(6));
+            }) as Box<dyn Fn()>
+        });
+        glass_macos::menubar::run_with_quit(
+            glass_macos::menubar::MenuBarActions {
+                title: "glass \u{25CF}".to_string(),
+                status_line,
+                on_copy: Box::new(move || {
+                    if let Err(e) = crate::onboarding::copy_to_clipboard(&endpoint_for_copy) {
+                        eprintln!("glass: menu 'Copy endpoint' failed: {e}");
                     }
-                }
-            }),
-        })?;
+                }),
+                on_restart: Box::new(|| {
+                    // This process *is* the LaunchAgent job, so `restart_launch_agent` uses
+                    // `launchctl kickstart -k gui/<uid>/tech.fixedwidth.glass` rather than
+                    // `bootout`+`bootstrap`: `kickstart -k` is a single request to launchd (a
+                    // separate supervisor process) to kill-and-restart the job in place, so it's
+                    // safe to call from inside the job being restarted and doesn't depend on
+                    // `KeepAlive`. `bootout` would instead SIGTERM this very process, and with
+                    // `KeepAlive=false` launchd would never bring it back.
+                    if let Err(e) = crate::setup::restart_launch_agent() {
+                        eprintln!("glass: menu 'Restart' failed: {e}");
+                    }
+                }),
+                on_uninstall: Box::new(|| {
+                    // Confirm first, defaulting to Cancel so a stray click/Return never uninstalls.
+                    // `uninstall_launch_agent` boots out (SIGTERM) this very process, so a dialog
+                    // shown *after* it may not survive to be read — put the "drag to Trash" step in
+                    // the confirmation itself. Only the exact "Uninstall" button proceeds.
+                    let clicked = confirm_dialog(
+                        "Remove glass?\n\nThis stops glass from launching at login and shuts it \
+                     down now. To finish removing it, drag GlassMcp.app to the Trash.",
+                        "Uninstall",
+                    );
+                    if clicked == "Uninstall" {
+                        // Best-effort: a menu action has no further error surface, so log loudly to
+                        // stderr rather than crash the action if bootout/plist-removal fails. On
+                        // success this process is terminated as part of the uninstall.
+                        if let Err(e) = crate::setup::uninstall_launch_agent() {
+                            eprintln!("glass: menu 'Uninstall glass' failed: {e}");
+                        }
+                    }
+                }),
+            },
+            on_quit,
+        )?;
         Ok(())
     }
 

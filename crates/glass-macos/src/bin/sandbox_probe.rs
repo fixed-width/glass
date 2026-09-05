@@ -27,6 +27,25 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--protected-file" => {
+                let path =
+                    std::env::var_os(&args[i + 1]).expect("protected file environment variable");
+                let path = std::path::Path::new(&path);
+                assert!(std::fs::read(path).is_err(), "protected file was readable");
+                assert!(
+                    std::fs::OpenOptions::new().write(true).open(path).is_err(),
+                    "protected file was writable"
+                );
+                assert!(
+                    std::fs::remove_file(path).is_err(),
+                    "protected file was removable"
+                );
+                assert!(
+                    std::fs::rename(path, path.with_extension("moved")).is_err(),
+                    "protected file was movable"
+                );
+                i += 2;
+            }
             "--print" => {
                 let line = args
                     .get(i + 1)

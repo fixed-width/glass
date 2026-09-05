@@ -95,6 +95,11 @@ Forced pointer mode waits for stable in-window bounds and refuses a target known
 hidden, moving, off-window, or occluded. Native accessibility actions can legitimately actuate a
 covered or off-screen control, so geometry and occlusion are optional disclosures on that path.
 
+To review a run after the app stops, opt into [session evidence recording](docs/how-to/record-session-evidence.md)
+with `--trace-dir`. Glass retains tool inputs and requested results in bounded storage, then
+`glass-mcp trace inspect` and `trace export` validate the trace and package its evidence in a ZIP.
+Recording is off by default; retained app content can contain sensitive data.
+
 ## Install at a glance
 
 Download the latest build for your platform from the

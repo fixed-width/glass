@@ -8,6 +8,7 @@ pub struct ServeConfig {
     pub addr: SocketAddr,
     pub token: Option<String>,
     pub tool_profile: crate::tool_profile::ToolProfile,
+    pub trace: Option<crate::trace::TraceConfig>,
 }
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7300";
@@ -88,6 +89,7 @@ pub fn parse_args(
         addr,
         token,
         tool_profile: Default::default(),
+        trace: None,
     })
 }
 
@@ -162,6 +164,7 @@ mod tests {
             addr: addr.parse().unwrap(),
             token: token.map(String::from),
             tool_profile: Default::default(),
+            trace: None,
         }
     }
 

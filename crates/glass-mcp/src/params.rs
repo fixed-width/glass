@@ -3,12 +3,12 @@
 
 use glass_core::Region;
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 pub(crate) const MAX_CLICK_COUNT: u32 = glass_core::MAX_CLICK_COUNT;
 pub(crate) const MAX_SCROLL_NOTCHES: i32 = glass_core::MAX_SCROLL_NOTCHES as i32;
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct RegionArgs {
     /// Left edge in window-relative pixels.
     pub x: u32,
@@ -37,7 +37,7 @@ pub fn ignore_regions(args: Option<&[RegionArgs]>) -> Vec<Region> {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ScreenshotArgs {
     /// Optional window-relative sub-rectangle to capture; omit for the whole window.
     pub region: Option<RegionArgs>,
@@ -45,7 +45,7 @@ pub struct ScreenshotArgs {
     pub window_id: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct WindowHintArgs {
     /// Case-insensitive title substring; can locate a window handed off to an unrelated process.
     pub title: Option<String>,
@@ -53,7 +53,7 @@ pub struct WindowHintArgs {
     pub class: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StartArgs {
     /// Optional shell command to run (in `cwd`) before launching.
     pub build: Option<String>,
@@ -77,7 +77,7 @@ pub struct StartArgs {
     pub a11y: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct WindowArgs {
     /// One of: "focus", "resize", "move", "geometry".
     pub op: String,
@@ -91,13 +91,13 @@ pub struct WindowArgs {
     pub height: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SelectWindowArgs {
     /// Current ID from glass_list_windows; re-list after window changes.
     pub id: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionModeArg {
     Auto,
@@ -105,7 +105,7 @@ pub enum ActionModeArg {
     Pointer,
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActionScopeArgs {
     pub query: Option<String>,
@@ -113,7 +113,7 @@ pub struct ActionScopeArgs {
     pub states: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActionTargetArgs {
     pub query: Option<String>,
@@ -122,7 +122,7 @@ pub struct ActionTargetArgs {
     pub within: Option<ActionScopeArgs>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ClickElementArgs {
     /// Latest snapshot ID, exclusive with target; re-read after UI changes. Native action may focus text editors; fallback clicks the center. Popover actions restore the prior window.
     pub id: Option<u32>,
@@ -136,7 +136,7 @@ pub struct ClickElementArgs {
     pub return_: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SetValueArgs {
     /// Latest snapshot ID, exclusive with target.
     pub id: Option<u32>,
@@ -152,7 +152,7 @@ pub struct SetValueArgs {
 }
 
 /// Arguments for `glass_find_elements` selector fields.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct FindSelectorArgs {
     /// Case-insensitive substring searched across accessible name, description and non-secure value.
@@ -164,7 +164,7 @@ pub struct FindSelectorArgs {
 }
 
 /// Arguments for `glass_find_elements`.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct FindElementsArgs {
     /// Approximate case-insensitive semantic text. Optional when role or states are supplied.
@@ -185,13 +185,13 @@ pub struct FindElementsArgs {
 }
 
 /// Arguments for `glass_a11y_snapshot`.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct A11ySnapshotArgs {
     /// Node cap; omit for server default, 0 for unlimited. Changing the cap renumbers IDs; re-read them.
     pub max_nodes: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ClickArgs {
     /// Click x in window-relative pixels.
     pub x: i32,
@@ -206,7 +206,7 @@ pub struct ClickArgs {
     pub modifiers: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MoveArgs {
     /// Destination x in window-relative pixels.
     pub x: i32,
@@ -214,7 +214,7 @@ pub struct MoveArgs {
     pub y: i32,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct DragArgs {
     /// Press x in window-relative pixels.
     pub x1: i32,
@@ -232,7 +232,7 @@ pub struct DragArgs {
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct PointerArgs {
     /// Window-relative start point.
     pub from: PointArg,
@@ -240,7 +240,7 @@ pub struct PointerArgs {
     pub to: PointArg,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct PointArg {
     /// Window-relative x in pixels.
     pub x: i32,
@@ -248,7 +248,7 @@ pub struct PointArg {
     pub y: i32,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GestureArgs {
     /// 2–10 simultaneous pointers; each a straight from→to segment. Pinch = two pointers
     /// moving toward/apart; rotate = two on an arc; two-finger swipe = two parallel segments.
@@ -257,7 +257,7 @@ pub struct GestureArgs {
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ScrollArgs {
     /// Window-relative anchor x; selects the container under the pointer.
     pub x: i32,
@@ -273,7 +273,7 @@ pub struct ScrollArgs {
     pub modifiers: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct TypeArgs {
     /// Synthetic keystrokes, not paste. When `target` is omitted: current keyboard focus. When `target` is supplied: resolves and focuses the target, confirms focus, then types. Newlines do not press Return.
     pub text: String,
@@ -287,19 +287,19 @@ pub struct TypeArgs {
     pub return_: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct KeyArgs {
     /// Modifiers plus one key: ctrl+s, Return, alt+F4. Modifiers: ctrl/shift/alt/super (cmd/win/meta aliases). Key: named key, F1-F12 or printable ASCII; case-insensitive names.
     pub chord: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ClipboardSetArgs {
     /// The text to write to the clipboard.
     pub text: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct WaitStableArgs {
     /// How long to wait between capture ticks (default 100ms).
     pub interval_ms: Option<u64>,
@@ -322,7 +322,7 @@ pub struct WaitStableArgs {
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct WaitForElementArgs {
     /// Substring of the element's accessible name (selector).
     pub name: Option<String>,
@@ -342,7 +342,7 @@ pub struct WaitForElementArgs {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ScrollToElementArgs {
     /// Substring of the target element's accessible name (selector).
     pub name: Option<String>,
@@ -364,7 +364,7 @@ pub struct ScrollToElementArgs {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct WaitForRegionArgs {
     /// Saved baseline name to compare against; omit to use the frame at call start.
     pub baseline: Option<String>,
@@ -390,7 +390,7 @@ pub struct WaitForRegionArgs {
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct WaitForLogArgs {
     /// Substring to wait for (required, non-empty).
     pub contains: String,
@@ -405,25 +405,25 @@ pub struct WaitForLogArgs {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct BaselineSaveArgs {
     /// ASCII letters/digits/-/_ only. Replaces an existing baseline silently; used by glass_diff and glass_wait_for_region.
     pub name: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct DoctorArgs {
     /// Start and tear down the default display to prove it starts (default false).
     pub deep: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CapabilitiesArgs {
     /// x11, wayland, windows, macos, android or ios. Default active/default backend. Valid but unbuilt backends report available:false.
     pub backend: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct DiffArgs {
     /// Saved baseline name; unsaved names error.
     pub name: String,
@@ -442,7 +442,7 @@ pub struct DiffArgs {
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct LogsArgs {
     /// Resume from a prior returned cursor; omit for oldest buffered line.
     pub cursor: Option<u64>,
@@ -456,7 +456,7 @@ pub struct LogsArgs {
 
 /// One action in a `glass_do` sequence. Internally tagged by `action`; each
 /// variant carries the same fields as the standalone tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
     Click(ClickArgs),
@@ -473,7 +473,7 @@ pub enum Action {
 }
 
 /// A mid-sequence or terminal settle — the `wait_stable` knobs, no image/return.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SettleArgs {
     /// How long to wait between capture ticks (default 100ms).
     pub interval_ms: Option<u64>,
@@ -492,7 +492,7 @@ pub struct SettleArgs {
 /// Optional terminal observe after a `glass_do` sequence (run settle → diff →
 /// screenshot). All text-first; only `screenshot` (or `diff` with its own
 /// `include_image`) returns an image.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ThenArgs {
     /// Wait for quiescence before diff/screenshot; otherwise they may observe a half-drawn frame.
     pub settle: Option<SettleArgs>,
@@ -503,7 +503,7 @@ pub struct ThenArgs {
 }
 
 /// Arguments for `glass_do`: an ordered, non-empty action sequence + optional observe.
-#[derive(Debug, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct DoArgs {
     /// Non-empty ordered actions; failure stops remaining steps. Completed mutations may already have landed.
     pub actions: Vec<Action>,
@@ -512,6 +512,7 @@ pub struct DoArgs {
     /// Overall budget in ms (default 30000, range 1..120000), shared by all actions and terminal observations.
     pub timeout_ms: Option<u64>,
     #[schemars(skip)]
+    #[serde(skip)]
     pub(crate) encoded_argument_bytes: usize,
 }
 

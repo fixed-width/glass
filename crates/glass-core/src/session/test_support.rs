@@ -92,9 +92,6 @@ pub(crate) struct FakePlatform {
     /// The deadline `stop_app_by` was handed. `stop_app` is the provided half of the pair, so it
     /// records [`crate::Deadline::UNBOUNDED`] rather than nothing.
     stop_deadline: Option<Arc<Mutex<Option<crate::Deadline>>>>,
-    /// Makes `stop_app_by` spend its whole deadline, standing in for a device that stopped
-    /// answering.
-    stop_burns_deadline: bool,
     protected_path_mode: HostPathProtectionMode,
     fail_protected_path_configuration: bool,
     fail_start: bool,
@@ -246,11 +243,6 @@ impl FakePlatform {
         self.stop_count = Some(c);
         self
     }
-    /// Spend the whole deadline in `stop_app_by`.
-    pub(crate) fn burning_its_deadline(mut self) -> Self {
-        self.stop_burns_deadline = true;
-        self
-    }
     /// Record the deadline `stop_app_by` receives, for proving the teardown budget reaches the
     /// backend rather than stopping at `Glass`.
     pub(crate) fn recording_stop_deadline(
@@ -353,9 +345,6 @@ impl Platform for FakePlatform {
     fn stop_app_by(&mut self, deadline: crate::Deadline) -> Result<()> {
         if let Some(at) = &self.stop_deadline {
             *at.lock().unwrap() = Some(deadline);
-        }
-        if self.stop_burns_deadline {
-            std::thread::sleep(deadline.remaining().unwrap_or_default());
         }
         self.stop_app()
     }

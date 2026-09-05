@@ -36,6 +36,11 @@ optional on-device companions — an `app_process` agent (clipboard + high-fidel
 `AccessibilityService` (Compose-rich a11y tree + high-fidelity `set_value`); both live in the
 separate repo `github.com/fixed-width/glass-android-agent`, driven over `adb forward`.
 
+`glass-mcp/src/trace` records optional bounded session evidence (`--trace-dir`) and implements
+offline `trace inspect`/`trace export`. Its persistent store is separate from temporary output
+artifacts; protect the entire configured root before launching contained targets. Capture requested
+results only, preserve worker outcomes after cancellation, and keep trace-off MCP behavior unchanged.
+
 ## Commands
 
 ```bash

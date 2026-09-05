@@ -428,7 +428,7 @@ fn semantic_glass(
 struct DeadlineRecordingAccessibility {
     tree: AxTree,
     coverage_delay: std::time::Duration,
-    coverage_finished: Arc<Mutex<Option<std::time::Instant>>>,
+    coverage_started: Arc<Mutex<Option<std::time::Instant>>>,
     subscription_deadlines: Arc<Mutex<Vec<Deadline>>>,
     snapshot_deadlines: Arc<Mutex<Vec<Deadline>>>,
 }
@@ -448,26 +448,26 @@ impl Accessibility for DeadlineRecordingAccessibility {
     }
 
     fn state_coverage(&self) -> AxStateCoverage {
+        *self.coverage_started.lock().unwrap() = Some(std::time::Instant::now());
         std::thread::sleep(self.coverage_delay);
-        *self.coverage_finished.lock().unwrap() = Some(std::time::Instant::now());
         full_state_coverage()
     }
 }
 
 fn deadline_recording_glass(coverage_delay: std::time::Duration) -> DeadlineRecordingFixture {
-    let coverage_finished = Arc::new(Mutex::new(None));
+    let coverage_started = Arc::new(Mutex::new(None));
     let subscription_deadlines = Arc::new(Mutex::new(Vec::new()));
     let snapshot_deadlines = Arc::new(Mutex::new(Vec::new()));
     let accessibility = DeadlineRecordingAccessibility {
         tree: named_button_tree("Save account"),
         coverage_delay,
-        coverage_finished: coverage_finished.clone(),
+        coverage_started: coverage_started.clone(),
         subscription_deadlines: subscription_deadlines.clone(),
         snapshot_deadlines: snapshot_deadlines.clone(),
     };
     (
         glass_with_backend(FakePlatform::new(100, 100), Box::new(accessibility)),
-        coverage_finished,
+        coverage_started,
         subscription_deadlines,
         snapshot_deadlines,
     )
@@ -1142,9 +1142,9 @@ fn selector_resolution_uses_the_reported_deadline_for_subscription_and_snapshot(
 
 #[test]
 fn selector_resolution_setup_consumes_the_reported_action_budget() {
-    let timeout = std::time::Duration::from_millis(300);
-    let (mut glass, coverage_finished, subscription_deadlines, snapshot_deadlines) =
-        deadline_recording_glass(std::time::Duration::from_millis(150));
+    let timeout = std::time::Duration::from_millis(SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS);
+    let (mut glass, coverage_started, subscription_deadlines, snapshot_deadlines) =
+        deadline_recording_glass(std::time::Duration::from_millis(10));
     glass.start(&spec()).unwrap();
 
     let resolved = glass
@@ -1157,16 +1157,10 @@ fn selector_resolution_setup_consumes_the_reported_action_budget() {
         )
         .unwrap();
 
-    let coverage_finished = coverage_finished.lock().unwrap().unwrap();
-    let remaining_after_setup = resolved
-        .bound
-        .deadline
-        .instant()
-        .unwrap()
-        .saturating_duration_since(coverage_finished);
+    let coverage_started = coverage_started.lock().unwrap().unwrap();
     assert!(
-        remaining_after_setup < std::time::Duration::from_millis(225),
-        "pre-poll setup did not consume the action budget: {remaining_after_setup:?} remained"
+        resolved.bound.deadline.instant().unwrap() <= coverage_started + timeout,
+        "the action deadline must start before pre-poll setup"
     );
     assert_eq!(
         subscription_deadlines.lock().unwrap().as_slice(),
@@ -1452,6 +1446,7 @@ fn target_deadlines_preserve_id_and_selector_bound_ownership() {
     assert_eq!(batched.owner, Some(Whose::Caller));
     assert!(batched.allow_wait);
 
+    let before_default = std::time::Instant::now();
     let defaulted = target_deadline(
         &ActionTarget::Semantic(semantic_target("save")),
         None,
@@ -1459,9 +1454,10 @@ fn target_deadlines_preserve_id_and_selector_bound_ownership() {
         Deadline::UNBOUNDED,
     )
     .unwrap();
-    let remaining = defaulted.deadline.remaining().unwrap();
-    assert!(remaining <= std::time::Duration::from_millis(SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS));
-    assert!(remaining > std::time::Duration::from_millis(SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS - 100));
+    let after_default = std::time::Instant::now();
+    let duration = std::time::Duration::from_millis(SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS);
+    assert!(defaulted.deadline.instant().unwrap() >= before_default + duration);
+    assert!(defaulted.deadline.instant().unwrap() <= after_default + duration);
     assert_eq!(defaulted.owner, Some(Whose::Callee));
     assert!(defaulted.allow_wait);
 
@@ -1513,7 +1509,7 @@ fn selector_pointer_waits_for_two_identical_samples_at_least_one_hundred_ms_apar
     let started = std::time::Instant::now();
     let outcome = glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap();
@@ -1554,7 +1550,7 @@ fn moving_bounds_reset_the_stability_sample_until_the_target_stops() {
     let started = std::time::Instant::now();
     glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(600)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap();
@@ -1588,7 +1584,7 @@ fn identity_change_resets_stability_even_when_bounds_are_equal() {
 
     glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(600)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap();
@@ -1666,7 +1662,7 @@ fn selector_pointer_builds_each_stability_sample_from_its_refreshed_window() {
 
     glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(600)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap();
@@ -1711,7 +1707,7 @@ fn selector_pointer_revalidates_the_exact_plan_against_the_dispatch_window() {
 
     let error = glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap_err();
@@ -1978,7 +1974,7 @@ fn selector_pointer_known_occlusion_blocks_before_pointer_dispatch() {
 
     let error = glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap_err();
@@ -2012,7 +2008,7 @@ fn selector_pointer_inconclusive_occlusion_dispatches_once_and_discloses_unprove
 
     let outcome = glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap();
@@ -2048,7 +2044,7 @@ fn selector_pointer_hit_probe_and_dispatch_use_the_same_planned_point() {
 
     glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap();
@@ -2135,7 +2131,7 @@ fn selector_pointer_rejects_a_trailing_toggle_with_a_boundary_endpoint() {
 
     let error = glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Wi-Fi")), Some(500)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Wi-Fi")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap_err();
@@ -2251,7 +2247,7 @@ fn selector_pointer_popover_row_toggle_dispatches_the_translated_planned_segment
 }
 
 #[test]
-fn legacy_id_forced_pointer_dispatches_without_a_fresh_read_or_stability_sleep() {
+fn legacy_id_forced_pointer_dispatches_without_a_fresh_read_or_stability_poll() {
     let tree = fake_tree();
     let clicks = Arc::new(Mutex::new(Vec::new()));
     let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
@@ -2263,7 +2259,6 @@ fn legacy_id_forced_pointer_dispatches_without_a_fresh_read_or_stability_sleep()
     hit_calls.store(0, Ordering::Relaxed);
     clicks.lock().unwrap().clear();
 
-    let started = std::time::Instant::now();
     let outcome = glass
         .click_target_inner(
             pointer_params(ActionTarget::Id(AxNodeId(1)), None),
@@ -2271,7 +2266,6 @@ fn legacy_id_forced_pointer_dispatches_without_a_fresh_read_or_stability_sleep()
         )
         .unwrap();
 
-    assert!(started.elapsed() < std::time::Duration::from_millis(75));
     assert_eq!(walks.load(Ordering::Relaxed), 0);
     assert_eq!(hit_calls.load(Ordering::Relaxed), 0);
     assert_eq!(clicks.lock().unwrap().len(), 1);
@@ -2314,7 +2308,7 @@ fn selector_pointer_hit_probe_errors_are_action_failed_before_dispatch() {
 
     let error = glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(500)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap_err();

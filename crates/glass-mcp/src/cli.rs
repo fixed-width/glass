@@ -27,10 +27,23 @@ pub struct Cli {
     /// Tools exposed to agents: full (default) or lean (actions through glass_do).
     #[arg(long, global = true, value_enum, default_value_t)]
     pub tool_profile: crate::tool_profile::ToolProfile,
+
+    /// Retain tool inputs and requested app evidence (may contain sensitive content) in a new child of this existing absolute directory.
+    #[arg(long, global = true, value_name = "DIRECTORY")]
+    pub trace_dir: Option<std::path::PathBuf>,
+
+    /// Maximum retained trace bytes, including metadata (default 268435456).
+    #[arg(long, global = true, requires = "trace_dir", value_parser = clap::value_parser!(u64).range(1048576..=2147483648))]
+    pub trace_max_bytes: Option<u64>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Inspect or export a stopped session trace without starting a backend.
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
+    },
     /// List the selected profile's MCP tools and schema cost without starting a session.
     Tools {
         /// Include complete definitions and server instructions as JSON.
@@ -133,6 +146,22 @@ pub enum Command {
     /// the window's rendering + buttons can be smoke-tested without building the .app. macOS-only.
     #[command(hide = true)]
     DebugChecklist,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TraceCommand {
+    /// Validate evidence and show a bounded timeline. Exit 2 means valid but incomplete.
+    Inspect {
+        directory: std::path::PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export validated evidence to a new ZIP. Exit 2 leaves a usable incomplete bundle.
+    Export {
+        directory: std::path::PathBuf,
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
 }
 
 #[cfg(test)]

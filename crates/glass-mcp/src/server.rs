@@ -27,6 +27,7 @@ use crate::tools::{self, BatchToolResult, ToolResult};
 type Job = (
     &'static str,
     ToolEffect,
+    Option<crate::trace::CallTrace>,
     Box<dyn FnOnce(&mut Glass) -> ToolCallOutcome + Send>,
     tokio::sync::oneshot::Sender<ToolCallOutcome>,
 );
@@ -43,6 +44,8 @@ pub struct GlassServer {
     output_policy: Arc<OutputPolicy>,
     tool_router: ToolRouter<GlassServer>,
     tool_profile: ToolProfile,
+    trace: Option<crate::trace::TraceRecorder>,
+    trace_client: u64,
 }
 
 fn tool_effect(tool: &str) -> ToolEffect {
@@ -73,8 +76,27 @@ fn target_access(access: HostPathAccess) -> TargetAccess {
     }
 }
 
+#[cfg(test)]
 fn applied_to_call_result(applied: AppliedOutcome, target_access: TargetAccess) -> CallToolResult {
+    traced_call_result(applied, target_access, None, None)
+}
+
+fn traced_call_result(
+    applied: AppliedOutcome,
+    target_access: TargetAccess,
+    trace: Option<&crate::trace::CallTrace>,
+    store: Option<&ArtifactStore>,
+) -> CallToolResult {
     let (output, is_error, _metadata, response_pin) = applied.into_parts();
+    if let Some(trace) = trace {
+        trace.output(
+            "response_constructed",
+            &output,
+            is_error,
+            target_access,
+            store,
+        );
+    }
     let content = output
         .0
         .into_iter()
@@ -179,6 +201,37 @@ impl GlassServer {
     }
 
     pub fn new(mut glass: Glass, report: AuditReport) -> Self {
+        let store = Self::prepare_artifacts(&mut glass);
+        Self::new_with_state(glass, report, store)
+    }
+
+    pub fn new_configured(
+        mut glass: Glass,
+        report: AuditReport,
+        profile: ToolProfile,
+        config: Option<&crate::trace::TraceConfig>,
+        transport: &str,
+    ) -> anyhow::Result<Self> {
+        let Some(config) = config else {
+            return Ok(Self::new_with_profile(glass, report, profile));
+        };
+        let trace = crate::trace::TraceRecorder::start(config, profile, transport)?;
+        let store = Self::prepare_artifacts(&mut glass);
+        let mut paths = vec![ProtectedHostPath::directory(trace.root())];
+        if let Some(store) = &store {
+            paths.push(ProtectedHostPath::directory(store.process_dir()));
+            paths.push(ProtectedHostPath::file(store.lease_path()));
+        }
+        glass.set_protected_host_paths(paths)?;
+        let mut server = Self::new_with_state(glass, report, store);
+        server.tool_router = configured_router(profile);
+        server.tool_profile = profile;
+        server.trace_client = trace.new_client();
+        server.trace = Some(trace);
+        Ok(server)
+    }
+
+    fn prepare_artifacts(glass: &mut Glass) -> Option<ArtifactStore> {
         const ARTIFACT_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
         let store = match ArtifactStore::new(ARTIFACT_LIMIT_BYTES) {
             Ok(store) => {
@@ -206,7 +259,7 @@ impl GlassServer {
                 "glass: artifact storage unavailable; oversized responses will be bounded and incomplete"
             );
         }
-        Self::new_with_state(glass, report, store)
+        store
     }
 
     #[cfg(test)]
@@ -241,8 +294,14 @@ impl GlassServer {
             std::thread::Builder::new()
                 .name("glass-platform".into())
                 .spawn(move || {
-                    while let Ok((tool, effect, job, reply)) = rx.recv() {
+                    let mut execution = 0_u64;
+                    let mut session = None;
+                    while let Ok((tool, effect, trace, job, reply)) = rx.recv() {
                         let mut g = worker_glass.blocking_lock();
+                        execution += 1;
+                        if let Some(trace) = &trace {
+                            trace.record("execution_started", serde_json::json!({"execution_order": execution, "session": session, "backend": g.active_backend()}));
+                        }
                         let mut outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut g)))
                                 .unwrap_or_else(|_| ToolCallOutcome {
@@ -255,6 +314,15 @@ impl GlassServer {
                                     )]),
                                 });
                         outcome.target_access = target_access(g.host_path_access());
+                        if g.active_backend().is_none() {
+                            session = None;
+                        } else if tool == "glass_start" && !outcome.is_error {
+                            session = Some(execution);
+                        }
+                        if let Some(trace) = &trace {
+                            trace.record("session_context", serde_json::json!({"session": session, "backend": g.active_backend()}));
+                            trace.logical_outcome(&outcome);
+                        }
                         let _ = reply.send(outcome);
                     }
                 })
@@ -271,11 +339,25 @@ impl GlassServer {
             output_policy,
             tool_router: Self::tool_router(),
             tool_profile: ToolProfile::Full,
+            trace: None,
+            trace_client: 0,
         }
     }
 
     pub fn sessions(&self) -> Arc<Mutex<Glass>> {
         self.glass.clone()
+    }
+
+    pub(crate) fn trace_recorder(&self) -> Option<crate::trace::TraceRecorder> {
+        self.trace.clone()
+    }
+
+    #[cfg(feature = "network")]
+    pub(crate) fn for_client(mut self) -> Self {
+        if let Some(trace) = &self.trace {
+            self.trace_client = trace.new_client();
+        }
+        self
     }
 
     #[cfg(test)]
@@ -339,6 +421,19 @@ impl GlassServer {
     where
         F: FnOnce(&mut Glass) -> (bool, ToolOutput) + Send + 'static,
     {
+        let trace = crate::trace::current_call();
+        if let Some(trace) = &trace
+            && !trace.has_valid_arguments()
+        {
+            if matches!(
+                tool,
+                "glass_stop" | "glass_clipboard_get" | "glass_list_windows" | "glass_a11y_marks"
+            ) {
+                trace.arguments(&serde_json::json!({}));
+            } else {
+                trace.arguments_unavailable();
+            }
+        }
         let job = move |g: &mut Glass| {
             let (is_error, output) = f(g);
             ToolCallOutcome {
@@ -360,26 +455,41 @@ impl GlassServer {
             )]),
         };
         let Some(jobs) = &self.jobs else {
-            return Ok(applied_to_call_result(
+            if let Some(trace) = &trace {
+                trace.record("worker_unavailable", serde_json::json!({}));
+            }
+            return Ok(traced_call_result(
                 self.output_policy.apply(fallback()),
                 TargetAccess::NoActiveTarget,
+                trace.as_ref(),
+                self.artifacts.as_ref(),
             ));
         };
-        if jobs.send((tool, effect, Box::new(job), reply_tx)).is_err() {
-            return Ok(applied_to_call_result(
+        if jobs
+            .send((tool, effect, trace.clone(), Box::new(job), reply_tx))
+            .is_err()
+        {
+            if let Some(trace) = &trace {
+                trace.record("worker_unavailable", serde_json::json!({}));
+            }
+            return Ok(traced_call_result(
                 self.output_policy.apply(fallback()),
                 TargetAccess::NoActiveTarget,
+                trace.as_ref(),
+                self.artifacts.as_ref(),
             ));
         }
         let outcome = reply_rx.await.unwrap_or_else(|_| fallback());
         let access = outcome.target_access;
         let policy = self.output_policy.clone();
-        let applied = tokio::task::spawn_blocking(move || policy.apply(outcome))
-            .await
-            .map_err(|_| {
-                McpError::new(ErrorCode::INTERNAL_ERROR, "output processing failed", None)
-            })?;
-        Ok(applied_to_call_result(applied, access))
+        let store = self.artifacts.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let applied = policy.apply(outcome);
+            traced_call_result(applied, access, trace.as_ref(), store.as_ref())
+        })
+        .await
+        .map_err(|_| McpError::new(ErrorCode::INTERNAL_ERROR, "output processing failed", None))?;
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -407,8 +517,20 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<StartArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::start_arguments(&a);
         self.run("glass_start", tool_effect("glass_start"), move |g| {
             tools::start(g, &a)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_trace_test_job(
+        &self,
+        job: impl FnOnce(&mut Glass) -> ToolOutput + Send + 'static,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_outcome("glass_test", ToolEffect::MayMutate, |glass| {
+            (false, job(glass))
         })
         .await
     }
@@ -439,6 +561,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<WindowArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run("glass_window", tool_effect("glass_window"), move |g| {
             tools::window(g, &a)
         })
@@ -453,6 +576,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ScreenshotArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run(
             "glass_screenshot",
             tool_effect("glass_screenshot"),
@@ -469,6 +593,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<WaitStableArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run(
             "glass_wait_stable",
             tool_effect("glass_wait_stable"),
@@ -489,6 +614,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ClickArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run("glass_click", tool_effect("glass_click"), move |g| {
             tools::click(g, &a)
         })
@@ -507,6 +633,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<MoveArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run("glass_move", tool_effect("glass_move"), move |g| {
             tools::mouse_move(g, &a)
         })
@@ -525,6 +652,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<DragArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run("glass_drag", tool_effect("glass_drag"), move |g| {
             tools::drag(g, &a)
         })
@@ -543,6 +671,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ScrollArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run("glass_scroll", tool_effect("glass_scroll"), move |g| {
             tools::scroll(g, &a)
         })
@@ -566,6 +695,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<GestureArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run("glass_gesture", tool_effect("glass_gesture"), move |g| {
             tools::gesture(g, &a)
         })
@@ -584,6 +714,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<TypeArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run_batch("glass_type", tool_effect("glass_type"), move |g| {
             tools::type_text(g, &a)
         })
@@ -602,6 +733,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<KeyArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run("glass_key", tool_effect("glass_key"), move |g| {
             tools::key(g, &a)
         })
@@ -637,6 +769,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ClipboardSetArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run(
             "glass_clipboard_set",
             tool_effect("glass_clipboard_set"),
@@ -657,6 +790,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<BaselineSaveArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run(
             "glass_baseline_save",
             tool_effect("glass_baseline_save"),
@@ -673,6 +807,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<DiffArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run("glass_diff", tool_effect("glass_diff"), move |g| {
             tools::diff(g, &a)
         })
@@ -691,15 +826,18 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<DoctorArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         let backend = crate::default_backend(std::env::var("GLASS_BACKEND").ok().as_deref());
         let deep = a.deep.unwrap_or(false);
         let report = self.report.clone();
+        let trace = self.trace.clone();
         self.run("glass_doctor", tool_effect("glass_doctor"), move |_| {
             let diag = crate::doctor::diagnose_with_audit(deep, &report);
-            Ok(ToolOutput::result(
-                "glass_doctor",
-                doctor_result(&diag, backend),
-            ))
+            let mut result = doctor_result(&diag, backend);
+            if let Some(trace) = trace {
+                result["trace"] = trace.status();
+            }
+            Ok(ToolOutput::result("glass_doctor", result))
         })
         .await
     }
@@ -712,6 +850,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<CapabilitiesArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         let profile = self.tool_profile;
         self.run(
             "glass_capabilities",
@@ -752,6 +891,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<SelectWindowArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run(
             "glass_select_window",
             tool_effect("glass_select_window"),
@@ -768,6 +908,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<FindElementsArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run(
             "glass_find_elements",
             tool_effect("glass_find_elements"),
@@ -784,6 +925,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<A11ySnapshotArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run(
             "glass_a11y_snapshot",
             tool_effect("glass_a11y_snapshot"),
@@ -804,6 +946,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ClickElementArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run_batch(
             "glass_click_element",
             tool_effect("glass_click_element"),
@@ -824,6 +967,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<SetValueArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run_batch(
             "glass_set_value",
             tool_effect("glass_set_value"),
@@ -853,6 +997,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<LogsArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run("glass_logs", tool_effect("glass_logs"), move |g| {
             tools::logs(g, &a)
         })
@@ -867,6 +1012,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<WaitForElementArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run(
             "glass_wait_for_element",
             tool_effect("glass_wait_for_element"),
@@ -887,6 +1033,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<ScrollToElementArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run(
             "glass_scroll_to_element",
             tool_effect("glass_scroll_to_element"),
@@ -903,6 +1050,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<WaitForRegionArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run(
             "glass_wait_for_region",
             tool_effect("glass_wait_for_region"),
@@ -919,6 +1067,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<WaitForLogArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run(
             "glass_wait_for_log",
             tool_effect("glass_wait_for_log"),
@@ -939,6 +1088,7 @@ impl GlassServer {
         &self,
         Parameters(a): Parameters<DoArgs>,
     ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
         self.run_batch("glass_do", tool_effect("glass_do"), move |g| {
             tools::do_actions(g, &a)
         })
@@ -961,6 +1111,41 @@ const SERVER_INSTRUCTIONS: &str = crate::tool_profile::SHARED_INSTRUCTIONS;
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for GlassServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let trace = self
+            .trace
+            .as_ref()
+            .and_then(|trace| trace.begin_call(&request.name, self.trace_client));
+        if let Some(trace) = &trace {
+            trace.record("argument_size", serde_json::json!({"compact_json_bytes": crate::trace::argument_bytes(&request.arguments)}));
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let mut result = if let Some(call) = trace {
+            let mut guard = crate::trace::RequestGuard::new(call.clone());
+            let result = crate::trace::ACTIVE_CALL
+                .scope(call.clone(), self.tool_router.call(tcc))
+                .await;
+            if !call.has_valid_arguments() {
+                call.record("router_rejection", serde_json::json!({"category": "tool_or_arguments_rejected", "raw_arguments": "excluded"}));
+            }
+            guard.complete();
+            result
+        } else {
+            self.tool_router.call(tcc).await
+        };
+        if let (Some(trace), Ok(result)) = (&self.trace, &mut result) {
+            let meta = result.meta.get_or_insert_with(Default::default);
+            meta.0
+                .entry("glass")
+                .or_insert_with(|| serde_json::json!({}))["trace"] = trace.status();
+        }
+        result
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(
             ServerCapabilities::builder()
@@ -1008,10 +1193,18 @@ impl ServerHandler for GlassServer {
     ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
         let store = self.artifacts.clone();
         let server_id = self.artifact_server_id.clone();
+        let trace = self
+            .trace
+            .as_ref()
+            .and_then(|trace| trace.begin_call("resources/read", self.trace_client));
         async move {
             let uri = request.uri;
             tokio::task::spawn_blocking(move || {
-                read_resource_result(store.as_ref(), &server_id, &uri)
+                let result = read_resource_result(store.as_ref(), &server_id, &uri);
+                if let Some(trace) = trace {
+                    trace.resource_read(&result);
+                }
+                result
             })
             .await
             .map_err(|_| resource_error(ArtifactReadError::ReadFailed, "artifact_read_failed"))?
