@@ -89,6 +89,10 @@ class RunnerTests(unittest.TestCase):
             ],
         }
         for change in (
+            {"backend": "unknown"},
+            {"backend": "macos", "cases": ["large-form"]},
+            {"backend": "ios", "cases": ["native-form"]},
+            {"backend": "x11", "cases": ["ios-publication", "native-form"]},
             {"repetitions": 0},
             {"repetitions": True},
             {"cases": []},
@@ -174,7 +178,9 @@ class RunnerTests(unittest.TestCase):
             }
             for path in root.rglob("*"):
                 if path.is_file():
-                    result["files"][str(path.relative_to(root))] = file_identity(path)
+                    result["files"][path.relative_to(root).as_posix()] = file_identity(
+                        path
+                    )
             self.assertEqual(validate_attempt(root, result, GlassDriver), [])
             (root / "evidence").mkdir()
             body = root / "evidence/note.txt"

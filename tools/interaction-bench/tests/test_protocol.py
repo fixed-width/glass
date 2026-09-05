@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import time
 import unittest
@@ -7,7 +8,6 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from protocol import Client, ProtocolError
-
 
 FAKE = r"""
 import json, os, sys, time
@@ -33,6 +33,32 @@ class ProtocolTests(unittest.TestCase):
         return Client(
             [sys.executable, "-c", FAKE, mode], Path(directory), timeout=1, **kwargs
         )
+
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows Job objects")
+    def test_job_reaps_owned_descendant_and_preserves_unrelated_process(self):
+        script = """import json, subprocess, sys
+r = json.loads(sys.stdin.readline())
+p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':{'pid':p.pid}}), flush=True)
+sys.stdin.read()
+"""
+        unrelated = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"]
+        )
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                client = Client(
+                    [sys.executable, "-c", script], Path(directory), timeout=5
+                )
+                response = client.rpc("probe", {})
+                self.assertFalse(client.close(grace=1))
+                self.assertIn(
+                    response["result"]["pid"], client.cleanup["forced_owned_pids"]
+                )
+                self.assertIsNone(unrelated.poll())
+        finally:
+            unrelated.terminate()
+            unrelated.wait(timeout=5)
 
     def test_chunked_utf8_notifications_and_exact_bytes(self):
         with tempfile.TemporaryDirectory() as directory:

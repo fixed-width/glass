@@ -179,6 +179,7 @@ class Evidence:
         return {
             "envelope": envelope,
             "observations": observations,
+            "images": images,
             "texts": texts,
             "is_error": is_error,
         }

@@ -7,7 +7,8 @@ reports offline. It does not run an LLM or measure model decision-making.
 Start with [Measure repeated application interactions](../../docs/how-to/measure-interactions.md).
 For packaged Electron, Android, native forms and cross-application transfer, use
 [Measure application boundaries](../../docs/how-to/measure-application-boundaries.md).
-Execution currently requires Linux/X11; the measurement and protocol tests require only Python 3.10+.
+Execution supports Linux X11/Wayland, native macOS/Windows, and an iOS publication probe.
+The runner and portable tests require Python 3.9+. See [native host execution](../../docs/how-to/measure-native-hosts.md).
 
 ## Commands
 
@@ -41,7 +42,8 @@ The minimum configuration is `{"browser":"/absolute/path/firefox"}`. Defaults:
 | `repetitions`, `warmups`, `seed` | 10 measured, 1 warm-up, ordering seed 41 |
 | `browser_family` | `firefox`; also accepts `chromium` |
 | `sandbox` | `off`, for this owned local fixture; recorded in the manifest |
-| `display`, `viewport` | 1280×900 Xvfb; observed content viewport 1000×700 at scale 1 |
+| `backend` | `x11`; also `wayland`, `macos`, `windows`, `ios` |
+| `display`, `viewport` | 1280×900 Linux display; observed content viewport 1000×700 at scale 1 |
 | `action_timeout_ms`, `attempt_timeout_ms` | 10000 and 180000; cleanup reserves 10 seconds |
 | `delay_ms`, `motion_ms` | 3000 each |
 | `frame_limit_bytes`, `evidence_limit_bytes` | 64 MiB per frame; 512 MiB wire/archive caps and aggregate acceptance limit |
@@ -49,8 +51,8 @@ The minimum configuration is `{"browser":"/absolute/path/firefox"}`. Defaults:
 | `optional_cases`, `exclusions` | Empty; every scheduled case is required |
 
 `browser_args` appends declared browser launch flags. `app_env` supplies declared target environment
-overrides. The runner uses a fresh profile, display, private session bus and runtime directory per
-attempt. It does not use your open browser or operator display. It stops after cleanup failure or
+overrides. Linux runs use a fresh profile, display, private session bus and runtime directory per
+attempt. Native desktop runs launch owned applications in the logged-in GUI session. It stops after cleanup failure or
 interruption and records the remaining scheduled attempts as skipped.
 
 Every driver entry has `id`, `adapter`, and an executable argument array `command`. The public runner
@@ -113,13 +115,14 @@ variants make that capability boundary visible. The standalone artifact case mus
 oversized observation containing the form and the final repeated section.
 
 
-## Application cases (recipe revision 2)
+## Application cases (recipe revision 3)
 
 | Case | Required outcome |
 |---|---|
 | `electron-form` | Shared form saves Ada once; native dialog is observed, selected, focused and confirmed with Return; the main window shows Ada and one confirmation. |
 | `android-boundary` | Native Open form leads to the embedded form; it saves Ada once; native Review saved value shows Ada, one submission and one review. |
 | `native-form` | The native form saves Ada exactly once. |
+| `ios-publication` | Capture the native and web tabs and probe their declared controls. Missing publication is `unsupported`; publication completion makes no typing or boundary-interaction claim. |
 | `cross-application` | The source generates one fresh ticket; the destination saves the observed ticket exactly once; the source value and generation count remain unchanged. |
 
 Typing requires confirmed native focus. Form actions use pointer mode on native/Android and native
@@ -140,3 +143,14 @@ and embedded form actions to `task`. Preparation commands use the owned ADB serv
 device identity; task observations/actions use MCP. Packaged bundles, native executable, APK,
 companions, emulator tools and system image files are hashed before/after the run. Fixture and runner
 sources are archived. Existing version-1 web evidence remains readable by the revision-2 validator.
+
+Native macOS/Windows fixtures are resized to 600×500 before task timing. macOS omits empty AX
+strings in ordinary reads, so its native recipe first writes the empty string with `glass_set_value`
+and requires `value_confirmed` for that exact target/value. Actual account entry still uses confirmed
+focus and typing. This reset is declared before execution and never retries a failed write.
+
+Windows MCP processes belong to an unnamed Job with kill-on-close ownership; residual descendants
+make cleanup unhealthy. POSIX native sessions track an exact per-attempt environment token. iOS
+creates, boots, shuts down and deletes only its own Simulator identifier, preserving its original
+case for companion compatibility. Its raw lifecycle commands and final device inventory are retained.
+Unsupported publication results undergo full channel, request, artifact and lifecycle replay.

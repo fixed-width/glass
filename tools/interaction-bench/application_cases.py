@@ -9,6 +9,7 @@ CASES = {
         "electron-form",
         "android-boundary",
         "native-form",
+        "ios-publication",
         "cross-application",
     )
 }
@@ -34,6 +35,11 @@ def form(driver, value):
 
 
 def execute(case, fleet):
+    if case == "ios-publication":
+        from ios_publication import execute as probe
+
+        probe(fleet.members["app"])
+        return
     if case == "cross-application":
         source, destination = fleet.members["source"], fleet.members["destination"]
         source.read("source_empty", "Source value", "")
@@ -99,6 +105,17 @@ class Oracle:
         fact = self.fact(step, participant)
         nodes = fact.get("nodes", [])
         if (
+            step == "empty"
+            and name == "Account name"
+            and value == ""
+            and fact.get("error") is False
+            and fact.get("set_value")
+            == {"target": {"query": name, "role": "TextField"}, "text": ""}
+            and fact.get("result", {}).get("dispatch") == "dispatched"
+            and fact.get("result", {}).get("confirmation") == "value_confirmed"
+        ):
+            return
+        if (
             fact.get("error") is not False
             or len(nodes) != 1
             or not (
@@ -137,6 +154,8 @@ class Oracle:
 
 
 def evaluate_setup(case, events, viewport):
+    if case == "ios-publication":
+        return []
     oracle = Oracle(events)
     if case == "android-boundary":
         oracle.label("entry", "Native stage: entry")

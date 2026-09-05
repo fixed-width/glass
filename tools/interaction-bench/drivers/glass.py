@@ -22,6 +22,12 @@ def normalize(request, decoded):
         "result": result,
         "nodes": nodes,
     }
+    if request["name"] == "glass_screenshot":
+        facts["images"] = decoded.get("images", 0)
+    if request["name"] == "glass_set_value":
+        facts["set_value"] = {
+            key: request["arguments"].get(key) for key in ("target", "text")
+        }
     if request["name"] == "glass_list_windows":
         facts["windows"] = [
             window
@@ -111,7 +117,7 @@ class Driver:
                     url,
                     self.config.get("browser_args", []),
                 ),
-                "backend": "x11",
+                "backend": self.config.get("backend", "x11"),
                 "sandbox": self.config["sandbox"],
                 "a11y": True,
                 "timeout_ms": 30000,

@@ -53,6 +53,23 @@ class Client:
             cwd=cwd,
             start_new_session=os.name == "posix",
         )
+        self.job = None
+        self.cleanup = {}
+        if os.name == "nt":
+            from windows_job import Job
+
+            try:
+                self.job = Job(self.process)
+            except BaseException:
+                self.process.kill()
+                self.process.wait(timeout=2)
+                for stream in (
+                    self.process.stdin,
+                    self.process.stdout,
+                    self.process.stderr,
+                ):
+                    stream.close()
+                raise
         self.readers = [
             threading.Thread(
                 target=self._pump,
@@ -286,6 +303,10 @@ class Client:
             else:
                 os.killpg(process.pid, signal.SIGKILL)
                 clean = False
+        if self.job:
+            residue = self.job.close()
+            self.cleanup = {"method": "windows_job", "forced_owned_pids": residue}
+            clean = clean and not residue
         for thread in self.readers:
             thread.join(timeout=1)
         self.stopping.set()

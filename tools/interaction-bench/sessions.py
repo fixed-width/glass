@@ -132,7 +132,10 @@ class Session:
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--force-renderer-accessibility",
-                "--ozone-platform=x11",
+                "--ozone-platform="
+                + (
+                    "wayland" if getattr(self, "backend", "x11") == "wayland" else "x11"
+                ),
             ]
         else:
             raise ValueError(f"unknown browser family {family}")

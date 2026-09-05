@@ -9,21 +9,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sessions import Session
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux"), "Xvfb display ownership is Linux-only"
+)
 class SessionTests(unittest.TestCase):
     def test_display_pipe_stays_open_until_server_shutdown(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fake = root / "Xvfb"
-            fake.write_text(
-                f"#!{sys.executable}\n"
-                + """import os, sys, time
+            fake.write_text(f"#!{sys.executable}\n" + """import os, sys, time
 fd = int(sys.argv[sys.argv.index('-displayfd') + 1])
 os.write(fd, b'99\\n')
 time.sleep(0.05)
 os.write(fd, b'99\\n')
 time.sleep(10)
-"""
-            )
+""")
             fake.chmod(0o700)
             session = Session.__new__(Session)
             session.env = {**os.environ, "PATH": str(root)}

@@ -5,6 +5,7 @@ import time
 
 import application_cases as cases
 from android_session import Android
+import ios_publication
 from drivers.glass import Driver as Glass
 from evidence import Evidence, EvidenceError
 from measurement import (
@@ -16,7 +17,7 @@ from measurement import (
     write_json,
 )
 from protocol import Client, ProtocolError
-from sessions import Session
+from native_sessions import create_session, prepare_display
 from validation import read_channel, validate_totals
 
 
@@ -28,6 +29,7 @@ def participants(case):
             "native-form": "native",
             "electron-form": "electron",
             "android-boundary": "android",
+            "ios-publication": "ios",
         }[case]
     }
 
@@ -66,6 +68,22 @@ class UI(Glass):
         )
 
     def read(self, step, name, expected=None, scope=None):
+        if (
+            self.kind == "native"
+            and self.config.get("backend") == "macos"
+            and step == "empty"
+            and name == "Account name"
+            and expected == ""
+        ):
+            return self.call(
+                step,
+                "glass_set_value",
+                {
+                    "target": self.target(name, "TextField"),
+                    "text": "",
+                    "timeout_ms": self.config["action_timeout_ms"],
+                },
+            )
         accessible_name = (
             cases.ANDROID_NAMES.get(name, name) if self.kind == "android" else name
         )
@@ -90,7 +108,9 @@ class UI(Glass):
 
     def launch_application(self):
         spec = self.config["applications"][self.kind]
-        if self.kind == "android":
+        if self.kind == "ios":
+            arguments = [spec["app"], "--tab=controls"]
+        elif self.kind == "android":
             arguments = [
                 spec["apk"],
                 "tech.fixedwidth.glassrolefixture/.InteractionActivity",
@@ -112,12 +132,18 @@ class UI(Glass):
             "glass_start",
             {
                 "run": arguments,
-                "backend": "android" if self.kind == "android" else "x11",
+                "backend": (
+                    self.kind
+                    if self.kind in ("android", "ios")
+                    else self.config.get("backend", "x11")
+                ),
                 "sandbox": self.config["sandbox"],
                 "a11y": True,
                 "timeout_ms": 30000,
             },
         )
+        if self.kind == "ios":
+            return
         if self.kind == "android":
             self.label("entry", "Native stage: entry")
         else:
@@ -126,6 +152,12 @@ class UI(Glass):
                 width, height = self.config["viewport"]
                 self.read("geometry", "Content geometry", f"{width}x{height}@1")
             else:
+                if self.config.get("backend", "x11") in ("macos", "windows"):
+                    self.call(
+                        "resize_native",
+                        "glass_window",
+                        {"op": "resize", "width": 600, "height": 500},
+                    )
                 self.call("geometry", "glass_window", {"op": "geometry"})
 
     def wait_windows(self, present):
@@ -179,10 +211,11 @@ class Fleet:
         for name, kind in participants(self.cell["case"]).items():
             directory = self.directory / name
             directory.mkdir()
-            session = Session()
+            session = create_session(self.config.get("backend", "x11"))
             owned = self.owned[name] = {
                 "session": session,
                 "android": None,
+                "ios": None,
                 "client": None,
             }
             record = self.records[name] = {
@@ -194,7 +227,16 @@ class Fleet:
                     "ownership_token": session.token,
                 },
             }
-            if kind == "android":
+            if kind == "ios":
+                owned["ios"] = ios_publication.IOS(
+                    session,
+                    self.config["applications"]["ios"],
+                    directory,
+                    self.deadline - 30,
+                )
+                record["device"] = owned["ios"].start()
+                record["session"]["udid"] = owned["ios"].udid
+            elif kind == "android":
                 owned["android"] = Android(
                     session,
                     self.config["applications"]["android"],
@@ -204,10 +246,10 @@ class Fleet:
                 record["device"] = owned["android"].start()
                 record["session"]["serial"] = owned["android"].serial
             else:
-                record["session"]["display"] = session.start_display(
-                    directory / "xvfb.log", *self.config["display"]
+                record["session"]["display"] = prepare_display(
+                    session, self.config, directory
                 )
-                session.env["GLASS_DISPLAY"] = record["session"]["display"]
+                record["session"]["backend"] = self.config.get("backend", "x11")
             client = owned["client"] = Client(
                 command,
                 directory / "mcp",
@@ -230,6 +272,10 @@ class Fleet:
                 "glass_select_window",
                 "glass_key",
             }
+            if kind == "ios":
+                required |= {"glass_screenshot"}
+            if kind == "native" and self.config.get("backend") == "macos":
+                required |= {"glass_set_value"}
             if required - {tool["name"] for tool in inventory}:
                 raise EvidenceError("application participant lacks required MCP tools")
             evidence = Evidence(
@@ -260,6 +306,12 @@ class Fleet:
                 try:
                     if not client.close(grace=1):
                         errors.append(f"{name}: MCP reader/process residue")
+                except Exception as exc:
+                    errors.append(f"{name}: {exc}")
+            if owned.get("ios"):
+                try:
+                    if not owned["ios"].close():
+                        errors.append(f"{name}: simulator cleanup failed")
                 except Exception as exc:
                     errors.append(f"{name}: {exc}")
             if owned["android"]:
@@ -316,9 +368,9 @@ def attempt(config, cell, directory):
         phase("app_start")
         for name, member in fleet.members.items():
             member.launch_application()
-            fleet.records[name]["owned_process_commands"] = (
-                member.session.process_commands()
-            )
+            fleet.records[name][
+                "owned_process_commands"
+            ] = member.session.process_commands()
         setup_errors = cases.evaluate_setup(
             cell["case"], fleet.events, config["viewport"]
         )
@@ -326,15 +378,24 @@ def attempt(config, cell, directory):
             raise EvidenceError("; ".join(setup_errors))
         phase("task")
         cases.execute(cell["case"], fleet)
-        result["assertion_errors"] = cases.evaluate(cell["case"], fleet.events)
-        result["outcome"] = "failed" if result["assertion_errors"] else "task_completed"
+        if cell["case"] == "ios-publication":
+            result["outcome"], result["assertion_errors"] = ios_publication.evaluate(
+                fleet.events
+            )
+        else:
+            result["assertion_errors"] = cases.evaluate(cell["case"], fleet.events)
+            result["outcome"] = (
+                "failed" if result["assertion_errors"] else "task_completed"
+            )
         phase("evidence")
         result.update(evidence_ok=True, error=None)
     except BaseException as exc:
         result.update(
-            outcome="harness_error"
-            if isinstance(exc, (ProtocolError, OSError))
-            else "failed",
+            outcome=(
+                "harness_error"
+                if isinstance(exc, (ProtocolError, OSError))
+                else "failed"
+            ),
             error=f"{type(exc).__name__}: {exc}",
             interrupted=isinstance(exc, KeyboardInterrupt),
         )
@@ -356,13 +417,14 @@ def attempt(config, cell, directory):
             client = fleet.owned[name]["client"]
             if client:
                 calls.extend(client.calls)
+                record["process_cleanup"] = client.cleanup
                 if client.fault:
                     result["evidence_ok"] = False
                     record["evidence_error"] = client.fault
                     record["evidence_ok"] = False
             for path in (directory / name).rglob("*"):
                 if path.is_file():
-                    record["files"][str(path.relative_to(directory / name))] = (
+                    record["files"][path.relative_to(directory / name).as_posix()] = (
                         file_identity(path)
                     )
         result.update(
@@ -386,7 +448,9 @@ def attempt(config, cell, directory):
         )
         for path in directory.rglob("*"):
             if path.is_file() and path.name != "result.json":
-                result["files"][str(path.relative_to(directory))] = file_identity(path)
+                result["files"][path.relative_to(directory).as_posix()] = file_identity(
+                    path
+                )
         if (
             sum(v["bytes"] for v in result["files"].values())
             > config["evidence_limit_bytes"]
@@ -444,7 +508,20 @@ def validate_application(directory, result, config):
     if recovered != result["events"]:
         errors.append("combined events differ from participant wire evidence")
     errors += validate_totals(directory, result, calls)
-    if result["outcome"] == "task_completed":
+    if result["case"] == "ios-publication" and result["outcome"] in (
+        "task_completed",
+        "unsupported",
+    ):
+        errors += ios_publication.validate_probe(
+            directory / "app",
+            result["participants"]["app"],
+            config["applications"]["ios"],
+        )
+        outcome, assertions = ios_publication.evaluate(recovered)
+        errors += assertions
+        if result["outcome"] != outcome:
+            errors.append("publication outcome is misclassified")
+    if result["outcome"] == "task_completed" and result["case"] != "ios-publication":
         if set(result["participants"]) != set(participants(result["case"])):
             errors.append("required participant is missing")
         errors += cases.evaluate(result["case"], recovered)

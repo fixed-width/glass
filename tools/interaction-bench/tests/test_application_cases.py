@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from application_cases import evaluate, evaluate_setup
+from application_cases import Oracle, evaluate, evaluate_setup
 
 
 def field(step, name, value, participant="app"):
@@ -15,6 +15,43 @@ def field(step, name, value, participant="app"):
 
 
 class ApplicationOracleTests(unittest.TestCase):
+    def test_empty_reset_requires_exact_confirmed_write(self):
+        from copy import deepcopy
+
+        fact = {
+            "error": False,
+            "nodes": [],
+            "set_value": {
+                "target": {"query": "Account name", "role": "TextField"},
+                "text": "",
+            },
+            "result": {"dispatch": "dispatched", "confirmation": "value_confirmed"},
+        }
+
+        def errors(value):
+            oracle = Oracle([{"participant": "app", "step": "empty", "facts": value}])
+            oracle.value("empty", "Account name", "")
+            return oracle.errors
+
+        self.assertFalse(errors(fact))
+        for key, value in (
+            ("confirmation", "unconfirmed"),
+            ("dispatch", "not_dispatched"),
+        ):
+            wrong = deepcopy(fact)
+            wrong["result"][key] = value
+            self.assertTrue(errors(wrong))
+        for key, value in (
+            ("text", "Ada"),
+            ("target", {"query": "Other", "role": "TextField"}),
+        ):
+            wrong = deepcopy(fact)
+            wrong["set_value"][key] = value
+            self.assertTrue(errors(wrong))
+        self.assertTrue(
+            errors({"error": False, "nodes": [{"name": "Account name", "value": None}]})
+        )
+
     def test_native_completion_requires_saved_value_and_one_submission(self):
         errors = evaluate(
             "native-form",

@@ -37,14 +37,15 @@ from measurement import (
     write_json,
 )
 from protocol import Client, ProtocolError
-from sessions import Session
+from native_sessions import create_session, prepare_display
 from validation import read_channel, validate_totals
 
 CASES = {**WEB_CASES, **APPLICATION_CASES}
-REVISION = 2
+REVISION = 3
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULTS = {
     "schema_version": 1,
+    "backend": "x11",
     "repetitions": 10,
     "warmups": 1,
     "seed": 41,
@@ -71,7 +72,15 @@ def load_config(path, registry):
     unknown = (
         set(supplied)
         - set(DEFAULTS)
-        - {"browser", "browser_args", "app_env", "drivers", "notes", "applications"}
+        - {
+            "browser",
+            "browser_args",
+            "app_env",
+            "drivers",
+            "notes",
+            "applications",
+            "sway",
+        }
     )
     if unknown:
         raise ValueError(f"unknown configuration options: {sorted(unknown)}")
@@ -97,6 +106,18 @@ def load_config(path, registry):
         or len(set(config["cases"])) != len(config["cases"])
     ):
         raise ValueError("cases must be a nonempty unique list of known cases")
+    if config["backend"] not in ("x11", "wayland", "macos", "windows", "ios"):
+        raise ValueError("unknown backend")
+    if (config["backend"] == "ios") != (config["cases"] == ["ios-publication"]):
+        raise ValueError("ios backend requires only ios-publication")
+    if "ios-publication" in config["cases"] and config["backend"] != "ios":
+        raise ValueError("ios-publication requires ios backend")
+    if config["backend"] == "wayland":
+        config["sway"] = str(Path(config["sway"]).expanduser().resolve(strict=True))
+        if any(d.get("adapter") != "glass" for d in config.get("drivers", [])):
+            raise ValueError("Wayland cohorts currently require the Glass adapter")
+    if config["backend"] in ("macos", "windows") and config["cases"] != ["native-form"]:
+        raise ValueError("native desktop cohorts currently support native-form")
     if config["browser_family"] not in ("firefox", "chromium") or config[
         "sandbox"
     ] not in ("off", "default", "strict"):
@@ -183,13 +204,27 @@ def git_output(*args):
 
 def preflight(config):
     errors = []
-    if platform.system() != "Linux":
+    backend = config.get("backend", "x11")
+    host = {
+        "x11": "Linux",
+        "wayland": "Linux",
+        "macos": "Darwin",
+        "windows": "Windows",
+        "ios": "Darwin",
+    }[backend]
+    if platform.system() != host:
         errors.append(
-            "execution currently requires Linux; offline validation is portable"
+            f"{backend} execution requires {host}; offline validation is portable"
         )
-    for command in ("Xvfb", "dbus-daemon"):
+    for command in (
+        ("Xvfb", "dbus-daemon")
+        if backend == "x11"
+        else ("dbus-daemon",) if backend == "wayland" else ()
+    ):
         if not shutil.which(command):
             errors.append(f"missing prerequisite {command}")
+    if backend == "wayland" and not os.access(config["sway"], os.X_OK):
+        errors.append("configured sway is not executable")
     errors.extend(application_prerequisites(config))
     if config["browser"] and not os.access(config["browser"], os.X_OK):
         errors.append("browser is not executable")
@@ -206,9 +241,11 @@ def preflight(config):
             "tree": git_output("rev-parse", "HEAD^{tree}"),
             "dirty": dirty,
         },
-        "browser": {"path": config["browser"], **file_identity(config["browser"])}
-        if config["browser"]
-        else None,
+        "browser": (
+            {"path": config["browser"], **file_identity(config["browser"])}
+            if config["browser"]
+            else None
+        ),
         "configuration_sha256": digest(config),
         "scheduled_attempts": len(config["cases"])
         * len(config["drivers"])
@@ -252,9 +289,9 @@ def attempt(config, cell, directory, fixtures, adapter):
     spec = next(d for d in config["drivers"] if d["id"] == cell["driver"])
     total_deadline = began + config["attempt_timeout_ms"] / 1000
     try:
-        session = Session()
-        display = session.start_display(directory / "xvfb.log", *config["display"])
-        if spec["adapter"] == "glass":
+        session = create_session(config.get("backend", "x11"))
+        display = prepare_display(session, config, directory)
+        if spec["adapter"] == "glass" and display:
             session.env["GLASS_DISPLAY"] = display
         command = (
             adapter.command(spec, config, directory, cell["case"])
@@ -264,6 +301,7 @@ def attempt(config, cell, directory, fixtures, adapter):
         result["effective_command"] = command
         result["session"] = {
             "display": display,
+            "backend": config.get("backend", "x11"),
             "runtime_root": str(session.root),
             "ownership_token": session.token,
         }
@@ -370,7 +408,9 @@ def attempt(config, cell, directory, fixtures, adapter):
         )
         for path in directory.rglob("*"):
             if path.is_file() and path.name != "result.json":
-                result["files"][str(path.relative_to(directory))] = file_identity(path)
+                result["files"][path.relative_to(directory).as_posix()] = file_identity(
+                    path
+                )
         if (
             sum(v["bytes"] for v in result["files"].values())
             > config["evidence_limit_bytes"]
@@ -382,12 +422,12 @@ def attempt(config, cell, directory, fixtures, adapter):
 
 
 def validate_attempt(directory, result, adapter, config=None):
-    if result["outcome"] in ("skipped", "unsupported"):
-        return verify_files(directory, result["files"])
     if "participants" in result:
         from application_run import validate_application
 
         return validate_application(directory, result, config)
+    if result["outcome"] in ("skipped", "unsupported"):
+        return verify_files(directory, result["files"])
     errors, reconstructed, calls = read_channel(directory, result, adapter)
     errors += validate_totals(directory, result, calls)
     if result["outcome"] in ("task_completed", "expected_refusal"):
@@ -498,6 +538,8 @@ def run(config, output, registry):
             "system": platform.platform(),
             "machine": platform.machine(),
             "node": platform.node(),
+            "python": platform.python_version(),
+            "python_executable": sys.executable,
         },
         "identities": {},
         "fixture_files": {},
@@ -543,7 +585,9 @@ def run(config, output, registry):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(identity_path, target)
     for source in (ROOT / "tools/interaction-bench").rglob("*.py"):
-        manifest["identities"][str(source.relative_to(ROOT))] = file_identity(source)
+        manifest["identities"][source.relative_to(ROOT).as_posix()] = file_identity(
+            source
+        )
         target = output / "source" / source.relative_to(ROOT)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source.read_bytes())
@@ -567,6 +611,8 @@ def run(config, output, registry):
                     "--",
                     "examples/electron-interaction-fixture",
                     "examples/android-role-fixture",
+                    "examples/ios-role-fixture",
+                    "examples/web-role-fixture",
                     "crates/glass-fixture-egui",
                 ]
             )
@@ -580,11 +626,18 @@ def run(config, output, registry):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(path, target)
     manifest["source_files"] = {
-        str(path.relative_to(output)): file_identity(path)
+        path.relative_to(output).as_posix(): file_identity(path)
         for path in (output / "source").rglob("*")
         if path.is_file()
     }
     frozen_paths = application_frozen_paths(config)
+    if config.get("sway"):
+        sway = Path(config["sway"])
+        frozen_paths.add(sway)
+        for name in ("bin", "lib"):
+            frozen_paths.update(
+                p for p in (sway.parent.parent / name).rglob("*") if p.is_file()
+            )
     if config["browser"]:
         frozen_paths.add(Path(config["browser"]))
     frozen_paths.update(

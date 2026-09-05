@@ -4,6 +4,7 @@ import os
 import json
 from pathlib import Path
 import shutil
+import subprocess
 
 from application_cases import CASES
 from application_run import participants
@@ -25,13 +26,17 @@ def configure(config):
         keys = (
             {"sdk", "image", "apk", "agent_jar", "a11y_apk"}
             if kind == "android"
-            else {"executable"}
+            else (
+                {"app", "runtime", "device_type", "companion"}
+                if kind == "ios"
+                else {"executable"}
+            )
         )
         if kind == "electron":
             keys.add("bundle")
         if set(spec) != keys:
             raise ValueError(f"{kind} requires exactly {sorted(keys)}")
-        for key in keys - {"image"}:
+        for key in keys - {"image", "runtime", "device_type"}:
             spec[key] = str(Path(spec[key]).expanduser().resolve(strict=True))
         if kind == "electron":
             if config["viewport"] != [1000, 700]:
@@ -55,7 +60,14 @@ def configure(config):
 def prerequisites(config):
     errors = []
     for kind, spec in config.get("applications", {}).items():
-        if kind != "android":
+        if kind == "ios":
+            if not shutil.which("xcrun") or not os.access(spec["companion"], os.X_OK):
+                errors.append(
+                    "iOS publication requires Xcode and an executable companion"
+                )
+            if not (Path(spec["app"]) / "Info.plist").is_file():
+                errors.append("iOS app bundle is missing Info.plist")
+        elif kind != "android":
             if not os.access(spec["executable"], os.X_OK):
                 errors.append(f"{kind} application is not executable")
             if (
@@ -88,10 +100,36 @@ def runtime_metadata(config):
             result[kind] = json.loads(
                 (Path(spec["bundle"]) / "fixture-build.json").read_bytes()
             )
+        elif kind == "ios":
+            runtimes = json.loads(
+                subprocess.check_output(
+                    ["xcrun", "simctl", "list", "runtimes", "--json"], timeout=15
+                )
+            )
+            runtime = next(
+                (r for r in runtimes["runtimes"] if r["identifier"] == spec["runtime"]),
+                None,
+            )
+            if not runtime or not runtime.get("isAvailable"):
+                raise ValueError("configured iOS Simulator runtime is unavailable")
+            result[kind] = {
+                "runtime": runtime,
+                "sdk_version": subprocess.check_output(
+                    ["xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"],
+                    timeout=15,
+                )
+                .decode()
+                .strip(),
+                "xcode_version": subprocess.check_output(
+                    ["xcodebuild", "-version"], timeout=15
+                )
+                .decode()
+                .strip(),
+            }
         elif kind == "android":
             sdk = Path(spec["sdk"])
             result[kind] = {
-                str(path.relative_to(sdk)): path.read_text()
+                path.relative_to(sdk).as_posix(): path.read_text()
                 for path in (
                     sdk / "platform-tools/source.properties",
                     sdk / "emulator/source.properties",
@@ -107,6 +145,11 @@ def frozen_paths(config):
     for kind, spec in config.get("applications", {}).items():
         if kind == "electron":
             paths.update(p for p in Path(spec["bundle"]).rglob("*") if p.is_file())
+        elif kind == "ios":
+            paths.update(p for p in Path(spec["app"]).rglob("*") if p.is_file())
+            paths.add(Path(spec["companion"]))
+            frameworks = Path(spec["companion"]).parent.parent / "Frameworks"
+            paths.update(p for p in frameworks.rglob("*") if p.is_file())
         elif kind == "native":
             paths.add(Path(spec["executable"]))
         else:

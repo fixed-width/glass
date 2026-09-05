@@ -106,7 +106,8 @@
         "electron-form",
         "android-boundary",
         "native-form",
-        "cross-application"
+        "cross-application",
+        "ios-publication"
       ]
     },
     "cell": {
@@ -244,7 +245,19 @@
         },
         "applications": {
           "type": "object",
-          "description": "Configured native executable, packaged Electron bundle, or Android SDK/image/APK and companion paths."
+          "description": "Configured native executable, packaged Electron bundle, Android SDK/image/APK/companions, or iOS app/runtime/device type/companion."
+        },
+        "backend": {
+          "enum": [
+            "x11",
+            "wayland",
+            "macos",
+            "windows",
+            "ios"
+          ]
+        },
+        "sway": {
+          "type": "string"
         }
       }
     },
@@ -323,7 +336,8 @@
                 "enum": [
                   "native",
                   "electron",
-                  "android"
+                  "android",
+                  "ios"
                 ]
               },
               "events": {

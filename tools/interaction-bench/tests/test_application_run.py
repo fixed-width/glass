@@ -88,7 +88,7 @@ class ApplicationRunTests(unittest.TestCase):
                     "tool_definitions_sha256": digest(inventory),
                 }
                 records[name]["files"] = {
-                    str(p.relative_to(directory)): file_identity(p)
+                    p.relative_to(directory).as_posix(): file_identity(p)
                     for p in directory.rglob("*")
                     if p.is_file()
                 }
