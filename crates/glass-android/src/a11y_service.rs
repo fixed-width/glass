@@ -1820,6 +1820,73 @@ mod tests {
     }
 
     #[test]
+    fn schema_downgrade_after_a_transient_attempt_stops_recovery_immediately() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("first connection");
+            let mut first_writer = first.try_clone().expect("clone first");
+            let mut first_reader = std::io::BufReader::new(first);
+            writeln!(first_writer, r#"{{"hello":{{"proto":1,"node_schema":2}}}}"#)
+                .expect("schema two hello");
+            loop {
+                let mut line = String::new();
+                if !matches!(first_reader.read_line(&mut line), Ok(n) if n > 0) {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).expect("request json");
+                recorded.lock().unwrap().push("conn1:tree".to_string());
+                writeln!(
+                    first_writer,
+                    "{}",
+                    json!({"id": request["id"], "ok": false, "error": "no active window"})
+                )
+                .expect("refusal");
+            }
+
+            let (second, _) = listener.accept().expect("second connection");
+            second
+                .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                .expect("read timeout");
+            let mut second_writer = second.try_clone().expect("clone second");
+            let mut second_reader = std::io::BufReader::new(second);
+            writeln!(second_writer, r#"{{"hello":{{"proto":1}}}}"#).expect("schema one hello");
+            let mut line = String::new();
+            if second_reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                recorded.lock().unwrap().push("conn2:request".to_string());
+            }
+        });
+        let rebinds = AtomicUsize::new(0);
+        let restores = AtomicUsize::new(0);
+
+        let error = match ready_or_restore(
+            port,
+            std::time::Duration::from_millis(20),
+            3,
+            &|_| {
+                rebinds.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            &|| {
+                restores.fetch_add(1, Ordering::Relaxed);
+            },
+        ) {
+            Ok(_) => panic!("a later schema downgrade is permanent, not another readiness refusal"),
+            Err(error) => error,
+        };
+
+        server.join().expect("server");
+        assert!(error.to_string().contains(INCOMPATIBLE_NODE_SCHEMA));
+        assert_eq!(rebinds.load(Ordering::Relaxed), 1);
+        assert_eq!(restores.load(Ordering::Relaxed), 1);
+        let requests = requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|request| request == "conn1:tree"));
+    }
+
+    #[test]
     fn schema_two_missing_a_required_boolean_is_rejected_before_exposure() {
         let response = r#"{"ok":true,"tree":{"ref":0,"class":"android.widget.EditText","text":"SECRET_SENTINEL","bounds":{"x":0,"y":100,"w":10,"h":10},"enabled":true,"visible":true,"checkable":false,"checked":false,"focused":false,"focusable":true,"editable":true,"clickable":true,"scrollable":false,"showing_hint_text":false}}"#;
         let (port, seen) = fake_agent(r#"{"hello":{"proto":1,"node_schema":2}}"#, vec![response]);

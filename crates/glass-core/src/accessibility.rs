@@ -1228,7 +1228,7 @@ pub trait Accessibility {
     }
 
     fn state_coverage(&self) -> AxStateCoverage {
-        AxStateCoverage::NONE
+        Default::default()
     }
 
     fn focus(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {

@@ -313,6 +313,26 @@ fn error_report_check(
         .expect("missing actionability check")
 }
 
+fn test_element(role: AxRole, states: AxStates, bounds: AxRect) -> ElementInfo {
+    ElementInfo {
+        id: AxNodeId(7),
+        role,
+        name: Some("Target".into()),
+        description: Some("test target".into()),
+        value: None,
+        bounds: Some(bounds),
+        states,
+    }
+}
+
+fn unbounded_action_deadline(owner: Option<Whose>) -> ActionDeadline {
+    ActionDeadline {
+        deadline: Deadline::UNBOUNDED,
+        owner,
+        allow_wait: true,
+    }
+}
+
 fn assert_pointer_report_order(error: &SemanticActionError) {
     assert_eq!(
         error
@@ -579,6 +599,427 @@ fn semantic_action_error_display_never_exposes_retained_payloads() {
 
     assert_eq!(error.to_string(), "semantic action failed");
     assert!(std::error::Error::source(&error).is_none());
+}
+
+#[test]
+fn source_errors_preserve_deadline_owner_in_kind_and_summary() {
+    let cases = [
+        (
+            GlassError::caller_deadline_elapsed("resolve"),
+            unbounded_action_deadline(None),
+            SemanticActionFailureKind::SequenceDeadlineExceeded,
+            "semantic action sequence deadline exceeded",
+        ),
+        (
+            GlassError::Bounded {
+                kind: crate::BoundKind::TimedOut,
+                whose: Whose::Callee,
+                dispatch: crate::BoundDispatch::NotDispatched,
+                message: "resolver ceiling elapsed".into(),
+            },
+            unbounded_action_deadline(None),
+            SemanticActionFailureKind::ActionDeadlineExceeded,
+            "semantic action deadline exceeded",
+        ),
+        (
+            GlassError::Backend("reader failed".into()),
+            unbounded_action_deadline(None),
+            SemanticActionFailureKind::ActionFailed,
+            "semantic action target resolution failed",
+        ),
+    ];
+
+    for (source, bound, kind, summary) in cases {
+        let error = source_error(source, bound);
+        assert_eq!(error.kind, kind);
+        assert_eq!(error.summary, summary);
+        assert!(error.source.is_some());
+    }
+}
+
+#[test]
+fn pointer_plan_requires_every_trailing_toggle_fact_and_uses_the_segment_midpoint() {
+    let bounds = AxRect {
+        x: 11,
+        y: 7,
+        width: 81,
+        height: 15,
+    };
+    let mut element = test_element(
+        AxRole::CheckBox,
+        AxStates {
+            checkable: true,
+            ..AxStates::default()
+        },
+        bounds,
+    );
+    let segment = bounds.trailing_toggle_swipe(120, 80).unwrap();
+    assert_eq!(
+        pointer_plan(&element, (120, 80), true),
+        Some(PlannedPointerInput::TrailingToggle {
+            segment,
+            probe_point: (
+                segment.from_x + (segment.to_x - segment.from_x) / 2,
+                segment.from_y + (segment.to_y - segment.from_y) / 2,
+            ),
+        })
+    );
+
+    element.states.checkable = false;
+    assert!(matches!(
+        pointer_plan(&element, (120, 80), true),
+        Some(PlannedPointerInput::Click { .. })
+    ));
+    element.states.checkable = true;
+    assert!(matches!(
+        pointer_plan(&element, (120, 80), false),
+        Some(PlannedPointerInput::Click { .. })
+    ));
+    element.bounds = Some(AxRect {
+        width: 60,
+        ..bounds
+    });
+    assert!(matches!(
+        pointer_plan(&element, (120, 80), true),
+        Some(PlannedPointerInput::Click { .. })
+    ));
+}
+
+#[test]
+fn pointer_candidate_requires_one_retained_match_from_a_complete_resolved_query() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let query = SemanticQuery::new(selector("Save"), None, SEMANTIC_ACTION_CANDIDATE_LIMIT)
+        .expect("valid query");
+    let complete = tree.semantic_query(&query);
+    assert!(complete_unique_pointer_result(&complete));
+
+    let mut unresolved_scope = complete.clone();
+    unresolved_scope.scope = ScopeResolution::NotFound;
+    let mut duplicate_walk = complete.clone();
+    duplicate_walk.matches_in_walk = 2;
+    let mut incomplete = complete.clone();
+    incomplete.search_complete = false;
+    let mut omitted_match = complete;
+    omitted_match.matches.clear();
+
+    for result in [unresolved_scope, duplicate_walk, incomplete, omitted_match] {
+        assert!(!complete_unique_pointer_result(&result), "{result:?}");
+    }
+}
+
+#[test]
+fn pointer_resolution_reports_partial_query_evidence_without_hit_testing_or_dispatch() {
+    let bounds = AxRect {
+        x: 10,
+        y: 10,
+        width: 20,
+        height: 20,
+    };
+    let mut incomplete = actionable_button_tree("Save", bounds);
+    incomplete.truncated = Some(Truncation {
+        limit: TruncationLimit::Nodes,
+        limit_value: 2,
+        nodes_walked: 2,
+    });
+    let cases = [
+        (
+            duplicate_button_tree("Save", 2),
+            SemanticTarget {
+                target: selector("Save"),
+                within: None,
+            },
+            SemanticActionFailureKind::AmbiguousTarget,
+        ),
+        (
+            incomplete,
+            SemanticTarget {
+                target: selector("Save"),
+                within: None,
+            },
+            SemanticActionFailureKind::IncompleteTree,
+        ),
+        (
+            scoped_tree(),
+            SemanticTarget {
+                target: selector("Save account"),
+                within: Some(selector("Account panel")),
+            },
+            SemanticActionFailureKind::AmbiguousScope,
+        ),
+    ];
+
+    for (tree, target, expected_kind) in cases {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let (mut glass, walks, hit_calls, _) =
+            pointer_glass(platform, vec![tree], PointerHit::Target, false);
+        glass.start(&spec()).unwrap();
+
+        let error = glass
+            .click_target_inner(
+                pointer_params(ActionTarget::Semantic(target), Some(0)),
+                Deadline::UNBOUNDED,
+            )
+            .expect_err("partial query evidence cannot choose a pointer target");
+
+        assert_eq!(error.kind, expected_kind);
+        assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+        assert_eq!(walks.load(Ordering::Relaxed), 1);
+        assert_eq!(hit_calls.load(Ordering::Relaxed), 0);
+        assert!(clicks.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn planned_pointer_input_requires_every_coordinate_to_be_strictly_inside_the_window() {
+    for point in [(0, 0), (99, 99)] {
+        assert!(PlannedPointerInput::Click { point }.is_inside_window((100, 100)));
+    }
+    for point in [(-1, 0), (0, -1), (100, 0), (0, 100)] {
+        assert!(!PlannedPointerInput::Click { point }.is_inside_window((100, 100)));
+    }
+
+    let segment = crate::Segment {
+        from_x: 1,
+        from_y: 2,
+        to_x: 98,
+        to_y: 97,
+    };
+    assert!(
+        PlannedPointerInput::TrailingToggle {
+            segment,
+            probe_point: (50, 50),
+        }
+        .is_inside_window((100, 100))
+    );
+    for plan in [
+        PlannedPointerInput::TrailingToggle {
+            segment: crate::Segment {
+                from_x: 100,
+                ..segment
+            },
+            probe_point: (50, 50),
+        },
+        PlannedPointerInput::TrailingToggle {
+            segment: crate::Segment {
+                to_y: 100,
+                ..segment
+            },
+            probe_point: (50, 50),
+        },
+        PlannedPointerInput::TrailingToggle {
+            segment,
+            probe_point: (-1, 50),
+        },
+    ] {
+        assert!(!plan.is_inside_window((100, 100)), "{plan:?}");
+    }
+}
+
+#[test]
+fn value_and_type_actionability_insert_one_exact_eligibility_check_before_stability() {
+    let bounds = AxRect {
+        x: 10,
+        y: 10,
+        width: 80,
+        height: 20,
+    };
+    let editable = test_element(
+        AxRole::Button,
+        AxStates {
+            enabled: true,
+            visible: true,
+            editable: true,
+            ..AxStates::default()
+        },
+        bounds,
+    );
+    let coverage = AxStateCoverage {
+        enabled: true,
+        visible: true,
+        editable: true,
+        checkable: true,
+        ..AxStateCoverage::NONE
+    };
+
+    let semantic = set_value_actionability(&editable, coverage, (100, 100), false);
+    let legacy = set_value_actionability(&editable, coverage, (100, 100), true);
+    let targeted = targeted_type_actionability(&editable, coverage, Some(true), (100, 100), true);
+    for (report, required, source) in [
+        (&semantic, true, ActionabilitySource::NormalizedState),
+        (&legacy, false, ActionabilitySource::LegacyCache),
+        (&targeted, true, ActionabilitySource::NormalizedState),
+    ] {
+        let positions = report
+            .checks
+            .iter()
+            .enumerate()
+            .filter(|(_, check)| check.name == ActionabilityCheckName::FocusEligible)
+            .collect::<Vec<_>>();
+        assert_eq!(positions.len(), 1);
+        let (position, check) = positions[0];
+        assert_eq!(
+            report.checks[position + 1].name,
+            ActionabilityCheckName::Stable
+        );
+        assert_eq!(check.verdict, ActionabilityVerdict::Passed);
+        assert_eq!(check.required, required);
+        assert_eq!(check.source, source);
+    }
+
+    let unsupported = test_element(AxRole::Button, AxStates::default(), bounds);
+    assert_eq!(
+        targeted_type_eligibility(&unsupported, AxStateCoverage::NONE),
+        ActionabilityVerdict::Unproven
+    );
+    assert_eq!(
+        targeted_type_eligibility(
+            &unsupported,
+            AxStateCoverage {
+                editable: true,
+                ..AxStateCoverage::NONE
+            }
+        ),
+        ActionabilityVerdict::Failed
+    );
+    assert_eq!(
+        targeted_type_eligibility(
+            &test_element(AxRole::TextArea, AxStates::default(), bounds),
+            AxStateCoverage::NONE
+        ),
+        ActionabilityVerdict::Passed
+    );
+}
+
+#[test]
+fn focus_confirmation_discloses_coverage_and_observation_independently() {
+    for (covered, confirmed, expected) in [
+        (false, false, ActionabilityVerdict::Unproven),
+        (false, true, ActionabilityVerdict::Unproven),
+        (true, false, ActionabilityVerdict::Failed),
+        (true, true, ActionabilityVerdict::Passed),
+    ] {
+        let mut report = ActionabilityReport::default();
+        record_focus_confirmation(
+            &mut report,
+            AxStateCoverage {
+                focused: covered,
+                ..AxStateCoverage::NONE
+            },
+            confirmed,
+        );
+        assert_eq!(
+            report.checks,
+            vec![ActionabilityCheck::new(
+                ActionabilityCheckName::Focused,
+                expected,
+                true,
+                ActionabilitySource::ConfirmationPoll,
+            )],
+            "covered={covered}, confirmed={confirmed}"
+        );
+    }
+}
+
+#[test]
+fn dispatch_and_retry_provenance_distinguish_pre_dispatch_from_uncertain_effects() {
+    let may_have = GlassError::Backend("focus transport failed".into());
+    assert_eq!(
+        focus_dispatch(&may_have, true),
+        DispatchStatus::MayHaveDispatched
+    );
+    assert_eq!(
+        focus_dispatch(&may_have, false),
+        DispatchStatus::NotDispatched
+    );
+    assert_eq!(
+        focus_dispatch(&GlassError::AxUnsupported, true),
+        DispatchStatus::NotDispatched
+    );
+    assert_eq!(
+        focus_dispatch(&GlassError::NoAxSnapshot, true),
+        DispatchStatus::NotDispatched
+    );
+    assert_eq!(
+        focus_dispatch(
+            &GlassError::Backend("pre-dispatch".into()).before_dispatch(),
+            true
+        ),
+        DispatchStatus::NotDispatched
+    );
+
+    let uncertain = action_source_error(
+        GlassError::Backend("click transport failed".into()),
+        None,
+        None,
+        ActionabilityReport::default(),
+        unbounded_action_deadline(None),
+        true,
+    );
+    assert_eq!(uncertain.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(uncertain.retry, RetryGuidance::DoNotRetry);
+    let pre_dispatch = action_source_error(
+        GlassError::NoAxSnapshot,
+        None,
+        None,
+        ActionabilityReport::default(),
+        unbounded_action_deadline(None),
+        true,
+    );
+    assert_eq!(pre_dispatch.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(pre_dispatch.retry, RetryGuidance::SafeToRetry);
+}
+
+#[test]
+fn set_value_error_provenance_requires_proof_before_reporting_safe_non_dispatch() {
+    let cases = [
+        (
+            GlassError::NoAxSnapshot,
+            DispatchStatus::NotDispatched,
+            RetryGuidance::Reobserve,
+        ),
+        (
+            GlassError::AxUnsupported,
+            DispatchStatus::NotDispatched,
+            RetryGuidance::CorrectRequest,
+        ),
+        (
+            GlassError::Backend("refused before write".into()).before_dispatch(),
+            DispatchStatus::NotDispatched,
+            RetryGuidance::SafeToRetry,
+        ),
+        (
+            GlassError::Backend("unknown transport outcome".into()),
+            DispatchStatus::MayHaveDispatched,
+            RetryGuidance::DoNotRetry,
+        ),
+        (
+            GlassError::AxWriteUnconfirmed(7, "read-back failed".into()),
+            DispatchStatus::MayHaveDispatched,
+            RetryGuidance::DoNotRetry,
+        ),
+    ];
+
+    for (source, dispatch, retry) in cases {
+        let error = set_value_source_error(
+            source,
+            None,
+            None,
+            ActionabilityReport::default(),
+            unbounded_action_deadline(None),
+        );
+        assert_eq!(error.action_dispatch, dispatch);
+        assert_eq!(error.retry, retry);
+        assert_eq!(error.summary, "semantic set-value action failed");
+    }
 }
 
 #[test]
@@ -954,6 +1395,16 @@ fn target_deadlines_validate_id_options_and_selector_timeout_ceiling() {
         DispatchStatus::NotDispatched
     );
     assert_eq!(selector_error.retry, RetryGuidance::CorrectRequest);
+
+    let exact_maximum = target_deadline(
+        &ActionTarget::Semantic(semantic_target("save")),
+        Some(SEMANTIC_ACTION_MAX_TIMEOUT_MS),
+        None,
+        Deadline::UNBOUNDED,
+    )
+    .expect("the documented maximum remains a valid action timeout");
+    assert_eq!(exact_maximum.owner, Some(Whose::Callee));
+    assert!(exact_maximum.allow_wait);
 }
 
 #[test]
@@ -1118,6 +1569,40 @@ fn identity_change_resets_stability_even_when_bounds_are_equal() {
 
     assert_eq!(walks.load(Ordering::Relaxed), 3);
     assert_eq!(clicks.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn pointer_plan_change_resets_stability_when_identity_and_bounds_are_equal() {
+    let bounds = AxRect {
+        x: 10,
+        y: 10,
+        width: 81,
+        height: 15,
+    };
+    let first = actionable_button_tree("Save", bounds);
+    let mut final_tree = first.clone();
+    final_tree.root.children[0].states.checkable = true;
+    let drags = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(120, 80)
+        .with_drag_log(drags.clone())
+        .with_trailing_toggle_backend();
+    let (mut glass, walks, _, _) = pointer_glass(
+        platform,
+        vec![first, final_tree.clone(), final_tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(600)),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+    assert_eq!(walks.load(Ordering::Relaxed), 3);
+    assert_eq!(drags.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -2405,6 +2890,37 @@ fn legacy_click_element_fields_and_native_first_behavior_are_unchanged() {
             native_fallback: Some(_)
         }
     ));
+    assert!(!outcome.actionability.checks.is_empty());
+    assert!(
+        outcome
+            .actionability
+            .checks
+            .iter()
+            .all(|check| !check.required && check.source == ActionabilitySource::LegacyCache)
+    );
+    assert_eq!(
+        report_verdict(&outcome, ActionabilityCheckName::BackendFingerprint),
+        ActionabilityVerdict::Unproven,
+        "a legacy pointer fallback cannot claim native fingerprint validation"
+    );
+    let native_report = legacy.legacy_click_actionability(id, false);
+    assert!(!native_report.checks.is_empty());
+    assert!(
+        native_report
+            .checks
+            .iter()
+            .all(|check| !check.required && check.source == ActionabilitySource::LegacyCache)
+    );
+    let native_outcome = legacy.legacy_click_outcome(
+        id,
+        ActionMethod::NativeAction { actuated: None },
+        false,
+        unbounded_action_deadline(None),
+    );
+    assert_eq!(
+        report_verdict(&native_outcome, ActionabilityCheckName::BackendFingerprint),
+        ActionabilityVerdict::Passed
+    );
     assert_eq!(legacy_pointer.label(), "pointer");
     assert_eq!(
         legacy_pointer.native_fallback(),
@@ -3155,6 +3671,75 @@ fn targeted_type_does_not_try_pointer_after_native_focus_may_have_dispatched() {
 }
 
 #[test]
+fn targeted_type_keeps_retry_safe_when_pointer_focus_proves_no_dispatch() {
+    let tree = value_control_tree(
+        "Account name",
+        AxRole::TextField,
+        Some("old"),
+        AxStates {
+            enabled: true,
+            visible: true,
+            focusable: true,
+            editable: true,
+            ..AxStates::default()
+        },
+    );
+    let mut tree = tree;
+    tree.root.children[0].bounds = Some(AxRect {
+        x: 70,
+        y: 248,
+        width: 80,
+        height: 27,
+    });
+    let active = window_info(
+        1,
+        WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 340,
+            height: 300,
+        },
+        true,
+    );
+    let popover = window_info(
+        2,
+        WindowGeometry {
+            x: -3,
+            y: 220,
+            width: 326,
+            height: 135,
+        },
+        false,
+    );
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(340, 300)
+        .with_windows(vec![active, popover])
+        .with_key_log(keys.clone());
+    let (mut glass, _, _, _) = pointer_glass(
+        platform,
+        vec![tree.clone(), tree.clone(), tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .type_target(
+            &targeted_type_params("Account name", ActionMode::Auto, 600),
+            "must not type",
+        )
+        .expect_err("an unmappable popover target cannot receive pointer focus");
+
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(error.retry, RetryGuidance::SafeToRetry);
+    assert_eq!(
+        error.focus.as_ref().map(|focus| focus.dispatch),
+        Some(DispatchStatus::NotDispatched)
+    );
+    assert!(keys.lock().unwrap().is_empty());
+}
+
+#[test]
 fn targeted_type_never_types_when_focus_cannot_be_confirmed() {
     let secret = "never expose this text";
     let mut fixture = targeted_type_glass(
@@ -3412,6 +3997,10 @@ fn targeted_type_rejects_a_button_even_when_the_backend_can_focus_it() {
 
     assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
     assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    let eligibility = error_report_check(&error, ActionabilityCheckName::FocusEligible);
+    assert_eq!(eligibility.verdict, ActionabilityVerdict::Failed);
+    assert!(eligibility.required);
+    assert_eq!(eligibility.source, ActionabilitySource::NormalizedState);
     assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 0);
     assert!(fixture.clicks.lock().unwrap().is_empty());
     assert!(fixture.key_log.lock().unwrap().is_empty());

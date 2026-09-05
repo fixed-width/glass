@@ -431,6 +431,32 @@ mod tests {
     }
 
     #[test]
+    fn checked_selectors_require_both_checkability_and_checked_coverage() {
+        for (checkable, checked, expected) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let coverage = AxStateCoverage {
+                checkable,
+                checked,
+                ..AxStateCoverage::NONE
+            };
+            assert_eq!(
+                coverage.covers_selector_state(SemanticState::Checked),
+                expected,
+                "checkable={checkable}, checked={checked}"
+            );
+            assert_eq!(
+                coverage.covers_selector_state(SemanticState::Unchecked),
+                expected,
+                "checkable={checkable}, checked={checked}"
+            );
+        }
+    }
+
+    #[test]
     fn actionability_records_keep_verdict_required_and_source_separate() {
         let check = ActionabilityCheck {
             name: ActionabilityCheckName::NonOccluded,
@@ -630,6 +656,50 @@ mod tests {
     }
 
     #[test]
+    fn passing_the_backend_fingerprint_changes_only_that_disclosed_check() {
+        let coverage = AxStateCoverage {
+            enabled: true,
+            visible: true,
+            ..AxStateCoverage::NONE
+        };
+        let mut report = ActionabilityReport::evaluate_click(
+            &target(
+                AxRole::Button,
+                AxStates {
+                    enabled: true,
+                    visible: true,
+                    ..AxStates::default()
+                },
+                Some(AxRect {
+                    x: 10,
+                    y: 10,
+                    width: 20,
+                    height: 20,
+                }),
+            ),
+            coverage,
+            Some(true),
+            (100, 100),
+            PointerHit::Target,
+            false,
+            true,
+        );
+        let before = report.clone();
+
+        report.pass_backend_fingerprint();
+
+        assert_eq!(
+            check(&report, ActionabilityCheckName::BackendFingerprint).verdict,
+            ActionabilityVerdict::Passed
+        );
+        for original in before.checks {
+            if original.name != ActionabilityCheckName::BackendFingerprint {
+                assert_eq!(check(&report, original.name), original);
+            }
+        }
+    }
+
+    #[test]
     fn focus_requires_focusable_or_editable_when_that_fact_is_covered() {
         let coverage = AxStateCoverage {
             enabled: true,
@@ -672,6 +742,39 @@ mod tests {
                 ActionabilitySource::NormalizedState,
             )
         );
+    }
+
+    #[test]
+    fn focus_eligibility_distinguishes_either_positive_fact_from_partial_negative_coverage() {
+        let cases = [
+            (true, true, false, false, ActionabilityVerdict::Passed),
+            (false, false, true, true, ActionabilityVerdict::Passed),
+            (true, false, false, false, ActionabilityVerdict::Unproven),
+            (false, false, true, false, ActionabilityVerdict::Unproven),
+            (true, false, true, false, ActionabilityVerdict::Failed),
+        ];
+
+        for (covers_focusable, focusable, covers_editable, editable, expected) in cases {
+            let coverage = AxStateCoverage {
+                focusable: covers_focusable,
+                editable: covers_editable,
+                ..AxStateCoverage::NONE
+            };
+            let element = target(
+                AxRole::Button,
+                AxStates {
+                    focusable,
+                    editable,
+                    ..AxStates::default()
+                },
+                None,
+            );
+            assert_eq!(
+                focus_eligibility(&element, coverage),
+                expected,
+                "coverage=({covers_focusable},{covers_editable}), state=({focusable},{editable})"
+            );
+        }
     }
 
     #[test]
@@ -749,5 +852,86 @@ mod tests {
                 "role {role:?} was not marked eligible"
             );
         }
+    }
+
+    #[test]
+    fn set_value_eligibility_requires_matching_state_evidence_or_complete_negative_coverage() {
+        let cases = [
+            (true, true, false, false, ActionabilityVerdict::Passed),
+            (false, false, true, true, ActionabilityVerdict::Passed),
+            (true, false, false, false, ActionabilityVerdict::Unproven),
+            (false, false, true, false, ActionabilityVerdict::Unproven),
+            (false, true, false, true, ActionabilityVerdict::Unproven),
+            (true, false, true, false, ActionabilityVerdict::Failed),
+        ];
+
+        for (covers_editable, editable, covers_checkable, checkable, expected) in cases {
+            let coverage = AxStateCoverage {
+                editable: covers_editable,
+                checkable: covers_checkable,
+                ..AxStateCoverage::NONE
+            };
+            let element = target(
+                AxRole::Button,
+                AxStates {
+                    editable,
+                    checkable,
+                    ..AxStates::default()
+                },
+                None,
+            );
+            assert_eq!(
+                set_value_eligibility(&element, coverage),
+                expected,
+                "coverage=({covers_editable},{covers_checkable}), state=({editable},{checkable})"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_pointer_actionability_is_disclosed_without_making_semantic_checks_required() {
+        let report = ActionabilityReport::evaluate_click(
+            &target(
+                AxRole::Button,
+                AxStates::default(),
+                Some(AxRect {
+                    x: 100,
+                    y: 100,
+                    width: 20,
+                    height: 20,
+                }),
+            ),
+            AxStateCoverage {
+                enabled: true,
+                visible: true,
+                ..AxStateCoverage::NONE
+            },
+            Some(false),
+            (100, 100),
+            PointerHit::Other,
+            true,
+            true,
+        );
+
+        assert!(report.checks.iter().all(|check| !check.required));
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.source == ActionabilitySource::LegacyCache)
+        );
+        assert_eq!(report.blocking(), None);
+        assert_eq!(
+            check(&report, ActionabilityCheckName::Unique).verdict,
+            ActionabilityVerdict::Unproven
+        );
+        assert_eq!(
+            check(&report, ActionabilityCheckName::Enabled).verdict,
+            ActionabilityVerdict::Failed
+        );
+        assert_eq!(
+            check(&report, ActionabilityCheckName::Visible).verdict,
+            ActionabilityVerdict::Failed
+        );
     }
 }

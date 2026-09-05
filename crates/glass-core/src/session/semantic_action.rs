@@ -593,6 +593,15 @@ fn pointer_plan(
     plan.is_inside_window(window).then_some(plan)
 }
 
+fn complete_unique_pointer_result(result: &SemanticQueryResult) -> bool {
+    matches!(
+        result.scope,
+        ScopeResolution::Unscoped | ScopeResolution::Resolved(_)
+    ) && result.matches_in_walk == 1
+        && result.search_complete
+        && result.matches.len() == 1
+}
+
 fn ax_target(element: &ElementInfo) -> AxTarget {
     AxTarget {
         id: element.id,
@@ -1203,12 +1212,7 @@ impl Glass {
                 "stabilize semantic pointer target",
                 |tree, window| {
                     let result = tree.semantic_query(&query);
-                    let complete_unique = matches!(
-                        result.scope,
-                        ScopeResolution::Unscoped | ScopeResolution::Resolved(_)
-                    ) && result.matches_in_walk == 1
-                        && result.search_complete
-                        && result.matches.len() == 1;
+                    let complete_unique = complete_unique_pointer_result(&result);
                     let mut actionability = None;
                     let candidate = if complete_unique {
                         let element = result.matches[0].element.clone();

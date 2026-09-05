@@ -85,12 +85,12 @@ jobs:
         with:
           workspaces: .
       - name: Install system deps
-        # The suite launches a real GTK4 app (python3-gi + gir1.2-gtk-4.0) under an X server it
-        # starts itself, against glass's own private bus + AT-SPI registry (at-spi2-core).
+        # The suite launches real GTK4 and GTK3 apps (python3-gi plus both typelibs) under an X
+        # server it starts itself, against glass's own private bus + AT-SPI registry (at-spi2-core).
         # bubblewrap, and the AppArmor knob Ubuntu 24.04 restricts it with, are for the four tests
         # that read the tree from inside a sandbox.
         run: |
-          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 at-spi2-core
+          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 gir1.2-gtk-3.0 at-spi2-core
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       # This suite owns every Linux accessibility fact the repo asserts — which role a GTK switch
       # arrives as, whether an event subscription actually stops a wait re-walking — and until now
@@ -234,10 +234,11 @@ jobs:
         # coverage.sh runs once it sees a display — absent, half the crate reports uncovered.
         # bubblewrap for the sandbox_* tests, whose unprivileged user namespaces Ubuntu 24.04
         # restricts via AppArmor (the sysctl is a no-op on images without the knob), and GTK4 for
-        # the software_render test's real app.
+        # the software_render test's real app. The full AT-SPI suite also launches its GTK3
+        # focus fixture, so install both GTK typelibs.
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb at-spi2-core bubblewrap python3-gi gir1.2-gtk-4.0
+          sudo apt-get install -y xvfb at-spi2-core bubblewrap python3-gi gir1.2-gtk-4.0 gir1.2-gtk-3.0
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Measure coverage (unit + X11; Wayland/AT-SPI self-skip)
         run: ./scripts/coverage.sh --lcov

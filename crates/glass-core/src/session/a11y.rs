@@ -2693,6 +2693,43 @@ mod tests {
         assert_eq!(invokes.lock().unwrap().len(), 1);
     }
 
+    #[test]
+    fn native_focus_geometry_failure_is_best_effort_only_for_an_unbounded_legacy_call() {
+        for (deadline, should_focus) in [
+            (Deadline::UNBOUNDED, true),
+            (Deadline::from_millis(1_000), false),
+        ] {
+            let focus_calls = Arc::new(AtomicUsize::new(0));
+            let accessibility = FakeAccessibility::new(fake_tree())
+                .with_focus_behavior(InvokeBehavior::Succeed)
+                .with_focus_calls(focus_calls.clone());
+            let mut g = glass_with_backend(
+                FakePlatform::new(100, 100).with_failing_geometry(),
+                Box::new(accessibility),
+            );
+            g.start(&spec()).unwrap();
+            let mut cached = fake_tree();
+            cached.assign_ids();
+            g.active.as_mut().unwrap().last_ax = Some(cached);
+
+            let result = g.try_native_focus(AxNodeId(1), deadline);
+
+            assert_eq!(result.is_ok(), should_focus, "deadline={deadline:?}");
+            assert_eq!(
+                focus_calls.load(Ordering::Relaxed),
+                usize::from(should_focus),
+                "deadline={deadline:?}"
+            );
+            if let Err(error) = result {
+                assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+                assert_eq!(
+                    error.bound_dispatch(),
+                    Some(crate::BoundDispatch::NotDispatched)
+                );
+            }
+        }
+    }
+
     /// The click is translated into the popover's container, on both axes. The validated
     /// fixture's container sits at x=0, where subtracting and adding its origin agree, so this
     /// repeats it with the container offset horizontally.
@@ -2732,6 +2769,93 @@ mod tests {
         // Item at x=70 inside a container at x=40 is 30 in; y is unchanged from the validated
         // fixture at 248 - 194.
         assert_eq!(clicks.lock().unwrap().last().copied(), Some((30, 54)));
+    }
+
+    #[test]
+    fn planned_popover_inputs_use_the_plan_and_translate_both_axes_into_the_container() {
+        let active = window_info(
+            1,
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            },
+            true,
+        );
+        let popover = window_info(
+            2,
+            WindowGeometry {
+                x: -3,
+                y: 220,
+                width: 326,
+                height: 135,
+            },
+            false,
+        );
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let drags = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300)
+            .with_windows(vec![active, popover])
+            .with_click_log(clicks.clone())
+            .with_drag_log(drags.clone());
+        let mut g = glass_with_a11y(platform, fake_tree_with_offset_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let id = tree.root.children[0].children[0].id;
+
+        g.click_element_pointer_only(
+            id,
+            Some(&super::semantic_action::PlannedPointerInput::Click { point: (83, 267) }),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+        g.click_element_pointer_only(
+            id,
+            Some(
+                &super::semantic_action::PlannedPointerInput::TrailingToggle {
+                    segment: crate::Segment {
+                        from_x: 78,
+                        from_y: 254,
+                        to_x: 90,
+                        to_y: 270,
+                    },
+                    probe_point: (84, 262),
+                },
+            ),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+        assert_eq!(clicks.lock().unwrap().as_slice(), &[(43, 73)]);
+        assert!(matches!(
+            drags.lock().unwrap().as_slice(),
+            [PointerEvent::Drag {
+                from_x: 38,
+                from_y: 60,
+                to_x: 50,
+                to_y: 76,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn planned_ordinary_click_uses_the_stored_point_instead_of_recomputing_center() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        g.click_element_pointer_only(
+            AxNodeId(1),
+            Some(&super::semantic_action::PlannedPointerInput::Click { point: (13, 17) }),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+        assert_eq!(clicks.lock().unwrap().as_slice(), &[(13, 17)]);
     }
 
     #[test]
