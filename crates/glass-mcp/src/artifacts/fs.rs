@@ -476,21 +476,20 @@ impl ArtifactStore {
         if prepared.is_empty() {
             return Err(ArtifactError::InvalidOutputState);
         }
-        {
-            let state = self
-                .inner
-                .state
-                .lock()
-                .map_err(|_| ArtifactError::StatePoisoned)?;
-            if state.lifecycle != Lifecycle::Open || state.availability_error.is_some() {
-                return Err(ArtifactError::InvalidOutputState);
-            }
+        // Publication, rollback and retention must observe one stable directory at a time.
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ArtifactError::StatePoisoned)?;
+        if state.lifecycle != Lifecycle::Open || state.availability_error.is_some() {
+            return Err(ArtifactError::InvalidOutputState);
         }
 
         let mut created = Vec::with_capacity(prepared.len() * 2);
-        let result = self.write_and_rename(&prepared, &mut created);
+        let result = self.write_and_rename(&state, &prepared, &mut created);
         if let Err(error) = result {
-            return self.rollback_publication(&created, error);
+            return self.rollback_publication(&mut state, &created, error);
         }
 
         let descriptors = prepared
@@ -501,20 +500,13 @@ impl ArtifactStore {
             .iter()
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
-        let mut state = match self.inner.state.lock() {
-            Ok(state) => state,
-            Err(_) => {
-                return self.rollback_publication(&created, ArtifactError::StatePoisoned);
-            }
-        };
-        if state.lifecycle != Lifecycle::Open || state.availability_error.is_some() {
-            drop(state);
-            return self.rollback_publication(&created, ArtifactError::InvalidOutputState);
-        }
         let count = u64::try_from(prepared.len()).map_err(|_| ArtifactError::InvalidOutputState)?;
         let Some(next_seq) = state.next_seq.checked_add(count) else {
-            drop(state);
-            return self.rollback_publication(&created, ArtifactError::InvalidOutputState);
+            return self.rollback_publication(
+                &mut state,
+                &created,
+                ArtifactError::InvalidOutputState,
+            );
         };
         let first_seq = state.next_seq;
         state.next_seq = next_seq;
@@ -530,7 +522,6 @@ impl ArtifactStore {
                 },
             );
         }
-        drop(state);
         let injected_retention_failure = match self.inner.fault {
             #[cfg(test)]
             Some(FaultStage::RetentionAfterRegistryInsertion)
@@ -559,10 +550,10 @@ impl ArtifactStore {
                 std::io::ErrorKind::PermissionDenied,
             ))
         } else {
-            self.enforce_retention()
+            Self::enforce_retention_locked(&mut state)
         };
         if let Err(error) = retention {
-            return self.rollback_committed_batch(&ids, &created, error);
+            return self.rollback_committed_batch(&mut state, &ids, &created, error);
         }
         Ok(PublishedBatch {
             descriptors,
@@ -575,6 +566,7 @@ impl ArtifactStore {
 
     fn write_and_rename(
         &self,
+        state: &StoreState,
         prepared: &[PreparedArtifact],
         created: &mut Vec<PathBuf>,
     ) -> Result<(), ArtifactError> {
@@ -583,11 +575,7 @@ impl ArtifactStore {
             created.push(item.temp_path.clone());
             let fail_rollback = self.inner.fault
                 == Some(FaultStage::PublicationRollbackCleanupFails)
-                && self
-                    .inner
-                    .state
-                    .lock()
-                    .is_ok_and(|state| !state.entries.is_empty());
+                && !state.entries.is_empty();
             if fail_rollback {
                 return Err(ArtifactError::WriteFailed);
             }
@@ -625,6 +613,7 @@ impl ArtifactStore {
 
     fn rollback_publication(
         &self,
+        state: &mut StoreState,
         paths: &[PathBuf],
         original: ArtifactError,
     ) -> Result<PublishedBatch, ArtifactError> {
@@ -638,40 +627,30 @@ impl ArtifactStore {
         if !injected_failure && rollback_paths(paths).is_ok() {
             return Err(original);
         }
-        if let Ok(mut state) = self.inner.state.lock() {
-            state.availability_error = Some(ArtifactError::RollbackFailed);
-        }
+        state.availability_error = Some(ArtifactError::RollbackFailed);
         Err(ArtifactError::RollbackFailed)
     }
 
     fn rollback_committed_batch(
         &self,
+        state: &mut StoreState,
         ids: &[String],
         paths: &[PathBuf],
         original: ArtifactError,
     ) -> Result<PublishedBatch, ArtifactError> {
-        let registry_rolled_back = match self.inner.state.lock() {
-            Ok(mut state) => {
-                for id in ids {
-                    state.entries.remove(id);
-                }
-                true
-            }
-            Err(mut poisoned) => {
-                poisoned.get_mut().availability_error = Some(ArtifactError::RollbackFailed);
-                false
-            }
-        };
+        for id in ids {
+            state.entries.remove(id);
+        }
         #[cfg(test)]
         let injected_cleanup_failure =
             self.inner.fault == Some(FaultStage::CommittedBatchRollbackCleanupFails);
         #[cfg(not(test))]
         let injected_cleanup_failure = false;
         let paths_rolled_back = !injected_cleanup_failure && rollback_paths(paths).is_ok();
-        if registry_rolled_back && paths_rolled_back {
+        if paths_rolled_back {
             return Err(original);
         }
-        self.mark_unavailable(ArtifactError::RollbackFailed);
+        state.availability_error = Some(ArtifactError::RollbackFailed);
         Err(ArtifactError::RollbackFailed)
     }
 
@@ -803,6 +782,10 @@ impl ArtifactStore {
             .state
             .lock()
             .map_err(|_| ArtifactError::StatePoisoned)?;
+        Self::enforce_retention_locked(&mut state)
+    }
+
+    fn enforce_retention_locked(state: &mut StoreState) -> Result<(), ArtifactError> {
         if state.lifecycle != Lifecycle::Open {
             return Ok(());
         }
