@@ -102,8 +102,12 @@ impl Deadline {
     /// [`Self::UNBOUNDED`] stays unbounded: there is nothing to take a share of. Never lands
     /// before now, so it cannot underflow the monotonic clock.
     pub fn reserving(self, reserve: std::time::Duration) -> Self {
+        self.reserving_at(reserve, std::time::Instant::now())
+    }
+
+    fn reserving_at(self, reserve: std::time::Duration, now: std::time::Instant) -> Self {
         Self(self.0.map(|d| {
-            let left = d.saturating_duration_since(std::time::Instant::now());
+            let left = d.saturating_duration_since(now);
             d - reserve.min(left / 2)
         }))
     }
@@ -250,16 +254,14 @@ mod tests {
     /// A share taken out of one budget, so two steps in sequence cannot each spend the whole.
     #[test]
     fn reserving_takes_a_share_and_leaves_unbounded_unbounded() {
-        let left = Deadline::at(Instant::now() + Duration::from_secs(3))
-            .reserving(Duration::from_secs(1))
-            .remaining()
+        let now = Instant::now();
+        let left = Deadline::at(now + Duration::from_secs(3))
+            .reserving_at(Duration::from_secs(1), now)
+            .remaining_at(now)
             .expect("still bounded");
-        assert!(
-            left <= Duration::from_secs(2) && left > Duration::from_millis(1900),
-            "{left:?}"
-        );
+        assert_eq!(left, Duration::from_secs(2));
         assert_eq!(
-            Deadline::UNBOUNDED.reserving(Duration::from_secs(1)),
+            Deadline::UNBOUNDED.reserving_at(Duration::from_secs(1), now),
             Deadline::UNBOUNDED
         );
     }
@@ -268,13 +270,15 @@ mod tests {
     /// held back from gets a deadline already in the past and is skipped rather than run.
     #[test]
     fn a_reserve_larger_than_the_budget_takes_only_half() {
-        let left = Deadline::at(Instant::now() + Duration::from_millis(100))
-            .reserving(Duration::from_secs(30))
-            .remaining()
+        let now = Instant::now();
+        let left = Deadline::at(now + Duration::from_millis(100))
+            .reserving_at(Duration::from_secs(30), now)
+            .remaining_at(now)
             .expect("still bounded");
-        assert!(
-            left > Duration::from_millis(30) && left <= Duration::from_millis(50),
-            "a 30s reserve out of 100ms should leave about half, left {left:?}"
+        assert_eq!(left, Duration::from_millis(50));
+        assert_eq!(
+            Deadline::at(now).reserving_at(Duration::from_secs(30), now),
+            Deadline::at(now)
         );
     }
 }

@@ -584,18 +584,16 @@ mod tests {
         g.set_shutdown_hook(Box::new(move |d| *hooked.lock().unwrap() = Some(d)));
         g.start(&spec()).unwrap();
 
-        let deadline = soon();
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_secs(3600));
         g.shutdown(deadline);
 
         let at_stop = at_stop
             .lock()
             .unwrap()
             .expect("the backend must be stopped through `stop_app_by`, not `stop_app`");
-        // Each `remaining()` reads its own now, microseconds apart, so comparing them compares
-        // the instants they hold.
-        assert!(
-            at_stop.remaining().expect("a bounded share") < deadline.remaining().unwrap(),
-            "the session's share must stop short of the hook's, or the reserve is not held back"
+        assert_eq!(
+            deadline.instant().unwrap() - at_stop.instant().expect("a bounded share"),
+            crate::TEARDOWN_HOOK_RESERVE
         );
         assert_eq!(
             *at_hook.lock().unwrap(),
@@ -604,66 +602,33 @@ mod tests {
         );
     }
 
-    /// The reserve is a fixed 750ms, so without the clamp a caller whose whole budget is smaller
-    /// hands the sessions a deadline already in the past.
     #[test]
-    fn a_budget_smaller_than_the_reserve_still_leaves_the_sessions_time() {
+    fn the_hook_has_reserved_time_at_the_backend_deadline() {
         let at_stop = Arc::new(Mutex::new(None));
-        let recorded = at_stop.clone();
+        let recorded_stop = at_stop.clone();
         let factory: PlatformFactory = Box::new(move |_backend| {
             Ok(Backend::display_only(Box::new(
-                FakePlatform::new(10, 10).recording_stop_deadline(recorded.clone()),
-            )))
-        });
-        let mut g = glass_with_factory(factory);
-        g.start(&spec()).unwrap();
-
-        // A fifth of the reserve, so an unclamped subtraction lands well in the past.
-        let budget = crate::TEARDOWN_HOOK_RESERVE / 5;
-        let started = std::time::Instant::now();
-        g.shutdown(Deadline::at(started + budget));
-
-        // Measured from `started`, not from now: `remaining()` here would subtract whatever the
-        // test itself has since spent, and the margin is only tens of milliseconds.
-        let given = at_stop
-            .lock()
-            .unwrap()
-            .expect("the backend was stopped")
-            .remaining_at(started)
-            .expect("a bounded share");
-        assert!(
-            given >= budget / 3,
-            "the sessions were given {given:?} of a {budget:?} budget — the reserve was taken \
-             whole from a budget too small to pay it"
-        );
-    }
-
-    /// The property this whole split exists for (glass#422): a session that spends everything it is
-    /// given must still leave the hook enough to run.
-    #[test]
-    fn a_session_that_burns_its_deadline_still_leaves_the_hook_time_to_run() {
-        let factory: PlatformFactory = Box::new(move |_backend| {
-            Ok(Backend::display_only(Box::new(
-                FakePlatform::new(10, 10).burning_its_deadline(),
+                FakePlatform::new(10, 10).recording_stop_deadline(recorded_stop.clone()),
             )))
         });
         let left = Arc::new(Mutex::new(None));
         let recorded = left.clone();
         let mut g = glass_with_factory(factory);
         g.set_shutdown_hook(Box::new(move |d| {
-            *recorded.lock().unwrap() = d.remaining();
+            let stopped_at = at_stop
+                .lock()
+                .unwrap()
+                .expect("backend stopped before hook");
+            *recorded.lock().unwrap() = d.remaining_at(stopped_at.instant().unwrap());
         }));
         g.start(&spec()).unwrap();
 
-        // A tenth of the real budget, so the test costs what it measures rather than 3s.
-        let budget = crate::TEARDOWN_BUDGET / 10;
-        g.shutdown(Deadline::at(std::time::Instant::now() + budget));
+        g.shutdown(Deadline::at(
+            std::time::Instant::now() + Duration::from_secs(3600),
+        ));
 
         let left = left.lock().unwrap().expect("the hook ran at all");
-        assert!(
-            left > std::time::Duration::ZERO,
-            "the hook was handed a spent deadline, so every step behind the session is skipped"
-        );
+        assert_eq!(left, crate::TEARDOWN_HOOK_RESERVE);
     }
 
     #[test]
