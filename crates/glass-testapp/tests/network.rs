@@ -37,6 +37,7 @@ async fn network_screenshot_over_http() {
         let cfg = ServeConfig {
             addr,
             token: Some("e2e".into()),
+            tool_profile: Default::default(),
         };
         let _ = glass_mcp::serve::run_on(listener, cfg, glass, report).await;
     });

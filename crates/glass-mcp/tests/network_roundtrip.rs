@@ -32,11 +32,19 @@ impl TestServer {
 }
 
 async fn start_server(token: Option<&str>) -> TestServer {
+    start_server_with_profile(token, glass_mcp::tool_profile::ToolProfile::Full).await
+}
+
+async fn start_server_with_profile(
+    token: Option<&str>,
+    profile: glass_mcp::tool_profile::ToolProfile,
+) -> TestServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let cfg = ServeConfig {
         addr,
         token: token.map(String::from),
+        tool_profile: profile,
     };
     let glass = glass_mcp::boot(None);
     let report = glass_mcp::audit::report_from_config(None, |_| None);
@@ -53,6 +61,45 @@ async fn start_server(token: Option<&str>) -> TestServer {
         cancel,
         task,
     }
+}
+
+#[tokio::test]
+async fn lean_http_exposes_batch_and_refuses_omitted_tools() {
+    let server =
+        start_server_with_profile(Some("tok"), glass_mcp::tool_profile::ToolProfile::Lean).await;
+    let client = ().serve(client_transport(&server.url, Some("tok"))).await.unwrap();
+    let inventory = client.list_all_tools().await.unwrap();
+    assert_eq!(inventory.len(), 20);
+    assert!(inventory.iter().any(|tool| tool.name == "glass_do"));
+    assert!(!inventory.iter().any(|tool| tool.name == "glass_key"));
+    let omitted = client
+        .call_tool(
+            CallToolRequestParams::new("glass_key").with_arguments(
+                serde_json::json!({"chord":"Return"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    assert!(
+        matches!(omitted, Err(ServiceError::McpError(ref error)) if error.code == ErrorCode::INVALID_PARAMS)
+    );
+    let batch = client
+        .call_tool(
+            CallToolRequestParams::new("glass_do").with_arguments(
+                serde_json::json!({"actions":[]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(batch.is_error, Some(true));
+    assert!(format!("{batch:?}").contains("invalid_sequence"));
+    client.cancel().await.ok();
+    server.shutdown().await;
 }
 
 /// Build an rmcp Streamable-HTTP client transport for `url`, optionally bearing `token`.

@@ -53,6 +53,7 @@ pub async fn run(
     token_file: Option<String>,
     sink: Option<Box<dyn glass_core::AuditSink>>,
     report: crate::audit::AuditReport,
+    tool_profile: crate::tool_profile::ToolProfile,
 ) -> anyhow::Result<()> {
     // Delegate to the audited resolver (token precedence + exposure rules + its tests stay
     // the single source of truth); just reconstruct its flag form from clap's typed args.
@@ -68,10 +69,11 @@ pub async fn run(
         argv.push("--token-file".into());
         argv.push(tf);
     }
-    let cfg = config::parse_args(&argv, std::env::var("GLASS_TOKEN").ok(), |p| {
+    let mut cfg = config::parse_args(&argv, std::env::var("GLASS_TOKEN").ok(), |p| {
         std::fs::read_to_string(p)
     })
     .map_err(|e| anyhow::anyhow!("glass serve: {e}"))?;
+    cfg.tool_profile = tool_profile;
 
     // Fail-closed exposure rule (spec D4) — refuse a network-exposed bind without a token.
     check_exposure(&cfg)?;
@@ -173,7 +175,7 @@ pub async fn run_on_until(
     report: crate::audit::AuditReport,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let server = GlassServer::new(glass, report);
+    let server = GlassServer::new_with_profile(glass, report, cfg.tool_profile);
     let sessions = server.sessions();
     let artifacts = server.artifact_store();
     let cancel = CancellationToken::new();
@@ -358,6 +360,7 @@ mod tests {
         ServeConfig {
             addr: addr.parse().unwrap(),
             token: token.map(String::from),
+            tool_profile: Default::default(),
         }
     }
 

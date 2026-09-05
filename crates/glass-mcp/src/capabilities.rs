@@ -7,6 +7,30 @@
 
 use glass_core::capability::{CapabilityMap, CapabilityStatus};
 
+pub(crate) fn apply_tool_profile(
+    value: &mut serde_json::Value,
+    profile: crate::tool_profile::ToolProfile,
+) {
+    value["tool_profile"] = serde_json::json!(profile);
+    if let Some(capabilities) = value
+        .get_mut("capabilities")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for (operation, entry) in capabilities {
+            if let Some(tools) = entry
+                .get_mut("tools")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                tools.retain(|tool| tool.as_str().is_some_and(|name| profile.includes(name)));
+                if operation == "accessibility" && profile == crate::tool_profile::ToolProfile::Lean
+                {
+                    tools.push(serde_json::json!("glass_do"));
+                }
+            }
+        }
+    }
+}
+
 /// Operation → the registered MCP tools it gates. One source; the `server` test
 /// `every_mapped_tool_is_a_registered_tool` pins it to the registry (that test lives in
 /// `server.rs`, the only module that can reach `tool_router()`).

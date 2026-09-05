@@ -118,6 +118,10 @@ Then [connect glass to your agent](docs/how-to/connect-an-agent.md) and run `gla
 the environment. New here? Follow [the tutorial](docs/tutorial/first-drive.md) for a guaranteed first
 success.
 
+The full toolbox remains the default. For fewer agent tool definitions, start with
+`glass-mcp --tool-profile lean` and use `glass_do` for actions. Inspect either inventory without
+starting a session using `glass-mcp tools --json`; see [tool profiles](docs/reference/tools.md#tool-profiles).
+
 ## Drive it well — the `glass-drive` skill
 
 glass needs no app integration and no skill to run, but an agent drives it far more reliably with the

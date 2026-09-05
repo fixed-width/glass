@@ -139,6 +139,7 @@ impl InProcessMcpHarness {
             let cfg = ServeConfig {
                 addr,
                 token: Some(server_token),
+                tool_profile: Default::default(),
             };
             glass_mcp::serve::run_on_until(listener, cfg, glass, report, async move {
                 shutdown.cancelled().await;

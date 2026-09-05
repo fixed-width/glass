@@ -46,6 +46,10 @@ claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe"
 add glass under `mcpServers` (the same shape as the generic config above), then reload the MCP
 servers (or restart Antigravity).
 
+For a smaller tool inventory, add `"args": ["--tool-profile", "lean"]` beside `command`.
+The default full inventory remains available; lean uses `glass_do` for actions, including single
+steps. See [tool profiles](../reference/tools.md#tool-profiles) for the included tools and wait semantics.
+
 **Codex CLI:** `codex mcp add glass -- /absolute/path/to/glass-mcp` — or add a `[mcp_servers.glass]`
 table with `command` / `args` to `~/.codex/config.toml`.
 

@@ -48,6 +48,7 @@ pub(crate) mod server;
 pub mod setup;
 pub(crate) mod shutdown;
 pub(crate) mod status;
+pub mod tool_profile;
 mod tools;
 mod untrusted;
 #[cfg(feature = "self-update")]
@@ -502,7 +503,16 @@ where
 
 /// Serve MCP over stdio (the default transport) and tear down on EOF or signal.
 pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyhow::Result<()> {
-    let server = GlassServer::new(glass, report);
+    run_stdio_with_profile(glass, report, tool_profile::ToolProfile::Full).await
+}
+
+/// Serve stdio with a tool profile fixed for the server lifetime.
+pub async fn run_stdio_with_profile(
+    glass: Glass,
+    report: crate::audit::AuditReport,
+    profile: tool_profile::ToolProfile,
+) -> anyhow::Result<()> {
+    let server = GlassServer::new_with_profile(glass, report, profile);
     let sessions = server.sessions();
     let artifacts = server.artifact_store();
     let service = server

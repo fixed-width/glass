@@ -3,7 +3,7 @@ use glass_mcp::cli::{Cli, Command};
 use glass_mcp::launch::NoArgLaunch;
 use glass_mcp::{
     boot, launch, onboarding, run_debug_checklist, run_debug_grants, run_doctor, run_env,
-    run_status, run_stdio, run_uninstall, setup,
+    run_status, run_stdio_with_profile, run_uninstall, setup,
 };
 
 #[tokio::main]
@@ -20,9 +20,11 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let audit_log = cli.audit_log;
+    let tool_profile = cli.tool_profile;
     // Resolve (and OPEN, fail-closed) the audit sink only in the serving arms below —
     // never for doctor/env/gen-token, so those never create the audit file as a side effect.
     match cli.command {
+        Some(Command::Tools { json }) => glass_mcp::tool_profile::print_tools(tool_profile, json),
         // No subcommand: a LaunchServices double-click routes to onboarding; an MCP client's
         // stdio spawn (the default, and the only case off macOS) serves MCP over stdio.
         None => match launch::detect_no_arg_launch() {
@@ -30,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
             NoArgLaunch::StdioServe => {
                 let (sink, report) =
                     glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
-                run_stdio(boot(sink), report).await
+                run_stdio_with_profile(boot(sink), report, tool_profile).await
             }
         },
         Some(Command::Doctor { deep, json, color }) => {
@@ -67,12 +69,13 @@ async fn main() -> anyhow::Result<()> {
                             argv.push("--token-file".into());
                             argv.push(tf);
                         }
-                        let cfg = glass_mcp::serve::config::parse_args(
+                        let mut cfg = glass_mcp::serve::config::parse_args(
                             &argv,
                             std::env::var("GLASS_TOKEN").ok(),
                             |p| std::fs::read_to_string(p),
                         )
                         .map_err(|e| anyhow::anyhow!("glass serve --menubar: {e}"))?;
+                        cfg.tool_profile = tool_profile;
                         glass_mcp::menubar::run(cfg)
                     }
                     #[cfg(not(target_os = "macos"))]
@@ -83,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     let (sink, report) =
                         glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
-                    glass_mcp::serve::run(http, addr, token_file, sink, report).await
+                    glass_mcp::serve::run(http, addr, token_file, sink, report, tool_profile).await
                 }
             }
             #[cfg(not(feature = "network"))]
