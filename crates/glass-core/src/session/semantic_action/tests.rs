@@ -2517,6 +2517,65 @@ fn semantic_public_click_audit_emits_exactly_one_record_on_native_fallback_and_f
 }
 
 #[test]
+fn failure_audit_auto_pointer_fallback_retains_the_resolved_target_and_selected_path() {
+    let tree = actionable_button_tree(
+        "Save account",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let native_calls = Arc::new(AtomicUsize::new(0));
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let accessibility = SeqAccessibility::new(vec![tree.clone(), tree.clone(), tree])
+        .with_coverage(full_state_coverage())
+        .with_invoke_behavior(InvokeBehavior::Unsupported)
+        .with_invoke_calls(native_calls.clone())
+        .with_hit(PointerHit::Target);
+    let platform = FakePlatform::new(100, 100)
+        .with_click_log(clicks.clone())
+        .with_failing_pointer();
+    let mut glass = glass_with_backend(platform, Box::new(accessibility));
+    let sink = RecordingSink::default();
+    glass.set_audit_sink(Box::new(sink.clone()));
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target(&semantic_click_params(ActionMode::Auto, 500))
+        .unwrap_err();
+
+    assert_eq!(native_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(clicks.lock().unwrap().len(), 1);
+    assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(
+        error.target.as_ref().map(|target| target.id),
+        Some(AxNodeId(1))
+    );
+    let audits = sink.1.lock().unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(
+        (
+            audits[0].element.id,
+            audits[0].method.as_deref(),
+            audits[0].native_fallback.as_deref(),
+        ),
+        (
+            1,
+            Some("pointer"),
+            Some("backend has no native action path"),
+        )
+    );
+    assert_eq!(audits[0].element.role.as_deref(), Some("Button"));
+    assert_eq!(audits[0].element.name.as_deref(), Some("Save account"));
+    assert_eq!(audits[0].actuated_id, None);
+    assert_eq!(audits[0].dispatch, "may_have_dispatched");
+    assert_eq!(audits[0].confirmation, "unconfirmed");
+    assert!(!audits[0].ok);
+}
+
+#[test]
 fn semantic_set_value_resolves_fresh_and_calls_the_backend_once() {
     let cached = editable_field_tree("Former account name", Some("old"), true);
     let fresh = editable_field_tree("Account name", Some("old"), true);
@@ -2902,6 +2961,43 @@ fn semantic_public_set_value_audit_emits_one_safe_high_level_record() {
 }
 
 #[test]
+fn failure_audit_set_value_retains_the_resolved_target_instead_of_the_selector_query() {
+    let secret = "audit secret text";
+    let tree = editable_field_tree("Primary account name", Some("old"), true);
+    let (mut glass, walks, set_log, _) = semantic_set_value_glass(
+        vec![tree],
+        vec![Err(GlassError::AxWriteUnconfirmed(1, secret.into()))],
+    );
+    let sink = RecordingSink::default();
+    glass.set_audit_sink(Box::new(sink.clone()));
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .set_value_target(&semantic_set_value_params("account", 0), secret)
+        .unwrap_err();
+
+    assert_eq!(walks.load(Ordering::Relaxed), 1);
+    assert_eq!(set_log.lock().unwrap().len(), 1);
+    assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(
+        error.target.as_ref().map(|target| target.id),
+        Some(AxNodeId(1))
+    );
+    let audits = sink.2.lock().unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].element.id, 1);
+    assert_eq!(audits[0].element.role.as_deref(), Some("TextField"));
+    assert_eq!(
+        audits[0].element.name.as_deref(),
+        Some("Primary account name")
+    );
+    assert_eq!(audits[0].dispatch, "may_have_dispatched");
+    assert_eq!(audits[0].confirmation, "unconfirmed");
+    assert!(!audits[0].ok);
+    assert!(!audits[0].error.as_deref().unwrap().contains(secret));
+}
+
+#[test]
 fn targeted_type_zero_timeout_types_only_if_the_first_confirmation_read_is_focused() {
     for (focused, succeeds) in [(true, true), (false, false)] {
         let mut fixture = targeted_type_glass(
@@ -3150,6 +3246,103 @@ fn targeted_type_never_dispatches_a_second_text_batch_after_possible_key_deliver
         Some(ConfirmationStatus::FocusConfirmed)
     );
     assert_eq!(sink.0.lock().unwrap().as_slice(), &["type_target:false"]);
+}
+
+#[test]
+fn failure_audit_post_focus_type_retains_the_resolved_target_and_dispatch_evidence() {
+    let secret = "one private batch";
+    let mut fixture = targeted_type_glass(
+        vec![
+            targeted_type_field_tree("Primary account name", false),
+            targeted_type_field_tree("Primary account name", true),
+        ],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        true,
+    );
+    let sink = RecordingSink::default();
+    fixture.glass.set_audit_sink(Box::new(sink.clone()));
+    fixture.glass.start(&spec()).unwrap();
+    sink.0.lock().unwrap().clear();
+    sink.3.lock().unwrap().clear();
+
+    let error = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("account", ActionMode::Native, 500),
+            secret,
+        )
+        .unwrap_err();
+
+    assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 1);
+    assert!(fixture.clicks.lock().unwrap().is_empty());
+    assert_eq!(fixture.key_log.lock().unwrap().len(), 1);
+    assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(
+        error.target.as_ref().map(|target| target.id),
+        Some(AxNodeId(1))
+    );
+    assert_eq!(sink.0.lock().unwrap().as_slice(), &["type_target:false"]);
+    let audits = sink.3.lock().unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].element.id, 1);
+    assert_eq!(audits[0].element.role.as_deref(), Some("TextField"));
+    assert_eq!(
+        audits[0].element.name.as_deref(),
+        Some("Primary account name")
+    );
+    assert_eq!(audits[0].focus_method.as_deref(), Some("native_action"));
+    assert_eq!(audits[0].focus_dispatch, "dispatched");
+    assert_eq!(audits[0].focus_confirmation, "focus_confirmed");
+    assert_eq!(audits[0].type_dispatch, "may_have_dispatched");
+    assert!(!audits[0].ok);
+    assert!(!audits[0].error.as_deref().unwrap().contains(secret));
+}
+
+#[test]
+fn failure_audit_ambiguity_stays_unresolved_and_dispatches_nothing() {
+    let mut tree = targeted_type_field_tree("Primary account name", false);
+    let mut duplicate = tree.root.children[0].clone();
+    duplicate.id = AxNodeId(2);
+    duplicate.name = Some("Backup account name".into());
+    tree.root.children.push(duplicate);
+    let tree = AxTree::new(tree.root);
+    let mut fixture = targeted_type_glass(
+        vec![tree],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        false,
+    );
+    let sink = RecordingSink::default();
+    fixture.glass.set_audit_sink(Box::new(sink.clone()));
+    fixture.glass.start(&spec()).unwrap();
+    sink.0.lock().unwrap().clear();
+    sink.3.lock().unwrap().clear();
+
+    let error = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("account", ActionMode::Native, 0),
+            "must not type",
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::AmbiguousTarget);
+    assert_eq!(error.candidates.len(), 2);
+    assert!(error.target.is_none());
+    assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 0);
+    assert!(fixture.clicks.lock().unwrap().is_empty());
+    assert!(fixture.key_log.lock().unwrap().is_empty());
+    assert_eq!(sink.0.lock().unwrap().as_slice(), &["type_target:false"]);
+    let audits = sink.3.lock().unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].element.id, 0);
+    assert_eq!(audits[0].element.role, None);
+    assert_eq!(audits[0].element.name.as_deref(), Some("account"));
+    assert_eq!(audits[0].focus_method, None);
+    assert_eq!(audits[0].focus_dispatch, "not_dispatched");
+    assert_eq!(audits[0].type_dispatch, "not_dispatched");
+    assert!(!audits[0].ok);
 }
 
 #[test]

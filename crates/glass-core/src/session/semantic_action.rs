@@ -989,6 +989,41 @@ fn native_fallback_reason(source: &GlassError) -> String {
     }
 }
 
+#[derive(Default)]
+struct ClickAuditContext {
+    method: Option<ActionMethod>,
+}
+
+impl ClickAuditContext {
+    fn selected(&mut self, method: ActionMethod) {
+        self.method = Some(method);
+    }
+}
+
+fn audit_element_ref(element: &ElementInfo) -> crate::audit::ElementRef {
+    crate::audit::ElementRef {
+        id: element.id.0,
+        role: Some(format!("{:?}", element.role)),
+        name: element.name.clone(),
+    }
+}
+
+fn click_audit_fields(
+    method: Option<&ActionMethod>,
+) -> (Option<&'static str>, Option<&str>, Option<u32>) {
+    match method {
+        Some(ActionMethod::NativeAction { actuated }) => {
+            (Some("native-action"), None, actuated.map(|id| id.0))
+        }
+        Some(ActionMethod::Pointer { native_fallback }) => {
+            (Some("pointer"), native_fallback.as_deref(), None)
+        }
+        Some(ActionMethod::AccessibilityValue) => (Some("accessibility-value"), None, None),
+        Some(ActionMethod::Keyboard) => (Some("keyboard"), None, None),
+        None => (None, None, None),
+    }
+}
+
 impl Glass {
     pub(super) fn resolve_semantic_target(
         &mut self,
@@ -1603,10 +1638,12 @@ impl Glass {
         max_nodes: Option<usize>,
         sequence_deadline: Deadline,
         bound: ActionDeadline,
+        audit: &mut ClickAuditContext,
     ) -> SemanticActionResult<SemanticActionOutcome> {
         match target {
             ActionTarget::Id(id) => {
                 let actionability = self.legacy_click_actionability(*id, false);
+                audit.selected(ActionMethod::NativeAction { actuated: None });
                 let actuated = self
                     .try_native_invoke(*id, bound.deadline)
                     .map_err(|source| {
@@ -1644,6 +1681,7 @@ impl Glass {
                         .is_none()
                     },
                 )?;
+                audit.selected(ActionMethod::NativeAction { actuated: None });
                 self.dispatch_native_click(resolved)
             }
         }
@@ -1656,10 +1694,14 @@ impl Glass {
         sequence_deadline: Deadline,
         bound: ActionDeadline,
         native_fallback: Option<String>,
+        audit: &mut ClickAuditContext,
     ) -> SemanticActionResult<SemanticActionOutcome> {
         match target {
             ActionTarget::Id(id) => {
                 let actionability = self.legacy_click_actionability(*id, true);
+                audit.selected(ActionMethod::Pointer {
+                    native_fallback: native_fallback.clone(),
+                });
                 self.click_element_pointer_only(*id, None, bound.deadline)
                     .map_err(|source| {
                         action_source_error(source, None, None, actionability, bound, true)
@@ -1678,6 +1720,9 @@ impl Glass {
                     sequence_deadline,
                     bound,
                 )?;
+                audit.selected(ActionMethod::Pointer {
+                    native_fallback: native_fallback.clone(),
+                });
                 self.dispatch_pointer_click(resolved, native_fallback)
             }
         }
@@ -1690,40 +1735,41 @@ impl Glass {
         self.click_target_by(params, Deadline::UNBOUNDED)
     }
 
+    fn semantic_action_audit_element(
+        &self,
+        result: &SemanticActionResult<SemanticActionOutcome>,
+        target: &ActionTarget,
+    ) -> crate::audit::ElementRef {
+        match result {
+            Ok(outcome) => audit_element_ref(&outcome.target),
+            Err(error) => error.target.as_deref().map_or_else(
+                || match target {
+                    ActionTarget::Id(id) => self.element_ref(*id),
+                    ActionTarget::Semantic(target) => crate::audit::ElementRef {
+                        id: 0,
+                        role: target.target.role().map(|role| format!("{role:?}")),
+                        name: target.target.query().map(str::to_owned),
+                    },
+                },
+                audit_element_ref,
+            ),
+        }
+    }
+
     pub fn click_target_by(
         &mut self,
         params: &ClickTargetParams,
         sequence_deadline: Deadline,
     ) -> SemanticActionResult<SemanticActionOutcome> {
         let started = std::time::Instant::now();
-        let result = self.click_target_inner(params.clone(), sequence_deadline);
-        let element = match &result {
-            Ok(outcome) => crate::audit::ElementRef {
-                id: outcome.target.id.0,
-                role: Some(format!("{:?}", outcome.target.role)),
-                name: outcome.target.name.clone(),
-            },
-            Err(_) => match &params.target {
-                ActionTarget::Id(id) => self.element_ref(*id),
-                ActionTarget::Semantic(target) => crate::audit::ElementRef {
-                    id: 0,
-                    role: target.target.role().map(|role| format!("{role:?}")),
-                    name: target.target.query().map(str::to_owned),
-                },
-            },
-        };
+        let mut audit = ClickAuditContext::default();
+        let result =
+            self.click_target_inner_with_audit(params.clone(), sequence_deadline, &mut audit);
+        let element = self.semantic_action_audit_element(&result, &params.target);
         let (method, native_fallback, actuated_id, dispatch, confirmation) = match &result {
             Ok(outcome) => {
-                let (method, native_fallback, actuated_id) = match &outcome.action.method {
-                    ActionMethod::NativeAction { actuated } => {
-                        (Some("native-action"), None, actuated.map(|id| id.0))
-                    }
-                    ActionMethod::Pointer { native_fallback } => {
-                        (Some("pointer"), native_fallback.as_deref(), None)
-                    }
-                    ActionMethod::AccessibilityValue => (Some("accessibility-value"), None, None),
-                    ActionMethod::Keyboard => (Some("keyboard"), None, None),
-                };
+                let (method, native_fallback, actuated_id) =
+                    click_audit_fields(Some(&outcome.action.method));
                 (
                     method,
                     native_fallback,
@@ -1732,13 +1778,16 @@ impl Glass {
                     outcome.action.confirmation.as_str(),
                 )
             }
-            Err(error) => (
-                None,
-                None,
-                None,
-                error.action_dispatch.as_str(),
-                ConfirmationStatus::Unconfirmed.as_str(),
-            ),
+            Err(error) => {
+                let (method, native_fallback, _) = click_audit_fields(audit.method.as_ref());
+                (
+                    method,
+                    native_fallback,
+                    None,
+                    error.action_dispatch.as_str(),
+                    ConfirmationStatus::Unconfirmed.as_str(),
+                )
+            }
         };
         self.emit_audit(
             &crate::audit::Actuation::ClickElement {
@@ -1761,6 +1810,19 @@ impl Glass {
         params: ClickTargetParams,
         sequence_deadline: Deadline,
     ) -> SemanticActionResult<SemanticActionOutcome> {
+        self.click_target_inner_with_audit(
+            params,
+            sequence_deadline,
+            &mut ClickAuditContext::default(),
+        )
+    }
+
+    fn click_target_inner_with_audit(
+        &mut self,
+        params: ClickTargetParams,
+        sequence_deadline: Deadline,
+        audit: &mut ClickAuditContext,
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         let bound = target_deadline(
             &params.target,
             params.timeout_ms,
@@ -1768,31 +1830,41 @@ impl Glass {
             sequence_deadline,
         )?;
         match params.mode {
-            ActionMode::Native => {
-                self.click_native_once(&params.target, params.max_nodes, sequence_deadline, bound)
-            }
+            ActionMode::Native => self.click_native_once(
+                &params.target,
+                params.max_nodes,
+                sequence_deadline,
+                bound,
+                audit,
+            ),
             ActionMode::Pointer => self.click_pointer_once(
                 &params.target,
                 params.max_nodes,
                 sequence_deadline,
                 bound,
                 None,
+                audit,
             ),
             ActionMode::Auto => match self.click_native_once(
                 &params.target,
                 params.max_nodes,
                 sequence_deadline,
                 bound,
+                audit,
             ) {
                 Ok(done) => Ok(done),
                 Err(error) if error.proves_pre_dispatch_native_unavailable() => {
                     let reason = error.safe_fallback_reason();
+                    audit.selected(ActionMethod::Pointer {
+                        native_fallback: Some(reason.clone()),
+                    });
                     self.click_pointer_once(
                         &params.target,
                         params.max_nodes,
                         sequence_deadline,
                         bound,
                         Some(reason),
+                        audit,
                     )
                 }
                 Err(error) => Err(error),
@@ -1950,21 +2022,7 @@ impl Glass {
             Ok(bound) => self.set_value_once(params, text, sequence_deadline, bound),
             Err(error) => Err(error),
         };
-        let element = match &result {
-            Ok(outcome) => crate::audit::ElementRef {
-                id: outcome.target.id.0,
-                role: Some(format!("{:?}", outcome.target.role)),
-                name: outcome.target.name.clone(),
-            },
-            Err(_) => match &params.target {
-                ActionTarget::Id(id) => self.element_ref(*id),
-                ActionTarget::Semantic(target) => crate::audit::ElementRef {
-                    id: 0,
-                    role: target.target.role().map(|role| format!("{role:?}")),
-                    name: target.target.query().map(str::to_owned),
-                },
-            },
-        };
+        let element = self.semantic_action_audit_element(&result, &params.target);
         let (dispatch, confirmation) = match &result {
             Ok(outcome) => (
                 outcome.action.dispatch.as_str(),
@@ -2335,26 +2393,8 @@ impl Glass {
     ) -> SemanticActionResult<SemanticActionOutcome> {
         let started = std::time::Instant::now();
         let result = self.type_target_inner(params, text, sequence_deadline);
-        let element = match &result {
-            Ok(outcome) => crate::audit::ElementRef {
-                id: outcome.target.id.0,
-                role: Some(format!("{:?}", outcome.target.role)),
-                name: outcome.target.name.clone(),
-            },
-            Err(error) => error
-                .candidates
-                .first()
-                .map(|candidate| crate::audit::ElementRef {
-                    id: candidate.element.id.0,
-                    role: Some(format!("{:?}", candidate.element.role)),
-                    name: candidate.element.name.clone(),
-                })
-                .unwrap_or_else(|| crate::audit::ElementRef {
-                    id: 0,
-                    role: params.target.target.role().map(|role| format!("{role:?}")),
-                    name: params.target.target.query().map(str::to_owned),
-                }),
-        };
+        let audit_target = ActionTarget::Semantic(params.target.clone());
+        let element = self.semantic_action_audit_element(&result, &audit_target);
         let focus = match &result {
             Ok(outcome) => outcome.focus.as_ref(),
             Err(error) => error.focus.as_ref(),
