@@ -121,6 +121,16 @@ fn fixture_spec() -> AppSpec {
     }
 }
 
+fn focus_fixture_spec() -> AppSpec {
+    let mut spec = fixture_spec();
+    spec.run.push("--gtk3-focus".into());
+    spec.window_hint = Some(WindowHint {
+        title: Some("Glass A11y Focus Fixture".into()),
+        class: None,
+    });
+    spec
+}
+
 /// How long a fixture gets to publish its tree — this bounds a hang, it does not pace anything.
 const A11Y_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -504,8 +514,12 @@ fn set_value_on_button_is_not_editable() {
     let button = find_role(&tree.root, glass_core::AxRole::Button).expect("button");
     let err = glass.set_value(button.id, "x").unwrap_err();
     assert!(
-        matches!(err, glass_core::GlassError::AxElementNotEditable(_)),
+        matches!(err.cause(), glass_core::GlassError::AxElementNotEditable(id) if *id == button.id.0),
         "got: {err:?}"
+    );
+    assert_eq!(
+        err.bound_dispatch(),
+        Some(glass_core::BoundDispatch::NotDispatched)
     );
     glass.stop().expect("stop");
 }
@@ -593,6 +607,358 @@ fn launch_fixture() -> Glass {
     glass.start(&fixture_spec()).expect("launch");
     await_a11y_ready(&mut glass);
     glass
+}
+
+fn launch_focus_fixture() -> Glass {
+    let mut glass = glass_x11_with_a11y();
+    glass
+        .start(&focus_fixture_spec())
+        .expect("launch GTK3 focus fixture");
+    await_a11y_ready(&mut glass);
+    glass
+}
+
+fn semantic_target(
+    role: glass_core::AxRole,
+    name: &str,
+    states: Vec<glass_core::SemanticState>,
+) -> glass_core::SemanticTarget {
+    glass_core::SemanticTarget {
+        target: glass_core::SemanticSelector::new(Some(name.into()), Some(role), states)
+            .expect("valid semantic selector"),
+        within: None,
+    }
+}
+
+fn actionability_verdict(
+    report: &glass_core::ActionabilityReport,
+    name: glass_core::ActionabilityCheckName,
+) -> glass_core::ActionabilityVerdict {
+    report
+        .checks
+        .iter()
+        .find(|check| check.name == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing {name:?} actionability check in {:?}",
+                report.checks
+            )
+        })
+        .verdict
+}
+
+#[test]
+#[ignore = "needs private AT-SPI bus + GTK fixture"]
+fn semantic_actions_cover_native_focus_pointer_stability_disabled_duplicates_and_occlusion() {
+    use glass_core::{
+        ActionMethod, ActionMode, ActionTarget, ActionabilityCheckName, ActionabilityVerdict,
+        AxRole, ConfirmationStatus, DispatchStatus, SemanticActionFailureKind, SemanticState,
+    };
+
+    let mut focus_glass = launch_focus_fixture();
+    let focus_tree = focus_glass
+        .a11y_snapshot(None)
+        .expect("GTK3 focus fixture snapshot");
+    let field = find_node(&focus_tree.root, "Field").expect("GTK3 Field");
+    assert_eq!(field.role, AxRole::TextField);
+    assert!(field.states.editable);
+    assert!(field.states.focusable);
+    let typed = focus_glass
+        .type_target(
+            &glass_core::TypeTargetParams {
+                target: semantic_target(
+                    AxRole::TextField,
+                    "Field",
+                    vec![SemanticState::Enabled, SemanticState::Visible],
+                ),
+                focus_mode: ActionMode::Native,
+                timeout_ms: 5_000,
+                max_nodes: None,
+            },
+            "Z",
+        )
+        .expect("native focus and one key batch");
+    let focus = typed.focus.expect("targeted type focus report");
+    assert_eq!(focus.confirmation, ConfirmationStatus::FocusConfirmed);
+    assert_eq!(focus.dispatch, DispatchStatus::Dispatched);
+    assert_eq!(typed.action.method, ActionMethod::Keyboard);
+    let typed_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let tree = focus_glass
+            .a11y_snapshot(None)
+            .expect("typed value snapshot");
+        if find_node(&tree.root, "Field")
+            .and_then(|node| node.value.as_deref())
+            .is_some_and(|value| value != "hello" && value.contains('Z'))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < typed_deadline,
+            "one targeted key batch did not change Field"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    focus_glass.stop().expect("stop GTK3 focus fixture");
+
+    let mut glass = launch_fixture();
+    await_a11y_settled(&mut glass);
+    let initial = glass
+        .a11y_snapshot(None)
+        .expect("initial semantic snapshot");
+    let coverage = glass_core::Accessibility::state_coverage(&glass_a11y_linux::LinuxA11y::new());
+    assert_eq!(
+        coverage,
+        glass_core::AxStateCoverage {
+            enabled: true,
+            visible: true,
+            checkable: true,
+            checked: true,
+            selected: true,
+            expanded: true,
+            focused: true,
+            focusable: true,
+            editable: true,
+        }
+    );
+    let semantic_save = find_node(&initial.root, "Semantic Save").expect("semantic save");
+    assert!(semantic_save.states.enabled);
+    assert!(semantic_save.states.visible);
+    assert!(semantic_save.states.focusable);
+    let disabled = find_node(&initial.root, "Disabled semantic").expect("disabled semantic");
+    assert!(!disabled.states.enabled);
+    assert!(disabled.states.visible);
+    let field = find_node(&initial.root, "Field").expect("Field");
+    assert_eq!(field.role, AxRole::TextArea);
+    assert!(field.states.editable);
+    assert!(field.states.focusable);
+    let active = find_node(&initial.root, "Active").expect("Active switch");
+    assert!(active.states.checkable);
+    assert!(!active.states.checked);
+    let company = find_role(&initial.root, AxRole::ComboBox).expect("Company dropdown");
+    assert!(!company.states.expanded);
+    let row = find_role(&initial.root, AxRole::ListItem).expect("first realized row");
+    assert!(!row.states.selected);
+
+    let pointer_typed = glass
+        .type_target(
+            &glass_core::TypeTargetParams {
+                target: semantic_target(
+                    AxRole::TextArea,
+                    "Field",
+                    vec![SemanticState::Enabled, SemanticState::Visible],
+                ),
+                focus_mode: ActionMode::Pointer,
+                timeout_ms: 5_000,
+                max_nodes: None,
+            },
+            "P",
+        )
+        .expect("pointer focus and one key batch");
+    assert_eq!(
+        pointer_typed.focus,
+        Some(glass_core::MutationReport {
+            method: ActionMethod::Pointer {
+                native_fallback: None,
+            },
+            dispatch: DispatchStatus::Dispatched,
+            confirmation: ConfirmationStatus::FocusConfirmed,
+        })
+    );
+    assert_eq!(pointer_typed.action.method, ActionMethod::Keyboard);
+    let pointer_typed_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let tree = glass
+            .a11y_snapshot(None)
+            .expect("pointer-typed value snapshot");
+        if find_node(&tree.root, "Field")
+            .and_then(|node| node.value.as_deref())
+            .is_some_and(|value| value != "hello" && value.contains('P'))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < pointer_typed_deadline,
+            "pointer-focused key batch did not change Field"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    let unconfirmed = glass
+        .type_target(
+            &glass_core::TypeTargetParams {
+                target: semantic_target(
+                    AxRole::TextArea,
+                    "Refusing Editor",
+                    vec![SemanticState::Enabled, SemanticState::Visible],
+                ),
+                focus_mode: ActionMode::Pointer,
+                timeout_ms: 5_000,
+                max_nodes: None,
+            },
+            "must not type",
+        )
+        .expect_err("typing must stop when pointer focus is not confirmed");
+    assert_eq!(
+        unconfirmed.kind,
+        SemanticActionFailureKind::FocusUnconfirmed
+    );
+    assert_eq!(unconfirmed.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        unconfirmed.focus,
+        Some(glass_core::MutationReport {
+            method: ActionMethod::Pointer {
+                native_fallback: None,
+            },
+            dispatch: DispatchStatus::Dispatched,
+            confirmation: ConfirmationStatus::Unconfirmed,
+        })
+    );
+    let unconfirmed_tree = glass
+        .a11y_snapshot(None)
+        .expect("unconfirmed field snapshot");
+    assert_eq!(
+        find_node(&unconfirmed_tree.root, "Refusing Editor").and_then(|node| node.value.as_deref()),
+        Some("untouched")
+    );
+
+    let save = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Semantic Save",
+                vec![SemanticState::Enabled],
+            )),
+            mode: ActionMode::Native,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect("native semantic save");
+    assert_eq!(
+        save.action.method,
+        ActionMethod::NativeAction { actuated: None }
+    );
+    assert_eq!(save.action.dispatch, DispatchStatus::Dispatched);
+    let save_log = glass
+        .wait_for_log(&glass_core::WaitLogParams {
+            contains: "SEMANTIC_SAVE".into(),
+            stream: None,
+            cursor: Some(0),
+            interval_ms: 25,
+            timeout_ms: 2_000,
+        })
+        .expect("semantic save log");
+    assert!(
+        save_log.matched,
+        "native action did not reach the GTK button"
+    );
+
+    let moving_started = std::time::Instant::now();
+    let moving = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Moving semantic",
+                vec![SemanticState::Enabled, SemanticState::Visible],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect("stable pointer click");
+    assert!(
+        moving_started.elapsed() >= std::time::Duration::from_millis(100),
+        "semantic pointer click skipped the two-sample stability interval"
+    );
+    assert_eq!(
+        moving.action.method,
+        ActionMethod::Pointer {
+            native_fallback: None
+        }
+    );
+    assert_eq!(
+        actionability_verdict(&moving.actionability, ActionabilityCheckName::Stable),
+        ActionabilityVerdict::Passed
+    );
+    assert_eq!(
+        actionability_verdict(&moving.actionability, ActionabilityCheckName::NonOccluded,),
+        ActionabilityVerdict::Passed
+    );
+    let (settled, _) = glass
+        .logs(0, 100, None, Some("MOVING_SETTLED"))
+        .expect("movement logs");
+    assert!(
+        !settled.is_empty(),
+        "pointer dispatch returned before the GTK bounds stopped moving"
+    );
+    let moving_click = glass
+        .wait_for_log(&glass_core::WaitLogParams {
+            contains: "MOVING_CLICKED".into(),
+            stream: None,
+            cursor: Some(0),
+            interval_ms: 25,
+            timeout_ms: 2_000,
+        })
+        .expect("moving click log");
+    assert!(
+        moving_click.matched,
+        "forced pointer click did not reach Moving semantic"
+    );
+
+    let disabled = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Disabled semantic",
+                vec![],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(0),
+            max_nodes: None,
+        })
+        .expect_err("disabled semantic target must be refused");
+    assert_eq!(disabled.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(disabled.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        actionability_verdict(&disabled.actionability, ActionabilityCheckName::Enabled),
+        ActionabilityVerdict::Failed
+    );
+
+    let duplicate = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Duplicate semantic",
+                vec![],
+            )),
+            mode: ActionMode::Native,
+            timeout_ms: Some(0),
+            max_nodes: None,
+        })
+        .expect_err("duplicate semantic target must be refused");
+    assert_eq!(duplicate.kind, SemanticActionFailureKind::AmbiguousTarget);
+    assert_eq!(duplicate.action_dispatch, DispatchStatus::NotDispatched);
+
+    let occluded = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Occluded semantic",
+                vec![SemanticState::Enabled, SemanticState::Visible],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect_err("AT-SPI must prove the occluder before pointer dispatch");
+    assert_eq!(occluded.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(occluded.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        actionability_verdict(&occluded.actionability, ActionabilityCheckName::NonOccluded,),
+        ActionabilityVerdict::Failed
+    );
+
+    glass.stop().expect("stop semantic fixture");
 }
 
 /// Every description case in one launch: the AT-SPI bus is shared per process and the suite

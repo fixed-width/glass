@@ -3,7 +3,14 @@
 <head>
 <meta charset="utf-8">
 <title>Glass web fixture</title>
-<style>body{font:16px sans-serif;margin:24px} section{margin-bottom:16px} iframe{width:320px;height:120px}</style>
+<style>
+body{font:16px sans-serif;margin:24px} section{margin-bottom:16px} iframe{width:320px;height:120px}
+#motion-track{position:relative;width:360px;height:48px}
+#moving-semantic{position:absolute;left:0;top:0}
+#occlusion-stage{position:relative;width:240px;height:48px}
+#occluded-semantic,#occluder{position:absolute;left:0;top:0;width:200px;height:40px}
+#occluder{left:70px;width:60px;z-index:2}
+</style>
 </head>
 <body>
 <h1>Glass web fixture</h1>
@@ -14,6 +21,23 @@
   <input id="account-name" type="text" value="">
   <button id="save-account" type="button">Save account</button>
   <p id="account-status" aria-live="polite">Not saved</p>
+</section>
+<section aria-labelledby="semantic-action-heading">
+  <h2 id="semantic-action-heading">Semantic action cases</h2>
+  <button id="disabled-semantic" type="button" disabled>Disabled semantic</button>
+  <button class="duplicate-semantic" type="button">Duplicate semantic</button>
+  <button class="duplicate-semantic" type="button">Duplicate semantic</button>
+  <button id="restart-moving-semantic" type="button">Start motion</button>
+  <div id="motion-track">
+    <button id="moving-semantic" type="button">Moving semantic</button>
+  </div>
+  <div id="occlusion-stage">
+    <button id="occluded-semantic" type="button">Occluded semantic</button>
+    <button id="occluder" type="button">Occluder</button>
+  </div>
+  <button id="restart-delayed-semantic" type="button">Start delay</button>
+  <button id="delayed-semantic" type="button" hidden>Delayed semantic</button>
+  <p id="semantic-action-status" aria-live="polite">No semantic action activated</p>
 </section>
 <div id="large-page" aria-label="Large page sections"></div>
 <section>
@@ -51,6 +75,56 @@
 document.getElementById('save-account').addEventListener('click', function () {
   document.getElementById('account-status').textContent = 'Saved';
 });
+const semanticStatus = document.getElementById('semantic-action-status');
+const movingSemantic = document.getElementById('moving-semantic');
+const delayedSemantic = document.getElementById('delayed-semantic');
+let movingFrame = 0;
+let delayedTimer = 0;
+let movingActivations = 0;
+let delayedActivations = 0;
+let duplicateActivations = 0;
+let occludedActivations = 0;
+let occluderActivations = 0;
+function restartMotion() {
+  cancelAnimationFrame(movingFrame);
+  const started = performance.now();
+  function move(now) {
+    const elapsed = now - started;
+    movingSemantic.style.left = `${Math.min(elapsed / 300, 1) * 240}px`;
+    if (elapsed < 300) movingFrame = requestAnimationFrame(move);
+  }
+  movingFrame = requestAnimationFrame(move);
+}
+function restartDelay() {
+  clearTimeout(delayedTimer);
+  delayedSemantic.hidden = true;
+  delayedTimer = setTimeout(function () { delayedSemantic.hidden = false; }, 250);
+}
+document.getElementById('restart-moving-semantic').addEventListener('click', restartMotion);
+document.getElementById('restart-delayed-semantic').addEventListener('click', restartDelay);
+movingSemantic.addEventListener('click', function () {
+  movingActivations += 1;
+  semanticStatus.textContent = `Moving activated ${movingActivations}`;
+});
+delayedSemantic.addEventListener('click', function () {
+  delayedActivations += 1;
+  semanticStatus.textContent = `Delayed activated ${delayedActivations}`;
+});
+for (const duplicate of document.querySelectorAll('.duplicate-semantic')) {
+  duplicate.addEventListener('click', function () {
+    duplicateActivations += 1;
+    semanticStatus.textContent = `Duplicate activated ${duplicateActivations}`;
+  });
+}
+document.getElementById('occluded-semantic').addEventListener('click', function () {
+  occludedActivations += 1;
+  semanticStatus.textContent = `Occluded activated ${occludedActivations}`;
+});
+document.getElementById('occluder').addEventListener('click', function () {
+  occluderActivations += 1;
+  semanticStatus.textContent = `Occluder activated ${occluderActivations}`;
+});
+restartMotion();
 const largePage = document.getElementById('large-page');
 for (let index = 0; index < 200; index += 1) {
   const section = document.createElement('section');

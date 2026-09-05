@@ -127,6 +127,7 @@ pub(crate) struct Conn {
     pub(crate) writer: TcpStream,
     pub(crate) reader: BufReader<TcpStream>,
     pub(crate) next_id: i64,
+    hello: Value,
     poisoned: bool,
     #[cfg(test)]
     timeout_faults: std::collections::VecDeque<TimeoutFault>,
@@ -180,6 +181,7 @@ impl Conn {
             writer: stream,
             reader,
             next_id: 1,
+            hello: Value::Null,
             poisoned: false,
             #[cfg(test)]
             timeout_faults: Default::default(),
@@ -205,8 +207,14 @@ impl Conn {
                 "agent protocol mismatch: got {proto:?}, want {PROTO}"
             )));
         }
+        c.hello = v.get("hello").cloned().unwrap_or(Value::Null);
         c.restore_timeouts()?;
         Ok(c)
+    }
+
+    /// One additive capability from the peer's protocol-1 hello.
+    pub(crate) fn hello_capability(&self, name: &str) -> Option<&Value> {
+        self.hello.get(name)
     }
 
     pub(crate) fn ensure_usable(&self) -> glass_core::Result<()> {
@@ -629,6 +637,16 @@ mod tests {
 
     const HELLO: &str = r#"{"hello":{"proto":1}}"#;
     const OK: &str = r#"{"ok":true}"#;
+
+    #[test]
+    fn additive_hello_capability_is_retained_without_changing_protocol_one() {
+        let (port, _) = fake_agent(r#"{"hello":{"proto":1,"node_schema":2}}"#, vec![]);
+        let conn = Conn::open(port).expect("protocol 1 with additive capability");
+        assert_eq!(
+            conn.hello_capability("node_schema").and_then(Value::as_i64),
+            Some(2)
+        );
+    }
 
     #[test]
     fn connection_retry_helpers_keep_short_writes_partial_and_retry_only_expected_errors() {

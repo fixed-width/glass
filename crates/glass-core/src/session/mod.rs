@@ -29,10 +29,18 @@ mod clipboard;
 mod find;
 mod input;
 mod lifecycle;
+mod semantic_action;
 mod wait;
 mod window;
 
 pub use find::{FindElementsOutcome, FindElementsParams};
+pub use semantic_action::{
+    ActionDeadline, ActionMethod, ActionMode, ActionTarget, ClickTargetParams, ConfirmationStatus,
+    DispatchStatus, MutationReport, ResolutionReport, RetryGuidance,
+    SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_MAX_TIMEOUT_MS, SemanticActionError,
+    SemanticActionFailureKind, SemanticActionOutcome, SemanticTarget, SetValueTargetParams,
+    TypeTargetParams,
+};
 pub use wait::{
     SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS, ScrollDirection, ScrollToElementOutcome,
     ScrollToElementParams, WaitElementOutcome, WaitElementParams, WaitLogOutcome, WaitLogParams,

@@ -128,6 +128,31 @@ pub struct SelectWindowArgs {
     pub id: u64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionModeArg {
+    Auto,
+    Native,
+    Pointer,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionScopeArgs {
+    pub query: Option<String>,
+    pub role: Option<String>,
+    pub states: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionTargetArgs {
+    pub query: Option<String>,
+    pub role: Option<String>,
+    pub states: Option<Vec<String>>,
+    pub within: Option<ActionScopeArgs>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClickElementArgs {
     /// Element `#id` from the latest `glass_a11y_snapshot`.
@@ -140,7 +165,12 @@ pub struct ClickElementArgs {
     /// `method:"native-action"` labels any native path.
     /// `native_fallback` explains pointer fallback.
     /// `actuated_id` identifies a substituted enclosing control.
-    pub id: u32,
+    pub id: Option<u32>,
+    pub target: Option<ActionTargetArgs>,
+    pub mode: Option<ActionModeArg>,
+    #[schemars(range(min = 0, max = 120000))]
+    pub timeout_ms: Option<u64>,
+    pub max_nodes: Option<u32>,
     /// Terminal observation: "snapshot" settles and refreshes/folds a11y, "settle" waits for
     /// visual stability and returns text-only metadata, and "none" skips observation (default).
     #[serde(rename = "return")]
@@ -150,12 +180,16 @@ pub struct ClickElementArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetValueArgs {
     /// The element `#id` from `glass_a11y_snapshot`.
-    pub id: u32,
+    pub id: Option<u32>,
+    pub target: Option<ActionTargetArgs>,
     /// The value to set. For a text field, the text. For a spin/slider, a number.
     /// For a switch/checkbox/toggle, a boolean (`"true"`/`"false"`/`"on"`/`"off"`/
     /// `"1"`/`"0"`) — idempotent. For a dropdown/combo box, an option label
     /// (case-insensitive); glass opens it and picks that option.
     pub text: String,
+    #[schemars(range(min = 0, max = 120000))]
+    pub timeout_ms: Option<u64>,
+    pub max_nodes: Option<u32>,
     /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
     /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (waits for visual
     /// stability and returns text-only metadata), or "none" (default).
@@ -298,10 +332,15 @@ pub struct ScrollArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TypeArgs {
-    /// Text to type into whatever currently has keyboard focus — this tool does not
-    /// focus a field, so click or `glass_click_element` one first. Sent as synthetic
-    /// key events, not pasted, so an app's per-keystroke handlers run.
+    /// Text to type. When `target` is omitted, text is sent to the current keyboard focus.
+    /// When `target` is supplied, Glass resolves and focuses that element before typing.
+    /// Sent as synthetic key events, not pasted, so an app's per-keystroke handlers run.
     pub text: String,
+    pub target: Option<ActionTargetArgs>,
+    pub focus_mode: Option<ActionModeArg>,
+    #[schemars(range(min = 0, max = 120000))]
+    pub timeout_ms: Option<u64>,
+    pub max_nodes: Option<u32>,
     /// Terminal observation: "snapshot" settles and refreshes/folds a11y, "settle" waits for
     /// visual stability and returns text-only metadata, and "none" skips observation (default).
     #[serde(rename = "return")]
@@ -896,20 +935,20 @@ mod tests {
     #[test]
     fn click_element_args_parse() {
         let a: ClickElementArgs = serde_json::from_str(r#"{"id":5}"#).unwrap();
-        assert_eq!(a.id, 5);
+        assert_eq!(a.id, Some(5));
     }
 
     #[test]
     fn set_value_args_parse() {
         let a: SetValueArgs = serde_json::from_str(r#"{"id":5,"text":"hi"}"#).unwrap();
-        assert_eq!(a.id, 5);
+        assert_eq!(a.id, Some(5));
         assert_eq!(a.text, "hi");
     }
 
     #[test]
     fn click_element_args_parse_return() {
         let a: ClickElementArgs = serde_json::from_str(r#"{"id":5,"return":"snapshot"}"#).unwrap();
-        assert_eq!(a.id, 5);
+        assert_eq!(a.id, Some(5));
         assert_eq!(a.return_.as_deref(), Some("snapshot"));
         let b: ClickElementArgs = serde_json::from_str(r#"{"id":1}"#).unwrap();
         assert!(b.return_.is_none());
@@ -919,8 +958,198 @@ mod tests {
     fn set_value_args_parse_return() {
         let a: SetValueArgs =
             serde_json::from_str(r#"{"id":2,"text":"hi","return":"settle"}"#).unwrap();
-        assert_eq!(a.id, 2);
+        assert_eq!(a.id, Some(2));
         assert_eq!(a.return_.as_deref(), Some("settle"));
+    }
+
+    #[test]
+    fn click_element_args_parse_id_with_typed_mode() {
+        let a: ClickElementArgs = serde_json::from_str(r#"{"id":42,"mode":"pointer"}"#).unwrap();
+        assert_eq!(a.id, Some(42));
+        assert!(matches!(a.mode, Some(ActionModeArg::Pointer)));
+        assert!(a.target.is_none());
+    }
+
+    #[test]
+    fn click_element_args_parse_semantic_target_controls() {
+        let a: ClickElementArgs = serde_json::from_str(
+            r#"{
+              "target":{"query":"Save account","role":"Button","states":["enabled"],
+                        "within":{"query":"Account","role":"Document"}},
+              "timeout_ms":10000,"max_nodes":0,"mode":"auto","return":"snapshot"
+            }"#,
+        )
+        .unwrap();
+        let target = a.target.as_ref().unwrap();
+        assert_eq!(target.query.as_deref(), Some("Save account"));
+        assert_eq!(target.role.as_deref(), Some("Button"));
+        assert_eq!(
+            target.states.as_deref(),
+            Some(["enabled".to_string()].as_slice())
+        );
+        assert_eq!(
+            target
+                .within
+                .as_ref()
+                .and_then(|scope| scope.query.as_deref()),
+            Some("Account")
+        );
+        assert_eq!(a.timeout_ms, Some(10_000));
+        assert_eq!(a.max_nodes, Some(0));
+        assert!(matches!(a.mode, Some(ActionModeArg::Auto)));
+        assert_eq!(a.return_.as_deref(), Some("snapshot"));
+    }
+
+    #[test]
+    fn set_value_args_parse_semantic_target() {
+        let a: SetValueArgs = serde_json::from_str(
+            r#"{"target":{"query":"Account name","role":"TextField"},"text":"Ada"}"#,
+        )
+        .unwrap();
+        assert!(a.id.is_none());
+        assert_eq!(
+            a.target.as_ref().and_then(|t| t.query.as_deref()),
+            Some("Account name")
+        );
+        assert_eq!(a.text, "Ada");
+    }
+
+    #[test]
+    fn type_args_parse_semantic_target_controls() {
+        let a: TypeArgs = serde_json::from_str(
+            r#"{
+              "target":{"query":"Account name","role":"TextField"},
+              "text":"Ada","focus_mode":"native","timeout_ms":5000
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            a.target.as_ref().and_then(|t| t.role.as_deref()),
+            Some("TextField")
+        );
+        assert!(matches!(a.focus_mode, Some(ActionModeArg::Native)));
+        assert_eq!(a.timeout_ms, Some(5_000));
+    }
+
+    #[test]
+    fn type_args_text_schema_distinguishes_targeted_and_untargeted_focus() {
+        let schema = serde_json::to_value(schemars::schema_for!(TypeArgs)).unwrap();
+        let description = schema["properties"]["text"]["description"]
+            .as_str()
+            .expect("text has a public schema description");
+        assert!(
+            description.contains("When `target` is omitted"),
+            "{description}"
+        );
+        assert!(
+            description.contains("current keyboard focus"),
+            "{description}"
+        );
+        assert!(
+            description.contains("When `target` is supplied"),
+            "{description}"
+        );
+        assert!(
+            description.contains("resolves and focuses"),
+            "{description}"
+        );
+        assert!(
+            !description.contains("does not focus a field"),
+            "{description}"
+        );
+    }
+
+    fn json_contains_number(value: &serde_json::Value, key: &str, expected: u64) -> bool {
+        match value {
+            serde_json::Value::Object(object) => {
+                object.get(key).and_then(serde_json::Value::as_u64) == Some(expected)
+                    || object
+                        .values()
+                        .any(|child| json_contains_number(child, key, expected))
+            }
+            serde_json::Value::Array(array) => array
+                .iter()
+                .any(|child| json_contains_number(child, key, expected)),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn click_element_args_schema_adds_optional_target_mode_and_bounded_timeout() {
+        let click = serde_json::to_value(schemars::schema_for!(ClickElementArgs)).unwrap();
+        let click_properties = click["properties"].as_object().unwrap();
+        for field in ["id", "target", "mode", "timeout_ms", "max_nodes", "return"] {
+            assert!(
+                click_properties.contains_key(field),
+                "missing click {field}"
+            );
+        }
+        assert!(
+            !click["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|name| name == "id"))
+        );
+
+        let set_value = serde_json::to_value(schemars::schema_for!(SetValueArgs)).unwrap();
+        let set_properties = set_value["properties"].as_object().unwrap();
+        for field in ["id", "target", "text", "timeout_ms", "max_nodes", "return"] {
+            assert!(
+                set_properties.contains_key(field),
+                "missing set_value {field}"
+            );
+        }
+        assert!(
+            !set_value["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|name| name == "id"))
+        );
+
+        let type_args = serde_json::to_value(schemars::schema_for!(TypeArgs)).unwrap();
+        let type_properties = type_args["properties"].as_object().unwrap();
+        for field in [
+            "text",
+            "target",
+            "focus_mode",
+            "timeout_ms",
+            "max_nodes",
+            "return",
+        ] {
+            assert!(type_properties.contains_key(field), "missing type {field}");
+        }
+
+        for timeout in [
+            &click_properties["timeout_ms"],
+            &set_properties["timeout_ms"],
+            &type_properties["timeout_ms"],
+        ] {
+            assert!(json_contains_number(timeout, "maximum", 120_000));
+        }
+
+        let mode_schema = serde_json::to_value(schemars::schema_for!(ActionModeArg)).unwrap();
+        assert_eq!(
+            mode_schema["enum"],
+            serde_json::json!(["auto", "native", "pointer"])
+        );
+    }
+
+    #[test]
+    fn action_schema_keeps_semantic_structs_embedded_in_existing_variants() {
+        let schema = serde_json::to_value(schemars::schema_for!(Action)).unwrap();
+        let encoded = schema.to_string();
+        for definition in ["ClickElementArgs", "SetValueArgs", "TypeArgs"] {
+            assert!(
+                encoded.contains(definition),
+                "missing {definition}: {encoded}"
+            );
+        }
+        assert!(
+            encoded.contains("target"),
+            "missing semantic target fields: {encoded}"
+        );
+        assert!(
+            encoded.contains("focus_mode"),
+            "missing targeted type mode: {encoded}"
+        );
     }
 
     #[test]

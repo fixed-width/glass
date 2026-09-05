@@ -11,8 +11,8 @@ use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
     A11yMutationDispatch, A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget,
-    AxTree, Deadline, GlassError, Result, WalkBudget, Whose, normalize_description, normalize_name,
-    read_back_confirms, write_took_no_effect,
+    AxTree, Deadline, GlassError, PointerHit, Result, WalkBudget, Whose, normalize_description,
+    normalize_name, read_back_confirms, write_took_no_effect,
 };
 
 use crate::mapping::{map_role, map_states};
@@ -41,6 +41,42 @@ impl Accessibility for LinuxA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let ctx = ctx.clone();
         BUS.snapshot(ctx.deadline, move || run_snapshot(&ctx))
+    }
+
+    fn state_coverage(&self) -> glass_core::AxStateCoverage {
+        glass_core::AxStateCoverage {
+            enabled: true,
+            visible: true,
+            checkable: true,
+            checked: true,
+            selected: true,
+            expanded: true,
+            focused: true,
+            focusable: true,
+            editable: true,
+        }
+    }
+
+    fn focus(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
+        let ctx = ctx.clone();
+        let target = target.clone();
+        BUS.focus(ctx.deadline, move |dispatch| {
+            run_focus(&ctx, &target, dispatch)
+        })?;
+        Ok(None)
+    }
+
+    fn pointer_target_at(
+        &mut self,
+        ctx: &AxContext,
+        target: &AxTarget,
+        point: (i32, i32),
+    ) -> Result<PointerHit> {
+        let ctx = ctx.clone();
+        let target = target.clone();
+        BUS.snapshot(ctx.deadline, move || {
+            run_pointer_target_at(&ctx, &target, point)
+        })
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -107,6 +143,26 @@ fn run_invoke(ctx: &AxContext, target: &AxTarget, dispatch: &A11yMutationDispatc
         .build()
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
     rt.block_on(invoke_async(ctx, target, dispatch))
+}
+
+fn run_focus(ctx: &AxContext, target: &AxTarget, dispatch: &A11yMutationDispatch) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
+    rt.block_on(focus_async(ctx, target, dispatch))
+}
+
+fn run_pointer_target_at(
+    ctx: &AxContext,
+    target: &AxTarget,
+    point: (i32, i32),
+) -> Result<PointerHit> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
+    rt.block_on(pointer_target_at_async(ctx, target, point))
 }
 
 fn bus_err(e: impl std::fmt::Display) -> GlassError {
@@ -742,11 +798,423 @@ enum NativeInvokeKind {
     Activate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeFocusKind {
+    Focus,
+    Unsupported,
+}
+
+fn native_focus_kind(role: glass_core::AxRole) -> NativeFocusKind {
+    match role {
+        glass_core::AxRole::TextField | glass_core::AxRole::TextArea => NativeFocusKind::Focus,
+        _ => NativeFocusKind::Unsupported,
+    }
+}
+
 fn native_invoke_kind(role: glass_core::AxRole) -> NativeInvokeKind {
     match role {
         glass_core::AxRole::TextField | glass_core::AxRole::TextArea => NativeInvokeKind::Focus,
         _ => NativeInvokeKind::Activate,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ObjectIdentity<'a> {
+    bus_name: &'a str,
+    object_path: &'a str,
+}
+
+impl<'a> ObjectIdentity<'a> {
+    const fn new(bus_name: &'a str, object_path: &'a str) -> Self {
+        Self {
+            bus_name,
+            object_path,
+        }
+    }
+
+    fn from_object_ref(object: &'a ObjectRefOwned) -> Option<Self> {
+        Some(Self::new(object.name_as_str()?, object.path_as_str()))
+    }
+}
+
+fn classify_hit_reference(
+    target: ObjectIdentity<'_>,
+    accepted_ancestor: Option<ObjectIdentity<'_>>,
+    hit: Option<ObjectIdentity<'_>>,
+) -> glass_core::PointerHit {
+    let Some(hit) = hit else {
+        return glass_core::PointerHit::Inconclusive;
+    };
+    if hit == target {
+        glass_core::PointerHit::Target
+    } else if Some(hit) == accepted_ancestor {
+        glass_core::PointerHit::AcceptedAncestor
+    } else {
+        glass_core::PointerHit::Other
+    }
+}
+
+const POINTER_HIT_OP: &str = "pointer hit probe";
+
+fn pointer_reference_error(detail: impl std::fmt::Display) -> GlassError {
+    GlassError::AccessibilityUnavailable(format!("AT-SPI pointer hit probe failed: {detail}"))
+}
+
+fn required_object_identity(object: &ObjectRefOwned) -> Result<ObjectIdentity<'_>> {
+    ObjectIdentity::from_object_ref(object)
+        .ok_or_else(|| pointer_reference_error("malformed non-null object reference"))
+}
+
+async fn pointer_bus_call<T, E, F>(deadline: Deadline, operation: &str, future: F) -> Result<T>
+where
+    E: std::fmt::Display,
+    F: std::future::Future<Output = std::result::Result<T, E>>,
+{
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(POINTER_HIT_OP));
+    }
+    await_caller_deadline(deadline, future)
+        .await
+        .map_err(|()| GlassError::caller_deadline_elapsed(POINTER_HIT_OP))?
+        .map_err(|e| pointer_reference_error(format!("{operation}: {e}")))
+}
+
+fn validate_strict_reference<'a>(
+    object: &'a ObjectRefOwned,
+    description: &str,
+) -> Result<ObjectIdentity<'a>> {
+    ObjectIdentity::from_object_ref(object).ok_or_else(|| {
+        pointer_reference_error(format!(
+            "{description} is an explicit null object reference"
+        ))
+    })
+}
+
+fn strict_pid_match(pids: &[u32], pid: Result<u32>) -> Result<bool> {
+    if pids.is_empty() {
+        Ok(true)
+    } else {
+        Ok(pids.contains(&pid?))
+    }
+}
+
+fn contextualize_pid_lookup_error(bus_name: &str, error: GlassError) -> GlassError {
+    match error {
+        error @ GlassError::Bounded { .. } => error,
+        error => pointer_reference_error(format!("application {bus_name} PID lookup: {error}")),
+    }
+}
+
+async fn pointer_accessible<'a>(
+    conn: &'a zbus::Connection,
+    object: &'a ObjectRefOwned,
+) -> Result<AccessibleProxy<'a>> {
+    if object.is_null() {
+        return Err(pointer_reference_error("unexpected null object reference"));
+    }
+    object
+        .as_accessible_proxy(conn)
+        .await
+        .map_err(|e| pointer_reference_error(format!("accessible proxy: {e}")))
+}
+
+async fn pointer_component<'a>(
+    ctx: &AxContext,
+    conn: &'a zbus::Connection,
+    object: &'a ObjectRefOwned,
+) -> Result<ComponentProxy<'a>> {
+    let identity = required_object_identity(object)?;
+    let builder = ComponentProxy::builder(conn)
+        .destination(identity.bus_name)
+        .map_err(|e| pointer_reference_error(format!("component destination: {e}")))?
+        .path(identity.object_path)
+        .map_err(|e| pointer_reference_error(format!("component path: {e}")))?;
+    pointer_bus_call(ctx.deadline, "component proxy", builder.build()).await
+}
+
+/// Pointer-action app lookup. Unlike snapshot discovery, every registry reference and PID read is
+/// evidence used for an action decision, so an unreadable entry is an error rather than a skipped
+/// non-match.
+async fn find_app_strict(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)> {
+    let conn = match ctx.a11y_bus_addr.as_deref() {
+        Some(addr) => {
+            let parsed = addr.try_into().map_err(|e| {
+                GlassError::AccessibilityUnavailable(format!("bad a11y address: {e}"))
+            })?;
+            pointer_bus_call(
+                ctx.deadline,
+                "private accessibility bus connection",
+                AccessibilityConnection::from_address(parsed),
+            )
+            .await?
+        }
+        None => {
+            return Err(GlassError::AccessibilityUnavailable(
+                "no accessibility bus for this launch — relaunch the app with a11y:true \
+                 to enable the accessibility tree (Linux)"
+                    .into(),
+            ));
+        }
+    };
+    let zbus_conn = conn.connection().clone();
+    let root = pointer_bus_call(
+        ctx.deadline,
+        "registry root",
+        conn.root_accessible_on_registry(),
+    )
+    .await?;
+    let app_refs =
+        pointer_bus_call(ctx.deadline, "registry applications", root.get_children()).await?;
+    let dbus = if ctx.pids.is_empty() {
+        None
+    } else {
+        Some(
+            pointer_bus_call(
+                ctx.deadline,
+                "D-Bus proxy",
+                zbus::fdo::DBusProxy::new(&zbus_conn),
+            )
+            .await?,
+        )
+    };
+    for app_ref in app_refs {
+        let identity = validate_strict_reference(&app_ref, "registry application")?;
+        let _app = pointer_accessible(&zbus_conn, &app_ref).await?;
+        let pid = match &dbus {
+            Some(dbus) => pointer_bus_call(
+                ctx.deadline,
+                "application PID",
+                dbus.get_connection_unix_process_id(
+                    app_ref
+                        .name()
+                        .expect("a validated non-null reference has a unique name")
+                        .clone()
+                        .into(),
+                ),
+            )
+            .await
+            .map_err(|error| contextualize_pid_lookup_error(identity.bus_name, error)),
+            None => Ok(0),
+        };
+        if strict_pid_match(&ctx.pids, pid)? {
+            return Ok((app_ref, zbus_conn));
+        }
+    }
+    Err(GlassError::AccessibilityNotReady(no_app_tree_message(
+        &ctx.pids,
+    )))
+}
+
+/// Action rewalk with the same pre-order and bounds as [`find_nth`], but without its
+/// snapshot-compatible null/proxy skips. Skipping here could shift the requested id onto another
+/// object, so every unreadable reference propagates.
+async fn find_nth_strict(
+    ctx: &AxContext,
+    node_ref: &ObjectRefOwned,
+    proxy: &AccessibleProxy<'_>,
+    conn: &zbus::Connection,
+    depth: usize,
+    target: u32,
+    budget: &mut WalkBudget,
+) -> Result<Option<ObjectRefOwned>> {
+    validate_strict_reference(node_ref, "walk node")?;
+    if budget.nodes_walked() == target as usize {
+        return Ok(Some(node_ref.clone()));
+    }
+    budget.visit();
+    let child_refs =
+        pointer_bus_call(ctx.deadline, "target walk children", proxy.get_children()).await?;
+    if child_refs.is_empty() || !budget.may_explore_children(depth) {
+        return Ok(None);
+    }
+    for (scanned, child_ref) in child_refs.into_iter().enumerate() {
+        if !budget.may_visit_sibling(scanned) {
+            break;
+        }
+        validate_strict_reference(&child_ref, "target walk child")?;
+        let child = pointer_accessible(conn, &child_ref).await?;
+        if let Some(found) = Box::pin(find_nth_strict(
+            ctx,
+            &child_ref,
+            &child,
+            conn,
+            depth + 1,
+            target,
+            budget,
+        ))
+        .await?
+        {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+fn is_window_coordinate_root(role: atspi_common::Role) -> bool {
+    matches!(
+        role,
+        atspi_common::Role::Frame
+            | atspi_common::Role::Window
+            | atspi_common::Role::Dialog
+            | atspi_common::Role::Alert
+            | atspi_common::Role::FileChooser
+            | atspi_common::Role::ColorChooser
+            | atspi_common::Role::FontChooser
+    )
+}
+
+async fn containing_window_root(
+    ctx: &AxContext,
+    conn: &zbus::Connection,
+    target_ref: &ObjectRefOwned,
+) -> Result<ObjectRefOwned> {
+    let mut current = target_ref.clone();
+    let mut seen = Vec::new();
+    for _ in 0..=ctx.limits.depth {
+        validate_strict_reference(&current, "target ancestry object")?;
+        if seen.contains(&current) {
+            return Err(pointer_reference_error("cyclic target ancestry"));
+        }
+        seen.push(current.clone());
+        let proxy = pointer_accessible(conn, &current).await?;
+        let role = pointer_bus_call(ctx.deadline, "target ancestor role", proxy.get_role()).await?;
+        if is_window_coordinate_root(role) {
+            return Ok(current);
+        }
+        let parent =
+            pointer_bus_call(ctx.deadline, "target ancestor parent", proxy.parent()).await?;
+        if parent.is_null() {
+            return Err(pointer_reference_error(
+                "target has no containing window, frame, or dialog",
+            ));
+        }
+        current = parent;
+    }
+    Err(pointer_reference_error(format!(
+        "target ancestry exceeded the configured depth limit ({})",
+        ctx.limits.depth
+    )))
+}
+
+async fn first_interactable_ancestor(
+    ctx: &AxContext,
+    conn: &zbus::Connection,
+    target_ref: &ObjectRefOwned,
+) -> Result<Option<ObjectRefOwned>> {
+    let mut current = target_ref.clone();
+    let mut seen = vec![current.clone()];
+    for _ in 0..ctx.limits.depth {
+        let current_proxy = pointer_accessible(conn, &current).await?;
+        let parent =
+            pointer_bus_call(ctx.deadline, "ancestor parent", current_proxy.parent()).await?;
+        if parent.is_null() {
+            return Ok(None);
+        }
+        if seen.contains(&parent) {
+            return Err(pointer_reference_error("cyclic ancestor references"));
+        }
+        let parent_proxy = pointer_accessible(conn, &parent).await?;
+        let role = pointer_bus_call(ctx.deadline, "ancestor role", parent_proxy.get_role()).await?;
+        if map_role(role).is_interactable() {
+            return Ok(Some(parent));
+        }
+        seen.push(parent.clone());
+        current = parent;
+    }
+    Err(pointer_reference_error(format!(
+        "ancestor walk exceeded the configured depth limit ({})",
+        ctx.limits.depth
+    )))
+}
+
+async fn classify_pointer_hit(
+    ctx: &AxContext,
+    conn: &zbus::Connection,
+    target_ref: &ObjectRefOwned,
+    accepted_ancestor: Option<&ObjectRefOwned>,
+    hit: ObjectRefOwned,
+) -> Result<PointerHit> {
+    if hit.is_null() {
+        return Ok(PointerHit::Inconclusive);
+    }
+    let target_identity = required_object_identity(target_ref)?;
+    let accepted_identity = accepted_ancestor
+        .map(required_object_identity)
+        .transpose()?;
+    let mut current = hit;
+    let mut seen = Vec::new();
+    for _ in 0..=ctx.limits.depth {
+        let current_identity = required_object_identity(&current)?;
+        let classification =
+            classify_hit_reference(target_identity, accepted_identity, Some(current_identity));
+        if classification != PointerHit::Other {
+            return Ok(classification);
+        }
+        if seen.contains(&current) {
+            return Err(pointer_reference_error("cyclic hit ancestry"));
+        }
+        seen.push(current.clone());
+        let current_proxy = pointer_accessible(conn, &current).await?;
+        let role = pointer_bus_call(ctx.deadline, "hit role", current_proxy.get_role()).await?;
+        if map_role(role).is_interactable() {
+            return Ok(PointerHit::Other);
+        }
+        let parent = pointer_bus_call(ctx.deadline, "hit parent", current_proxy.parent()).await?;
+        if parent.is_null() {
+            return Ok(PointerHit::Other);
+        }
+        current = parent;
+    }
+    Err(pointer_reference_error(format!(
+        "hit ancestry exceeded the configured depth limit ({})",
+        ctx.limits.depth
+    )))
+}
+
+async fn pointer_target_at_async(
+    ctx: &AxContext,
+    target: &AxTarget,
+    point: (i32, i32),
+) -> Result<PointerHit> {
+    if ctx.deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(POINTER_HIT_OP));
+    }
+    let (app_ref, conn) = find_app_strict(ctx).await?;
+    let app = pointer_accessible(&conn, &app_ref).await?;
+    let mut budget = WalkBudget::with_limits(ctx.limits);
+    let target_ref = Box::pin(find_nth_strict(
+        ctx,
+        &app_ref,
+        &app,
+        &conn,
+        0,
+        target.id.0,
+        &mut budget,
+    ))
+    .await?
+    .ok_or(GlassError::AxElementChanged(target.id.0))?;
+    let target_proxy = pointer_accessible(&conn, &target_ref).await?;
+    let role =
+        map_role(pointer_bus_call(ctx.deadline, "target role", target_proxy.get_role()).await?);
+    let name = nonempty(pointer_bus_call(ctx.deadline, "target name", target_proxy.name()).await?);
+    if !target.matches(role, name.as_deref()) {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+
+    let accepted_ancestor = if role.is_interactable() {
+        None
+    } else {
+        first_interactable_ancestor(ctx, &conn, &target_ref).await?
+    };
+    let root_ref = containing_window_root(ctx, &conn, &target_ref).await?;
+    let component = pointer_component(ctx, &conn, &root_ref).await?;
+    let hit = pointer_bus_call(
+        ctx.deadline,
+        "GetAccessibleAtPoint",
+        component.get_accessible_at_point(point.0, point.1, CoordType::Window),
+    )
+    .await?;
+    classify_pointer_hit(ctx, &conn, &target_ref, accepted_ancestor.as_ref(), hit).await
 }
 
 const FOCUS_CONFIRM_POLL: Duration = Duration::from_millis(10);
@@ -965,6 +1433,30 @@ async fn invoke_async(
     }
 }
 
+async fn focus_async(
+    ctx: &AxContext,
+    target: &AxTarget,
+    dispatch: &A11yMutationDispatch,
+) -> Result<()> {
+    let (app_ref, conn) = find_app(ctx).await?;
+    let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
+    let mut budget = WalkBudget::with_limits(ctx.limits);
+    let node_ref = Box::pin(find_nth(&app_ref, &app, &conn, 0, target.id.0, &mut budget))
+        .await?
+        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+    let node = node_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
+    let role = map_role(node.get_role().await.map_err(bus_err)?);
+    let name = nonempty(node.name().await.unwrap_or_default());
+    if !target.matches(role, name.as_deref()) {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    let states = map_states(&node.get_state().await.map_err(bus_err)?);
+    if native_focus_kind(role) != NativeFocusKind::Focus || !states.editable {
+        return Err(GlassError::AxActionUnavailable(target.id.0));
+    }
+    focus_text_editor(ctx, &conn, &node, target.id.0, dispatch).await
+}
+
 /// Window-relative bounds via the Component interface, or `None` if the node has no
 /// geometry / doesn't implement Component / reports a zero-area rect.
 ///
@@ -1106,6 +1598,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linux_reader_declares_every_state_fact_its_atspi_mapping_populates() {
+        assert_eq!(
+            LinuxA11y::new().state_coverage(),
+            glass_core::AxStateCoverage {
+                enabled: true,
+                visible: true,
+                checkable: true,
+                checked: true,
+                selected: true,
+                expanded: true,
+                focused: true,
+                focusable: true,
+                editable: true,
+            }
+        );
+    }
+
+    #[test]
     fn linux_set_value_forwards_ax_context_deadline_to_a11y_thread() {
         let ctx = AxContext {
             pids: vec![],
@@ -1233,36 +1743,89 @@ mod tests {
     fn text_roles_use_native_focus_and_other_controls_activate() {
         use glass_core::AxRole::*;
 
-        for role in [TextField, TextArea] {
-            assert_eq!(
-                native_invoke_kind(role),
-                NativeInvokeKind::Focus,
-                "{role:?}"
-            );
-        }
-        for role in [
-            Button,
-            ToggleButton,
-            CheckBox,
-            ComboBox,
-            SpinButton,
-            Slider,
-            Link,
-            MenuItem,
-        ] {
-            assert_eq!(
-                native_invoke_kind(role),
-                NativeInvokeKind::Activate,
-                "{role:?}"
-            );
-        }
+        assert_eq!(native_focus_kind(TextField), NativeFocusKind::Focus);
+        assert_eq!(native_focus_kind(TextArea), NativeFocusKind::Focus);
+        assert_eq!(native_focus_kind(Button), NativeFocusKind::Unsupported);
+        assert_eq!(native_invoke_kind(TextField), NativeInvokeKind::Focus);
+        assert_eq!(native_invoke_kind(Button), NativeInvokeKind::Activate);
+    }
+
+    #[test]
+    fn hit_classifier_accepts_target_or_its_actuating_ancestor_and_rejects_another_branch() {
+        let target = ObjectIdentity::new(":1.42", "/app/window/save/label");
+        let ancestor = ObjectIdentity::new(":1.42", "/app/window/save");
+        let other = ObjectIdentity::new(":1.42", "/app/window/occluder");
+        let same_path_on_another_bus = ObjectIdentity::new(":1.43", "/app/window/save/label");
+
         assert_eq!(
-            glass_core::AxRole::ALL
-                .into_iter()
-                .filter(|&role| native_invoke_kind(role) == NativeInvokeKind::Focus)
-                .collect::<Vec<_>>(),
-            vec![TextField, TextArea]
+            classify_hit_reference(target, Some(ancestor), Some(target)),
+            glass_core::PointerHit::Target
         );
+        assert_eq!(
+            classify_hit_reference(target, Some(ancestor), Some(ancestor)),
+            glass_core::PointerHit::AcceptedAncestor
+        );
+        assert_eq!(
+            classify_hit_reference(target, Some(ancestor), Some(other)),
+            glass_core::PointerHit::Other
+        );
+        assert_eq!(
+            classify_hit_reference(target, Some(ancestor), Some(same_path_on_another_bus)),
+            glass_core::PointerHit::Other
+        );
+        assert_eq!(
+            classify_hit_reference(target, Some(ancestor), None),
+            glass_core::PointerHit::Inconclusive
+        );
+    }
+
+    #[test]
+    fn strict_pointer_lookup_rejects_null_references_and_propagates_pid_failures() {
+        let null = ObjectRefOwned::new(ObjectRef::Null);
+        assert!(validate_strict_reference(&null, "registry application").is_err());
+
+        let pid_error = contextualize_pid_lookup_error(
+            ":1.42",
+            pointer_reference_error("PID lookup permission denied"),
+        );
+        let error = strict_pid_match(&[42], Err(pid_error))
+            .expect_err("a PID lookup failure is not an absent application");
+        assert!(error.to_string().contains("permission denied"));
+        assert!(error.to_string().contains(":1.42"));
+    }
+
+    #[test]
+    fn strict_pid_lookup_timeout_preserves_exact_deadline_metadata() {
+        let timeout = GlassError::caller_deadline_elapsed(POINTER_HIT_OP);
+        let original_message = timeout.to_string();
+
+        let error = contextualize_pid_lookup_error(":1.42", timeout);
+
+        assert!(matches!(error, GlassError::Bounded { .. }), "{error}");
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(error.to_string(), original_message);
+    }
+
+    #[test]
+    fn pointer_window_coordinate_root_roles_include_frames_and_dialogs_but_not_applications() {
+        for role in [
+            atspi_common::Role::Frame,
+            atspi_common::Role::Window,
+            atspi_common::Role::Dialog,
+            atspi_common::Role::Alert,
+            atspi_common::Role::FileChooser,
+            atspi_common::Role::ColorChooser,
+            atspi_common::Role::FontChooser,
+        ] {
+            assert!(is_window_coordinate_root(role), "{role:?}");
+        }
+        assert!(!is_window_coordinate_root(atspi_common::Role::Application));
+        assert!(!is_window_coordinate_root(atspi_common::Role::Panel));
     }
 
     #[test]

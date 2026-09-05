@@ -4,7 +4,8 @@
 
 pub(crate) use super::*;
 pub(crate) use crate::accessibility::{
-    AxNode, AxRect, AxRole, AxStates, AxTarget, ChangeSignal, ChangeWait, ElementCondition,
+    AxNode, AxRect, AxRole, AxStateCoverage, AxStates, AxTarget, ChangeSignal, ChangeWait,
+    ElementCondition, PointerHit,
 };
 pub(crate) use crate::audit::{Actuation, ActuationContext, AuditOutcome, AuditSink};
 pub(crate) use crate::platform::{SandboxLevel, Segment};
@@ -38,6 +39,8 @@ pub(crate) struct FakePlatform {
     pointer_events: Vec<PointerEvent>,
     fail_pointer: bool,
     key_events: Vec<KeyEvent>,
+    fail_key: bool,
+    event_log: Option<Arc<Mutex<Vec<&'static str>>>>,
     started: bool,
     capture_log: Arc<Mutex<Vec<Option<Region>>>>,
     capture_deadline_log: Option<CaptureDeadlineLog>,
@@ -157,6 +160,14 @@ impl FakePlatform {
     }
     pub(crate) fn with_failing_pointer(mut self) -> Self {
         self.fail_pointer = true;
+        self
+    }
+    pub(crate) fn with_failing_key(mut self) -> Self {
+        self.fail_key = true;
+        self
+    }
+    pub(crate) fn with_event_log(mut self, log: Arc<Mutex<Vec<&'static str>>>) -> Self {
+        self.event_log = Some(log);
         self
     }
     pub(crate) fn with_key_deadline_log(mut self, log: InputDeadlineLog) -> Self {
@@ -443,6 +454,9 @@ impl Platform for FakePlatform {
         }
         if let PointerEvent::Click { x, y, .. } = event {
             self.click_log.lock().unwrap().push((*x, *y));
+            if let Some(log) = &self.event_log {
+                log.lock().unwrap().push("pointer");
+            }
         }
         if let PointerEvent::Scroll { .. } = event {
             self.scroll_log.lock().unwrap().push(event.clone());
@@ -484,7 +498,14 @@ impl Platform for FakePlatform {
         }
         self.key_events.push(event.clone());
         self.key_log.lock().unwrap().push(event.clone());
-        Ok(())
+        if let Some(log) = &self.event_log {
+            log.lock().unwrap().push("key");
+        }
+        if self.fail_key {
+            Err(GlassError::Backend("scripted key failure".into()))
+        } else {
+            Ok(())
+        }
     }
     fn window_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
         if deadline.has_passed() {
@@ -621,6 +642,8 @@ pub(crate) enum InvokeBehavior {
     NoAction,
     /// Action fired but the toolkit reported failure.
     Fail,
+    /// The caller's bound elapsed after the backend may have dispatched the action.
+    MayHaveDispatched,
     /// Fingerprint mismatch — tree drifted since the snapshot.
     Drifted,
 }
@@ -647,7 +670,41 @@ fn scripted_invoke(
             target.id.0,
             "action reported failure".into(),
         )),
+        InvokeBehavior::MayHaveDispatched => Err(GlassError::caller_deadline_elapsed(
+            "scripted native accessibility action",
+        )),
         InvokeBehavior::Drifted => Err(GlassError::AxElementChanged(target.id.0)),
+    }
+}
+
+fn scripted_focus(behavior: InvokeBehavior, target: &AxTarget) -> Result<Option<AxNodeId>> {
+    match behavior {
+        InvokeBehavior::Unsupported => Err(GlassError::AxUnsupported),
+        InvokeBehavior::Succeed => Ok(None),
+        InvokeBehavior::SucceedOnAnother(actuated) => Ok(Some(AxNodeId(actuated))),
+        InvokeBehavior::NoAction => Err(GlassError::AxActionUnavailable(target.id.0)),
+        InvokeBehavior::Fail => Err(GlassError::AxActionFailed(
+            target.id.0,
+            "focus reported failure".into(),
+        )),
+        InvokeBehavior::MayHaveDispatched => Err(GlassError::caller_deadline_elapsed(
+            "scripted native accessibility focus",
+        )),
+        InvokeBehavior::Drifted => Err(GlassError::AxElementChanged(target.id.0)),
+    }
+}
+
+pub fn full_state_coverage() -> AxStateCoverage {
+    AxStateCoverage {
+        enabled: true,
+        visible: true,
+        checkable: true,
+        checked: true,
+        selected: true,
+        expanded: true,
+        focused: true,
+        focusable: true,
+        editable: true,
     }
 }
 
@@ -669,6 +726,69 @@ pub(crate) struct FakeAccessibility {
     /// Succeed`) — lets a test prove the native path fired instead of / in addition to the
     /// pointer path.
     pub(crate) invoke_log: Arc<Mutex<Vec<AxTarget>>>,
+    coverage: AxStateCoverage,
+    focus_behavior: InvokeBehavior,
+    hit: PointerHit,
+    hit_error: bool,
+    focus_calls: Arc<AtomicUsize>,
+    hit_calls: Arc<AtomicUsize>,
+    hit_points: Arc<Mutex<Vec<(i32, i32)>>>,
+}
+
+#[allow(dead_code)]
+impl FakeAccessibility {
+    pub(crate) fn new(tree: AxTree) -> Self {
+        Self {
+            tree,
+            set_log: Arc::new(Mutex::new(Vec::new())),
+            set_fail: false,
+            ctx_log: Arc::new(Mutex::new(None)),
+            invoke_behavior: InvokeBehavior::Unsupported,
+            invoke_log: Arc::new(Mutex::new(Vec::new())),
+            coverage: AxStateCoverage::NONE,
+            focus_behavior: InvokeBehavior::Unsupported,
+            hit: PointerHit::Inconclusive,
+            hit_error: false,
+            focus_calls: Arc::new(AtomicUsize::new(0)),
+            hit_calls: Arc::new(AtomicUsize::new(0)),
+            hit_points: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub(crate) fn with_coverage(mut self, coverage: AxStateCoverage) -> Self {
+        self.coverage = coverage;
+        self
+    }
+
+    pub(crate) fn with_focus_behavior(mut self, behavior: InvokeBehavior) -> Self {
+        self.focus_behavior = behavior;
+        self
+    }
+
+    pub(crate) fn with_hit(mut self, hit: PointerHit) -> Self {
+        self.hit = hit;
+        self
+    }
+
+    pub(crate) fn with_hit_error(mut self) -> Self {
+        self.hit_error = true;
+        self
+    }
+
+    pub(crate) fn with_focus_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
+        self.focus_calls = calls;
+        self
+    }
+
+    pub(crate) fn with_hit_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
+        self.hit_calls = calls;
+        self
+    }
+
+    pub(crate) fn with_hit_points(mut self, points: Arc<Mutex<Vec<(i32, i32)>>>) -> Self {
+        self.hit_points = points;
+        self
+    }
 }
 
 impl Accessibility for FakeAccessibility {
@@ -681,6 +801,30 @@ impl Accessibility for FakeAccessibility {
     fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
         *self.ctx_log.lock().unwrap() = Some(ctx.clone());
         None
+    }
+    fn state_coverage(&self) -> AxStateCoverage {
+        self.coverage
+    }
+    fn focus(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
+        *self.ctx_log.lock().unwrap() = Some(ctx.clone());
+        self.focus_calls.fetch_add(1, Ordering::Relaxed);
+        scripted_focus(self.focus_behavior, target)
+    }
+    fn pointer_target_at(
+        &mut self,
+        ctx: &AxContext,
+        _target: &AxTarget,
+        point: (i32, i32),
+    ) -> Result<PointerHit> {
+        *self.ctx_log.lock().unwrap() = Some(ctx.clone());
+        self.hit_calls.fetch_add(1, Ordering::Relaxed);
+        self.hit_points.lock().unwrap().push(point);
+        if self.hit_error {
+            return Err(GlassError::AccessibilityUnavailable(
+                "scripted pointer hit probe failure".into(),
+            ));
+        }
+        Ok(self.hit)
     }
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         *self.ctx_log.lock().unwrap() = Some(ctx.clone());
@@ -826,17 +970,7 @@ pub(crate) fn glass_with_backend(
 }
 
 pub(crate) fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
-    glass_with_backend(
-        platform,
-        Box::new(FakeAccessibility {
-            tree,
-            set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            set_fail: false,
-            ctx_log: Arc::new(Mutex::new(None)),
-            invoke_behavior: InvokeBehavior::Unsupported,
-            invoke_log: Arc::new(Mutex::new(Vec::new())),
-        }),
-    )
+    glass_with_backend(platform, Box::new(FakeAccessibility::new(tree)))
 }
 
 /// [`glass_with_a11y`] plus the ctx log — for a test that must prove what reached the backend
@@ -868,17 +1002,11 @@ pub(crate) fn glass_with_a11y_invoke_ctx(
 ) -> (Glass, Arc<Mutex<Vec<AxTarget>>>, CtxLog) {
     let invoke_log = Arc::new(Mutex::new(Vec::new()));
     let ctx_log: CtxLog = Arc::new(Mutex::new(None));
-    let g = glass_with_backend(
-        platform,
-        Box::new(FakeAccessibility {
-            tree,
-            set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            set_fail: false,
-            ctx_log: ctx_log.clone(),
-            invoke_behavior: behavior,
-            invoke_log: invoke_log.clone(),
-        }),
-    );
+    let mut accessibility = FakeAccessibility::new(tree);
+    accessibility.ctx_log = ctx_log.clone();
+    accessibility.invoke_behavior = behavior;
+    accessibility.invoke_log = invoke_log.clone();
+    let g = glass_with_backend(platform, Box::new(accessibility));
     (g, invoke_log, ctx_log)
 }
 
@@ -902,6 +1030,129 @@ pub(crate) struct SeqAccessibility {
     subscribes: Arc<AtomicUsize>,
     deadlines: AxDeadlineLog,
     read_starts: AxReadStartLog,
+    coverage: AxStateCoverage,
+    focus_behavior: InvokeBehavior,
+    hit: PointerHit,
+    hit_error: bool,
+    focus_calls: Arc<AtomicUsize>,
+    invoke_calls: Arc<AtomicUsize>,
+    hit_calls: Arc<AtomicUsize>,
+    hit_points: Arc<Mutex<Vec<(i32, i32)>>>,
+    set_log: Arc<Mutex<Vec<(AxNodeId, String)>>>,
+    set_results: VecDeque<Result<()>>,
+    event_log: Option<Arc<Mutex<Vec<&'static str>>>>,
+}
+
+#[allow(dead_code)]
+impl SeqAccessibility {
+    pub(crate) fn new(trees: Vec<AxTree>) -> Self {
+        assert!(
+            !trees.is_empty(),
+            "SeqAccessibility needs at least one tree"
+        );
+        Self {
+            trees,
+            idx: 0,
+            invoke_behavior: InvokeBehavior::Unsupported,
+            invoke_log: Arc::new(Mutex::new(Vec::new())),
+            walks: Arc::new(AtomicUsize::new(0)),
+            signal: None,
+            subscribes: Arc::new(AtomicUsize::new(0)),
+            deadlines: Arc::new(Mutex::new(Vec::new())),
+            read_starts: Arc::new(Mutex::new(Vec::new())),
+            coverage: AxStateCoverage::NONE,
+            focus_behavior: InvokeBehavior::Unsupported,
+            hit: PointerHit::Inconclusive,
+            hit_error: false,
+            focus_calls: Arc::new(AtomicUsize::new(0)),
+            invoke_calls: Arc::new(AtomicUsize::new(0)),
+            hit_calls: Arc::new(AtomicUsize::new(0)),
+            hit_points: Arc::new(Mutex::new(Vec::new())),
+            set_log: Arc::new(Mutex::new(Vec::new())),
+            set_results: VecDeque::new(),
+            event_log: None,
+        }
+    }
+
+    pub(crate) fn with_coverage(mut self, coverage: AxStateCoverage) -> Self {
+        self.coverage = coverage;
+        self
+    }
+
+    pub(crate) fn with_focus_behavior(mut self, behavior: InvokeBehavior) -> Self {
+        self.focus_behavior = behavior;
+        self
+    }
+
+    pub(crate) fn with_hit(mut self, hit: PointerHit) -> Self {
+        self.hit = hit;
+        self
+    }
+
+    pub(crate) fn with_hit_error(mut self) -> Self {
+        self.hit_error = true;
+        self
+    }
+
+    pub(crate) fn with_focus_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
+        self.focus_calls = calls;
+        self
+    }
+
+    pub(crate) fn with_invoke_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
+        self.invoke_calls = calls;
+        self
+    }
+
+    pub(crate) fn with_deadlines(mut self, deadlines: AxDeadlineLog) -> Self {
+        self.deadlines = deadlines;
+        self
+    }
+
+    pub(crate) fn with_hit_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
+        self.hit_calls = calls;
+        self
+    }
+
+    pub(crate) fn with_hit_points(mut self, points: Arc<Mutex<Vec<(i32, i32)>>>) -> Self {
+        self.hit_points = points;
+        self
+    }
+
+    pub(crate) fn with_set_log(mut self, log: Arc<Mutex<Vec<(AxNodeId, String)>>>) -> Self {
+        self.set_log = log;
+        self
+    }
+
+    pub(crate) fn with_set_results(mut self, results: Vec<Result<()>>) -> Self {
+        self.set_results = results.into();
+        self
+    }
+
+    pub(crate) fn with_invoke_behavior(mut self, behavior: InvokeBehavior) -> Self {
+        self.invoke_behavior = behavior;
+        self
+    }
+
+    pub(crate) fn with_invoke_log(mut self, log: Arc<Mutex<Vec<AxTarget>>>) -> Self {
+        self.invoke_log = log;
+        self
+    }
+
+    pub(crate) fn with_walks(mut self, walks: Arc<AtomicUsize>) -> Self {
+        self.walks = walks;
+        self
+    }
+
+    pub(crate) fn with_signal(mut self, signal: Option<fn() -> Box<dyn ChangeSignal>>) -> Self {
+        self.signal = signal;
+        self
+    }
+
+    pub(crate) fn with_event_log(mut self, log: Arc<Mutex<Vec<&'static str>>>) -> Self {
+        self.event_log = Some(log);
+        self
+    }
 }
 
 impl Accessibility for SeqAccessibility {
@@ -914,18 +1165,58 @@ impl Accessibility for SeqAccessibility {
         self.walks.fetch_add(1, Ordering::Relaxed);
         let t = self.trees[self.idx.min(self.trees.len() - 1)].clone();
         self.idx += 1;
+        fn contains_focused(node: &AxNode) -> bool {
+            node.states.focused || node.children.iter().any(contains_focused)
+        }
+        if contains_focused(&t.root)
+            && let Some(log) = &self.event_log
+        {
+            log.lock().unwrap().push("snapshot focused");
+        }
         Ok(t)
     }
     fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
         self.subscribes.fetch_add(1, Ordering::Relaxed);
         self.signal.map(|make| make())
     }
-    fn set_value(&mut self, ctx: &AxContext, _t: &AxTarget, _s: &str) -> Result<()> {
+    fn state_coverage(&self) -> AxStateCoverage {
+        self.coverage
+    }
+    fn focus(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         self.deadlines.lock().unwrap().push(ctx.deadline);
-        Ok(())
+        self.focus_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(log) = &self.event_log {
+            log.lock().unwrap().push("focus");
+        }
+        scripted_focus(self.focus_behavior, target)
+    }
+    fn pointer_target_at(
+        &mut self,
+        ctx: &AxContext,
+        _target: &AxTarget,
+        point: (i32, i32),
+    ) -> Result<PointerHit> {
+        self.deadlines.lock().unwrap().push(ctx.deadline);
+        self.hit_calls.fetch_add(1, Ordering::Relaxed);
+        self.hit_points.lock().unwrap().push(point);
+        if self.hit_error {
+            return Err(GlassError::AccessibilityUnavailable(
+                "scripted pointer hit probe failure".into(),
+            ));
+        }
+        Ok(self.hit)
+    }
+    fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+        self.deadlines.lock().unwrap().push(ctx.deadline);
+        self.set_log
+            .lock()
+            .unwrap()
+            .push((target.id, text.to_string()));
+        self.set_results.pop_front().unwrap_or(Ok(()))
     }
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         self.deadlines.lock().unwrap().push(ctx.deadline);
+        self.invoke_calls.fetch_add(1, Ordering::Relaxed);
         scripted_invoke(self.invoke_behavior, &self.invoke_log, target)
     }
 }
@@ -972,20 +1263,12 @@ pub(crate) fn glass_with_a11y_seq_observed(
     let invoke_log = Arc::new(Mutex::new(Vec::new()));
     let deadlines = Arc::new(Mutex::new(Vec::new()));
     let read_starts = Arc::new(Mutex::new(Vec::new()));
-    let g = glass_with_backend(
-        platform,
-        Box::new(SeqAccessibility {
-            trees,
-            idx: 0,
-            invoke_behavior: behavior,
-            invoke_log: invoke_log.clone(),
-            walks: Arc::new(AtomicUsize::new(0)),
-            signal: None,
-            subscribes: Arc::new(AtomicUsize::new(0)),
-            deadlines: deadlines.clone(),
-            read_starts: read_starts.clone(),
-        }),
-    );
+    let mut accessibility = SeqAccessibility::new(trees);
+    accessibility.invoke_behavior = behavior;
+    accessibility.invoke_log = invoke_log.clone();
+    accessibility.deadlines = deadlines.clone();
+    accessibility.read_starts = read_starts.clone();
+    let g = glass_with_backend(platform, Box::new(accessibility));
     (g, invoke_log, deadlines, read_starts)
 }
 
@@ -1010,20 +1293,11 @@ pub(crate) fn glass_with_a11y_counted_subs(
 ) -> (Glass, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let walks = Arc::new(AtomicUsize::new(0));
     let subscribes = Arc::new(AtomicUsize::new(0));
-    let g = glass_with_backend(
-        platform,
-        Box::new(SeqAccessibility {
-            trees,
-            idx: 0,
-            invoke_behavior: InvokeBehavior::Unsupported,
-            invoke_log: Arc::new(Mutex::new(Vec::new())),
-            walks: walks.clone(),
-            signal,
-            subscribes: subscribes.clone(),
-            deadlines: Arc::new(Mutex::new(Vec::new())),
-            read_starts: Arc::new(Mutex::new(Vec::new())),
-        }),
-    );
+    let mut accessibility = SeqAccessibility::new(trees);
+    accessibility.walks = walks.clone();
+    accessibility.signal = signal;
+    accessibility.subscribes = subscribes.clone();
+    let g = glass_with_backend(platform, Box::new(accessibility));
     (g, walks, subscribes)
 }
 
@@ -1288,9 +1562,49 @@ impl Platform for BareMinPlatform {
     }
 }
 
-/// Records `"action:ok"` for each actuation the seam reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedClickAudit {
+    pub(crate) element: crate::audit::ElementRef,
+    pub(crate) mode: String,
+    pub(crate) method: Option<String>,
+    pub(crate) native_fallback: Option<String>,
+    pub(crate) actuated_id: Option<u32>,
+    pub(crate) dispatch: String,
+    pub(crate) confirmation: String,
+    pub(crate) ok: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedSetValueAudit {
+    pub(crate) element: crate::audit::ElementRef,
+    pub(crate) text: String,
+    pub(crate) dispatch: String,
+    pub(crate) confirmation: String,
+    pub(crate) ok: bool,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedTypeTargetAudit {
+    pub(crate) element: crate::audit::ElementRef,
+    pub(crate) text: String,
+    pub(crate) focus_mode: String,
+    pub(crate) focus_method: Option<String>,
+    pub(crate) focus_dispatch: String,
+    pub(crate) focus_confirmation: String,
+    pub(crate) type_dispatch: String,
+    pub(crate) ok: bool,
+    pub(crate) error: Option<String>,
+}
+
+/// Records `"action:ok"` for each actuation plus structured click metadata.
 #[derive(Clone, Default)]
-pub(crate) struct RecordingSink(pub(crate) Arc<Mutex<Vec<String>>>);
+pub(crate) struct RecordingSink(
+    pub(crate) Arc<Mutex<Vec<String>>>,
+    pub(crate) Arc<Mutex<Vec<RecordedClickAudit>>>,
+    pub(crate) Arc<Mutex<Vec<RecordedSetValueAudit>>>,
+    pub(crate) Arc<Mutex<Vec<RecordedTypeTargetAudit>>>,
+);
 impl AuditSink for RecordingSink {
     fn record(&self, act: &Actuation, _ctx: &ActuationContext, o: &AuditOutcome, _d: Duration) {
         let action = match act {
@@ -1311,8 +1625,68 @@ impl AuditSink for RecordingSink {
             Actuation::Window { .. } => "window",
             Actuation::ClickElement { .. } => "click_element",
             Actuation::SetValue { .. } => "set_value",
+            Actuation::TypeTarget { .. } => "type_target",
         };
         self.0.lock().unwrap().push(format!("{action}:{}", o.ok));
+        if let Actuation::ClickElement {
+            element,
+            mode,
+            method,
+            native_fallback,
+            actuated_id,
+            dispatch,
+            confirmation,
+        } = act
+        {
+            self.1.lock().unwrap().push(RecordedClickAudit {
+                element: element.clone(),
+                mode: (*mode).into(),
+                method: method.map(|value| (*value).into()),
+                native_fallback: native_fallback.map(Into::into),
+                actuated_id: *actuated_id,
+                dispatch: (*dispatch).into(),
+                confirmation: (*confirmation).into(),
+                ok: o.ok,
+            });
+        }
+        if let Actuation::SetValue {
+            element,
+            text,
+            dispatch,
+            confirmation,
+        } = act
+        {
+            self.2.lock().unwrap().push(RecordedSetValueAudit {
+                element: element.clone(),
+                text: (*text).into(),
+                dispatch: (*dispatch).into(),
+                confirmation: (*confirmation).into(),
+                ok: o.ok,
+                error: o.error.clone(),
+            });
+        }
+        if let Actuation::TypeTarget {
+            element,
+            text,
+            focus_mode,
+            focus_method,
+            focus_dispatch,
+            focus_confirmation,
+            type_dispatch,
+        } = act
+        {
+            self.3.lock().unwrap().push(RecordedTypeTargetAudit {
+                element: element.clone(),
+                text: (*text).into(),
+                focus_mode: (*focus_mode).into(),
+                focus_method: focus_method.map(Into::into),
+                focus_dispatch: (*focus_dispatch).into(),
+                focus_confirmation: (*focus_confirmation).into(),
+                type_dispatch: (*type_dispatch).into(),
+                ok: o.ok,
+                error: o.error.clone(),
+            });
+        }
     }
 }
 

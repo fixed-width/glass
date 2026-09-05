@@ -32,9 +32,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, AxNode, AxRole, AxTree, Backend, BaselineStore, FindElementsParams, Glass, GlassError,
-    KeyEvent, PlatformFactory, SandboxLevel, ScopeResolution, SemanticQuery, SemanticSelector,
-    SemanticState, WindowHint, read_back_confirms, role_histogram,
+    ActionMethod, ActionMode, ActionTarget, ActionabilityCheckName, ActionabilityReport,
+    ActionabilityVerdict, AppSpec, AxNode, AxRole, AxTree, Backend, BaselineStore,
+    ClickTargetParams, DispatchStatus, ElementCondition, FindElementsParams, Glass, GlassError,
+    PlatformFactory, SandboxLevel, ScopeResolution, SemanticActionFailureKind, SemanticQuery,
+    SemanticSelector, SemanticState, SemanticTarget, TypeTargetParams, WaitElementParams,
+    WindowHint, role_histogram,
 };
 
 const BROWSERS_VAR: &str = "GLASS_WEB_PROBE_BROWSERS";
@@ -43,6 +46,7 @@ const LEVER_VAR: &str = "GLASS_WEB_PROBE_LEVER";
 /// How long to keep re-reading the tree for the page's own elements before calling the content
 /// missing. The reading this bounds is "time to content", so it is deliberately generous.
 const SETTLE: Duration = Duration::from_secs(20);
+const SEMANTIC_READ_TIMEOUT_MS: u64 = 20_000;
 
 /// Window-discovery budget. A cold browser opening a fresh profile under a software renderer
 /// maps its window far later than the GTK fixture does.
@@ -50,16 +54,6 @@ const LAUNCH_TIMEOUT_MS: u64 = 30_000;
 
 /// The fixture button's accessible name — the page content the probe waits for, then clicks.
 const BUTTON: &str = "click me";
-/// The fixture text input's accessible name, from its `<label for>`.
-const INPUT: &str = "text input";
-/// What the page's result paragraph reads before the button fires, and after.
-const NOT_CLICKED: &str = "not clicked";
-/// See [`NOT_CLICKED`].
-const CLICKED: &str = "clicked";
-/// What `set_value` writes into the text input.
-const TYPED: &str = "typed by glass";
-/// What the keyboard control types into the text input — a second route to the same field.
-const KEYED: &str = "keyed by glass";
 
 fn page_url() -> String {
     format!(
@@ -227,37 +221,6 @@ fn named<'a>(tree: &'a AxTree, name: &str) -> Option<&'a AxNode> {
     find(tree, &|n| n.name.as_deref() == Some(name))
 }
 
-/// The fixture's text input, not its `<label for>`: both carry the same accessible name, and
-/// the label comes first in pre-order, so `named` alone writes to the wrong element.
-fn text_input(tree: &AxTree) -> Option<&AxNode> {
-    find(tree, &|n| {
-        n.name.as_deref() == Some(INPUT) && n.states.editable
-    })
-}
-
-/// The fixture's result paragraph, found by the text it carries. The text of a `<p>` is a
-/// node's `value` (the reader reads the AT-SPI `Text` interface for text-bearing roles), not
-/// its name, and the outline render does not print values — so this is the only place the
-/// before/after of the click is visible.
-fn valued<'a>(tree: &'a AxTree, value: &str) -> Option<&'a AxNode> {
-    find(tree, &|n| n.value.as_deref() == Some(value))
-}
-
-/// Every editable node in the tree, in pre-order.
-fn editable(tree: &AxTree) -> Vec<&AxNode> {
-    fn walk<'a>(node: &'a AxNode, out: &mut Vec<&'a AxNode>) {
-        if node.states.editable {
-            out.push(node);
-        }
-        for child in &node.children {
-            walk(child, out);
-        }
-    }
-    let mut out = Vec::new();
-    walk(&tree.root, &mut out);
-    out
-}
-
 /// Every `Document` in the tree, in pre-order — the web-content boundary this probe reads.
 fn documents(tree: &AxTree) -> Vec<&AxNode> {
     fn walk<'a>(node: &'a AxNode, out: &mut Vec<&'a AxNode>) {
@@ -355,319 +318,423 @@ fn report_tree(tree: &AxTree) {
     println!("outline:\n{}", tree.to_outline());
 }
 
-/// How many times to re-snapshot-and-click. A browser's tree keeps changing while its other
-/// tabs load, and an id whose node has moved since the snapshot is rejected as changed —
-/// retrying reads the button's clickability rather than the retry's luck.
-const CLICK_ATTEMPTS: usize = 4;
-
-/// Push `e` into `failures` unless it is [`GlassError::AccessibilityNotReady`] — a caller not
-/// yet answering is expected here just as it is in `snapshot_until_page`; every other snapshot
-/// error means the a11y bus broke after it had already been serving this session.
-fn record_snapshot_failure(failures: &mut Vec<String>, label: &str, context: &str, e: &GlassError) {
-    if !matches!(e, GlassError::AccessibilityNotReady(_)) {
-        failures.push(format!("{label}: {context}: {e}"));
-    }
-}
-
-/// The actuation readings. Each step re-snapshots first: `click_element` and `set_value` resolve
-/// ids against the session's most recent tree, so an id from an older one addresses nothing.
-fn exercise(glass: &mut Glass, label: &str, failures: &mut Vec<String>) {
-    for attempt in 1..=CLICK_ATTEMPTS {
-        let before = match glass.a11y_snapshot(Some(0)) {
-            Ok(tree) => tree,
-            Err(e) => {
-                println!("snapshot before the click failed: {e} — no click reading");
-                record_snapshot_failure(failures, label, "snapshot before the click failed", &e);
-                return;
-            }
-        };
-        let Some(button) = named(&before, BUTTON) else {
-            println!("no node named {BUTTON:?} — no click reading");
-            return;
-        };
-        if attempt == 1 {
-            println!(
-                "button: #{} role={:?} raw_role={} bounds={:?}",
-                button.id.0, button.role, button.raw_role, button.bounds
-            );
-            println!(
-                "result paragraph before the click: {:?}",
-                valued(&before, NOT_CLICKED).map(|n| (n.id.0, n.role, n.raw_role.clone()))
-            );
-        }
-        match glass.click_element(button.id) {
-            Ok(method) => {
-                std::thread::sleep(Duration::from_millis(500));
-                match glass.a11y_snapshot(Some(0)) {
-                    Ok(after) => println!(
-                        "click_element (attempt {attempt}): {method:?} → result paragraph reads \
-                         {CLICKED:?}: {}",
-                        valued(&after, CLICKED).is_some()
-                    ),
-                    Err(e) => {
-                        println!("click_element: {method:?} → re-snapshot failed: {e}");
-                        record_snapshot_failure(
-                            failures,
-                            label,
-                            "re-snapshot after click_element failed",
-                            &e,
-                        );
-                    }
-                }
-                break;
-            }
-            Err(e) => {
-                println!("click_element (attempt {attempt}) failed: {e}");
-                // A retry that lands is a reading, not a failure — only the exhausted attempt
-                // means click_element never worked at all.
-                if attempt == CLICK_ATTEMPTS {
-                    record_snapshot_failure(
-                        failures,
-                        label,
-                        &format!("click_element failed after {CLICK_ATTEMPTS} attempts"),
-                        &e,
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-    }
-
-    let after = match glass.a11y_snapshot(Some(0)) {
-        Ok(tree) => tree,
-        Err(e) => {
-            println!("snapshot before set_value failed: {e} — no set_value reading");
-            record_snapshot_failure(failures, label, "snapshot before set_value failed", &e);
-            return;
-        }
-    };
-    let Some(field) = text_input(&after) else {
-        println!("no editable node named {INPUT:?} — no set_value reading");
-        return;
-    };
-    println!(
-        "text input: #{} role={:?} raw_role={} value={:?}",
-        field.id.0, field.role, field.raw_role, field.value
-    );
-    // The baseline glass's own rule compares against — read before the write, not after.
-    let before = field.value.clone();
-    let set = glass.set_value(field.id, TYPED);
-    std::thread::sleep(Duration::from_millis(500));
-    let after = match glass.a11y_snapshot(Some(0)) {
-        Ok(tree) => tree,
-        Err(e) => {
-            println!("set_value: {set:?} → re-snapshot failed: {e}");
-            record_snapshot_failure(failures, label, "re-snapshot after set_value failed", &e);
-            return;
-        }
-    };
-    let held = text_input(&after).and_then(|n| n.value.clone());
-    println!("set_value: {set:?} → text input value={held:?}");
-    // A claim about glass, not about the engine: whatever this browser does with the write, the
-    // verdict has to agree with `read_back_confirms`, the readers' own rule — `Ok` it cannot
-    // confirm is a false success, `Err` it can a false failure. Do not tighten this to
-    // `held == TYPED`: that fails the probe for an engine that reformatted the value and that
-    // glass accepts.
-    let confirms = read_back_confirms(held.as_deref(), before.as_deref(), TYPED);
-    if set.is_ok() != confirms {
-        failures.push(format!(
-            "{label}: set_value returned {set:?} while the field reads back {held:?} (was \
-             {before:?}) — a verdict that disagrees with glass's own read-back rule"
-        ));
-    }
-
-    // The control for the line above. An empty readback has two causes — the write never
-    // landed, or this engine never reports a web input's text over AT-SPI — and only text
-    // that reached the field by another route tells them apart. Typed through the pointer
-    // and keyboard, which do not touch the accessibility write path.
-    if let Some(field) = text_input(&after) {
-        let focus = glass.click_element(field.id);
-        let keyed = glass.key(&KeyEvent::Text(KEYED.to_string()));
-        std::thread::sleep(Duration::from_millis(500));
-        match glass.a11y_snapshot(Some(0)) {
-            Ok(after) => println!(
-                "control — click {focus:?} then key {keyed:?} → text input value={:?}",
-                text_input(&after).and_then(|n| n.value.clone())
-            ),
-            Err(e) => {
-                println!("control — re-snapshot failed: {e}");
-                record_snapshot_failure(failures, label, "control re-snapshot failed", &e);
-            }
-        }
-    }
-
-    match glass.a11y_snapshot(Some(0)) {
-        Ok(after) => {
-            println!("every editable node at the end:");
-            for node in editable(&after) {
-                println!(
-                    "  #{} role={:?} raw_role={} name={:?} value={:?}",
-                    node.id.0, node.role, node.raw_role, node.name, node.value
-                );
-            }
-            println!("--- tree after actuation ---");
-            report_tree(&after);
-        }
-        Err(e) => {
-            println!("final snapshot failed: {e}");
-            record_snapshot_failure(failures, label, "final snapshot failed", &e);
-        }
-    }
-}
-
 /// Discover the large fixture's account controls before any explicit unbounded diagnostic
 /// snapshot. Browser non-publication remains evidence-only, while malformed published content is
 /// recorded as a probe failure.
-fn discover_account_controls(glass: &mut Glass, label: &str, failures: &mut Vec<String>) {
+fn account_scope() -> SemanticTarget {
+    SemanticTarget {
+        target: SemanticSelector::new(
+            Some("Account name".into()),
+            Some(AxRole::TextField),
+            vec![SemanticState::Enabled],
+        )
+        .expect("account selector"),
+        within: Some(
+            SemanticSelector::new(
+                Some("Glass web fixture".into()),
+                Some(AxRole::Document),
+                Vec::new(),
+            )
+            .expect("document scope"),
+        ),
+    }
+}
+
+fn save_account_target() -> SemanticTarget {
+    SemanticTarget {
+        target: SemanticSelector::new(
+            Some("Save account".into()),
+            Some(AxRole::Button),
+            vec![SemanticState::Enabled],
+        )
+        .expect("save selector"),
+        within: account_scope().within,
+    }
+}
+
+fn usable_account_controls_are_published(glass: &mut Glass) -> bool {
     let within = SemanticSelector::new(
         Some("Glass web fixture".into()),
         Some(AxRole::Document),
-        vec![SemanticState::Visible],
+        Vec::new(),
     )
     .expect("document scope");
     let account = SemanticQuery::new(
         SemanticSelector::new(
-            Some("account name".into()),
+            Some("Account name".into()),
             Some(AxRole::TextField),
-            vec![SemanticState::Visible],
+            vec![SemanticState::Enabled],
         )
         .expect("account selector"),
-        Some(within.clone()),
-        10,
+        Some(within),
+        1,
     )
     .expect("account query");
-    let found = glass.find_elements(&FindElementsParams {
-        query: account,
-        max_nodes: None,
-        timeout_ms: SETTLE.as_millis() as u64,
-    });
+    glass
+        .find_elements(&FindElementsParams {
+            query: account,
+            max_nodes: None,
+            timeout_ms: 0,
+        })
+        .is_ok_and(|outcome| {
+            matches!(outcome.result.scope, ScopeResolution::Resolved(_))
+                && outcome.result.matches.len() == 1
+        })
+}
 
-    let account = match found {
-        Err(GlassError::AccessibilityNotReady(message)) => {
+/// Run the account mutation entirely through fresh semantic targets before any diagnostic tree
+/// snapshot. Returns false only when the browser published no usable Account controls at all.
+fn exercise_account_semantically(
+    glass: &mut Glass,
+    label: &str,
+    failures: &mut Vec<String>,
+) -> bool {
+    let started = Instant::now();
+    let typed = glass.type_target(
+        &TypeTargetParams {
+            target: account_scope(),
+            focus_mode: ActionMode::Native,
+            timeout_ms: 20_000,
+            max_nodes: None,
+        },
+        "Ada",
+    );
+    let typed = match typed {
+        Ok(outcome) => outcome,
+        Err(error) => {
             println!(
-                "targeted discovery: page accessibility remained not ready for {SETTLE:?}: \
-                 {message}"
+                "semantic Account targeted type failed after {:?}: kind={} dispatch={} \
+                 error={error:?}",
+                started.elapsed(),
+                error.kind.as_str(),
+                error.action_dispatch.as_str(),
             );
-            return;
-        }
-        Err(e) => {
+            if !usable_account_controls_are_published(glass) {
+                println!("no usable page controls published — preserving evidence-only behavior");
+                return false;
+            }
             failures.push(format!(
-                "{label}: targeted Account name discovery failed: {e}"
+                "{label}: semantic Account targeted type failed with usable controls published: \
+                 kind={} dispatch={} error={error:?}",
+                error.kind.as_str(),
+                error.action_dispatch.as_str(),
             ));
-            return;
+            return true;
         }
-        Ok(out) => out,
     };
-
-    if let ScopeResolution::Ambiguous { observed } = account.result.scope {
-        failures.push(format!(
-            "{label}: targeted Account name discovery found {observed} visible Documents named \
-             \"Glass web fixture\""
-        ));
-        return;
-    }
-    if !account.matched && account.result.unexposed_placeholders > 0 {
-        println!(
-            "targeted discovery: browser withheld {} placeholder(s); preserving evidence-only \
-             behavior",
-            account.result.unexposed_placeholders
-        );
-        return;
-    }
-    if !matches!(account.result.scope, ScopeResolution::Resolved(_)) {
-        failures.push(format!(
-            "{label}: targeted Account name discovery did not uniquely resolve the visible \
-             Document scope: {:?}",
-            account.result.scope
-        ));
-        return;
-    }
-    if account.timed_out || account.result.matches.len() != 1 {
-        failures.push(format!(
-            "{label}: targeted Account name discovery expected one match before any unbounded \
-             diagnostic snapshot, got matched={} timed_out={} matches={}",
-            account.matched,
-            account.timed_out,
-            account.result.matches.len()
-        ));
-        return;
-    }
-    let field = &account.result.matches[0].element;
-    if field.name.as_deref() != Some("Account name")
-        || field.role != AxRole::TextField
-        || !field.states.visible
-        || field.states.secure
-    {
-        failures.push(format!(
-            "{label}: targeted Account name discovery returned the wrong, hidden, or secure element: \
-             name={:?} role={:?} visible={} secure={} value={:?}",
-            field.name, field.role, field.states.visible, field.states.secure, field.value
-        ));
-        return;
-    }
+    let focus = typed.focus.as_ref().expect("targeted type focus report");
     println!(
-        "targeted discovery before any unbounded diagnostic snapshot: Account name → #{} \
-         {:?}",
-        field.id.0, field.role
+        "semantic Account targeted type after {:?}: focus_method={} focus_dispatch={} \
+         focus_confirmation={} type_method={} type_dispatch={} type_confirmation={} \
+         actionability={:?}",
+        started.elapsed(),
+        focus.method.as_str(),
+        focus.dispatch.as_str(),
+        focus.confirmation.as_str(),
+        typed.action.method.as_str(),
+        typed.action.dispatch.as_str(),
+        typed.action.confirmation.as_str(),
+        typed.actionability.checks,
     );
 
-    let save = SemanticQuery::new(
-        SemanticSelector::new(
-            Some("save account".into()),
-            Some(AxRole::Button),
-            vec![SemanticState::Visible],
-        )
-        .expect("save selector"),
-        Some(within),
-        10,
-    )
-    .expect("save query");
-    let save = match glass.find_elements(&FindElementsParams {
-        query: save,
+    let field = glass
+        .wait_for_element(&WaitElementParams {
+            name: Some("Account name".into()),
+            description: None,
+            role: Some(AxRole::TextField),
+            value: Some("Ada".into()),
+            value_contains: None,
+            condition: ElementCondition::Appears,
+            interval_ms: 25,
+            timeout_ms: SEMANTIC_READ_TIMEOUT_MS,
+        })
+        .expect("wait for Account value");
+    if !field.matched {
+        failures.push(format!("{label}: Account field did not read back as Ada"));
+        return true;
+    }
+
+    let clicked_at = Instant::now();
+    let click = match glass.click_target(&ClickTargetParams {
+        target: ActionTarget::Semantic(save_account_target()),
+        mode: ActionMode::Auto,
+        timeout_ms: Some(20_000),
         max_nodes: None,
-        timeout_ms: 0,
     }) {
-        Ok(out) => out,
-        Err(e) => {
+        Ok(outcome) => outcome,
+        Err(error) => {
             failures.push(format!(
-                "{label}: targeted Save account discovery failed: {e}"
+                "{label}: semantic Save account click failed: kind={} dispatch={} error={error:?}",
+                error.kind.as_str(),
+                error.action_dispatch.as_str(),
             ));
-            return;
+            return true;
         }
     };
-    if let ScopeResolution::Ambiguous { observed } = save.result.scope {
-        failures.push(format!(
-            "{label}: zero-timeout Save account discovery found {observed} visible Documents named \
-             \"Glass web fixture\""
-        ));
-        return;
-    }
-    if !matches!(save.result.scope, ScopeResolution::Resolved(_)) || save.result.matches.len() != 1
-    {
-        failures.push(format!(
-            "{label}: zero-timeout Save account discovery expected one match in the resolved \
-             Document scope, got scope={:?} matches={}",
-            save.result.scope,
-            save.result.matches.len()
-        ));
-        return;
-    }
-    let button = &save.result.matches[0].element;
-    if button.name.as_deref() != Some("Save account")
-        || button.role != AxRole::Button
-        || !button.states.visible
-        || button.states.secure
-    {
-        failures.push(format!(
-            "{label}: zero-timeout Save account discovery returned the wrong, hidden, or secure \
-             element: name={:?} role={:?} visible={} secure={} value={:?}",
-            button.name, button.role, button.states.visible, button.states.secure, button.value
-        ));
-        return;
+    println!(
+        "semantic Save account click after {:?}: method={} dispatch={} confirmation={} actionability={:?}",
+        clicked_at.elapsed(),
+        click.action.method.as_str(),
+        click.action.dispatch.as_str(),
+        click.action.confirmation.as_str(),
+        click.actionability.checks,
+    );
+    let saved = glass
+        .wait_for_element(&WaitElementParams {
+            name: None,
+            description: None,
+            role: Some(AxRole::TextArea),
+            value: Some("Saved".into()),
+            value_contains: None,
+            condition: ElementCondition::Appears,
+            interval_ms: 25,
+            timeout_ms: SEMANTIC_READ_TIMEOUT_MS,
+        })
+        .expect("wait for Saved status");
+    if !saved.matched {
+        failures.push(format!("{label}: Save click did not produce Saved status"));
     }
     println!(
-        "zero-timeout targeted discovery: Save account → #{} {:?}",
-        button.id.0, button.role
+        "semantic Account workflow: field=Ada status=Saved matched={}",
+        saved.matched
+    );
+    true
+}
+
+fn fixture_target(name: &str, states: Vec<SemanticState>) -> SemanticTarget {
+    SemanticTarget {
+        target: SemanticSelector::new(Some(name.into()), Some(AxRole::Button), states)
+            .expect("fixture selector"),
+        within: account_scope().within,
+    }
+}
+
+fn fixture_click(name: &str, mode: ActionMode, timeout_ms: u64) -> ClickTargetParams {
+    ClickTargetParams {
+        target: ActionTarget::Semantic(fixture_target(name, Vec::new())),
+        mode,
+        timeout_ms: Some(timeout_ms),
+        max_nodes: None,
+    }
+}
+
+fn actionability_verdict(
+    report: &ActionabilityReport,
+    name: ActionabilityCheckName,
+) -> ActionabilityVerdict {
+    report
+        .checks
+        .iter()
+        .find(|check| check.name == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing {name:?} actionability check in {:?}",
+                report.checks
+            )
+        })
+        .verdict
+}
+
+fn status_is(glass: &mut Glass, expected: &str) -> bool {
+    glass
+        .wait_for_element(&WaitElementParams {
+            name: None,
+            description: None,
+            role: None,
+            value: Some(expected.into()),
+            value_contains: None,
+            condition: ElementCondition::Appears,
+            interval_ms: 25,
+            timeout_ms: SEMANTIC_READ_TIMEOUT_MS,
+        })
+        .expect("semantic status read")
+        .matched
+}
+
+fn assert_quiet_status(glass: &mut Glass, expected: &str, context: &str) {
+    std::thread::sleep(Duration::from_millis(350));
+    assert!(
+        status_is(glass, expected),
+        "{context} changed status during the 350 ms quiet window"
+    );
+}
+
+fn exercise_actionability(glass: &mut Glass) {
+    const INITIAL: &str = "No semantic action activated";
+    assert!(status_is(glass, INITIAL));
+
+    let disabled_started = Instant::now();
+    let disabled = glass
+        .click_target(&fixture_click("Disabled semantic", ActionMode::Native, 0))
+        .expect_err("disabled target must be refused");
+    let disabled_elapsed = disabled_started.elapsed();
+    assert_eq!(disabled.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(disabled.action_dispatch, DispatchStatus::NotDispatched);
+    assert_quiet_status(glass, INITIAL, "disabled refusal");
+    println!(
+        "disabled refusal after {:?}: kind={} dispatch={} actionability={:?}; quiet_ms=350",
+        disabled_elapsed,
+        disabled.kind.as_str(),
+        disabled.action_dispatch.as_str(),
+        disabled.actionability.checks,
+    );
+
+    let duplicate_started = Instant::now();
+    let duplicate = glass
+        .click_target(&fixture_click("Duplicate semantic", ActionMode::Native, 0))
+        .expect_err("duplicate target must be refused");
+    let duplicate_elapsed = duplicate_started.elapsed();
+    assert_eq!(duplicate.kind, SemanticActionFailureKind::AmbiguousTarget);
+    assert_eq!(duplicate.action_dispatch, DispatchStatus::NotDispatched);
+    assert_quiet_status(glass, INITIAL, "ambiguous refusal");
+    println!(
+        "duplicate refusal after {:?}: kind={} dispatch={}; quiet_ms=350",
+        duplicate_elapsed,
+        duplicate.kind.as_str(),
+        duplicate.action_dispatch.as_str(),
+    );
+
+    let delayed_query = SemanticQuery::new(
+        fixture_target("Delayed semantic", vec![SemanticState::Enabled]).target,
+        account_scope().within,
+        1,
+    )
+    .expect("delayed query");
+    let absent = glass
+        .find_elements(&FindElementsParams {
+            query: delayed_query,
+            max_nodes: None,
+            timeout_ms: 0,
+        })
+        .expect("one fresh delayed absence read");
+    assert!(
+        !absent.matched,
+        "delayed target was not absent before its action"
+    );
+    assert_eq!(absent.result.matches_in_walk, 0);
+    assert!(absent.result.search_complete);
+    glass
+        .click_target(&fixture_click("Start delay", ActionMode::Native, 20_000))
+        .expect("start delayed publication");
+    let delayed_started = Instant::now();
+    let delayed = glass
+        .click_target(&fixture_click("Delayed semantic", ActionMode::Auto, 20_000))
+        .expect("delayed selector action waits and clicks");
+    let delayed_elapsed = delayed_started.elapsed();
+    assert_eq!(delayed.action.dispatch, DispatchStatus::Dispatched);
+    assert!(status_is(glass, "Delayed activated 1"));
+    assert_quiet_status(glass, "Delayed activated 1", "delayed activation");
+    println!(
+        "delayed action after observed absence waited {:?}: method={} dispatch={} confirmation={} \
+         actionability={:?}; exact_activations=1",
+        delayed_elapsed,
+        delayed.action.method.as_str(),
+        delayed.action.dispatch.as_str(),
+        delayed.action.confirmation.as_str(),
+        delayed.actionability.checks,
+    );
+
+    glass
+        .click_target(&fixture_click("Start motion", ActionMode::Native, 20_000))
+        .expect("restart motion");
+    let first_tree = glass.a11y_snapshot(Some(0)).expect("first moving sample");
+    let first_bounds = named(&first_tree, "Moving semantic")
+        .and_then(|node| node.bounds)
+        .expect("first moving bounds");
+    let observed_deadline = Instant::now() + Duration::from_millis(250);
+    let changed_bounds = loop {
+        let tree = glass
+            .a11y_snapshot(Some(0))
+            .expect("changing moving sample");
+        let bounds = named(&tree, "Moving semantic")
+            .and_then(|node| node.bounds)
+            .expect("changing moving bounds");
+        if bounds != first_bounds {
+            break bounds;
+        }
+        assert!(
+            Instant::now() < observed_deadline,
+            "moving target bounds never changed after Start motion"
+        );
+    };
+    let moving_started = Instant::now();
+    let moving = glass
+        .click_target(&fixture_click(
+            "Moving semantic",
+            ActionMode::Pointer,
+            20_000,
+        ))
+        .expect("forced pointer waits for stable bounds and clicks");
+    let moving_elapsed = moving_started.elapsed();
+    assert_eq!(
+        moving.action.method,
+        ActionMethod::Pointer {
+            native_fallback: None
+        }
+    );
+    assert_eq!(moving.action.dispatch, DispatchStatus::Dispatched);
+    assert_eq!(
+        actionability_verdict(&moving.actionability, ActionabilityCheckName::Stable),
+        ActionabilityVerdict::Passed
+    );
+    assert!(status_is(glass, "Moving activated 1"));
+    assert_quiet_status(glass, "Moving activated 1", "moving activation");
+    println!(
+        "moving generation bounds changed {first_bounds:?} -> {changed_bounds:?}; pointer waited \
+         {:?}: method={} dispatch={} confirmation={} actionability={:?}; exact_activations=1",
+        moving_elapsed,
+        moving.action.method.as_str(),
+        moving.action.dispatch.as_str(),
+        moving.action.confirmation.as_str(),
+        moving.actionability.checks,
+    );
+
+    let occlusion_tree = glass
+        .a11y_snapshot(Some(0))
+        .expect("occlusion identity snapshot");
+    let occluded = named(&occlusion_tree, "Occluded semantic").expect("occluded target");
+    let occluder = named(&occlusion_tree, "Occluder").expect("occluder identity");
+    assert_eq!(occluder.role, AxRole::Button);
+    let target_bounds = occluded.bounds.expect("occluded bounds");
+    let cover_bounds = occluder.bounds.expect("occluder bounds");
+    let center = (
+        target_bounds.x + target_bounds.width as i32 / 2,
+        target_bounds.y + target_bounds.height as i32 / 2,
+    );
+    assert!(
+        center.0 >= cover_bounds.x
+            && center.0 < cover_bounds.x + cover_bounds.width as i32
+            && center.1 >= cover_bounds.y
+            && center.1 < cover_bounds.y + cover_bounds.height as i32,
+        "named Occluder does not cover the target center: target={target_bounds:?} \
+         occluder={cover_bounds:?}"
+    );
+    let occluded_started = Instant::now();
+    let refusal = glass
+        .click_target(&fixture_click(
+            "Occluded semantic",
+            ActionMode::Pointer,
+            20_000,
+        ))
+        .expect_err("AT-SPI must prove the named occluder before pointer dispatch");
+    let occluded_elapsed = occluded_started.elapsed();
+    println!("occlusion outcome before assertions: {refusal:?}");
+    assert_eq!(refusal.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(refusal.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        actionability_verdict(&refusal.actionability, ActionabilityCheckName::NonOccluded),
+        ActionabilityVerdict::Failed
+    );
+    assert_quiet_status(glass, "Moving activated 1", "occlusion refusal");
+    println!(
+        "occlusion refusal after {:?}: target_center={center:?} named_occluder=#{} {:?} \
+         kind={} dispatch={} actionability={:?}; quiet_ms=350",
+        occluded_elapsed,
+        occluder.id.0,
+        cover_bounds,
+        refusal.kind.as_str(),
+        refusal.action_dispatch.as_str(),
+        refusal.actionability.checks,
     );
 }
 
@@ -676,6 +743,7 @@ fn discover_account_controls(glass: &mut Glass, label: &str, failures: &mut Vec<
 /// `failures` rather than panicking, so the rest of the requested browsers still get their turn
 /// and this browser's `stop` still runs.
 fn probe(backend: &str, browser: &str, lever: Lever, failures: &mut Vec<String>) {
+    let failures_before = failures.len();
     let label = format!("{backend}/{browser}/lever={lever:?}");
     println!("=== {label} ===");
     println!("engine: {}", version_of(browser));
@@ -698,14 +766,14 @@ fn probe(backend: &str, browser: &str, lever: Lever, failures: &mut Vec<String>)
     }
     println!("window mapped after {:?}", started.elapsed());
 
-    discover_account_controls(&mut glass, &label, failures);
+    let account_controls_published = exercise_account_semantically(&mut glass, &label, failures);
     let (tree, settle, arrived) = snapshot_until_page(&mut glass, &label, failures);
     println!("page content arrived: {arrived} after {settle:?}");
     match tree {
         Some(tree) => {
             report_tree(&tree);
-            if arrived {
-                exercise(&mut glass, &label, failures);
+            if arrived && account_controls_published && failures.len() == failures_before {
+                exercise_actionability(&mut glass);
             } else if let Some(hint) = tree.document_guidance().or_else(|| tree.unexposed_notice())
             {
                 println!("disclosure rendered:\n{hint}");

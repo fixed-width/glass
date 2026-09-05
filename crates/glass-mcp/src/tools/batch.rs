@@ -1,6 +1,6 @@
 //! `glass_do`: run an ordered input sequence server-side, then optionally observe.
 
-use glass_core::{Deadline, Glass, Whose};
+use glass_core::{BoundDispatch, Deadline, Glass, Whose};
 use serde_json::json;
 use std::time::{Duration, Instant};
 
@@ -94,6 +94,11 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
             "`timeout_ms` must be between 1 and {MAX_TIMEOUT_MS}"
         )));
     }
+    for (index, action) in a.actions.iter().enumerate() {
+        if let Err(error) = crate::tools::semantic_action::validate_action(action) {
+            return Err(validation_error_at(index, action.kind(), error));
+        }
+    }
     let started = Instant::now();
     let Some(deadline) = checked_sequence_deadline(started, Duration::from_millis(timeout_ms))
     else {
@@ -101,23 +106,26 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
             "`timeout_ms` is outside this platform's monotonic clock range",
         ));
     };
-    let context = ToolContext { deadline };
+    let context = ToolContext {
+        deadline,
+        owner: Some(glass_core::Whose::Caller),
+        allow_wait: true,
+    };
     let n = a.actions.len();
     let mut steps = Vec::with_capacity(n);
     let mut siblings = Vec::new();
     for (i, action) in a.actions.iter().enumerate() {
         let kind = action.kind();
         if context.deadline.has_passed() {
+            let error = ContextualError::validation(
+                "sequence deadline exceeded before action started".into(),
+            )
+            .after_sequence_deadline();
             return Err(step_failure(
                 &a.actions,
                 i,
-                kind,
-                false,
-                false,
-                Some(SafeErrorCategory::SequenceDeadlineExceeded),
-                "sequence deadline exceeded before action started",
-                None,
-                true,
+                action,
+                error,
                 steps,
                 siblings,
                 started.elapsed().as_millis(),
@@ -192,24 +200,11 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 } else {
                     error
                 };
-                let detail = redacted_error_detail(action, &error);
-                let attempted =
-                    error.bound_dispatch != Some(glass_core::BoundDispatch::NotDispatched);
-                let summary = matches!(
-                    error.category,
-                    SafeErrorCategory::InvalidValue | SafeErrorCategory::OptionNotFound
-                )
-                .then_some(error.safe_summary);
                 return Err(step_failure(
                     &a.actions,
                     i,
-                    kind,
-                    attempted,
-                    attempted && action.is_side_effecting(),
-                    Some(error.category),
-                    detail,
-                    summary,
-                    error.sequence_deadline_exceeded,
+                    action,
+                    error,
                     steps,
                     siblings,
                     started.elapsed().as_millis(),
@@ -314,41 +309,41 @@ fn predicate_failure(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn step_failure(
     actions: &[Action],
     index: usize,
-    action: &'static str,
-    attempted: bool,
-    side_effects_may_have_occurred: bool,
-    category: Option<SafeErrorCategory>,
-    detail: &str,
-    summary: Option<&str>,
-    sequence_deadline_exceeded: bool,
+    action: &Action,
+    mut error: ContextualError,
     mut steps: Vec<StepOutcome>,
     mut siblings: Vec<OutContent>,
     elapsed_ms: u128,
 ) -> ToolOutput {
-    let (code, default_summary) = if sequence_deadline_exceeded {
-        ("sequence_deadline_exceeded", "sequence deadline exceeded")
-    } else {
-        ("action_failed", "action execution failed")
+    let attempted = match error.bound_dispatch {
+        Some(BoundDispatch::NotDispatched) => false,
+        Some(BoundDispatch::MayHaveDispatched) | None => true,
     };
-    let summary = summary.unwrap_or(default_summary);
-    let content_block = siblings.len() + 1;
+    let side_effects_may_have_occurred = attempted && action.is_side_effecting();
+    let detail = match action {
+        Action::Type(_) | Action::SetValue(_) => error.safe_summary,
+        _ => &error.message,
+    };
+    let content_start = siblings.len() + 1;
+    let content_count = error.siblings.len() + 1;
+    siblings.append(&mut error.siblings);
     siblings.push(OutContent::untrusted_observation(detail));
+    let content_blocks = (content_start..content_start + content_count).collect();
     steps.push(StepOutcome::Failed {
         index,
-        action,
+        action: action.kind(),
         attempted,
-        result: None,
+        result: error.result,
         error: StepError {
-            code,
-            summary: summary.into(),
-            category,
+            code: error.code,
+            summary: error.safe_summary.into(),
+            category: Some(error.category),
         },
         side_effects_may_have_occurred,
-        content_blocks: vec![content_block],
+        content_blocks,
     });
     steps.extend(
         actions[index + 1..]
@@ -363,18 +358,15 @@ fn step_failure(
         json!({
             "ok": false,
             "tool": "glass_do",
-            "error": { "code": code, "step": index, "summary": summary },
+            "error": {
+                "code": error.code,
+                "step": index,
+                "summary": error.safe_summary,
+            },
             "outcome": failure_outcome(steps, index, elapsed_ms),
         }),
         siblings,
     )
-}
-
-fn redacted_error_detail<'a>(action: &Action, error: &'a ContextualError) -> &'a str {
-    match action {
-        Action::Type(_) | Action::SetValue(_) => error.safe_summary,
-        _ => &error.message,
-    }
 }
 
 fn validation_error(summary: &str) -> ToolOutput {
@@ -383,6 +375,22 @@ fn validation_error(summary: &str) -> ToolOutput {
             "ok": false,
             "tool": "glass_do",
             "error": { "code": "invalid_sequence", "summary": summary },
+        }),
+        Vec::new(),
+    )
+}
+
+fn validation_error_at(index: usize, action: &'static str, error: ContextualError) -> ToolOutput {
+    error_output(
+        json!({
+            "ok": false,
+            "tool": "glass_do",
+            "error": {
+                "code": "invalid_sequence",
+                "step": index,
+                "action": action,
+                "summary": error.message,
+            },
         }),
         Vec::new(),
     )

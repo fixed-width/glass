@@ -21,19 +21,28 @@ struct GlassFixtureApp: App {
     }
 }
 
-/// Four elements with stable accessibility identifiers, each verifiable from a snapshot
-/// alone: `statusLabel` (READY, flips to TAPPED), `tapButton`, `inputField`, and
-/// `echoLabel` (mirrors the field, or `(empty)`). glass surfaces an iOS element's
-/// identifier as its name, so the identifier is how a test addresses each one.
+/// Controls with stable accessibility identifiers and snapshot-readable ground truth. glass
+/// surfaces an iOS element's identifier as its name, so the identifier is how a test addresses
+/// each one.
 struct ContentView: View {
     @State private var tapped = false
     @State private var text = ""
+    @State private var saveCount = 0
+    @State private var movingCount = 0
+    @State private var movingOffset: CGFloat = 0
+
+    private var status: String {
+        if saveCount > 0 || movingCount > 0 {
+            return "SAVED:\(saveCount) MOVED:\(movingCount)"
+        }
+        return tapped ? "TAPPED" : "READY"
+    }
 
     var body: some View {
-        VStack(spacing: 40) {
-            Text(tapped ? "TAPPED" : "READY")
+        VStack(spacing: 20) {
+            Text(status)
                 .font(.system(size: 44, weight: .bold))
-                .foregroundStyle(tapped ? .green : .primary)
+                .foregroundStyle(status == "READY" ? Color.primary : Color.green)
                 .accessibilityIdentifier("statusLabel")
 
             Button("Tap Me") { tapped.toggle() }
@@ -45,12 +54,37 @@ struct ContentView: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.title2)
                 .padding(.horizontal, 40)
+                .textInputAutocapitalization(.never)
                 .accessibilityIdentifier("inputField")
 
             Text(text.isEmpty ? "(empty)" : text)
                 .font(.title3)
                 .foregroundStyle(.secondary)
                 .accessibilityIdentifier("echoLabel")
+
+            Button("Semantic Save") {
+                saveCount += 1
+                withAnimation(.linear(duration: 0.3)) {
+                    movingOffset = movingOffset == 0 ? 90 : 0
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("semanticSave")
+
+            Button("Disabled Semantic") {}
+                .disabled(true)
+                .accessibilityIdentifier("disabledSemantic")
+
+            HStack {
+                Button("Duplicate Left") {}
+                    .accessibilityIdentifier("duplicateSemantic")
+                Button("Duplicate Right") {}
+                    .accessibilityIdentifier("duplicateSemantic")
+            }
+
+            Button("Moving Semantic") { movingCount += 1 }
+                .offset(x: movingOffset)
+                .accessibilityIdentifier("movingSemantic")
         }
         .padding()
     }

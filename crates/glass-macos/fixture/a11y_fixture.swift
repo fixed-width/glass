@@ -1,6 +1,6 @@
 // a11y_fixture.swift — glass-macos accessibility-tree test fixture.
 //
-// A minimal Cocoa app whose window exposes a real NSAccessibility tree with five controls, for
+// A minimal Cocoa app whose window exposes a real NSAccessibility tree with known controls, for
 // the macOS a11y reader's on-box tests to drive by name:
 //
 //   - an NSButton titled "Save" — prints `SAVE_CLICKED` to stdout (flushed) when its action
@@ -35,8 +35,12 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 400, height: 200),
+        contentRect: NSRect(x: 0, y: 0, width: 500, height: 440),
         styleMask: [.titled], backing: .buffered, defer: false)
+    var movingSemantic: NSButton?
+    var movementTicks = 0
+    var movementTimer: Timer?
+    var movementStep: CGFloat = 20
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let save = NSButton(title: "Save", target: self, action: #selector(onSave))
@@ -79,6 +83,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // same string twice on one outline line.
         status.setAccessibilityHelp("Status")
 
+        let semanticSave = NSButton(
+            title: "Semantic Save", target: self, action: #selector(onSemanticSave))
+        semanticSave.frame = NSRect(x: 20, y: 380, width: 130, height: 32)
+        semanticSave.setAccessibilityLabel("Semantic Save")
+
+        let disabledSemantic = NSButton(
+            title: "Disabled semantic", target: self, action: #selector(onDisabledSemantic))
+        disabledSemantic.frame = NSRect(x: 170, y: 380, width: 150, height: 32)
+        disabledSemantic.setAccessibilityLabel("Disabled semantic")
+        disabledSemantic.isEnabled = false
+
+        let duplicateOne = NSButton(
+            title: "Duplicate semantic", target: self, action: #selector(onDuplicateSemantic))
+        duplicateOne.frame = NSRect(x: 20, y: 340, width: 160, height: 32)
+        duplicateOne.setAccessibilityLabel("Duplicate semantic")
+        let duplicateTwo = NSButton(
+            title: "Duplicate semantic", target: self, action: #selector(onDuplicateSemantic))
+        duplicateTwo.frame = NSRect(x: 200, y: 340, width: 160, height: 32)
+        duplicateTwo.setAccessibilityLabel("Duplicate semantic")
+
+        let moving = NSButton(
+            title: "Moving semantic", target: self, action: #selector(onMovingSemantic))
+        moving.frame = NSRect(x: 20, y: 300, width: 150, height: 32)
+        moving.setAccessibilityLabel("Moving semantic")
+        movingSemantic = moving
+
+        let occluded = NSButton(
+            title: "Occluded semantic", target: self, action: #selector(onOccludedSemantic))
+        occluded.frame = NSRect(x: 20, y: 250, width: 160, height: 32)
+        occluded.setAccessibilityLabel("Occluded semantic")
+        let occluder = NSButton(title: "Occluder", target: self, action: #selector(onOccluder))
+        occluder.frame = NSRect(x: 60, y: 250, width: 90, height: 32)
+        occluder.setAccessibilityLabel("Occluder")
+
         let contentView = NSView(frame: window.contentView!.bounds)
         contentView.addSubview(save)
         contentView.addSubview(enable)
@@ -86,10 +124,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         contentView.addSubview(bold)
         contentView.addSubview(note)
         contentView.addSubview(status)
+        contentView.addSubview(semanticSave)
+        contentView.addSubview(disabledSemantic)
+        contentView.addSubview(duplicateOne)
+        contentView.addSubview(duplicateTwo)
+        contentView.addSubview(moving)
+        contentView.addSubview(occluded)
+        contentView.addSubview(occluder)
         window.contentView = contentView
         window.title = "glass a11y fixture"
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        window.makeFirstResponder(note)
+        if let editor = note.currentEditor() as? NSTextView {
+            editor.setSelectedRange(NSRange(location: note.stringValue.utf16.count, length: 0))
+        }
+        restartMovement()
+    }
+
+    func restartMovement() {
+        movementTimer?.invalidate()
+        movementTicks = 0
+        if let moving = movingSemantic {
+            let previousX = moving.frame.origin.x
+            if previousX > 140 {
+                moving.frame.origin.x = 180
+                movementStep = -16
+            } else {
+                moving.frame.origin.x = 60
+                movementStep = 20
+            }
+            if abs(previousX - moving.frame.origin.x) > 12 {
+                emit("MOVING_RESET")
+            }
+        }
+        let timer = Timer(
+            timeInterval: 0.03,
+            target: self,
+            selector: #selector(moveSemantic),
+            userInfo: nil,
+            repeats: true)
+        movementTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     // `print` is fully buffered (not line-buffered) once stdout is a pipe rather than a
@@ -101,8 +177,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // process — on a non-seekable fd such as a pipe. `fflush(stdout)`, the convention
     // already used throughout `quadrants.swift`, is the safe equivalent here.
     @objc func onSave() {
-        print("SAVE_CLICKED")
+        emit("SAVE_CLICKED")
+    }
+
+    func emit(_ marker: String) {
+        print(marker)
         fflush(stdout)
+    }
+
+    @objc func onSemanticSave() {
+        restartMovement()
+        emit("SEMANTIC_SAVE")
+    }
+    @objc func onDisabledSemantic() { emit("DISABLED_SEMANTIC") }
+    @objc func onDuplicateSemantic() { emit("DUPLICATE_SEMANTIC") }
+    @objc func onMovingSemantic() {
+        emit(movementTimer == nil ? "MOVING_CLICKED_SETTLED" : "MOVING_CLICKED_MOVING")
+        emit("MOVING_CLICKED")
+    }
+    @objc func onOccludedSemantic() { emit("OCCLUDED_CLICKED") }
+    @objc func onOccluder() { emit("OCCLUDER_CLICKED") }
+
+    @objc func moveSemantic() {
+        guard let moving = movingSemantic else { return }
+        movementTicks += 1
+        moving.frame.origin.x += movementStep
+        if movementTicks == 1 {
+            emit("MOVING_STARTED")
+        }
+        if movementTicks >= 10 {
+            movementTimer?.invalidate()
+            movementTimer = nil
+            emit("MOVING_SETTLED")
+        }
     }
 }
 

@@ -38,11 +38,17 @@
 
 #![cfg(unix)]
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use glass_core::Deadline;
 use glass_core::accessibility::{
     Accessibility, AxContext, AxNode, AxRole, AxTarget, AxTree, WalkLimits,
+};
+use glass_core::{
+    ActionMethod, ActionMode, ActionTarget, ActionabilityCheckName, ActionabilityVerdict, Backend,
+    BaselineStore, ClickTargetParams, ConfirmationStatus, Deadline, DispatchStatus, Glass,
+    MutationReport, SemanticActionFailureKind, SemanticSelector, SemanticTarget,
+    SetValueTargetParams, TypeTargetParams,
 };
 use glass_core::{AppSpec, KeyEvent, MouseButton, Platform, PointerEvent, SandboxLevel};
 use glass_ios::{IosA11y, IosPlatform, SimulatorRegistry};
@@ -106,6 +112,190 @@ fn tap(x: i32, y: i32) -> PointerEvent {
         count: 1,
         modifiers: vec![],
     }
+}
+
+fn semantic_target(query: &str, role: AxRole) -> SemanticTarget {
+    SemanticTarget {
+        target: SemanticSelector::new(Some(query.to_owned()), Some(role), Vec::new())
+            .expect("valid semantic selector"),
+        within: None,
+    }
+}
+
+fn pointer_click(query: &str, role: AxRole, timeout_ms: u64) -> ClickTargetParams {
+    ClickTargetParams {
+        target: ActionTarget::Semantic(semantic_target(query, role)),
+        mode: ActionMode::Pointer,
+        timeout_ms: Some(timeout_ms),
+        max_nodes: None,
+    }
+}
+
+fn semantic_fixture_spec(app: String) -> AppSpec {
+    AppSpec {
+        build: None,
+        run: vec![app],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 30_000,
+        sandbox: SandboxLevel::Off,
+        a11y: true,
+    }
+}
+
+struct CountingIosPlatform {
+    inner: IosPlatform,
+    pointer_events: Arc<Mutex<Vec<PointerEvent>>>,
+    key_events: Arc<Mutex<Vec<KeyEvent>>>,
+}
+
+impl Platform for CountingIosPlatform {
+    fn start_app(&mut self, spec: &AppSpec) -> glass_core::Result<glass_core::WindowGeometry> {
+        self.inner.start_app(spec)
+    }
+
+    fn stop_app_by(&mut self, deadline: Deadline) -> glass_core::Result<()> {
+        self.inner.stop_app_by(deadline)
+    }
+
+    fn capture_frame_by(
+        &mut self,
+        region: Option<&glass_core::Region>,
+        deadline: Deadline,
+    ) -> glass_core::Result<glass_core::Frame> {
+        self.inner.capture_frame_by(region, deadline)
+    }
+
+    fn capture_window_by(
+        &mut self,
+        id: glass_core::WindowId,
+        region: Option<&glass_core::Region>,
+        deadline: Deadline,
+    ) -> glass_core::Result<glass_core::Frame> {
+        self.inner.capture_window_by(id, region, deadline)
+    }
+
+    fn send_pointer_by(
+        &mut self,
+        event: &PointerEvent,
+        deadline: Deadline,
+    ) -> glass_core::Result<()> {
+        let result = self.inner.send_pointer_by(event, deadline);
+        if result.is_ok() {
+            self.pointer_events.lock().unwrap().push(event.clone());
+        }
+        result
+    }
+
+    fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> glass_core::Result<()> {
+        let result = self.inner.send_key_by(event, deadline);
+        if result.is_ok() {
+            self.key_events.lock().unwrap().push(event.clone());
+        }
+        result
+    }
+
+    fn window_by(
+        &mut self,
+        op: &glass_core::WindowOp,
+        deadline: Deadline,
+    ) -> glass_core::Result<glass_core::WindowGeometry> {
+        self.inner.window_by(op, deadline)
+    }
+
+    fn list_windows_by(
+        &mut self,
+        deadline: Deadline,
+    ) -> glass_core::Result<Vec<glass_core::WindowInfo>> {
+        self.inner.list_windows_by(deadline)
+    }
+
+    fn select_window_by(
+        &mut self,
+        id: glass_core::WindowId,
+        deadline: Deadline,
+    ) -> glass_core::Result<glass_core::WindowGeometry> {
+        self.inner.select_window_by(id, deadline)
+    }
+
+    fn drain_logs(&mut self) -> Vec<(glass_core::Stream, String)> {
+        self.inner.drain_logs()
+    }
+
+    fn app_pid(&self) -> Option<u32> {
+        self.inner.app_pid()
+    }
+
+    fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
+        self.inner.a11y_toggle_control_at_trailing_edge()
+    }
+}
+
+type SemanticFixtureSession = (
+    Glass,
+    IosA11y,
+    Arc<Mutex<Vec<PointerEvent>>>,
+    Arc<Mutex<Vec<KeyEvent>>>,
+);
+
+fn semantic_fixture_session() -> SemanticFixtureSession {
+    let registry = Box::new(SimulatorRegistry::new());
+    let platform = IosPlatform::from_env(&registry)
+        .expect("from_env: resolve/boot a Simulator and open the idb_companion input client");
+    let session_reader = platform
+        .accessibility()
+        .expect("connect the session accessibility reader")
+        .expect("companion is required for this on-box test");
+    let independent_reader = platform
+        .accessibility()
+        .expect("connect the independent stale-target reader")
+        .expect("companion is required for this on-box test");
+    let pointer_events = Arc::new(Mutex::new(Vec::new()));
+    let key_events = Arc::new(Mutex::new(Vec::new()));
+    let mut backend = Some(Backend {
+        platform: Box::new(CountingIosPlatform {
+            inner: platform,
+            pointer_events: Arc::clone(&pointer_events),
+            key_events: Arc::clone(&key_events),
+        }),
+        accessibility: Some(Box::new(session_reader)),
+    });
+    let factory: glass_core::PlatformFactory = Box::new(move |_: &str| {
+        let _keep_registry_alive = &registry;
+        backend.take().ok_or_else(|| {
+            glass_core::GlassError::Backend("iOS backend already constructed".into())
+        })
+    });
+    let baselines = std::env::temp_dir().join(format!(
+        "glass-ios-semantic-integration-{}",
+        std::process::id()
+    ));
+    let glass = Glass::new(factory, "ios".into(), BaselineStore::new(baselines), 64);
+    (glass, independent_reader, pointer_events, key_events)
+}
+
+fn fresh_until(glass: &mut Glass, attempts: usize, pred: impl Fn(&AxTree) -> bool) -> AxTree {
+    let mut tree = glass.a11y_snapshot(None).expect("fresh semantic snapshot");
+    for _ in 0..attempts {
+        if pred(&tree) {
+            return tree;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        tree = glass.a11y_snapshot(None).expect("fresh semantic snapshot");
+    }
+    tree
+}
+
+fn check_verdict(
+    checks: &[glass_core::ActionabilityCheck],
+    name: ActionabilityCheckName,
+) -> ActionabilityVerdict {
+    checks
+        .iter()
+        .find(|check| check.name == name)
+        .unwrap_or_else(|| panic!("missing {name:?} actionability check: {checks:?}"))
+        .verdict
 }
 
 #[test]
@@ -231,6 +421,244 @@ fn drive_fixture_snapshot_tap_and_type_end_to_end() {
     );
 
     platform.stop_app().expect("stop_app");
+}
+
+#[test]
+#[ignore = "on-box only: needs a macOS host with Xcode + idb_companion + a booted iOS \
+            Simulator, and GLASS_IOS_APP pointing at the examples/ios-fixture .app"]
+fn semantic_actions_refuse_unproven_ios_state_and_dispatch_once() {
+    let app = std::env::var("GLASS_IOS_APP")
+        .expect("GLASS_IOS_APP must be set to the examples/ios-fixture GlassFixture.app path");
+    let (mut glass, mut independent_reader, pointer_events, key_events) =
+        semantic_fixture_session();
+    let window = glass
+        .start(&semantic_fixture_spec(app))
+        .expect("start semantic fixture through Glass");
+
+    let initial = fresh_until(&mut glass, 20, |tree| {
+        named_value(tree, "statusLabel").as_deref() == Some("READY")
+            && find_named(&tree.root, "movingSemantic").is_some()
+    });
+    assert_eq!(
+        named_value(&initial, "statusLabel").as_deref(),
+        Some("READY")
+    );
+    let initial_moving = find_named(&initial.root, "movingSemantic")
+        .and_then(|node| node.bounds)
+        .expect("movingSemantic has initial bounds");
+
+    let pointers_before_save = pointer_events.lock().unwrap().len();
+    let save = glass
+        .click_target(&pointer_click("semanticSave", AxRole::Button, 2_000))
+        .expect("semantic save pointer action");
+    assert_eq!(save.action.dispatch, DispatchStatus::Dispatched);
+    assert_eq!(
+        check_verdict(
+            &save.actionability.checks,
+            ActionabilityCheckName::NonOccluded
+        ),
+        ActionabilityVerdict::Unproven
+    );
+    assert_eq!(
+        check_verdict(&save.actionability.checks, ActionabilityCheckName::Visible),
+        ActionabilityVerdict::Unproven
+    );
+    assert_eq!(
+        check_verdict(&save.actionability.checks, ActionabilityCheckName::InWindow),
+        ActionabilityVerdict::Passed
+    );
+    assert_eq!(
+        pointer_events.lock().unwrap().len(),
+        pointers_before_save + 1,
+        "semanticSave sends one pointer submission"
+    );
+
+    let mut observed_bounds = Vec::new();
+    let motion_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let tree = glass
+            .a11y_snapshot(None)
+            .expect("motion observation snapshot");
+        let bounds = find_named(&tree.root, "movingSemantic")
+            .and_then(|node| node.bounds)
+            .expect("movingSemantic stays published while moving");
+        let save_counted = named_value(&tree, "statusLabel").as_deref() == Some("SAVED:1 MOVED:0");
+        if observed_bounds.last().copied() != Some(bounds) {
+            observed_bounds.push(bounds);
+        }
+        if observed_bounds.len() >= 2 && save_counted {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < motion_deadline,
+            "movingSemantic never published two changing bounds with the exact save count: \
+             {observed_bounds:?}"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    println!("movingSemantic initial={initial_moving:?}, changing bounds={observed_bounds:?}");
+
+    let pointers_before_moving = pointer_events.lock().unwrap().len();
+    let moving = glass
+        .click_target(&pointer_click("movingSemantic", AxRole::Button, 2_000))
+        .expect("moving target waits for stable bounds then dispatches");
+    assert_eq!(moving.action.dispatch, DispatchStatus::Dispatched);
+    assert_eq!(
+        check_verdict(&moving.actionability.checks, ActionabilityCheckName::Stable),
+        ActionabilityVerdict::Passed
+    );
+    assert_eq!(
+        pointer_events.lock().unwrap().len(),
+        pointers_before_moving + 1,
+        "movingSemantic sends one pointer submission after stability"
+    );
+    std::thread::sleep(Duration::from_millis(350));
+    let after_moving = glass.a11y_snapshot(None).expect("quiet moving observation");
+    assert_eq!(
+        named_value(&after_moving, "statusLabel").as_deref(),
+        Some("SAVED:1 MOVED:1"),
+        "both semantic controls must remain at exactly one dispatch through the quiet window"
+    );
+
+    let pointers_before_refusals = pointer_events.lock().unwrap().len();
+    let duplicate = glass
+        .click_target(&pointer_click("duplicateSemantic", AxRole::Button, 0))
+        .expect_err("duplicate selector must refuse without a tap");
+    assert_eq!(duplicate.kind, SemanticActionFailureKind::AmbiguousTarget);
+    assert_eq!(duplicate.action_dispatch, DispatchStatus::NotDispatched);
+    let disabled = glass
+        .click_target(&pointer_click("disabledSemantic", AxRole::Button, 0))
+        .expect_err("known disabled selector must refuse without a tap");
+    assert_eq!(disabled.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(disabled.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        check_verdict(
+            &disabled.actionability.checks,
+            ActionabilityCheckName::Enabled
+        ),
+        ActionabilityVerdict::Failed
+    );
+    std::thread::sleep(Duration::from_millis(350));
+    let after_refusals = glass
+        .a11y_snapshot(None)
+        .expect("quiet refusal observation");
+    assert_eq!(
+        named_value(&after_refusals, "statusLabel").as_deref(),
+        Some("SAVED:1 MOVED:1"),
+        "duplicate and disabled refusals must deliver no fixture tap"
+    );
+    assert_eq!(
+        pointer_events.lock().unwrap().len(),
+        pointers_before_refusals,
+        "duplicate and disabled refusals submit zero pointer events"
+    );
+
+    let stale_ctx = AxContext {
+        pids: vec![],
+        window: window.clone(),
+        window_handle: None,
+        a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
+        deadline: Deadline::UNBOUNDED,
+    };
+    let stale_tree = independent_reader
+        .snapshot(&stale_ctx)
+        .expect("capture stale inputField identity before semantic write");
+    let stale_field = find_named(&stale_tree.root, "inputField").expect("inputField present");
+    let stale_target = AxTarget {
+        id: stale_field.id,
+        role: stale_field.role,
+        name: stale_field.name.clone(),
+        bounds: stale_field.bounds,
+        value: stale_field.value.clone(),
+    };
+
+    let set_value = glass
+        .set_value_target(
+            &SetValueTargetParams {
+                target: ActionTarget::Semantic(semantic_target("inputField", AxRole::TextField)),
+                timeout_ms: Some(3_000),
+                max_nodes: None,
+            },
+            "semantic-value",
+        )
+        .expect("semantic set-value resolves fresh and confirms its value");
+    assert_eq!(set_value.action.dispatch, DispatchStatus::Dispatched);
+    assert_eq!(
+        set_value.action.confirmation,
+        ConfirmationStatus::ValueConfirmed
+    );
+    let written = fresh_until(&mut glass, 12, |tree| {
+        named_value(tree, "echoLabel").as_deref() == Some("semantic-value")
+    });
+    assert_eq!(
+        named_value(&written, "echoLabel").as_deref(),
+        Some("semantic-value")
+    );
+
+    let stale_error = independent_reader
+        .set_value(&stale_ctx, &stale_target, "stale-write")
+        .expect_err("stale value identity must refuse before dispatch");
+    assert!(
+        matches!(stale_error, glass_core::GlassError::AxElementChanged(_)),
+        "{stale_error}"
+    );
+    std::thread::sleep(Duration::from_millis(350));
+    let after_stale = glass
+        .a11y_snapshot(None)
+        .expect("quiet stale refusal observation");
+    assert_eq!(
+        named_value(&after_stale, "echoLabel").as_deref(),
+        Some("semantic-value"),
+        "stale identity refusal must not deliver text"
+    );
+
+    let pointers_before_type = pointer_events.lock().unwrap().len();
+    let keys_before_type = key_events.lock().unwrap().len();
+    let type_error = glass
+        .type_target(
+            &TypeTargetParams {
+                target: semantic_target("inputField", AxRole::TextField),
+                focus_mode: ActionMode::Pointer,
+                timeout_ms: 500,
+                max_nodes: None,
+            },
+            "forbidden-text",
+        )
+        .expect_err("idb cannot confirm focus, so targeted typing must stop after the focus tap");
+    assert_eq!(type_error.kind, SemanticActionFailureKind::FocusUnconfirmed);
+    assert_eq!(type_error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        type_error.focus,
+        Some(MutationReport {
+            method: ActionMethod::Pointer {
+                native_fallback: None,
+            },
+            dispatch: DispatchStatus::Dispatched,
+            confirmation: ConfirmationStatus::Unconfirmed,
+        })
+    );
+    assert_eq!(
+        pointer_events.lock().unwrap().len(),
+        pointers_before_type + 1,
+        "targeted type sends exactly one focus tap"
+    );
+    assert_eq!(
+        key_events.lock().unwrap().len(),
+        keys_before_type,
+        "unconfirmed focus sends zero text key submissions"
+    );
+    std::thread::sleep(Duration::from_millis(350));
+    let after_type = glass
+        .a11y_snapshot(None)
+        .expect("quiet targeted-type observation");
+    assert_eq!(
+        named_value(&after_type, "echoLabel").as_deref(),
+        Some("semantic-value"),
+        "unconfirmed focus must dispatch zero text to the field"
+    );
+
+    glass.stop().expect("stop semantic fixture");
 }
 
 /// The page's own elements, by the accessible name each carries on a platform that exposes web

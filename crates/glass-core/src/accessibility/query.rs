@@ -413,7 +413,7 @@ fn context_for(tree: &AxTree, node: &AxNode, scope: ScopeResolution) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AxNode, AxNodeId, AxRect, AxStates, AxTree};
+    use crate::{AxNode, AxNodeId, AxRect, AxStateCoverage, AxStates, AxTree, SemanticTarget};
 
     fn node(role: AxRole, name: Option<&str>) -> AxNode {
         AxNode {
@@ -435,6 +435,54 @@ mod tests {
         let mut tree = AxTree::new(root);
         tree.assign_ids();
         tree
+    }
+
+    #[test]
+    fn semantic_target_checks_target_and_scope_state_coverage() {
+        let target = SemanticTarget {
+            target: SemanticSelector::new(None, None, vec![SemanticState::Visible]).unwrap(),
+            within: Some(SemanticSelector::new(None, None, vec![SemanticState::Focused]).unwrap()),
+        };
+
+        assert_eq!(
+            target.uncovered_states(AxStateCoverage::NONE),
+            vec![SemanticState::Visible, SemanticState::Focused]
+        );
+    }
+
+    #[test]
+    fn semantic_target_coverage_observes_selector_state_deduplication() {
+        let target = SemanticTarget {
+            target: SemanticSelector::new(
+                None,
+                None,
+                vec![SemanticState::Visible, SemanticState::Visible],
+            )
+            .unwrap(),
+            within: None,
+        };
+
+        assert_eq!(
+            target.uncovered_states(AxStateCoverage::NONE),
+            vec![SemanticState::Visible]
+        );
+    }
+
+    #[test]
+    fn enabled_and_disabled_selectors_share_one_coverage_fact() {
+        let target = SemanticTarget {
+            target: SemanticSelector::new(None, None, vec![SemanticState::Enabled]).unwrap(),
+            within: Some(SemanticSelector::new(None, None, vec![SemanticState::Disabled]).unwrap()),
+        };
+
+        assert!(
+            target
+                .uncovered_states(AxStateCoverage {
+                    enabled: true,
+                    ..AxStateCoverage::NONE
+                })
+                .is_empty()
+        );
     }
 
     #[test]

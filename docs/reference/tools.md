@@ -398,15 +398,29 @@ Click at window-relative coordinates.
 
 ### `glass_type`
 
-Type a string into the focused window.
+Type text once. With no `target`, this preserves the original focused-window behavior and sends the
+text wherever focus already is. With a `target`, Glass resolves one fresh unique semantic element,
+focuses it by `focus_mode`, confirms focused state, and only then sends the text once. An unconfirmed
+focus returns `focus_unconfirmed` and sends no text; Glass does not try a second focus path after a
+focus may have dispatched.
 
 - `text` (string, **required**).
+- `target` (object) — optional semantic target. It follows the selector-action matching, deadline,
+  completeness, and output contract below.
+- `focus_mode` (string) — `"auto"` (default), `"native"`, or `"pointer"`; accepted only with
+  `target`.
+- `timeout_ms` (integer, range 0–120000, default 10000) — semantic-target deadline; accepted only
+  with `target`.
+- `max_nodes` (integer) — accessibility walk limit for semantic-target resolution; accepted only
+  with `target`.
 - `return` (string) — `"snapshot"`, `"settle"`, or `"none"` (default), as for
   `glass_click_element`. All three values are also accepted inside a `glass_do` `type` action;
   the chosen observation is retained in that action step's `result` and sibling `content_blocks`.
 
-Returns `{}` plus `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`,
-exactly as for `glass_click_element`.
+Targeted typing returns the resolved target, focus method, focus dispatch and confirmation, and the
+single keyboard dispatch separately. Untargeted typing retains its existing empty result. Either
+form also includes `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`, exactly as
+for `glass_click_element`.
 
 ### `glass_key`
 
@@ -487,10 +501,10 @@ the event — glass reports the binary and its build info if yours does not. Oth
 ### `glass_do`
 
 Prefer `glass_do` whenever at least two upcoming actions or verification waits are already known.
-Use `glass_find_elements` for each target that is not already known, retain the returned ids, then
-put the known mutations and waits into `glass_do`. Use `glass_a11y_snapshot` only when the task
-genuinely needs broad tree inspection. Use standalone tools only when the next step depends on newly
-observed state, and inspect the structured outcomes before recovery.
+Give each known unique target directly to its action. Use `glass_find_elements` when the selector
+still has several plausible candidates, and use `glass_a11y_snapshot` only when the task genuinely
+needs broad tree inspection. Use standalone tools only when the next step depends on newly observed
+state, and inspect the structured outcomes before recovery.
 
 The call runs a bounded, fixed sequence, then optionally observes. The sequence is a static list: it
 cannot use variables, references to earlier results, interpolation, branching, loops, retries, or
@@ -534,14 +548,14 @@ Do not replay a completed action or a failed action with
 `side_effects_may_have_occurred:true`. `attempted:false` proves only that the failed action itself
 was not dispatched. Inspect the outcomes and current app state before deciding what is safe to run.
 
-Example, using element ids obtained before the call:
+Example, resolving each intended target immediately before acting:
 
 ```json
 {
   "actions": [
-    {"action":"set_value","id":12,"text":"Alice"},
+    {"action":"set_value","target":{"query":"Name","role":"TextField","states":["enabled"]},"text":"Alice"},
     {"action":"wait_for_element","description":"Name","role":"TextField","value":"Alice","timeout_ms":3000},
-    {"action":"click_element","id":16,"return":"snapshot"},
+    {"action":"click_element","target":{"query":"Save","role":"Button","states":["enabled"]},"mode":"auto","return":"snapshot"},
     {"action":"wait_for_element","name":"Clicked 1","description":"Counter","timeout_ms":3000}
   ],
   "timeout_ms":10000
@@ -713,18 +727,71 @@ follow as siblings (the legend untrusted-wrapped), per the image ordering above.
 `glass_a11y_snapshot`. The box is only as precise as the toolkit's a11y geometry (can drift
 ~10–20px), but the `#id` and the click are exact.
 
+## Selector action contract
+
+`glass_click_element` and `glass_set_value` require exactly one of `id` or `target`. A target has
+`target.query`, `target.role`, `target.states`, and optional `target.within`; the scope has the same
+`query`, `role`, and `states` fields and cannot contain another scope. `query` is a case-insensitive
+substring over accessible name, description, and non-secure value, `role` uses Glass's normalized
+roles, and every supplied field and state is AND-combined. Secure values are never searched.
+
+A selector action performs fresh reads until exactly one target exists in exactly one optional
+scope. It refuses zero matches as `no_match`, duplicate targets as `ambiguous_target`, duplicate
+scopes as `ambiguous_scope`, and a truncated, unreadable, or withheld tree as `incomplete_tree` when
+that tree cannot prove uniqueness. Any explicitly requested selector state that the active reader
+does not cover returns `unproven_selector_state` before the first tree read.
+
+Selector `timeout_ms` defaults to 10000, accepts 0 through 120000, and zero performs one fresh
+attempt. Selector `max_nodes` omitted installs the default walk cap; zero removes only the node-count
+cap. One absolute deadline covers resolution, pointer stability, hit testing, backend rewalk,
+dispatch, confirmation, and an optional `return`; an enclosing `glass_do` deadline wins when it is
+earlier. Deadline failures are `action_deadline_exceeded` or `sequence_deadline_exceeded`.
+
+Pointer actions require the same semantic identity and exact bounds in two fresh samples at least
+100 ms apart. They require known enabled and visible state, stable in-window bounds, and no proven
+occluder. Native accessibility actions may bypass visibility, stability, window, and occlusion
+blockers because they do not depend on pointer geometry, while still disclosing those checks. Each
+actionability entry reports a `passed`, `failed`, or `unproven` verdict, whether it was `required`,
+and its evidence `source`. Actionability refusal is `not_actionable`; changed bounds that never
+settle return `unstable_target`; unavailable requested paths return `unsupported_mode`.
+
+Results distinguish dispatch from application effect. Click reports whether input dispatched and
+requires a separate observation for the resulting app state. Set-value succeeds only after backend
+value confirmation; uncertainty after a possible write is terminal and must not be retried. Targeted
+type reports focus and typing as separate phases, returns `focus_unconfirmed` without typing when
+focus cannot be proved, and never sends the text more than once.
+
+Resolved targets and known-target failures place application-controlled fields in nonce-delimited
+target content blocks. Ambiguity places candidates and their context in a nonce-delimited candidate
+content block. Successes and errors share the 8 KiB response policy; oversized logical content is
+externalized as a read-only artifact without changing error status.
+
+Legacy ID actions keep their immediate timing and existing result fields: they do not resolve
+freshly, wait for stability, or accept selector deadlines/limits. `glass_type` without `target`
+keeps focused-window typing. Selector behavior and error codes are the same in standalone calls and
+the corresponding `glass_do` actions.
+
 ### `glass_click_element`
 
-Address an element by its `#id`. Glass tries the platform's role-appropriate native accessibility
-operation first, falling back to a synthetic pointer click at the center of the element's bounds.
-For a text editor, the native operation may focus and confirm focus rather than activate it.
+Click one immediate `#id` or one freshly resolved semantic target. In `auto` mode Glass tries the
+role-appropriate native accessibility operation and falls back to pointer only after a proven
+pre-dispatch unsupported or unavailable native refusal. `native` and `pointer` force one path. No
+path is retried after it may have dispatched. For a text editor, a native operation may focus and
+confirm focus rather than activate it.
 
-- `id` (integer, **required**) — the `#id` from the latest snapshot.
+- `id` (integer) — the `#id` from the latest snapshot. Supply exactly one of `id` or `target`.
+- `target` (object) — semantic target described above. Supply exactly one of `id` or `target`.
+- `mode` (string) — `"auto"` (default), `"native"`, or `"pointer"`.
+- `timeout_ms` (integer, range 0–120000, default 10000) — semantic-target deadline; accepted only
+  with `target`.
+- `max_nodes` (integer) — selector-only walk cap; omitted installs the default and `0` removes the
+  node cap. Accepted only with `target`.
 - `return` (string) — `"snapshot"` appends a fresh a11y outline as an untrusted sibling block (and
   refreshes the id cache), `"settle"` folds settle metadata into `result.observed`, or `"none"`
   (default) adds nothing.
 
-Returns `{id, method}` — the addressed `#id` and which path ran (`native-action`/`pointer`).
+Returns the resolved `id`, `method`, `dispatch`, `confirmation`, and `actionability`. The method is
+`native-action` or `pointer`.
 `native-action` is the stable umbrella label for the native path, not proof that an activation verb
 fired. The result also includes `native_fallback` (why the pointer path was used) when it was,
 `actuated_id` when the native operation targeted a different element than the one you named (a
@@ -733,7 +800,8 @@ and `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`.
 
 ### `glass_set_value`
 
-Where the platform can write the value directly this is instant and takes no keystrokes. On a mobile
+Set exactly one immediate `#id` or one freshly resolved unique semantic target. Where the platform
+can write the value directly this is instant and takes no keystrokes. On a mobile
 backend (Android without the on-device accessibility service, and the iOS Simulator) it taps the
 element, clears it and types, then reads the element back to confirm — up to three reads, since a
 field may commit a frame or two later. Errors if the element isn't editable, changed since the
@@ -766,11 +834,17 @@ fixes it. Clearing a field (`text: ""`) additionally needs the element to have a
 field is not by itself evidence the clear landed on the element you meant, so a nameless one reports
 unconfirmed rather than a success it cannot prove.
 
-- `id` (integer, **required**) — the element's `#id`.
+- `id` (integer) — the element's `#id`. Supply exactly one of `id` or `target`.
+- `target` (object) — semantic target described above. Supply exactly one of `id` or `target`.
 - `text` (string, **required**) — the value to set.
+- `timeout_ms` (integer, range 0–120000, default 10000) — semantic-target deadline; accepted only
+  with `target`.
+- `max_nodes` (integer) — selector-only walk cap; omitted installs the default and `0` removes the
+  node cap. Accepted only with `target`.
 - `return` (string) — `"snapshot"`, `"settle"`, or `"none"` (default), as for `glass_click_element`.
 
-Returns `{id}` plus `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`, exactly
+Returns the resolved `id`, value-write `method`, `dispatch`, backend `confirmation`, and
+`actionability`, plus `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`, exactly
 as for `glass_click_element`.
 
 ### `glass_scroll_to_element`

@@ -84,6 +84,8 @@ command from Linux.
 ## Integration suites (Linux)
 
 `#[ignore]`d, so the ordinary `cargo test` never starts them. Each self-starts what it needs.
+On Debian/Ubuntu, install the full AT-SPI suite's fixtures with
+`sudo apt install at-spi2-core bubblewrap dbus-bin xvfb python3-gi gir1.2-gtk-3.0 gir1.2-gtk-4.0`.
 
 ```bash
 ./scripts/test-x11.sh [name]        # X11 suite; starts its own Xvfb

@@ -642,6 +642,30 @@ mod tests {
     }
 
     #[test]
+    fn uiautomator_claimed_state_coverage_is_backed_by_mapped_attributes() {
+        let xml = concat!(
+            "<?xml version='1.0'?><hierarchy rotation=\"0\">",
+            "<node class=\"android.widget.EditText\" content-desc=\"State probe\" ",
+            "enabled=\"true\" focusable=\"true\" focused=\"true\" selected=\"true\" ",
+            "checkable=\"true\" checked=\"true\" password=\"false\" ",
+            "bounds=\"[0,0][100,50]\" />",
+            "</hierarchy>",
+        );
+        let tree = build_tree(xml, &win(), WalkLimits::DEFAULT).expect("state fixture maps");
+        let states = tree.root.children[0].states;
+
+        assert!(states.enabled);
+        assert!(states.visible);
+        assert!(states.checkable);
+        assert!(states.checked);
+        assert!(states.selected);
+        assert!(states.focused);
+        assert!(states.focusable);
+        assert!(states.editable);
+        assert!(!states.expanded);
+    }
+
+    #[test]
     fn container_classes_the_probe_found_map_to_group() {
         // Every class here was observed in a real app's uiautomator dump landing in
         // AxRole::Other. They are all containers, and the container rule cannot catch

@@ -17,8 +17,8 @@ if ! command -v dbus-daemon >/dev/null 2>&1 \
    || ! command -v python3 >/dev/null 2>&1 \
    || ! python3 -c 'import gi; gi.require_version("Gtk", "4.0")' >/dev/null 2>&1; then
     echo "test-a11y: prerequisites missing — glass needs dbus-daemon, at-spi-bus-launcher,"
-    echo "           Xvfb, and python3 with GTK4 GI (apt install at-spi2-core"
-    echo "           gir1.2-gtk-4.0 python3-gi xvfb dbus-bin). Skipping."
+    echo "           Xvfb, and python3 with GTK3 + GTK4 GI (apt install at-spi2-core"
+    echo "           gir1.2-gtk-3.0 gir1.2-gtk-4.0 python3-gi xvfb dbus-bin). Skipping."
     exit 0
 fi
 

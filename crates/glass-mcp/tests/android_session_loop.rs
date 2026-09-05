@@ -11,11 +11,15 @@ mod common;
 
 use std::time::Duration;
 
-use common::mcp_http::{InProcessMcpHarness, await_cleanup, call};
-use glass_android::{A11yServiceRegistry, AgentRegistry, AndroidPlatform, EmulatorRegistry};
+use common::mcp_http::{InProcessMcpHarness, await_cleanup, call, try_call_full};
+use glass_android::{
+    A11yServiceRegistry, AgentRegistry, AndroidA11y, AndroidPlatform, EmulatorRegistry,
+};
 use glass_core::Deadline;
 use glass_core::accessibility::{AxNode, AxTree, ClickMethod};
-use glass_core::{AppSpec, BaselineStore, Glass, PlatformFactory, SandboxLevel};
+use glass_core::{
+    AppSpec, Backend, BaselineStore, Glass, GlassError, PlatformFactory, SandboxLevel,
+};
 use rmcp::{Peer, RoleClient};
 use serde_json::json;
 
@@ -50,6 +54,35 @@ fn session_glass(device: &Companions) -> Glass {
         Box::new(move |b| glass_mcp::make_platform(b, &emulators, &agents, &a11y))
     };
 
+    let baselines = tempfile::tempdir()
+        .expect("a temp dir for the baseline store")
+        .keep();
+    Glass::new(
+        factory,
+        "android".to_string(),
+        BaselineStore::new(&baselines),
+        10_000,
+    )
+}
+
+/// The same public MCP/session path with the baseline reader selected explicitly, so its
+/// pre-dispatch native-focus refusal and core's automatic pointer fallback are exercised without
+/// mutating process-global environment while the HTTP server is running.
+fn uiautomator_session_glass(device: &Companions) -> Glass {
+    let (emulators, agents) = (device.emulators.clone(), device.agents.clone());
+    let factory: PlatformFactory = Box::new(move |backend| {
+        if backend != "android" {
+            return Err(GlassError::Backend(format!(
+                "uiautomator acceptance supports only android, got {backend:?}"
+            )));
+        }
+        let platform = AndroidPlatform::from_env(&emulators, &agents)?;
+        let accessibility = AndroidA11y::for_adb(platform.resolved_adb());
+        Ok(Backend {
+            platform: Box::new(platform),
+            accessibility: Some(Box::new(accessibility)),
+        })
+    });
     let baselines = tempfile::tempdir()
         .expect("a temp dir for the baseline store")
         .keep();
@@ -96,6 +129,103 @@ fn outline_nodes(outline: &str) -> Vec<OutlineNode<'_>> {
         .collect()
 }
 
+fn outline_line<'a>(outline: &'a str, needle: &str) -> &'a str {
+    outline
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("outline has no {needle:?}:\n{outline}"))
+}
+
+fn quoted_value(line: &str, prefix: &str) -> String {
+    line.split_once(prefix)
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(value, _)| value.to_string())
+        .unwrap_or_else(|| panic!("{line:?} has no quoted {prefix:?} value"))
+}
+
+fn semantic_status(outline: &str) -> String {
+    let line = outline_line(outline, "desc=\"Semantic Status\"");
+    line.split('"')
+        .nth(1)
+        .unwrap_or_else(|| panic!("status line has no name: {line}"))
+        .to_string()
+}
+
+fn semantic_field_value(outline: &str) -> String {
+    quoted_value(
+        outline_line(outline, "TextField \"Semantic Field\""),
+        "value=\"",
+    )
+}
+
+fn semantic_focus_status(outline: &str) -> String {
+    let line = outline_line(outline, "desc=\"Semantic Focus Status\"");
+    line.split('"')
+        .nth(1)
+        .unwrap_or_else(|| panic!("focus status line has no name: {line}"))
+        .to_string()
+}
+
+fn node_bounds(outline: &str, needle: &str) -> (i32, i32, u32, u32) {
+    let line = outline_line(outline, needle);
+    let tuple = line
+        .rsplit_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(tuple, _)| tuple)
+        .unwrap_or_else(|| panic!("node has no bounds: {line}"));
+    let (position, size) = tuple
+        .split_once(' ')
+        .unwrap_or_else(|| panic!("node bounds have no size: {line}"));
+    let (x, y) = position
+        .split_once(',')
+        .unwrap_or_else(|| panic!("node bounds have no position: {line}"));
+    let (width, height) = size
+        .split_once('x')
+        .unwrap_or_else(|| panic!("node bounds have no dimensions: {line}"));
+    (
+        x.parse().expect("bounds x"),
+        y.parse().expect("bounds y"),
+        width.parse().expect("bounds width"),
+        height.parse().expect("bounds height"),
+    )
+}
+
+fn actionability(result: &serde_json::Value, check: &str) -> String {
+    result["actionability"]
+        .as_array()
+        .and_then(|checks| checks.iter().find(|item| item["check"] == check))
+        .and_then(|item| item["verdict"].as_str())
+        .unwrap_or_else(|| panic!("missing actionability check {check:?}: {result}"))
+        .to_string()
+}
+
+async fn snapshot_outline(client: &Peer<RoleClient>) -> String {
+    call(client, "glass_a11y_snapshot", json!({})).await.1
+}
+
+async fn await_exact_status(client: &Peer<RoleClient>, expected: &str) -> String {
+    let start = std::time::Instant::now();
+    loop {
+        let outline = snapshot_outline(client).await;
+        let status = semantic_status(&outline);
+        if status == expected {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            let quiet = snapshot_outline(client).await;
+            assert_eq!(
+                semantic_status(&quiet),
+                expected,
+                "handler count changed during the quiet window"
+            );
+            return quiet;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "status did not reach {expected:?}; last was {status:?}\n{outline}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn unique_outline_id(
     outline: &str,
     label: &str,
@@ -115,10 +245,14 @@ fn name_id_from_outline_result(outline: &str) -> Result<u32, String> {
     let nodes = outline_nodes(outline);
     unique_outline_id(
         outline,
-        "TextField \"Name\"",
+        "Name TextField",
         nodes
             .iter()
-            .filter(|node| node.shape.starts_with("TextField \"Name\" value="))
+            .filter(|node| {
+                (node.shape.starts_with("TextField value=\"\" ")
+                    || node.shape.starts_with("TextField \"Name\" value=\"\" "))
+                    && node.shape.contains("editable")
+            })
             .map(|node| node.id),
     )
 }
@@ -288,7 +422,7 @@ async fn ime_form_proof(client: Peer<RoleClient>, fixture: String) {
             "timeout_ms": 20_000,
             "actions": [
                 {"action": "set_value", "id": name_id, "text": "viaBatch"},
-                {"action": "wait_for_element", "name": "Name", "value": "viaBatch", "timeout_ms": 5_000},
+                {"action": "wait_for_element", "role": "TextField", "value": "viaBatch", "timeout_ms": 5_000},
                 {"action": "click_element", "id": save_id},
                 {"action": "wait_for_element", "name": "Clicked 1", "description": "Counter", "timeout_ms": 5_000}
             ]
@@ -320,14 +454,393 @@ async fn ime_form_proof(client: Peer<RoleClient>, fixture: String) {
         json!("native-action"),
         "{all_text}"
     );
+    let (_, after) = call(&client, "glass_a11y_snapshot", json!({})).await;
+    let submitted = outline_nodes(&after)
+        .into_iter()
+        .filter(|node| {
+            node.shape.starts_with("TextField value=\"viaBatch\" ")
+                && node.shape.contains("editable")
+        })
+        .count();
+    assert_eq!(submitted, 1, "expected one submitted TextField:\n{after}");
 
     call(&client, "glass_stop", json!({})).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a booted AVD + GLASS_ADB + GLASS_ANDROID_A11Y_APK + GLASS_ANDROID_ROLE_FIXTURE_APK"]
+async fn android_semantic_actions_are_conservative_and_exactly_once() {
+    let _device_lock = ANDROID_DEVICE_TEST.lock().await;
+    std::env::var("GLASS_ANDROID_A11Y_APK").expect("set GLASS_ANDROID_A11Y_APK");
+    let fixture = std::env::var("GLASS_ANDROID_ROLE_FIXTURE_APK")
+        .expect("set GLASS_ANDROID_ROLE_FIXTURE_APK");
+    let component = "tech.fixedwidth.glassrolefixture/.MainActivity";
+
+    let device = Companions {
+        agents: AgentRegistry::new(),
+        a11y: A11yServiceRegistry::new(),
+        emulators: EmulatorRegistry::new(),
+    };
+    let mcp = InProcessMcpHarness::boot(session_glass(&device), "android-semantic").await;
+    let client = mcp.peer();
+    call(
+        &client,
+        "glass_start",
+        json!({
+            "run": [fixture, component],
+            "backend": "android",
+            "timeout_ms": 10_000,
+        }),
+    )
+    .await;
+
+    let initial = snapshot_outline(&client).await;
+    assert!(
+        !initial.contains("PASSWORD_SENTINEL"),
+        "protected fixture text crossed the companion boundary: {initial}"
+    );
+    assert_eq!(
+        semantic_status(&initial),
+        "save=0 type=0 move=0 duplicate=0"
+    );
+    let duplicate_count = initial
+        .lines()
+        .filter(|line| line.contains("Button \"Duplicate semantic\""))
+        .count();
+    assert_eq!(
+        duplicate_count, 2,
+        "duplicate fixture must be genuinely ambiguous"
+    );
+
+    let native = call(
+        &client,
+        "glass_click_element",
+        json!({
+            "target": {"query": "Semantic Save", "role": "Button", "states": ["enabled"]},
+            "mode": "native",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await
+    .0;
+    assert_eq!(native["method"], "native-action");
+    assert_eq!(native["dispatch"], "dispatched");
+    await_exact_status(&client, "save=1 type=0 move=0 duplicate=0").await;
+
+    let pointer = call(
+        &client,
+        "glass_click_element",
+        json!({
+            "target": {
+                "query": "Semantic Save",
+                "role": "Button",
+                "states": ["enabled", "visible"]
+            },
+            "mode": "pointer",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await
+    .0;
+    assert_eq!(pointer["method"], "pointer");
+    assert_eq!(pointer["dispatch"], "dispatched");
+    assert_eq!(actionability(&pointer, "non_occluded"), "unproven");
+    await_exact_status(&client, "save=2 type=0 move=0 duplicate=0").await;
+
+    let set = call(
+        &client,
+        "glass_set_value",
+        json!({
+            "target": {"query": "Semantic Field", "role": "TextField", "states": ["enabled", "visible"]},
+            "text": "replaced",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await
+    .0;
+    assert_eq!(set["method"], "accessibility-value");
+    assert_eq!(set["dispatch"], "dispatched");
+    let after_set = await_exact_status(&client, "save=2 type=1 move=0 duplicate=0").await;
+    assert_eq!(semantic_field_value(&after_set), "replaced");
+
+    let before_type = semantic_field_value(&after_set);
+    let typed = call(
+        &client,
+        "glass_type",
+        json!({
+            "target": {"query": "Semantic Field", "role": "TextField", "states": ["enabled", "visible"]},
+            "focus_mode": "native",
+            "text": "Z",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await
+    .0;
+    assert_eq!(typed["focus_method"], "native-action");
+    assert_eq!(typed["focus_dispatch"], "dispatched");
+    assert_eq!(typed["focus_confirmation"], "focus_confirmed");
+    assert_eq!(typed["type_dispatch"], "dispatched");
+    let after_type = await_exact_status(&client, "save=2 type=2 move=0 duplicate=0").await;
+    assert_eq!(
+        semantic_focus_status(&after_type),
+        "focus_click=1 request=true focused=true",
+        "the fixture must observe exactly one native focus handler"
+    );
+    let after_type_value = semantic_field_value(&after_type);
+    assert_eq!(after_type_value.len(), before_type.len() + 1);
+    assert_eq!(after_type_value.matches('Z').count(), 1);
+    assert_eq!(after_type_value.replace('Z', ""), before_type);
+
+    let before_refusals = semantic_status(&after_type);
+    let disabled = try_call_full(
+        &client,
+        "glass_click_element",
+        json!({
+            "target": {"query": "Disabled semantic", "role": "Button"},
+            "mode": "pointer",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await
+    .expect_err("disabled target must be refused");
+    assert!(
+        disabled.contains("\"code\":\"not_actionable\""),
+        "{disabled}"
+    );
+    assert!(
+        disabled.contains("\"dispatch\":\"not_dispatched\""),
+        "{disabled}"
+    );
+    await_exact_status(&client, &before_refusals).await;
+
+    let duplicate = try_call_full(
+        &client,
+        "glass_click_element",
+        json!({
+            "target": {"query": "Duplicate semantic", "role": "Button"},
+            "mode": "native",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await
+    .expect_err("duplicate target must be refused");
+    assert!(
+        duplicate.contains("\"code\":\"ambiguous_target\""),
+        "{duplicate}"
+    );
+    assert!(
+        duplicate.contains("\"dispatch\":\"not_dispatched\""),
+        "{duplicate}"
+    );
+    await_exact_status(&client, &before_refusals).await;
+
+    call(
+        &client,
+        "glass_click_element",
+        json!({
+            "target": {"query": "Restart movement", "role": "Button"},
+            "mode": "native",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await;
+    let movement_started = std::time::Instant::now();
+    let mut movement_samples = Vec::new();
+    while movement_started.elapsed() < Duration::from_millis(500) {
+        let outline = snapshot_outline(&client).await;
+        movement_samples.push((
+            movement_started.elapsed(),
+            node_bounds(&outline, "Moving semantic"),
+        ));
+        if movement_samples
+            .iter()
+            .map(|(_, bounds)| bounds)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1
+        {
+            break;
+        }
+    }
+    println!("Android 300ms movement samples: {movement_samples:?}");
+    assert!(
+        movement_samples
+            .iter()
+            .map(|(_, bounds)| bounds)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1,
+        "the 300ms fixture motion produced no observed bounds change: {movement_samples:?}"
+    );
+
+    let moving = call(
+        &client,
+        "glass_click_element",
+        json!({
+            "target": {"query": "Moving semantic", "role": "Button", "states": ["enabled", "visible"]},
+            "mode": "pointer",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await
+    .0;
+    assert_eq!(moving["method"], "pointer");
+    assert_eq!(actionability(&moving, "stable"), "passed");
+    assert_eq!(actionability(&moving, "non_occluded"), "unproven");
+    await_exact_status(&client, "save=2 type=2 move=1 duplicate=0").await;
+
+    let stale_snapshot = snapshot_outline(&client).await;
+    let stale_status = outline_nodes(&stale_snapshot)
+        .into_iter()
+        .find(|node| node.shape.contains("desc=\"Semantic Status\""))
+        .expect("semantic status id");
+    let (x, y, width, height) = node_bounds(&stale_snapshot, "Button \"Semantic Save\"");
+    call(
+        &client,
+        "glass_click",
+        json!({"x": x + i32::try_from(width / 2).unwrap(), "y": y + i32::try_from(height / 2).unwrap()}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let stale = try_call_full(
+        &client,
+        "glass_click_element",
+        json!({"id": stale_status.id, "mode": "native"}),
+    )
+    .await
+    .expect_err("changed status identity must refuse the stale id");
+    assert!(stale.contains("\"code\":\"stale_element\""), "{stale}");
+    assert!(stale.contains("\"dispatch\":\"not_dispatched\""), "{stale}");
+    await_exact_status(&client, "save=3 type=2 move=1 duplicate=0").await;
+
+    call(&client, "glass_stop", json!({})).await;
+    mcp.shutdown().await.expect("companion semantic cleanup");
+
+    let fallback =
+        InProcessMcpHarness::boot(uiautomator_session_glass(&device), "android-fallback").await;
+    let client = fallback.peer();
+    call(
+        &client,
+        "glass_start",
+        json!({
+            "run": [std::env::var("GLASS_ANDROID_ROLE_FIXTURE_APK").unwrap(), component],
+            "backend": "android",
+            "timeout_ms": 10_000,
+        }),
+    )
+    .await;
+    let before = snapshot_outline(&client).await;
+    let before_value = semantic_field_value(&before);
+    let typed = call(
+        &client,
+        "glass_type",
+        json!({
+            "target": {"query": "Semantic Field", "role": "TextField", "states": ["enabled", "visible"]},
+            "focus_mode": "auto",
+            "text": "Q",
+            "timeout_ms": 30_000,
+        }),
+    )
+    .await
+    .0;
+    assert_eq!(typed["focus_method"], "pointer");
+    assert_eq!(typed["focus_confirmation"], "focus_confirmed");
+    assert_eq!(typed["type_dispatch"], "dispatched");
+    let after = await_exact_status(&client, "save=0 type=1 move=0 duplicate=0").await;
+    let after_value = semantic_field_value(&after);
+    assert_eq!(after_value.len(), before_value.len() + 1);
+    assert_eq!(after_value.matches('Q').count(), 1);
+    assert_eq!(after_value.replace('Q', ""), before_value);
+    call(&client, "glass_stop", json!({})).await;
+    fallback
+        .shutdown()
+        .await
+        .expect("fallback semantic cleanup");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "set GLASS_ANDROID_VERIFY_SCHEMA1=1 and point GLASS_ANDROID_A11Y_APK at the released schema-1 APK"]
+async fn released_schema_one_companion_falls_back_without_exposing_secure_text() {
+    if std::env::var("GLASS_ANDROID_VERIFY_SCHEMA1").as_deref() != Ok("1") {
+        eprintln!("schema-1 fallback acceptance not requested");
+        return;
+    }
+    let _device_lock = ANDROID_DEVICE_TEST.lock().await;
+    std::env::var("GLASS_ANDROID_A11Y_APK").expect("set the released schema-1 APK");
+    let fixture = std::env::var("GLASS_ANDROID_ROLE_FIXTURE_APK")
+        .expect("set GLASS_ANDROID_ROLE_FIXTURE_APK");
+    let device = Companions {
+        agents: AgentRegistry::new(),
+        a11y: A11yServiceRegistry::new(),
+        emulators: EmulatorRegistry::new(),
+    };
+    let mcp = InProcessMcpHarness::boot(session_glass(&device), "android-schema-one").await;
+    let client = mcp.peer();
+    call(
+        &client,
+        "glass_start",
+        json!({
+            "run": [fixture, "tech.fixedwidth.glassrolefixture/.MainActivity"],
+            "backend": "android",
+            "timeout_ms": 10_000,
+        }),
+    )
+    .await;
+
+    let before = snapshot_outline(&client).await;
+    assert!(!before.contains("PASSWORD_SENTINEL"), "{before}");
+    assert_eq!(semantic_status(&before), "save=0 type=0 move=0 duplicate=0");
+    let before_value = semantic_field_value(&before);
+    let native = try_call_full(
+        &client,
+        "glass_type",
+        json!({
+            "target": {"query": "Semantic Field", "role": "TextField"},
+            "focus_mode": "native",
+            "text": "NATIVE_SENTINEL",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await
+    .expect_err("uiautomator cannot claim native focus");
+    assert!(native.contains("unsupported"), "{native}");
+    assert!(
+        native.contains("\"dispatch\":\"not_dispatched\""),
+        "{native}"
+    );
+    assert!(!native.contains("NATIVE_SENTINEL"), "{native}");
+    let unchanged = await_exact_status(&client, "save=0 type=0 move=0 duplicate=0").await;
+    assert_eq!(semantic_field_value(&unchanged), before_value);
+
+    let typed = call(
+        &client,
+        "glass_type",
+        json!({
+            "target": {"query": "Semantic Field", "role": "TextField"},
+            "focus_mode": "auto",
+            "text": "Q",
+            "timeout_ms": 30_000,
+        }),
+    )
+    .await
+    .0;
+    assert_eq!(typed["focus_method"], "pointer");
+    assert_eq!(typed["focus_confirmation"], "focus_confirmed");
+    assert_eq!(typed["type_dispatch"], "dispatched");
+    let after = await_exact_status(&client, "save=0 type=1 move=0 duplicate=0").await;
+    let after_value = semantic_field_value(&after);
+    assert_eq!(after_value.matches('Q').count(), 1);
+    assert_eq!(after_value.replace('Q', ""), before_value);
+
+    call(&client, "glass_stop", json!({})).await;
+    mcp.shutdown().await.expect("schema-one fallback cleanup");
 }
 
 #[test]
 fn outline_selectors_require_the_observed_unique_control_shapes() {
     let outline = r#"
-  #3 TextField "Name" value="" (63,338 735x147) [focusable,enabled,visible,editable]
+  #3 TextField value="" (63,338 735x147) [focusable,enabled,visible,editable]
+    #4 Group "Name" (63,338 735x147) [enabled,visible]
     #5 Label "Save" (126,522 80x53) [enabled,visible]
     #6 Button (63,496 206x105) [enabled,visible]
 "#;
@@ -342,7 +855,7 @@ fn outline_selectors_reject_ambiguous_controls() {
   #4 TextField "Name" value="" (63,338 735x147) [focusable,enabled,visible,editable]
 "#;
     let error = name_id_from_outline_result(outline).unwrap_err();
-    assert!(error.contains("expected exactly one TextField \"Name\""));
+    assert!(error.contains("expected exactly one Name TextField"));
     assert!(error.contains(outline.trim()));
 
     let outline = r#"

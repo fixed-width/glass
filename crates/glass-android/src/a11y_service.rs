@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 
 use glass_core::Deadline;
 use glass_core::accessibility::{
-    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
-    Located, Subject, WalkBudget, WalkLimits,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStateCoverage, AxStates,
+    AxTarget, AxTree, Located, PointerHit, Subject, WalkBudget, WalkLimits,
 };
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result, write_took_no_effect};
@@ -17,11 +17,75 @@ use glass_core::{GlassError, Result, write_took_no_effect};
 use crate::axmap::{LabelInputs, class_to_role, demote_web_hosts, labels};
 use crate::conn::{CallFailure, Conn};
 
-/// One walk of a device `tree` reply: the bounds it runs under, and the device `ref` of every
-/// node it keeps, in the pre-order those nodes are about to be numbered in.
+const REQUIRED_NODE_SCHEMA: i64 = 2;
+const INCOMPATIBLE_NODE_SCHEMA: &str = "incompatible Android accessibility node schema";
+
+fn service_connection(port: u16, deadline: Deadline) -> Result<Conn> {
+    let conn = Conn::open_by(port, deadline)?;
+    match conn.hello_capability("node_schema").and_then(Value::as_i64) {
+        Some(REQUIRED_NODE_SCHEMA) => Ok(conn),
+        advertised => Err(GlassError::AccessibilityUnavailable(format!(
+            "{INCOMPATIBLE_NODE_SCHEMA}: got {advertised:?}, require {REQUIRED_NODE_SCHEMA}; \
+             install a schema-{REQUIRED_NODE_SCHEMA} companion or use uiautomator"
+        ))),
+    }
+}
+
+fn incompatible_node_schema(error: &GlassError) -> bool {
+    matches!(error, GlassError::AccessibilityUnavailable(message) if message.starts_with(INCOMPATIBLE_NODE_SCHEMA))
+}
+
+fn validate_node_schema(tree: &Value) -> Result<()> {
+    const REQUIRED_BOOLEANS: &[&str] = &[
+        "visible",
+        "focused",
+        "focusable",
+        "password",
+        "editable",
+        "clickable",
+        "enabled",
+        "scrollable",
+        "checkable",
+        "checked",
+        "showing_hint_text",
+    ];
+
+    fn walk(node: &Value, path: &str) -> Result<()> {
+        let object = node.as_object().ok_or_else(|| {
+            GlassError::AccessibilityUnavailable(format!(
+                "schema-{REQUIRED_NODE_SCHEMA} node {path} is not an object"
+            ))
+        })?;
+        for field in REQUIRED_BOOLEANS {
+            if !object.get(*field).is_some_and(Value::is_boolean) {
+                return Err(GlassError::AccessibilityUnavailable(format!(
+                    "schema-{REQUIRED_NODE_SCHEMA} node {path} has no boolean {field}"
+                )));
+            }
+        }
+        match object.get("children") {
+            None => Ok(()),
+            Some(Value::Array(children)) => {
+                for (index, child) in children.iter().enumerate() {
+                    walk(child, &format!("{path}.children[{index}]"))?;
+                }
+                Ok(())
+            }
+            Some(_) => Err(GlassError::AccessibilityUnavailable(format!(
+                "schema-{REQUIRED_NODE_SCHEMA} node {path} has non-array children"
+            ))),
+        }
+    }
+
+    walk(tree, "root")
+}
+
+/// One walk of a device `tree` reply: the bounds it runs under, plus the device `ref` and native
+/// click capability of every node it keeps, in the pre-order those nodes are about to be numbered.
 struct Walk {
     budget: WalkBudget,
     refs: Vec<u32>,
+    clickable: Vec<bool>,
 }
 
 impl Walk {
@@ -29,6 +93,7 @@ impl Walk {
         Walk {
             budget: WalkBudget::with_limits(limits),
             refs: Vec::new(),
+            clickable: Vec::new(),
         }
     }
 }
@@ -58,22 +123,26 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
     walk.refs.push(device_ref);
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+    walk.clickable.push(flag("clickable"));
     let editable = flag("editable");
+    let password = flag("password");
     // The device omits empty text; preserve it as empty for editable nodes.
-    let text = v
-        .get("text")
-        .and_then(Value::as_str)
-        .or_else(|| editable.then_some(""));
-    // Android can publish its displayed hint through `text`.
-    // Older companions omit the flag, preserving their legacy text mapping.
+    let text = (!password)
+        .then(|| {
+            v.get("text")
+                .and_then(Value::as_str)
+                .or_else(|| editable.then_some(""))
+        })
+        .flatten();
+    // Android can publish its displayed hint through `text`. The mapper remains tolerant of
+    // payloads without this optional label hint; production separately requires the state schema.
     let text = if flag("showing_hint_text") {
         None
     } else {
         text
     };
     let desc = v.get("desc").and_then(Value::as_str);
-    // Both keys are absent (not null) on an older companion; `get` returns `None` either way, so
-    // no version check is needed to stay compatible with it.
+    // Both optional label keys may be absent rather than null; `get` handles either shape.
     let resource_id = v.get("resource_id").and_then(Value::as_str);
     let hint = v.get("hint").and_then(Value::as_str);
     let (name, value, description) = labels(LabelInputs {
@@ -132,11 +201,10 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
         states: AxStates {
             enabled: flag("enabled"),
             editable: flag("editable"),
-            secure: flag("password"),
+            secure: password,
             focused: flag("focused"),
-            // Android "focusable" is keyboard-only; map isClickable -> focusable as the actability proxy.
-            focusable: flag("clickable"),
-            visible: true,
+            focusable: flag("focusable"),
+            visible: flag("visible"),
             // The companion carries isCheckable/isChecked (authoritative, unlike the baseline
             // uiautomator reader), so surface them directly; `AxStates::active()` and the
             // Checked/Unchecked `state_pred`s gate `checked` on `checkable`.
@@ -154,15 +222,16 @@ fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) 
     })
 }
 
-/// A tree read off the device, paired with the device `ref` of each of its nodes.
+/// A tree read off the device, paired with every node's device `ref` and click capability.
 ///
-/// The halves are only meaningful together: `refs[n]` is the `ref` the device gave the node this
-/// host numbered `AxNodeId(n)`, so an action a caller addresses by host id can be dispatched to
-/// the node the *device* knows by that name.
+/// The parts are only meaningful together: `refs[n]` and `clickable[n]` describe the node this
+/// host numbered `AxNodeId(n)`, so an action is dispatched to a ref that actually advertised
+/// `ACTION_CLICK` without substituting that capability for the node's truthful focusable state.
 #[derive(Debug)]
 pub(crate) struct RefTree {
     pub(crate) tree: AxTree,
     refs: Vec<u32>,
+    clickable: Vec<bool>,
     /// The package explicitly named by the companion. `AxTree::subject` intentionally cannot
     /// distinguish an explicit match from an omitted package, but retry authorization must.
     explicit_package: Option<String>,
@@ -175,6 +244,10 @@ impl RefTree {
             .get(id.0 as usize)
             .copied()
             .ok_or(GlassError::AxElementNotFound(id.0))
+    }
+
+    fn is_clickable(&self, id: AxNodeId) -> bool {
+        self.clickable.get(id.0 as usize).copied().unwrap_or(false)
     }
 
     /// The app whose nodes these refs number: what the tree actually described, falling back to
@@ -216,9 +289,15 @@ pub(crate) fn tree_from_json(
         walk.refs.len(),
         "one ref per kept node, or the index is meaningless"
     );
+    debug_assert_eq!(
+        tree.count,
+        walk.clickable.len(),
+        "one click capability per kept node, or the index is meaningless"
+    );
     Ok(RefTree {
         tree,
         refs: walk.refs,
+        clickable: walk.clickable,
         explicit_package: None,
     })
 }
@@ -240,7 +319,7 @@ pub struct ServiceClient {
 
 impl ServiceClient {
     pub fn connect(port: u16) -> Result<ServiceClient> {
-        let conn = Conn::open(port)?;
+        let conn = service_connection(port, Deadline::UNBOUNDED)?;
         Ok(ServiceClient {
             conn: Mutex::new(conn),
             port,
@@ -266,7 +345,7 @@ impl ServiceClient {
             )));
         }
         if conn.ensure_usable().is_err() {
-            *conn = Conn::open_by(self.port, deadline).map_err(CallFailure::NotSent)?;
+            *conn = service_connection(self.port, deadline).map_err(CallFailure::NotSent)?;
         }
         let first = conn
             .call_within(
@@ -279,7 +358,7 @@ impl ServiceClient {
             Ok(v) => Ok(v),
             Err(f) if resend(&f) => {
                 // The service's accept loop accepts a fresh connection after a drop.
-                *conn = Conn::open_by(self.port, deadline).map_err(|e| f.with_error(e))?;
+                *conn = service_connection(self.port, deadline).map_err(|e| f.with_error(e))?;
                 conn.call_within(req, deadline, "Android accessibility service retry")
                     .map_err(|e| f.with_error(e))?
                     .map_err(|retry| f.merge_retry(retry))
@@ -368,6 +447,7 @@ impl ServiceClient {
             .get("tree")
             .cloned()
             .ok_or_else(|| GlassError::AccessibilityUnavailable("no tree in response".into()))?;
+        validate_node_schema(&tree)?;
         Ok(TreeReply {
             tree,
             package: r.get("package").and_then(Value::as_str).map(str::to_owned),
@@ -588,7 +668,7 @@ impl ServiceA11y {
                     .refreshed_action_tree(ctx, explicit_acting_package, "click")
                     .map_err(|failure| action_error(target.id.0, failure))?;
                 let fresh_target = relocated_target(&fresh.tree, target)?;
-                let fresh_plan = invoke_plan(&fresh.tree, &fresh_target)?;
+                let fresh_plan = invoke_plan(&fresh, &fresh_target)?;
                 let fresh_ref = fresh.device_ref(fresh_plan.actuated.id)?;
                 require_semantic_time(ctx.deadline, "Android accessibility click", false)?;
                 self.client
@@ -762,22 +842,73 @@ impl Accessibility for ServiceA11y {
         Ok(self.snapshot_with_refs(ctx)?.tree)
     }
 
+    fn state_coverage(&self) -> AxStateCoverage {
+        AxStateCoverage {
+            enabled: true,
+            visible: true,
+            checkable: true,
+            checked: true,
+            selected: false,
+            expanded: false,
+            focused: true,
+            focusable: true,
+            editable: true,
+        }
+    }
+
+    fn focus(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
+        let rt = self
+            .snapshot_with_refs(ctx)
+            .map_err(before_mutation_dispatch)?;
+        let device_ref = rt
+            .device_ref(
+                resolved_editable_target(&rt.tree, target)
+                    .map_err(before_mutation_dispatch)?
+                    .id,
+            )
+            .map_err(before_mutation_dispatch)?;
+        require_semantic_time(ctx.deadline, "Android accessibility focus", false)
+            .map_err(before_mutation_dispatch)?;
+        self.client
+            .click(device_ref, rt.acting_on(&self.package), ctx.deadline)
+            .map_err(|failure| focus_error(target.id.0, failure))?;
+        Ok(None)
+    }
+
+    fn pointer_target_at(
+        &mut self,
+        _ctx: &AxContext,
+        _target: &AxTarget,
+        _point: (i32, i32),
+    ) -> Result<PointerHit> {
+        Ok(PointerHit::Inconclusive)
+    }
+
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         // Guard: re-snapshot and verify the id still points at the same editable element before
         // acting — `invoke`'s guard plus the editable check.
-        let rt = self.snapshot_with_refs(ctx)?;
+        let rt = self
+            .snapshot_with_refs(ctx)
+            .map_err(before_mutation_dispatch)?;
         let acting_package = rt.acting_on(&self.package).to_owned();
         let explicit_acting_package = rt.explicit_acting_package();
         // Addressed by the node the guard approved, not by the id the caller named, so a guard
         // that ever relaxes into a search cannot dispatch to a node it never approved.
-        let device_ref = rt.device_ref(resolved_editable_target(&rt.tree, target)?.id)?;
+        let device_ref = rt
+            .device_ref(
+                resolved_editable_target(&rt.tree, target)
+                    .map_err(before_mutation_dispatch)?
+                    .id,
+            )
+            .map_err(before_mutation_dispatch)?;
         #[cfg(test)]
         std::thread::sleep(self.before_set_text_delay);
         #[cfg(test)]
         if std::mem::take(&mut self.retire_before_set_text) {
             self.client.conn.lock().expect("lock").poison();
         }
-        require_semantic_time(ctx.deadline, "Android accessibility set_text", false)?;
+        require_semantic_time(ctx.deadline, "Android accessibility set_text", false)
+            .map_err(before_mutation_dispatch)?;
         match self
             .client
             .set_text(device_ref, text, rt.acting_on(&self.package), ctx.deadline)
@@ -887,8 +1018,10 @@ impl Accessibility for ServiceA11y {
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
-        let rt = self.snapshot_with_refs(ctx)?;
-        let plan = invoke_plan(&rt.tree, target)?;
+        let rt = self
+            .snapshot_with_refs(ctx)
+            .map_err(before_mutation_dispatch)?;
+        let plan = invoke_plan(&rt, target).map_err(before_mutation_dispatch)?;
         self.dispatch_click(ctx, target, &plan, &rt)
     }
 }
@@ -1170,6 +1303,10 @@ fn ready_or_restore(
     let started = std::time::Instant::now();
     let mut refusal = match wait_for_ready(port, attempt) {
         Ok(client) => return Ok(client),
+        Err(error) if error.contains(INCOMPATIBLE_NODE_SCHEMA) => {
+            restore();
+            return Err(GlassError::AccessibilityUnavailable(error));
+        }
         Err(e) => e,
     };
     let mut rebinds = 0u32;
@@ -1185,6 +1322,10 @@ fn ready_or_restore(
         rebinds += 1;
         match wait_for_ready(port, attempt) {
             Ok(client) => return Ok(client),
+            Err(error) if error.contains(INCOMPATIBLE_NODE_SCHEMA) => {
+                restore();
+                return Err(GlassError::AccessibilityUnavailable(error));
+            }
             Err(e) => refusal = e,
         }
     }
@@ -1209,6 +1350,7 @@ fn wait_for_ready(
     let client = loop {
         match ServiceClient::connect(port) {
             Ok(c) => break c,
+            Err(e) if incompatible_node_schema(&e) => return Err(e.to_string()),
             Err(e) if std::time::Instant::now() >= deadline => {
                 return Err(format!("never accepted a connection in {timeout:?}: {e}"));
             }
@@ -1378,12 +1520,20 @@ fn resolved_editable_target<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&
 ///
 /// The order is load-bearing: a Compose control omits `ACTION_CLICK` while disabled, so a climb
 /// run before the target's own `enabled` check walks past it and actuates whatever encloses it.
-fn invoke_plan(tree: &AxTree, target: &AxTarget) -> Result<InvokePlan> {
+fn invoke_plan(ref_tree: &RefTree, target: &AxTarget) -> Result<InvokePlan> {
+    invoke_plan_with(&ref_tree.tree, target, |id| ref_tree.is_clickable(id))
+}
+
+fn invoke_plan_with(
+    tree: &AxTree,
+    target: &AxTarget,
+    is_clickable: impl Fn(AxNodeId) -> bool,
+) -> Result<InvokePlan> {
     let node = resolved_target(tree, target)?;
     if !node.states.enabled {
         return Err(disabled_error(target.id.0, target.id));
     }
-    let chosen = actuable_node(tree, target)?;
+    let chosen = actuable_node_with(tree, target, is_clickable)?;
     if !chosen.states.enabled {
         return Err(disabled_error(target.id.0, chosen.id));
     }
@@ -1434,7 +1584,11 @@ fn check_state(after: &AxTree, act: &Actuated) -> CheckState {
 /// carries no name and the named child carries no `ACTION_CLICK`. When the target itself
 /// advertises no click, climb to the nearest node that does and encloses it. Only the ancestor
 /// chain is walked, so an overlapping sibling drawn above the target could still take a real tap.
-fn actuable_node<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
+fn actuable_node_with<'a>(
+    tree: &'a AxTree,
+    target: &AxTarget,
+    is_clickable: impl Fn(AxNodeId) -> bool,
+) -> Result<&'a AxNode> {
     let mut path = Vec::new();
     if !path_to(&tree.root, target.id, &mut path) {
         return Err(GlassError::AxElementNotFound(target.id.0));
@@ -1442,9 +1596,23 @@ fn actuable_node<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> 
     let want = path.last().expect("path_to leaves the target last").bounds;
     path.iter()
         .rev()
-        .find(|n| n.states.focusable && (n.id == target.id || encloses(n.bounds, want)))
+        .find(|n| is_clickable(n.id) && (n.id == target.id || encloses(n.bounds, want)))
         .copied()
         .ok_or(GlassError::AxActionUnavailable(target.id.0))
+}
+
+#[cfg(test)]
+fn actuable_node_for_tree<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
+    actuable_node_with(tree, target, |id| {
+        tree.find(id).is_some_and(|node| node.states.focusable)
+    })
+}
+
+#[cfg(test)]
+fn invoke_plan_for_tree(tree: &AxTree, target: &AxTarget) -> Result<InvokePlan> {
+    invoke_plan_with(tree, target, |id| {
+        tree.find(id).is_some_and(|node| node.states.focusable)
+    })
 }
 
 /// The root-to-`id` path, inclusive of both ends. False when `id` is not in this subtree,
@@ -1514,6 +1682,12 @@ fn read_back_error(target: &AxTarget, error: GlassError) -> GlassError {
     GlassError::write_unconfirmed_because(target.id.0, "reading the element back failed", error)
 }
 
+/// Mark errors from a proven preflight guard without weakening provenance already attached by a
+/// lower layer.
+fn before_mutation_dispatch(error: GlassError) -> GlassError {
+    error.before_dispatch()
+}
+
 /// Map a click failure onto the invoke contract. No arm is fallback-eligible: a refusal may
 /// still have reached the toolkit, and a lost answer says nothing either way.
 fn action_error(target: u32, f: CallFailure) -> GlassError {
@@ -1540,6 +1714,17 @@ fn action_error(target: u32, f: CallFailure) -> GlassError {
     }
 }
 
+/// Preserve the click transport's delivery verdict for a native focus request.
+fn focus_error(target: u32, failure: CallFailure) -> GlassError {
+    let dispatched = !matches!(&failure, CallFailure::NotSent(_));
+    let error = action_error(target, failure);
+    if dispatched {
+        error.after_dispatch()
+    } else {
+        error.before_dispatch()
+    }
+}
+
 /// The error for a control whose click was accepted but whose state never reached `want`.
 fn check_timeout(target: u32, act: &Actuated, want: bool, seen: CheckState) -> GlassError {
     let id = act.id.0;
@@ -1562,6 +1747,7 @@ fn check_timeout(target: u32, act: &Actuated, want: bool, seen: CheckState) -> G
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::fake_agent;
     use crate::conn::TimeoutFault;
     use glass_core::accessibility::{AxRole, TruncationLimit};
     use serde_json::json;
@@ -1577,6 +1763,212 @@ mod tests {
         }
     }
 
+    #[test]
+    fn schema_one_companion_is_rejected_before_any_tree_read() {
+        let (port, seen) = fake_agent(r#"{"hello":{"proto":1}}"#, vec![]);
+        let result = ServiceClient::connect(port);
+        assert!(
+            result.is_err(),
+            "schema 1 must not expose password-blind trees"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no tree request may be sent"
+        );
+    }
+
+    #[test]
+    fn node_schema_capability_must_be_the_exact_integer_two() {
+        for hello in [
+            r#"{"hello":{"proto":1,"node_schema":"2"}}"#,
+            r#"{"hello":{"proto":1,"node_schema":1}}"#,
+            r#"{"hello":{"proto":1,"node_schema":3}}"#,
+        ] {
+            let (port, seen) = fake_agent(hello, vec![]);
+            let error = match ServiceClient::connect(port) {
+                Ok(_) => panic!("accepted malformed or unsupported hello {hello}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(INCOMPATIBLE_NODE_SCHEMA));
+            assert!(seen.lock().unwrap().is_empty(), "hello={hello}");
+        }
+    }
+
+    #[test]
+    fn schema_one_readiness_restores_immediately_without_rebinding() {
+        let (port, seen) = fake_agent(r#"{"hello":{"proto":1}}"#, vec![]);
+        let rebinds = AtomicUsize::new(0);
+        let restores = AtomicUsize::new(0);
+        let error = ready_or_restore(
+            port,
+            std::time::Duration::from_secs(6),
+            3,
+            &|_| {
+                rebinds.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            &|| {
+                restores.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .err()
+        .expect("schema one is permanently incompatible");
+        assert!(error.to_string().contains(INCOMPATIBLE_NODE_SCHEMA));
+        assert_eq!(rebinds.load(Ordering::Relaxed), 0);
+        assert_eq!(restores.load(Ordering::Relaxed), 1);
+        assert!(seen.lock().unwrap().is_empty(), "no tree request");
+    }
+
+    #[test]
+    fn schema_downgrade_after_a_transient_attempt_stops_recovery_immediately() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("first connection");
+            let mut first_writer = first.try_clone().expect("clone first");
+            let mut first_reader = std::io::BufReader::new(first);
+            writeln!(first_writer, r#"{{"hello":{{"proto":1,"node_schema":2}}}}"#)
+                .expect("schema two hello");
+            loop {
+                let mut line = String::new();
+                if !matches!(first_reader.read_line(&mut line), Ok(n) if n > 0) {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).expect("request json");
+                recorded.lock().unwrap().push("conn1:tree".to_string());
+                writeln!(
+                    first_writer,
+                    "{}",
+                    json!({"id": request["id"], "ok": false, "error": "no active window"})
+                )
+                .expect("refusal");
+            }
+
+            let (second, _) = listener.accept().expect("second connection");
+            second
+                .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                .expect("read timeout");
+            let mut second_writer = second.try_clone().expect("clone second");
+            let mut second_reader = std::io::BufReader::new(second);
+            writeln!(second_writer, r#"{{"hello":{{"proto":1}}}}"#).expect("schema one hello");
+            let mut line = String::new();
+            if second_reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                recorded.lock().unwrap().push("conn2:request".to_string());
+            }
+        });
+        let rebinds = AtomicUsize::new(0);
+        let restores = AtomicUsize::new(0);
+
+        let error = match ready_or_restore(
+            port,
+            std::time::Duration::from_millis(20),
+            3,
+            &|_| {
+                rebinds.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            &|| {
+                restores.fetch_add(1, Ordering::Relaxed);
+            },
+        ) {
+            Ok(_) => panic!("a later schema downgrade is permanent, not another readiness refusal"),
+            Err(error) => error,
+        };
+
+        server.join().expect("server");
+        assert!(error.to_string().contains(INCOMPATIBLE_NODE_SCHEMA));
+        assert_eq!(rebinds.load(Ordering::Relaxed), 1);
+        assert_eq!(restores.load(Ordering::Relaxed), 1);
+        let requests = requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|request| request == "conn1:tree"));
+    }
+
+    #[test]
+    fn schema_two_missing_a_required_boolean_is_rejected_before_exposure() {
+        let response = r#"{"ok":true,"tree":{"ref":0,"class":"android.widget.EditText","text":"SECRET_SENTINEL","bounds":{"x":0,"y":100,"w":10,"h":10},"enabled":true,"visible":true,"checkable":false,"checked":false,"focused":false,"focusable":true,"editable":true,"clickable":true,"scrollable":false,"showing_hint_text":false}}"#;
+        let (port, seen) = fake_agent(r#"{"hello":{"proto":1,"node_schema":2}}"#, vec![response]);
+        let client = ServiceClient::connect(port).expect("schema 2 hello");
+        let mut reader = ServiceA11y::new(client, "com.example.app".to_string());
+        let error = reader
+            .snapshot(&ctx())
+            .expect_err("missing password must fail the whole snapshot");
+        assert!(error.to_string().contains("password"), "{error}");
+        assert!(!error.to_string().contains("SECRET_SENTINEL"), "{error}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "one guarded tree read");
+    }
+
+    #[test]
+    fn a_reconnect_rejects_schema_downgrade_without_replaying_the_request() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let tree = with_refs(&editable_field("old"));
+        let server = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("first connection");
+            let mut first_writer = first.try_clone().expect("clone first");
+            let mut first_reader = std::io::BufReader::new(first);
+            writeln!(first_writer, r#"{{"hello":{{"proto":1,"node_schema":2}}}}"#)
+                .expect("schema two hello");
+            for request_index in 0..2 {
+                let mut line = String::new();
+                first_reader.read_line(&mut line).expect("first request");
+                let request: Value = serde_json::from_str(&line).expect("request json");
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(format!("conn1:{}", request["op"].as_str().unwrap_or("?")));
+                if request_index == 0 {
+                    writeln!(
+                        first_writer,
+                        "{}",
+                        json!({"id": request["id"], "ok": true, "tree": tree})
+                    )
+                    .expect("first tree reply");
+                }
+            }
+            drop(first_writer);
+            drop(first_reader);
+
+            let (second, _) = listener.accept().expect("second connection");
+            second
+                .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                .expect("read timeout");
+            let mut second_writer = second.try_clone().expect("clone second");
+            let mut second_reader = std::io::BufReader::new(second);
+            writeln!(second_writer, r#"{{"hello":{{"proto":1}}}}"#).expect("schema one hello");
+            let mut line = String::new();
+            if second_reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                recorded.lock().unwrap().push("conn2:request".to_string());
+            }
+        });
+
+        let client = ServiceClient::connect(port).expect("initial schema two");
+        client.tree("com.example.app").expect("initial tree");
+        let failure = client
+            .call(
+                json!({"op": "tree", "package": "com.example.app"}),
+                Deadline::UNBOUNDED,
+            )
+            .expect_err("lost reply cannot reconnect through schema one");
+        assert!(matches!(failure, CallFailure::AnswerLost(_)));
+        assert!(
+            failure
+                .into_error()
+                .to_string()
+                .contains(INCOMPATIBLE_NODE_SCHEMA)
+        );
+        server.join().expect("server");
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec!["conn1:tree".to_string(), "conn1:tree".to_string()],
+            "the request must not replay on the downgraded connection"
+        );
+    }
+
     /// Number every node that carries no `ref` the way the companion's `treeJson` does —
     /// pre-order, root = 0 — so a fixture reads like a real device reply without restating what
     /// every companion release already sends. A fixture that states its own refs keeps them,
@@ -1587,6 +1979,22 @@ mod tests {
             *next += 1;
             if let Some(o) = v.as_object_mut() {
                 o.entry("ref").or_insert(json!(r));
+                let focusable = o.get("clickable").cloned().unwrap_or(json!(false));
+                for (field, value) in [
+                    ("visible", json!(true)),
+                    ("focused", json!(false)),
+                    ("focusable", focusable),
+                    ("password", json!(false)),
+                    ("editable", json!(false)),
+                    ("clickable", json!(false)),
+                    ("enabled", json!(false)),
+                    ("scrollable", json!(false)),
+                    ("checkable", json!(false)),
+                    ("checked", json!(false)),
+                    ("showing_hint_text", json!(false)),
+                ] {
+                    o.entry(field).or_insert(value);
+                }
             }
             if let Some(kids) = v.get_mut("children").and_then(Value::as_array_mut) {
                 for c in kids {
@@ -2032,6 +2440,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn companion_claimed_state_coverage_is_backed_by_mapped_fields() {
+        let node = mapped_node(&json!({
+            "class": "android.widget.EditText",
+            "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
+            "enabled": true,
+            "visible": true,
+            "editable": true,
+            "focused": true,
+            "focusable": true,
+            "checkable": true,
+            "checked": true
+        }));
+
+        assert!(node.states.enabled);
+        assert!(node.states.visible);
+        assert!(node.states.checkable);
+        assert!(node.states.checked);
+        assert!(node.states.focused);
+        assert!(node.states.focusable);
+        assert!(node.states.editable);
+        assert!(!node.states.selected);
+        assert!(!node.states.expanded);
+    }
+
+    #[test]
+    fn password_text_is_dropped_before_label_and_value_mapping() {
+        let node = mapped_node(&json!({
+            "class": "android.widget.EditText",
+            "text": "PASSWORD_SENTINEL",
+            "desc": "Password",
+            "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
+            "password": true,
+            "editable": true
+        }));
+        assert!(node.states.secure);
+        assert_eq!(node.name.as_deref(), Some("Password"));
+        for exposed in [
+            node.name.as_deref(),
+            node.description.as_deref(),
+            node.value.as_deref(),
+        ] {
+            assert_ne!(exposed, Some("PASSWORD_SENTINEL"));
+        }
+    }
+
+    #[test]
+    fn companion_state_coverage_matches_its_mapped_evidence() {
+        let (port, _ops) = fake_service(vec![editable_field("old")], OnAction::Ok);
+        let reader = reader(port, std::time::Duration::ZERO);
+        assert_eq!(
+            reader.state_coverage(),
+            glass_core::AxStateCoverage {
+                enabled: true,
+                visible: true,
+                checkable: true,
+                checked: true,
+                selected: false,
+                expanded: false,
+                focused: true,
+                focusable: true,
+                editable: true,
+            }
+        );
+    }
+
     /// Device JSON for a root with `n` flat children, each a distinctly-named Button.
     fn wide_device_json(n: usize) -> Value {
         let kids: Vec<Value> = (0..n)
@@ -2461,7 +2935,7 @@ mod tests {
         let t = built(&compose_like());
         let label = target_for(&t, AxNodeId(2));
         assert_eq!(label.name.as_deref(), Some("Save"));
-        assert_eq!(actuable_node(&t, &label).unwrap().id, AxNodeId(1));
+        assert_eq!(actuable_node_for_tree(&t, &label).unwrap().id, AxNodeId(1));
     }
 
     #[test]
@@ -2470,7 +2944,21 @@ mod tests {
         // enclosing it that also advertises a click".
         let t = built(&nested_clickables());
         let btn = target_for(&t, AxNodeId(2));
-        assert_eq!(actuable_node(&t, &btn).unwrap().id, AxNodeId(2));
+        assert_eq!(actuable_node_for_tree(&t, &btn).unwrap().id, AxNodeId(2));
+    }
+
+    #[test]
+    fn a_clickable_but_not_focusable_node_remains_natively_actuable() {
+        let mut value = nested_clickables();
+        value["children"][0]["children"][0]["focusable"] = json!(false);
+        let ref_tree = read_json(&value, WalkLimits::DEFAULT).expect("maps");
+        let button = target_for(&ref_tree.tree, AxNodeId(2));
+
+        assert!(!ref_tree.tree.find(button.id).unwrap().states.focusable);
+        assert_eq!(
+            invoke_plan(&ref_tree, &button).unwrap().actuated.id,
+            AxNodeId(2)
+        );
     }
 
     #[test]
@@ -2482,7 +2970,7 @@ mod tests {
         let t = built(&v);
         let label = target_for(&t, AxNodeId(2));
         assert!(matches!(
-            actuable_node(&t, &label),
+            actuable_node_for_tree(&t, &label),
             Err(GlassError::AxActionUnavailable(2))
         ));
     }
@@ -2495,7 +2983,7 @@ mod tests {
         v["children"][0]["bounds"] = json!({"x": 120, "y": 520, "w": 80, "h": 50});
         let t = built(&v);
         let label = target_for(&t, AxNodeId(2));
-        assert_eq!(actuable_node(&t, &label).unwrap().id, AxNodeId(1));
+        assert_eq!(actuable_node_for_tree(&t, &label).unwrap().id, AxNodeId(1));
     }
 
     #[test]
@@ -2505,7 +2993,7 @@ mod tests {
         let t = built(&v);
         let label = target_for(&t, AxNodeId(2));
         assert!(matches!(
-            actuable_node(&t, &label),
+            actuable_node_for_tree(&t, &label),
             Err(GlassError::AxActionUnavailable(2))
         ));
     }
@@ -2515,7 +3003,7 @@ mod tests {
         let mut v = compose_like();
         v["children"][0]["clickable"] = json!(false);
         let t = built(&v);
-        let e = actuable_node(&t, &target_for(&t, AxNodeId(2))).unwrap_err();
+        let e = actuable_node_for_tree(&t, &target_for(&t, AxNodeId(2))).unwrap_err();
         assert!(e.invoke_fallback_eligible(), "{e}");
     }
 
@@ -2527,7 +3015,7 @@ mod tests {
         let mut label = target_for(&t, AxNodeId(2));
         label.name = Some("Send".into());
         assert!(matches!(
-            invoke_plan(&t, &label),
+            invoke_plan_for_tree(&t, &label),
             Err(GlassError::AxElementGone(2))
         ));
     }
@@ -2537,7 +3025,7 @@ mod tests {
         let t = built(&compose_like());
         let mut label = target_for(&t, AxNodeId(2));
         label.name = Some("Send".into());
-        let e = invoke_plan(&t, &label).unwrap_err();
+        let e = invoke_plan_for_tree(&t, &label).unwrap_err();
         assert!(!e.invoke_fallback_eligible(), "{e}");
     }
 
@@ -2570,7 +3058,7 @@ mod tests {
         let t = built(&target_follows_a_rejected_clickable_sibling());
         let target = target_for(&t, AxNodeId(2));
         assert!(matches!(
-            actuable_node(&t, &target),
+            actuable_node_for_tree(&t, &target),
             Err(GlassError::AxActionUnavailable(2))
         ));
     }
@@ -2719,7 +3207,7 @@ mod tests {
         let mut clicked = checkable_json("android.widget.CheckBox", "Agree", false);
         clicked["bounds"] = json!({"x": 40, "y": 400, "w": 200, "h": 100});
         let before = after_tree(vec![clicked.clone()]);
-        let plan = invoke_plan(&before, &target_for(&before, AxNodeId(1))).unwrap();
+        let plan = invoke_plan_for_tree(&before, &target_for(&before, AxNodeId(1))).unwrap();
 
         // Ids shifted between the click and this read-back: an already-checked impostor now
         // occupies id 1, and the control actually clicked is id 2, still unchecked.
@@ -2785,7 +3273,7 @@ mod tests {
         let label = target_for(&t, AxNodeId(3));
         assert_eq!(label.name.as_deref(), Some("Delete"));
         assert_eq!(
-            actuable_node(&t, &label).unwrap().id,
+            actuable_node_for_tree(&t, &label).unwrap().id,
             AxNodeId(2),
             "the enclosing Button, not the Card around it"
         );
@@ -2804,7 +3292,7 @@ mod tests {
     #[test]
     fn a_disabled_target_is_refused_even_when_something_around_it_is_clickable() {
         let t = built(&disabled_inside_a_clickable_card());
-        let e = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap_err();
+        let e = invoke_plan_for_tree(&t, &target_for(&t, AxNodeId(2))).unwrap_err();
         assert!(matches!(e, GlassError::AxActionFailed(2, _)), "{e}");
         assert!(e.to_string().contains("disabled"), "{e}");
         assert!(
@@ -2820,7 +3308,7 @@ mod tests {
         v["children"][0]["children"][0]["clickable"] = json!(false);
         v["children"][0]["enabled"] = json!(false);
         let t = built(&v);
-        let e = invoke_plan(&t, &target_for(&t, AxNodeId(3))).unwrap_err();
+        let e = invoke_plan_for_tree(&t, &target_for(&t, AxNodeId(3))).unwrap_err();
         assert!(e.to_string().contains("element 1 is disabled"), "{e}");
         assert!(!e.invoke_fallback_eligible(), "{e}");
     }
@@ -2832,7 +3320,7 @@ mod tests {
         let mut v = disabled_inside_a_clickable_card();
         v["children"][0]["clickable"] = json!(false);
         let t = built(&v);
-        let e = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap_err();
+        let e = invoke_plan_for_tree(&t, &target_for(&t, AxNodeId(2))).unwrap_err();
         assert!(e.to_string().contains("disabled"), "{e}");
         assert!(!e.invoke_fallback_eligible(), "{e}");
     }
@@ -2856,14 +3344,14 @@ mod tests {
         // A radio button already selected stays selected, so waiting for a flip fails a click
         // on a UI already in the requested state.
         let t = selection_tree("android.widget.RadioButton", true);
-        let plan = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap();
+        let plan = invoke_plan_for_tree(&t, &target_for(&t, AxNodeId(1))).unwrap();
         assert_eq!(plan.want_checked, None);
     }
 
     #[test]
     fn clicking_an_unselected_radio_button_asks_for_it_to_end_selected() {
         let t = selection_tree("android.widget.RadioButton", false);
-        let plan = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap();
+        let plan = invoke_plan_for_tree(&t, &target_for(&t, AxNodeId(1))).unwrap();
         assert_eq!(plan.want_checked, Some(true));
     }
 
@@ -2871,7 +3359,7 @@ mod tests {
     fn clicking_a_checkbox_asks_for_its_state_to_move_either_way() {
         for was in [false, true] {
             let t = selection_tree("android.widget.CheckBox", was);
-            let plan = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap();
+            let plan = invoke_plan_for_tree(&t, &target_for(&t, AxNodeId(1))).unwrap();
             assert_eq!(plan.want_checked, Some(!was), "checked was {was}");
         }
     }
@@ -2880,7 +3368,7 @@ mod tests {
     fn clicking_a_switch_asks_for_its_state_to_move_either_way() {
         for was in [false, true] {
             let t = selection_tree("android.widget.Switch", was);
-            let plan = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap();
+            let plan = invoke_plan_for_tree(&t, &target_for(&t, AxNodeId(1))).unwrap();
             assert_eq!(plan.want_checked, Some(!was), "checked was {was}");
         }
     }
@@ -2888,14 +3376,14 @@ mod tests {
     #[test]
     fn a_plain_button_has_no_state_to_wait_for() {
         let t = built(&compose_like());
-        let plan = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap();
+        let plan = invoke_plan_for_tree(&t, &target_for(&t, AxNodeId(2))).unwrap();
         assert_eq!(plan.want_checked, None);
     }
 
     #[test]
     fn the_plan_actuates_the_climbed_ancestor_and_reports_the_substitution() {
         let t = built(&compose_like());
-        let plan = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap();
+        let plan = invoke_plan_for_tree(&t, &target_for(&t, AxNodeId(2))).unwrap();
         assert_eq!(plan.actuated.id, AxNodeId(1));
         assert_eq!(plan.substituted(), Some(AxNodeId(1)));
     }
@@ -2903,7 +3391,7 @@ mod tests {
     #[test]
     fn a_target_actuated_in_its_own_right_substitutes_nothing() {
         let t = built(&nested_clickables());
-        let plan = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap();
+        let plan = invoke_plan_for_tree(&t, &target_for(&t, AxNodeId(2))).unwrap();
         assert_eq!(plan.actuated.id, AxNodeId(2));
         assert_eq!(plan.substituted(), None);
     }
@@ -2925,7 +3413,7 @@ mod tests {
         });
         assert_eq!(t.truncated.map(|x| x.limit), Some(TruncationLimit::Nodes));
         assert_eq!(
-            invoke_plan(&t, &target_for(&t, AxNodeId(1)))
+            invoke_plan_for_tree(&t, &target_for(&t, AxNodeId(1)))
                 .unwrap()
                 .actuated
                 .id,
@@ -3164,7 +3652,8 @@ mod tests {
                 let (sock, _) = listener.accept().expect("accept connection");
                 let mut writer = sock.try_clone().expect("clone connection");
                 let mut reader = std::io::BufReader::new(sock);
-                writeln!(writer, r#"{{"hello":{{"proto":1}}}}"#).expect("write hello");
+                writeln!(writer, r#"{{"hello":{{"proto":1,"node_schema":2}}}}"#)
+                    .expect("write hello");
                 let mut tree_confirmed = false;
                 loop {
                     let mut line = String::new();
@@ -3281,7 +3770,7 @@ mod tests {
                 let this_action = on_action[(conn - 1).min(on_action.len() - 1)];
                 let Ok(mut w) = sock.try_clone() else { break };
                 let mut r = std::io::BufReader::new(sock);
-                if writeln!(w, r#"{{"hello":{{"proto":1}}}}"#)
+                if writeln!(w, r#"{{"hello":{{"proto":1,"node_schema":2}}}}"#)
                     .and_then(|()| w.flush())
                     .is_err()
                 {
@@ -4483,7 +4972,7 @@ mod tests {
         let target = target_for(&t, AxNodeId(1));
 
         let rt = a.snapshot_with_refs(&ctx()).expect("snapshot");
-        let plan = invoke_plan(&rt.tree, &target).expect("plan resolves");
+        let plan = invoke_plan(&rt, &target).expect("plan resolves");
         retire_current_connection_before_dispatch(&mut a);
 
         a.dispatch_click(&ctx(), &target, &plan, &rt)
@@ -4522,7 +5011,7 @@ mod tests {
         let mut a = ServiceA11y::new(client, "com.example.app".to_string());
         let target = target_for(&built(&initial), AxNodeId(1));
         let rt = a.snapshot_with_refs(&ctx()).expect("snapshot");
-        let plan = invoke_plan(&rt.tree, &target).expect("plan resolves");
+        let plan = invoke_plan(&rt, &target).expect("plan resolves");
 
         retire_current_connection_before_dispatch(&mut a);
 
@@ -4564,7 +5053,7 @@ mod tests {
         let target = target_for(&t, AxNodeId(1));
 
         let rt = a.snapshot_with_refs(&ctx()).expect("snapshot");
-        let plan = invoke_plan(&rt.tree, &target).expect("plan resolves");
+        let plan = invoke_plan(&rt, &target).expect("plan resolves");
 
         retire_current_connection_before_dispatch(&mut a);
 
@@ -5094,7 +5583,7 @@ mod tests {
             let (sock, _) = listener.accept().expect("accept");
             let mut w = sock.try_clone().expect("clone");
             let mut r = std::io::BufReader::new(sock);
-            writeln!(w, r#"{{"hello":{{"proto":1}}}}"#)
+            writeln!(w, r#"{{"hello":{{"proto":1,"node_schema":2}}}}"#)
                 .and_then(|()| w.flush())
                 .expect("hello");
             let mut line = String::new();
@@ -5144,6 +5633,79 @@ mod tests {
     }
 
     #[test]
+    fn service_focus_clicks_the_resolved_editable_once() {
+        let tree = editable_field("old");
+        let (port, ops) = fake_service(vec![tree.clone()], OnAction::Ok);
+        let mut reader = reader(port, std::time::Duration::ZERO);
+        let seen = built(&tree);
+
+        let focused = reader
+            .focus(&ctx(), &target_for(&seen, AxNodeId(1)))
+            .expect("editable focus uses ACTION_CLICK");
+
+        assert_eq!(focused, None);
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()]
+        );
+    }
+
+    #[test]
+    fn service_focus_refuses_a_non_editable_button() {
+        let tree = json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
+            "enabled": true,
+            "children": [{
+                "class": "android.widget.Button", "desc": "Do not activate",
+                "bounds": {"x": 0, "y": 100, "w": 600, "h": 120},
+                "clickable": true, "enabled": true
+            }]
+        });
+        let (port, ops) = fake_service(vec![tree.clone()], OnAction::Ok);
+        let mut reader = reader(port, std::time::Duration::ZERO);
+        let seen = built(&tree);
+
+        let error = reader
+            .focus(&ctx(), &target_for(&seen, AxNodeId(1)))
+            .expect_err("focus must not activate a non-editable button");
+
+        assert!(
+            matches!(error.cause(), GlassError::AxElementNotEditable(1)),
+            "{error}"
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+        assert_eq!(ops_of(&ops), vec!["conn1:tree".to_string()]);
+    }
+
+    #[test]
+    fn a_lost_focus_reply_is_may_have_dispatched_and_is_never_replayed() {
+        let tree = editable_field("old");
+        let (port, ops) = fake_service(vec![tree.clone()], OnAction::DropWithoutAnswering);
+        let mut reader = reader(port, std::time::Duration::ZERO);
+        let seen = built(&tree);
+
+        let error = reader
+            .focus(&ctx(), &target_for(&seen, AxNodeId(1)))
+            .expect_err("a lost focus reply is not a confirmed focus");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
+        assert!(!error.invoke_fallback_eligible(), "{error}");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()],
+            "the focus click is never replayed after its answer is lost"
+        );
+    }
+
+    #[test]
     fn the_click_is_sent_to_the_node_the_climb_resolved_to() {
         // Sending the caller's own id would click the label, which handles nothing — every
         // Compose click a no-op reported as success.
@@ -5175,6 +5737,27 @@ mod tests {
             vec!["conn1:tree".to_string()],
             "the refusal must happen before anything is dispatched"
         );
+    }
+
+    #[test]
+    fn a_stale_invoke_guard_is_annotated_before_dispatch() {
+        let tree = compose_like();
+        let (port, ops) = fake_service(vec![tree.clone()], OnAction::Ok);
+        let mut reader = reader(port, std::time::Duration::ZERO);
+        let seen = built(&tree);
+        let mut stale = target_for(&seen, AxNodeId(2));
+        stale.name = Some("no longer Save".into());
+
+        let error = reader
+            .invoke(&ctx(), &stale)
+            .expect_err("a stale target must be refused before ACTION_CLICK");
+
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+        assert_eq!(ops_of(&ops), vec!["conn1:tree".to_string()]);
     }
 
     #[test]
@@ -5275,7 +5858,7 @@ mod tests {
             .expect_err("only position is forgiven");
         // Renaming the node left nothing in the tree presenting as the target, so the
         // relaxation is never reached.
-        assert!(matches!(e, GlassError::AxElementGone(2)), "{e}");
+        assert!(matches!(e.cause(), GlassError::AxElementGone(2)), "{e}");
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string()],
@@ -5340,7 +5923,7 @@ mod tests {
         let e = a
             .set_value(&ctx(), &target_for(&seen, AxNodeId(1)), "new@example.com")
             .expect_err("a field holding other data is not the field that was addressed");
-        assert!(matches!(e, GlassError::AxElementChanged(1)), "{e}");
+        assert!(matches!(e.cause(), GlassError::AxElementChanged(1)), "{e}");
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string()],
@@ -5361,7 +5944,7 @@ mod tests {
         let e = a
             .set_value(&ctx(), &gone, "new")
             .expect_err("an id that resolves to nothing is absent, not moved");
-        assert!(matches!(e, GlassError::AxElementNotFound(9)), "{e}");
+        assert!(matches!(e.cause(), GlassError::AxElementNotFound(9)), "{e}");
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string()],
@@ -5380,7 +5963,7 @@ mod tests {
         let e = a
             .invoke(&ctx(), &target_for(&seen, AxNodeId(2)))
             .expect_err("a resize is not a translation");
-        assert!(matches!(e, GlassError::AxElementChanged(2)), "{e}");
+        assert!(matches!(e.cause(), GlassError::AxElementChanged(2)), "{e}");
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string()],

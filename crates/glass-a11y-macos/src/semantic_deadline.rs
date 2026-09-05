@@ -7,6 +7,7 @@ pub(crate) enum SemanticOperation {
     Snapshot,
     SetValue(u32),
     Invoke,
+    Focus,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +38,14 @@ impl SemanticDeadline {
         Self {
             deadline,
             operation: SemanticOperation::Invoke,
+            dispatched: false,
+        }
+    }
+
+    pub(crate) fn focus(deadline: Deadline, _target: u32) -> Self {
+        Self {
+            deadline,
+            operation: SemanticOperation::Focus,
             dispatched: false,
         }
     }
@@ -72,6 +81,12 @@ impl SemanticDeadline {
             }
             (SemanticOperation::Invoke, true) => {
                 GlassError::caller_deadline_elapsed("native accessibility invoke")
+            }
+            (SemanticOperation::Focus, false) => {
+                GlassError::deadline_not_started("native accessibility focus")
+            }
+            (SemanticOperation::Focus, true) => {
+                GlassError::caller_deadline_elapsed("native accessibility focus")
             }
         }
     }
@@ -378,11 +393,38 @@ mod tests {
         for guard in [
             SemanticDeadline::set_value(Deadline::at(now), 7),
             SemanticDeadline::invoke(Deadline::at(now)),
+            SemanticDeadline::focus(Deadline::at(now), 7),
         ] {
             let error = guard.require_at(now).unwrap_err();
             assert_eq!(error.bound_owner(), Some(Whose::Caller));
             assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
         }
+    }
+
+    #[test]
+    fn focus_spent_before_the_ax_write_is_not_dispatched() {
+        let now = Instant::now();
+        let error = SemanticDeadline::focus(Deadline::at(now), 7)
+            .require_at(now)
+            .expect_err("focus must stop before a write when its deadline is spent");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn focus_expiry_after_the_ax_write_may_have_dispatched() {
+        let now = Instant::now();
+        let error = SemanticDeadline::focus(Deadline::at(now), 7)
+            .after_dispatch()
+            .require_at(now)
+            .expect_err("focus expiry after the write must remain ambiguous");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
     }
 
     #[test]

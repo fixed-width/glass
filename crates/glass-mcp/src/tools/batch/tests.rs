@@ -3,12 +3,13 @@ use crate::tools::start as start_tool;
 use crate::tools::testutil::*;
 use crate::tools::{OutContent, baseline_save};
 use glass_core::{
-    A11yThread, Accessibility, AppSpec, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates,
-    AxTree, Backend, BaselineStore, Deadline, Frame, GlassError, KeyEvent, Platform,
-    PlatformFactory, PointerEvent, Region, Result as GlassResult, Stream, WindowGeometry, WindowId,
-    WindowInfo, WindowOp,
+    A11yThread, Accessibility, AppSpec, AxContext, AxNode, AxNodeId, AxRect, AxRole,
+    AxStateCoverage, AxStates, AxTarget, AxTree, Backend, BaselineStore, Deadline, Frame,
+    GlassError, KeyEvent, Platform, PlatformFactory, PointerEvent, Region, Result as GlassResult,
+    Stream, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,12 +44,14 @@ enum DeadlineBehavior {
     ComboEscapeFailure,
     OtherFailure,
     ResizeAfterOneScroll,
+    FocusConfirmationSequenceDeadline,
 }
 
 struct DeadlinePlatform {
     inner: FakePlatform,
     deadlines: Arc<Mutex<Vec<Deadline>>>,
     behavior: DeadlineBehavior,
+    pointer_tree_changed: Option<Arc<AtomicBool>>,
 }
 
 type DeadlineFixture = (Glass, Arc<Mutex<Vec<Deadline>>>, Arc<Mutex<Vec<String>>>);
@@ -151,14 +154,25 @@ fn untrusted_nonce_normalization_changes_only_wrapper_markers() {
 
 struct DeadlineAccessibility {
     tree: AxTree,
+    tree_after_pointer: Option<(Arc<AtomicBool>, AxTree)>,
     deadlines: Arc<Mutex<Vec<Deadline>>>,
     events: Arc<Mutex<Vec<String>>>,
     behavior: DeadlineBehavior,
+    coverage: AxStateCoverage,
+    focus_dispatched: bool,
 }
 
 impl Accessibility for DeadlineAccessibility {
     fn snapshot(&mut self, context: &AxContext) -> GlassResult<AxTree> {
         self.deadlines.lock().unwrap().push(context.deadline);
+        if matches!(
+            self.behavior,
+            DeadlineBehavior::FocusConfirmationSequenceDeadline
+        ) && self.focus_dispatched
+            && context.deadline != Deadline::UNBOUNDED
+        {
+            sleep_past(context.deadline);
+        }
         if matches!(self.behavior, DeadlineBehavior::A11yNotReadyLate)
             && context.deadline != Deadline::UNBOUNDED
         {
@@ -176,7 +190,21 @@ impl Accessibility for DeadlineAccessibility {
                 "the read reached its effective deadline",
             ));
         }
-        Ok(self.tree.clone())
+        Ok(self
+            .tree_after_pointer
+            .as_ref()
+            .filter(|(changed, _)| changed.load(Ordering::SeqCst))
+            .map_or_else(|| self.tree.clone(), |(_, tree)| tree.clone()))
+    }
+
+    fn state_coverage(&self) -> AxStateCoverage {
+        self.coverage
+    }
+
+    fn focus(&mut self, _context: &AxContext, _target: &AxTarget) -> GlassResult<Option<AxNodeId>> {
+        self.events.lock().unwrap().push("focus".into());
+        self.focus_dispatched = true;
+        Ok(None)
     }
 
     fn set_value(
@@ -244,6 +272,9 @@ impl Accessibility for DeadlineAccessibility {
         _context: &AxContext,
         _target: &glass_core::AxTarget,
     ) -> GlassResult<Option<glass_core::AxNodeId>> {
+        if matches!(self.behavior, DeadlineBehavior::UnsupportedAccessibility) {
+            return Err(GlassError::AxUnsupported);
+        }
         self.events.lock().unwrap().push("click_element".into());
         Ok(None)
     }
@@ -312,7 +343,7 @@ impl Platform for DeadlinePlatform {
 
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> GlassResult<()> {
         self.deadlines.lock().unwrap().push(deadline);
-        match self.behavior {
+        let result = match self.behavior {
             DeadlineBehavior::Normal => self.inner.send_pointer(event),
             DeadlineBehavior::CompleteLate => {
                 sleep_past(deadline);
@@ -368,8 +399,16 @@ impl Platform for DeadlinePlatform {
             | DeadlineBehavior::SetValueWorkerSpawnFailure
             | DeadlineBehavior::InvalidBoolean
             | DeadlineBehavior::OptionNotFound
-            | DeadlineBehavior::ComboEscapeFailure => self.inner.send_pointer(event),
+            | DeadlineBehavior::ComboEscapeFailure
+            | DeadlineBehavior::FocusConfirmationSequenceDeadline => self.inner.send_pointer(event),
+        };
+        if result.is_ok()
+            && matches!(event, PointerEvent::Click { .. })
+            && let Some(changed) = &self.pointer_tree_changed
+        {
+            changed.store(true, Ordering::SeqCst);
         }
+        result
     }
     fn send_key_by(&mut self, event: &KeyEvent, deadline: Deadline) -> GlassResult<()> {
         self.deadlines.lock().unwrap().push(deadline);
@@ -416,6 +455,7 @@ fn deadline_glass(behavior: DeadlineBehavior, frames: Vec<Frame>) -> DeadlineFix
             .with_event_log(events.clone()),
         deadlines: deadlines.clone(),
         behavior,
+        pointer_tree_changed: None,
     };
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("baselines");
@@ -456,15 +496,35 @@ fn deadline_a11y_glass_with_behavior(
     behavior: DeadlineBehavior,
     frames: Vec<Frame>,
 ) -> A11yReturnDeadlineFixture {
+    deadline_a11y_glass_with_tree_behavior(
+        behavior,
+        frames,
+        fake_tree(),
+        None,
+        AxStateCoverage::NONE,
+    )
+}
+
+fn deadline_a11y_glass_with_tree_behavior(
+    behavior: DeadlineBehavior,
+    frames: Vec<Frame>,
+    tree: AxTree,
+    tree_after_pointer: Option<(Arc<AtomicBool>, AxTree)>,
+    coverage: AxStateCoverage,
+) -> A11yReturnDeadlineFixture {
     let platform_deadlines = Arc::new(Mutex::new(Vec::new()));
     let accessibility_deadlines = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
+    let pointer_tree_changed = tree_after_pointer
+        .as_ref()
+        .map(|(changed, _)| Arc::clone(changed));
     let platform = DeadlinePlatform {
         inner: FakePlatform::new(100, 100)
             .with_frames(frames)
             .with_event_log(events.clone()),
         deadlines: platform_deadlines.clone(),
         behavior,
+        pointer_tree_changed,
     };
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("baselines");
@@ -472,10 +532,13 @@ fn deadline_a11y_glass_with_behavior(
     let mut held = Some(Backend {
         platform: Box::new(platform),
         accessibility: Some(Box::new(DeadlineAccessibility {
-            tree: fake_tree(),
+            tree,
+            tree_after_pointer,
             deadlines: accessibility_deadlines.clone(),
             events: events.clone(),
             behavior,
+            coverage,
+            focus_dispatched: false,
         })),
     });
     let factory: PlatformFactory = Box::new(move |_| {
@@ -512,6 +575,52 @@ fn do_args(actions: Vec<Action>, timeout_ms: u64) -> DoArgs {
         timeout_ms: Some(timeout_ms),
         encoded_argument_bytes: 0,
     }
+}
+
+fn parsed_action(raw: &str) -> Action {
+    serde_json::from_str(raw).unwrap()
+}
+
+fn semantic_control_tree(role: AxRole, name: &str, focused: bool) -> AxTree {
+    let control = AxNode {
+        id: AxNodeId(0),
+        role,
+        raw_role: format!("{role:?}"),
+        name: Some(name.into()),
+        description: None,
+        value: None,
+        states: AxStates {
+            enabled: true,
+            visible: true,
+            focusable: true,
+            editable: role == AxRole::TextField,
+            focused,
+            ..AxStates::default()
+        },
+        bounds: Some(AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        }),
+        children: vec![],
+    };
+    AxTree::new(AxNode {
+        id: AxNodeId(0),
+        role: AxRole::Window,
+        raw_role: "frame".into(),
+        name: Some("Win".into()),
+        description: None,
+        value: None,
+        states: AxStates::default(),
+        bounds: Some(AxRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }),
+        children: vec![control],
+    })
 }
 
 fn sleep_past(deadline: Deadline) {
@@ -592,6 +701,10 @@ fn type_secret_failure_preserves_no_active_session_without_echoing_input() {
         &mut glass,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: secret.into(),
                 return_: None,
             })],
@@ -617,7 +730,10 @@ fn set_value_secret_failure_preserves_no_active_session_without_echoing_input() 
         &mut glass,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: secret.into(),
                 return_: None,
             })],
@@ -648,7 +764,10 @@ fn assert_safe_set_value_category(
         &mut glass,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: secret.into(),
                 return_: None,
             })],
@@ -752,6 +871,7 @@ fn started_scripted_combo(trees: Vec<AxTree>) -> (Glass, Arc<Mutex<Vec<String>>>
         inner: FakePlatform::new(100, 100).with_event_log(events.clone()),
         deadlines: Arc::new(Mutex::new(Vec::new())),
         behavior: DeadlineBehavior::ComboEscapeFailure,
+        pointer_tree_changed: None,
     };
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("baselines");
@@ -805,7 +925,10 @@ fn real_combo_missing_option_after_open_and_failed_escape_is_attempted_and_secre
         &mut glass,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: submitted_secret.into(),
                 return_: None,
             })],
@@ -846,6 +969,10 @@ fn secret_failure_omits_backend_detail_containing_submitted_input() {
         &mut type_glass,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: typed_secret.into(),
                 return_: None,
             })],
@@ -866,7 +993,10 @@ fn secret_failure_omits_backend_detail_containing_submitted_input() {
         &mut set_glass,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: set_secret.into(),
                 return_: None,
             })],
@@ -986,6 +1116,10 @@ fn sequence_deadline_construction_is_checked() {
 fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
     let frame = Frame::solid(100, 100, [7, 8, 9, 255]);
     let settle_args = TypeArgs {
+        target: None,
+        focus_mode: None,
+        timeout_ms: None,
+        max_nodes: None,
         text: "private".into(),
         return_: Some("settle".into()),
     };
@@ -1020,6 +1154,10 @@ fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
     assert_eq!(contextual_deadlines.lock().unwrap()[0], Deadline::UNBOUNDED);
 
     let snapshot_args = TypeArgs {
+        target: None,
+        focus_mode: None,
+        timeout_ms: None,
+        max_nodes: None,
         text: "private".into(),
         return_: Some("snapshot".into()),
     };
@@ -1059,21 +1197,32 @@ fn standalone_return_handlers_keep_wire_shape_and_unbounded_context() {
     }
 
     let invalid = TypeArgs {
+        target: None,
+        focus_mode: None,
+        timeout_ms: None,
+        max_nodes: None,
         text: "private".into(),
         return_: Some("later".into()),
     };
     let mut standalone = started(FakePlatform::new(100, 100));
     let mut contextual = started(FakePlatform::new(100, 100));
+    let standalone = crate::tools::type_text(&mut standalone, &invalid).unwrap_err();
+    let contextual = crate::tools::type_text_with(
+        &mut contextual,
+        &invalid,
+        crate::tools::ToolContext::UNBOUNDED,
+    )
+    .unwrap_err();
+    let envelope: serde_json::Value =
+        serde_json::from_str(&standalone.render_text_blocks()[0]).unwrap();
+    assert_eq!(envelope["error"]["code"], contextual.code);
+    assert_eq!(envelope["error"]["summary"], contextual.safe_summary);
     assert_eq!(
-        crate::tools::type_text(&mut standalone, &invalid).unwrap_err(),
-        crate::tools::type_text_with(
-            &mut contextual,
-            &invalid,
-            crate::tools::ToolContext::UNBOUNDED,
-        )
-        .unwrap_err()
-        .message
+        contextual.bound_dispatch,
+        Some(glass_core::BoundDispatch::NotDispatched)
     );
+    assert_eq!(envelope["result"]["dispatch"], "not_dispatched");
+    assert_eq!(envelope["result"]["side_effects_may_have_occurred"], false);
 }
 
 #[test]
@@ -1090,7 +1239,7 @@ fn sequence_uses_one_absolute_deadline_for_every_action() {
                     chord: "Tab".into(),
                 }),
                 Action::Settle(SettleArgs {
-                    interval_ms: Some(0),
+                    interval_ms: Some(1),
                     settle_frames: Some(1),
                     tolerance: None,
                     timeout_ms: Some(2000),
@@ -1246,8 +1395,8 @@ fn action_owned_bounded_wait_read_is_action_failed_not_sequence_deadline() {
     let envelope = envelope(&error);
     let step = &envelope["outcome"]["steps"][0];
 
-    assert_eq!(envelope["error"]["code"], "action_failed");
-    assert_eq!(step["error"]["code"], "action_failed");
+    assert_eq!(envelope["error"]["code"], "transport_failure");
+    assert_eq!(step["error"]["code"], "transport_failure");
     assert_eq!(step["error"]["category"], "transport_failure");
     assert_eq!(step["attempted"], true);
     assert_eq!(step["side_effects_may_have_occurred"], false);
@@ -1362,7 +1511,7 @@ fn settle_own_timeout_is_completed_but_sequence_timeout_fails() {
     let black = Frame::solid(100, 100, [0, 0, 0, 255]);
     let white = Frame::solid(100, 100, [255, 255, 255, 255]);
     let settle = Action::Settle(SettleArgs {
-        interval_ms: Some(0),
+        interval_ms: Some(1),
         settle_frames: Some(u32::MAX),
         tolerance: None,
         timeout_ms: Some(2),
@@ -1379,7 +1528,7 @@ fn settle_own_timeout_is_completed_but_sequence_timeout_fails() {
         false
     );
     let caller_settle = Action::Settle(SettleArgs {
-        interval_ms: Some(0),
+        interval_ms: Some(1),
         settle_frames: Some(u32::MAX),
         tolerance: None,
         timeout_ms: Some(1000),
@@ -1431,7 +1580,7 @@ fn action_owned_capture_timeout_is_not_a_sequence_deadline() {
         &mut g,
         &do_args(
             vec![Action::Settle(SettleArgs {
-                interval_ms: Some(0),
+                interval_ms: Some(1),
                 settle_frames: Some(2),
                 tolerance: None,
                 timeout_ms: Some(20),
@@ -1445,8 +1594,8 @@ fn action_owned_capture_timeout_is_not_a_sequence_deadline() {
     let envelope = envelope(&error);
     let step = &envelope["outcome"]["steps"][0];
 
-    assert_eq!(envelope["error"]["code"], "action_failed");
-    assert_eq!(step["error"]["code"], "action_failed");
+    assert_eq!(envelope["error"]["code"], "action_deadline_exceeded");
+    assert_eq!(step["error"]["code"], "action_deadline_exceeded");
     assert_eq!(step["error"]["category"], "action_deadline_exceeded");
     assert_eq!(step["attempted"], true);
     assert_eq!(step["side_effects_may_have_occurred"], false);
@@ -1466,6 +1615,10 @@ fn caller_soft_return_settle_fails_the_mutating_action() {
             vec![
                 click(1, 1),
                 Action::Type(TypeArgs {
+                    target: None,
+                    focus_mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     text: "secret".into(),
                     return_: Some("settle".into()),
                 }),
@@ -1502,6 +1655,10 @@ fn caller_soft_return_snapshot_stops_before_accessibility_work() {
         &mut g,
         &do_args(
             vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("snapshot".into()),
             })],
@@ -1527,6 +1684,10 @@ fn return_snapshot_propagates_settle_capture_failure_after_dispatch() {
         &mut g,
         &do_args(
             vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("snapshot".into()),
             })],
@@ -1537,7 +1698,7 @@ fn return_snapshot_propagates_settle_capture_failure_after_dispatch() {
     let envelope = envelope(&error);
     let step = &envelope["outcome"]["steps"][0];
 
-    assert_eq!(envelope["error"]["code"], "action_failed");
+    assert_eq!(envelope["error"]["code"], "transport_failure");
     assert_eq!(step["error"]["category"], "transport_failure");
     assert_eq!(step["attempted"], true);
     assert_eq!(step["side_effects_may_have_occurred"], true);
@@ -1559,6 +1720,10 @@ fn type_return_not_dispatched_after_actuation_remains_attempted() {
         &mut g,
         &do_args(
             vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("settle".into()),
             })],
@@ -1579,7 +1744,11 @@ fn click_element_return_not_dispatched_after_actuation_remains_attempted() {
         &mut g,
         &do_args(
             vec![Action::ClickElement(ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: Some("settle".into()),
             })],
             100,
@@ -1599,7 +1768,10 @@ fn set_value_return_not_dispatched_after_actuation_remains_attempted() {
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("settle".into()),
             })],
@@ -1620,7 +1792,10 @@ fn set_value_caller_deadline_shorter_than_backend_ceiling_is_sequence_deadline_e
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: None,
             })],
@@ -1652,7 +1827,10 @@ fn set_value_backend_ceiling_shorter_than_sequence_is_transport_failure() {
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: None,
             })],
@@ -1663,7 +1841,7 @@ fn set_value_backend_ceiling_shorter_than_sequence_is_transport_failure() {
     let envelope = envelope(&error);
     let step = &envelope["outcome"]["steps"][0];
 
-    assert_eq!(envelope["error"]["code"], "action_failed");
+    assert_eq!(envelope["error"]["code"], "transport_failure");
     assert_eq!(step["error"]["category"], "transport_failure");
     assert_eq!(step["attempted"], true);
     assert_eq!(step["side_effects_may_have_occurred"], true);
@@ -1684,7 +1862,10 @@ fn set_value_transport_failure_keeps_post_write_retry_guidance() {
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: None,
             })],
@@ -1714,7 +1895,10 @@ fn set_value_worker_spawn_failure_is_unattempted_and_safe_to_retry() {
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: None,
             })],
@@ -1763,7 +1947,7 @@ fn nested_prior_dispatch_remains_attempted_and_warns_about_side_effects() {
     let envelope: serde_json::Value = serde_json::from_str(&error_text(err)).unwrap();
     let step = &envelope["outcome"]["steps"][0];
 
-    assert_eq!(envelope["error"]["code"], "action_failed");
+    assert_eq!(envelope["error"]["code"], "transport_failure");
     assert_eq!(step["attempted"], true);
     assert_eq!(step["side_effects_may_have_occurred"], true);
 }
@@ -1850,6 +2034,10 @@ fn success_retains_existing_fields_and_adds_every_step_result() {
             actions: vec![
                 click(10, 20),
                 Action::Type(TypeArgs {
+                    target: None,
+                    focus_mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     text: "alice".into(),
                     return_: None,
                 }),
@@ -1897,6 +2085,10 @@ fn type_return_snapshot_is_retained_in_content_blocks() {
         &mut g,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "hi".into(),
                 return_: Some("snapshot".into()),
             })],
@@ -1930,6 +2122,10 @@ fn type_action_with_return_none_is_allowed() {
         &mut g,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "hi".into(),
                 return_: Some("none".into()),
             })],
@@ -2000,6 +2196,115 @@ fn invalid_sequence_rejects_empty_actions_before_actuation() {
         .unwrap_err(),
     );
     assert!(err.contains("at least one"), "got: {err}");
+}
+
+fn assert_invalid_later_action_is_preflighted(case: &str, action: Action) {
+    let kind = action.kind();
+    let (mut glass, platform_deadlines, accessibility_deadlines, events) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::Normal, vec![]);
+    let error = do_actions(&mut glass, &do_args(vec![click(1, 1), action], 1_000)).unwrap_err();
+    let envelope = envelope(&error);
+
+    assert_eq!(envelope["error"]["code"], "invalid_sequence", "{case}");
+    assert_eq!(envelope["error"]["step"], 1, "{case}");
+    assert_eq!(envelope["error"]["action"], kind, "{case}");
+    assert!(envelope.get("outcome").is_none(), "{case}: {envelope}");
+    assert_eq!(
+        error.0.len(),
+        1,
+        "{case}: validation must stay trusted-only"
+    );
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "{case}: mutation occurred"
+    );
+    assert!(
+        platform_deadlines.lock().unwrap().is_empty(),
+        "{case}: platform state was read or mutated"
+    );
+    assert!(
+        accessibility_deadlines.lock().unwrap().is_empty(),
+        "{case}: selector resolution or accessibility state read occurred"
+    );
+}
+
+#[test]
+fn invalid_semantic_actions_are_preflighted_before_mutation() {
+    let cases = [
+        (
+            "invalid return",
+            r#"{"action":"click_element","id":1,"return":"invalid"}"#,
+        ),
+        (
+            "both target forms",
+            r#"{"action":"click_element","id":1,"target":{"role":"Button"}}"#,
+        ),
+        (
+            "neither target form",
+            r#"{"action":"set_value","text":"secret"}"#,
+        ),
+        (
+            "target timeout",
+            r#"{"action":"click_element","target":{"role":"Button"},"timeout_ms":120001}"#,
+        ),
+        (
+            "selector state",
+            r#"{"action":"click_element","target":{"role":"Button","states":["hovered"]}}"#,
+        ),
+        (
+            "target role",
+            r#"{"action":"type","target":{"role":"Mystery"},"text":"secret"}"#,
+        ),
+    ];
+
+    for (case, raw) in cases {
+        assert_invalid_later_action_is_preflighted(case, parsed_action(raw));
+    }
+}
+
+#[test]
+fn invalid_semantic_preflight_covers_every_later_action_variant() {
+    let cases = [
+        ("click count", r#"{"action":"click","x":1,"y":1,"count":0}"#),
+        (
+            "click modifier",
+            r#"{"action":"click","x":1,"y":1,"modifiers":["invalid"]}"#,
+        ),
+        (
+            "drag modifier",
+            r#"{"action":"drag","x1":1,"y1":1,"x2":2,"y2":2,"modifiers":["invalid"]}"#,
+        ),
+        (
+            "scroll magnitude",
+            r#"{"action":"scroll","x":1,"y":1,"dx":101}"#,
+        ),
+        (
+            "targetless type controls",
+            r#"{"action":"type","text":"secret","focus_mode":"auto"}"#,
+        ),
+        ("key chord", r#"{"action":"key","chord":"ctrl+"}"#),
+        ("settle interval", r#"{"action":"settle","interval_ms":0}"#),
+        (
+            "wait selector",
+            r#"{"action":"wait_for_element","condition":"appears"}"#,
+        ),
+        (
+            "wait condition",
+            r#"{"action":"wait_for_element","role":"Button","condition":"mystery"}"#,
+        ),
+        (
+            "scroll direction",
+            r#"{"action":"scroll_to_element","role":"Button","direction":"diagonal"}"#,
+        ),
+        (
+            "half scroll anchor",
+            r#"{"action":"scroll_to_element","role":"Button","x":1}"#,
+        ),
+    ];
+
+    for (case, raw) in cases {
+        assert_invalid_later_action_is_preflighted(case, parsed_action(raw));
+    }
 }
 
 #[test]
@@ -2101,6 +2406,10 @@ fn mutating_action_validation_failures_are_proven_not_dispatched() {
         (
             "type return",
             Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("invalid".into()),
             }),
@@ -2108,14 +2417,21 @@ fn mutating_action_validation_failures_are_proven_not_dispatched() {
         (
             "click_element return",
             Action::ClickElement(ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: Some("invalid".into()),
             }),
         ),
         (
             "set_value return",
             Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("invalid".into()),
             }),
@@ -2125,12 +2441,22 @@ fn mutating_action_validation_failures_are_proven_not_dispatched() {
     for (case, action) in cases {
         let error = do_actions(&mut g, &do_args(vec![action], 1_000)).unwrap_err();
         let envelope = envelope(&error);
-        let step = &envelope["outcome"]["steps"][0];
-        assert_eq!(step["attempted"], false, "{case}: {envelope}");
-        assert_eq!(
-            step["side_effects_may_have_occurred"], false,
-            "{case}: {envelope}"
+        let runtime_geometry_check = matches!(
+            case,
+            "click bounds" | "drag bounds" | "scroll bounds" | "scroll_to_element anchor bounds"
         );
+        if runtime_geometry_check {
+            let step = &envelope["outcome"]["steps"][0];
+            assert_eq!(step["attempted"], false, "{case}: {envelope}");
+            assert_eq!(
+                step["side_effects_may_have_occurred"], false,
+                "{case}: {envelope}"
+            );
+        } else {
+            assert_eq!(envelope["error"]["code"], "invalid_sequence", "{case}");
+            assert_eq!(envelope["error"]["step"], 0, "{case}");
+            assert!(envelope.get("outcome").is_none(), "{case}: {envelope}");
+        }
     }
     assert!(
         events.lock().unwrap().is_empty(),
@@ -2158,11 +2484,10 @@ fn batch_click_rejects_zero_and_unbounded_count_without_platform_dispatch() {
         )
         .unwrap_err();
         let envelope = envelope(&error);
-        let step = &envelope["outcome"]["steps"][0];
-
-        assert_eq!(envelope["error"]["code"], "action_failed");
-        assert_eq!(step["attempted"], false);
-        assert_eq!(step["side_effects_may_have_occurred"], false);
+        assert_eq!(envelope["error"]["code"], "invalid_sequence");
+        assert_eq!(envelope["error"]["step"], 0);
+        assert_eq!(envelope["error"]["action"], "click");
+        assert!(envelope.get("outcome").is_none());
         assert!(
             output_text(&error).contains("between 1 and 10"),
             "unexpected validation detail for {count}: {}",
@@ -2204,11 +2529,10 @@ fn batch_scroll_rejects_extreme_magnitudes_without_platform_dispatch() {
         )
         .unwrap_err();
         let envelope = envelope(&error);
-        let step = &envelope["outcome"]["steps"][0];
-
-        assert_eq!(envelope["error"]["code"], "action_failed");
-        assert_eq!(step["attempted"], false);
-        assert_eq!(step["side_effects_may_have_occurred"], false);
+        assert_eq!(envelope["error"]["code"], "invalid_sequence");
+        assert_eq!(envelope["error"]["step"], 0);
+        assert_eq!(envelope["error"]["action"], "scroll");
+        assert!(envelope.get("outcome").is_none());
         assert!(
             output_text(&error).contains("between -100 and 100"),
             "unexpected validation detail for ({dx:?}, {dy:?}): {}",
@@ -2235,7 +2559,10 @@ fn invalid_boolean_semantic_validation_is_proven_not_dispatched() {
         &mut g,
         &do_args(
             vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "not-a-boolean".into(),
                 return_: None,
             })],
@@ -2263,11 +2590,18 @@ fn semantic_actions_delegate_and_retain_standalone_results() {
         &DoArgs {
             actions: vec![
                 Action::ClickElement(ClickElementArgs {
-                    id: 1,
+                    id: Some(1),
+                    target: None,
+                    mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     return_: None,
                 }),
                 Action::SetValue(SetValueArgs {
-                    id: 1,
+                    id: Some(1),
+                    target: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     text: "secret".into(),
                     return_: None,
                 }),
@@ -2341,6 +2675,205 @@ fn semantic_actions_delegate_and_retain_standalone_results() {
 }
 
 #[test]
+fn semantic_step_selector_resolves_at_execution_time() {
+    let changed = Arc::new(AtomicBool::new(false));
+    let (mut glass, _, accessibility_deadlines, events) = deadline_a11y_glass_with_tree_behavior(
+        DeadlineBehavior::Normal,
+        vec![],
+        semantic_control_tree(AxRole::Button, "Before", false),
+        Some((
+            Arc::clone(&changed),
+            semantic_control_tree(AxRole::Button, "Save", false),
+        )),
+        AxStateCoverage::NONE,
+    );
+
+    let output = do_actions(
+        &mut glass,
+        &do_args(
+            vec![
+                click(1, 1),
+                parsed_action(
+                    r#"{"action":"click_element","target":{"query":"Save","role":"Button"},"mode":"native","timeout_ms":0}"#,
+                ),
+            ],
+            1_000,
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(assert_envelope(&output, "glass_do")["executed"], 2);
+    assert!(changed.load(Ordering::SeqCst));
+    assert_eq!(*events.lock().unwrap(), vec!["click(1,1)", "click_element"]);
+    assert_eq!(
+        accessibility_deadlines.lock().unwrap().len(),
+        1,
+        "the selector must resolve exactly when its step begins"
+    );
+}
+
+#[test]
+fn semantic_step_timeout_is_bounded_by_the_earlier_sequence_deadline() {
+    let (mut glass, _, accessibility_deadlines, _) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::Normal, vec![]);
+    let output = do_actions(
+        &mut glass,
+        &do_args(
+            vec![parsed_action(
+                r#"{"action":"click_element","target":{"query":"Save","role":"Button"},"mode":"native","timeout_ms":120000}"#,
+            )],
+            100,
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(assert_envelope(&output, "glass_do")["executed"], 1);
+    let deadline = accessibility_deadlines.lock().unwrap()[0];
+    let remaining = deadline.remaining().unwrap();
+    assert!(remaining <= Duration::from_millis(100));
+    assert!(remaining > Duration::from_millis(50));
+}
+
+#[test]
+fn semantic_step_uses_its_ten_second_default_inside_a_longer_sequence() {
+    let (mut glass, _, accessibility_deadlines, _) =
+        deadline_a11y_glass_with_behavior(DeadlineBehavior::Normal, vec![]);
+    let output = do_actions(
+        &mut glass,
+        &do_args(
+            vec![parsed_action(
+                r#"{"action":"click_element","target":{"query":"Save","role":"Button"},"mode":"native"}"#,
+            )],
+            120_000,
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(assert_envelope(&output, "glass_do")["executed"], 1);
+    let deadline = accessibility_deadlines.lock().unwrap()[0];
+    let remaining = deadline.remaining().unwrap();
+    assert!(remaining <= Duration::from_secs(10));
+    assert!(remaining > Duration::from_millis(9_900));
+}
+
+#[test]
+fn sequence_deadline_after_focus_prevents_type_and_marks_side_effects_possible() {
+    let coverage = AxStateCoverage {
+        enabled: true,
+        visible: true,
+        focused: true,
+        focusable: true,
+        editable: true,
+        ..AxStateCoverage::NONE
+    };
+    let (mut glass, _, _, events) = deadline_a11y_glass_with_tree_behavior(
+        DeadlineBehavior::FocusConfirmationSequenceDeadline,
+        vec![],
+        semantic_control_tree(AxRole::TextField, "Account", false),
+        None,
+        coverage,
+    );
+    let error = do_actions(
+        &mut glass,
+        &do_args(
+            vec![parsed_action(
+                r#"{"action":"type","target":{"query":"Account","role":"TextField"},"focus_mode":"native","timeout_ms":10000,"text":"secret"}"#,
+            )],
+            30,
+        ),
+    )
+    .unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(envelope["error"]["code"], "sequence_deadline_exceeded");
+    assert_eq!(step["attempted"], true);
+    assert_eq!(step["side_effects_may_have_occurred"], true);
+    assert_eq!(step["result"]["dispatch"], "not_dispatched");
+    assert_eq!(step["result"]["focus"]["dispatch"], "dispatched");
+    assert_eq!(step["content_blocks"], json!([1, 2]));
+    assert_eq!(*events.lock().unwrap(), vec!["focus"]);
+    assert!(!output_text(&error).contains("secret"));
+}
+
+#[test]
+fn semantic_failure_keeps_resolution_actionability_dispatch_and_content_blocks() {
+    let (mut glass, _, _, events) = deadline_a11y_glass_with_tree_behavior(
+        DeadlineBehavior::UnsupportedAccessibility,
+        vec![],
+        semantic_control_tree(AxRole::Button, "Save", false),
+        None,
+        AxStateCoverage::NONE,
+    );
+    let error = do_actions(
+        &mut glass,
+        &do_args(
+            vec![parsed_action(
+                r#"{"action":"click_element","target":{"query":"Save","role":"Button"},"mode":"native","timeout_ms":1000}"#,
+            )],
+            5_000,
+        ),
+    )
+    .unwrap_err();
+    let envelope = envelope(&error);
+    let step = &envelope["outcome"]["steps"][0];
+
+    assert_eq!(envelope["error"]["code"], "unsupported_accessibility");
+    assert_eq!(step["error"]["category"], "unsupported_accessibility");
+    assert_eq!(step["attempted"], false);
+    assert_eq!(step["side_effects_may_have_occurred"], false);
+    assert!(step["result"]["resolution"].is_object());
+    assert!(step["result"]["actionability"].is_array());
+    assert_eq!(step["result"]["dispatch"], "not_dispatched");
+    assert_eq!(step["content_blocks"], json!([1, 2]));
+    assert_eq!(error.0.len(), 3);
+    assert!(output_text(&error).contains("Save"));
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn standalone_and_batch_semantic_click_results_match_except_for_sequence_fields() {
+    fn args() -> ClickElementArgs {
+        serde_json::from_str(
+            r#"{"target":{"query":"Save","role":"Button"},"mode":"native","timeout_ms":0}"#,
+        )
+        .unwrap()
+    }
+
+    let mut standalone = started_a11y_session(glass_with_a11y_invoke_ok(
+        FakePlatform::new(100, 100),
+        fake_tree(),
+    ));
+    let standalone_output = crate::tools::click_element(&mut standalone, &args()).unwrap();
+    let mut standalone_result = assert_envelope(&standalone_output, "glass_click_element").clone();
+
+    let mut batch = started_a11y_session(glass_with_a11y_invoke_ok(
+        FakePlatform::new(100, 100),
+        fake_tree(),
+    ));
+    let batch_output = do_actions(
+        &mut batch,
+        &do_args(vec![Action::ClickElement(args())], 1_000),
+    )
+    .unwrap();
+    let mut batch_result = assert_envelope(&batch_output, "glass_do")["steps"][0]["result"].clone();
+
+    standalone_result["resolution"]
+        .as_object_mut()
+        .unwrap()
+        .remove("elapsed_ms");
+    batch_result["resolution"]
+        .as_object_mut()
+        .unwrap()
+        .remove("elapsed_ms");
+    assert_eq!(batch_result, standalone_result);
+    assert_eq!(
+        exact_content_slice(&batch_output.0[1..]),
+        exact_content_slice(&standalone_output.0[1..])
+    );
+}
+
+#[test]
 fn click_element_stale_target_stops_with_structured_detail() {
     let mut g = started_a11y(FakePlatform::new(100, 100));
     let err = error_text(
@@ -2349,7 +2882,11 @@ fn click_element_stale_target_stops_with_structured_detail() {
             &DoArgs {
                 actions: vec![
                     Action::ClickElement(ClickElementArgs {
-                        id: 99,
+                        id: Some(99),
+                        target: None,
+                        mode: None,
+                        timeout_ms: None,
+                        max_nodes: None,
                         return_: None,
                     }),
                     Action::Key(KeyArgs {
@@ -2365,7 +2902,7 @@ fn click_element_stale_target_stops_with_structured_detail() {
     );
     let error: serde_json::Value = serde_json::from_str(&err).unwrap();
     let step = &error["outcome"]["steps"][0];
-    assert_eq!(error["error"]["code"], "action_failed");
+    assert_eq!(error["error"]["code"], "stale_element");
     assert_eq!(step["action"], "click_element");
     assert_eq!(step["attempted"], true);
     assert_eq!(step["side_effects_may_have_occurred"], true);
@@ -2501,7 +3038,11 @@ fn semantic_return_snapshot_keeps_untrusted_outline_outside_the_envelope() {
         &mut g,
         &DoArgs {
             actions: vec![Action::ClickElement(ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: Some("snapshot".into()),
             })],
             then: None,
@@ -2539,7 +3080,11 @@ fn app_element_details_stay_in_untrusted_step_content() {
         &mut g,
         &DoArgs {
             actions: vec![Action::ClickElement(ClickElementArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 return_: Some("snapshot".into()),
             })],
             then: None,
@@ -2588,7 +3133,11 @@ fn stale_target_detail_is_not_embedded_in_trusted_error_json() {
         &DoArgs {
             actions: vec![
                 Action::ClickElement(ClickElementArgs {
-                    id: 1,
+                    id: Some(1),
+                    target: None,
+                    mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     return_: None,
                 }),
                 Action::Key(KeyArgs {
@@ -2607,14 +3156,14 @@ fn stale_target_detail_is_not_embedded_in_trusted_error_json() {
     assert!(!text.as_str().contains(APP_DETAIL), "{trusted}");
     assert_eq!(
         trusted["error"],
-        json!({"code":"action_failed","step":0,"summary":"action execution failed"})
+        json!({"code":"transport_failure","step":0,"summary":"backend transport failed"})
     );
     let step = &trusted["outcome"]["steps"][0];
     assert_eq!(
         step["error"],
         json!({
-            "code":"action_failed",
-            "summary":"action execution failed",
+            "code":"transport_failure",
+            "summary":"backend transport failed",
             "category":"transport_failure"
         })
     );
@@ -2637,11 +3186,18 @@ fn typed_and_set_value_text_are_never_echoed() {
         &DoArgs {
             actions: vec![
                 Action::Type(TypeArgs {
+                    target: None,
+                    focus_mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     text: typed_success.into(),
                     return_: None,
                 }),
                 Action::SetValue(SetValueArgs {
-                    id: 1,
+                    id: Some(1),
+                    target: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     text: set_success.into(),
                     return_: None,
                 }),
@@ -2670,6 +3226,10 @@ fn typed_and_set_value_text_are_never_echoed() {
         &mut type_g,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: typed_failure.into(),
                 return_: Some("not-a-return".into()),
             })],
@@ -2684,7 +3244,10 @@ fn typed_and_set_value_text_are_never_echoed() {
         &mut set_g,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 99,
+                id: Some(99),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: set_failure.into(),
                 return_: None,
             })],
@@ -2717,6 +3280,10 @@ fn typed_and_set_value_text_are_never_echoed() {
         &mut type_g,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: typed_dispatch_failure.into(),
                 return_: None,
             })],
@@ -2741,7 +3308,10 @@ fn typed_and_set_value_text_are_never_echoed() {
         &mut set_g,
         &DoArgs {
             actions: vec![Action::SetValue(SetValueArgs {
-                id: 1,
+                id: Some(1),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: set_dispatch_failure.into(),
                 return_: None,
             })],
@@ -2794,11 +3364,19 @@ fn content_indices_cover_completed_step_siblings_before_failure_detail() {
         &DoArgs {
             actions: vec![
                 Action::ClickElement(ClickElementArgs {
-                    id: 1,
+                    id: Some(1),
+                    target: None,
+                    mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     return_: Some("snapshot".into()),
                 }),
                 Action::ClickElement(ClickElementArgs {
-                    id: 99,
+                    id: Some(99),
+                    target: None,
+                    mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     return_: None,
                 }),
                 Action::Key(KeyArgs {
@@ -3447,6 +4025,10 @@ fn terminal_content_blocks_reference_images_and_notes_in_response_order() {
         &mut g,
         &DoArgs {
             actions: vec![Action::Type(TypeArgs {
+                target: None,
+                focus_mode: None,
+                timeout_ms: None,
+                max_nodes: None,
                 text: "secret".into(),
                 return_: Some("snapshot".into()),
             })],
@@ -3530,6 +4112,40 @@ fn error_code(out: ToolOutput) -> String {
         .as_str()
         .unwrap()
         .to_string()
+}
+
+#[test]
+fn batch_limits_remain_sixty_four_actions_and_65536_encoded_bytes() {
+    let mut accepted_actions = started(FakePlatform::new(10, 10));
+    assert!(
+        do_actions(
+            &mut accepted_actions,
+            &DoArgs {
+                actions: limit_actions(64),
+                then: None,
+                timeout_ms: None,
+                encoded_argument_bytes: 65_536,
+            },
+        )
+        .is_ok()
+    );
+
+    for (actions, encoded_argument_bytes) in [(65, 0), (1, 65_537)] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut rejected = started(FakePlatform::new(10, 10).with_event_log(Arc::clone(&events)));
+        let error = do_actions(
+            &mut rejected,
+            &DoArgs {
+                actions: limit_actions(actions),
+                then: None,
+                timeout_ms: None,
+                encoded_argument_bytes,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error_code(error), "invalid_sequence");
+        assert!(events.lock().unwrap().is_empty());
+    }
 }
 
 #[test]

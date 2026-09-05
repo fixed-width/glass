@@ -4,7 +4,7 @@
 //! input, and finally reads the element back and reports the write as not applied if it does not
 //! hold the text.
 use glass_core::accessibility::{
-    Accessibility, AxContext, AxNodeId, AxRect, AxTarget, AxTree, Located,
+    Accessibility, AxContext, AxNodeId, AxRect, AxTarget, AxTree, Located, PointerHit,
 };
 use std::time::Duration;
 
@@ -299,6 +299,10 @@ fn post_write_error(target: &AxTarget, error: GlassError) -> GlassError {
 }
 
 impl Accessibility for IosA11y {
+    fn state_coverage(&self) -> glass_core::AxStateCoverage {
+        crate::axmap::STATE_COVERAGE
+    }
+
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         Ok(self
             .describe(ctx, SemanticPhase::Snapshot { dispatched: false })?
@@ -379,6 +383,19 @@ impl Accessibility for IosA11y {
     fn invoke(&mut self, ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
         SemanticPhase::Invoke.run(ctx.deadline, || Err(GlassError::AxUnsupported))
     }
+
+    fn focus(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
+        Err(GlassError::AxUnsupported)
+    }
+
+    fn pointer_target_at(
+        &mut self,
+        _ctx: &AxContext,
+        _target: &AxTarget,
+        _point: (i32, i32),
+    ) -> Result<PointerHit> {
+        Ok(PointerHit::Inconclusive)
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +414,7 @@ mod tests {
     struct ScriptedClient {
         scale: Mutex<VecDeque<ScaleRpc>>,
         tree: Mutex<VecDeque<TreeRpc>>,
+        hid: Option<Arc<Mutex<Vec<Vec<proto::HidEvent>>>>>,
     }
 
     #[derive(Debug)]
@@ -441,6 +459,19 @@ mod tests {
             Self {
                 scale: Mutex::new(scale.into()),
                 tree: Mutex::new(tree.into()),
+                hid: None,
+            }
+        }
+
+        fn with_hid_log(
+            scale: Vec<ScaleRpc>,
+            tree: Vec<TreeRpc>,
+            hid: Arc<Mutex<Vec<Vec<proto::HidEvent>>>>,
+        ) -> Self {
+            Self {
+                scale: Mutex::new(scale.into()),
+                tree: Mutex::new(tree.into()),
+                hid: Some(hid),
             }
         }
     }
@@ -462,8 +493,12 @@ mod tests {
                 .expect("one scripted tree RPC")(deadline)
         }
 
-        fn hid_by(&self, _events: Vec<proto::HidEvent>, _deadline: Deadline) -> Result<()> {
-            panic!("snapshot deadline tests never send HID")
+        fn hid_by(&self, events: Vec<proto::HidEvent>, _deadline: Deadline) -> Result<()> {
+            let Some(hid) = &self.hid else {
+                panic!("snapshot deadline tests never send HID");
+            };
+            hid.lock().expect("HID log lock").push(events);
+            Ok(())
         }
     }
 
@@ -538,6 +573,285 @@ mod tests {
             a11y_bus_addr: None,
             limits: glass_core::WalkLimits::DEFAULT,
             deadline,
+        }
+    }
+
+    fn successful_tree_replies(json: &str, count: usize) -> Vec<TreeRpc> {
+        (0..count)
+            .map(|_| {
+                let json = json.to_owned();
+                Box::new(move |_deadline| SnapshotRpc::dispatched(Ok(json))) as TreeRpc
+            })
+            .collect()
+    }
+
+    fn field_json(value: &str) -> String {
+        format!(
+            r#"[{{"role":"AXApplication","AXLabel":"Fixture","enabled":true,
+                "frame":{{"x":0,"y":0,"width":200,"height":200}},"children":[{{
+                  "role":"AXTextField","AXUniqueId":"inputField","AXValue":"{value}",
+                  "enabled":true,"frame":{{"x":10,"y":10,"width":80,"height":30}},
+                  "children":[]
+                }}]}}]"#
+        )
+    }
+
+    #[derive(Default)]
+    struct HidPlatform {
+        pointer_batches: Arc<Mutex<Vec<Vec<proto::HidEvent>>>>,
+        key_batches: Arc<Mutex<Vec<Vec<proto::HidEvent>>>>,
+    }
+
+    impl glass_core::Platform for HidPlatform {
+        fn start_app(&mut self, _spec: &glass_core::AppSpec) -> Result<glass_core::WindowGeometry> {
+            Ok(glass_core::WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 200,
+            })
+        }
+
+        fn stop_app_by(&mut self, _deadline: Deadline) -> Result<()> {
+            Ok(())
+        }
+
+        fn capture_frame_by(
+            &mut self,
+            _region: Option<&glass_core::Region>,
+            _deadline: Deadline,
+        ) -> Result<glass_core::Frame> {
+            Err(GlassError::CaptureFailed("scripted iOS platform".into()))
+        }
+
+        fn capture_window_by(
+            &mut self,
+            _id: glass_core::WindowId,
+            _region: Option<&glass_core::Region>,
+            _deadline: Deadline,
+        ) -> Result<glass_core::Frame> {
+            Err(GlassError::Unsupported(
+                "scripted iOS window capture".into(),
+            ))
+        }
+
+        fn send_pointer_by(&mut self, event: &PointerEvent, _deadline: Deadline) -> Result<()> {
+            self.pointer_batches
+                .lock()
+                .expect("pointer HID log lock")
+                .push(IdbInjector::new(1.0).pointer_events(event)?);
+            Ok(())
+        }
+
+        fn send_key_by(&mut self, event: &KeyEvent, _deadline: Deadline) -> Result<()> {
+            self.key_batches
+                .lock()
+                .expect("key HID log lock")
+                .push(IdbInjector::new(1.0).key_events(event)?);
+            Ok(())
+        }
+
+        fn window_by(
+            &mut self,
+            _op: &glass_core::WindowOp,
+            _deadline: Deadline,
+        ) -> Result<glass_core::WindowGeometry> {
+            Ok(glass_core::WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 200,
+            })
+        }
+
+        fn list_windows_by(&mut self, _deadline: Deadline) -> Result<Vec<glass_core::WindowInfo>> {
+            Ok(Vec::new())
+        }
+
+        fn select_window_by(
+            &mut self,
+            _id: glass_core::WindowId,
+            _deadline: Deadline,
+        ) -> Result<glass_core::WindowGeometry> {
+            Err(GlassError::WindowNotFound)
+        }
+
+        fn drain_logs(&mut self) -> Vec<(glass_core::Stream, String)> {
+            Vec::new()
+        }
+    }
+
+    fn selector_target(
+        query: &str,
+        states: Vec<glass_core::SemanticState>,
+    ) -> glass_core::SemanticTarget {
+        glass_core::SemanticTarget {
+            target: glass_core::SemanticSelector::new(
+                Some(query.to_owned()),
+                Some(AxRole::TextField),
+                states,
+            )
+            .expect("valid semantic selector"),
+            within: None,
+        }
+    }
+
+    fn scripted_glass(
+        trees: Vec<TreeRpc>,
+        reader_hid: Arc<Mutex<Vec<Vec<proto::HidEvent>>>>,
+        platform: HidPlatform,
+    ) -> glass_core::Glass {
+        let a11y = IosA11y {
+            client: Box::new(ScriptedClient::with_hid_log(Vec::new(), trees, reader_hid)),
+            scale: Some(1.0),
+        };
+        let mut backend = Some(glass_core::Backend {
+            platform: Box::new(platform),
+            accessibility: Some(Box::new(a11y)),
+        });
+        glass_core::Glass::new(
+            Box::new(move |_| {
+                backend
+                    .take()
+                    .ok_or_else(|| GlassError::Backend("scripted backend already used".into()))
+            }),
+            "ios".into(),
+            glass_core::BaselineStore::new(std::env::temp_dir().join("glass-ios-semantic-tests")),
+            16,
+        )
+    }
+
+    fn test_spec() -> glass_core::AppSpec {
+        glass_core::AppSpec {
+            build: None,
+            run: vec!["fixture".into()],
+            cwd: None,
+            env: Vec::new(),
+            window_hint: None,
+            timeout_ms: 1_000,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        }
+    }
+
+    #[test]
+    fn targeted_type_pointer_focus_without_focused_state_never_sends_text() {
+        let reader_hid = Arc::new(Mutex::new(Vec::new()));
+        let pointer_batches = Arc::new(Mutex::new(Vec::new()));
+        let key_batches = Arc::new(Mutex::new(Vec::new()));
+        let platform = HidPlatform {
+            pointer_batches: Arc::clone(&pointer_batches),
+            key_batches: Arc::clone(&key_batches),
+        };
+        let replies = successful_tree_replies(&field_json("old"), 32);
+        let mut glass = scripted_glass(replies, Arc::clone(&reader_hid), platform);
+        glass.start(&test_spec()).expect("start scripted session");
+
+        let error = glass
+            .type_target(
+                &glass_core::TypeTargetParams {
+                    target: selector_target("inputField", Vec::new()),
+                    focus_mode: glass_core::ActionMode::Pointer,
+                    timeout_ms: 350,
+                    max_nodes: None,
+                },
+                "must not dispatch",
+            )
+            .expect_err("idb publishes no focused state, so typing must be refused");
+
+        assert_eq!(pointer_batches.lock().unwrap().len(), 1);
+        assert!(key_batches.lock().unwrap().is_empty());
+        assert!(reader_hid.lock().unwrap().is_empty());
+        assert_eq!(
+            error.kind,
+            glass_core::SemanticActionFailureKind::FocusUnconfirmed
+        );
+        assert_eq!(
+            error.action_dispatch,
+            glass_core::DispatchStatus::NotDispatched
+        );
+        assert_eq!(
+            error.focus,
+            Some(glass_core::MutationReport {
+                method: glass_core::ActionMethod::Pointer {
+                    native_fallback: None,
+                },
+                dispatch: glass_core::DispatchStatus::Dispatched,
+                confirmation: glass_core::ConfirmationStatus::Unconfirmed,
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_set_value_resolves_fresh_input_field_and_keeps_two_hid_calls() {
+        let reader_hid = Arc::new(Mutex::new(Vec::new()));
+        let platform = HidPlatform::default();
+        let mut replies = successful_tree_replies(&field_json("old"), 2);
+        replies.extend(successful_tree_replies(&field_json("updated"), 4));
+        let mut glass = scripted_glass(replies, Arc::clone(&reader_hid), platform);
+        glass.start(&test_spec()).expect("start scripted session");
+
+        let outcome = glass
+            .set_value_target(
+                &glass_core::SetValueTargetParams {
+                    target: glass_core::ActionTarget::Semantic(selector_target(
+                        "inputField",
+                        Vec::new(),
+                    )),
+                    timeout_ms: Some(1_000),
+                    max_nodes: None,
+                },
+                "updated",
+            )
+            .expect("semantic set-value confirms the fresh field value");
+
+        assert_eq!(reader_hid.lock().unwrap().len(), 2);
+        assert_eq!(outcome.target.name.as_deref(), Some("inputField"));
+        assert_eq!(
+            outcome.action.dispatch,
+            glass_core::DispatchStatus::Dispatched
+        );
+        assert_eq!(
+            outcome.action.confirmation,
+            glass_core::ConfirmationStatus::ValueConfirmed
+        );
+    }
+
+    #[test]
+    fn visible_and_hidden_selectors_are_refused_before_idb_read_or_dispatch() {
+        for state in [
+            glass_core::SemanticState::Visible,
+            glass_core::SemanticState::Hidden,
+        ] {
+            let reader_hid = Arc::new(Mutex::new(Vec::new()));
+            let pointer_batches = Arc::new(Mutex::new(Vec::new()));
+            let key_batches = Arc::new(Mutex::new(Vec::new()));
+            let platform = HidPlatform {
+                pointer_batches: Arc::clone(&pointer_batches),
+                key_batches: Arc::clone(&key_batches),
+            };
+            let mut glass = scripted_glass(Vec::new(), Arc::clone(&reader_hid), platform);
+            glass.start(&test_spec()).expect("start scripted session");
+
+            let error = glass
+                .click_target(&glass_core::ClickTargetParams {
+                    target: glass_core::ActionTarget::Semantic(selector_target(
+                        "inputField",
+                        vec![state],
+                    )),
+                    mode: glass_core::ActionMode::Pointer,
+                    timeout_ms: Some(0),
+                    max_nodes: None,
+                })
+                .expect_err("iOS has no truthful visible/hidden state coverage");
+
+            assert_eq!(
+                error.kind,
+                glass_core::SemanticActionFailureKind::UnprovenSelectorState
+            );
+            assert!(pointer_batches.lock().unwrap().is_empty());
+            assert!(key_batches.lock().unwrap().is_empty());
+            assert!(reader_hid.lock().unwrap().is_empty());
         }
     }
 

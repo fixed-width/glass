@@ -149,7 +149,7 @@ if [ "$unit_only" -eq 0 ]; then
     fi
     classify_suite wayland ./scripts/test-wayland.sh
 
-    echo "coverage: running AT-SPI integration suite (needs dbus/at-spi2/GTK4)…"
+    echo "coverage: running AT-SPI integration suite (needs dbus/at-spi2/GTK3/GTK4)…"
     classify_suite a11y ./scripts/test-a11y.sh
 fi
 

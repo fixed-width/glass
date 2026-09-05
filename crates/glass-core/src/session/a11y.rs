@@ -16,6 +16,34 @@ const TOGGLE_SWIPE_MS: u64 = 250;
 const COMBO_OPEN_POINTER_REASON: &str =
     "combo popup opened by pointer so the keyboard commit lands in it";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SetValueExecution {
+    AlreadyApplied,
+    DispatchedAndConfirmed,
+}
+
+fn click_method_from_semantic_outcome(outcome: SemanticActionOutcome) -> ClickMethod {
+    match outcome.action.method {
+        ActionMethod::NativeAction { actuated } => ClickMethod::NativeAction { actuated },
+        ActionMethod::Pointer {
+            native_fallback: Some(native_fallback),
+        } => ClickMethod::Pointer { native_fallback },
+        ActionMethod::Pointer {
+            native_fallback: None,
+        } => unreachable!("legacy auto click always records its native fallback reason"),
+        ActionMethod::AccessibilityValue | ActionMethod::Keyboard => {
+            unreachable!("click actions cannot return a non-click method")
+        }
+    }
+}
+
+fn glass_error_from_semantic_action(mut error: Box<SemanticActionError>) -> GlassError {
+    error
+        .source
+        .take()
+        .expect("legacy ID action failures always retain their original GlassError")
+}
+
 /// Poll cadence for `set_value`'s post-toggle verify: how often to re-snapshot while waiting for
 /// the swiped switch to read back the wanted state.
 const TOGGLE_VERIFY_INTERVAL_MS: u64 = 50;
@@ -188,17 +216,23 @@ impl Glass {
     }
 
     pub fn click_element_by(&mut self, id: AxNodeId, deadline: Deadline) -> Result<ClickMethod> {
-        self.audited_click(id, |g, id| g.click_element_inner(id, deadline))
+        self.click_target_by(
+            &ClickTargetParams {
+                target: ActionTarget::Id(id),
+                mode: ActionMode::Auto,
+                timeout_ms: None,
+                max_nodes: None,
+            },
+            deadline,
+        )
+        .map(click_method_from_semantic_outcome)
+        .map_err(glass_error_from_semantic_action)
     }
 
-    /// Run one element click and record it through the audit seam. Both clicks that stand on
-    /// their own go through here — the native-first [`Glass::click_element`] and the
-    /// deliberately pointer-only combo open — so the log can't miss one just because an
-    /// internal caller took a different route to the same actuation.
-    ///
-    /// The exception is `set_value_inner`'s trailing-toggle branch, which calls
-    /// `click_element_inner` directly: there the click is one step *inside* a `set_value`, and
-    /// the enclosing `SetValue` record already accounts for it.
+    /// Record an internal pointer-only click that does not pass through [`Glass::click_target_by`].
+    /// Public semantic and ID clicks are audited by that high-level owner. The combo open flow
+    /// remains here because it deliberately bypasses native invoke, while a trailing-toggle click
+    /// inside `set_value_inner` is already accounted for by the enclosing `SetValue` record.
     fn audited_click(
         &mut self,
         id: AxNodeId,
@@ -207,10 +241,33 @@ impl Glass {
         let t = std::time::Instant::now();
         let element = self.element_ref(id);
         let result = click(self, id);
+        let dispatch = match &result {
+            Ok(_) => DispatchStatus::Dispatched.as_str(),
+            Err(error) => match error.bound_dispatch() {
+                Some(crate::BoundDispatch::NotDispatched) => DispatchStatus::NotDispatched.as_str(),
+                Some(crate::BoundDispatch::MayHaveDispatched) | None => {
+                    DispatchStatus::MayHaveDispatched.as_str()
+                }
+            },
+        };
+        let confirmation = if result.is_ok() {
+            ConfirmationStatus::DispatchConfirmed.as_str()
+        } else {
+            ConfirmationStatus::Unconfirmed.as_str()
+        };
         self.emit_audit(
             &crate::audit::Actuation::ClickElement {
                 element,
-                method: result.as_ref().ok(),
+                mode: ActionMode::Pointer.as_str(),
+                method: result.as_ref().ok().map(ClickMethod::label),
+                native_fallback: result.as_ref().ok().and_then(ClickMethod::native_fallback),
+                actuated_id: result
+                    .as_ref()
+                    .ok()
+                    .and_then(ClickMethod::actuated)
+                    .map(|id| id.0),
+                dispatch,
+                confirmation,
             },
             crate::audit::AuditOutcome::from_result(&result),
             t.elapsed(),
@@ -219,22 +276,17 @@ impl Glass {
     }
 
     fn click_element_inner(&mut self, id: AxNodeId, deadline: Deadline) -> Result<ClickMethod> {
-        if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("click element"));
-        }
-        // Native action first: works for occluded/off-screen/boundless elements, and on a
-        // backend whose action API is out-of-band it doesn't move the cursor.
-        //
-        // Do not widen the fallback to a denylist: only an attempt that dispatched NOTHING may
-        // retry with the pointer (see [`GlassError::invoke_fallback_eligible`]), or a native
-        // action that may still land actuates the control twice.
-        let native_fallback = match self.try_native_invoke(id, deadline) {
-            Ok(actuated) => return Ok(ClickMethod::NativeAction { actuated }),
-            Err(e) if !e.invoke_fallback_eligible() => return Err(e),
-            Err(e) => native_fallback_reason(&e),
-        };
-        self.click_element_pointer_only(id, deadline)
-            .map(|()| ClickMethod::Pointer { native_fallback })
+        self.click_target_inner(
+            ClickTargetParams {
+                target: ActionTarget::Id(id),
+                mode: ActionMode::Auto,
+                timeout_ms: None,
+                max_nodes: None,
+            },
+            deadline,
+        )
+        .map(click_method_from_semantic_outcome)
+        .map_err(glass_error_from_semantic_action)
     }
 
     /// The synthetic-pointer half of [`Glass::click_element`], on its own: the center of the
@@ -242,7 +294,12 @@ impl Glass {
     /// one, or swiped across the trailing control for a row-shaped checkable on a
     /// trailing-toggle backend. Callable directly by an internal caller that must NOT take
     /// the native action (see [`Glass::set_combo_value`]).
-    fn click_element_pointer_only(&mut self, id: AxNodeId, deadline: Deadline) -> Result<()> {
+    pub(super) fn click_element_pointer_only(
+        &mut self,
+        id: AxNodeId,
+        plan: Option<&super::semantic_action::PlannedPointerInput>,
+        deadline: Deadline,
+    ) -> Result<()> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("click element"));
         }
@@ -295,16 +352,41 @@ impl Glass {
                     .after_dispatch(),
                 });
             }
-            let primary = self.pointer_inner_by(
-                &PointerEvent::Click {
-                    x: bounds.x - container.x,
-                    y: bounds.y - container.y,
-                    button: MouseButton::Left,
-                    count: 1,
-                    modifiers: vec![],
-                },
-                deadline,
-            );
+            let primary = match plan {
+                Some(super::semantic_action::PlannedPointerInput::TrailingToggle {
+                    segment,
+                    ..
+                }) => self.pointer_inner_by(
+                    &PointerEvent::Drag {
+                        from_x: segment.from_x - container.x,
+                        from_y: segment.from_y - container.y,
+                        to_x: segment.to_x - container.x,
+                        to_y: segment.to_y - container.y,
+                        duration_ms: TOGGLE_SWIPE_MS,
+                        button: MouseButton::Left,
+                        modifiers: vec![],
+                    },
+                    deadline,
+                ),
+                planned => {
+                    let point = match planned {
+                        Some(super::semantic_action::PlannedPointerInput::Click { point }) => {
+                            *point
+                        }
+                        _ => (bounds.x, bounds.y),
+                    };
+                    self.pointer_inner_by(
+                        &PointerEvent::Click {
+                            x: point.0 - container.x,
+                            y: point.1 - container.y,
+                            button: MouseButton::Left,
+                            count: 1,
+                            modifiers: vec![],
+                        },
+                        deadline,
+                    )
+                }
+            };
             // Restore focus even after expiry; temporary selection already makes failure
             // after-dispatch.
             let restore = self.select_window_by(prev, Deadline::UNBOUNDED);
@@ -326,12 +408,18 @@ impl Glass {
         //
         // Gate on the backend capability, NOT geometry alone: a wide labeled checkbox on a
         // desktop backend is row-shaped too, but its indicator is at the LEADING edge.
+        let planned_segment = match plan {
+            Some(super::semantic_action::PlannedPointerInput::TrailingToggle {
+                segment, ..
+            }) => Some(*segment),
+            _ => None,
+        };
         let row_shaped_toggle = checkable
             && trailing_toggle_backend
             && bounds.width > bounds.height.saturating_mul(ROW_ASPECT);
-        if row_shaped_toggle {
-            let seg = bounds
-                .trailing_toggle_swipe(active_geo.width, active_geo.height)
+        if planned_segment.is_some() || (plan.is_none() && row_shaped_toggle) {
+            let seg = planned_segment
+                .or_else(|| bounds.trailing_toggle_swipe(active_geo.width, active_geo.height))
                 .ok_or(GlassError::AxElementNotClickable(id.0))?;
             self.pointer_inner_by(
                 &PointerEvent::Drag {
@@ -346,9 +434,12 @@ impl Glass {
                 deadline,
             )
         } else {
-            let (x, y) = bounds
-                .clamped_center(active_geo.width, active_geo.height)
-                .ok_or(GlassError::AxElementNotClickable(id.0))?;
+            let (x, y) = match plan {
+                Some(super::semantic_action::PlannedPointerInput::Click { point }) => *point,
+                _ => bounds
+                    .clamped_center(active_geo.width, active_geo.height)
+                    .ok_or(GlassError::AxElementNotClickable(id.0))?,
+            };
             self.pointer_inner_by(
                 &PointerEvent::Click {
                     x,
@@ -365,7 +456,11 @@ impl Glass {
     /// One native-invoke attempt: the same fingerprint + context assembly as
     /// `set_value_inner` (over freshly re-read window geometry — see below), then the
     /// backend's `invoke`. Passes on the element the backend actuated when it is not `id`.
-    fn try_native_invoke(&mut self, id: AxNodeId, deadline: Deadline) -> Result<Option<AxNodeId>> {
+    pub(super) fn try_native_invoke(
+        &mut self,
+        id: AxNodeId,
+        deadline: Deadline,
+    ) -> Result<Option<AxNodeId>> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started(
                 "native accessibility action",
@@ -425,6 +520,63 @@ impl Glass {
         Ok(actuated)
     }
 
+    /// One native-focus attempt with the same fresh geometry, target fingerprint, and deadline
+    /// ordering as [`Self::try_native_invoke`].
+    pub(super) fn try_native_focus(
+        &mut self,
+        id: AxNodeId,
+        deadline: Deadline,
+    ) -> Result<Option<AxNodeId>> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility focus",
+            ));
+        }
+        {
+            let s = self.active_mut()?;
+            if s.accessibility.is_none() {
+                return Err(GlassError::AxUnsupported);
+            }
+            match s.platform.window_by(&WindowOp::Geometry, deadline) {
+                Ok(window) => s.geometry = window,
+                Err(_) if legacy_window_probe_is_best_effort(deadline) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility focus",
+            ));
+        }
+        let (target, ctx) = {
+            let s = self.require_active()?;
+            let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
+            let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
+            let target = AxTarget {
+                id,
+                role: node.role,
+                name: node.name.clone(),
+                bounds: node.bounds,
+                value: node.value.clone(),
+            };
+            let ctx = s.accessibility_context(s.geometry.clone(), deadline)?;
+            (target, ctx)
+        };
+        let s = self.active_mut()?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility focus",
+            ));
+        }
+        let focused = s
+            .accessibility
+            .as_mut()
+            .ok_or(GlassError::AxUnsupported)?
+            .focus(&ctx, &target)?;
+        s.pump();
+        Ok(focused)
+    }
+
     /// Set the value/text of element `id` (from the latest `a11y_snapshot`) via the
     /// platform a11y API. Errors `NoAxSnapshot`/`AxElementNotFound` (id not in the
     /// cached snapshot), `AxUnsupported` (no reader), or — from the backend —
@@ -434,18 +586,25 @@ impl Glass {
     }
 
     pub fn set_value_by(&mut self, id: AxNodeId, text: &str, deadline: Deadline) -> Result<()> {
-        let t = std::time::Instant::now();
-        let element = self.element_ref(id);
-        let result = self.set_value_inner(id, text, deadline);
-        self.emit_audit(
-            &crate::audit::Actuation::SetValue { element, text },
-            crate::audit::AuditOutcome::from_result(&result),
-            t.elapsed(),
-        );
-        result
+        self.set_value_target_by(
+            &SetValueTargetParams {
+                target: ActionTarget::Id(id),
+                timeout_ms: None,
+                max_nodes: None,
+            },
+            text,
+            deadline,
+        )
+        .map(|_| ())
+        .map_err(glass_error_from_semantic_action)
     }
 
-    fn set_value_inner(&mut self, id: AxNodeId, text: &str, deadline: Deadline) -> Result<()> {
+    pub(super) fn set_value_inner(
+        &mut self,
+        id: AxNodeId,
+        text: &str,
+        deadline: Deadline,
+    ) -> Result<SetValueExecution> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("set value"));
         }
@@ -490,7 +649,23 @@ impl Glass {
         //
         // Invalidate the cache unless input is proven pre-dispatch; a snapshot replaces it.
         if target.role == AxRole::ComboBox {
-            return self.set_combo_value(id, &target, text, deadline);
+            let already_applied = self
+                .require_active()?
+                .last_ax
+                .as_ref()
+                .and_then(|tree| tree.find(id))
+                .is_some_and(|combo| {
+                    !combo.states.expanded
+                        && combo
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(text.trim()))
+                });
+            if already_applied {
+                return Ok(SetValueExecution::AlreadyApplied);
+            }
+            self.set_combo_value(id, &target, text, deadline)?;
+            return Ok(SetValueExecution::DispatchedAndConfirmed);
         }
         // iOS's value-set (tap+type) can't drive a checkable: a tap doesn't toggle a UISwitch
         // and there's no text to type, so it takes the trailing-edge swipe instead.
@@ -520,7 +695,7 @@ impl Glass {
             let want = parse_bool(text)
                 .ok_or_else(|| GlassError::AxValueNotBoolean(id.0, text.to_string()))?;
             if st.checked == want {
-                return Ok(()); // truthful no-op, no actuation
+                return Ok(SetValueExecution::AlreadyApplied); // truthful no-op, no actuation
             }
             let actuation = self.click_element_inner(id, deadline);
             // Drop the pre-toggle cache after ambiguous actuation to prevent a reversing retry.
@@ -558,7 +733,7 @@ impl Glass {
                 seen = find_checkable_near(&tree.root, target.bounds.as_ref())
                     .map(|n| n.states.checked);
                 if seen == Some(want) {
-                    return Ok(());
+                    return Ok(SetValueExecution::DispatchedAndConfirmed);
                 }
                 let left = verify_deadline.remaining().unwrap_or_default();
                 if left.is_zero() {
@@ -615,7 +790,7 @@ impl Glass {
             node.value = (!text.is_empty()).then(|| text.to_string());
         }
         s.pump();
-        Ok(())
+        Ok(SetValueExecution::DispatchedAndConfirmed)
     }
 
     /// Select an option in a dropdown/combo by label (case-insensitive). Opens the popup when
@@ -654,10 +829,11 @@ impl Glass {
                     // Use a pointer click because UIA programmatic expand does not move keyboard
                     // focus to the popup.
                     let open = self.audited_click(id, |g, id| {
-                        g.click_element_pointer_only(id, deadline)
-                            .map(|()| ClickMethod::Pointer {
+                        g.click_element_pointer_only(id, None, deadline).map(|()| {
+                            ClickMethod::Pointer {
                                 native_fallback: COMBO_OPEN_POINTER_REASON.into(),
-                            })
+                            }
+                        })
                     });
                     self.invalidate_ax_cache_after_possible_dispatch(open)?;
                     mutation_may_have_dispatched = true;
@@ -777,22 +953,6 @@ impl Glass {
             return Err(GlassError::deadline_not_started("semantic key input"));
         }
         self.key_by(event, deadline)
-    }
-}
-
-/// Short, agent-facing reason a native-invoke attempt fell back to the pointer path.
-/// `AxUnsupported`'s own `Display` is snapshot-oriented (it tells the agent to screenshot
-/// instead), which would mislead in a click result — map it.
-///
-/// Only the two fallback-eligible errors reach here (see
-/// [`GlassError::invoke_fallback_eligible`], the single place that decides). The `other` arm
-/// is unreachable defence-in-depth, kept so this stays a total function if the eligibility
-/// set ever widens.
-fn native_fallback_reason(e: &GlassError) -> String {
-    match e {
-        GlassError::AxUnsupported => "backend has no native action path".into(),
-        GlassError::AxActionUnavailable(_) => "element exposes no activation action".into(),
-        other => format!("native action error: {other}"),
     }
 }
 
@@ -2533,6 +2693,43 @@ mod tests {
         assert_eq!(invokes.lock().unwrap().len(), 1);
     }
 
+    #[test]
+    fn native_focus_geometry_failure_is_best_effort_only_for_an_unbounded_legacy_call() {
+        for (deadline, should_focus) in [
+            (Deadline::UNBOUNDED, true),
+            (Deadline::from_millis(1_000), false),
+        ] {
+            let focus_calls = Arc::new(AtomicUsize::new(0));
+            let accessibility = FakeAccessibility::new(fake_tree())
+                .with_focus_behavior(InvokeBehavior::Succeed)
+                .with_focus_calls(focus_calls.clone());
+            let mut g = glass_with_backend(
+                FakePlatform::new(100, 100).with_failing_geometry(),
+                Box::new(accessibility),
+            );
+            g.start(&spec()).unwrap();
+            let mut cached = fake_tree();
+            cached.assign_ids();
+            g.active.as_mut().unwrap().last_ax = Some(cached);
+
+            let result = g.try_native_focus(AxNodeId(1), deadline);
+
+            assert_eq!(result.is_ok(), should_focus, "deadline={deadline:?}");
+            assert_eq!(
+                focus_calls.load(Ordering::Relaxed),
+                usize::from(should_focus),
+                "deadline={deadline:?}"
+            );
+            if let Err(error) = result {
+                assert_eq!(error.bound(), Some(crate::BoundKind::NotStarted));
+                assert_eq!(
+                    error.bound_dispatch(),
+                    Some(crate::BoundDispatch::NotDispatched)
+                );
+            }
+        }
+    }
+
     /// The click is translated into the popover's container, on both axes. The validated
     /// fixture's container sits at x=0, where subtracting and adding its origin agree, so this
     /// repeats it with the container offset horizontally.
@@ -2572,6 +2769,93 @@ mod tests {
         // Item at x=70 inside a container at x=40 is 30 in; y is unchanged from the validated
         // fixture at 248 - 194.
         assert_eq!(clicks.lock().unwrap().last().copied(), Some((30, 54)));
+    }
+
+    #[test]
+    fn planned_popover_inputs_use_the_plan_and_translate_both_axes_into_the_container() {
+        let active = window_info(
+            1,
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            },
+            true,
+        );
+        let popover = window_info(
+            2,
+            WindowGeometry {
+                x: -3,
+                y: 220,
+                width: 326,
+                height: 135,
+            },
+            false,
+        );
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let drags = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300)
+            .with_windows(vec![active, popover])
+            .with_click_log(clicks.clone())
+            .with_drag_log(drags.clone());
+        let mut g = glass_with_a11y(platform, fake_tree_with_offset_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let id = tree.root.children[0].children[0].id;
+
+        g.click_element_pointer_only(
+            id,
+            Some(&super::semantic_action::PlannedPointerInput::Click { point: (83, 267) }),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+        g.click_element_pointer_only(
+            id,
+            Some(
+                &super::semantic_action::PlannedPointerInput::TrailingToggle {
+                    segment: crate::Segment {
+                        from_x: 78,
+                        from_y: 254,
+                        to_x: 90,
+                        to_y: 270,
+                    },
+                    probe_point: (84, 262),
+                },
+            ),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+        assert_eq!(clicks.lock().unwrap().as_slice(), &[(43, 73)]);
+        assert!(matches!(
+            drags.lock().unwrap().as_slice(),
+            [PointerEvent::Drag {
+                from_x: 38,
+                from_y: 60,
+                to_x: 50,
+                to_y: 76,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn planned_ordinary_click_uses_the_stored_point_instead_of_recomputing_center() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        g.click_element_pointer_only(
+            AxNodeId(1),
+            Some(&super::semantic_action::PlannedPointerInput::Click { point: (13, 17) }),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap();
+
+        assert_eq!(clicks.lock().unwrap().as_slice(), &[(13, 17)]);
     }
 
     #[test]
@@ -4254,16 +4538,11 @@ mod tests {
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
         let log2 = log.clone();
+        let mut accessibility = FakeAccessibility::new(fake_tree());
+        accessibility.set_log = log2;
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(FakePlatform::new(100, 100)),
-            accessibility: Some(Box::new(FakeAccessibility {
-                tree: fake_tree(),
-                set_log: log2,
-                set_fail: false,
-                ctx_log: Arc::new(Mutex::new(None)),
-                invoke_behavior: InvokeBehavior::Unsupported,
-                invoke_log: Arc::new(Mutex::new(Vec::new())),
-            })),
+            accessibility: Some(Box::new(accessibility)),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
             held.take()
@@ -4326,14 +4605,9 @@ mod tests {
         tree: AxTree,
         set_log: Arc<Mutex<Vec<(AxTarget, String)>>>,
     ) -> FakeAccessibility {
-        FakeAccessibility {
-            tree,
-            set_log,
-            set_fail: false,
-            ctx_log: Arc::new(Mutex::new(None)),
-            invoke_behavior: InvokeBehavior::Unsupported,
-            invoke_log: Arc::new(Mutex::new(Vec::new())),
-        }
+        let mut accessibility = FakeAccessibility::new(tree);
+        accessibility.set_log = set_log;
+        accessibility
     }
 
     fn glass_with_geometry_failure_ready_for_set_value(
@@ -4674,16 +4948,11 @@ mod tests {
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
         let ctx_log = Arc::new(Mutex::new(None));
+        let mut accessibility = FakeAccessibility::new(fake_tree());
+        accessibility.ctx_log = ctx_log.clone();
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(FakePlatform::new(100, 100)),
-            accessibility: Some(Box::new(FakeAccessibility {
-                tree: fake_tree(),
-                set_log: Arc::new(Mutex::new(Vec::new())),
-                set_fail: false,
-                ctx_log: ctx_log.clone(),
-                invoke_behavior: InvokeBehavior::Unsupported,
-                invoke_log: Arc::new(Mutex::new(Vec::new())),
-            })),
+            accessibility: Some(Box::new(accessibility)),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
             held.take()
@@ -4724,16 +4993,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
+        let mut accessibility = FakeAccessibility::new(fake_tree());
+        accessibility.set_fail = true;
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(FakePlatform::new(100, 100)),
-            accessibility: Some(Box::new(FakeAccessibility {
-                tree: fake_tree(),
-                set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-                set_fail: true,
-                ctx_log: Arc::new(Mutex::new(None)),
-                invoke_behavior: InvokeBehavior::Unsupported,
-                invoke_log: Arc::new(Mutex::new(Vec::new())),
-            })),
+            accessibility: Some(Box::new(accessibility)),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
             held.take()
@@ -5185,20 +5449,16 @@ mod tests {
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
         let log2 = log.clone();
+        let mut accessibility = FakeAccessibility::new(fake_tree());
+        accessibility.set_log = log2;
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(
                 FakePlatform::new(100, 100)
                     .with_drag_log(drags.clone())
                     .with_trailing_toggle_backend(),
             ),
-            accessibility: Some(Box::new(FakeAccessibility {
-                tree: fake_tree(), // #1 is a non-checkable Button "Save"
-                set_log: log2,
-                set_fail: false,
-                ctx_log: Arc::new(Mutex::new(None)),
-                invoke_behavior: InvokeBehavior::Unsupported,
-                invoke_log: Arc::new(Mutex::new(Vec::new())),
-            })),
+            // fake_tree: #1 is a non-checkable Button "Save"
+            accessibility: Some(Box::new(accessibility)),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
             held.take()
@@ -5234,20 +5494,16 @@ mod tests {
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
         let log2 = log.clone();
+        let mut accessibility = FakeAccessibility::new(sw(false));
+        accessibility.set_log = log2;
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(
                 FakePlatform::new(400, 400)
                     .with_drag_log(drags.clone())
                     .with_trailing_toggle_backend(),
             ),
-            accessibility: Some(Box::new(FakeAccessibility {
-                tree: sw(false), // #1 is the checkable switch "Sw"
-                set_log: log2,
-                set_fail: false,
-                ctx_log: Arc::new(Mutex::new(None)),
-                invoke_behavior: InvokeBehavior::Unsupported,
-                invoke_log: Arc::new(Mutex::new(Vec::new())),
-            })),
+            // sw(false): #1 is the checkable switch "Sw"
+            accessibility: Some(Box::new(accessibility)),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
             held.take()

@@ -106,7 +106,7 @@ impl Glass {
         result
     }
 
-    fn key_inner_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+    pub(super) fn key_inner_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
         let s = self.active_mut()?;
         s.platform.send_key_by(event, deadline)?;
         s.pump();

@@ -10,6 +10,12 @@ use crate::deadline::Deadline;
 use crate::error::{GlassError, Result};
 use crate::platform::{Segment, WindowGeometry};
 
+mod actionability;
+pub use actionability::{
+    ActionabilityCheck, ActionabilityCheckName, ActionabilityReport, ActionabilitySource,
+    ActionabilityVerdict, AxStateCoverage, PointerHit,
+};
+
 mod query;
 pub use query::{
     MatchField, MatchTier, ScopeResolution, SemanticMatch, SemanticQuery, SemanticQueryError,
@@ -1221,6 +1227,23 @@ pub trait Accessibility {
         None
     }
 
+    fn state_coverage(&self) -> AxStateCoverage {
+        Default::default()
+    }
+
+    fn focus(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
+        Err(crate::GlassError::AxUnsupported)
+    }
+
+    fn pointer_target_at(
+        &mut self,
+        _ctx: &AxContext,
+        _target: &AxTarget,
+        _point: (i32, i32),
+    ) -> Result<PointerHit> {
+        Ok(PointerHit::Inconclusive)
+    }
+
     /// Set the editable `target` after rewalking and verifying its fingerprint; default:
     /// unsupported.
     ///
@@ -1621,6 +1644,42 @@ mod tests {
             .set_value(&ctx, &target, "x")
             .expect_err("the default must refuse, not report success");
         assert!(matches!(err, crate::error::GlassError::AxUnsupported));
+    }
+
+    #[test]
+    fn actionability_capabilities_default_to_unavailable() {
+        struct Bare;
+        impl Accessibility for Bare {
+            fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+                unreachable!("not exercised")
+            }
+        }
+        let ctx = AxContext {
+            pids: vec![],
+            window: WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: Deadline::UNBOUNDED,
+        };
+        let target = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::Button,
+            name: None,
+            bounds: None,
+            value: None,
+        };
+        let mut backend = Bare;
+
+        assert_eq!(backend.state_coverage(), AxStateCoverage::NONE);
+        assert!(matches!(
+            backend.focus(&ctx, &target),
+            Err(crate::error::GlassError::AxUnsupported)
+        ));
+        assert_eq!(
+            backend.pointer_target_at(&ctx, &target, (10, 20)).unwrap(),
+            PointerHit::Inconclusive
+        );
     }
 
     /// Every arm of the condition table, plus the predicate each one selects. `Appears` and

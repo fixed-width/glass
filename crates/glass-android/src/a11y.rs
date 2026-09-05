@@ -6,7 +6,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree};
+use glass_core::accessibility::{
+    Accessibility, AxContext, AxNode, AxStateCoverage, AxTarget, AxTree, PointerHit,
+};
 use glass_core::{BoundDispatch, Deadline, Whose};
 use glass_core::{
     GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, WindowGeometry,
@@ -605,6 +607,29 @@ impl Accessibility for AndroidA11y {
         self.snapshot_within(ctx, snapshot_bound(self.warmth(), ctx.deadline))
     }
 
+    fn state_coverage(&self) -> AxStateCoverage {
+        AxStateCoverage {
+            enabled: true,
+            visible: true,
+            checkable: true,
+            checked: true,
+            selected: true,
+            expanded: false,
+            focused: true,
+            focusable: true,
+            editable: true,
+        }
+    }
+
+    fn pointer_target_at(
+        &mut self,
+        _ctx: &AxContext,
+        _target: &AxTarget,
+        _point: (i32, i32),
+    ) -> Result<PointerHit> {
+        Ok(PointerHit::Inconclusive)
+    }
+
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         fn read_back_error(target: &AxTarget, error: GlassError) -> GlassError {
             GlassError::write_unconfirmed_because(
@@ -731,14 +756,15 @@ impl Accessibility for AndroidA11y {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attempt, COLD_BOUND, RetryBound, Warmth, bound_fired, command_error, dump_once,
-        dump_until_ready, editable_target, locate_editable_target, locate_for_write, require_time,
-        snapshot_bound, snapshot_with_runner, verification_phase_owned_by_caller,
+        AndroidA11y, Attempt, COLD_BOUND, RetryBound, Warmth, bound_fired, command_error,
+        dump_once, dump_until_ready, editable_target, locate_editable_target, locate_for_write,
+        require_time, snapshot_bound, snapshot_with_runner, verification_phase_owned_by_caller,
     };
     use crate::adb::{AdbOp, a_failed_call, a_real_spawn_failure, a_real_timeout_hinted};
     use glass_core::Deadline;
     use glass_core::accessibility::{
-        AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree, WalkLimits,
+        Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStateCoverage, AxStates,
+        AxTarget, AxTree, WalkLimits,
     };
     use glass_core::{BoundDispatch, Whose};
     use glass_core::{BoundKind, GlassError, Result, WindowGeometry};
@@ -748,6 +774,24 @@ mod tests {
     /// A deadline no test reaches, for the cases that are not about the bound.
     fn ample() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn uiautomator_state_coverage_matches_its_mapped_evidence() {
+        assert_eq!(
+            AndroidA11y::new().state_coverage(),
+            AxStateCoverage {
+                enabled: true,
+                visible: true,
+                checkable: true,
+                checked: true,
+                selected: true,
+                expanded: false,
+                focused: true,
+                focusable: true,
+                editable: true,
+            }
+        );
     }
 
     #[test]

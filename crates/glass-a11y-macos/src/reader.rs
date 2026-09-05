@@ -20,7 +20,7 @@ use glass_core::coords::pixel_geometry_from_content_rect;
 use glass_core::platform::WindowGeometry;
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, GlassError,
-    Result, WalkBudget, normalize_name, read_back_confirms, write_took_no_effect,
+    PointerHit, Result, WalkBudget, normalize_name, read_back_confirms, write_took_no_effect,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
@@ -134,6 +134,61 @@ impl Accessibility for MacosA11y {
         })
     }
 
+    fn state_coverage(&self) -> glass_core::AxStateCoverage {
+        mapping::STATE_COVERAGE
+    }
+
+    fn focus(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
+        let deadline = SemanticDeadline::focus(ctx.deadline, target.id.0);
+        let (window_el, scale) = resolve_window(ctx, deadline)?;
+        let mut budget = WalkBudget::with_limits(ctx.limits);
+        let found = find_nth(window_el, 0, &mut budget, target.id.0, deadline)?;
+        let el = found.ok_or(GlassError::AxElementChanged(target.id.0))?;
+        verify_target_fingerprint(&el, ctx, target, scale, deadline)?;
+        if !deadline.observe(|| ffi::is_settable_checked(&el, attr::FOCUSED))?? {
+            return Err(GlassError::AxActionUnavailable(target.id.0));
+        }
+        deadline.dispatch(|| ffi::set_bool_attribute(&el, attr::FOCUSED, true))?;
+        Ok(None)
+    }
+
+    fn pointer_target_at(
+        &mut self,
+        ctx: &AxContext,
+        target: &AxTarget,
+        point: (i32, i32),
+    ) -> Result<PointerHit> {
+        let deadline = SemanticDeadline::snapshot(ctx.deadline);
+        let (window_el, scale) = resolve_window(ctx, deadline)?;
+        let mut budget = WalkBudget::with_limits(ctx.limits);
+        let found = find_nth(window_el, 0, &mut budget, target.id.0, deadline)?;
+        let target_el = found.ok_or(GlassError::AxElementChanged(target.id.0))?;
+        let target_role = verify_target_fingerprint(&target_el, ctx, target, scale, deadline)?;
+
+        let global_x = (f64::from(ctx.window.x) + f64::from(point.0)) / scale;
+        let global_y = (f64::from(ctx.window.y) + f64::from(point.1)) / scale;
+        if !global_x.is_finite()
+            || !global_y.is_finite()
+            || global_x < f64::from(f32::MIN)
+            || global_x > f64::from(f32::MAX)
+            || global_y < f64::from(f32::MIN)
+            || global_y > f64::from(f32::MAX)
+        {
+            return Err(GlassError::Backend(
+                "AX hit-test coordinate is not representable".into(),
+            ));
+        }
+        let &pid = ctx.pids.first().ok_or(GlassError::WindowNotFound)?;
+        let app = deadline.observe(|| ffi::app_element(pid as i32))?;
+        let hit = deadline
+            .observe(|| ffi::element_at_position(&app, global_x as f32, global_y as f32))??;
+        let Some(hit) = hit else {
+            return Ok(PointerHit::Inconclusive);
+        };
+
+        classify_pointer_hit(target_el, target_role, hit, ctx.limits.depth, deadline)
+    }
+
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         let deadline = SemanticDeadline::set_value(ctx.deadline, target.id.0);
         deadline.require()?;
@@ -162,7 +217,7 @@ impl Accessibility for MacosA11y {
             return Err(GlassError::AxElementChanged(target.id.0));
         }
 
-        if !deadline.observe(|| ffi::is_settable(&el, attr::VALUE))? {
+        if !deadline.observe(|| ffi::is_settable_checked(&el, attr::VALUE))?? {
             return Err(GlassError::AxElementNotEditable(target.id.0));
         }
 
@@ -248,6 +303,150 @@ impl Accessibility for MacosA11y {
         })?;
         Ok(None)
     }
+}
+
+fn verify_target_fingerprint(
+    el: &AXUIElement,
+    ctx: &AxContext,
+    target: &AxTarget,
+    scale: f64,
+    deadline: SemanticDeadline,
+) -> Result<AxRole> {
+    let ax_role = deadline
+        .observe(|| ffi::attribute_string(el, attr::ROLE))?
+        .unwrap_or_default();
+    let subrole = read_subrole(el, &ax_role, deadline)?;
+    let role = mapping::map_role(&ax_role, subrole.as_deref());
+    let name = read_name(el, deadline)?;
+    let bounds = window_relative_rect(el, scale, &ctx.window, deadline)?;
+    if !target.matches(role, name.as_deref())
+        || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
+    {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    deadline.require()?;
+    Ok(role)
+}
+
+fn checked_role(el: &AXUIElement, deadline: SemanticDeadline) -> Result<AxRole> {
+    let ax_role = deadline
+        .observe(|| ffi::attribute_string_checked(el, attr::ROLE))??
+        .unwrap_or_default();
+    let subrole = if mapping::subrole_matters(&ax_role) {
+        deadline.observe(|| ffi::attribute_string_checked(el, attr::SUBROLE))??
+    } else {
+        deadline.require()?;
+        None
+    };
+    Ok(mapping::map_role(&ax_role, subrole.as_deref()))
+}
+
+fn same_element(a: &AXUIElement, b: &AXUIElement, deadline: SemanticDeadline) -> Result<bool> {
+    deadline.observe(|| ffi::same_element(a, b))
+}
+
+fn contains_element_by<N>(
+    elements: &[N],
+    candidate: &N,
+    same: &mut impl FnMut(&N, &N) -> Result<bool>,
+) -> Result<bool> {
+    for element in elements {
+        if same(element, candidate)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn first_interactable_ancestor_by<N: Clone>(
+    target: &N,
+    depth_limit: usize,
+    same: &mut impl FnMut(&N, &N) -> Result<bool>,
+    role: &mut impl FnMut(&N) -> Result<AxRole>,
+    parent: &mut impl FnMut(&N) -> Result<Option<N>>,
+) -> Result<Option<N>> {
+    let mut current = parent(target)?;
+    let mut seen = Vec::new();
+    for _ in 0..depth_limit {
+        let Some(ancestor) = current else {
+            return Ok(None);
+        };
+        if contains_element_by(&seen, &ancestor, same)? {
+            return Err(GlassError::Backend("cyclic AX target ancestry".into()));
+        }
+        if role(&ancestor)?.is_interactable() {
+            return Ok(Some(ancestor));
+        }
+        seen.push(ancestor.clone());
+        current = parent(&ancestor)?;
+    }
+    Err(GlassError::Backend(format!(
+        "AX target ancestry exceeded the configured depth limit ({depth_limit})"
+    )))
+}
+
+fn classify_pointer_hit_by<N: Clone>(
+    target: &N,
+    target_role: AxRole,
+    hit: N,
+    depth_limit: usize,
+    same: &mut impl FnMut(&N, &N) -> Result<bool>,
+    role: &mut impl FnMut(&N) -> Result<AxRole>,
+    parent: &mut impl FnMut(&N) -> Result<Option<N>>,
+) -> Result<PointerHit> {
+    if same(&hit, target)? {
+        return Ok(PointerHit::Target);
+    }
+    let accepted_ancestor = if target_role.is_interactable() {
+        None
+    } else {
+        first_interactable_ancestor_by(target, depth_limit, same, role, parent)?
+    };
+    if let Some(ancestor) = &accepted_ancestor
+        && same(&hit, ancestor)?
+    {
+        return Ok(PointerHit::AcceptedAncestor);
+    }
+
+    let mut current = hit;
+    let mut seen = Vec::new();
+    for _ in 0..=depth_limit {
+        if same(&current, target)? {
+            return Ok(PointerHit::Target);
+        }
+        if role(&current)?.is_interactable() {
+            return Ok(PointerHit::Other);
+        }
+        if contains_element_by(&seen, &current, same)? {
+            return Err(GlassError::Backend("cyclic AX hit ancestry".into()));
+        }
+        seen.push(current.clone());
+        let Some(next) = parent(&current)? else {
+            return Ok(PointerHit::Other);
+        };
+        current = next;
+    }
+    Err(GlassError::Backend(format!(
+        "AX hit ancestry exceeded the configured depth limit ({depth_limit})"
+    )))
+}
+
+fn classify_pointer_hit(
+    target: CFRetained<AXUIElement>,
+    target_role: AxRole,
+    hit: CFRetained<AXUIElement>,
+    depth_limit: usize,
+    deadline: SemanticDeadline,
+) -> Result<PointerHit> {
+    classify_pointer_hit_by(
+        &target,
+        target_role,
+        hit,
+        depth_limit,
+        &mut |a, b| same_element(a, b, deadline),
+        &mut |element| checked_role(element, deadline),
+        &mut |element| deadline.observe(|| ffi::parent(element))?,
+    )
 }
 
 struct WriteVerification<'a> {
@@ -842,12 +1041,10 @@ fn gather_states(
     // extra AX IPC round-trip) only for those roles — every other node skips it. `ToggleButton`
     // is where a switch lands, whichever base role its toolkit gave it.
     let (checkable, checked) = if mapping::role_carries_checked(role) {
-        let value = deadline.observe(|| ffi::attribute_i64(el, attr::VALUE))?;
+        let value = deadline.observe(|| ffi::attribute_i64_checked(el, attr::VALUE))??;
         if value.is_none() {
-            // A control of this role with no readable numeric value claims neither checked nor
-            // unchecked (the #170 invariant), so `condition:"checked"` silently matches nothing —
-            // say why here, since the tree cannot. Reads through the error-blind `attribute_i64`,
-            // so this cannot distinguish an absent value from a failed read.
+            // A control of this role with no numeric value claims neither checked nor unchecked;
+            // genuine AX failures have already propagated from the checked read.
             eprintln!(
                 "glass-a11y-macos: {role:?} has no readable AXValue; \
                  it will report neither checked nor unchecked"
@@ -859,13 +1056,13 @@ fn gather_states(
         (false, false)
     };
     let enabled = deadline
-        .observe(|| ffi::attribute_bool(el, attr::ENABLED))?
+        .observe(|| ffi::attribute_bool_checked(el, attr::ENABLED))??
         .unwrap_or(false);
     let focused = deadline
-        .observe(|| ffi::attribute_bool(el, attr::FOCUSED))?
+        .observe(|| ffi::attribute_bool_checked(el, attr::FOCUSED))??
         .unwrap_or(false);
-    let focusable = deadline.observe(|| ffi::is_settable(el, attr::FOCUSED))?;
-    let editable = deadline.observe(|| ffi::is_settable(el, attr::VALUE))?;
+    let focusable = deadline.observe(|| ffi::is_settable_checked(el, attr::FOCUSED))??;
+    let editable = deadline.observe(|| ffi::is_settable_checked(el, attr::VALUE))??;
     deadline.require()?;
     Ok(AxStateFacts {
         enabled,
@@ -883,6 +1080,7 @@ fn gather_states(
 mod tests {
     use super::*;
     use glass_core::{BoundDispatch, BoundKind, Deadline, WalkLimits, Whose};
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -892,6 +1090,115 @@ mod tests {
         Gate,
         NativeCall,
         Finish,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum HitNode {
+        Target,
+        ContentDescendant,
+        ActionableDescendant,
+        ContainerAncestor,
+        ButtonAncestor,
+    }
+
+    #[test]
+    fn non_actionable_hit_descendant_walks_to_the_target() {
+        let mut same = |left: &HitNode, right: &HitNode| Ok(left == right);
+        let mut role = |node: &HitNode| {
+            Ok(match node {
+                HitNode::Target | HitNode::ActionableDescendant | HitNode::ButtonAncestor => {
+                    AxRole::Button
+                }
+                HitNode::ContentDescendant | HitNode::ContainerAncestor => AxRole::Group,
+            })
+        };
+        let mut parent = |node: &HitNode| {
+            Ok(match node {
+                HitNode::ContentDescendant => Some(HitNode::Target),
+                _ => None,
+            })
+        };
+
+        let hit = classify_pointer_hit_by(
+            &HitNode::Target,
+            AxRole::Button,
+            HitNode::ContentDescendant,
+            4,
+            &mut same,
+            &mut role,
+            &mut parent,
+        )
+        .expect("a content descendant has a checked path to the target");
+
+        assert_eq!(hit, PointerHit::Target);
+    }
+
+    #[test]
+    fn exact_first_interactable_target_ancestor_is_accepted() {
+        let mut same = |left: &HitNode, right: &HitNode| Ok(left == right);
+        let mut role = |node: &HitNode| {
+            Ok(match node {
+                HitNode::ButtonAncestor | HitNode::ActionableDescendant => AxRole::Button,
+                HitNode::Target | HitNode::ContentDescendant | HitNode::ContainerAncestor => {
+                    AxRole::Group
+                }
+            })
+        };
+        let mut parent = |node: &HitNode| {
+            Ok(match node {
+                HitNode::Target => Some(HitNode::ContainerAncestor),
+                HitNode::ContainerAncestor => Some(HitNode::ButtonAncestor),
+                _ => None,
+            })
+        };
+
+        let hit = classify_pointer_hit_by(
+            &HitNode::Target,
+            AxRole::Group,
+            HitNode::ButtonAncestor,
+            4,
+            &mut same,
+            &mut role,
+            &mut parent,
+        )
+        .expect("the exact first interactable target ancestor is supported");
+
+        assert_eq!(hit, PointerHit::AcceptedAncestor);
+    }
+
+    #[test]
+    fn independent_actionable_descendant_is_rejected_before_ancestry_acceptance() {
+        let parent_reads = Cell::new(0);
+        let mut same = |left: &HitNode, right: &HitNode| Ok(left == right);
+        let mut role = |node: &HitNode| {
+            Ok(match node {
+                HitNode::ActionableDescendant | HitNode::Target | HitNode::ButtonAncestor => {
+                    AxRole::Button
+                }
+                HitNode::ContentDescendant | HitNode::ContainerAncestor => AxRole::Group,
+            })
+        };
+        let mut parent = |node: &HitNode| {
+            parent_reads.set(parent_reads.get() + 1);
+            Ok(match node {
+                HitNode::ActionableDescendant => Some(HitNode::Target),
+                _ => None,
+            })
+        };
+
+        let hit = classify_pointer_hit_by(
+            &HitNode::Target,
+            AxRole::Button,
+            HitNode::ActionableDescendant,
+            4,
+            &mut same,
+            &mut role,
+            &mut parent,
+        )
+        .expect("an actionable descendant is a supported negative hit result");
+
+        assert_eq!(hit, PointerHit::Other);
+        assert_eq!(parent_reads.get(), 0);
     }
 
     #[derive(Debug)]

@@ -9,7 +9,7 @@
 // `// SAFETY:`-documented).
 #![allow(unsafe_code)]
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_a11y_windows::WindowsA11y;
@@ -143,6 +143,90 @@ fn glass_windows_with_a11y() -> Glass {
     Glass::new(factory, "windows".into(), BaselineStore::new(root), 100)
 }
 
+type MovementSamples = Arc<Mutex<Vec<(Instant, glass_core::AxRect)>>>;
+
+struct RecordingWindowsA11y {
+    inner: WindowsA11y,
+    movement_samples: MovementSamples,
+}
+
+impl Accessibility for RecordingWindowsA11y {
+    fn snapshot(&mut self, ctx: &AxContext) -> glass_core::Result<AxTree> {
+        let tree = self.inner.snapshot(ctx)?;
+        if let Some(bounds) = named_node(&tree.root, "Moving semantic").and_then(|node| node.bounds)
+        {
+            self.movement_samples
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((Instant::now(), bounds));
+        }
+        Ok(tree)
+    }
+
+    fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        self.inner.subscribe_changes(ctx)
+    }
+
+    fn state_coverage(&self) -> glass_core::AxStateCoverage {
+        self.inner.state_coverage()
+    }
+
+    fn focus(
+        &mut self,
+        ctx: &AxContext,
+        target: &AxTarget,
+    ) -> glass_core::Result<Option<glass_core::AxNodeId>> {
+        self.inner.focus(ctx, target)
+    }
+
+    fn pointer_target_at(
+        &mut self,
+        ctx: &AxContext,
+        target: &AxTarget,
+        point: (i32, i32),
+    ) -> glass_core::Result<glass_core::PointerHit> {
+        self.inner.pointer_target_at(ctx, target, point)
+    }
+
+    fn set_value(
+        &mut self,
+        ctx: &AxContext,
+        target: &AxTarget,
+        text: &str,
+    ) -> glass_core::Result<()> {
+        self.inner.set_value(ctx, target, text)
+    }
+
+    fn invoke(
+        &mut self,
+        ctx: &AxContext,
+        target: &AxTarget,
+    ) -> glass_core::Result<Option<glass_core::AxNodeId>> {
+        self.inner.invoke(ctx, target)
+    }
+}
+
+fn glass_windows_with_movement_recording() -> (Glass, MovementSamples) {
+    let movement_samples = Arc::new(Mutex::new(Vec::new()));
+    let recorder = movement_samples.clone();
+    let factory: PlatformFactory = Box::new(move |_backend| {
+        Ok(Backend {
+            platform: Box::new(WindowsPlatform::new()?),
+            accessibility: Some(Box::new(RecordingWindowsA11y {
+                inner: WindowsA11y::new(),
+                movement_samples: recorder.clone(),
+            })),
+        })
+    });
+    let dir = tempfile::tempdir().expect("tempdir for baseline store");
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    (
+        Glass::new(factory, "windows".into(), BaselineStore::new(root), 100),
+        movement_samples,
+    )
+}
+
 /// The repo root: two levels above `crates/glass-windows` (this crate's `CARGO_MANIFEST_DIR`),
 /// baked in at build time — so on the box's own `cargo build`, it reflects wherever that box's
 /// checkout actually lives, not a hardcoded path/user.
@@ -265,6 +349,171 @@ fn first_role_with_bounds<'a>(n: &'a AxNode, role: AxRole, out: &mut Option<&'a 
     for c in &n.children {
         first_role_with_bounds(c, role, out);
     }
+}
+
+fn named_node<'a>(node: &'a AxNode, name: &str) -> Option<&'a AxNode> {
+    if node.name.as_deref() == Some(name) {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| named_node(child, name))
+}
+
+fn semantic_target(
+    role: AxRole,
+    name: &str,
+    states: Vec<glass_core::SemanticState>,
+) -> glass_core::SemanticTarget {
+    glass_core::SemanticTarget {
+        target: glass_core::SemanticSelector::new(Some(name.into()), Some(role), states)
+            .expect("valid semantic selector"),
+        within: None,
+    }
+}
+
+fn actionability_verdict(
+    report: &glass_core::ActionabilityReport,
+    name: glass_core::ActionabilityCheckName,
+) -> glass_core::ActionabilityVerdict {
+    report
+        .checks
+        .iter()
+        .find(|check| check.name == name)
+        .unwrap_or_else(|| panic!("missing {name:?} in {:?}", report.checks))
+        .verdict
+}
+
+fn log_cursor(glass: &mut Glass) -> u64 {
+    glass
+        .logs(0, 100, None, None)
+        .expect("read fixture log cursor")
+        .1
+}
+
+fn exact_log_count_since(glass: &mut Glass, cursor: u64, expected: &str) -> usize {
+    let lines = glass
+        .logs(cursor, 1_000, None, None)
+        .expect("read fixture logs")
+        .0;
+    let messages = lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    count_exact_messages(&messages, expected)
+}
+
+fn await_exact_log_arrival(glass: &mut Glass, cursor: u64, expected: &str, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let observed = exact_log_count_since(glass, cursor, expected);
+        if observed == count {
+            return;
+        }
+        assert!(
+            observed < count && Instant::now() < deadline,
+            "expected exactly {count} {expected:?} logs, got {observed}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn await_exact_log_count(glass: &mut Glass, cursor: u64, expected: &str, count: usize) {
+    if count != 0 {
+        await_exact_log_arrival(glass, cursor, expected, count);
+    }
+    let quiet_until = Instant::now() + Duration::from_millis(400);
+    loop {
+        let observed = exact_log_count_since(glass, cursor, expected);
+        assert_eq!(
+            observed, count,
+            "expected {count} exact {expected:?} logs throughout the bounded quiet window"
+        );
+        if Instant::now() >= quiet_until {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn count_exact_messages(messages: &[&str], expected: &str) -> usize {
+    messages
+        .iter()
+        .filter(|message| **message == expected)
+        .count()
+}
+
+fn observed_change_before_stable_pair(
+    samples: &[(Duration, glass_core::AxRect)],
+    stable_gap: Duration,
+) -> bool {
+    let Some(last) = samples.windows(2).last() else {
+        return false;
+    };
+    last[0].1 == last[1].1
+        && last[1].0.saturating_sub(last[0].0) >= stable_gap
+        && samples[..samples.len() - 1]
+            .windows(2)
+            .any(|pair| pair[0].1 != pair[1].1)
+}
+
+#[test]
+fn semantic_log_oracle_matches_complete_messages() {
+    assert_eq!(
+        count_exact_messages(
+            &[
+                "[fixture] text=Z",
+                "[fixture] text=ZZ",
+                "prefix [fixture] text=Z"
+            ],
+            "[fixture] text=Z",
+        ),
+        1
+    );
+}
+
+#[test]
+fn movement_evidence_requires_change_before_the_final_stable_pair() {
+    let bounds = |x| glass_core::AxRect {
+        x,
+        y: 0,
+        width: 10,
+        height: 10,
+    };
+    let samples = [
+        (Duration::ZERO, bounds(0)),
+        (Duration::from_millis(25), bounds(4)),
+        (Duration::from_millis(150), bounds(4)),
+    ];
+    assert!(observed_change_before_stable_pair(
+        &samples,
+        Duration::from_millis(100)
+    ));
+    assert!(!observed_change_before_stable_pair(
+        &[
+            (Duration::ZERO, bounds(4)),
+            (Duration::from_millis(150), bounds(4)),
+        ],
+        Duration::from_millis(100)
+    ));
+    assert!(!observed_change_before_stable_pair(
+        &[
+            (Duration::ZERO, bounds(0)),
+            (Duration::from_millis(25), bounds(4)),
+            (Duration::from_millis(150), bounds(4)),
+            (Duration::from_millis(200), bounds(8)),
+        ],
+        Duration::from_millis(100)
+    ));
+    assert!(!observed_change_before_stable_pair(
+        &[
+            (Duration::ZERO, bounds(0)),
+            (Duration::from_millis(25), bounds(4)),
+            (Duration::from_millis(100), bounds(8)),
+            (Duration::from_millis(150), bounds(4)),
+        ],
+        Duration::from_millis(100)
+    ));
 }
 
 /// Nodes carrying UIA's Toggle pattern that are NOT already a checkbox or radio button —
@@ -802,12 +1051,16 @@ fn onbox_a11y_set_value() {
         bounds: b.bounds,
         value: b.value.clone(),
     };
+    let error = a11y
+        .set_value(&ctx, &bt, "x")
+        .expect_err("set_value on a Button must not dispatch");
     assert!(
-        matches!(
-            a11y.set_value(&ctx, &bt, "x"),
-            Err(GlassError::AxElementNotEditable(_))
-        ),
-        "set_value on a Button must error AxElementNotEditable"
+        matches!(error.cause(), GlassError::AxElementNotEditable(id) if *id == bt.id.0),
+        "set_value on a Button must preserve AxElementNotEditable: {error:?}"
+    );
+    assert_eq!(
+        error.bound_dispatch(),
+        Some(glass_core::BoundDispatch::NotDispatched)
     );
 
     let _ = p.stop_app();
@@ -860,6 +1113,364 @@ fn onbox_egui_set_value_honesty() {
     );
 
     let _ = p.stop_app();
+}
+
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session + builds the egui fixture"]
+fn onbox_semantic_actions() {
+    use glass_core::{
+        ActionMethod, ActionMode, ActionTarget, ActionabilityCheckName, ActionabilityVerdict,
+        ConfirmationStatus, DispatchStatus, SemanticActionFailureKind, SemanticState,
+    };
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let (mut glass, movement_samples) = glass_windows_with_movement_recording();
+    let mut spec = egui_fixture_spec(glass_core::SandboxLevel::Off);
+    spec.run.push("--movement-duration-ms=3000".into());
+    let geometry = glass.start(&spec).expect("build + launch the egui fixture");
+    await_exact_log_count(&mut glass, 0, "[fixture] movement_duration_ms=3000", 1);
+
+    let initial = glass
+        .a11y_snapshot(None)
+        .expect("initial egui semantic snapshot");
+    assert_eq!(
+        Accessibility::state_coverage(&WindowsA11y::new()),
+        glass_core::AxStateCoverage {
+            enabled: true,
+            visible: true,
+            checkable: true,
+            checked: true,
+            selected: true,
+            expanded: true,
+            focused: true,
+            focusable: true,
+            editable: true,
+        }
+    );
+    let disabled = named_node(&initial.root, "Disabled semantic").expect("disabled semantic");
+    assert!(!disabled.states.enabled);
+    let hidden = named_node(&initial.root, "Hidden semantic").expect("hidden semantic");
+    assert!(!hidden.states.visible);
+    assert!(
+        hidden
+            .bounds
+            .is_some_and(|bounds| bounds.y >= geometry.height as i32),
+        "hidden semantic bounds must remain outside the fixture viewport: {:?}",
+        hidden.bounds
+    );
+    let moving_id = named_node(&initial.root, "Moving semantic")
+        .expect("moving semantic")
+        .id;
+    let occluded = named_node(&initial.root, "Occluded semantic").expect("occluded semantic");
+    let occluded_center = occluded
+        .bounds
+        .and_then(|bounds| bounds.clamped_center(geometry.width, geometry.height))
+        .expect("occluded semantic has an in-window center");
+    let automation = uiautomation::UIAutomation::new().expect("UI Automation client");
+    let screen = uiautomation::types::Point::new(
+        geometry.x.checked_add(occluded_center.0).expect("screen x"),
+        geometry.y.checked_add(occluded_center.1).expect("screen y"),
+    );
+    let hit = automation
+        .element_from_point(screen)
+        .expect("UIA element from occluded center");
+    assert_eq!(hit.get_name().expect("hit element name"), "Occluder");
+    let composite = named_node(&initial.root, "Composite semantic").expect("composite target");
+    let nested = named_node(composite, "Nested semantic").expect("nested interactive descendant");
+    assert!(nested.role.is_interactable());
+    let composite_center = composite
+        .bounds
+        .and_then(|bounds| bounds.clamped_center(geometry.width, geometry.height))
+        .expect("composite has actual in-window geometry");
+    let nested_hit = automation
+        .element_from_point(uiautomation::types::Point::new(
+            geometry
+                .x
+                .checked_add(composite_center.0)
+                .expect("composite screen x"),
+            geometry
+                .y
+                .checked_add(composite_center.1)
+                .expect("composite screen y"),
+        ))
+        .expect("UIA hit at composite target center");
+    assert_eq!(
+        nested_hit.get_name().expect("nested hit name"),
+        "Nested semantic"
+    );
+
+    let native_save_cursor = log_cursor(&mut glass);
+    let native_save = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Semantic Save",
+                vec![SemanticState::Enabled],
+            )),
+            mode: ActionMode::Native,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect("native semantic save");
+    assert_eq!(
+        native_save.action.method,
+        ActionMethod::NativeAction { actuated: None }
+    );
+    assert_eq!(native_save.action.dispatch, DispatchStatus::Dispatched);
+    await_exact_log_count(&mut glass, native_save_cursor, "[fixture] semantic_save", 1);
+
+    let stale_cursor = log_cursor(&mut glass);
+    let stale = glass
+        .click_element(moving_id)
+        .expect_err("moving bounds must stale the backend fingerprint before dispatch");
+    assert!(matches!(stale.cause(), GlassError::AxElementChanged(_)));
+    await_exact_log_count(&mut glass, stale_cursor, "[fixture] moving_semantic", 0);
+
+    let pointer_save_cursor = log_cursor(&mut glass);
+    let pointer_save = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Semantic Save",
+                vec![SemanticState::Enabled],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect("forced pointer semantic save");
+    assert_eq!(
+        pointer_save.action.method,
+        ActionMethod::Pointer {
+            native_fallback: None
+        }
+    );
+    await_exact_log_count(
+        &mut glass,
+        pointer_save_cursor,
+        "[fixture] semantic_save",
+        1,
+    );
+
+    let text_cursor = log_cursor(&mut glass);
+    let typed = glass
+        .type_target(
+            &glass_core::TypeTargetParams {
+                target: semantic_target(
+                    AxRole::TextField,
+                    "Text",
+                    vec![SemanticState::Enabled, SemanticState::Visible],
+                ),
+                focus_mode: ActionMode::Native,
+                timeout_ms: 5_000,
+                max_nodes: None,
+            },
+            "Z",
+        )
+        .expect("native targeted type");
+    let focus = typed.focus.expect("targeted type focus report");
+    assert_eq!(focus.confirmation, ConfirmationStatus::FocusConfirmed);
+    assert_eq!(focus.dispatch, DispatchStatus::Dispatched);
+    await_exact_log_count(&mut glass, text_cursor, "[fixture] text=Z", 1);
+    let typed_snapshot = glass
+        .a11y_snapshot(None)
+        .expect("snapshot exact targeted type result");
+    let mut typed_field = None;
+    first_role(&typed_snapshot.root, AxRole::TextField, &mut typed_field);
+    let typed_field = typed_field.expect("TextField after targeted typing");
+    assert_eq!(typed_field.value.as_deref(), Some("Z"));
+
+    let disabled_cursor = log_cursor(&mut glass);
+    let disabled = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Disabled semantic",
+                vec![],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(0),
+            max_nodes: None,
+        })
+        .expect_err("disabled semantic target must be refused");
+    assert_eq!(disabled.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(disabled.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        actionability_verdict(&disabled.actionability, ActionabilityCheckName::Enabled),
+        ActionabilityVerdict::Failed
+    );
+    await_exact_log_count(
+        &mut glass,
+        disabled_cursor,
+        "[fixture] disabled_semantic",
+        0,
+    );
+
+    let duplicate_cursor = log_cursor(&mut glass);
+    let duplicate = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Duplicate semantic",
+                vec![],
+            )),
+            mode: ActionMode::Native,
+            timeout_ms: Some(0),
+            max_nodes: None,
+        })
+        .expect_err("duplicate semantic target must be refused");
+    assert_eq!(duplicate.kind, SemanticActionFailureKind::AmbiguousTarget);
+    assert_eq!(duplicate.action_dispatch, DispatchStatus::NotDispatched);
+    await_exact_log_count(
+        &mut glass,
+        duplicate_cursor,
+        "[fixture] duplicate_semantic",
+        0,
+    );
+
+    let occluded_cursor = log_cursor(&mut glass);
+    let occluded = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Occluded semantic",
+                vec![SemanticState::Enabled, SemanticState::Visible],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect_err("UIA must prove the foreground occluder before dispatch");
+    assert_eq!(occluded.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(occluded.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        actionability_verdict(&occluded.actionability, ActionabilityCheckName::NonOccluded,),
+        ActionabilityVerdict::Failed
+    );
+    await_exact_log_count(
+        &mut glass,
+        occluded_cursor,
+        "[fixture] occluded_semantic",
+        0,
+    );
+
+    let nested_cursor = log_cursor(&mut glass);
+    let nested = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Composite semantic",
+                vec![SemanticState::Enabled, SemanticState::Visible],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect_err("an interactable descendant must fail closed before pointer dispatch");
+    assert_eq!(nested.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(nested.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        actionability_verdict(&nested.actionability, ActionabilityCheckName::NonOccluded),
+        ActionabilityVerdict::Failed
+    );
+    await_exact_log_count(&mut glass, nested_cursor, "[fixture] nested_semantic", 0);
+
+    let hidden_cursor = log_cursor(&mut glass);
+    let hidden = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Hidden semantic",
+                vec![SemanticState::Enabled],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect_err("an offscreen AccessKit target must be refused");
+    assert_eq!(hidden.kind, SemanticActionFailureKind::NotActionable);
+    assert_eq!(hidden.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        actionability_verdict(&hidden.actionability, ActionabilityCheckName::Visible),
+        ActionabilityVerdict::Failed
+    );
+    await_exact_log_count(&mut glass, hidden_cursor, "[fixture] hidden_semantic", 0);
+
+    let restart_cursor = log_cursor(&mut glass);
+    glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Restart movement",
+                vec![SemanticState::Enabled],
+            )),
+            mode: ActionMode::Native,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        })
+        .expect("restart movement immediately before the pointer request");
+    await_exact_log_arrival(&mut glass, restart_cursor, "[fixture] movement_restart", 1);
+    movement_samples
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+
+    let moving_cursor = log_cursor(&mut glass);
+    let moving = glass
+        .click_target(&glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(
+                AxRole::Button,
+                "Moving semantic",
+                vec![SemanticState::Enabled, SemanticState::Visible],
+            )),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(10_000),
+            max_nodes: None,
+        })
+        .expect("stable forced pointer click");
+    assert_eq!(
+        moving.action.method,
+        ActionMethod::Pointer {
+            native_fallback: None
+        }
+    );
+    assert_eq!(
+        actionability_verdict(&moving.actionability, ActionabilityCheckName::Stable),
+        ActionabilityVerdict::Passed
+    );
+    let samples = movement_samples
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let first_observed_at = samples
+        .first()
+        .expect("pointer stabilization records at least one moving-target sample")
+        .0;
+    let elapsed_samples = samples
+        .iter()
+        .map(|(observed_at, bounds)| {
+            (
+                observed_at.saturating_duration_since(first_observed_at),
+                *bounds,
+            )
+        })
+        .collect::<Vec<_>>();
+    let artifact_dir = repo_root().join(".windows-artifacts");
+    std::fs::create_dir_all(&artifact_dir).expect("create semantic evidence directory");
+    std::fs::write(
+        artifact_dir.join("semantic-movement-samples.txt"),
+        format!("movement_duration_ms=3000\nstable_gap_ms=100\nsamples={elapsed_samples:?}\n"),
+    )
+    .expect("record real UIA movement samples");
+    assert!(
+        observed_change_before_stable_pair(&elapsed_samples, Duration::from_millis(100)),
+        "pointer stabilization samples must contain changed bounds before the final stable pair: {elapsed_samples:?}"
+    );
+    await_exact_log_count(&mut glass, moving_cursor, "[fixture] moving_semantic", 1);
+    await_exact_log_count(&mut glass, restart_cursor, "[fixture] movement_restart", 1);
+
+    glass.stop().expect("stop egui semantic fixture");
 }
 
 // Uncontained: end-to-end verification that a Windows ctrl+scroll both DELIVERS the wheel with its

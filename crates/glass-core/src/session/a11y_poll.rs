@@ -1,8 +1,5 @@
 use super::*;
 
-/// Maximum wall-clock time a change signal may suppress tree reads.
-const REREAD_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// Reader headroom reserved before a quiet wait's deadline, capped at one quarter of the
 /// remaining budget.
 const FINAL_READ_HEADROOM: std::time::Duration = std::time::Duration::from_millis(20);
@@ -14,12 +11,30 @@ pub(super) struct A11yPollOutcome<O> {
     pub timed_out_by: Option<crate::Whose>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct A11yPollCadence {
+    pub interval_ms: u64,
+    pub reread_after: std::time::Duration,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct A11yPollBound {
+    pub action_deadline: Deadline,
+    pub whose: crate::Whose,
+    pub allow_wait: bool,
+    pub sequence_deadline: Deadline,
+}
+
 fn final_read_pause(left: std::time::Duration) -> std::time::Duration {
     left.saturating_sub(FINAL_READ_HEADROOM.min(left / 4))
 }
 
-fn quiet_wait_needs_read(final_read: bool, since_last: std::time::Duration) -> bool {
-    final_read || since_last >= REREAD_AFTER
+fn quiet_wait_needs_read(
+    final_read: bool,
+    since_last: std::time::Duration,
+    reread_after: std::time::Duration,
+) -> bool {
+    final_read || since_last >= reread_after
 }
 
 fn should_schedule_final_read(
@@ -75,8 +90,30 @@ impl Glass {
         timeout_ms: u64,
         sequence_deadline: Deadline,
         operation: &'static str,
-        mut observe: impl FnMut(&AxTree) -> O,
-        mut satisfied: impl FnMut(&O) -> bool,
+        observe: impl FnMut(&AxTree) -> O,
+        satisfied: impl FnMut(&O) -> bool,
+    ) -> Result<A11yPollOutcome<O>> {
+        self.poll_accessibility_until_with_reread(
+            A11yPollCadence {
+                interval_ms,
+                reread_after: std::time::Duration::from_secs(1),
+            },
+            timeout_ms,
+            sequence_deadline,
+            operation,
+            observe,
+            satisfied,
+        )
+    }
+
+    pub(super) fn poll_accessibility_until_with_reread<O>(
+        &mut self,
+        cadence: A11yPollCadence,
+        timeout_ms: u64,
+        sequence_deadline: Deadline,
+        operation: &'static str,
+        observe: impl FnMut(&AxTree) -> O,
+        satisfied: impl FnMut(&O) -> bool,
     ) -> Result<A11yPollOutcome<O>> {
         if sequence_deadline.has_passed() {
             return Err(GlassError::deadline_not_started(operation));
@@ -86,16 +123,153 @@ impl Glass {
         let (effective_duration, whose) =
             sequence_deadline.budget(std::time::Duration::from_millis(timeout_ms), started);
         let action_deadline = Deadline::at(started + effective_duration);
+        self.poll_accessibility_until_with_deadline(
+            cadence,
+            A11yPollBound {
+                action_deadline,
+                whose,
+                allow_wait: timeout_ms > 0,
+                sequence_deadline,
+            },
+            operation,
+            started,
+            observe,
+            satisfied,
+        )
+    }
+
+    pub(super) fn poll_accessibility_until_by_deadline<O>(
+        &mut self,
+        cadence: A11yPollCadence,
+        bound: A11yPollBound,
+        operation: &'static str,
+        observe: impl FnMut(&AxTree) -> O,
+        satisfied: impl FnMut(&O) -> bool,
+    ) -> Result<A11yPollOutcome<O>> {
+        let A11yPollBound {
+            action_deadline,
+            whose,
+            allow_wait,
+            sequence_deadline,
+        } = bound;
+        if sequence_deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(operation));
+        }
+        self.require_active()?;
+        if allow_wait && action_deadline.has_passed() {
+            return Err(GlassError::Bounded {
+                kind: crate::BoundKind::NotStarted,
+                whose,
+                dispatch: crate::BoundDispatch::NotDispatched,
+                message: format!(
+                    "{operation}: its effective deadline was already spent, so it was not started"
+                ),
+            });
+        }
+        self.poll_accessibility_until_with_deadline(
+            cadence,
+            bound,
+            operation,
+            std::time::Instant::now(),
+            observe,
+            satisfied,
+        )
+    }
+
+    pub(super) fn poll_accessibility_until_by_deadline_with_window<O>(
+        &mut self,
+        cadence: A11yPollCadence,
+        bound: A11yPollBound,
+        operation: &'static str,
+        observe: impl FnMut(&AxTree, (u32, u32)) -> O,
+        satisfied: impl FnMut(&O) -> bool,
+    ) -> Result<A11yPollOutcome<O>> {
+        let A11yPollBound {
+            action_deadline,
+            whose,
+            allow_wait,
+            sequence_deadline,
+        } = bound;
+        if sequence_deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(operation));
+        }
+        self.require_active()?;
+        if allow_wait && action_deadline.has_passed() {
+            return Err(GlassError::Bounded {
+                kind: crate::BoundKind::NotStarted,
+                whose,
+                dispatch: crate::BoundDispatch::NotDispatched,
+                message: format!(
+                    "{operation}: its effective deadline was already spent, so it was not started"
+                ),
+            });
+        }
+        self.poll_accessibility_until_with_deadline_and_window(
+            cadence,
+            bound,
+            operation,
+            std::time::Instant::now(),
+            observe,
+            satisfied,
+        )
+    }
+
+    fn poll_accessibility_until_with_deadline<O>(
+        &mut self,
+        cadence: A11yPollCadence,
+        bound: A11yPollBound,
+        operation: &'static str,
+        started: std::time::Instant,
+        mut observe: impl FnMut(&AxTree) -> O,
+        satisfied: impl FnMut(&O) -> bool,
+    ) -> Result<A11yPollOutcome<O>> {
+        self.poll_accessibility_until_with_deadline_and_window(
+            cadence,
+            bound,
+            operation,
+            started,
+            move |tree, _window| observe(tree),
+            satisfied,
+        )
+    }
+
+    fn poll_accessibility_until_with_deadline_and_window<O>(
+        &mut self,
+        cadence: A11yPollCadence,
+        bound: A11yPollBound,
+        operation: &'static str,
+        started: std::time::Instant,
+        mut observe: impl FnMut(&AxTree, (u32, u32)) -> O,
+        mut satisfied: impl FnMut(&O) -> bool,
+    ) -> Result<A11yPollOutcome<O>> {
+        let A11yPollCadence {
+            interval_ms,
+            reread_after,
+        } = cadence;
+        let A11yPollBound {
+            action_deadline,
+            whose,
+            allow_wait,
+            sequence_deadline,
+        } = bound;
         let mut signal = (interval_ms > 0)
             .then(|| self.subscribe_a11y_changes(action_deadline))
             .flatten();
-        let remaining = (effective_duration.as_millis() as u64)
-            .saturating_sub(started.elapsed().as_millis() as u64);
+        let remaining = if allow_wait {
+            let deadline = action_deadline
+                .instant()
+                .expect("a waiting accessibility poll has a finite deadline");
+            let effective_duration = deadline.saturating_duration_since(started);
+            (effective_duration.as_millis() as u64)
+                .saturating_sub(started.elapsed().as_millis() as u64)
+        } else {
+            0
+        };
         let mut last_read = std::time::Instant::now();
         let mut unread: Option<GlassError> = None;
         let mut unread_owner = whose;
         let mut saw_a_tree = false;
-        let first_read_deadline = if timeout_ms == 0 {
+        let first_read_deadline = if !allow_wait {
             sequence_deadline
         } else {
             action_deadline
@@ -122,7 +296,9 @@ impl Glass {
                 let read_now = match signal.as_mut() {
                     Some(s) => match s.wait(pause_budget) {
                         ChangeWait::Changed => true,
-                        ChangeWait::Quiet => quiet_wait_needs_read(final_read, last_read.elapsed()),
+                        ChangeWait::Quiet => {
+                            quiet_wait_needs_read(final_read, last_read.elapsed(), reread_after)
+                        }
                         ChangeWait::Unusable => {
                             signal = None;
                             true
@@ -144,7 +320,7 @@ impl Glass {
                     action_deadline
                 };
                 let read_owner =
-                    if first_read && timeout_ms == 0 && sequence_deadline.instant().is_some() {
+                    if first_read && !allow_wait && sequence_deadline.instant().is_some() {
                         crate::Whose::Caller
                     } else {
                         whose
@@ -170,7 +346,11 @@ impl Glass {
                     }
                     Err(e) => return Err(e),
                 };
-                let observation = observe(&tree);
+                let window = {
+                    let active = self.require_active()?;
+                    (active.geometry.width, active.geometry.height)
+                };
+                let observation = observe(&tree, window);
                 let is_satisfied = satisfied(&observation);
                 last_observation = Some(observation);
                 Ok(is_satisfied.then_some(()))
@@ -252,12 +432,14 @@ mod tests {
 
     #[test]
     fn a_quiet_signal_reads_only_for_a_safety_or_periodic_refresh() {
+        let reread_after = Duration::from_secs(1);
         assert!(!quiet_wait_needs_read(
             false,
-            REREAD_AFTER - Duration::from_millis(1)
+            reread_after - Duration::from_millis(1),
+            reread_after,
         ));
-        assert!(quiet_wait_needs_read(false, REREAD_AFTER));
-        assert!(quiet_wait_needs_read(true, Duration::ZERO));
+        assert!(quiet_wait_needs_read(false, reread_after, reread_after));
+        assert!(quiet_wait_needs_read(true, Duration::ZERO, reread_after));
     }
 
     #[test]
@@ -293,5 +475,60 @@ mod tests {
             .unwrap();
         assert!(!out.satisfied);
         assert_eq!(out.observation, "latest");
+    }
+
+    #[test]
+    fn window_aware_exact_deadline_pairs_each_tree_with_its_refreshed_geometry() {
+        let mut first = fake_tree();
+        first.root.name = Some("first".into());
+        let mut second = fake_tree();
+        second.root.name = Some("second".into());
+        let first_window = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 50,
+        };
+        let second_window = WindowGeometry {
+            width: 80,
+            height: 90,
+            ..first_window.clone()
+        };
+        let platform = FakePlatform::new(100, 100)
+            .resized_to(first_window)
+            .resized_to(second_window);
+        let mut glass = glass_with_a11y_seq(platform, vec![first, second]);
+        glass.start(&spec()).unwrap();
+        let mut observed = Vec::new();
+
+        let outcome = glass
+            .poll_accessibility_until_by_deadline_with_window(
+                A11yPollCadence {
+                    interval_ms: 1,
+                    reread_after: Duration::from_millis(1),
+                },
+                A11yPollBound {
+                    action_deadline: Deadline::from_millis(100),
+                    whose: crate::Whose::Callee,
+                    allow_wait: true,
+                    sequence_deadline: Deadline::UNBOUNDED,
+                },
+                "observe geometry",
+                |tree, window| {
+                    observed.push((tree.root.name.clone(), window));
+                    tree.root.name.as_deref() == Some("second")
+                },
+                |matched| *matched,
+            )
+            .unwrap();
+
+        assert!(outcome.satisfied);
+        assert_eq!(
+            observed,
+            vec![
+                (Some("first".into()), (40, 50)),
+                (Some("second".into()), (80, 90)),
+            ]
+        );
     }
 }

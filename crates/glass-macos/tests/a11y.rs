@@ -58,16 +58,16 @@ fn main() {
 #[cfg(target_os = "macos")]
 mod macos_main {
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use glass_core::platform::{MouseButton, PointerEvent};
     use glass_core::{
-        Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, Deadline, GlassError,
-        Platform, SandboxLevel, Stream, WalkLimits,
+        Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, Backend, BaselineStore,
+        Deadline, Glass, GlassError, Platform, PlatformFactory, SandboxLevel, Stream, WalkLimits,
     };
     use glass_macos::MacosPlatform;
 
-    use crate::common::{build_fixture, expect, fail, swiftc_available, try_expect};
+    use crate::common::{build_fixture, fail, swiftc_available, try_expect};
 
     /// Settle after an action that should print `SAVE_CLICKED` — native `invoke` or the
     /// a11y-bounds pointer click — before draining logs, mirroring `input.rs`'s
@@ -119,6 +119,106 @@ mod macos_main {
         lines
             .iter()
             .any(|(stream, line)| *stream == Stream::Stdout && line.contains(needle))
+    }
+
+    fn semantic_target(
+        role: AxRole,
+        name: &str,
+        states: Vec<glass_core::SemanticState>,
+    ) -> glass_core::SemanticTarget {
+        glass_core::SemanticTarget {
+            target: glass_core::SemanticSelector::new(Some(name.into()), Some(role), states)
+                .expect("valid semantic selector"),
+            within: None,
+        }
+    }
+
+    fn actionability_verdict(
+        report: &glass_core::ActionabilityReport,
+        name: glass_core::ActionabilityCheckName,
+    ) -> glass_core::ActionabilityVerdict {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap_or_else(|| panic!("missing {name:?} check in {:?}", report.checks))
+            .verdict
+    }
+
+    fn log_cursor(glass: &mut Glass) -> Result<u64, String> {
+        glass
+            .logs(0, 1_000, None, None)
+            .map(|(_, cursor)| cursor)
+            .map_err(|error| format!("read fixture log cursor: {error}"))
+    }
+
+    fn exact_log_count_since(
+        glass: &mut Glass,
+        cursor: u64,
+        expected: &str,
+    ) -> Result<usize, String> {
+        glass
+            .logs(cursor, 1_000, None, None)
+            .map(|(lines, _)| lines.iter().filter(|line| line.text == expected).count())
+            .map_err(|error| format!("read fixture logs: {error}"))
+    }
+
+    fn await_exact_log_arrival(
+        glass: &mut Glass,
+        cursor: u64,
+        expected: &str,
+        count: usize,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observed = exact_log_count_since(glass, cursor, expected)?;
+            if observed == count {
+                return Ok(());
+            }
+            if observed > count || Instant::now() >= deadline {
+                return Err(format!(
+                    "expected exactly {count} {expected:?} logs, got {observed}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn await_exact_log_count(
+        glass: &mut Glass,
+        cursor: u64,
+        expected: &str,
+        count: usize,
+    ) -> Result<(), String> {
+        if count != 0 {
+            await_exact_log_arrival(glass, cursor, expected, count)?;
+        }
+        let quiet_until = Instant::now() + Duration::from_millis(400);
+        loop {
+            let observed = exact_log_count_since(glass, cursor, expected)?;
+            if observed != count {
+                return Err(format!(
+                    "expected {count} exact {expected:?} logs throughout the quiet window, got {observed}"
+                ));
+            }
+            if Instant::now() >= quiet_until {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn glass_with_a11y() -> Glass {
+        let factory: PlatformFactory = Box::new(|_backend| {
+            Ok(Backend {
+                platform: Box::new(MacosPlatform::new()?),
+                accessibility: Some(Box::new(glass_a11y_macos::MacosA11y::new())),
+            })
+        });
+        let dir = tempfile::tempdir().expect("semantic baseline tempdir");
+        let root = dir.path().join("baselines");
+        std::mem::forget(dir);
+        Glass::new(factory, "macos".into(), BaselineStore::new(root), 100)
     }
 
     /// Launch the fixture, snapshot its accessibility tree, and assert the outline contains
@@ -357,6 +457,298 @@ mod macos_main {
         Ok(())
     }
 
+    fn run_semantic_checks(fixture_bin: &std::path::Path) -> Result<(), String> {
+        use glass_core::{
+            ActionMethod, ActionMode, ActionTarget, ActionabilityCheckName, ActionabilityVerdict,
+            ConfirmationStatus, DispatchStatus, SemanticActionFailureKind, SemanticState,
+        };
+
+        let mut glass = glass_with_a11y();
+        glass
+            .start(&AppSpec {
+                build: None,
+                run: vec![fixture_bin.to_string_lossy().into_owned()],
+                cwd: None,
+                env: vec![],
+                window_hint: None,
+                timeout_ms: 8_000,
+                sandbox: SandboxLevel::Off,
+                a11y: false,
+            })
+            .map_err(|error| format!("semantic fixture start: {error}"))?;
+
+        let result = (|| {
+            await_exact_log_arrival(&mut glass, 0, "MOVING_SETTLED", 1)?;
+            let initial = glass
+                .a11y_snapshot(None)
+                .map_err(|error| format!("initial semantic snapshot: {error}"))?;
+            let initial_moving = find_by_name(&initial.root, "Moving semantic")
+                .ok_or_else(|| "initial snapshot has no Moving semantic button".to_string())?;
+            let moving_id = initial_moving.id;
+            let stale_cached_bounds = initial_moving.bounds;
+            let coverage =
+                glass_core::Accessibility::state_coverage(&glass_a11y_macos::MacosA11y::new());
+            if coverage != glass_a11y_macos::mapping::STATE_COVERAGE {
+                return Err(format!("unexpected macOS state coverage: {coverage:?}"));
+            }
+
+            let save_cursor = log_cursor(&mut glass)?;
+            let native_save = glass
+                .click_target(&glass_core::ClickTargetParams {
+                    target: ActionTarget::Semantic(semantic_target(
+                        AxRole::Button,
+                        "Semantic Save",
+                        vec![SemanticState::Enabled],
+                    )),
+                    mode: ActionMode::Native,
+                    timeout_ms: Some(5_000),
+                    max_nodes: None,
+                })
+                .map_err(|error| format!("native semantic save: {error}"))?;
+            if native_save.action.method != (ActionMethod::NativeAction { actuated: None })
+                || native_save.action.dispatch != DispatchStatus::Dispatched
+            {
+                return Err(format!("unexpected native action report: {native_save:?}"));
+            }
+            await_exact_log_arrival(&mut glass, save_cursor, "SEMANTIC_SAVE", 1)?;
+            await_exact_log_arrival(&mut glass, save_cursor, "MOVING_RESET", 1)?;
+            let stale_cursor = log_cursor(&mut glass)?;
+            let stale = glass
+                .click_element(moving_id)
+                .expect_err("moving bounds must stale the cached backend target");
+            if !matches!(stale.cause(), GlassError::AxElementChanged(_)) {
+                return Err(format!("stale backend rewalk returned {stale}"));
+            }
+            let stale_current = glass
+                .a11y_snapshot(None)
+                .map_err(|error| format!("stale rejection evidence snapshot: {error}"))?;
+            let stale_current_bounds = find_by_name(&stale_current.root, "Moving semantic")
+                .ok_or_else(|| "stale evidence has no Moving semantic button".to_string())?
+                .bounds;
+            if stale_current_bounds == stale_cached_bounds {
+                return Err(format!(
+                    "stale rejection did not observe changed bounds: cached={stale_cached_bounds:?}, current={stale_current_bounds:?}"
+                ));
+            }
+            await_exact_log_count(&mut glass, stale_cursor, "MOVING_CLICKED", 0)?;
+            await_exact_log_count(&mut glass, save_cursor, "SEMANTIC_SAVE", 1)?;
+            await_exact_log_count(&mut glass, save_cursor, "MOVING_RESET", 1)?;
+
+            await_exact_log_arrival(&mut glass, save_cursor, "MOVING_SETTLED", 1)?;
+            let pointer_baseline = glass
+                .a11y_snapshot(None)
+                .map_err(|error| format!("settled pointer baseline snapshot: {error}"))?;
+            let pointer_baseline_bounds = find_by_name(&pointer_baseline.root, "Moving semantic")
+                .ok_or_else(|| "pointer baseline has no Moving semantic button".to_string())?
+                .bounds;
+
+            let moving_cursor = log_cursor(&mut glass)?;
+            glass
+                .click_target(&glass_core::ClickTargetParams {
+                    target: ActionTarget::Semantic(semantic_target(
+                        AxRole::Button,
+                        "Semantic Save",
+                        vec![SemanticState::Enabled],
+                    )),
+                    mode: ActionMode::Native,
+                    timeout_ms: Some(5_000),
+                    max_nodes: None,
+                })
+                .map_err(|error| format!("restart movement through native save: {error}"))?;
+            await_exact_log_arrival(&mut glass, moving_cursor, "MOVING_STARTED", 1)?;
+            let changing_sample = glass
+                .a11y_snapshot(None)
+                .map_err(|error| format!("changing pointer sample snapshot: {error}"))?;
+            let changing_bounds = find_by_name(&changing_sample.root, "Moving semantic")
+                .ok_or_else(|| "changing sample has no Moving semantic button".to_string())?
+                .bounds;
+            if changing_bounds == pointer_baseline_bounds {
+                return Err(format!(
+                    "moving bounds did not change after restart: {changing_bounds:?}"
+                ));
+            }
+            let moving_started = std::time::Instant::now();
+            let moving = glass
+                .click_target(&glass_core::ClickTargetParams {
+                    target: ActionTarget::Semantic(semantic_target(
+                        AxRole::Button,
+                        "Moving semantic",
+                        vec![SemanticState::Enabled],
+                    )),
+                    mode: ActionMode::Pointer,
+                    timeout_ms: Some(5_000),
+                    max_nodes: None,
+                })
+                .map_err(|error| format!("forced pointer moving semantic: {error}"))?;
+            if moving_started.elapsed() < Duration::from_millis(300)
+                || moving.action.method
+                    != (ActionMethod::Pointer {
+                        native_fallback: None,
+                    })
+                || actionability_verdict(&moving.actionability, ActionabilityCheckName::Stable)
+                    != ActionabilityVerdict::Passed
+                || actionability_verdict(&moving.actionability, ActionabilityCheckName::NonOccluded)
+                    != ActionabilityVerdict::Passed
+            {
+                return Err(format!("unexpected moving pointer report: {moving:?}"));
+            }
+            await_exact_log_count(&mut glass, moving_cursor, "MOVING_SETTLED", 1)?;
+            await_exact_log_count(&mut glass, moving_cursor, "MOVING_CLICKED", 1)?;
+            await_exact_log_count(&mut glass, moving_cursor, "MOVING_CLICKED_SETTLED", 1)?;
+            await_exact_log_count(&mut glass, moving_cursor, "MOVING_CLICKED_MOVING", 0)?;
+            await_exact_log_count(&mut glass, moving_cursor, "SEMANTIC_SAVE", 1)?;
+            let settled_sample = glass
+                .a11y_snapshot(None)
+                .map_err(|error| format!("settled pointer sample snapshot: {error}"))?;
+            let settled_bounds = find_by_name(&settled_sample.root, "Moving semantic")
+                .ok_or_else(|| "settled sample has no Moving semantic button".to_string())?
+                .bounds;
+            if settled_bounds == changing_bounds {
+                return Err(format!(
+                    "pointer samples never changed before settling: {changing_bounds:?}"
+                ));
+            }
+
+            let before_type = glass
+                .a11y_snapshot(None)
+                .map_err(|error| format!("before targeted type snapshot: {error}"))?;
+            let before_value = find_by_name(&before_type.root, "Note")
+                .and_then(|node| node.value.clone())
+                .ok_or_else(|| "before targeted type snapshot has no Note value".to_string())?;
+            let typed = glass
+                .type_target(
+                    &glass_core::TypeTargetParams {
+                        target: semantic_target(
+                            AxRole::TextField,
+                            "Note",
+                            vec![SemanticState::Enabled],
+                        ),
+                        focus_mode: ActionMode::Native,
+                        timeout_ms: 5_000,
+                        max_nodes: None,
+                    },
+                    "Z",
+                )
+                .map_err(|error| format!("native targeted type: {error}"))?;
+            let Some(ref focus) = typed.focus else {
+                return Err("targeted type returned no focus report".into());
+            };
+            if focus.confirmation != ConfirmationStatus::FocusConfirmed
+                || focus.dispatch != DispatchStatus::Dispatched
+                || typed.action.method != ActionMethod::Keyboard
+            {
+                return Err(format!("unexpected targeted type report: {typed:?}"));
+            }
+            let typed_tree = glass
+                .a11y_snapshot(None)
+                .map_err(|error| format!("targeted type snapshot: {error}"))?;
+            let typed_note = find_by_name(&typed_tree.root, "Note")
+                .ok_or_else(|| "typed snapshot has no Note field".to_string())?;
+            let after_value = typed_note
+                .value
+                .as_deref()
+                .ok_or_else(|| "typed Note has no value".to_string())?;
+            let inserted_once = after_value.len() == before_value.len() + 1
+                && after_value.matches('Z').count() == before_value.matches('Z').count() + 1
+                && after_value.replacen('Z', "", 1) == before_value;
+            if !typed_note.states.focused || !inserted_once {
+                return Err(format!(
+                    "targeted type did not insert exactly one Z: before={before_value:?}, after={after_value:?}, node={typed_note:?}"
+                ));
+            }
+            let typed_value = after_value.to_string();
+            std::thread::sleep(Duration::from_millis(400));
+            let quiet_typed_tree = glass
+                .a11y_snapshot(None)
+                .map_err(|error| format!("quiet targeted type snapshot: {error}"))?;
+            let quiet_typed_note = find_by_name(&quiet_typed_tree.root, "Note")
+                .ok_or_else(|| "quiet typed snapshot has no Note field".to_string())?;
+            if quiet_typed_note.value.as_deref() != Some(typed_value.as_str()) {
+                return Err(format!(
+                    "targeted type changed again during the quiet interval: first={typed_value:?}, quiet={:?}",
+                    quiet_typed_note.value
+                ));
+            }
+
+            let disabled_cursor = log_cursor(&mut glass)?;
+            let disabled = glass
+                .click_target(&glass_core::ClickTargetParams {
+                    target: ActionTarget::Semantic(semantic_target(
+                        AxRole::Button,
+                        "Disabled semantic",
+                        vec![],
+                    )),
+                    mode: ActionMode::Pointer,
+                    timeout_ms: Some(0),
+                    max_nodes: None,
+                })
+                .expect_err("disabled semantic target must be refused");
+            if disabled.kind != SemanticActionFailureKind::NotActionable
+                || disabled.action_dispatch != DispatchStatus::NotDispatched
+                || actionability_verdict(&disabled.actionability, ActionabilityCheckName::Enabled)
+                    != ActionabilityVerdict::Failed
+            {
+                return Err(format!("unexpected disabled refusal: {disabled:?}"));
+            }
+            await_exact_log_count(&mut glass, disabled_cursor, "DISABLED_SEMANTIC", 0)?;
+
+            let duplicate_cursor = log_cursor(&mut glass)?;
+            let duplicate = glass
+                .click_target(&glass_core::ClickTargetParams {
+                    target: ActionTarget::Semantic(semantic_target(
+                        AxRole::Button,
+                        "Duplicate semantic",
+                        vec![],
+                    )),
+                    mode: ActionMode::Native,
+                    timeout_ms: Some(0),
+                    max_nodes: None,
+                })
+                .expect_err("duplicate semantic target must be refused");
+            if duplicate.kind != SemanticActionFailureKind::AmbiguousTarget
+                || duplicate.action_dispatch != DispatchStatus::NotDispatched
+            {
+                return Err(format!("unexpected duplicate refusal: {duplicate:?}"));
+            }
+            await_exact_log_count(&mut glass, duplicate_cursor, "DUPLICATE_SEMANTIC", 0)?;
+
+            let occluded_cursor = log_cursor(&mut glass)?;
+            let occluded = glass
+                .click_target(&glass_core::ClickTargetParams {
+                    target: ActionTarget::Semantic(semantic_target(
+                        AxRole::Button,
+                        "Occluded semantic",
+                        vec![SemanticState::Enabled],
+                    )),
+                    mode: ActionMode::Pointer,
+                    timeout_ms: Some(5_000),
+                    max_nodes: None,
+                })
+                .expect_err("AX hit testing must prove the foreground occluder");
+            if occluded.kind != SemanticActionFailureKind::NotActionable
+                || occluded.action_dispatch != DispatchStatus::NotDispatched
+                || actionability_verdict(
+                    &occluded.actionability,
+                    ActionabilityCheckName::NonOccluded,
+                ) != ActionabilityVerdict::Failed
+            {
+                return Err(format!("unexpected occlusion refusal: {occluded:?}"));
+            }
+            await_exact_log_count(&mut glass, occluded_cursor, "OCCLUDED_CLICKED", 0)?;
+            await_exact_log_count(&mut glass, occluded_cursor, "OCCLUDER_CLICKED", 0)?;
+
+            println!("A11Y_SEMANTIC_PASS");
+            Ok(())
+        })();
+
+        let stop_result = glass.stop();
+        match (result, stop_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(format!("semantic fixture stop: {error}")),
+        }
+    }
+
     pub(super) fn run() {
         // Prefer a pre-built fixture (the granted run supplies `GLASS_A11Y_FIXTURE_BIN`);
         // otherwise build it here, skipping cleanly if `swiftc` is unavailable.
@@ -403,11 +795,18 @@ mod macos_main {
         // Reached on every path and BEFORE any process::exit below: stop_app is idempotent,
         // so this guarantees the fixture process never survives a failed run.
         let stop_result = platform.stop_app();
-        cleanup_dir(&fixture_dir);
 
         match result {
             Ok(()) => {
-                expect(stop_result, "stop_app");
+                if let Err(error) = stop_result {
+                    cleanup_dir(&fixture_dir);
+                    fail(format!("stop_app: {error}"));
+                }
+                if let Err(error) = run_semantic_checks(&fixture_bin) {
+                    cleanup_dir(&fixture_dir);
+                    fail(error);
+                }
+                cleanup_dir(&fixture_dir);
                 println!("A11Y_SNAPSHOT_PASS");
                 std::process::exit(0);
             }
@@ -415,6 +814,7 @@ mod macos_main {
                 if let Err(e) = stop_result {
                     eprintln!("(additionally) stop_app failed: {e}");
                 }
+                cleanup_dir(&fixture_dir);
                 fail(msg);
             }
         }

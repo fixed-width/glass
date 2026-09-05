@@ -1,11 +1,11 @@
 //! Pointer and keyboard tools.
 
-use glass_core::{Glass, KeyEvent, Modifier, PointerEvent};
+use glass_core::{Glass, KeyEvent, Modifier, MouseButton, PointerEvent};
 
 use crate::params::*;
 use crate::tools::{
-    ContextualError, ContextualOutput, ContextualToolResult, ToolContext, ToolOutput, ToolResult,
-    parse_button,
+    BatchToolResult, ContextualError, ContextualOutput, ContextualToolResult, ToolContext,
+    ToolOutput, ToolResult, erase_semantic_context, parse_button, semantic_return_error,
 };
 
 fn standalone(result: ContextualToolResult) -> ToolResult {
@@ -22,6 +22,54 @@ pub(crate) fn parse_modifiers(mods: Option<&[String]>) -> Result<Vec<Modifier>, 
     Ok(out)
 }
 
+fn validate_click_count(count: Option<u32>) -> Result<u32, ContextualError> {
+    let count = count.unwrap_or(1);
+    if !(1..=MAX_CLICK_COUNT).contains(&count) {
+        return Err(ContextualError::validation(format!(
+            "`count` must be between 1 and {MAX_CLICK_COUNT}"
+        )));
+    }
+    Ok(count)
+}
+
+pub(crate) fn validate_click_args(
+    a: &ClickArgs,
+) -> Result<(MouseButton, Vec<Modifier>, u32), ContextualError> {
+    let count = validate_click_count(a.count)?;
+    let button = parse_button(a.button.as_deref()).map_err(ContextualError::validation)?;
+    let modifiers = parse_modifiers(a.modifiers.as_deref()).map_err(ContextualError::validation)?;
+    Ok((button, modifiers, count))
+}
+
+pub(crate) fn validate_drag_args(
+    a: &DragArgs,
+) -> Result<(MouseButton, Vec<Modifier>), ContextualError> {
+    let button = parse_button(a.button.as_deref()).map_err(ContextualError::validation)?;
+    let modifiers = parse_modifiers(a.modifiers.as_deref()).map_err(ContextualError::validation)?;
+    Ok((button, modifiers))
+}
+
+pub(crate) fn validate_scroll_args(
+    a: &ScrollArgs,
+) -> Result<(i32, i32, Vec<Modifier>), ContextualError> {
+    let dx = a.dx.unwrap_or(0);
+    let dy = a.dy.unwrap_or(0);
+    let valid = -MAX_SCROLL_NOTCHES..=MAX_SCROLL_NOTCHES;
+    if !valid.contains(&dx) || !valid.contains(&dy) {
+        return Err(ContextualError::validation(format!(
+            "`dx` and `dy` must each be between -{MAX_SCROLL_NOTCHES} and {MAX_SCROLL_NOTCHES}"
+        )));
+    }
+    let modifiers = parse_modifiers(a.modifiers.as_deref()).map_err(ContextualError::validation)?;
+    Ok((dx, dy, modifiers))
+}
+
+pub(crate) fn validate_key_args(a: &KeyArgs) -> Result<(), ContextualError> {
+    glass_core::keys::parse_chord(&a.chord)
+        .map(|_| ())
+        .map_err(|error| ContextualError::validation(error.to_string()))
+}
+
 pub fn click(glass: &mut Glass, a: &ClickArgs) -> ToolResult {
     standalone(click_with(glass, a, ToolContext::UNBOUNDED))
 }
@@ -31,14 +79,7 @@ pub(crate) fn click_with(
     a: &ClickArgs,
     context: ToolContext,
 ) -> ContextualToolResult {
-    let count = a.count.unwrap_or(1);
-    if !(1..=MAX_CLICK_COUNT).contains(&count) {
-        return Err(ContextualError::validation(format!(
-            "`count` must be between 1 and {MAX_CLICK_COUNT}"
-        )));
-    }
-    let button = parse_button(a.button.as_deref()).map_err(ContextualError::validation)?;
-    let modifiers = parse_modifiers(a.modifiers.as_deref()).map_err(ContextualError::validation)?;
+    let (button, modifiers, count) = validate_click_args(a)?;
     glass
         .pointer_by(
             &PointerEvent::Click {
@@ -84,8 +125,7 @@ pub(crate) fn drag_with(
     a: &DragArgs,
     context: ToolContext,
 ) -> ContextualToolResult {
-    let button = parse_button(a.button.as_deref()).map_err(ContextualError::validation)?;
-    let modifiers = parse_modifiers(a.modifiers.as_deref()).map_err(ContextualError::validation)?;
+    let (button, modifiers) = validate_drag_args(a)?;
     glass
         .pointer_by(
             &PointerEvent::Drag {
@@ -145,15 +185,7 @@ pub(crate) fn scroll_with(
     a: &ScrollArgs,
     context: ToolContext,
 ) -> ContextualToolResult {
-    let dx = a.dx.unwrap_or(0);
-    let dy = a.dy.unwrap_or(0);
-    let valid = -MAX_SCROLL_NOTCHES..=MAX_SCROLL_NOTCHES;
-    if !valid.contains(&dx) || !valid.contains(&dy) {
-        return Err(ContextualError::validation(format!(
-            "`dx` and `dy` must each be between -{MAX_SCROLL_NOTCHES} and {MAX_SCROLL_NOTCHES}"
-        )));
-    }
-    let modifiers = parse_modifiers(a.modifiers.as_deref()).map_err(ContextualError::validation)?;
+    let (dx, dy, modifiers) = validate_scroll_args(a)?;
     glass
         .pointer_by(
             &PointerEvent::Scroll {
@@ -172,8 +204,11 @@ pub(crate) fn scroll_with(
     )))
 }
 
-pub fn type_text(glass: &mut Glass, a: &TypeArgs) -> ToolResult {
-    standalone(type_text_with(glass, a, ToolContext::UNBOUNDED))
+pub fn type_text(glass: &mut Glass, a: &TypeArgs) -> BatchToolResult {
+    erase_semantic_context(
+        "glass_type",
+        type_text_with(glass, a, ToolContext::UNBOUNDED),
+    )
 }
 
 pub(crate) fn type_text_with(
@@ -181,26 +216,66 @@ pub(crate) fn type_text_with(
     a: &TypeArgs,
     context: ToolContext,
 ) -> ContextualToolResult {
-    // Bad `return` value → reject before injecting anything (see `validate_return`).
-    crate::tools::validate_return(a.return_.as_deref()).map_err(ContextualError::validation)?;
-    glass
-        .key_by(&KeyEvent::Text(a.text.clone()), context.deadline)
-        .map_err(|e| ContextualError::from_caller_bound(e, context))?;
-    // Past this point the keystrokes have landed: a failing observe (e.g. `snapshot`
-    // with no a11y reader) must say so, or an agent retries and types the text twice.
-    let (observed, extra, timed_out_by) =
-        crate::tools::resolve_return_with(glass, a.return_.as_deref(), context).map_err(|e| {
-            e.after_dispatch()
+    match crate::tools::semantic_action::validate_type_args(a)? {
+        crate::tools::semantic_action::ValidatedType::Untargeted => {
+            glass
+                .key_by(&KeyEvent::Text(a.text.clone()), context.deadline)
+                .map_err(|e| ContextualError::from_caller_bound(e, context).scrub_message())?;
+            let (observed, extra, timed_out_by) =
+                crate::tools::resolve_return_with(glass, a.return_.as_deref(), context, true)
+                    .map_err(|error| {
+                        error
+                            .after_dispatch()
+                            .scrub_message()
+                            .annotate("text was typed; return observe failed")
+                    })?;
+            let mut result = serde_json::json!({});
+            if let Some(observed) = observed {
+                result["observed"] = observed;
+            }
+            Ok(ContextualOutput::with_timeout(
+                ToolOutput::result_with("glass_type", result, extra),
+                timed_out_by,
+            ))
+        }
+        crate::tools::semantic_action::ValidatedType::Targeted(params) => {
+            let outcome = glass
+                .type_target_by(&params, &a.text, context.deadline)
+                .map_err(|error| {
+                    crate::tools::semantic_action::semantic_error("glass_type", error)
+                })?;
+            let action_context = ToolContext {
+                deadline: outcome.bound.deadline,
+                owner: outcome.bound.owner,
+                allow_wait: outcome.bound.allow_wait,
+            };
+            let (observed, extra, timed_out_by) = crate::tools::resolve_return_with(
+                glass,
+                a.return_.as_deref(),
+                action_context,
+                false,
+            )
+            .map_err(|error| {
+                semantic_return_error(
+                    "glass_type",
+                    &outcome,
+                    error,
+                    "text was typed; return observe failed",
+                )
+                .scrub_message()
                 .annotate("text was typed; return observe failed")
-        })?;
-    let mut result = serde_json::json!({});
-    if let Some(o) = observed {
-        result["observed"] = o;
+            })?;
+            Ok(ContextualOutput::with_timeout(
+                crate::tools::semantic_action::success_output(
+                    "glass_type",
+                    &outcome,
+                    observed,
+                    extra,
+                ),
+                timed_out_by,
+            ))
+        }
     }
-    Ok(ContextualOutput::with_timeout(
-        ToolOutput::result_with("glass_type", result, extra),
-        timed_out_by,
-    ))
 }
 
 pub fn key(glass: &mut Glass, a: &KeyArgs) -> ToolResult {
@@ -212,6 +287,7 @@ pub(crate) fn key_with(
     a: &KeyArgs,
     context: ToolContext,
 ) -> ContextualToolResult {
+    validate_key_args(a)?;
     glass
         .key_by(&KeyEvent::Chord(a.chord.clone()), context.deadline)
         .map_err(|e| ContextualError::from_caller_bound(e, context))?;
@@ -342,6 +418,10 @@ mod tests {
             &type_text(
                 &mut g,
                 &TypeArgs {
+                    target: None,
+                    focus_mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
                     text: "hi".into(),
                     return_: None,
                 },

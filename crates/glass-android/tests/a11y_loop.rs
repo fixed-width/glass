@@ -13,7 +13,9 @@
 //! a write; and that a test which fails mid-interaction still hands the device back launchable.
 
 use glass_core::Deadline;
-use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree, WalkLimits};
+use glass_core::accessibility::{
+    Accessibility, AxContext, AxNode, AxStateCoverage, AxTarget, AxTree, PointerHit, WalkLimits,
+};
 use glass_core::{
     AppSpec, AxRole, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel, WindowGeometry,
 };
@@ -184,9 +186,16 @@ fn a_read_stops_at_the_deadline_its_caller_named() {
         .expect_err("50ms is not enough for a dump this device serves in seconds");
     let took = started.elapsed();
 
-    assert!(
-        matches!(e, GlassError::AccessibilityNotReady(_)),
-        "a read the caller cut short must not read as a broken device: {e}"
+    assert_eq!(
+        e.bound_owner(),
+        Some(glass_core::Whose::Caller),
+        "a read the caller cut short must retain caller ownership: {e}"
+    );
+    assert_eq!(e.bound(), Some(glass_core::BoundKind::TimedOut), "{e}");
+    assert_eq!(
+        e.bound_dispatch(),
+        Some(glass_core::BoundDispatch::MayHaveDispatched),
+        "the abandoned dump process may still have written its device file: {e}"
     );
     assert!(
         took < std::time::Duration::from_secs(5),
@@ -803,4 +812,93 @@ fn web_fixture_button_and_field_respond() {
         }
         None => println!("no editable node in the page to write into"),
     }
+}
+
+#[test]
+#[ignore = "requires a booted AVD + GLASS_ADB + GLASS_ANDROID_ROLE_FIXTURE_APK"]
+fn uiautomator_semantic_fixture_exposes_unique_and_duplicate_resolution_inputs() {
+    let fixture = std::env::var("GLASS_ANDROID_ROLE_FIXTURE_APK")
+        .expect("set GLASS_ANDROID_ROLE_FIXTURE_APK");
+    let mut session = Session::start_spec(AppSpec {
+        build: None,
+        run: vec![
+            fixture,
+            "tech.fixedwidth.glassrolefixture/.MainActivity".to_string(),
+        ],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 15_000,
+        sandbox: SandboxLevel::Off,
+        a11y: true,
+    });
+    let ctx = session.ctx();
+    let mut a11y = glass_android::AndroidA11y::new();
+    let mut tree = a11y.snapshot(&ctx).expect("semantic role fixture snapshot");
+    tree.assign_ids();
+    assert!(!tree.to_outline().contains("PASSWORD_SENTINEL"));
+
+    fn named<'a>(node: &'a AxNode, name: &str, out: &mut Vec<&'a AxNode>) {
+        if node.name.as_deref() == Some(name) || node.description.as_deref() == Some(name) {
+            out.push(node);
+        }
+        for child in &node.children {
+            named(child, name, out);
+        }
+    }
+
+    let mut saves = Vec::new();
+    named(&tree.root, "Semantic Save", &mut saves);
+    assert_eq!(
+        saves.len(),
+        1,
+        "unique selector input:\n{}",
+        tree.to_outline()
+    );
+    let mut duplicates = Vec::new();
+    named(&tree.root, "Duplicate semantic", &mut duplicates);
+    assert_eq!(
+        duplicates.len(),
+        2,
+        "ambiguous selector input:\n{}",
+        tree.to_outline()
+    );
+    let mut fields = Vec::new();
+    named(&tree.root, "Semantic Field", &mut fields);
+    let field = fields.as_slice().first().copied().expect("semantic field");
+    let mut passwords = Vec::new();
+    named(&tree.root, "Semantic Password", &mut passwords);
+    let password = passwords.first().copied().expect("semantic password");
+    assert!(password.states.secure);
+    assert_ne!(password.value.as_deref(), Some("PASSWORD_SENTINEL"));
+    let target = AxTarget {
+        id: field.id,
+        role: field.role,
+        name: field.name.clone(),
+        bounds: field.bounds,
+        value: field.value.clone(),
+    };
+    assert!(matches!(
+        a11y.focus(&ctx, &target),
+        Err(GlassError::AxUnsupported)
+    ));
+    assert_eq!(
+        a11y.pointer_target_at(&ctx, &target, (0, 0))
+            .expect("honest hit probe"),
+        PointerHit::Inconclusive
+    );
+    assert_eq!(
+        a11y.state_coverage(),
+        AxStateCoverage {
+            enabled: true,
+            visible: true,
+            checkable: true,
+            checked: true,
+            selected: true,
+            expanded: false,
+            focused: true,
+            focusable: true,
+            editable: true,
+        }
+    );
 }

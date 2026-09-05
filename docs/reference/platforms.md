@@ -8,6 +8,9 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 |---|:--:|:--:|:--:|:--:|:--:|
 | Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | ✓ § | ✓ ‡ |
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ idb § | ✓ AX |
+| Semantic state coverage | All selector states, plus focus and editable | All selector states, plus focus and editable | UIAutomator: all except expanded; companion schema 2: no selected or expanded | Enabled, checkable, and editable; no reliable visible, selected, expanded, or focused proof | Enabled, checkable, focus, and editable; no universal visible, selected, or expanded proof |
+| Explicit native focus | ✓ AT-SPI | ✓ UIA SetFocus | ◑ companion accessibility click; UIAutomator uses pointer focus | – pointer only; focus cannot be confirmed from idb | ✓ AXFocused |
+| Pointer occlusion proof | ✓ AT-SPI hit test | ✓ UIA element-from-point | ◑ unproven | ◑ unproven | ✓ AX element-at-position |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | ✓ the Simulator | ✓ ‡ |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | ✓ headless simctl boot | 🚧 |
 
@@ -87,6 +90,12 @@ falls back to `adb`'s `input` (single-pointer only) and clipboard is unavailable
 a11y falls back to `uiautomator`. Window resize/move (apps are full-screen) and physical devices are
 non-goals.
 
+The Android AccessibilityService protocol requires node schema 2 for semantic actions. Older
+companion APKs are rejected before a tree read, and Glass selects the UIAutomator fallback instead.
+That fallback does not expose Compose-rich nodes or native value replacement, cannot prove
+`expanded`, uses pointer focus, and cannot prove pointer occlusion. Upgrade the companion APK to use
+its native click/focus path, explicit visible/focused/focusable/password facts, and `ACTION_SET_TEXT`.
+
 **§ iOS** is Simulator-only — macOS host required (`xcrun`/`simctl` ship with Xcode). Capture,
 clipboard, and logs work over `simctl`; pointer/keyboard input (tap, type, swipe, scroll) and the
 accessibility tree (snapshot, click-element, set-value) run over `idb_companion` (`brew install
@@ -101,6 +110,11 @@ at the right coordinate, the a11y tree, clear-then-type) is exercised by `#[igno
 tests on a macOS host with a booted Simulator (no CI wiring on the macOS runner yet). Containment has
 no separate glass-managed step, the same as Android — the Simulator's per-app data container is the
 isolation boundary.
+
+The idb accessibility schema does not publish reliable `visible`, `focused`, or `focusable` facts.
+The outline retains a legacy approximate visible flag, but explicit visible/hidden selectors refuse
+as unproven, pointer visibility and occlusion are disclosed as unproven, and targeted typing stops
+after an unconfirmed pointer focus without sending text.
 
 **‡ macOS** capture, input, windows, clipboard, and logs are built and CI-tested (ScreenCaptureKit
 capture, CGEvent input, AXUIElement windows). Containment is Seatbelt (`sandbox_init`): filesystem and
