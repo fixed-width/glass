@@ -1023,8 +1023,7 @@ fn set_value_error_provenance_requires_proof_before_reporting_safe_non_dispatch(
             RetryGuidance::DoNotRetry,
         ),
         (
-            GlassError::Backend("dispatch completed before transport failure".into())
-                .after_dispatch(),
+            GlassError::AxElementGone(7).after_dispatch(),
             DispatchStatus::MayHaveDispatched,
             RetryGuidance::DoNotRetry,
         ),
@@ -4028,6 +4027,36 @@ fn targeted_type_rejects_a_button_even_when_the_backend_can_focus_it() {
     assert_eq!(eligibility.verdict, ActionabilityVerdict::Failed);
     assert!(eligibility.required);
     assert_eq!(eligibility.source, ActionabilitySource::NormalizedState);
+    assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 0);
+    assert!(fixture.clicks.lock().unwrap().is_empty());
+    assert!(fixture.key_log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn targeted_type_rejects_a_disabled_field_before_native_focus_dispatch() {
+    let mut tree = targeted_type_field_tree("Account name", false);
+    tree.root.children[0].states.enabled = false;
+    let mut fixture = targeted_type_glass(
+        vec![tree],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+
+    let error = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("Account name", ActionMode::Native, 0),
+            "must not type",
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+    let enabled = error_report_check(&error, ActionabilityCheckName::Enabled);
+    assert_eq!(enabled.verdict, ActionabilityVerdict::Failed);
+    assert!(enabled.required);
+    assert_eq!(enabled.source, ActionabilitySource::NormalizedState);
     assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 0);
     assert!(fixture.clicks.lock().unwrap().is_empty());
     assert!(fixture.key_log.lock().unwrap().is_empty());
