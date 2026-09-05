@@ -110,6 +110,160 @@ impl Harness {
     }
 }
 
+fn bounded_image_bytes(result: &rmcp::model::CallToolResult) -> Vec<u8> {
+    use base64::Engine;
+    assert!(!result.is_error.unwrap_or(false));
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(
+            &result
+                .content
+                .iter()
+                .find_map(|b| b.as_image())
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+    assert_eq!(
+        glass_core::frame_from_webp(&bytes).unwrap(),
+        Frame::solid(25, 25, [1, 2, 3, 255])
+    );
+    let envelope: Value = serde_json::from_str(
+        &result
+            .content
+            .iter()
+            .find_map(|b| b.as_text())
+            .unwrap()
+            .text,
+    )
+    .unwrap();
+    assert_eq!(
+        envelope["result"]["image"]["source"],
+        json!({"x":0,"y":0,"width":100,"height":100})
+    );
+    assert_eq!(envelope["result"]["image"]["pixel_exact"], false);
+    assert!(
+        result
+            .content
+            .iter()
+            .filter_map(|b| b.as_text())
+            .any(|t| t.text == crate::untrusted::IMAGE_NOTE)
+    );
+    bytes
+}
+
+fn assert_bounded_trace(path: &std::path::Path, report: &super::inspect::Inspection, bytes: &[u8]) {
+    assert!(report.complete, "{report:?}");
+    let images = report
+        .events
+        .iter()
+        .flat_map(|e| e["evidence"].as_array().into_iter().flatten())
+        .filter(|e| e["mime_type"] == "image/webp")
+        .collect::<Vec<_>>();
+    assert!(!images.is_empty());
+    for image in images {
+        assert_eq!(
+            std::fs::read(path.join(image["payload"]["path"].as_str().unwrap())).unwrap(),
+            bytes
+        );
+    }
+    let content = String::from_utf8_lossy(&all_content(path)).into_owned();
+    assert!(content.contains("\"max_width\":25"));
+    assert!(content.contains("\"pixel_exact\":false"));
+}
+
+#[tokio::test]
+async fn bounded_stdio_images_and_traces_match_in_both_profiles() {
+    for profile in [ToolProfile::Full, ToolProfile::Lean] {
+        let harness = Harness::stdio(profile, None).await;
+        harness.start().await;
+        for terminal in ["screenshot", "diff"] {
+            let invalid = harness
+                .call(
+                    "glass_do",
+                    json!({"actions":[{"action":"key","chord":"Return"}],
+                "then":{terminal:{"name":"base","include_image":false,"max_width":0}}}),
+                )
+                .await;
+            assert!(invalid.is_error.unwrap_or(false));
+        }
+        assert!(harness.inputs.lock().unwrap().is_empty());
+        assert_eq!(*harness.captures.lock().unwrap(), 0);
+        let result = harness
+            .call("glass_screenshot", json!({"max_width":25}))
+            .await;
+        let bytes = bounded_image_bytes(&result);
+        assert_eq!(*harness.captures.lock().unwrap(), 1);
+        let (_root, path, report) = harness.finish().await;
+        assert_bounded_trace(&path, &report, &bytes);
+    }
+}
+
+#[cfg(feature = "network")]
+#[tokio::test]
+async fn bounded_http_image_and_trace_retain_the_same_requested_pixels() {
+    use rmcp::transport::StreamableHttpClientTransport;
+    let root = super::tests::private_root();
+    let captures = Arc::new(Mutex::new(0));
+    let mut platform = FakePlatform::new(100, 100)
+        .with_frames(vec![Frame::solid(100, 100, [1, 2, 3, 255])])
+        .with_capture_log(captures.clone());
+    platform.protected_paths = Some(Arc::new(Mutex::new(vec![])));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = crate::serve::config::ServeConfig {
+        addr,
+        token: None,
+        tool_profile: ToolProfile::Lean,
+        trace: Some(TraceConfig::new(root.path().to_owned(), None).unwrap()),
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stopping = cancel.clone();
+    let server = tokio::spawn(crate::serve::run_on_until(
+        listener,
+        config,
+        crate::tools::testutil::glass_with(platform),
+        crate::audit::report_from_config(None, |_| None),
+        async move { stopping.cancelled().await },
+    ));
+    let client = ()
+        .serve(StreamableHttpClientTransport::from_uri(format!(
+            "http://{addr}/"
+        )))
+        .await
+        .unwrap();
+    let start = client
+        .call_tool(
+            CallToolRequestParams::new("glass_start").with_arguments(
+                json!({"run":["app"],"sandbox":"off"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(!start.is_error.unwrap_or(false), "{start:?}");
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("glass_screenshot")
+                .with_arguments(json!({"max_width":25}).as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    let bytes = bounded_image_bytes(&result);
+    assert_eq!(*captures.lock().unwrap(), 1);
+    client.cancel().await.unwrap();
+    cancel.cancel();
+    server.await.unwrap().unwrap();
+    let path = std::fs::read_dir(root.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_bounded_trace(&path, &inspect(&path).unwrap(), &bytes);
+}
+
 #[tokio::test]
 async fn writer_failure_does_not_change_or_repeat_input() {
     let harness = Harness::stdio(ToolProfile::Full, None).await;

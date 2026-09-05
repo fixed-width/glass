@@ -1025,6 +1025,7 @@ mod capture; // filled in Task 6
 mod clipboard;
 #[allow(dead_code)]
 mod find;
+mod image_output;
 mod input; // filled in Task 5
 pub(crate) mod semantic_action;
 mod wait;

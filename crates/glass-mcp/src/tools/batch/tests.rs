@@ -1042,6 +1042,8 @@ fn run_delayed_terminal_screenshot() -> ToolOutput {
             settle: None,
             diff: None,
             screenshot: Some(ScreenshotArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 window_id: None,
             }),
@@ -1077,6 +1079,8 @@ fn standalone_handlers_use_unbounded_context_and_keep_wire_shape() {
         vec![Deadline::UNBOUNDED, Deadline::UNBOUNDED]
     );
     let screenshot_args = ScreenshotArgs {
+        max_width: None,
+        max_height: None,
         region: None,
         window_id: None,
     };
@@ -1336,6 +1340,8 @@ fn ordinary_terminal_error_returned_after_deadline_is_sequence_deadline_exceeded
             settle: None,
             diff: None,
             screenshot: Some(ScreenshotArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 window_id: None,
             }),
@@ -3526,6 +3532,8 @@ fn then_screenshot_appends_image() {
                 settle: None,
                 diff: None,
                 screenshot: Some(ScreenshotArgs {
+                    max_width: None,
+                    max_height: None,
                     region: None,
                     window_id: None,
                 }),
@@ -3600,6 +3608,8 @@ fn then_diff_reports_change_text_only() {
             then: Some(ThenArgs {
                 settle: None,
                 diff: Some(DiffArgs {
+                    max_width: None,
+                    max_height: None,
                     region: None,
                     name: "m".into(),
                     mode: None,
@@ -3638,6 +3648,8 @@ fn then_diff_with_image_appends_image_sibling() {
             then: Some(ThenArgs {
                 settle: None,
                 diff: Some(DiffArgs {
+                    max_width: None,
+                    max_height: None,
                     region: None,
                     name: "m".into(),
                     mode: None,
@@ -3682,6 +3694,8 @@ fn terminal_failure_keeps_completed_action_steps() {
                 then: Some(ThenArgs {
                     settle: None,
                     diff: Some(DiffArgs {
+                        max_width: None,
+                        max_height: None,
                         region: None,
                         name: "absent".into(),
                         mode: None,
@@ -3734,6 +3748,8 @@ fn terminal_steps_report_settle_diff_screenshot_in_fixed_order() {
                     ignore: None,
                 }),
                 diff: Some(DiffArgs {
+                    max_width: None,
+                    max_height: None,
                     region: None,
                     name: "base".into(),
                     mode: Some("exact".into()),
@@ -3743,6 +3759,8 @@ fn terminal_steps_report_settle_diff_screenshot_in_fixed_order() {
                     ignore: None,
                 }),
                 screenshot: Some(ScreenshotArgs {
+                    max_width: None,
+                    max_height: None,
                     region: None,
                     window_id: None,
                 }),
@@ -3794,6 +3812,8 @@ fn terminal_failure_marks_later_observations_unexecuted() {
                     ignore: None,
                 }),
                 diff: Some(DiffArgs {
+                    max_width: None,
+                    max_height: None,
                     region: None,
                     name: "missing".into(),
                     mode: None,
@@ -3803,6 +3823,8 @@ fn terminal_failure_marks_later_observations_unexecuted() {
                     ignore: None,
                 }),
                 screenshot: Some(ScreenshotArgs {
+                    max_width: None,
+                    max_height: None,
                     region: None,
                     window_id: None,
                 }),
@@ -3878,6 +3900,8 @@ fn terminal_sequence_deadline_keeps_all_action_steps_completed() {
                 }),
                 diff: None,
                 screenshot: Some(ScreenshotArgs {
+                    max_width: None,
+                    max_height: None,
                     region: None,
                     window_id: None,
                 }),
@@ -3938,6 +3962,8 @@ fn terminal_window_screenshot_uses_sequence_deadline_and_rejects_late_success() 
                 settle: None,
                 diff: None,
                 screenshot: Some(ScreenshotArgs {
+                    max_width: None,
+                    max_height: None,
                     region: None,
                     window_id: Some(7),
                 }),
@@ -3967,6 +3993,8 @@ fn terminal_window_screenshot_uses_sequence_deadline_and_rejects_late_success() 
 fn then_shape_remains_backward_compatible() {
     let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
     let screenshot_args = ScreenshotArgs {
+        max_width: None,
+        max_height: None,
         region: None,
         window_id: None,
     };
@@ -4035,6 +4063,8 @@ fn terminal_content_blocks_reference_images_and_notes_in_response_order() {
             then: Some(ThenArgs {
                 settle: None,
                 diff: Some(DiffArgs {
+                    max_width: None,
+                    max_height: None,
                     region: None,
                     name: "base".into(),
                     mode: Some("exact".into()),
@@ -4044,6 +4074,8 @@ fn terminal_content_blocks_reference_images_and_notes_in_response_order() {
                     ignore: None,
                 }),
                 screenshot: Some(ScreenshotArgs {
+                    max_width: None,
+                    max_height: None,
                     region: None,
                     window_id: None,
                 }),

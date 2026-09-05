@@ -4,10 +4,11 @@
 use glass_core::{
     AxRole, ElementCondition, Glass, RegionUntil, SCROLL_TO_DEFAULT_STEP,
     SCROLL_TO_DEFAULT_TIMEOUT_MS, ScrollDirection, ScrollToElementParams, Stream,
-    WaitElementParams, WaitLogParams, WaitRegionParams, frame_to_webp,
+    WaitElementParams, WaitLogParams, WaitRegionParams,
 };
 use serde_json::json;
 
+use super::image_output::encode_image;
 use crate::params::*;
 use crate::tools::{
     ContextualError, ContextualOutput, ContextualToolResult, OutContent, ToolContext, ToolOutput,
@@ -227,7 +228,7 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
     let bbox = o
         .bbox
         .map(|b| json!({ "x": b.x + ox, "y": b.y + oy, "width": b.width, "height": b.height }));
-    let meta = json!({
+    let mut meta = json!({
         "matched": o.matched,
         "changed_pct": o.changed_pct,
         "bbox": bbox,
@@ -235,7 +236,9 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
         "ignored_pixels": o.ignored_pixels,
     });
     let image = if o.matched && a.include_image.unwrap_or(false) {
-        Some(frame_to_webp(&o.frame).map_err(|e| e.to_string())?)
+        let image = encode_image(o.frame, (ox, oy), a.max_width, a.max_height)
+            .map_err(|e| e.to_string())?;
+        Some(image.attach_to(&mut meta))
     } else {
         None
     };
@@ -862,6 +865,8 @@ mod tests {
 
     fn region_args() -> WaitForRegionArgs {
         WaitForRegionArgs {
+            max_width: None,
+            max_height: None,
             baseline: None,
             region: None,
             until: None,

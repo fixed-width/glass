@@ -55,6 +55,8 @@ fn split_sub(out: ToolOutput) -> (serde_json::Value, Vec<OutContent>) {
 /// Build a text-only `WaitStableArgs` from a `SettleArgs` (no image, no crop).
 fn settle_args(s: &SettleArgs) -> WaitStableArgs {
     WaitStableArgs {
+        max_width: None,
+        max_height: None,
         interval_ms: s.interval_ms,
         settle_frames: s.settle_frames,
         tolerance: s.tolerance,

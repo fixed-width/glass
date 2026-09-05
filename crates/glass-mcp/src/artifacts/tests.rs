@@ -219,7 +219,15 @@ fn concurrent_publishers_reserve_the_final_sequence_once() {
         .map(|thread| thread.join().unwrap())
         .collect::<Vec<_>>();
 
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "publication errors: {:?}",
+        results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         results
             .iter()
@@ -228,6 +236,44 @@ fn concurrent_publishers_reserve_the_final_sequence_once() {
         1
     );
     assert_eq!(store.registry_len(), 1);
+}
+
+#[test]
+fn concurrent_publications_remain_readable_until_each_response_unpins() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::for_test(root.path(), 1).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(9));
+    let threads = (0..8)
+        .map(|index| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let text = format!("response {index}");
+                let prepared = store.prepare(draft(&text)).unwrap();
+                barrier.wait();
+                (text, store.publish(vec![prepared]))
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let batches = threads
+        .into_iter()
+        .map(|thread| {
+            let (text, result) = thread.join().unwrap();
+            (text, result.unwrap())
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(store.registry_len(), batches.len());
+    for (text, batch) in &batches {
+        assert_eq!(
+            store.read(batch.descriptors()[0].uri()).unwrap().text,
+            *text
+        );
+    }
+    drop(batches);
+    assert_eq!(store.registry_len(), 0);
+    assert_eq!(store.total_file_bytes().unwrap(), 0);
 }
 
 #[test]

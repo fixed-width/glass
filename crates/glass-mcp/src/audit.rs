@@ -1219,6 +1219,8 @@ mod tests {
         tools::screenshot(
             &mut g,
             &ScreenshotArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 window_id: None,
             },
