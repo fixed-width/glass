@@ -586,9 +586,12 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Type a string of text into the focused window. Does not focus anything \
-                       itself — click the field first (glass_click_element, or glass_click), or \
-                       the text goes wherever focus already was. Sent as individual keystrokes, \
+        description = "Type text once. Without `target`, this preserves focused-window typing and \
+                       sends text wherever focus already is. With `target`, Glass resolves one \
+                       fresh unique semantic element, focuses it by `focus_mode` auto (default), \
+                       native, or pointer, confirms focus, then types once. Unconfirmed focus never types \
+                       and never tries another focus path. Selector timeout defaults to 10 seconds; \
+                       `max_nodes` bounds each fresh accessibility read. Sent as individual keystrokes, \
                        not a paste, so per-key handlers, autocomplete and validation all run; a \
                        newline in `text` does not press Return, so send that as a separate \
                        glass_key. Prefer glass_set_value for a field the a11y tree exposes: it \
@@ -876,7 +879,11 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Click an element by its #id from glass_a11y_snapshot (actuates via the \
+        description = "Click exactly one `id` or `target`. A semantic target resolves fresh and \
+                       uniquely within one selector timeout (10 seconds by default); mode auto \
+                       (default), native, or pointer selects the action path. Pointer waits for \
+                       two-sample stability and reports every actionability verdict. ID targets remain immediate. \
+                       Glass never retries after possible dispatch. An id from glass_a11y_snapshot actuates via the \
                        platform's native accessibility action when the element exposes one — \
                        works even when it's occluded or scrolled off-screen — else falls back \
                        to a synthetic pointer click at the center of its bounds; the result's \
@@ -913,8 +920,10 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Set an editable element's value — pick the element's #id from \
-                       glass_a11y_snapshot. Where the platform can write the value directly this is \
+        description = "Set exactly one editable `id` or `target` and require backend confirmation. \
+                       A semantic target resolves fresh and uniquely within one selector timeout \
+                       (10 seconds by default); `max_nodes` bounds each fresh read. An id may come \
+                       from glass_a11y_snapshot and remains immediate. Where the platform can write the value directly this is \
                        instant and takes no keystrokes; where it has to be typed, glass taps the \
                        element, clears it and types, then reads the element back to confirm — up to \
                        three accessibility reads, since a field may commit a frame or two later. \
@@ -929,7 +938,7 @@ impl GlassServer {
                        this backend knows about that. A separate \
                        error says the text WAS typed but the write could not be confirmed — the \
                        read-back failed, or could not tell which element now holds it. Do NOT write \
-                       again on that one: the keystrokes already went out, and re-snapshotting is \
+                       again on that one: post-write uncertainty is terminal because the keystrokes already went out, and re-snapshotting is \
                        how you see where they landed. \
                        Optional `return`: \"snapshot\" settles the UI then folds a fresh a11y \
                        tree into the result (and refreshes the snapshot cache); \"settle\" waits \
@@ -1114,9 +1123,10 @@ impl GlassServer {
             open_world_hint = false
         ),
         description = "Prefer glass_do whenever at least two upcoming actions or verification waits \
-                       are already known. Typical form flow: take one fresh glass_a11y_snapshot, \
-                       retain the needed ids, then run set_value, wait_for_element, click_element, \
-                       and wait_for_element here in one ordered call. Use standalone tools only when \
+                       are already known. Typical form flow: give each unique intended target directly \
+                       to set_value or click_element, then run set_value, wait_for_element, click_element, \
+                       and wait_for_element here in one ordered call. Use glass_find_elements when \
+                       candidates need inspection and glass_a11y_snapshot for broad structure. Use standalone tools only when \
                        the next step depends on newly observed state. Inspect the structured outcomes \
                        before recovery. Run fixed static ordered actions in one call: click, move, drag, scroll, type, \
                        key, settle, click_element, set_value, wait_for_element, scroll_to_element. \
@@ -1150,20 +1160,24 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      app — no app integration needed. One active session; tools target it implicitly; \
      choose a backend at glass_start (defaults to the host; see the `backend` param). \
      glass_start launches the app and captures its logs (glass_logs for stdout/stderr).\n\n\
-     SEE AND ADDRESS THE UI CHEAPLY FIRST — the low-token default. When the target is approximate, \
-     duplicated, or not yet identified, call glass_find_elements first: it returns a small ranked \
-     set of actionable ids and context from a fresh accessibility read. Use glass_a11y_snapshot for \
-     broad structural inspection, and glass_wait_for_element when one precise known condition must \
-     become true. Retain returned ids only until the UI changes. Prefer this semantic path over \
+     SEE AND ADDRESS THE UI CHEAPLY FIRST — the low-token default. Give one unique intended target \
+     directly to glass_click_element, glass_set_value, or targeted glass_type so it resolves fresh \
+     immediately before acting. When a target is approximate, duplicated, or not yet identified, \
+     call glass_find_elements to inspect a small ranked candidate set. Use glass_a11y_snapshot for \
+     broad structural diagnosis, and glass_wait_for_element when one precise condition must become \
+     true. Prefer this semantic path over \
      screenshots and pixel-hunting whenever it works.\n\n\
      BATCH KNOWN WORK: Prefer glass_do whenever at least two upcoming actions or verification waits \
-     are already known. Typical form flow: take one fresh glass_a11y_snapshot, retain the needed ids, \
-     then run set_value, wait_for_element, click_element, and wait_for_element in one ordered call. \
+     are already known. Typical form flow: give each unique intended target directly to set_value or \
+     click_element, then run set_value, wait_for_element, click_element, and wait_for_element in one \
+     ordered call. Use glass_find_elements when candidates need inspection and \
+     glass_a11y_snapshot for broad structure. \
      Use standalone tools only when the next step depends on newly observed state. Inspect the \
      structured outcomes before recovery.\n\n\
-     ADDRESS RETURNED IDS DIRECTLY: glass_click_element clicks one, glass_set_value writes an \
-     editable element's value, and glass_wait_for_element verifies semantic transition completion, \
-     including exact editable text with value.\n\n\
+     ACT ON ONE TARGET: glass_click_element clicks one id or fresh unique target, glass_set_value \
+     writes one id or fresh unique editable target with confirmation, and targeted glass_type \
+     focuses, confirms, then types once. Existing ids remain immediate. glass_wait_for_element \
+     verifies semantic transition completion, including exact editable text with value.\n\n\
      PIXELS ARE THE FALLBACK — for a canvas/black-box app with no tree (glass_a11y_snapshot \
      errors there): glass_screenshot to see it, then glass_click / glass_type / glass_key / \
      glass_scroll / glass_drag (glass_gesture for multi-touch where supported) to interact. \
@@ -1751,8 +1765,10 @@ mod tests {
             "glass_do must lead with when to choose it: {description}"
         );
         for required in [
-            "one fresh glass_a11y_snapshot",
+            "give each unique intended target directly",
             "set_value, wait_for_element, click_element, and wait_for_element",
+            "glass_find_elements when candidates need inspection",
+            "glass_a11y_snapshot for broad structure",
             "Use standalone tools only when the next step depends on newly observed state",
             "Inspect the structured outcomes before recovery",
         ] {
@@ -2042,8 +2058,145 @@ mod tests {
     }
 
     #[test]
-    fn semantic_transport_keeps_the_tool_registry_count_unchanged() {
-        assert_eq!(registered_tools().len(), 31);
+    fn semantic_transport_keeps_the_exact_tool_registry_unchanged() {
+        let expected = [
+            "glass_a11y_marks",
+            "glass_a11y_snapshot",
+            "glass_baseline_save",
+            "glass_capabilities",
+            "glass_click",
+            "glass_click_element",
+            "glass_clipboard_get",
+            "glass_clipboard_set",
+            "glass_diff",
+            "glass_do",
+            "glass_doctor",
+            "glass_drag",
+            "glass_find_elements",
+            "glass_gesture",
+            "glass_key",
+            "glass_list_windows",
+            "glass_logs",
+            "glass_move",
+            "glass_screenshot",
+            "glass_scroll",
+            "glass_scroll_to_element",
+            "glass_select_window",
+            "glass_set_value",
+            "glass_start",
+            "glass_stop",
+            "glass_type",
+            "glass_wait_for_element",
+            "glass_wait_for_log",
+            "glass_wait_for_region",
+            "glass_wait_stable",
+            "glass_window",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+        assert_eq!(registered_tools(), expected);
+    }
+
+    #[test]
+    fn semantic_action_registry_and_reference_publish_the_complete_contract() {
+        let params = registered_params();
+        assert!(params["glass_click_element"].contains("id"));
+        assert!(params["glass_set_value"].contains("id"));
+        for field in ["target", "timeout_ms", "max_nodes"] {
+            assert!(params["glass_click_element"].contains(field));
+            assert!(params["glass_set_value"].contains(field));
+            assert!(params["glass_type"].contains(field));
+        }
+        assert!(params["glass_click_element"].contains("mode"));
+        assert!(params["glass_type"].contains("focus_mode"));
+
+        for required in [
+            "target.query",
+            "target.role",
+            "target.states",
+            "target.within",
+            "no_match",
+            "ambiguous_target",
+            "ambiguous_scope",
+            "incomplete_tree",
+            "unproven_selector_state",
+            "not_actionable",
+            "unstable_target",
+            "focus_unconfirmed",
+            "unsupported_mode",
+            "action_deadline_exceeded",
+            "sequence_deadline_exceeded",
+        ] {
+            assert!(
+                TOOLS_MD.contains(required),
+                "canonical tool reference missing {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_action_descriptions_explain_resolution_dispatch_and_confirmation() {
+        let descriptions: BTreeMap<String, String> = GlassServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                (
+                    tool.name.to_string(),
+                    tool.description.unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let click = &descriptions["glass_click_element"];
+        for required in [
+            "exactly one",
+            "fresh",
+            "uniquely",
+            "auto",
+            "native",
+            "pointer",
+            "10 seconds",
+            "stability",
+            "actionability",
+            "ID targets remain immediate",
+            "never retries after possible dispatch",
+        ] {
+            assert!(
+                click.contains(required),
+                "click description missing {required:?}"
+            );
+        }
+        let set_value = &descriptions["glass_set_value"];
+        for required in [
+            "exactly one",
+            "fresh",
+            "uniquely",
+            "backend confirmation",
+            "10 seconds",
+            "post-write uncertainty is terminal",
+        ] {
+            assert!(
+                set_value.contains(required),
+                "set-value description missing {required:?}"
+            );
+        }
+        let type_text = &descriptions["glass_type"];
+        for required in [
+            "Without `target`",
+            "focused-window typing",
+            "fresh",
+            "auto",
+            "native",
+            "pointer",
+            "confirms focus",
+            "types once",
+            "Unconfirmed focus never types",
+        ] {
+            assert!(
+                type_text.contains(required),
+                "type description missing {required:?}"
+            );
+        }
     }
 
     #[test]

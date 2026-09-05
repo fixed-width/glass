@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
+- `glass_click_element`, `glass_set_value`, and `glass_type` can now resolve a unique semantic target immediately before acting, wait within one action deadline, and disclose native or pointer actionability and dispatch truth. Pointer actions refuse ambiguous, stale, disabled, hidden, moving, off-window, or provably occluded targets without unsafe retry; native accessibility actions may bypass geometry blockers. Existing ID actions and untargeted typing remain compatible.
 - `glass_find_elements` performs a fresh bounded accessibility search across native and published web content, returning up to 20 ranked actionable matches with semantic scope, optional publication waiting, compact context, explicit incompleteness, secure-value exclusion, and an 8 KiB total response ceiling.
 - Tool responses now share an 8 KiB text ceiling, with oversized logical blocks recoverable exactly through read-only `glass-artifact://` MCP resources backed by secure, ephemeral server-process artifacts.
 

@@ -1906,6 +1906,185 @@ fn semantic_click_params(mode: ActionMode, timeout_ms: u64) -> ClickTargetParams
     }
 }
 
+#[derive(Debug)]
+struct GeneratedTreeCase {
+    tree: AxTree,
+    match_count: usize,
+    complete: bool,
+    summary: String,
+}
+
+struct FixedLcg(u64);
+
+impl FixedLcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0
+    }
+
+    fn below(&mut self, upper: usize) -> usize {
+        (self.next() % upper as u64) as usize
+    }
+}
+
+fn generated_trees(count: usize) -> Vec<GeneratedTreeCase> {
+    let mut rng = FixedLcg(0x676c_6173_735f_7077);
+    (0..count)
+        .map(|case_index| {
+            let match_count = rng.below(7);
+            let sibling_count = rng.below(13);
+            let mut children = Vec::with_capacity(match_count + sibling_count);
+            for index in 0..match_count {
+                children.push(AxNode {
+                    id: AxNodeId(0),
+                    role: AxRole::Button,
+                    raw_role: "button".into(),
+                    name: Some("Generated target".into()),
+                    description: None,
+                    value: None,
+                    states: AxStates {
+                        enabled: true,
+                        visible: true,
+                        focusable: true,
+                        ..AxStates::default()
+                    },
+                    bounds: Some(AxRect {
+                        x: 10,
+                        y: 10 + index as i32 * 20,
+                        width: 80,
+                        height: 18,
+                    }),
+                    children: Vec::new(),
+                });
+            }
+            for index in 0..sibling_count {
+                children.push(AxNode {
+                    id: AxNodeId(0),
+                    role: if rng.below(2) == 0 {
+                        AxRole::Button
+                    } else {
+                        AxRole::Label
+                    },
+                    raw_role: "generated sibling".into(),
+                    name: Some(format!("Unrelated sibling {case_index}-{index}")),
+                    description: None,
+                    value: None,
+                    states: AxStates {
+                        enabled: true,
+                        visible: true,
+                        ..AxStates::default()
+                    },
+                    bounds: Some(AxRect {
+                        x: 110,
+                        y: 10 + index as i32 * 12,
+                        width: 80,
+                        height: 10,
+                    }),
+                    children: Vec::new(),
+                });
+            }
+            let mut tree = AxTree::new(AxNode {
+                id: AxNodeId(0),
+                role: AxRole::Window,
+                raw_role: "window".into(),
+                name: Some("Generated app".into()),
+                description: None,
+                value: None,
+                states: AxStates::default(),
+                bounds: Some(AxRect {
+                    x: 0,
+                    y: 0,
+                    width: 320,
+                    height: 240,
+                }),
+                children,
+            });
+            if rng.below(4) == 0 {
+                tree.truncated = Some(Truncation {
+                    limit: match rng.below(3) {
+                        0 => TruncationLimit::Nodes,
+                        1 => TruncationLimit::Depth,
+                        _ => TruncationLimit::Siblings,
+                    },
+                    limit_value: 32,
+                    nodes_walked: tree.root.children.len() + 1,
+                });
+            }
+            tree.unexposed = rng.below(4);
+            let complete = tree.can_prove_absence();
+            let summary = format!(
+                "index={case_index} matches={match_count} siblings={sibling_count} \
+                 truncated={:?} withheld={} complete={complete}",
+                tree.truncated.map(|value| value.limit),
+                tree.unexposed,
+            );
+            GeneratedTreeCase {
+                tree,
+                match_count,
+                complete,
+                summary,
+            }
+        })
+        .collect()
+}
+
+fn run_generated_click(
+    tree: AxTree,
+    dispatches: Arc<AtomicUsize>,
+) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    let accessibility = SeqAccessibility::new(vec![tree])
+        .with_coverage(full_state_coverage())
+        .with_invoke_behavior(InvokeBehavior::Succeed)
+        .with_invoke_calls(dispatches);
+    let mut glass = glass_with_backend(FakePlatform::new(320, 240), Box::new(accessibility));
+    glass.start(&spec()).unwrap();
+    glass.click_target(&ClickTargetParams {
+        target: ActionTarget::Semantic(SemanticTarget {
+            target: SemanticSelector::new(
+                Some("Generated target".into()),
+                Some(AxRole::Button),
+                vec![SemanticState::Enabled, SemanticState::Visible],
+            )
+            .unwrap(),
+            within: None,
+        }),
+        mode: ActionMode::Native,
+        timeout_ms: Some(0),
+        max_nodes: None,
+    })
+}
+
+#[test]
+fn generated_selector_actions_dispatch_only_for_one_match_in_a_complete_tree() {
+    let mut seen = [[false; 2]; 7];
+    for case in generated_trees(512) {
+        seen[case.match_count][usize::from(case.complete)] = true;
+        let expected = case.match_count == 1 && case.complete;
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let result = run_generated_click(case.tree, Arc::clone(&dispatches));
+        assert_eq!(result.is_ok(), expected, "case={:?}", case.summary);
+        assert_eq!(dispatches.load(Ordering::SeqCst), usize::from(expected));
+        if let Err(error) = result {
+            assert_eq!(
+                error.action_dispatch,
+                DispatchStatus::NotDispatched,
+                "case={:?}",
+                case.summary
+            );
+        }
+    }
+    for (match_count, completeness) in seen.into_iter().enumerate() {
+        assert_eq!(
+            completeness,
+            [true, true],
+            "generator did not cover complete and incomplete trees for match_count={match_count}"
+        );
+    }
+}
+
 #[test]
 fn semantic_auto_click_uses_native_action_first() {
     let tree = actionable_button_tree(

@@ -44,6 +44,33 @@ When the likely target is known, an agent can search within the published page:
 
 `glass_find_elements` resolves the scope and targets from the same fresh accessibility read. The
 scope must identify one observed `Document`; a positive timeout can wait for delayed publication.
+When that query identifies one intended target, the action can carry the same selector directly:
+
+```json
+{
+  "target": {
+    "query": "Save",
+    "role": "Button",
+    "states": ["enabled"],
+    "within": {"query": "Glass web fixture", "role": "Document"}
+  },
+  "mode": "native"
+}
+```
+
+Native mode asks the platform accessibility API to invoke the control. It can legitimately activate
+a web control that is covered or outside the viewport, and reports visibility, stability,
+in-window geometry, and occlusion as optional evidence. Forced pointer mode instead requires stable
+in-window geometry, blocks a target known to be hidden or occluded, and discloses evidence a reader
+cannot prove as `unproven`:
+
+```json
+{
+  "target": {"query": "Save", "role": "Button", "states": ["enabled"]},
+  "mode": "pointer",
+  "timeout_ms": 5000
+}
+```
 
 Web content shows up in a `glass_a11y_snapshot` outline as one of three shapes, plus a fourth,
 older case that isn't specific to web content at all:
@@ -69,7 +96,7 @@ engine — a later version, or the same engine under a different embedder, can d
 
 | Platform | Engines read (2026-08-24) | What was read |
 |---|---|---|
-| Linux (AT-SPI) | Firefox 153 | Publishes `document web` at baseline (0.3–0.9s) on both X11 and Wayland; a nested `<iframe>` is its own `Document`. |
+| Linux (AT-SPI) | Firefox 154 | Publishes `document web` at baseline on both X11 and Wayland; a nested `<iframe>` is its own `Document`. Semantic native focus plus typing reaches an on-screen input. Firefox's Account Save button exposes no activation action, so `auto` uses the pointer fallback; forced pointer actions wait for stable bounds and refuse proven occlusion. Direct accessibility value replacement can be acknowledged without applying to a Firefox input, so use targeted typing for that case. |
 | Linux (AT-SPI) | Brave 151 (Chromium) | Publishes a null placeholder child while renderer accessibility is off — read as withheld content, not an empty page. |
 | Windows (UIA) | Edge 151, Brave 151, Firefox 154 | Publish at baseline (0.4–3.3s). A web page's `Document` and a text editor's edit surface report the same UIA control type; they're told apart per element by the `FrameworkId` each reports (`Chrome`/`Gecko` vs. `Win32`). Clicks and `set_value` land. |
 | macOS (AX) | Safari 26.5 (WebKit) | Publishes `AXWebArea` in the very first snapshot — reading the tree is itself what materializes the lazily built web area. `AXPress` clicks land; `set_value` on a web input is refused honestly (`AxValueNotApplied`) — type into it instead. |

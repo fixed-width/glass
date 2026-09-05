@@ -49,22 +49,25 @@ finish. (`glass-mcp doctor` checks your environment if anything's off.)
 ## The loop in practice
 
 Point an agent at a GUI app and it runs the whole cycle itself. When the app exposes an accessibility
-tree, the agent drives it semantically — addressing widgets by `#id` and confirming each step from
-text, no per-step screenshot:
+tree, the agent resolves each intended unique widget immediately before acting and confirms each step
+from text, with no per-step screenshot or carried element id:
 
 ```jsonc
-glass_start         { "run": ["python3", "app.py"] }
-glass_find_elements { "query": "account", "states": ["visible"] } // returns field #4 and Save #5
-glass_do            { "actions": [
-  { "action": "set_value", "id": 4, "text": "hello" },
-  { "action": "click_element", "id": 5 },
+glass_start { "run": ["python3", "app.py"] }
+glass_do { "actions": [
+  { "action": "set_value",
+    "target": { "query": "account", "role": "TextField", "states": ["enabled"] },
+    "text": "hello" },
+  { "action": "click_element",
+    "target": { "query": "Save", "role": "Button", "states": ["enabled"] },
+    "mode": "auto" },
   { "action": "wait_for_element", "name": "Saved" }
 ] }
 glass_logs
 ```
 
-Use `glass_a11y_snapshot` when the agent needs broad structural inspection rather than a small set
-of likely targets.
+Use `glass_find_elements` to inspect candidates when the intended target is not unique or known well
+enough to act on directly. Use `glass_a11y_snapshot` for broad structural diagnosis.
 
 For a canvas or custom-rendered app with no accessibility tree, drive it by pixels instead —
 `glass_screenshot`, `glass_click {x,y}`, and `glass_diff`, which returns `changed_pct` + a `bbox` as
@@ -87,9 +90,10 @@ named. On the backends that attempt it, the native path re-checks the element ag
 the live tree, so a click whose element no longer matches errors instead of clicking stale
 coordinates; the pointer-only paths have no such live check.
 
-Clicking a control the tree reports **disabled** is an error on the native path, not a tap that
-silently does nothing — a contract change if you were relying on a click that lands on a greyed-out
-button and reports success.
+Selector clicks resolve uniquely and disclose which checks were passed, failed, or unavailable.
+Forced pointer mode waits for stable in-window bounds and refuses a target known to be disabled,
+hidden, moving, off-window, or occluded. Native accessibility actions can legitimately actuate a
+covered or off-screen control, so geometry and occlusion are optional disclosures on that path.
 
 ## Install at a glance
 
