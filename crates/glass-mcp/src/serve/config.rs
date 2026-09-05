@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 pub struct ServeConfig {
     pub addr: SocketAddr,
     pub token: Option<String>,
+    pub tool_profile: crate::tool_profile::ToolProfile,
 }
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7300";
@@ -83,7 +84,11 @@ pub fn parse_args(
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty()),
     };
-    Ok(ServeConfig { addr, token })
+    Ok(ServeConfig {
+        addr,
+        token,
+        tool_profile: Default::default(),
+    })
 }
 
 #[cfg(test)]
@@ -156,6 +161,7 @@ mod tests {
         ServeConfig {
             addr: addr.parse().unwrap(),
             token: token.map(String::from),
+            tool_profile: Default::default(),
         }
     }
 

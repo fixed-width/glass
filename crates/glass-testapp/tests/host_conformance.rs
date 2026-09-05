@@ -338,6 +338,7 @@ async fn boot_http_client(display: &str) -> RunningService<RoleClient, ()> {
         let cfg = ServeConfig {
             addr,
             token: Some("conf".into()),
+            tool_profile: Default::default(),
         };
         let _ = glass_mcp::serve::run_on(listener, cfg, glass, report).await;
     });

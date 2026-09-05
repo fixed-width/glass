@@ -17,6 +17,8 @@ client's filesystem.
 
 - `--audit-log <path>` — append a JSONL audit record per actuation (same as `GLASS_AUDIT_LOG`); see
   [reference/audit-log.md](audit-log.md).
+- `--tool-profile full|lean` — fixed tool inventory for this server, default `full`.
+  Lean uses `glass_do` for actions; see [tool profiles](tools.md#tool-profiles).
 
 ## `serve`
 
@@ -28,10 +30,23 @@ Serve MCP over the network (Streamable HTTP) instead of stdio.
 - `--menubar` — run as the visible **`glass ●`** menu-bar app (macOS); without it the server stays
   headless (no menu bar, MCP served silently).
 - `--audit-log <path>` — as above.
+- `--tool-profile full|lean` — as above, including menu-bar mode.
 
 Loopback binds need no token; see [how-to/run-over-the-network.md](../how-to/run-over-the-network.md).
 Remote HTTP clients must read `glass-artifact://` links with MCP `resources/read`; they must not try
 to open the server-local path from resource metadata on the client machine.
+
+## `tools`
+
+List the selected profile's MCP tools and schema cost without starting a backend/session or opening
+the audit sink or artifact store. The global `--tool-profile` flag selects full (default) or lean.
+
+- `--json` — return `profile`, `tools`, `instructions`, `tools_json_bytes`, `instructions_bytes`,
+  `total_bytes`, and `per_tool` (name and serialized bytes). Definitions and instructions match the
+  live MCP server for that profile.
+
+Byte counts use compact UTF-8 JSON for the tool array and UTF-8 text for instructions, excluding
+JSON-RPC framing. They are not token counts. This command inspects schemas; actions still run over MCP.
 
 ## `gen-token`
 
@@ -130,4 +145,3 @@ memory until it is restarted — `update` replaces the file on disk, not the run
 
 Stop glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does
 not remove the app bundle. See [how-to/setup-macos.md](../how-to/setup-macos.md#uninstall).
-

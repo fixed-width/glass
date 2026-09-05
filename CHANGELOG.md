@@ -20,11 +20,13 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
+- Optional `--tool-profile lean` exposes 20 tools with actions through `glass_do`; the complete 31-tool profile remains the default. `glass-mcp tools --json` reports either profile's definitions, shared instructions and schema cost without starting a session.
 - `glass_click_element`, `glass_set_value`, and `glass_type` can now resolve a unique semantic target immediately before acting, wait within one action deadline, and disclose native or pointer actionability and dispatch truth. Pointer actions refuse ambiguous, stale, disabled, hidden, moving, off-window, or provably occluded targets without unsafe retry; native accessibility actions may bypass geometry blockers. Existing ID actions and untargeted typing remain compatible.
 - `glass_find_elements` performs a fresh bounded accessibility search across native and published web content, returning up to 20 ranked actionable matches with semantic scope, optional publication waiting, compact context, explicit incompleteness, secure-value exclusion, and an 8 KiB total response ceiling.
 - Tool responses now share an 8 KiB text ceiling, with oversized logical blocks recoverable exactly through read-only `glass-artifact://` MCP resources backed by secure, ephemeral server-process artifacts.
 
 ### Changed
+- Shortened MCP tool and parameter guidance and centralized cross-tool instructions while retaining action limits, mutation warnings and existing tool contracts. Capability reports identify the selected tool profile and link only to its exposed tools.
 - Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
 
 ## [1.7.0] - 2026-08-31

@@ -10,13 +10,13 @@ pub(crate) const MAX_SCROLL_NOTCHES: i32 = glass_core::MAX_SCROLL_NOTCHES as i32
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RegionArgs {
-    /// Left edge in pixels, window-relative — 0 is the window's left edge, not the screen's.
+    /// Left edge in window-relative pixels.
     pub x: u32,
-    /// Top edge in pixels, window-relative — 0 is the window's top edge, not the screen's.
+    /// Top edge in window-relative pixels.
     pub y: u32,
-    /// Width in pixels, extending right from `x`.
+    /// Width in pixels.
     pub width: u32,
-    /// Height in pixels, extending down from `y`.
+    /// Height in pixels.
     pub height: u32,
 }
 
@@ -41,20 +41,15 @@ pub fn ignore_regions(args: Option<&[RegionArgs]>) -> Vec<Region> {
 pub struct ScreenshotArgs {
     /// Optional window-relative sub-rectangle to capture; omit for the whole window.
     pub region: Option<RegionArgs>,
-    /// Capture/observe this window (id from `glass_list_windows`) instead of the
-    /// active one, without changing which window subsequent ops target. Omit for
-    /// the active window.
+    /// Observe this current glass_list_windows ID without selecting it; omit for active window.
     pub window_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WindowHintArgs {
-    /// Case-insensitive substring matched against window titles. Used to pick the
-    /// right window when several appear, and — since it ignores the process tree —
-    /// to locate a window the launched process hands off to an unrelated process.
+    /// Case-insensitive title substring; can locate a window handed off to an unrelated process.
     pub title: Option<String>,
-    /// Exact window-class match. Same purpose as `title` but more stable, since
-    /// class names rarely carry the dynamic prefixes/suffixes that titles do.
+    /// Exact window-class match.
     pub class: Option<String>,
 }
 
@@ -62,44 +57,22 @@ pub struct WindowHintArgs {
 pub struct StartArgs {
     /// Optional shell command to run (in `cwd`) before launching.
     pub build: Option<String>,
-    /// What to launch: desktop `[executable, args...]`; iOS `[.app-or-bundle-id, args...]`;
-    /// Android `[apk?, package/.Activity]` in either order, for example
-    /// `["/absolute/path/app.apk", "com.example.app/.MainActivity"]`.
+    /// Desktop: [executable, args...]. iOS: [.app-or-bundle-id, args...]. Android: [apk?, package/.Activity] in either order, e.g. ["/absolute/path/app.apk", "com.example.app/.MainActivity"].
     pub run: Vec<String>,
-    /// Backend to launch under: `"x11"` or `"wayland"` (Linux), `"windows"` (on a
-    /// Windows host), `"macos"` (on a macOS host), `"android"` (an AVD emulator, any
-    /// host), or `"ios"` (an iOS Simulator, macOS host). Omit for the server default
-    /// (`GLASS_BACKEND`, else `windows` on Windows, `macos` on macOS, else x11).
+    /// x11/wayland (Linux), windows (Windows), macos (macOS), android (any host), ios (macOS). Default: GLASS_BACKEND, else host default (x11 on Linux).
     pub backend: Option<String>,
-    /// Containment level for the launched app: `"default"` (filesystem/process
-    /// containment, network on), `"strict"` (also no network), or `"off"` (no
-    /// containment). Omit for the server default (`GLASS_SANDBOX`, else `default`).
-    /// An operator-set floor (`GLASS_SANDBOX_FLOOR`) may raise an omitted level, and
-    /// refuses an explicit level requested below it.
+    /// default: filesystem/process containment, network on; strict: also no network; off: uncontained. Default GLASS_SANDBOX or default. GLASS_SANDBOX_FLOOR raises omitted levels and refuses explicit lower levels.
     pub sandbox: Option<String>,
-    /// Working directory for both `build` and the launched app; omit to inherit the
-    /// server's own.
+    /// Working directory for build and app; defaults to the server directory.
     pub cwd: Option<String>,
-    /// Extra environment variables, as a `{ "KEY": "VALUE" }` object. They reach the launched app
-    /// on the desktop backends and on `ios`; on `android` they configure the `build` command on
-    /// the host only, since an app launched by `am start` is forked from zygote and never sees
-    /// the shell's environment.
+    /// Extra {KEY: VALUE} environment for build and app. Android applies it only to the host build, not the app.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
-    /// Optional `{ title?, class? }` to disambiguate which window is the app's when
-    /// more than one appears, or to find a window the launched process hands off to
-    /// an unrelated process. Omit to take the first window owned by the launched
-    /// process or a descendant it can follow.
+    /// Select a window by title/class, including process handoffs. Omit for the first window owned by the process or a followable descendant.
     pub window_hint: Option<WindowHintArgs>,
-    /// How long to wait for the app's window to appear before failing the launch
-    /// (default 10000ms). Does not bound `build`.
+    /// Window-publication timeout in ms (default 10000); does not bound build.
     pub timeout_ms: Option<u64>,
-    /// Spawn a private accessibility (AT-SPI) bus so `glass_a11y_snapshot` / `marks` /
-    /// `set_value` / `click_element` / `wait_for_element` work against this app. **On by
-    /// default** — the accessibility path is the cheap, low-token way to drive a UI, so it
-    /// is available unless you opt out. Pass `false` to skip the bus for canvas/pixel-only
-    /// apps (it spawns extra processes). Effective on Linux only; other backends read
-    /// accessibility ambiently and ignore this flag.
+    /// Enable the private accessibility bus (default true). False skips it for canvas-only apps. Linux only; other backends read accessibility ambiently.
     #[serde(default)]
     pub a11y: Option<bool>,
 }
@@ -108,23 +81,19 @@ pub struct StartArgs {
 pub struct WindowArgs {
     /// One of: "focus", "resize", "move", "geometry".
     pub op: String,
-    /// New left edge for `op: "move"`, required there and ignored otherwise. Screen
-    /// coordinates — the one place in this API that is not window-relative, since a
-    /// window cannot be positioned relative to itself.
+    /// Screen-relative left edge; required only for move.
     pub x: Option<i32>,
-    /// New top edge for `op: "move"`, required there and ignored otherwise. Screen
-    /// coordinates; see `x`.
+    /// Screen-relative top edge; required only for move.
     pub y: Option<i32>,
-    /// New width in pixels for `op: "resize"`, required there and ignored otherwise.
+    /// Width in pixels; required only for resize.
     pub width: Option<u32>,
-    /// New height in pixels for `op: "resize"`, required there and ignored otherwise.
+    /// Height in pixels; required only for resize.
     pub height: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SelectWindowArgs {
-    /// The window id from `glass_list_windows`. Ids are not stable across calls —
-    /// re-list rather than caching them.
+    /// Current ID from glass_list_windows; re-list after window changes.
     pub id: u64,
 }
 
@@ -155,44 +124,29 @@ pub struct ActionTargetArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClickElementArgs {
-    /// Element `#id` from the latest `glass_a11y_snapshot`.
-    /// Re-snapshot after UI changes.
-    /// Popover-owned targets route to their window and restore the prior active window.
-    /// The role-appropriate native accessibility operation handles occluded or off-screen targets
-    /// and separate labels through their enclosing control.
-    /// Unavailable native operations fall back to a pointer click at the target center.
-    /// Text editors may receive focus without activation.
-    /// `method:"native-action"` labels any native path.
-    /// `native_fallback` explains pointer fallback.
-    /// `actuated_id` identifies a substituted enclosing control.
+    /// Latest snapshot ID, exclusive with target; re-read after UI changes. Native action may focus text editors; fallback clicks the center. Popover actions restore the prior window.
     pub id: Option<u32>,
     pub target: Option<ActionTargetArgs>,
     pub mode: Option<ActionModeArg>,
     #[schemars(range(min = 0, max = 120000))]
     pub timeout_ms: Option<u64>,
     pub max_nodes: Option<u32>,
-    /// Terminal observation: "snapshot" settles and refreshes/folds a11y, "settle" waits for
-    /// visual stability and returns text-only metadata, and "none" skips observation (default).
+    /// none (default): no observation; settle: text-only visual stability; snapshot: settle and refresh/fold the accessibility tree.
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetValueArgs {
-    /// The element `#id` from `glass_a11y_snapshot`.
+    /// Latest snapshot ID, exclusive with target.
     pub id: Option<u32>,
     pub target: Option<ActionTargetArgs>,
-    /// The value to set. For a text field, the text. For a spin/slider, a number.
-    /// For a switch/checkbox/toggle, a boolean (`"true"`/`"false"`/`"on"`/`"off"`/
-    /// `"1"`/`"0"`) — idempotent. For a dropdown/combo box, an option label
-    /// (case-insensitive); glass opens it and picks that option.
+    /// Text, slider/spin number, toggle boolean (true/false/on/off/1/0), or case-insensitive combo option label. Toggle writes are idempotent; combos open and choose the option.
     pub text: String,
     #[schemars(range(min = 0, max = 120000))]
     pub timeout_ms: Option<u64>,
     pub max_nodes: Option<u32>,
-    /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
-    /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (waits for visual
-    /// stability and returns text-only metadata), or "none" (default).
+    /// none (default): no observation; settle: text-only visual stability; snapshot: settle and refresh/fold the accessibility tree.
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }
@@ -233,53 +187,48 @@ pub struct FindElementsArgs {
 /// Arguments for `glass_a11y_snapshot`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct A11ySnapshotArgs {
-    /// Maximum number of elements to include. Omit for the default cap (protects the token
-    /// budget). Pass a larger number to raise it, or `0` for the full tree (no limit). A
-    /// snapshot renumbers ids, so re-read them after changing this.
+    /// Node cap; omit for server default, 0 for unlimited. Changing the cap renumbers IDs; re-read them.
     pub max_nodes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClickArgs {
-    /// Click point x, window-relative — 0 is the window's left edge, not the screen's.
+    /// Click x in window-relative pixels.
     pub x: i32,
-    /// Click point y, window-relative — 0 is the window's top edge, not the screen's.
+    /// Click y in window-relative pixels.
     pub y: i32,
     /// "left" (default), "right", or "middle".
     pub button: Option<String>,
-    /// Consecutive clicks at this point (default 1, valid range 1 through 10); pass 2 for a
-    /// double-click.
+    /// Click count (default 1, range 1 through 10); 2 double-clicks.
     #[schemars(range(min = 1, max = 10))]
     pub count: Option<u32>,
-    /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
+    /// Held modifiers, e.g. ["ctrl", "shift"].
     pub modifiers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MoveArgs {
-    /// Destination x, window-relative — 0 is the window's left edge, not the screen's.
+    /// Destination x in window-relative pixels.
     pub x: i32,
-    /// Destination y, window-relative — 0 is the window's top edge, not the screen's.
+    /// Destination y in window-relative pixels.
     pub y: i32,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DragArgs {
-    /// Press-point x, window-relative — 0 is the window's left edge, not the screen's.
+    /// Press x in window-relative pixels.
     pub x1: i32,
-    /// Press-point y, window-relative — 0 is the window's top edge, not the screen's.
+    /// Press y in window-relative pixels.
     pub y1: i32,
-    /// Release-point x, window-relative.
+    /// Release x in window-relative pixels.
     pub x2: i32,
-    /// Release-point y, window-relative.
+    /// Release y in window-relative pixels.
     pub y2: i32,
     /// Button held for the drag: "left" (default), "right", or "middle".
     pub button: Option<String>,
-    /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
+    /// Held modifiers, e.g. ["ctrl", "shift"].
     pub modifiers: Option<Vec<String>>,
-    /// Span the drag's motion over this many milliseconds so a frame-based GUI
-    /// samples the path across multiple frames (and registers the drag even while
-    /// it repaints). Default 200. Lower = faster but coarser.
+    /// Motion duration in ms (default 200). Faster motion gives the app fewer sampled frames.
     pub duration_ms: Option<u64>,
 }
 
@@ -293,9 +242,9 @@ pub struct PointerArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PointArg {
-    /// Window-relative x — 0 is the window's left edge, not the screen's.
+    /// Window-relative x in pixels.
     pub x: i32,
-    /// Window-relative y — 0 is the window's top edge, not the screen's.
+    /// Window-relative y in pixels.
     pub y: i32,
 }
 
@@ -310,46 +259,37 @@ pub struct GestureArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScrollArgs {
-    /// Pointer x the wheel is aimed at, window-relative — apps scroll the container
-    /// under this point, so it selects which pane moves.
+    /// Window-relative anchor x; selects the container under the pointer.
     pub x: i32,
-    /// Pointer y the wheel is aimed at, window-relative. See `x`.
+    /// Window-relative anchor y.
     pub y: i32,
-    /// Horizontal wheel notches from -100 through 100, not pixels.
-    /// Positive is right and negative is left, repeated `|dx|` times.
-    /// Typical values are 1–5.
+    /// Horizontal wheel notches, -100 through 100 (positive right, negative left); typically 1-5, not pixels.
     #[schemars(range(min = -100, max = 100))]
     pub dx: Option<i32>,
-    /// Vertical wheel notches from -100 through 100, not pixels.
-    /// Positive is down and negative is up, repeated `|dy|` times.
-    /// Typical values are 1–5.
-    /// Apps choose how a notch maps to lines, pixels, or zoom.
+    /// Vertical wheel notches, -100 through 100 (positive down, negative up); typically 1-5. App determines distance/zoom.
     #[schemars(range(min = -100, max = 100))]
     pub dy: Option<i32>,
-    /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
+    /// Held modifiers, e.g. ["ctrl", "shift"].
     pub modifiers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TypeArgs {
-    /// Text to type. When `target` is omitted, text is sent to the current keyboard focus.
-    /// When `target` is supplied, Glass resolves and focuses that element before typing.
-    /// Sent as synthetic key events, not pasted, so an app's per-keystroke handlers run.
+    /// Synthetic keystrokes, not paste. When `target` is omitted: current keyboard focus. When `target` is supplied: resolves and focuses the target, confirms focus, then types. Newlines do not press Return.
     pub text: String,
     pub target: Option<ActionTargetArgs>,
     pub focus_mode: Option<ActionModeArg>,
     #[schemars(range(min = 0, max = 120000))]
     pub timeout_ms: Option<u64>,
     pub max_nodes: Option<u32>,
-    /// Terminal observation: "snapshot" settles and refreshes/folds a11y, "settle" waits for
-    /// visual stability and returns text-only metadata, and "none" skips observation (default).
+    /// none (default): no observation; settle: text-only visual stability; snapshot: settle and refresh/fold the accessibility tree.
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct KeyArgs {
-    /// A chord like "ctrl+s", "Return", "alt+F4".
+    /// Modifiers plus one key: ctrl+s, Return, alt+F4. Modifiers: ctrl/shift/alt/super (cmd/win/meta aliases). Key: named key, F1-F12 or printable ASCII; case-insensitive names.
     pub chord: String,
 }
 
@@ -363,41 +303,22 @@ pub struct ClipboardSetArgs {
 pub struct WaitStableArgs {
     /// How long to wait between capture ticks (default 100ms).
     pub interval_ms: Option<u64>,
-    /// Consecutive unchanged frames required before the UI counts as settled
-    /// (default 3). Raise it for an app that pauses mid-animation.
+    /// Consecutive unchanged frames required (default 3).
     pub settle_frames: Option<u32>,
-    /// Per-channel difference (0–255) two frames may have and still count as
-    /// unchanged (default 0, exact match). Raise it for a backend with dithering
-    /// or compression noise.
+    /// Per-channel difference allowed (0-255, default 0).
     pub tolerance: Option<u8>,
     /// Give up after this long (default 5000ms); returns `{settled:false}` rather
     /// than erroring.
     pub timeout_ms: Option<u64>,
     /// Optional window-relative sub-rectangle for the returned frame.
     pub region: Option<RegionArgs>,
-    /// Optional window-relative sub-rectangle to watch for settling; when set,
-    /// the settle decision ignores changes outside it. Independent of `region`.
+    /// Window-relative area watched for settling, independent of returned-image region.
     pub stability_region: Option<RegionArgs>,
-    /// Return the settled frame as an image (default true). Set false for a
-    /// text-only `{settled, saw_motion, observed_ms, ignored_pixels, width,
-    /// height}` result with no WebP — cheap when the next step is a text
-    /// `glass_diff`. `region` is ignored when false.
+    /// Return image (default true). False returns settled/saw_motion/observed_ms/ignored_pixels/dimensions as text; region then has no effect.
     pub include_image: Option<bool>,
-    /// Capture/observe this window (id from `glass_list_windows`) instead of the
-    /// active one, without changing which window subsequent ops target. Omit for
-    /// the active window.
+    /// Observe this current glass_list_windows ID without selecting it; omit for active window.
     pub window_id: Option<u64>,
-    /// Window-relative rectangles to exclude from the settle comparison. Use for
-    /// perpetually animating content — a blinking text caret, a clock, a
-    /// spinner — which otherwise keeps the window from ever settling. Pixels
-    /// inside a rect never count as changed and never set `saw_motion`.
-    /// Combines with `stability_region`: rects are always window-relative and
-    /// are intersected with it. Independent of `region`, which only crops the
-    /// returned image. A rect that falls partially or entirely outside the
-    /// compared area — the frame, or the `stability_region` sub-rectangle when
-    /// one is set — is silently clamped or dropped, masking less than
-    /// requested or nothing at all; the excluded count is reported as
-    /// `ignored_pixels`, so a smaller-than-expected value flags a misplaced rect.
+    /// Window-relative rects excluded from comparison and saw_motion, intersected with stability_region. Off-area rects clamp/drop silently; check ignored_pixels for misplaced masks.
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
@@ -405,24 +326,19 @@ pub struct WaitStableArgs {
 pub struct WaitForElementArgs {
     /// Substring of the element's accessible name (selector).
     pub name: Option<String>,
-    /// Substring of the element's accessible description (selector). Useful for unnamed
-    /// controls whose platform label is exposed as a hint, help text, or description.
+    /// Accessible-description substring; can select unnamed controls.
     pub description: Option<String>,
     /// Element role filter, e.g. "Button", "ProgressBar", "Document" (selector).
     pub role: Option<String>,
-    /// What to wait for (default "appears"): appears|disappears|enabled|disabled|
-    /// checked|unchecked|selected|unselected|expanded|collapsed|focused|visible|hidden.
-    /// `checked`/`unchecked` only match a checkable element (one exposing a real toggle
-    /// state) — a non-toggle element matches neither.
+    /// Default appears. appears|disappears|enabled|disabled|checked|unchecked|selected|unselected|expanded|collapsed|focused|visible|hidden. checked/unchecked require a real checkable state.
     pub condition: Option<String>,
     /// Exact case-sensitive accessible value, requiring another selector and excluding `value_contains`.
     pub value: Option<String>,
-    /// Additionally require the matched element's `value` to contain this substring.
-    /// Not a standalone selector — `name`, `description`, and/or `role` is still required.
+    /// Value substring; requires name, description and/or role; exclusive with value.
     pub value_contains: Option<String>,
     /// Poll interval (default 200ms — an a11y snapshot per tick).
     pub interval_ms: Option<u64>,
-    /// Give up after this long (default 10000ms); returns `{matched:false}`.
+    /// Timeout in ms (default 10000). Standalone: matched:false; batched: fails the sequence.
     pub timeout_ms: Option<u64>,
 }
 
@@ -430,29 +346,21 @@ pub struct WaitForElementArgs {
 pub struct ScrollToElementArgs {
     /// Substring of the target element's accessible name (selector).
     pub name: Option<String>,
-    /// Substring of the target element's accessible description (selector). This can select
-    /// an unnamed control, including an Android text field labelled only by its hint.
+    /// Accessible-description substring; can select unnamed controls.
     pub description: Option<String>,
     /// Element role filter, e.g. "ListItem", "Button", "Document" (selector).
     pub role: Option<String>,
-    /// Additionally require the matched element's `value` to contain this substring.
-    /// Not a standalone selector — `name`, `description`, and/or `role` is still required.
+    /// Value substring; requires name, description and/or role.
     pub value_contains: Option<String>,
-    /// Sweep direction: "up"/"down" (vertical) or "left"/"right" (horizontal).
-    /// Omit to infer it from the target's off-screen position (falls back to a
-    /// vertical down→up sweep when the target isn't in the a11y tree yet). The
-    /// search reverses to the other end if the target isn't found first.
+    /// up/down/left/right. Default infers off-screen direction, or down then up if absent. Reverses at the first end.
     pub direction: Option<String>,
-    /// Scroll anchor x (window-relative). By default the swipe anchors on the target's
-    /// own row/column (falling back to the window center if it isn't in the a11y tree
-    /// yet); set both `x` and `y` to point the wheel at a specific container instead.
+    /// Window-relative anchor x; supply both x/y for a container. Default target row/column, or window center if absent.
     pub x: Option<i32>,
     /// Scroll anchor y (window-relative). See `x`.
     pub y: Option<i32>,
-    /// Wheel notches per scroll step (default 3). A calibration escape hatch — larger
-    /// covers distance faster but risks stepping past a row's/column's realized band.
+    /// Wheel notches per step (default 3); large steps can skip realized rows.
     pub step: Option<u32>,
-    /// Give up after this long (default 20000ms); returns `{matched:false}`.
+    /// Timeout in ms (default 20000). Standalone: matched:false; batched: fails the sequence.
     pub timeout_ms: Option<u64>,
 }
 
@@ -476,20 +384,9 @@ pub struct WaitForRegionArgs {
     pub timeout_ms: Option<u64>,
     /// On match, also return the watched region as an image (default false).
     pub include_image: Option<bool>,
-    /// Capture/observe this window (id from `glass_list_windows`) instead of the
-    /// active one, without changing which window subsequent ops target. Omit for
-    /// the active window.
+    /// Observe this current glass_list_windows ID without selecting it; omit for active window.
     pub window_id: Option<u64>,
-    /// Window-relative rectangles to exclude from the comparison. Use for
-    /// perpetually animating content — a blinking text caret, a clock, a
-    /// spinner — which otherwise keeps `changed_pct` permanently non-zero.
-    /// `changed_pct` is measured over the pixels that remain. Combines with
-    /// `region`: rects are always window-relative and are intersected with it.
-    /// A rect that falls partially or entirely outside the compared area —
-    /// the frame, or the `region` sub-rectangle when one is set — is silently
-    /// clamped or dropped, masking less than requested or nothing at all; the
-    /// excluded count is reported as `ignored_pixels`, so a smaller-than-
-    /// expected value flags a misplaced rect.
+    /// Window-relative excluded rects intersected with region. Off-area rects clamp/drop silently; check ignored_pixels. changed_pct uses remaining pixels.
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
@@ -510,32 +407,25 @@ pub struct WaitForLogArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BaselineSaveArgs {
-    /// Name to file this baseline under, reused by `glass_diff` and
-    /// `glass_wait_for_region`. ASCII letters, digits, `-` and `_` only; saving over
-    /// an existing name replaces it without warning.
+    /// ASCII letters/digits/-/_ only. Replaces an existing baseline silently; used by glass_diff and glass_wait_for_region.
     pub name: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DoctorArgs {
-    /// Also spawn and tear down the default backend's headless display to verify it
-    /// actually starts (slower). Default false.
+    /// Start and tear down the default display to prove it starts (default false).
     pub deep: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CapabilitiesArgs {
-    /// Which backend to report: `x11`, `wayland`, `windows`, `macos`, `android`, or
-    /// `ios`. Omit for the active/default backend (`GLASS_BACKEND`, else the host
-    /// default). A valid name for a backend not built into this binary reports
-    /// `available: false`.
+    /// x11, wayland, windows, macos, android or ios. Default active/default backend. Valid but unbuilt backends report available:false.
     pub backend: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DiffArgs {
-    /// Name of a baseline saved by `glass_baseline_save`; an unsaved name errors
-    /// rather than reporting no change.
+    /// Saved baseline name; unsaved names error.
     pub name: String,
     /// `"perceptual"` (default) or `"exact"`.
     pub mode: Option<String>,
@@ -546,32 +436,21 @@ pub struct DiffArgs {
     /// Also return the current frame cropped to the changed region (default
     /// false). No image is returned when nothing changed.
     pub include_image: Option<bool>,
-    /// Optional window-relative sub-rectangle to diff; omit to diff the whole
-    /// window. Scopes the comparison (and the reported `bbox`, which becomes
-    /// region-relative) to just this area — the way to ask "did *only* this part
-    /// change?" Mirrors `glass_wait_for_region`'s `region`.
+    /// Window-relative comparison area; omit for whole window. Returned bbox is region-relative.
     pub region: Option<RegionArgs>,
-    /// Window-relative rectangles to exclude from the comparison. Use for
-    /// perpetually animating content — a blinking text caret, a clock, a
-    /// spinner — which otherwise keeps `changed_pct` permanently non-zero.
-    /// `changed_pct` is measured over the pixels that remain; the excluded
-    /// count is reported as `ignored_pixels`. Combines with `region`: rects are
-    /// always window-relative and are intersected with it.
+    /// Window-relative excluded rects intersected with region. changed_pct uses remaining pixels; ignored_pixels reports the excluded count.
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LogsArgs {
-    /// Resume point — the `cursor` a previous call returned, to read only what has
-    /// been logged since. Omit to read from the oldest buffered line.
+    /// Resume from a prior returned cursor; omit for oldest buffered line.
     pub cursor: Option<u64>,
-    /// Cap on lines returned (default 200); the returned `cursor` resumes at the
-    /// first line left unread, so a capped read is not a lost one.
+    /// Line cap (default 200). Returned cursor resumes at the first unread line.
     pub max_lines: Option<u32>,
     /// "stdout", "stderr", or "both" (default).
     pub stream: Option<String>,
-    /// Return only lines containing this substring (case-sensitive). Filtering
-    /// happens server-side, so it narrows what the cap applies to.
+    /// Case-sensitive substring filter applied before the line cap.
     pub contains: Option<String>,
 }
 
@@ -600,23 +479,13 @@ pub struct SettleArgs {
     pub interval_ms: Option<u64>,
     /// Consecutive unchanged frames required before the UI counts as settled (default 3).
     pub settle_frames: Option<u32>,
-    /// Per-channel difference (0–255) two frames may have and still count as
-    /// unchanged (default 0, exact match).
+    /// Per-channel difference allowed (0-255, default 0).
     pub tolerance: Option<u8>,
-    /// Give up after this long (default 5000ms).
-    /// This settle's timeout returns settled:false and completes the step.
-    /// The enclosing glass_do deadline fails the sequence.
+    /// Timeout in ms (default 5000) completes with settled:false. The overall glass_do deadline instead fails the sequence.
     pub timeout_ms: Option<u64>,
-    /// Window-relative sub-rectangle to watch for settling; when set, changes outside
-    /// it are ignored.
+    /// Window-relative area watched for settling.
     pub stability_region: Option<RegionArgs>,
-    /// Window-relative rectangles to exclude from the settle comparison. Use for
-    /// perpetually animating content — a blinking text caret, a clock, a
-    /// spinner — which otherwise keeps the window from ever settling.
-    /// Combines with `stability_region`: rects are always window-relative and
-    /// are intersected with it. A rect that falls partially or entirely
-    /// outside the compared area is silently clamped or dropped, masking less
-    /// than requested or nothing at all — double-check placement.
+    /// Window-relative excluded rects intersected with stability_region. Off-area rects clamp/drop silently; check placement.
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
@@ -625,29 +494,22 @@ pub struct SettleArgs {
 /// `include_image`) returns an image.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ThenArgs {
-    /// Wait for the UI to stop changing first. Set this whenever `diff` or
-    /// `screenshot` follows, or they observe a half-drawn frame.
+    /// Wait for quiescence before diff/screenshot; otherwise they may observe a half-drawn frame.
     pub settle: Option<SettleArgs>,
     /// Compare against a saved baseline and return change stats as text.
     pub diff: Option<DiffArgs>,
-    /// Capture the window as an image — the only field here that always spends image
-    /// tokens; prefer `diff` when you just need to know whether something changed.
+    /// Return a screenshot. Prefer diff for change detection without image tokens.
     pub screenshot: Option<ScreenshotArgs>,
 }
 
 /// Arguments for `glass_do`: an ordered, non-empty action sequence + optional observe.
 #[derive(Debug, JsonSchema)]
 pub struct DoArgs {
-    /// Actions to run in order; must be non-empty. Fail-fast — the first failing
-    /// action aborts the rest and reports its index, so a partial sequence may
-    /// already have landed.
+    /// Non-empty ordered actions; failure stops remaining steps. Completed mutations may already have landed.
     pub actions: Vec<Action>,
-    /// Optional observe run once after the last action, in the order settle → diff
-    /// → screenshot.
+    /// Terminal observation in order: settle, diff, screenshot.
     pub then: Option<ThenArgs>,
-    /// Overall sequence budget in milliseconds. Omit for 30000; valid range
-    /// 1..=120000. One absolute deadline is shared by all actions and terminal
-    /// observations.
+    /// Overall budget in ms (default 30000, range 1..120000), shared by all actions and terminal observations.
     pub timeout_ms: Option<u64>,
     #[schemars(skip)]
     pub(crate) encoded_argument_bytes: usize,

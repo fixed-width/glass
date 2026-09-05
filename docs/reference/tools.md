@@ -10,6 +10,40 @@ For the concepts behind these tools — the build→see→interact→debug loop 
 return text — see [explanation/the-loop.md](../explanation/the-loop.md). For which tools each OS
 supports, see [reference/platforms.md](platforms.md).
 
+## Tool profiles
+
+The default **full** profile exposes all 31 tools below. Start with `glass-mcp --tool-profile lean`
+or `glass-mcp serve --http --tool-profile lean` for a smaller, fixed 20-tool inventory. Full remains
+the default for existing configurations; `--tool-profile full` selects it explicitly.
+
+Lean keeps lifecycle, discovery, observation, diagnostics, windows, clipboard and gestures. It uses
+`glass_do` for individual actions as well as known sequences, omitting these standalone tools:
+`glass_click`, `glass_move`, `glass_drag`, `glass_scroll`, `glass_type`, `glass_key`,
+`glass_click_element`, `glass_set_value`, `glass_wait_for_element`, `glass_scroll_to_element`, and
+`glass_wait_stable`. All other tools in this reference are included. For example, press Return with:
+
+```json
+{"actions":[{"action":"key","chord":"Return"}]}
+```
+
+The action uses the existing `glass_do` contract. Batched element waits and scroll-to-element
+operations fail the sequence when unmatched; standalone predicates return `matched:false` softly.
+A `settle` action can complete with `settled:false`; the overall sequence deadline still fails
+the sequence. Inspect step outcomes before recovery and never replay completed or possibly
+dispatched mutations blindly. Choose full for standalone soft predicates or background-window
+`glass_wait_stable`, which the batch settle action does not provide.
+
+An omitted tool is absent from `tools/list` and rejected by `tools/call`. Restart the server to
+change profiles; changing the app or backend does not change the inventory. Shared tools have the
+same schemas, annotations, handlers and results in both profiles. Capability reports identify the
+profile separately from backend support.
+
+`glass-mcp tools --json` prints the actual full definitions and shared instructions without starting
+a session; add `--tool-profile lean` for lean. `tools_json_bytes` measures the compact UTF-8 tools
+array, `instructions_bytes` measures initialization guidance, and `total_bytes` is their sum.
+These measure serialized context size, not model tokens or billing. Both inventories and instructions
+have separate regression budgets; no safety guidance is removed automatically to fit them.
+
 ## Conventions
 
 - **Coordinates are window-relative.** `(0,0)` is the active window's top-left; glass maps to global
@@ -975,7 +1009,7 @@ before `glass_start`.
 Returns JSON as `result` (no untrusted siblings — capability data is glass-computed, not read from
 the app). For a backend compiled into this binary:
 
-`{ "backend", "available": true, "capabilities": { <operation>: { "status", "note"?, "tools" } } }`
+`{ "backend", "available": true, "tool_profile": "full" | "lean", "capabilities": { <operation>: { "status", "note"?, "tools" } } }`
 
 Each of the five operations — `input`, `multi_touch`, `clipboard`, `accessibility`,
 `window_move_resize` — carries a live `status`, one of four states: `supported` (works now),
@@ -987,7 +1021,7 @@ being supported but needing on-screen paste consent); omitted otherwise.
 
 Every entry also carries `tools`: the MCP tools that operation gates, so a
 `degraded`/`requires_setup`/`unsupported` entry tells you exactly which calls to expect trouble
-from:
+from. In full, the links are:
 
 - **input** → `glass_type`, `glass_click`, `glass_key`, `glass_drag`, `glass_scroll`,
   `glass_move`, `glass_do`
@@ -997,8 +1031,12 @@ from:
   `glass_click_element`, `glass_set_value`, `glass_wait_for_element`, `glass_scroll_to_element`
 - **window_move_resize** → `glass_window`
 
+Lean filters these links to its exposed tools and includes `glass_do` under accessibility for its
+semantic actions. A profile's inclusion of a tool does not imply that the backend supports every
+action the tool can perform.
+
 For a valid backend **not** built into the running binary:
-`{ "backend", "available": false, "reason": "..." }`.
+`{ "backend", "available": false, "tool_profile": "full" | "lean", "reason": "..." }`.
 
 **Platform notes:** availability is live. android `input` is `degraded` (adb-only injection
 unless the on-device agent is set up) and its `multi_touch`/`clipboard` need that same agent

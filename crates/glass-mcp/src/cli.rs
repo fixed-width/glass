@@ -23,10 +23,20 @@ pub struct Cli {
     /// (GLASS_AUDIT_CONTENT=none|redacted|full, GLASS_AUDIT_PREFIX_LEN=N).
     #[arg(long, global = true, value_name = "PATH")]
     pub audit_log: Option<String>,
+
+    /// Tools exposed to agents: full (default) or lean (actions through glass_do).
+    #[arg(long, global = true, value_enum, default_value_t)]
+    pub tool_profile: crate::tool_profile::ToolProfile,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// List the selected profile's MCP tools and schema cost without starting a session.
+    Tools {
+        /// Include complete definitions and server instructions as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Check the environment glass needs and print remedies.
     Doctor {
         /// Additionally spawn + tear down the display to prove it starts.
@@ -128,6 +138,26 @@ pub enum Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_profile_defaults_and_global_placement() {
+        use crate::tool_profile::ToolProfile;
+        assert_eq!(
+            Cli::try_parse_from(["glass-mcp"]).unwrap().tool_profile,
+            ToolProfile::Full
+        );
+        for args in [
+            vec!["glass-mcp", "--tool-profile", "lean"],
+            vec!["glass-mcp", "serve", "--http", "--tool-profile", "lean"],
+            vec!["glass-mcp", "--tool-profile", "lean", "tools", "--json"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args).unwrap().tool_profile,
+                ToolProfile::Lean
+            );
+        }
+        assert!(Cli::try_parse_from(["glass-mcp", "--tool-profile", "small"]).is_err());
+    }
 
     #[test]
     fn no_subcommand_is_none() {
