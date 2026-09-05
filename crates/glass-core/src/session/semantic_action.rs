@@ -579,7 +579,7 @@ fn pointer_plan(
         let segment = bounds.trailing_toggle_swipe(window.0, window.1)?;
         let probe_point = (
             segment.from_x + (segment.to_x - segment.from_x) / 2,
-            segment.from_y + (segment.to_y - segment.from_y) / 2,
+            segment.from_y,
         );
         PlannedPointerInput::TrailingToggle {
             segment,

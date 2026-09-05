@@ -653,17 +653,38 @@ fn pointer_plan_requires_every_trailing_toggle_fact_and_uses_the_segment_midpoin
         },
         bounds,
     );
-    let segment = bounds.trailing_toggle_swipe(120, 80).unwrap();
     assert_eq!(
         pointer_plan(&element, (120, 80), true),
         Some(PlannedPointerInput::TrailingToggle {
-            segment,
-            probe_point: (
-                segment.from_x + (segment.to_x - segment.from_x) / 2,
-                segment.from_y + (segment.to_y - segment.from_y) / 2,
-            ),
+            segment: Segment {
+                from_x: 66,
+                from_y: 14,
+                to_x: 88,
+                to_y: 14,
+            },
+            probe_point: (77, 14),
         })
     );
+
+    element.bounds = Some(AxRect {
+        x: 10,
+        y: 0,
+        width: 20,
+        height: 1,
+    });
+    assert_eq!(
+        pointer_plan(&element, (120, 80), true),
+        Some(PlannedPointerInput::TrailingToggle {
+            segment: Segment {
+                from_x: 28,
+                from_y: 0,
+                to_x: 30,
+                to_y: 0,
+            },
+            probe_point: (29, 0),
+        })
+    );
+    element.bounds = Some(bounds);
 
     element.states.checkable = false;
     assert!(matches!(
@@ -998,6 +1019,12 @@ fn set_value_error_provenance_requires_proof_before_reporting_safe_non_dispatch(
         ),
         (
             GlassError::Backend("unknown transport outcome".into()),
+            DispatchStatus::MayHaveDispatched,
+            RetryGuidance::DoNotRetry,
+        ),
+        (
+            GlassError::Backend("dispatch completed before transport failure".into())
+                .after_dispatch(),
             DispatchStatus::MayHaveDispatched,
             RetryGuidance::DoNotRetry,
         ),
@@ -4001,6 +4028,39 @@ fn targeted_type_rejects_a_button_even_when_the_backend_can_focus_it() {
     assert_eq!(eligibility.verdict, ActionabilityVerdict::Failed);
     assert!(eligibility.required);
     assert_eq!(eligibility.source, ActionabilitySource::NormalizedState);
+    assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 0);
+    assert!(fixture.clicks.lock().unwrap().is_empty());
+    assert!(fixture.key_log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn targeted_type_incomplete_query_keeps_resolution_error_actionability_unselected() {
+    let mut tree = targeted_type_field_tree("Account name", false);
+    tree.truncated = Some(Truncation {
+        limit: TruncationLimit::Nodes,
+        limit_value: 2,
+        nodes_walked: 2,
+    });
+    let mut fixture = targeted_type_glass(
+        vec![tree],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+
+    let error = fixture
+        .glass
+        .type_target(
+            &targeted_type_params("Account name", ActionMode::Native, 0),
+            "must not type",
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::IncompleteTree);
+    assert_eq!(error.candidates.len(), 1);
+    assert!(error.actionability.checks.is_empty());
+    assert!(error.target.is_none());
     assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 0);
     assert!(fixture.clicks.lock().unwrap().is_empty());
     assert!(fixture.key_log.lock().unwrap().is_empty());

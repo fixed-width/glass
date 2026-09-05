@@ -240,7 +240,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb at-spi2-core bubblewrap python3-gi gir1.2-gtk-4.0 gir1.2-gtk-3.0
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-      - name: Measure coverage (unit + X11; Wayland/AT-SPI self-skip)
+      - name: Measure coverage
         run: ./scripts/coverage.sh --lcov
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
