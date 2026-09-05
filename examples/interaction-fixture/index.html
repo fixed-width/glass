@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Interaction fixture</title>
+<style>
+body { font: 16px sans-serif; margin: 20px; }
+label { display: block; margin: 8px 0; }
+button { min-height: 36px; margin: 4px; }
+input { width: 240px; }
+.stage { position: relative; height: 52px; width: 540px; }
+.stage button { position: absolute; left: 0; top: 0; width: 170px; margin: 0; }
+iframe { display: block; width: 600px; height: 180px; }
+</style>
+<h1>Interaction fixture</h1>
+<main id="case"></main>
+<label>Fixture ready <input id="ready" readonly aria-label="Fixture ready" value="loading"></label>
+<label>Content geometry <input id="geometry" readonly aria-label="Content geometry"></label>
+<script src="fixture.js"></script>
+</html>
