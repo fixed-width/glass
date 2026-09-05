@@ -5,6 +5,9 @@ for it is built by a web engine (Chromium, WebKit, Gecko) sitting inside the app
 schedule, not by the toolkit glass reads everywhere else. That difference is why web content gets
 its own page rather than a line in the roles reference.
 
+For choosing between renderer tests and external application tests, see
+[Glass and Playwright](glass-and-playwright.md).
+
 ## Publication is not tied to the page load
 
 A web engine does not necessarily build its accessibility tree when the page loads. What was read

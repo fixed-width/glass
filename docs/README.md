@@ -25,6 +25,7 @@ way it does? The explanations.
 
 **Connect and drive**
 
+- [Test an Electron or hybrid app](how-to/test-electron-and-hybrid-apps.md) — renderer checks and packaged-app acceptance
 - [Capture a smaller image](how-to/capture-a-smaller-image.md) — size bounds and native coordinate mapping
 - [Connect glass to your agent](how-to/connect-an-agent.md) — stdio and HTTP
 - [Run glass over the network](how-to/run-over-the-network.md) — agent and app on different machines
@@ -59,6 +60,7 @@ way it does? The explanations.
 
 ## Explanation — understand why
 
+- [Glass and Playwright](explanation/glass-and-playwright.md) — choose a test surface and understand its coverage
 - [The build → see → interact → debug loop](explanation/the-loop.md)
 - [Backends and display isolation](explanation/backends.md)
 - [Containment and sandboxing](explanation/containment.md)

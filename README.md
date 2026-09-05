@@ -19,6 +19,9 @@ or language. It has two Linux backends (**X11** and **Wayland**), a **Windows** 
 apps in the Simulator over `xcrun simctl`, with input and the accessibility tree via `idb_companion`,
 including a two-finger pinch), and a **macOS** backend, behind a platform-agnostic core.
 
+For browser, Electron and hybrid testing, see [Glass and Playwright](docs/explanation/glass-and-playwright.md)
+and the [renderer/packaged-app testing recipe](docs/how-to/test-electron-and-hybrid-apps.md).
+
 ## See it
 
 ![An agent debugging a GTK app under glass](docs/assets/hero-debug-loop.gif)

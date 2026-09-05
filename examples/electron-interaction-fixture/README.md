@@ -18,8 +18,10 @@ npm run package
 `dist/interaction-fixture-linux/interaction-fixture`. The distribution includes Electron's license
 and third-party notices. Packaging currently supports Linux only.
 
-There is no development server or debugging endpoint. The preload IPC is ordinary application logic
-for opening the native dialog. Automation uses the external UI through Glass's public MCP tools.
+The packaged app starts without a development server or debugging endpoint. The preload IPC is ordinary
+application logic for opening the native dialog. The Glass benchmark uses the external UI through
+public MCP tools. A separate [renderer test recipe](../../docs/how-to/test-electron-and-hybrid-apps.md)
+launches the same package through Playwright's Electron automation connection.
 
 The benchmark declares native semantic actions for the form. For the dialog it observes the native
 window, selects and focuses it, presses Return for the default **Confirm value** action, then observes
