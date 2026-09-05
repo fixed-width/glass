@@ -9,6 +9,37 @@ use crate::{
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+type SemanticSetValueFixture = (
+    Glass,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<(AxNodeId, String)>>>,
+    AxDeadlineLog,
+);
+type PointerFixture = (
+    Glass,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<(i32, i32)>>>,
+);
+type SemanticFixture = (
+    Glass,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<AxTarget>>>,
+);
+type DeadlineRecordingFixture = (
+    Glass,
+    Arc<Mutex<Option<std::time::Instant>>>,
+    Arc<Mutex<Vec<Deadline>>>,
+    Arc<Mutex<Vec<Deadline>>>,
+);
+type ClickModeFixture = (
+    Glass,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<(i32, i32)>>>,
+    AxDeadlineLog,
+);
+
 fn selector(query: &str) -> SemanticSelector {
     SemanticSelector::new(Some(query.into()), None, Vec::new()).unwrap()
 }
@@ -80,12 +111,7 @@ fn semantic_set_value_params(query: &str, timeout_ms: u64) -> SetValueTargetPara
 fn semantic_set_value_glass(
     trees: Vec<AxTree>,
     set_results: Vec<crate::Result<()>>,
-) -> (
-    Glass,
-    Arc<AtomicUsize>,
-    Arc<Mutex<Vec<(AxNodeId, String)>>>,
-    AxDeadlineLog,
-) {
+) -> SemanticSetValueFixture {
     semantic_set_value_glass_with_coverage(trees, set_results, full_state_coverage())
 }
 
@@ -93,12 +119,7 @@ fn semantic_set_value_glass_with_coverage(
     trees: Vec<AxTree>,
     set_results: Vec<crate::Result<()>>,
     coverage: AxStateCoverage,
-) -> (
-    Glass,
-    Arc<AtomicUsize>,
-    Arc<Mutex<Vec<(AxNodeId, String)>>>,
-    AxDeadlineLog,
-) {
+) -> SemanticSetValueFixture {
     let walks = Arc::new(AtomicUsize::new(0));
     let set_log = Arc::new(Mutex::new(Vec::new()));
     let deadlines = Arc::new(Mutex::new(Vec::new()));
@@ -245,12 +266,7 @@ fn pointer_glass(
     trees: Vec<AxTree>,
     hit: PointerHit,
     hit_error: bool,
-) -> (
-    Glass,
-    Arc<AtomicUsize>,
-    Arc<AtomicUsize>,
-    Arc<Mutex<Vec<(i32, i32)>>>,
-) {
+) -> PointerFixture {
     let walks = Arc::new(AtomicUsize::new(0));
     let hit_calls = Arc::new(AtomicUsize::new(0));
     let hit_points = Arc::new(Mutex::new(Vec::new()));
@@ -374,12 +390,7 @@ fn semantic_glass(
     trees: Vec<AxTree>,
     signal: Option<fn() -> Box<dyn ChangeSignal>>,
     behavior: InvokeBehavior,
-) -> (
-    Glass,
-    Arc<AtomicUsize>,
-    Arc<AtomicUsize>,
-    Arc<Mutex<Vec<AxTarget>>>,
-) {
+) -> SemanticFixture {
     let walks = Arc::new(AtomicUsize::new(0));
     let focus_calls = Arc::new(AtomicUsize::new(0));
     let invoke_log = Arc::new(Mutex::new(Vec::new()));
@@ -423,14 +434,7 @@ impl Accessibility for DeadlineRecordingAccessibility {
     }
 }
 
-fn deadline_recording_glass(
-    coverage_delay: std::time::Duration,
-) -> (
-    Glass,
-    Arc<Mutex<Option<std::time::Instant>>>,
-    Arc<Mutex<Vec<Deadline>>>,
-    Arc<Mutex<Vec<Deadline>>>,
-) {
+fn deadline_recording_glass(coverage_delay: std::time::Duration) -> DeadlineRecordingFixture {
     let coverage_finished = Arc::new(Mutex::new(None));
     let subscription_deadlines = Arc::new(Mutex::new(Vec::new()));
     let snapshot_deadlines = Arc::new(Mutex::new(Vec::new()));
@@ -1870,15 +1874,7 @@ fn legacy_id_missing_bounds_preserves_the_primitive_error_before_dispatch() {
     assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
 }
 
-fn click_mode_glass(
-    trees: Vec<AxTree>,
-    behavior: InvokeBehavior,
-) -> (
-    Glass,
-    Arc<AtomicUsize>,
-    Arc<Mutex<Vec<(i32, i32)>>>,
-    AxDeadlineLog,
-) {
+fn click_mode_glass(trees: Vec<AxTree>, behavior: InvokeBehavior) -> ClickModeFixture {
     let native_calls = Arc::new(AtomicUsize::new(0));
     let clicks = Arc::new(Mutex::new(Vec::new()));
     let deadlines = Arc::new(Mutex::new(Vec::new()));
@@ -2034,7 +2030,7 @@ fn generated_trees(count: usize) -> Vec<GeneratedTreeCase> {
 fn run_generated_click(
     tree: AxTree,
     dispatches: Arc<AtomicUsize>,
-) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+) -> SemanticActionResult<SemanticActionOutcome> {
     let accessibility = SeqAccessibility::new(vec![tree])
         .with_coverage(full_state_coverage())
         .with_invoke_behavior(InvokeBehavior::Succeed)

@@ -37,7 +37,7 @@ fn click_method_from_semantic_outcome(outcome: SemanticActionOutcome) -> ClickMe
     }
 }
 
-fn glass_error_from_semantic_action(mut error: SemanticActionError) -> GlassError {
+fn glass_error_from_semantic_action(mut error: Box<SemanticActionError>) -> GlassError {
     error
         .source
         .take()

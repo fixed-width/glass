@@ -228,6 +228,8 @@ pub struct SemanticActionError {
     pub source: Option<GlassError>,
 }
 
+type SemanticActionResult<T> = std::result::Result<T, Box<SemanticActionError>>;
+
 impl std::fmt::Display for SemanticActionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.summary)
@@ -237,7 +239,7 @@ impl std::fmt::Display for SemanticActionError {
 impl std::error::Error for SemanticActionError {}
 
 impl SemanticActionError {
-    fn with_target(mut self, target: ElementInfo) -> Self {
+    fn with_target(mut self: Box<Self>, target: ElementInfo) -> Box<Self> {
         self.target = Some(Box::new(target));
         self
     }
@@ -381,8 +383,8 @@ fn empty_error(
     bound: ActionDeadline,
     retry: RetryGuidance,
     source: Option<GlassError>,
-) -> SemanticActionError {
-    SemanticActionError {
+) -> Box<SemanticActionError> {
+    Box::new(SemanticActionError {
         kind,
         summary,
         resolution: None,
@@ -394,10 +396,10 @@ fn empty_error(
         bound,
         retry,
         source,
-    }
+    })
 }
 
-fn request_error(summary: &'static str, sequence_deadline: Deadline) -> SemanticActionError {
+fn request_error(summary: &'static str, sequence_deadline: Deadline) -> Box<SemanticActionError> {
     empty_error(
         SemanticActionFailureKind::UnsupportedMode,
         summary,
@@ -416,7 +418,7 @@ fn target_deadline(
     timeout_ms: Option<u64>,
     max_nodes: Option<usize>,
     sequence_deadline: Deadline,
-) -> std::result::Result<ActionDeadline, SemanticActionError> {
+) -> SemanticActionResult<ActionDeadline> {
     let now = std::time::Instant::now();
     match source {
         ActionTarget::Id(_) => {
@@ -487,7 +489,7 @@ fn classified_resolution_error(
     observation: ResolutionObservation,
     report: ResolutionReport,
     bound: ActionDeadline,
-) -> SemanticActionError {
+) -> Box<SemanticActionError> {
     let (kind, summary, retry) =
         if matches!(observation.result.scope, ScopeResolution::Ambiguous { .. }) {
             (
@@ -521,7 +523,7 @@ fn classified_resolution_error(
                 RetryGuidance::Reobserve,
             )
         };
-    SemanticActionError {
+    Box::new(SemanticActionError {
         kind,
         summary,
         resolution: Some(report),
@@ -533,10 +535,10 @@ fn classified_resolution_error(
         bound,
         retry,
         source: None,
-    }
+    })
 }
 
-fn source_error(source: GlassError, bound: ActionDeadline) -> SemanticActionError {
+fn source_error(source: GlassError, bound: ActionDeadline) -> Box<SemanticActionError> {
     let owner = source.bound_owner().or_else(|| {
         matches!(&source, GlassError::AccessibilityNotReady(_))
             .then_some(bound.owner)
@@ -773,7 +775,7 @@ fn focus_source_error(
     method: ActionMethod,
     bound: ActionDeadline,
     dispatch_started: bool,
-) -> SemanticActionError {
+) -> Box<SemanticActionError> {
     let dispatch = focus_dispatch(&source, dispatch_started);
     let mut error = source_error(source, bound);
     error.summary = "semantic target focus failed";
@@ -800,11 +802,13 @@ fn focus_unconfirmed_error(
     coverage: AxStateCoverage,
     method: ActionMethod,
     bound: ActionDeadline,
-) -> SemanticActionError {
+) -> Box<SemanticActionError> {
     record_focus_confirmation(&mut actionability, coverage, false);
     let mut error = actionability_error(
-        SemanticActionFailureKind::FocusUnconfirmed,
-        "semantic target focus could not be confirmed",
+        FailureSummary {
+            kind: SemanticActionFailureKind::FocusUnconfirmed,
+            summary: "semantic target focus could not be confirmed",
+        },
         Some(resolution),
         actionability,
         bound,
@@ -821,7 +825,7 @@ fn focus_unconfirmed_error(
     error
 }
 
-fn key_source_error(source: GlassError, focused: ConfirmedFocus) -> SemanticActionError {
+fn key_source_error(source: GlassError, focused: ConfirmedFocus) -> Box<SemanticActionError> {
     let proven_not_dispatched =
         source.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched);
     let mut error = source_error(source, focused.bound);
@@ -844,19 +848,23 @@ fn key_source_error(source: GlassError, focused: ConfirmedFocus) -> SemanticActi
     error
 }
 
-fn actionability_error(
+struct FailureSummary {
     kind: SemanticActionFailureKind,
     summary: &'static str,
+}
+
+fn actionability_error(
+    failure: FailureSummary,
     resolution: Option<ResolutionReport>,
     actionability: ActionabilityReport,
     bound: ActionDeadline,
     retry: RetryGuidance,
     source: Option<GlassError>,
     dispatch: DispatchStatus,
-) -> SemanticActionError {
-    SemanticActionError {
-        kind,
-        summary,
+) -> Box<SemanticActionError> {
+    Box::new(SemanticActionError {
+        kind: failure.kind,
+        summary: failure.summary,
         resolution,
         actionability,
         focus: None,
@@ -866,7 +874,7 @@ fn actionability_error(
         bound,
         retry,
         source,
-    }
+    })
 }
 
 fn action_source_error(
@@ -876,7 +884,7 @@ fn action_source_error(
     actionability: ActionabilityReport,
     bound: ActionDeadline,
     dispatch_started: bool,
-) -> SemanticActionError {
+) -> Box<SemanticActionError> {
     let proves_not_dispatched = !dispatch_started
         || source.invoke_fallback_eligible()
         || source.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched)
@@ -922,7 +930,7 @@ fn set_value_source_error(
     resolution: Option<ResolutionReport>,
     actionability: ActionabilityReport,
     bound: ActionDeadline,
-) -> SemanticActionError {
+) -> Box<SemanticActionError> {
     let possible_dispatch = source.set_value_failed_after_writing()
         || source.bound_dispatch() == Some(crate::BoundDispatch::MayHaveDispatched);
     let cause = source.cause();
@@ -989,7 +997,7 @@ impl Glass {
         timeout_ms: u64,
         sequence_deadline: Deadline,
         eligibility: impl Fn(&ElementInfo, AxStateCoverage) -> bool,
-    ) -> std::result::Result<ResolvedSemanticTarget, SemanticActionError> {
+    ) -> SemanticActionResult<ResolvedSemanticTarget> {
         let bound = target_deadline(
             &ActionTarget::Semantic(target.clone()),
             Some(timeout_ms),
@@ -1012,7 +1020,7 @@ impl Glass {
         sequence_deadline: Deadline,
         bound: ActionDeadline,
         eligibility: impl Fn(&ElementInfo, AxStateCoverage) -> bool,
-    ) -> std::result::Result<ResolvedSemanticTarget, SemanticActionError> {
+    ) -> SemanticActionResult<ResolvedSemanticTarget> {
         let coverage = {
             let active = self
                 .active_mut()
@@ -1042,12 +1050,16 @@ impl Glass {
         .expect("the fixed candidate limit is valid");
         let poll = self
             .poll_accessibility_until_by_deadline(
-                SEMANTIC_ACTION_STABILITY_MS,
-                std::time::Duration::from_secs(1),
-                bound.deadline,
-                bound.owner.unwrap_or(Whose::Callee),
-                bound.allow_wait,
-                sequence_deadline,
+                a11y_poll::A11yPollCadence {
+                    interval_ms: SEMANTIC_ACTION_STABILITY_MS,
+                    reread_after: std::time::Duration::from_secs(1),
+                },
+                a11y_poll::A11yPollBound {
+                    action_deadline: bound.deadline,
+                    whose: bound.owner.unwrap_or(Whose::Callee),
+                    allow_wait: bound.allow_wait,
+                    sequence_deadline,
+                },
                 "resolve semantic action target",
                 |tree| {
                     let result = tree.semantic_query(&query);
@@ -1105,7 +1117,7 @@ impl Glass {
         max_nodes: Option<usize>,
         sequence_deadline: Deadline,
         bound: ActionDeadline,
-    ) -> std::result::Result<ResolvedPointerTarget, SemanticActionError> {
+    ) -> SemanticActionResult<ResolvedPointerTarget> {
         let coverage = {
             let active = self
                 .active_mut()
@@ -1143,12 +1155,16 @@ impl Glass {
         let mut sample: Option<StabilitySample> = None;
         let poll = self
             .poll_accessibility_until_by_deadline_with_window(
-                SEMANTIC_ACTION_STABILITY_MS,
-                std::time::Duration::from_millis(SEMANTIC_ACTION_STABILITY_MS),
-                bound.deadline,
-                bound.owner.unwrap_or(Whose::Callee),
-                bound.allow_wait,
-                sequence_deadline,
+                a11y_poll::A11yPollCadence {
+                    interval_ms: SEMANTIC_ACTION_STABILITY_MS,
+                    reread_after: std::time::Duration::from_millis(SEMANTIC_ACTION_STABILITY_MS),
+                },
+                a11y_poll::A11yPollBound {
+                    action_deadline: bound.deadline,
+                    whose: bound.owner.unwrap_or(Whose::Callee),
+                    allow_wait: bound.allow_wait,
+                    sequence_deadline,
+                },
                 "stabilize semantic pointer target",
                 |tree, window| {
                     let result = tree.semantic_query(&query);
@@ -1251,8 +1267,10 @@ impl Glass {
             if let Some(candidate) = &poll.observation.candidate {
                 let target = candidate.element.clone();
                 return Err(actionability_error(
-                    SemanticActionFailureKind::UnstableTarget,
-                    "semantic pointer target did not remain stable",
+                    FailureSummary {
+                        kind: SemanticActionFailureKind::UnstableTarget,
+                        summary: "semantic pointer target did not remain stable",
+                    },
                     Some(report),
                     poll.observation
                         .actionability
@@ -1323,7 +1341,7 @@ impl Glass {
     fn dispatch_native_click(
         &mut self,
         resolved: ResolvedSemanticTarget,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         let window = {
             let active = self.active.as_ref().ok_or_else(|| {
                 let mut error = source_error(GlassError::NoActiveSession, resolved.bound);
@@ -1344,8 +1362,10 @@ impl Glass {
         );
         if actionability.blocking().is_some() {
             return Err(actionability_error(
-                SemanticActionFailureKind::NotActionable,
-                "semantic target is not actionable",
+                FailureSummary {
+                    kind: SemanticActionFailureKind::NotActionable,
+                    summary: "semantic target is not actionable",
+                },
                 Some(resolved.resolution),
                 actionability,
                 resolved.bound,
@@ -1386,7 +1406,7 @@ impl Glass {
         &mut self,
         resolved: ResolvedPointerTarget,
         native_fallback: Option<String>,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         let sample_actionability = ActionabilityReport::evaluate_click(
             &resolved.candidate.element,
             resolved.coverage,
@@ -1422,8 +1442,10 @@ impl Glass {
         }
         if actionability.blocking().is_some() {
             return Err(actionability_error(
-                SemanticActionFailureKind::NotActionable,
-                "semantic pointer target is not actionable",
+                FailureSummary {
+                    kind: SemanticActionFailureKind::NotActionable,
+                    summary: "semantic pointer target is not actionable",
+                },
                 Some(resolved.resolution),
                 actionability,
                 resolved.bound,
@@ -1464,8 +1486,10 @@ impl Glass {
         );
         if actionability.blocking().is_some() {
             return Err(actionability_error(
-                SemanticActionFailureKind::NotActionable,
-                "semantic pointer target is not actionable",
+                FailureSummary {
+                    kind: SemanticActionFailureKind::NotActionable,
+                    summary: "semantic pointer target is not actionable",
+                },
                 Some(resolved.resolution),
                 actionability,
                 resolved.bound,
@@ -1579,7 +1603,7 @@ impl Glass {
         max_nodes: Option<usize>,
         sequence_deadline: Deadline,
         bound: ActionDeadline,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         match target {
             ActionTarget::Id(id) => {
                 let actionability = self.legacy_click_actionability(*id, false);
@@ -1632,7 +1656,7 @@ impl Glass {
         sequence_deadline: Deadline,
         bound: ActionDeadline,
         native_fallback: Option<String>,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         match target {
             ActionTarget::Id(id) => {
                 let actionability = self.legacy_click_actionability(*id, true);
@@ -1662,7 +1686,7 @@ impl Glass {
     pub fn click_target(
         &mut self,
         params: &ClickTargetParams,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         self.click_target_by(params, Deadline::UNBOUNDED)
     }
 
@@ -1670,7 +1694,7 @@ impl Glass {
         &mut self,
         params: &ClickTargetParams,
         sequence_deadline: Deadline,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         let started = std::time::Instant::now();
         let result = self.click_target_inner(params.clone(), sequence_deadline);
         let element = match &result {
@@ -1736,7 +1760,7 @@ impl Glass {
         &mut self,
         params: ClickTargetParams,
         sequence_deadline: Deadline,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         let bound = target_deadline(
             &params.target,
             params.timeout_ms,
@@ -1799,7 +1823,7 @@ impl Glass {
         text: &str,
         sequence_deadline: Deadline,
         bound: ActionDeadline,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         let (element, resolution, coverage, window, legacy_id, execution) = match &params.target {
             ActionTarget::Id(id) => {
                 let before = self.legacy_set_value_snapshot(*id);
@@ -1906,7 +1930,7 @@ impl Glass {
         &mut self,
         params: &SetValueTargetParams,
         text: &str,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         self.set_value_target_by(params, text, Deadline::UNBOUNDED)
     }
 
@@ -1915,7 +1939,7 @@ impl Glass {
         params: &SetValueTargetParams,
         text: &str,
         sequence_deadline: Deadline,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         let started = std::time::Instant::now();
         let result = match target_deadline(
             &params.target,
@@ -1968,7 +1992,7 @@ impl Glass {
         &mut self,
         target: &AxTarget,
         deadline: ActionDeadline,
-    ) -> std::result::Result<ElementInfo, SemanticActionError> {
+    ) -> SemanticActionResult<ElementInfo> {
         let coverage = self
             .active
             .as_ref()
@@ -2004,12 +2028,16 @@ impl Glass {
         }
         let poll = self
             .poll_accessibility_until_by_deadline(
-                SEMANTIC_ACTION_STABILITY_MS,
-                std::time::Duration::from_secs(1),
-                deadline.deadline,
-                deadline.owner.unwrap_or(Whose::Callee),
-                true,
-                Deadline::UNBOUNDED,
+                a11y_poll::A11yPollCadence {
+                    interval_ms: SEMANTIC_ACTION_STABILITY_MS,
+                    reread_after: std::time::Duration::from_secs(1),
+                },
+                a11y_poll::A11yPollBound {
+                    action_deadline: deadline.deadline,
+                    whose: deadline.owner.unwrap_or(Whose::Callee),
+                    allow_wait: true,
+                    sequence_deadline: Deadline::UNBOUNDED,
+                },
                 "confirm semantic target focus",
                 observe,
                 Option::is_some,
@@ -2055,7 +2083,7 @@ impl Glass {
         params: &TypeTargetParams,
         sequence_deadline: Deadline,
         bound: ActionDeadline,
-    ) -> std::result::Result<ConfirmedFocus, SemanticActionError> {
+    ) -> SemanticActionResult<ConfirmedFocus> {
         let window = self
             .active
             .as_ref()
@@ -2154,7 +2182,7 @@ impl Glass {
         sequence_deadline: Deadline,
         bound: ActionDeadline,
         native_fallback: Option<String>,
-    ) -> std::result::Result<ConfirmedFocus, SemanticActionError> {
+    ) -> SemanticActionResult<ConfirmedFocus> {
         let resolved = self.resolve_stable_pointer_target(
             &params.target,
             params.max_nodes,
@@ -2170,8 +2198,10 @@ impl Glass {
         );
         if pre_dispatch.blocking().is_some() {
             return Err(actionability_error(
-                SemanticActionFailureKind::NotActionable,
-                "semantic target is not eligible for targeted typing",
+                FailureSummary {
+                    kind: SemanticActionFailureKind::NotActionable,
+                    summary: "semantic target is not eligible for targeted typing",
+                },
                 Some(resolved.resolution),
                 pre_dispatch,
                 resolved.bound,
@@ -2242,7 +2272,7 @@ impl Glass {
         params: &TypeTargetParams,
         text: &str,
         sequence_deadline: Deadline,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         let bound = target_deadline(
             &ActionTarget::Semantic(params.target.clone()),
             Some(params.timeout_ms),
@@ -2293,7 +2323,7 @@ impl Glass {
         &mut self,
         params: &TypeTargetParams,
         text: &str,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         self.type_target_by(params, text, Deadline::UNBOUNDED)
     }
 
@@ -2302,7 +2332,7 @@ impl Glass {
         params: &TypeTargetParams,
         text: &str,
         sequence_deadline: Deadline,
-    ) -> std::result::Result<SemanticActionOutcome, SemanticActionError> {
+    ) -> SemanticActionResult<SemanticActionOutcome> {
         let started = std::time::Instant::now();
         let result = self.type_target_inner(params, text, sequence_deadline);
         let element = match &result {

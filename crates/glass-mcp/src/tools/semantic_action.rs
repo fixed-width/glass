@@ -458,7 +458,11 @@ fn failure_result(error: &SemanticActionError) -> Value {
     result
 }
 
-pub(crate) fn semantic_error(tool: &'static str, error: SemanticActionError) -> ContextualError {
+pub(crate) fn semantic_error(
+    tool: &'static str,
+    error: impl Into<Box<SemanticActionError>>,
+) -> ContextualError {
+    let error = error.into();
     let category = semantic_category(&error);
     let include_text = tool != "glass_type";
     let mut siblings = Vec::new();

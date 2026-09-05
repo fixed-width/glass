@@ -11,6 +11,20 @@ pub(super) struct A11yPollOutcome<O> {
     pub timed_out_by: Option<crate::Whose>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct A11yPollCadence {
+    pub interval_ms: u64,
+    pub reread_after: std::time::Duration,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct A11yPollBound {
+    pub action_deadline: Deadline,
+    pub whose: crate::Whose,
+    pub allow_wait: bool,
+    pub sequence_deadline: Deadline,
+}
+
 fn final_read_pause(left: std::time::Duration) -> std::time::Duration {
     left.saturating_sub(FINAL_READ_HEADROOM.min(left / 4))
 }
@@ -80,8 +94,10 @@ impl Glass {
         satisfied: impl FnMut(&O) -> bool,
     ) -> Result<A11yPollOutcome<O>> {
         self.poll_accessibility_until_with_reread(
-            interval_ms,
-            std::time::Duration::from_secs(1),
+            A11yPollCadence {
+                interval_ms,
+                reread_after: std::time::Duration::from_secs(1),
+            },
             timeout_ms,
             sequence_deadline,
             operation,
@@ -92,8 +108,7 @@ impl Glass {
 
     pub(super) fn poll_accessibility_until_with_reread<O>(
         &mut self,
-        interval_ms: u64,
-        reread_after: std::time::Duration,
+        cadence: A11yPollCadence,
         timeout_ms: u64,
         sequence_deadline: Deadline,
         operation: &'static str,
@@ -109,12 +124,13 @@ impl Glass {
             sequence_deadline.budget(std::time::Duration::from_millis(timeout_ms), started);
         let action_deadline = Deadline::at(started + effective_duration);
         self.poll_accessibility_until_with_deadline(
-            interval_ms,
-            reread_after,
-            action_deadline,
-            whose,
-            timeout_ms > 0,
-            sequence_deadline,
+            cadence,
+            A11yPollBound {
+                action_deadline,
+                whose,
+                allow_wait: timeout_ms > 0,
+                sequence_deadline,
+            },
             operation,
             started,
             observe,
@@ -122,19 +138,20 @@ impl Glass {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn poll_accessibility_until_by_deadline<O>(
         &mut self,
-        interval_ms: u64,
-        reread_after: std::time::Duration,
-        action_deadline: Deadline,
-        whose: crate::Whose,
-        allow_wait: bool,
-        sequence_deadline: Deadline,
+        cadence: A11yPollCadence,
+        bound: A11yPollBound,
         operation: &'static str,
         observe: impl FnMut(&AxTree) -> O,
         satisfied: impl FnMut(&O) -> bool,
     ) -> Result<A11yPollOutcome<O>> {
+        let A11yPollBound {
+            action_deadline,
+            whose,
+            allow_wait,
+            sequence_deadline,
+        } = bound;
         if sequence_deadline.has_passed() {
             return Err(GlassError::deadline_not_started(operation));
         }
@@ -150,12 +167,8 @@ impl Glass {
             });
         }
         self.poll_accessibility_until_with_deadline(
-            interval_ms,
-            reread_after,
-            action_deadline,
-            whose,
-            allow_wait,
-            sequence_deadline,
+            cadence,
+            bound,
             operation,
             std::time::Instant::now(),
             observe,
@@ -163,19 +176,20 @@ impl Glass {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn poll_accessibility_until_by_deadline_with_window<O>(
         &mut self,
-        interval_ms: u64,
-        reread_after: std::time::Duration,
-        action_deadline: Deadline,
-        whose: crate::Whose,
-        allow_wait: bool,
-        sequence_deadline: Deadline,
+        cadence: A11yPollCadence,
+        bound: A11yPollBound,
         operation: &'static str,
         observe: impl FnMut(&AxTree, (u32, u32)) -> O,
         satisfied: impl FnMut(&O) -> bool,
     ) -> Result<A11yPollOutcome<O>> {
+        let A11yPollBound {
+            action_deadline,
+            whose,
+            allow_wait,
+            sequence_deadline,
+        } = bound;
         if sequence_deadline.has_passed() {
             return Err(GlassError::deadline_not_started(operation));
         }
@@ -191,12 +205,8 @@ impl Glass {
             });
         }
         self.poll_accessibility_until_with_deadline_and_window(
-            interval_ms,
-            reread_after,
-            action_deadline,
-            whose,
-            allow_wait,
-            sequence_deadline,
+            cadence,
+            bound,
             operation,
             std::time::Instant::now(),
             observe,
@@ -204,27 +214,18 @@ impl Glass {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn poll_accessibility_until_with_deadline<O>(
         &mut self,
-        interval_ms: u64,
-        reread_after: std::time::Duration,
-        action_deadline: Deadline,
-        whose: crate::Whose,
-        allow_wait: bool,
-        sequence_deadline: Deadline,
+        cadence: A11yPollCadence,
+        bound: A11yPollBound,
         operation: &'static str,
         started: std::time::Instant,
         mut observe: impl FnMut(&AxTree) -> O,
         satisfied: impl FnMut(&O) -> bool,
     ) -> Result<A11yPollOutcome<O>> {
         self.poll_accessibility_until_with_deadline_and_window(
-            interval_ms,
-            reread_after,
-            action_deadline,
-            whose,
-            allow_wait,
-            sequence_deadline,
+            cadence,
+            bound,
             operation,
             started,
             move |tree, _window| observe(tree),
@@ -232,20 +233,25 @@ impl Glass {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn poll_accessibility_until_with_deadline_and_window<O>(
         &mut self,
-        interval_ms: u64,
-        reread_after: std::time::Duration,
-        action_deadline: Deadline,
-        whose: crate::Whose,
-        allow_wait: bool,
-        sequence_deadline: Deadline,
+        cadence: A11yPollCadence,
+        bound: A11yPollBound,
         operation: &'static str,
         started: std::time::Instant,
         mut observe: impl FnMut(&AxTree, (u32, u32)) -> O,
         mut satisfied: impl FnMut(&O) -> bool,
     ) -> Result<A11yPollOutcome<O>> {
+        let A11yPollCadence {
+            interval_ms,
+            reread_after,
+        } = cadence;
+        let A11yPollBound {
+            action_deadline,
+            whose,
+            allow_wait,
+            sequence_deadline,
+        } = bound;
         let mut signal = (interval_ms > 0)
             .then(|| self.subscribe_a11y_changes(action_deadline))
             .flatten();
@@ -497,12 +503,16 @@ mod tests {
 
         let outcome = glass
             .poll_accessibility_until_by_deadline_with_window(
-                1,
-                Duration::from_millis(1),
-                Deadline::from_millis(100),
-                crate::Whose::Callee,
-                true,
-                Deadline::UNBOUNDED,
+                A11yPollCadence {
+                    interval_ms: 1,
+                    reread_after: Duration::from_millis(1),
+                },
+                A11yPollBound {
+                    action_deadline: Deadline::from_millis(100),
+                    whose: crate::Whose::Callee,
+                    allow_wait: true,
+                    sequence_deadline: Deadline::UNBOUNDED,
+                },
                 "observe geometry",
                 |tree, window| {
                     observed.push((tree.root.name.clone(), window));
