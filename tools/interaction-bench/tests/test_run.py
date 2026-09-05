@@ -176,6 +176,36 @@ class RunnerTests(unittest.TestCase):
                 if path.is_file():
                     result["files"][str(path.relative_to(root))] = file_identity(path)
             self.assertEqual(validate_attempt(root, result, GlassDriver), [])
+            (root / "evidence").mkdir()
+            body = root / "evidence/note.txt"
+            body.write_bytes(b"note")
+            artifact = {**file_identity(body), "path": "note.txt"}
+            sha = artifact["sha256"]
+            result["artifacts"] = {sha: artifact}
+            result["artifact_references"] = [
+                {"source": "output/note.txt", "sha256": sha, "origin_call": 1}
+            ]
+            result["files"]["evidence/note.txt"] = file_identity(body)
+            result["file_reads"] = [
+                {
+                    "method": "files/read",
+                    "phase": "evidence",
+                    "file_reads": 1,
+                    "response_text_bytes": 4,
+                    "sha256": sha,
+                    "origin_call": 1,
+                }
+            ]
+            result["phases"] = phase_totals([call] + result["file_reads"], durations)
+            self.assertEqual(validate_attempt(root, result, GlassDriver), [])
+            result["file_reads"][0]["tool_calls"] = 100
+            result["phases"] = phase_totals([call] + result["file_reads"], durations)
+            self.assertIn(
+                "file read contains invalid method, phase or counters",
+                validate_attempt(root, result, GlassDriver),
+            )
+            del result["file_reads"][0]["tool_calls"]
+            result["phases"] = phase_totals([call] + result["file_reads"], durations)
             result["phases"]["task"]["response_text_bytes"] = 0
             self.assertIn(
                 "phase totals differ from recorded calls and timing",

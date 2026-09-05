@@ -20,6 +20,8 @@ from drivers.glass import Driver as GlassDriver, normalize as glass_normalize
 from evidence import Evidence, EvidenceError
 from fixtures import Fixtures
 from measurement import (
+    COUNTERS,
+    PHASES,
     canonical,
     call_metrics,
     digest,
@@ -450,6 +452,14 @@ def validate_attempt(directory, result, adapter, config=None):
             errors.append(f"invalid archived artifact: {exc}")
     for read in result.get("file_reads", []):
         artifact = result["artifacts"].get(read.get("sha256"), {})
+        expected_metrics = {key: 0 for key in COUNTERS}
+        expected_metrics.update(file_reads=1, response_text_bytes=artifact.get("bytes"))
+        if (
+            read.get("method") != "files/read"
+            or read.get("phase") not in PHASES
+            or any(read.get(key, 0) != value for key, value in expected_metrics.items())
+        ):
+            errors.append("file read contains invalid method, phase or counters")
         if (
             read.get("file_reads") != 1
             or read.get("response_text_bytes") != artifact.get("bytes")
