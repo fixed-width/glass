@@ -22,7 +22,7 @@
 # code. That must not fail — but it must not pass unchecked either, because
 # deleting the test that kills a survivor brings the survivor back while the diff
 # itself contains nothing to mutate. So a `--in-diff` run that yields nothing falls
-# back to mutating the whole of each file the diff touched.
+# back to mutating each touched file, including its owning module for tests.rs.
 #
 # Usage:
 #   scripts/mutants.sh <output-dir> [--package NAME]... [extra cargo-mutants args...]
@@ -205,12 +205,21 @@ if [ "$planned" -eq 0 ] && [ -n "$diff_file" ] && [ -s "$diff_file" ]; then
     )
     if [ "${#touched[@]}" -gt 0 ]; then
         echo "The diff changed no mutable code — only tests, or only comments."
-        echo "Falling back to the whole of each file it touched, so a deleted test"
+        echo "Falling back to each touched file and the owning module of tests.rs, so a deleted test"
         echo "cannot bring a survivor back unnoticed:"
         printf '  %s\n' "${touched[@]}"
         scope=()
         for f in "${touched[@]}"; do
             scope+=(--file "$f")
+            if [[ "$f" == */tests.rs ]]; then
+                module_dir=${f%/tests.rs}
+                for owner in "$module_dir.rs" "$module_dir/mod.rs"; do
+                    if [ -f "$owner" ]; then
+                        scope+=(--file "$owner")
+                        printf '  owning module: %s\n' "$owner"
+                    fi
+                done
+            fi
         done
         diff_file=""
         planned=$(list_count "${scope[@]}")
