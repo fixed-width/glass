@@ -31,6 +31,7 @@ pub struct FakePlatform {
     pub specs: Arc<Mutex<Vec<AppSpec>>>,
     pub fail_text_dispatch_after_receiving: bool,
     pub trailing_toggle: bool,
+    pub protected_paths: Option<Arc<Mutex<Vec<glass_core::ProtectedHostPath>>>>,
 }
 
 impl FakePlatform {
@@ -93,6 +94,19 @@ pub fn frame_4x4_corner(corner: [u8; 4]) -> Frame {
 }
 
 impl Platform for FakePlatform {
+    fn configure_protected_host_paths(
+        &mut self,
+        paths: &[glass_core::ProtectedHostPath],
+    ) -> Result<glass_core::HostPathProtectionMode> {
+        if let Some(recorded) = &self.protected_paths {
+            *recorded.lock().unwrap() = paths.to_vec();
+        } else if !paths.is_empty() {
+            return Err(GlassError::SandboxUnavailable(
+                "fake backend has no protected-path support".into(),
+            ));
+        }
+        Ok(glass_core::HostPathProtectionMode::SandboxRules)
+    }
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         self.specs.lock().unwrap().push(spec.clone());
         self.started = true;

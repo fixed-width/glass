@@ -24,7 +24,16 @@ const LOCK_WAIT_WORTH_SAYING: Duration = Duration::from_millis(250);
 /// `bounded::KILL_REAP` past its deadline — still lands inside. This `timeout` is the backstop for
 /// a step that ignores the deadline: a `spawn_blocking` task cannot be cancelled, so that step is
 /// still running when the process exits, and its child is orphaned.
+#[cfg(test)]
 pub async fn run_shutdown(sessions: Arc<Mutex<Glass>>, budget: Duration) {
+    run_shutdown_with_trace(sessions, budget, None).await;
+}
+
+pub(crate) async fn run_shutdown_with_trace(
+    sessions: Arc<Mutex<Glass>>,
+    budget: Duration,
+    trace: Option<crate::trace::TraceRecorder>,
+) {
     let task = tokio::task::spawn_blocking(move || {
         // Started after the lock: a tool call in flight holds the session, and a deadline
         // measured across that wait arrives spent — reported downstream as every step skipped,
@@ -37,16 +46,26 @@ pub async fn run_shutdown(sessions: Arc<Mutex<Glass>>, budget: Duration) {
         if waited > LOCK_WAIT_WORTH_SAYING {
             eprintln!("glass: a tool call held the session for {waited:?} before teardown started");
         }
-        glass.shutdown(Deadline::at(
+        glass.shutdown_report(Deadline::at(
             Instant::now() + budget - glass_core::TEARDOWN_REAP_HEADROOM,
-        ));
+        ))
     });
-    match tokio::time::timeout(budget, task).await {
-        Ok(Ok(())) => {}
+    let status = match tokio::time::timeout(budget, task).await {
+        Ok(Ok(Ok(()))) => "completed",
+        Ok(Ok(Err(_))) => "target_stop_failed",
         // A panic inside teardown: the steps behind it did not run, and the process is about to
         // exit past it.
-        Ok(Err(e)) => eprintln!("glass: teardown panicked ({e}); exiting anyway"),
-        Err(_) => eprintln!("glass: shutdown exceeded {budget:?}; exiting anyway"),
+        Ok(Err(e)) => {
+            eprintln!("glass: teardown panicked ({e}); exiting anyway");
+            "panicked"
+        }
+        Err(_) => {
+            eprintln!("glass: shutdown exceeded {budget:?}; exiting anyway");
+            "timed_out"
+        }
+    };
+    if let Some(trace) = trace {
+        trace.shutdown_event(status);
     }
 }
 

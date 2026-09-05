@@ -55,6 +55,18 @@ pub async fn run(
     report: crate::audit::AuditReport,
     tool_profile: crate::tool_profile::ToolProfile,
 ) -> anyhow::Result<()> {
+    run_configured(http, addr, token_file, sink, report, tool_profile, None).await
+}
+
+pub async fn run_configured(
+    http: bool,
+    addr: Option<String>,
+    token_file: Option<String>,
+    sink: Option<Box<dyn glass_core::AuditSink>>,
+    report: crate::audit::AuditReport,
+    tool_profile: crate::tool_profile::ToolProfile,
+    trace: Option<crate::trace::TraceConfig>,
+) -> anyhow::Result<()> {
     // Delegate to the audited resolver (token precedence + exposure rules + its tests stay
     // the single source of truth); just reconstruct its flag form from clap's typed args.
     let mut argv: Vec<String> = Vec::new();
@@ -74,6 +86,7 @@ pub async fn run(
     })
     .map_err(|e| anyhow::anyhow!("glass serve: {e}"))?;
     cfg.tool_profile = tool_profile;
+    cfg.trace = trace;
 
     // Fail-closed exposure rule (spec D4) — refuse a network-exposed bind without a token.
     check_exposure(&cfg)?;
@@ -120,7 +133,7 @@ fn build_router(cfg: &ServeConfig, server: GlassServer, cancel: &CancellationTok
         http_cfg = http_cfg.disable_allowed_hosts();
     }
     let service = StreamableHttpService::new(
-        move || Ok(server.clone()),
+        move || Ok(server.clone().for_client()),
         Arc::new(SingleSessionManager::default()),
         http_cfg,
     );
@@ -175,34 +188,11 @@ pub async fn run_on_until(
     report: crate::audit::AuditReport,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let server = GlassServer::new_with_profile(glass, report, cfg.tool_profile);
-    let sessions = server.sessions();
-    let artifacts = server.artifact_store();
-    let cancel = CancellationToken::new();
-    let app = build_router(&cfg, server, &cancel);
-
-    let server_cancel = cancel.clone();
-    let serving = axum::serve(listener, app).with_graceful_shutdown(async move {
-        server_cancel.cancelled().await;
-    });
-    let transport_result = run_server_then_teardown(
-        async move { serving.await },
-        shutdown,
-        &cancel,
-        HTTP_GRACEFUL_DRAIN_BUDGET,
-        crate::shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET),
-        crate::cleanup_artifacts(artifacts),
-    )
-    .await;
-    match transport_result {
-        Ok(result) => result.context("serving MCP over HTTP"),
-        Err(()) => Err(anyhow::anyhow!(
-            "MCP HTTP graceful drain exceeded {HTTP_GRACEFUL_DRAIN_BUDGET:?}"
-        )),
-    }
+    let server =
+        GlassServer::new_configured(glass, report, cfg.tool_profile, cfg.trace.as_ref(), "http")?;
+    run_server_on_until(listener, cfg, server, shutdown).await
 }
 
-#[cfg(test)]
 pub(crate) async fn run_server_on_until(
     listener: tokio::net::TcpListener,
     cfg: ServeConfig,
@@ -211,6 +201,7 @@ pub(crate) async fn run_server_on_until(
 ) -> anyhow::Result<()> {
     let sessions = server.sessions();
     let artifacts = server.artifact_store();
+    let trace = server.trace_recorder();
     let cancel = CancellationToken::new();
     let app = build_router(&cfg, server, &cancel);
     let server_cancel = cancel.clone();
@@ -222,8 +213,12 @@ pub(crate) async fn run_server_on_until(
         shutdown,
         &cancel,
         HTTP_GRACEFUL_DRAIN_BUDGET,
-        crate::shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET),
-        crate::cleanup_artifacts(artifacts),
+        crate::shutdown::run_shutdown_with_trace(
+            sessions,
+            glass_core::TEARDOWN_BUDGET,
+            trace.clone(),
+        ),
+        crate::cleanup_evidence(trace, artifacts),
     )
     .await;
     match transport_result {
@@ -361,6 +356,7 @@ mod tests {
             addr: addr.parse().unwrap(),
             token: token.map(String::from),
             tool_profile: Default::default(),
+            trace: None,
         }
     }
 

@@ -45,6 +45,7 @@ async fn start_server_with_profile(
         addr,
         token: token.map(String::from),
         tool_profile: profile,
+        trace: None,
     };
     let glass = glass_mcp::boot(None);
     let report = glass_mcp::audit::report_from_config(None, |_| None);

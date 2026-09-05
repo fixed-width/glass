@@ -19,6 +19,10 @@ client's filesystem.
   [reference/audit-log.md](audit-log.md).
 - `--tool-profile full|lean` — fixed tool inventory for this server, default `full`.
   Lean uses `glass_do` for actions; see [tool profiles](tools.md#tool-profiles).
+- `--trace-dir <absolute-directory>` — retain supplied inputs and requested results, which can
+  contain sensitive data, in a new child of an existing private directory.
+- `--trace-max-bytes <bytes>` — per-process trace allowance, default 256 MiB; requires `--trace-dir`.
+  See [session trace](session-trace.md) for bounds, exclusions and ownership requirements.
 
 ## `serve`
 
@@ -31,10 +35,25 @@ Serve MCP over the network (Streamable HTTP) instead of stdio.
   headless (no menu bar, MCP served silently).
 - `--audit-log <path>` — as above.
 - `--tool-profile full|lean` — as above, including menu-bar mode.
+- `--trace-dir` and `--trace-max-bytes` — as above, including menu-bar mode.
 
 Loopback binds need no token; see [how-to/run-over-the-network.md](../how-to/run-over-the-network.md).
 Remote HTTP clients must read `glass-artifact://` links with MCP `resources/read`; they must not try
 to open the server-local path from resource metadata on the client machine.
+
+## `trace inspect` and `trace export`
+
+Validate a stopped or interrupted trace without starting a backend or server:
+
+```sh
+glass-mcp trace inspect /absolute/path/trace-ID [--json]
+glass-mcp trace export /absolute/path/trace-ID --out /absolute/path/incident.zip
+```
+
+Inspection returns a bounded timeline with payload references. Export creates a new ZIP containing
+the validated evidence. Active writers and existing destinations are refused. Exit codes are `0`
+for complete evidence, `2` for valid incomplete evidence (a ZIP is still created), and `1` for
+refusal or failure. See [Record and export session evidence](../how-to/record-session-evidence.md).
 
 ## `tools`
 

@@ -736,7 +736,10 @@ mod tests {
                 std::process::id(),
                 CLIP_TOKEN.fetch_add(1, Ordering::Relaxed)
             );
-            let root = std::env::temp_dir().join("glass-macos-artifact-probe");
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join("glass-macos-artifact-probe");
             let process_dir = root.join(&nonce);
             let lease = root.join(format!("{nonce}.lease"));
             let marker = process_dir.join("marker");
@@ -814,6 +817,53 @@ mod tests {
             fixture.marker_text
         );
         assert_eq!(std::fs::read_to_string(&fixture.lease).unwrap(), "lease");
+    }
+
+    #[test]
+    #[ignore = "requires macOS Seatbelt"]
+    #[cfg(target_os = "macos")]
+    fn protected_trace_root_denies_current_and_retained_history() {
+        let fixture = ArtifactProbeFixture::new();
+        let history = fixture.process_dir.join("retained");
+        std::fs::create_dir(&history).unwrap();
+        let old = history.join("old-evidence");
+        std::fs::write(&old, "retained evidence").unwrap();
+        let probe = sandbox_probe_path();
+        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
+            let mut launch = spec(&[
+                probe.to_str().unwrap(),
+                "--protected-file",
+                "CURRENT",
+                "--protected-file",
+                "HISTORY",
+            ]);
+            launch.sandbox = level;
+            // Re-allowing the target's cwd must not override the protected subtree.
+            launch.cwd = fixture.process_dir.parent().map(Path::to_owned);
+            launch.env = vec![
+                ("CURRENT".into(), fixture.marker.to_str().unwrap().into()),
+                ("HISTORY".into(), old.to_str().unwrap().into()),
+            ];
+            let logs = empty_sink();
+            let mut launched = spawn(
+                &launch,
+                logs.clone(),
+                &[ProtectedHostPath::directory(&fixture.process_dir)],
+            )
+            .unwrap();
+            let status = launched.child.wait().unwrap();
+            drop(launched);
+            assert!(
+                status.success(),
+                "{level} probe failed: {:?}",
+                logs.lock().unwrap()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&fixture.marker).unwrap(),
+            fixture.marker_text
+        );
+        assert_eq!(std::fs::read_to_string(old).unwrap(), "retained evidence");
     }
 
     /// glass#477: the launch's readers are the caller's to end, and the last thing the app said

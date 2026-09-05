@@ -96,10 +96,9 @@ pub(crate) enum ArtifactDescriptorError {
 }
 
 impl ArtifactDescriptor {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Used by artifact verification tests.")
-    )]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
     pub(crate) fn uri(&self) -> &str {
         &self.uri
     }

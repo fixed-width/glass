@@ -135,7 +135,8 @@ foreach ($t in $targetList) {
 # the interactive session via the same schtasks /it path the examples use.
 if ($Tests -ne "") {
   Write-Host "`n===== tests: --ignored $Tests ====="
-  $json = cmd /c "cargo test -p glass-windows --no-run --message-format=json $relArg 2>&1"
+  $testTarget = if ($Tests -in @("artifact", "protected_trace_root")) { "--lib" } else { "" }
+  $json = cmd /c "cargo test -p glass-windows $testTarget --no-run --message-format=json $relArg 2>&1"
   if ($LASTEXITCODE -ne 0) {
     $json | Select-Object -Last 20 | Out-Host
     Write-Host "tests($Tests): FAIL (build)"; $failures++
@@ -144,28 +145,30 @@ if ($Tests -ne "") {
     foreach ($line in $json) {
       if ($line -notmatch '"reason"') { continue }
       try { $o = $line | ConvertFrom-Json } catch { continue }
-      if ($o.reason -eq "compiler-artifact" -and $o.executable -and ($o.target.kind -contains "test")) {
+      if ($o.reason -eq "compiler-artifact" -and $o.executable -and $o.profile.test) {
         $exes += $o.executable
       }
     }
     if ($exes.Count -eq 0) {
-      Write-Host "tests($Tests): FAIL (no integration test binary built)"; $failures++
+      Write-Host "tests($Tests): FAIL (no test binary built)"; $failures++
     } else {
       $anyFail = $false
       $artifactMatches = 0
+      $traceMatches = 0
       $safeTests = ($Tests -replace '[^A-Za-z0-9_.-]', '_')
       $artifactEvidence = Join-Path $artifacts "artifact.log"
       if ($Tests -eq "artifact" -and (Test-Path $artifactEvidence)) { Remove-Item $artifactEvidence -Force }
       foreach ($exe in $exes) {
         $tag = [System.IO.Path]::GetFileNameWithoutExtension($exe)
         if ($Tests -eq "artifact") {
-          $testArgs = "--ignored --test-threads=1 --exact containment::artifact_onbox::sandboxie_denies_artifact_read_and_lease_tampering"
+          $testArgs = "--ignored --test-threads=1 sandboxie_denies_artifact"
           $evidenceTag = "artifact"
         } else {
           $testArgs = "--ignored --test-threads=1 $Tests"
           $evidenceTag = "$tag-$safeTests"
         }
-        $r = Invoke-Interactive $exe $tag $testArgs
+        $runTag = if ($Tests -eq "artifact") { "artifact" } else { $tag }
+        $r = Invoke-Interactive $exe $runTag $testArgs
         Write-Host $r.text
         if ($Tests -eq "artifact") {
           $r.text | Out-File -Encoding ascii -Append $artifactEvidence
@@ -177,10 +180,19 @@ if ($Tests -ne "") {
             $r.text -match 'test result: ok\. 1 passed;') {
           $artifactMatches++
         }
+        if ($Tests -eq "protected_trace_root" -and
+            $r.text -match 'test containment::artifact_onbox::protected_trace_root_denies_current_and_retained_history \.\.\. ok' -and
+            $r.text -match 'test result: ok\. 1 passed;') {
+          $traceMatches++
+        }
         if (-not ($r.ran -and $r.result -eq "0")) { $anyFail = $true }
       }
       if ($Tests -eq "artifact" -and $artifactMatches -ne 1) {
         Write-Host "tests(artifact): FAIL (expected exactly one passing artifact test, found $artifactMatches)"
+        $anyFail = $true
+      }
+      if ($Tests -eq "protected_trace_root" -and $traceMatches -ne 1) {
+        Write-Host "tests(protected_trace_root): FAIL (expected exactly one passing trace test, found $traceMatches)"
         $anyFail = $true
       }
       if ($anyFail) { Write-Host "tests($Tests): FAIL"; $failures++ } else { Write-Host "tests($Tests): PASS" }

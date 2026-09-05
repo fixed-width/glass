@@ -29,6 +29,9 @@ serde_json = "1"
 schemars = "1"
 base64 = "0.23"
 anyhow = "1"
+cap-std = "4"
+cap-fs-ext = "4"
+zip = { version = "8.6", default-features = false }
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }

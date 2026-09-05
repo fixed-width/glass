@@ -48,6 +48,7 @@ pub use wait::{
 };
 
 struct ActiveSession {
+    backend: String,
     platform: Box<dyn Platform + Send>,
     // Held here so the session owns the backend's accessibility reader and the
     // last-captured tree (read by the a11y tools).
@@ -111,6 +112,10 @@ pub struct Glass {
 }
 
 impl Glass {
+    /// Backend of the current session, without querying the target.
+    pub fn active_backend(&self) -> Option<&str> {
+        self.active.as_ref().map(|session| session.backend.as_str())
+    }
     pub fn new(
         factory: PlatformFactory,
         default_backend: String,

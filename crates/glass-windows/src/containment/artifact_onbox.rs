@@ -22,6 +22,7 @@ enum AccessResult {
 #[derive(Debug, PartialEq, Eq)]
 struct ProbeResult {
     marker_read: AccessResult,
+    marker_write: AccessResult,
     lease_write: AccessResult,
 }
 
@@ -57,6 +58,7 @@ fn parse_probe_logs(text: &str) -> Result<ProbeResult, ProbeParseError> {
     }
     Ok(ProbeResult {
         marker_read: parse_access(text, "MARKER"),
+        marker_write: parse_access(text, "MARKER_WRITE"),
         lease_write: parse_access(text, "LEASE"),
     })
 }
@@ -68,7 +70,6 @@ struct ArtifactOnboxFixture {
     marker: PathBuf,
     marker_text: String,
     lease: Option<File>,
-    box_prefix: String,
 }
 
 impl ArtifactOnboxFixture {
@@ -99,7 +100,6 @@ impl ArtifactOnboxFixture {
             marker,
             marker_text,
             lease: Some(lease),
-            box_prefix: format!("glass_artifact_{nonce}"),
         }
     }
 
@@ -113,7 +113,7 @@ impl ArtifactOnboxFixture {
     fn run_probe_in_sandboxie(&self, level: SandboxLevel) -> Result<ProbeResult, ProbeParseError> {
         let dir = sandboxie_dir();
         assert!(available(&dir), "Sandboxie not available at {dir}");
-        let box_name = format!("{}_{level}", self.box_prefix);
+        let box_name = super::sandboxie::unique_box_name();
         let sandboxie = Sandboxie::new(dir, box_name);
         sandboxie
             .configure_with_paths(level, &self.protected_paths())
@@ -121,7 +121,12 @@ impl ArtifactOnboxFixture {
 
         let marker = path_string(&self.marker);
         let lease = path_string(&self.lease_path);
-        let script = "$ErrorActionPreference='Stop'; try { [void][IO.File]::ReadAllText($env:ARTIFACT_MARKER); Write-Output 'MARKER_SUCCESS' } catch { Write-Output ('MARKER_ERROR:'+ $_.Exception.HResult) }; try { [IO.File]::AppendAllText($env:ARTIFACT_LEASE,'tamper'); Write-Output 'LEASE_SUCCESS' } catch { Write-Output ('LEASE_ERROR:'+ $_.Exception.HResult) }; Write-Output 'PROBE_COMPLETE'".to_string();
+        let probe = "$ErrorActionPreference='Stop'; try { [void][IO.File]::ReadAllText($env:ARTIFACT_MARKER); Write-Output 'MARKER_SUCCESS' } catch { Write-Output ('MARKER_ERROR:'+ $_.Exception.GetBaseException().HResult) }; try { [IO.File]::AppendAllText($env:ARTIFACT_MARKER,'tamper'); Write-Output 'MARKER_WRITE_SUCCESS' } catch { Write-Output ('MARKER_WRITE_ERROR:'+ $_.Exception.GetBaseException().HResult) }; try { [IO.File]::AppendAllText($env:ARTIFACT_LEASE,'tamper'); Write-Output 'LEASE_SUCCESS' } catch { Write-Output ('LEASE_ERROR:'+ $_.Exception.GetBaseException().HResult) }; Write-Output 'PROBE_COMPLETE'";
+        let script = format!(
+            "$env:ARTIFACT_MARKER='{}'; $env:ARTIFACT_LEASE='{}'; {probe}",
+            marker.replace('\'', "''"),
+            lease.replace('\'', "''")
+        );
         let spec = AppSpec {
             build: None,
             run: vec![
@@ -215,6 +220,7 @@ fn sandboxie_denies_artifact_read_and_lease_tampering() {
             .run_probe_in_sandboxie(level)
             .expect("probe reached completion sentinel");
         assert_eq!(result.marker_read, AccessResult::Denied);
+        assert_eq!(result.marker_write, AccessResult::Denied);
         assert_eq!(result.lease_write, AccessResult::Denied);
     }
     assert_eq!(
@@ -222,6 +228,43 @@ fn sandboxie_denies_artifact_read_and_lease_tampering() {
         fixture.marker_text
     );
     assert_eq!(fixture.conflicting_lease_open_error(), SHARING_VIOLATION);
+}
+
+#[test]
+#[ignore = "requires Windows Sandboxie Plus"]
+fn protected_trace_root_denies_current_and_retained_history() {
+    let mut fixture = ArtifactOnboxFixture::new();
+    let current = fixture.marker.clone();
+    let history = fixture.process_dir.join("retained");
+    std::fs::create_dir(&history).unwrap();
+    let old = history.join("old-evidence");
+    std::fs::write(&old, "retained evidence").unwrap();
+    for marker in [&current, &old] {
+        fixture.marker = marker.clone();
+        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
+            let result = fixture
+                .run_probe_in_sandboxie(level)
+                .expect("probe completed");
+            assert_eq!(
+                result.marker_read,
+                AccessResult::Denied,
+                "{level} {marker:?}"
+            );
+            assert_eq!(
+                result.marker_write,
+                AccessResult::Denied,
+                "{level} {marker:?}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(&current).unwrap(),
+        fixture.marker_text
+    );
+    assert_eq!(std::fs::read_to_string(&old).unwrap(), "retained evidence");
+    std::fs::remove_file(old).unwrap();
+    std::fs::remove_dir(history).unwrap();
+    fixture.marker = current;
 }
 
 #[cfg(test)]

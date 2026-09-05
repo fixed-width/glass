@@ -20,6 +20,7 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
+- Optional `--trace-dir` retains supplied tool inputs and requested results in a bounded private session trace. Offline `trace inspect` and `trace export` validate and package evidence after the server stops, with explicit omissions and unchanged tool execution when recording reaches a limit or fails.
 - Optional `--tool-profile lean` exposes 20 tools with actions through `glass_do`; the complete 31-tool profile remains the default. `glass-mcp tools --json` reports either profile's definitions, shared instructions and schema cost without starting a session.
 - `glass_click_element`, `glass_set_value`, and `glass_type` can now resolve a unique semantic target immediately before acting, wait within one action deadline, and disclose native or pointer actionability and dispatch truth. Pointer actions refuse ambiguous, stale, disabled, hidden, moving, off-window, or provably occluded targets without unsafe retry; native accessibility actions may bypass geometry blockers. Existing ID actions and untargeted typing remain compatible.
 - `glass_find_elements` performs a fresh bounded accessibility search across native and published web content, returning up to 20 ranked actionable matches with semantic scope, optional publication waiting, compact context, explicit incompleteness, secure-value exclusion, and an 8 KiB total response ceiling.

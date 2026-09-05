@@ -45,6 +45,7 @@ impl Glass {
             ) => HostPathAccess::DeniedBySandbox,
         };
         let mut session = ActiveSession {
+            backend: backend.to_owned(),
             platform,
             accessibility,
             last_ax: None,
@@ -105,15 +106,22 @@ impl Glass {
     /// A third step between them is bounded by neither — dropping the session reaps the backend
     /// (Xvfb, sway, a Job object) and the log-stream children, each an unbounded `wait()`.
     pub fn shutdown(&mut self, deadline: Deadline) {
-        if let Some(mut s) = self.active.take() {
-            let _ = s
-                .platform
-                .stop_app_by(deadline.reserving(crate::TEARDOWN_HOOK_RESERVE));
+        let _ = self.shutdown_report(deadline);
+    }
+
+    /// Tear down the session and host hook, retaining any target-stop error.
+    pub fn shutdown_report(&mut self, deadline: Deadline) -> Result<()> {
+        let outcome = if let Some(mut s) = self.active.take() {
+            s.platform
+                .stop_app_by(deadline.reserving(crate::TEARDOWN_HOOK_RESERVE))
             // `s` drops here: the backend (Xvfb/sway/Job) is torn down.
-        }
+        } else {
+            Ok(())
+        };
         if let Some(hook) = self.shutdown_hook.take() {
             hook(deadline);
         }
+        outcome
     }
 
     pub fn geometry(&self) -> Result<WindowGeometry> {

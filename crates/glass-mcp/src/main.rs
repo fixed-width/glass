@@ -1,29 +1,56 @@
 use clap::Parser;
-use glass_mcp::cli::{Cli, Command};
+use glass_mcp::cli::{Cli, Command, TraceCommand};
 use glass_mcp::launch::NoArgLaunch;
 use glass_mcp::{
     boot, launch, onboarding, run_debug_checklist, run_debug_grants, run_doctor, run_env,
-    run_status, run_stdio_with_profile, run_uninstall, setup,
+    run_status, run_stdio_configured, run_uninstall, setup,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // One-time AppKit/WindowServer init — must run on the process's real main thread
-    // ("thread 0"), exactly once, before anything spawns the `glass-platform` worker thread
-    // that `GlassServer::new` parents every `MacosPlatform` call to. This is the FIRST
-    // statement of `main()`, with no `.await` above it: `#[tokio::main]` calls
-    // `Runtime::block_on` on the thread that invoked `main()` and polls the async body on
-    // that same thread, so this runs synchronously on thread 0, strictly before
-    // `boot()`/`run_stdio()` construct a `GlassServer`.
-    #[cfg(target_os = "macos")]
-    glass_macos::init_main_thread();
-
     let cli = Cli::parse();
+    // AppKit setup precedes platform workers; offline evidence commands need none.
+    #[cfg(target_os = "macos")]
+    if !matches!(
+        cli.command,
+        Some(Command::Tools { .. } | Command::Trace { .. })
+    ) {
+        glass_macos::init_main_thread();
+    }
     let audit_log = cli.audit_log;
     let tool_profile = cli.tool_profile;
+    let trace = cli
+        .trace_dir
+        .map(|directory| glass_mcp::trace::TraceConfig::new(directory, cli.trace_max_bytes))
+        .transpose()?;
     // Resolve (and OPEN, fail-closed) the audit sink only in the serving arms below —
     // never for doctor/env/gen-token, so those never create the audit file as a side effect.
     match cli.command {
+        Some(Command::Trace { command }) => {
+            let report = match command {
+                TraceCommand::Inspect { directory, json } => {
+                    let report = glass_mcp::trace::inspect(&directory)?;
+                    glass_mcp::trace::print_inspection(&report, json)?;
+                    report
+                }
+                TraceCommand::Export { directory, out } => {
+                    let report = glass_mcp::trace::export(&directory, &out)?;
+                    eprintln!(
+                        "glass: exported {} trace to {out:?}",
+                        if report.complete {
+                            "complete"
+                        } else {
+                            "incomplete"
+                        }
+                    );
+                    report
+                }
+            };
+            if report.exit_code() != 0 {
+                std::process::exit(report.exit_code());
+            }
+            Ok(())
+        }
         Some(Command::Tools { json }) => glass_mcp::tool_profile::print_tools(tool_profile, json),
         // No subcommand: a LaunchServices double-click routes to onboarding; an MCP client's
         // stdio spawn (the default, and the only case off macOS) serves MCP over stdio.
@@ -32,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
             NoArgLaunch::StdioServe => {
                 let (sink, report) =
                     glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
-                run_stdio_with_profile(boot(sink), report, tool_profile).await
+                run_stdio_configured(boot(sink), report, tool_profile, trace.as_ref()).await
             }
         },
         Some(Command::Doctor { deep, json, color }) => {
@@ -76,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .map_err(|e| anyhow::anyhow!("glass serve --menubar: {e}"))?;
                         cfg.tool_profile = tool_profile;
+                        cfg.trace = trace;
                         glass_mcp::menubar::run(cfg)
                     }
                     #[cfg(not(target_os = "macos"))]
@@ -86,7 +114,16 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     let (sink, report) =
                         glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
-                    glass_mcp::serve::run(http, addr, token_file, sink, report, tool_profile).await
+                    glass_mcp::serve::run_configured(
+                        http,
+                        addr,
+                        token_file,
+                        sink,
+                        report,
+                        tool_profile,
+                        trace,
+                    )
+                    .await
                 }
             }
             #[cfg(not(feature = "network"))]

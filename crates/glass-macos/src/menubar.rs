@@ -61,6 +61,7 @@ struct Ivars {
     on_copy: Box<dyn Fn()>,
     on_restart: Box<dyn Fn()>,
     on_uninstall: Box<dyn Fn()>,
+    on_quit: Option<Box<dyn Fn()>>,
 }
 
 define_class!(
@@ -90,6 +91,12 @@ define_class!(
         #[unsafe(method(uninstall:))]
         fn uninstall(&self, _sender: Option<&AnyObject>) {
             (self.ivars().on_uninstall)();
+        }
+
+        #[unsafe(method(quit:))]
+        fn quit(&self, _sender: Option<&AnyObject>) {
+            if let Some(quit) = &self.ivars().on_quit { quit(); }
+            NSApplication::sharedApplication(self.mtm()).terminate(None);
         }
     }
 
@@ -146,6 +153,11 @@ fn action_item(
 /// precondition this crate can enforce; everything else (the status item appearing, the menu
 /// firing its actions, `terminate:` quitting cleanly) is main-thread AppKit runtime behavior.
 pub fn run(actions: MenuBarActions) -> Result<()> {
+    run_with_quit(actions, None)
+}
+
+/// Run the menu with an optional host cleanup callback before quitting.
+pub fn run_with_quit(actions: MenuBarActions, on_quit: Option<Box<dyn Fn()>>) -> Result<()> {
     let mtm = MainThreadMarker::new().ok_or_else(|| {
         GlassError::Backend("the menu-bar app must start on the main thread".into())
     })?;
@@ -168,6 +180,7 @@ pub fn run(actions: MenuBarActions) -> Result<()> {
             on_copy: actions.on_copy,
             on_restart: actions.on_restart,
             on_uninstall: actions.on_uninstall,
+            on_quit,
         },
     );
 
@@ -195,7 +208,11 @@ pub fn run(actions: MenuBarActions) -> Result<()> {
     menu.addItem(&sep2);
 
     // 4. Quit glass — nil target lets the responder chain deliver `terminate:` to `NSApp`.
-    let quit_item = action_item(mtm, "Quit glass", sel!(terminate:), "q", None);
+    let quit_item = if target.ivars().on_quit.is_some() {
+        action_item(mtm, "Quit glass", sel!(quit:), "q", Some(&target))
+    } else {
+        action_item(mtm, "Quit glass", sel!(terminate:), "q", None)
+    };
     menu.addItem(&quit_item);
 
     // 5. Uninstall glass… — routed to our custom target. The trailing ellipsis is the macOS
