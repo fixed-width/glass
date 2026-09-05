@@ -1622,7 +1622,7 @@ fn pointer_plan_change_resets_stability_when_identity_and_bounds_are_equal() {
 
     glass
         .click_target_inner(
-            pointer_params(ActionTarget::Semantic(semantic_target("Save")), Some(600)),
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
             Deadline::UNBOUNDED,
         )
         .unwrap();
