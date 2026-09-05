@@ -22,6 +22,17 @@ def normalize(request, decoded):
         "result": result,
         "nodes": nodes,
     }
+    if request["name"] == "glass_list_windows":
+        facts["windows"] = [
+            window
+            for value in decoded["observations"]
+            if isinstance(value, list)
+            for window in value
+        ]
+    if request["name"] == "glass_select_window":
+        facts["selected_window"] = request["arguments"]["id"]
+    if request["name"] == "glass_key":
+        facts["key"] = request["arguments"].get("chord")
     if request["name"] == "glass_a11y_snapshot":
         body = "\n".join(
             value for value in decoded["observations"] if isinstance(value, str)

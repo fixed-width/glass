@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Account web form</title>
+<style>body {font: 18px sans-serif; margin: 20px} label {display: block; margin: 12px 0} input {width: 240px} button {min-height: 44px}</style>
+<h1>Account web form</h1>
+<label>Account name <input id="account" aria-label="Account name"></label>
+<button id="save">Save account</button>
+<label>Saved value <input id="saved" aria-label="Saved value" readonly></label>
+<label>Submission count <input id="count" aria-label="Submission count" readonly value="0"></label>
+<script>
+document.getElementById('save').addEventListener('click', () => {
+  const value = document.getElementById('account').value;
+  window.accountStore.save(value);
+  document.getElementById('saved').value = value;
+  document.getElementById('count').value = String(Number(document.getElementById('count').value) + 1);
+});
+</script>
+</html>

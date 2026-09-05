@@ -2,31 +2,34 @@
 """Run and revalidate repeated application interactions through external MCP servers."""
 
 import argparse
-from contextlib import contextmanager
 import datetime as dt
 import json
 import os
-from pathlib import Path
 import platform
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
+from contextlib import contextmanager
+from pathlib import Path
 
-from cases import CASES, REVISION, evaluate, evaluate_setup, execute
-from drivers.glass import Driver as GlassDriver, normalize as glass_normalize
+from application_cases import CASES as APPLICATION_CASES
+from application_config import configure as configure_applications
+from application_config import frozen_paths as application_frozen_paths
+from application_config import prerequisites as application_prerequisites
+from application_config import runtime_metadata
+from application_run import attempt as application_attempt
+from cases import CASES as WEB_CASES
+from cases import evaluate, evaluate_setup, execute
+
+from drivers.glass import Driver as GlassDriver
 from evidence import Evidence, EvidenceError
 from fixtures import Fixtures
 from measurement import (
-    COUNTERS,
-    PHASES,
     canonical,
-    call_metrics,
     digest,
     file_identity,
-    owned_path,
     phase_totals,
     schedule,
     summarize,
@@ -35,14 +38,17 @@ from measurement import (
 )
 from protocol import Client, ProtocolError
 from sessions import Session
+from validation import read_channel, validate_totals
 
+CASES = {**WEB_CASES, **APPLICATION_CASES}
+REVISION = 2
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULTS = {
     "schema_version": 1,
     "repetitions": 10,
     "warmups": 1,
     "seed": 41,
-    "cases": list(CASES),
+    "cases": list(WEB_CASES),
     "browser_family": "firefox",
     "sandbox": "off",
     "display": [1280, 900],
@@ -65,7 +71,7 @@ def load_config(path, registry):
     unknown = (
         set(supplied)
         - set(DEFAULTS)
-        - {"browser", "browser_args", "app_env", "drivers", "notes"}
+        - {"browser", "browser_args", "app_env", "drivers", "notes", "applications"}
     )
     if unknown:
         raise ValueError(f"unknown configuration options: {sorted(unknown)}")
@@ -104,7 +110,12 @@ def load_config(path, registry):
             raise ValueError(f"invalid {key} dimensions")
     if type(config["allow_dirty"]) is not bool:
         raise ValueError("allow_dirty must be boolean")
-    config["browser"] = str(Path(config["browser"]).expanduser().resolve(strict=True))
+    if set(config["cases"]) & WEB_CASES.keys():
+        config["browser"] = str(
+            Path(config["browser"]).expanduser().resolve(strict=True)
+        )
+    else:
+        config["browser"] = None
     drivers = config.get(
         "drivers",
         [
@@ -160,6 +171,7 @@ def load_config(path, registry):
                 "exclusions require a unique optional driver/case and reason"
             )
         excluded.add(key)
+    configure_applications(config)
     return config
 
 
@@ -178,7 +190,8 @@ def preflight(config):
     for command in ("Xvfb", "dbus-daemon"):
         if not shutil.which(command):
             errors.append(f"missing prerequisite {command}")
-    if not os.access(config["browser"], os.X_OK):
+    errors.extend(application_prerequisites(config))
+    if config["browser"] and not os.access(config["browser"], os.X_OK):
         errors.append("browser is not executable")
     dirty = git_output("status", "--porcelain")
     if dirty and not config["allow_dirty"]:
@@ -193,7 +206,9 @@ def preflight(config):
             "tree": git_output("rev-parse", "HEAD^{tree}"),
             "dirty": dirty,
         },
-        "browser": {"path": config["browser"], **file_identity(config["browser"])},
+        "browser": {"path": config["browser"], **file_identity(config["browser"])}
+        if config["browser"]
+        else None,
         "configuration_sha256": digest(config),
         "scheduled_attempts": len(config["cases"])
         * len(config["drivers"])
@@ -366,153 +381,17 @@ def attempt(config, cell, directory, fixtures, adapter):
     return result
 
 
-class ReplayClient:
-    def __init__(self, directory, calls, origin):
-        self.directory, self.all_calls = directory, calls
-        self.calls = [{"sequence": origin}]
-        self.origin = origin
-
-    def rpc(self, method, params, **kwargs):
-        for call in self.all_calls:
-            if call["sequence"] <= self.origin:
-                continue
-            if call["method"] == "tools/call":
-                break
-            request = json.loads(
-                owned_path(self.directory, call["request_file"]).read_bytes()
-            )
-            if (
-                request["method"] == method
-                and request["params"] == params
-                and call["response_file"]
-            ):
-                self.origin = call["sequence"]
-                return json.loads(
-                    owned_path(self.directory, call["response_file"]).read_bytes()
-                )
-        raise EvidenceError("missing recorded resource read")
-
-
 def validate_attempt(directory, result, adapter, config=None):
-    errors = verify_files(directory, result["files"])
     if result["outcome"] in ("skipped", "unsupported"):
-        return errors
-    calls_path = directory / "mcp/calls.json"
-    if not calls_path.is_file():
-        return errors + ["missing call ledger"]
-    calls = json.loads(calls_path.read_bytes())
-    sequences = [c["sequence"] for c in calls]
-    if sequences != list(range(1, len(calls) + 1)):
-        errors.append("RPC ledger sequences are not contiguous and unique")
-    for call in calls:
-        try:
-            request_path = owned_path(directory / "mcp", call["request_file"])
-            raw = request_path.read_bytes()
-            request = json.loads(raw)
-            if (
-                request["id"] != call["sequence"]
-                or request["method"] != call["method"]
-                or len(raw) != call["request_wire_bytes"]
-            ):
-                errors.append(f"request accounting mismatch: {call['sequence']}")
-            response = {"result": {}}
-            if call["response_file"]:
-                raw = owned_path(directory / "mcp", call["response_file"]).read_bytes()
-                response = json.loads(raw)
-                if (
-                    response["id"] != call["sequence"]
-                    or len(raw) != call["response_wire_bytes"]
-                ):
-                    errors.append(f"response accounting mismatch: {call['sequence']}")
-            for key, expected in call_metrics(request, response).items():
-                if (
-                    key not in ("request_wire_bytes", "response_wire_bytes")
-                    and call.get(key, 0) != expected
-                ):
-                    errors.append(f"call metric mismatch: {call['sequence']} {key}")
-        except (ValueError, KeyError, OSError) as exc:
-            errors.append(f"invalid call record: {exc}")
-    timing = json.loads((directory / "timing.json").read_bytes())
-    if result["wall_ms"] != timing["wall_ms"] or result["phases"] != phase_totals(
-        calls + result.get("file_reads", []), timing["durations"]
-    ):
-        errors.append("phase totals differ from recorded calls and timing")
-    indexed = {c["sequence"]: c for c in calls}
-    for sha, artifact in result["artifacts"].items():
-        try:
-            identity = file_identity(
-                owned_path(directory / "evidence", artifact["path"])
-            )
-            if sha != artifact["sha256"] or identity != {
-                "bytes": artifact["bytes"],
-                "sha256": sha,
-            }:
-                errors.append("artifact metadata differs from archived body")
-        except (ValueError, KeyError, OSError) as exc:
-            errors.append(f"invalid archived artifact: {exc}")
-    for read in result.get("file_reads", []):
-        artifact = result["artifacts"].get(read.get("sha256"), {})
-        expected_metrics = {key: 0 for key in COUNTERS}
-        expected_metrics.update(file_reads=1, response_text_bytes=artifact.get("bytes"))
-        if (
-            read.get("method") != "files/read"
-            or read.get("phase") not in PHASES
-            or any(read.get(key, 0) != value for key, value in expected_metrics.items())
-        ):
-            errors.append("file read contains invalid method, phase or counters")
-        if (
-            read.get("file_reads") != 1
-            or read.get("response_text_bytes") != artifact.get("bytes")
-            or read.get("origin_call") not in indexed
-            or not any(
-                ref["sha256"] == read.get("sha256")
-                and ref["origin_call"] == read.get("origin_call")
-                for ref in result.get("artifact_references", [])
-            )
-        ):
-            errors.append("file read accounting differs from artifact evidence")
-    if result["case"] == "large-form":
-        task_calls = [c for c in calls if c["phase"] == "task"]
-        if any(
-            c.get("images")
-            or c.get("tool") in ("glass_snapshot", "glass_a11y_snapshot")
-            for c in task_calls
-        ):
-            errors.append("normal form workflow acquired an image or full snapshot")
-    reconstructed = []
-    with tempfile.TemporaryDirectory(prefix="interaction-validate-") as temporary:
-        for event in result["events"]:
-            try:
-                call = indexed[event["call"]]
-                if call["step"] != event["step"] or call["response_file"] is None:
-                    raise EvidenceError("event does not match its RPC ledger entry")
-                request = json.loads(
-                    owned_path(directory / "mcp", call["request_file"]).read_bytes()
-                )
-                response = json.loads(
-                    owned_path(directory / "mcp", call["response_file"]).read_bytes()
-                )
-                if hasattr(adapter, "replay"):
-                    facts = adapter.replay(
-                        request["params"], response, directory, result
-                    )
-                else:
-                    evidence = Evidence(
-                        Path(temporary),
-                        ReplayClient(directory / "mcp", calls, event["call"]),
-                    )
-                    facts = glass_normalize(
-                        request["params"],
-                        evidence.decode(request["params"]["name"], response),
-                    )
-                if facts != event["facts"]:
-                    errors.append(f"changed interpreted facts: {event['step']}")
-                reconstructed.append({"step": event["step"], "facts": facts})
-            except (ValueError, KeyError, OSError, EvidenceError) as exc:
-                errors.append(f"{event['step']}: {exc}")
-    oracle_errors = evaluate(result["case"], reconstructed, result["artifacts"])
+        return verify_files(directory, result["files"])
+    if "participants" in result:
+        from application_run import validate_application
+
+        return validate_application(directory, result, config)
+    errors, reconstructed, calls = read_channel(directory, result, adapter)
+    errors += validate_totals(directory, result, calls)
     if result["outcome"] in ("task_completed", "expected_refusal"):
-        errors += oracle_errors
+        errors += evaluate(result["case"], reconstructed, result["artifacts"])
         if config:
             errors += evaluate_setup(reconstructed, config["viewport"])
         if result["outcome"] != CASES[result["case"]]:
@@ -569,6 +448,20 @@ def saved_run(directory, registry):
                 errors.append(f"tool inventory accounting mismatch {path.name}")
             if inventories.setdefault(cell["driver"], identity) != identity:
                 errors.append(f"tool inventory changed during cohort {path.name}")
+        for name in row.get("participants", {}):
+            inventory_path = path / name / "mcp/inventory.json"
+            if name not in ("app", "source", "destination"):
+                errors.append(f"unexpected participant name {path.name}")
+                continue
+            if inventory_path.is_file():
+                identity = digest(json.loads(inventory_path.read_bytes()))
+                if (
+                    inventories.setdefault((cell["driver"], "application"), identity)
+                    != identity
+                ):
+                    errors.append(
+                        f"participant tool inventory changed during cohort {path.name}"
+                    )
         adapter = registry[
             next(d["adapter"] for d in config["drivers"] if d["id"] == cell["driver"])
         ]
@@ -608,25 +501,28 @@ def run(config, output, registry):
         },
         "identities": {},
         "fixture_files": {},
+        "application_runtime": runtime_metadata(config),
     }
-    manifest["browser_version"] = (
-        subprocess.check_output(
-            [config["browser"], "--version"], timeout=10, stderr=subprocess.STDOUT
+    manifest["browser_components"] = {}
+    if config["browser"]:
+        manifest["browser_version"] = (
+            subprocess.check_output(
+                [config["browser"], "--version"], timeout=10, stderr=subprocess.STDOUT
+            )
+            .decode("utf-8")
+            .strip()
         )
-        .decode("utf-8")
-        .strip()
-    )
-    manifest["browser_components"] = {
-        name: file_identity(Path(config["browser"]).parent / name)
-        for name in (
-            "application.ini",
-            "platform.ini",
-            "libxul.so",
-            "omni.ja",
-            "browser/omni.ja",
-        )
-        if (Path(config["browser"]).parent / name).is_file()
-    }
+        manifest["browser_components"] = {
+            name: file_identity(Path(config["browser"]).parent / name)
+            for name in (
+                "application.ini",
+                "platform.ini",
+                "libxul.so",
+                "omni.ja",
+                "browser/omni.ja",
+            )
+            if (Path(config["browser"]).parent / name).is_file()
+        }
     for driver in config["drivers"]:
         manifest["identities"][driver["id"]] = {
             "command": driver["command"],
@@ -657,12 +553,40 @@ def run(config, output, registry):
             target = output / "source/examples/interaction-fixture" / path.name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, target)
+    if set(config["cases"]) & APPLICATION_CASES.keys():
+        sources = (
+            subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(ROOT),
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "--",
+                    "examples/electron-interaction-fixture",
+                    "examples/android-role-fixture",
+                    "crates/glass-fixture-egui",
+                ]
+            )
+            .decode()
+            .splitlines()
+        )
+        for source in sources:
+            path = ROOT / source
+            if path.is_file():
+                target = output / "source" / source
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, target)
     manifest["source_files"] = {
         str(path.relative_to(output)): file_identity(path)
         for path in (output / "source").rglob("*")
         if path.is_file()
     }
-    frozen_paths = {Path(config["browser"])}
+    frozen_paths = application_frozen_paths(config)
+    if config["browser"]:
+        frozen_paths.add(Path(config["browser"]))
     frozen_paths.update(
         Path(config["browser"]).parent / name for name in manifest["browser_components"]
     )
@@ -680,7 +604,11 @@ def run(config, output, registry):
                 ["git", "-C", str(ROOT), "diff", "HEAD", "--binary"]
             )
         )
-    fixtures = Fixtures(ROOT / "examples/interaction-fixture")
+    fixtures = (
+        Fixtures(ROOT / "examples/interaction-fixture")
+        if set(config["cases"]) & WEB_CASES.keys()
+        else None
+    )
     manifest["preparation_ms"] = (time.monotonic() - started) * 1000
     write_json(output / "manifest.json", manifest)
     results, halted = [], None
@@ -712,7 +640,11 @@ def run(config, output, registry):
                 }
                 write_json(directory / "result.json", result)
             else:
-                result = attempt(config, cell, directory, fixtures, adapter)
+                result = (
+                    application_attempt(config, cell, directory)
+                    if cell["case"] in APPLICATION_CASES
+                    else attempt(config, cell, directory, fixtures, adapter)
+                )
                 if not result["cleanup_ok"] or result["interrupted"]:
                     halted = "previous attempt interrupted or cleanup failed"
             results.append(result)
@@ -727,7 +659,8 @@ def run(config, output, registry):
                 {"configuration_sha256": digest(config), "groups": summarize(results)},
             )
     finally:
-        fixtures.close()
+        if fixtures:
+            fixtures.close()
         manifest["final_identity_errors"] = []
         for path, expected in manifest["frozen_files"].items():
             try:

@@ -51,6 +51,8 @@ browser that publishes accessibility controls. The runner uses owned displays an
    wrong values and duplicate activations are evidence of a limitation or regression, not successful
    conformance. Preserve the failed run before changing code or settings.
 
+For packaged Electron, Android and native application tasks, see
+[measure application boundaries](measure-application-boundaries.md).
 For configuration limits, record formats, metrics, outcome rules and cleanup behavior, see the
 [runner reference](../../tools/interaction-bench/README.md). The existing
 [verification-cost benchmark](verification-cost.md) remains useful for its native fixture and

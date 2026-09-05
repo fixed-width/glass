@@ -38,6 +38,8 @@ way it does? The explanations.
 - [Benchmark and profile](how-to/benchmarking.md)
 - [Measure what the verification loop costs](how-to/verification-cost.md) — semantic vs
   screenshot-every-step, round-trips and tokens
+- [Measure application boundaries](how-to/measure-application-boundaries.md) — packaged Electron,
+  Android native/WebView, native forms and transfer between two applications.
 - [Measure repeated application interactions](how-to/measure-interactions.md) — web conformance,
   exact outcomes, preserved evidence and phase costs
 

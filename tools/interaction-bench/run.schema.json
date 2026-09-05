@@ -102,7 +102,11 @@
         "mutation",
         "iframe",
         "cross-origin",
-        "artifact"
+        "artifact",
+        "electron-form",
+        "android-boundary",
+        "native-form",
+        "cross-application"
       ]
     },
     "cell": {
@@ -147,7 +151,10 @@
           "const": 1
         },
         "browser": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "browser_family": {
           "enum": [
@@ -234,6 +241,10 @@
               }
             }
           }
+        },
+        "applications": {
+          "type": "object",
+          "description": "Configured native executable, packaged Electron bundle, or Android SDK/image/APK and companion paths."
         }
       }
     },
@@ -295,6 +306,39 @@
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/file"
+          }
+        },
+        "participants": {
+          "type": "object",
+          "description": "Application channels, each with its own wire ledger, inventory, events and artifacts. Parent costs sum all channels.",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "kind",
+              "events",
+              "files"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "native",
+                  "electron",
+                  "android"
+                ]
+              },
+              "events": {
+                "type": "array"
+              },
+              "artifacts": {
+                "type": "object"
+              },
+              "files": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/$defs/file"
+                }
+              }
+            }
           }
         }
       }

@@ -5,6 +5,8 @@ wire responses, checks exact application outcomes, preserves failures and resour
 reports offline. It does not run an LLM or measure model decision-making.
 
 Start with [Measure repeated application interactions](../../docs/how-to/measure-interactions.md).
+For packaged Electron, Android, native forms and cross-application transfer, use
+[Measure application boundaries](../../docs/how-to/measure-application-boundaries.md).
 Execution currently requires Linux/X11; the measurement and protocol tests require only Python 3.10+.
 
 ## Commands
@@ -35,7 +37,7 @@ The minimum configuration is `{"browser":"/absolute/path/firefox"}`. Defaults:
 | Setting | Default |
 |---|---|
 | `drivers` | One Glass adapter using `target/release/glass-mcp` |
-| `cases` | All cases shown by `list` |
+| `cases` | The twelve web cases; application cases require explicit selection |
 | `repetitions`, `warmups`, `seed` | 10 measured, 1 warm-up, ordering seed 41 |
 | `browser_family` | `firefox`; also accepts `chromium` |
 | `sandbox` | `off`, for this owned local fixture; recorded in the manifest |
@@ -109,3 +111,32 @@ strict occlusion pass. If the pointer activates the cover, that attempt fails an
 report; do not silently remove the case or reinterpret it as successful input. The two geometry
 variants make that capability boundary visible. The standalone artifact case must recover an
 oversized observation containing the form and the final repeated section.
+
+
+## Application cases (recipe revision 2)
+
+| Case | Required outcome |
+|---|---|
+| `electron-form` | Shared form saves Ada once; native dialog is observed, selected, focused and confirmed with Return; the main window shows Ada and one confirmation. |
+| `android-boundary` | Native Open form leads to the embedded form; it saves Ada once; native Review saved value shows Ada, one submission and one review. |
+| `native-form` | The native form saves Ada exactly once. |
+| `cross-application` | The source generates one fresh ticket; the destination saves the observed ticket exactly once; the source value and generation count remain unchanged. |
+
+Typing requires confirmed native focus. Form actions use pointer mode on native/Android and native
+semantic mode on Electron. The dialog recipe establishes native-window/default-key completion;
+it does not claim semantic access to dialog buttons. Observed action order, exact values and quiet
+counter checks are required. Android WebView field IDs are names and their human labels are
+accessibility descriptions; both are checked without rewriting the observed facts.
+
+Application records add `participants` (`app`, or `source` and `destination`). Each participant has its
+own `mcp/`, `evidence/`, inventory, session ownership and call sequence. Top-level events include the
+participant, and offline replay reconstructs their order from raw channel timestamps. Parent phase
+costs sum all participant RPCs, while phase duration is measured once across the whole attempt.
+Inventory bytes are the sum of per-session inventories; the combined digest identifies the mapping of
+participant names to inventory digests. It is not the digest of a fabricated merged tools array.
+
+Android emulator boot belongs to `server_start`, installation/readiness to `app_start`, and all native
+and embedded form actions to `task`. Preparation commands use the owned ADB server for lifecycle and
+device identity; task observations/actions use MCP. Packaged bundles, native executable, APK,
+companions, emulator tools and system image files are hashed before/after the run. Fixture and runner
+sources are archived. Existing version-1 web evidence remains readable by the revision-2 validator.

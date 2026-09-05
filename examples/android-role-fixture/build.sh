@@ -72,6 +72,7 @@ find "$out/classes" -name '*.class' -exec "$tools/d8" --lib "$android_jar" --out
 # The shared page travels as an asset, copied at build time so there is one copy to edit.
 mkdir -p "$out/assets"
 cp "$here/../web-role-fixture/index.html" "$out/assets/index.html"
+cp "$here/interaction.html" "$out/assets/interaction.html"
 
 "$tools/aapt2" link -o "$out/unsigned.apk" -I "$android_jar" -A "$out/assets" \
   --manifest "$here/AndroidManifest.xml" --min-sdk-version 24 --target-sdk-version 34

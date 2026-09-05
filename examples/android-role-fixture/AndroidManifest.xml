@@ -9,5 +9,6 @@
             </intent-filter>
         </activity>
         <activity android:name=".WebActivity" android:exported="true" />
+        <activity android:name=".InteractionActivity" android:exported="true" />
     </application>
 </manifest>
