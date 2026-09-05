@@ -41,6 +41,10 @@ offline `trace inspect`/`trace export`. Its persistent store is separate from te
 artifacts; protect the entire configured root before launching contained targets. Capture requested
 results only, preserve worker outcomes after cancellation, and keep trace-off MCP behavior unchanged.
 
+Ordinary image tools accept `max_width`/`max_height` through MCP's `tools/image_output` helper.
+Resize only the returned observation after native capture/comparison; retain native baselines,
+coordinates and comparison metrics. Omitted bounds preserve output, and traces retain returned bytes.
+
 ## Commands
 
 ```bash

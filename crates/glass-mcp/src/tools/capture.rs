@@ -1,9 +1,10 @@
 //! Capture, visual-diff, and log tools.
 
-use glass_core::{Frame, Glass, Region, Stream, frame_to_webp};
+use glass_core::{Frame, Glass, Region, Stream};
 use serde_json::json;
 use std::time::{Duration, Instant};
 
+use super::image_output::encode_image;
 use crate::params::*;
 use crate::tools::{
     ContextualError, ContextualOutput, ContextualToolResult, OutContent, ToolContext, ToolOutput,
@@ -38,15 +39,18 @@ pub(crate) fn screenshot_with(
             context.deadline,
         )
         .map_err(|e| ContextualError::from_core(e, context))?;
-    let img = frame_to_webp(&frame).map_err(|e| ContextualError::from_core(e, context))?;
-    let mut meta = json!({ "width": frame.width, "height": frame.height });
+    let origin = a.region.as_ref().map_or((0, 0), |r| (r.x, r.y));
+    let img = encode_image(frame, origin, a.max_width, a.max_height)
+        .map_err(|e| ContextualError::from_core(e, context))?;
+    let mut meta = json!({ "width": img.width, "height": img.height });
     if let Some(r) = a.region.as_ref() {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
     }
+    let bytes = img.attach_to(&mut meta);
     Ok(ContextualOutput::immediate(ToolOutput::image_result(
         "glass_screenshot",
-        Some(img),
+        Some(bytes),
         meta,
         vec![],
     )))
@@ -116,14 +120,17 @@ pub(crate) fn wait_stable_with(
 
     let frame =
         crop_frame(outcome.frame, a.region.as_ref()).map_err(ContextualError::validation)?;
-    let img = frame_to_webp(&frame).map_err(|e| ContextualError::from_core(e, context))?;
-    let mut meta = json!({ "settled": settled, "saw_motion": saw_motion, "observed_ms": observed_ms, "ignored_pixels": ignored_pixels, "width": frame.width, "height": frame.height });
+    let origin = a.region.as_ref().map_or((0, 0), |r| (r.x, r.y));
+    let img = encode_image(frame, origin, a.max_width, a.max_height)
+        .map_err(|e| ContextualError::from_core(e, context))?;
+    let mut meta = json!({ "settled": settled, "saw_motion": saw_motion, "observed_ms": observed_ms, "ignored_pixels": ignored_pixels, "width": img.width, "height": img.height });
     if let Some(r) = a.region.as_ref() {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
     }
+    let bytes = img.attach_to(&mut meta);
     Ok(ContextualOutput::with_timeout(
-        ToolOutput::image_result("glass_wait_stable", Some(img), meta, vec![]),
+        ToolOutput::image_result("glass_wait_stable", Some(bytes), meta, vec![]),
         (!settled).then_some(whose),
     ))
 }
@@ -203,7 +210,11 @@ pub(crate) fn diff_with(
         let cropped = current
             .crop(&region)
             .map_err(|e| ContextualError::from_core(e, context))?;
-        image = Some(frame_to_webp(&cropped).map_err(|e| ContextualError::from_core(e, context))?);
+        let (ox, oy) = a.region.as_ref().map_or((0, 0), |r| (r.x, r.y));
+        let origin = (ox + b.x, oy + b.y);
+        let img = encode_image(cropped, origin, a.max_width, a.max_height)
+            .map_err(|e| ContextualError::from_core(e, context))?;
+        image = Some(img.attach_to(&mut body));
     }
     Ok(ContextualOutput::immediate(ToolOutput::image_result(
         "glass_diff",
@@ -271,12 +282,52 @@ mod tests {
     }
 
     #[test]
+    fn bounded_screenshot_reports_native_crop_and_returned_pixels() {
+        let frame = Frame::new(8, 6, (0..48).flat_map(|n| [n, 0, 0, 255]).collect()).unwrap();
+        let captures = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut g = started_with(
+            FakePlatform::new(8, 6)
+                .with_frames(vec![frame])
+                .with_capture_log(captures.clone()),
+        );
+        let args = serde_json::from_value(json!({
+            "region": {"x": 2, "y": 1, "width": 6, "height": 4}, "max_width": 3
+        }))
+        .unwrap();
+        let out = screenshot(&mut g, &args).unwrap();
+        let OutContent::Image(bytes) = &out.0[0] else {
+            panic!("missing image")
+        };
+        let decoded = glass_core::frame_from_webp(bytes).unwrap();
+        assert_eq!((decoded.width, decoded.height), (3, 2));
+        assert_eq!(
+            decoded.pixels,
+            [19, 21, 23, 35, 37, 39]
+                .into_iter()
+                .flat_map(|n| [n, 0, 0, 255])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            envelope_at(&out, 1)["result"],
+            json!({
+                "width":3,"height":2,"x":2,"y":1,
+                "image": {"source":{"x":2,"y":1,"width":6,"height":4},
+                    "width":3,"height":2,"scale_x":0.5,"scale_y":0.5,
+                    "resized":true,"pixel_exact":false,"encoding":"lossless_webp"}
+            })
+        );
+        assert_eq!(*captures.lock().unwrap(), 1);
+    }
+
+    #[test]
     fn screenshot_returns_image_then_meta() {
         let frame = Frame::solid(4, 4, [1, 2, 3, 255]);
         let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![frame]));
         let out = screenshot(
             &mut g,
             &ScreenshotArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 window_id: None,
             },
@@ -305,6 +356,8 @@ mod tests {
             [5, 6, 7, 255],
         )]));
         let a = ScreenshotArgs {
+            max_width: None,
+            max_height: None,
             region: Some(RegionArgs {
                 x: 1,
                 y: 1,
@@ -336,6 +389,8 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = ScreenshotArgs {
+            max_width: None,
+            max_height: None,
             region: Some(RegionArgs {
                 x: 0,
                 y: 0,
@@ -358,6 +413,8 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = ScreenshotArgs {
+            max_width: None,
+            max_height: None,
             region: None,
             window_id: Some(7),
         };
@@ -373,6 +430,8 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = WaitStableArgs {
+            max_width: None,
+            max_height: None,
             interval_ms: Some(1),
             settle_frames: Some(1),
             tolerance: None,
@@ -405,6 +464,8 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = WaitStableArgs {
+            max_width: None,
+            max_height: None,
             interval_ms: Some(1),
             settle_frames: Some(1),
             tolerance: None,
@@ -434,6 +495,8 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = WaitStableArgs {
+            max_width: None,
+            max_height: None,
             interval_ms: Some(1),
             settle_frames: Some(1),
             tolerance: None,
@@ -468,6 +531,8 @@ mod tests {
                 .with_capture_log(log.clone()),
         );
         let a = WaitStableArgs {
+            max_width: None,
+            max_height: None,
             interval_ms: Some(0),
             settle_frames: Some(2),
             tolerance: None,
@@ -514,6 +579,8 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = WaitStableArgs {
+            max_width: None,
+            max_height: None,
             interval_ms: Some(0),
             settle_frames: Some(1),
             tolerance: None,
@@ -557,6 +624,8 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 name: "main".into(),
                 mode: None,
@@ -581,6 +650,8 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 name: "m".into(),
                 mode: None,
@@ -620,6 +691,8 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                max_width: None,
+                max_height: None,
                 region: Some(RegionArgs {
                     x: 0,
                     y: 0,
@@ -655,6 +728,8 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 name: "m".into(),
                 mode: Some("exact".into()),
@@ -671,6 +746,8 @@ mod tests {
         let err = diff(
             &mut g,
             &DiffArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 name: "m".into(),
                 mode: Some("fuzzy".into()),
@@ -694,6 +771,8 @@ mod tests {
         let err = diff(
             &mut g,
             &DiffArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 name: "absent".into(),
                 mode: None,
@@ -761,6 +840,8 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = WaitStableArgs {
+            max_width: None,
+            max_height: None,
             interval_ms: Some(1),
             settle_frames: Some(1),
             tolerance: None,
@@ -793,6 +874,8 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 name: "m".into(),
                 mode: None,
@@ -832,6 +915,8 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 name: "m".into(),
                 mode: None,
@@ -854,6 +939,8 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = WaitStableArgs {
+            max_width: None,
+            max_height: None,
             interval_ms: Some(1),
             settle_frames: Some(1),
             tolerance: None,
@@ -899,6 +986,8 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = WaitStableArgs {
+            max_width: None,
+            max_height: None,
             interval_ms: Some(1),
             settle_frames: Some(1),
             tolerance: None,
@@ -935,6 +1024,8 @@ mod tests {
         let out = screenshot(
             &mut g,
             &ScreenshotArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 window_id: None,
             },
@@ -974,6 +1065,8 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 name: "m".into(),
                 mode: None,
@@ -1011,6 +1104,8 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                max_width: None,
+                max_height: None,
                 region: None,
                 name: "m".into(),
                 mode: None,

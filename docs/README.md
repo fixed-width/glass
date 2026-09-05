@@ -25,6 +25,7 @@ way it does? The explanations.
 
 **Connect and drive**
 
+- [Capture a smaller image](how-to/capture-a-smaller-image.md) — size bounds and native coordinate mapping
 - [Connect glass to your agent](how-to/connect-an-agent.md) — stdio and HTTP
 - [Run glass over the network](how-to/run-over-the-network.md) — agent and app on different machines
 - [Record and export session evidence](how-to/record-session-evidence.md) — retain requested results for offline review

@@ -4,6 +4,7 @@
 use glass_core::Region;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use std::num::NonZeroU32;
 
 pub(crate) const MAX_CLICK_COUNT: u32 = glass_core::MAX_CLICK_COUNT;
 pub(crate) const MAX_SCROLL_NOTCHES: i32 = glass_core::MAX_SCROLL_NOTCHES as i32;
@@ -39,6 +40,12 @@ pub fn ignore_regions(args: Option<&[RegionArgs]>) -> Vec<Region> {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ScreenshotArgs {
+    /// Maximum returned image width; shrinks after crop, preserving native comparison pixels.
+    #[schemars(range(min = 1, max = 4294967295_u64))]
+    pub max_width: Option<NonZeroU32>,
+    /// Maximum returned image height; omit both limits for native output.
+    #[schemars(range(min = 1, max = 4294967295_u64))]
+    pub max_height: Option<NonZeroU32>,
     /// Optional window-relative sub-rectangle to capture; omit for the whole window.
     pub region: Option<RegionArgs>,
     /// Observe this current glass_list_windows ID without selecting it; omit for active window.
@@ -301,6 +308,12 @@ pub struct ClipboardSetArgs {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct WaitStableArgs {
+    /// Maximum returned image width; shrinks after crop, preserving native comparison pixels.
+    #[schemars(range(min = 1, max = 4294967295_u64))]
+    pub max_width: Option<NonZeroU32>,
+    /// Maximum returned image height; omit both limits for native output.
+    #[schemars(range(min = 1, max = 4294967295_u64))]
+    pub max_height: Option<NonZeroU32>,
     /// How long to wait between capture ticks (default 100ms).
     pub interval_ms: Option<u64>,
     /// Consecutive unchanged frames required (default 3).
@@ -366,6 +379,12 @@ pub struct ScrollToElementArgs {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct WaitForRegionArgs {
+    /// Maximum returned image width; shrinks after crop, preserving native comparison pixels.
+    #[schemars(range(min = 1, max = 4294967295_u64))]
+    pub max_width: Option<NonZeroU32>,
+    /// Maximum returned image height; omit both limits for native output.
+    #[schemars(range(min = 1, max = 4294967295_u64))]
+    pub max_height: Option<NonZeroU32>,
     /// Saved baseline name to compare against; omit to use the frame at call start.
     pub baseline: Option<String>,
     /// Window-relative sub-rectangle to watch; omit for the whole window.
@@ -425,6 +444,12 @@ pub struct CapabilitiesArgs {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct DiffArgs {
+    /// Maximum returned image width; shrinks after crop, preserving native comparison pixels.
+    #[schemars(range(min = 1, max = 4294967295_u64))]
+    pub max_width: Option<NonZeroU32>,
+    /// Maximum returned image height; omit both limits for native output.
+    #[schemars(range(min = 1, max = 4294967295_u64))]
+    pub max_height: Option<NonZeroU32>,
     /// Saved baseline name; unsaved names error.
     pub name: String,
     /// `"perceptual"` (default) or `"exact"`.

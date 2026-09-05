@@ -249,9 +249,52 @@ completion, or stability.
   whole window. Vision cost scales with pixel area, so a tight region is a recurring token saving.
 - `window_id` (integer) — capture this window (id from `glass_list_windows`) instead of the active
   one, without changing which window subsequent ops target. Omit for the active window.
+- `max_width`, `max_height` (optional positive integers) — shrink the returned image after cropping;
+  see [image size controls](#image-size-controls). Omit both for native pixels.
 
-Returns `{width, height}` — the captured frame's dimensions — plus `x, y` (the region's origin) when
-`region` was given.
+Returns `{width, height}` — the returned image dimensions — plus native `x, y` (the region's origin)
+when `region` was given. Supplying a size bound also adds `image` metadata.
+
+#### Image size controls
+
+`glass_screenshot`, `glass_wait_stable`, `glass_diff` and `glass_wait_for_region` accept `max_width`
+and `max_height`. The same controls work in `glass_do.then.screenshot` and `glass_do.then.diff`.
+Each accepts an integer from 1 through 4294967295; omit it or use `null` for an unbounded axis.
+Zero, negative, fractional and nonnumeric values fail argument parsing, including before any actions
+in a batch with invalid terminal bounds.
+
+Glass fits the already cropped image inside both bounds without enlarging, padding or clipping it.
+Aspect ratio is preserved with fractional dimensions rounded down to at least one pixel per axis.
+A 3840×2160 image bounded to width 1280 returns 1280×720. A 1001×667 image bounded to width 500
+returns 500×333. The nearest-neighbor preview is encoded as lossless WebP; resizing discards native
+detail even though the encoding preserves the returned pixels.
+
+When a bound is supplied and an image is returned, the result includes:
+
+```json
+{"image":{"source":{"x":120,"y":80,"width":2400,"height":1600},
+          "width":1200,"height":800,"scale_x":0.5,"scale_y":0.5,
+          "resized":true,"pixel_exact":false,"encoding":"lossless_webp"}}
+```
+
+`source` is the native image rectangle in the observed window, after cropping; it does not report
+the full window size or the OS display scale. `width`/`height` match the decoded returned image.
+`scale_x`/`scale_y` are returned/source ratios and may differ slightly after rounding. A bound that
+does not shrink the frame reports unit scale, `resized:false` and `pixel_exact:true`.
+
+Input coordinates remain native window pixels. For returned pixel index `(i,j)`, its center maps
+to native x `source.x + floor((i+0.5)*source.width/image.width)`, and analogously for y. Use indices
+inside the returned image and coordinates inside the source rectangle. A `window_id` observation
+still does not select that window for subsequent input.
+
+Baselines, comparisons, masks, pixel counts, bboxes and stability detection use native pixels.
+A resized preview can hide a change that an exact diff detects. Diff bboxes keep their existing
+region-relative coordinates; the new image source origin is always window-relative.
+Bounds do not enable images: suppressed images, unchanged diffs and unmatched region waits produce
+no image metadata. Text-only settle retains native dimensions. Omitted bounds preserve existing
+bytes and result fields. Controls are per call; marks remain native, and no file-output mode,
+format/quality setting or automatic size limit is added. Compressed bytes and model token cost vary
+with content. See [capture a smaller image](../how-to/capture-a-smaller-image.md) for examples.
 
 ### `glass_baseline_save`
 
@@ -272,6 +315,8 @@ Compare current visual evidence with a named baseline; returns change stats and 
 - `tolerance` (integer 0–255, default `0`) — per-channel tolerance for `mode:"exact"`.
 - `include_image` (boolean, default false) — also return the current frame cropped to the changed
   region. No image is returned when nothing changed.
+- `max_width`, `max_height` — optional [image size controls](#image-size-controls) for that attachment;
+  comparison statistics and bounding boxes remain native.
 - `region` (`{x,y,width,height}`) — window-relative sub-rectangle to diff; omit to diff the whole
   window. Scopes the comparison (and the reported `bbox`, which becomes region-relative) to just
   this area — the way to ask "did *only* this part change?".
@@ -298,6 +343,8 @@ changing, not that expected semantics or pixels were reached.
 - `include_image` (boolean, default true) — set false for a text-only result (no image; cheap
   before a text `glass_diff`); `region` is ignored when false.
 - `region` (`{x,y,width,height}`) — crop the returned frame.
+- `max_width`, `max_height` — optional [image size controls](#image-size-controls) after that crop;
+  they do not affect settling or text-only dimensions.
 - `stability_region` (`{x,y,width,height}`) — watch only this sub-rectangle for settling, ignoring
   unrelated motion (a clock, a spinner) elsewhere. Independent of `region`.
 - `settle_frames` (integer) — consecutive stable frames required.
@@ -367,6 +414,8 @@ or subsequent stability.
 - `interval_ms` (integer, default 100) — poll interval.
 - `timeout_ms` (integer, default 10000) — returns `{matched:false}` on timeout.
 - `include_image` (boolean, default false) — on match, also return the watched region as an image.
+- `max_width`, `max_height` — optional [image size controls](#image-size-controls) for the matched
+  image; they do not affect the predicate or its bounding box.
 - `window_id` (integer) — observe this window (id from `glass_list_windows`) instead of the active
   one, without changing which window subsequent ops target.
 - `ignore` (array of `{x,y,width,height}`) — window-relative rectangles excluded from the
