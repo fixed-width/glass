@@ -11,7 +11,6 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import contextmanager
 from pathlib import Path
 
 from application_cases import CASES as APPLICATION_CASES
@@ -20,6 +19,7 @@ from application_config import frozen_paths as application_frozen_paths
 from application_config import prerequisites as application_prerequisites
 from application_config import runtime_metadata
 from application_run import attempt as application_attempt
+from attempt_record import AttemptRecord
 from cases import CASES as WEB_CASES
 from cases import evaluate, evaluate_setup, execute
 
@@ -30,13 +30,12 @@ from measurement import (
     canonical,
     digest,
     file_identity,
-    phase_totals,
     schedule,
     summarize,
     verify_files,
     write_json,
 )
-from protocol import Client, ProtocolError
+from protocol import Client
 from native_sessions import create_session, prepare_display
 from validation import read_channel, validate_totals
 
@@ -254,40 +253,13 @@ def preflight(config):
     }
 
 
-@contextmanager
-def phase(client, durations, name):
-    client.phase = name
-    started = time.monotonic()
-    try:
-        yield
-    finally:
-        durations[name] = (time.monotonic() - started) * 1000
-
-
 def attempt(config, cell, directory, fixtures, adapter):
-    directory.mkdir()
-    began = time.monotonic()
-    result = {
-        "schema_version": 1,
-        **cell,
-        "outcome": "harness_error",
-        "cleanup_ok": False,
-        "evidence_ok": False,
-        "error": "attempt incomplete",
-        "wall_ms": 0,
-        "events": [],
-        "phases": {},
-        "artifacts": {},
-        "artifact_references": [],
-        "files": {},
-    }
-    write_json(directory / "result.json", result)
+    record = AttemptRecord(config, cell, directory, artifact_references=[])
+    result = record.result
     client = session = driver = evidence = None
-    durations = {}
-    interrupted = False
     errors = []
     spec = next(d for d in config["drivers"] if d["id"] == cell["driver"])
-    total_deadline = began + config["attempt_timeout_ms"] / 1000
+    total_deadline = record.deadline
     try:
         session = create_session(config.get("backend", "x11"))
         display = prepare_display(session, config, directory)
@@ -322,45 +294,39 @@ def attempt(config, cell, directory, fixtures, adapter):
         missing = adapter.required_tools - {t["name"] for t in inventory}
         if missing:
             raise EvidenceError(f"required tools missing: {sorted(missing)}")
-        durations["server_start"] = (time.monotonic() - began) * 1000
+        record.advance(None)
         evidence = Evidence(
             directory / "evidence", client, limit=config["evidence_limit_bytes"]
         )
         driver = adapter(config, session, client, evidence, total_deadline - 10)
         url = fixtures.url(cell["case"], config)
         result["fixture_url"] = url
-        with phase(client, durations, "app_start"):
+        with record.phase("app_start", (client,)):
             driver.launch(url)
             setup_errors = evaluate_setup(driver.events, config["viewport"])
             if setup_errors:
                 raise EvidenceError("; ".join(setup_errors))
             result["owned_process_commands"] = session.process_commands()
-        with phase(client, durations, "task"):
+        with record.phase("task", (client,)):
             execute(cell["case"], driver)
             errors = evaluate(cell["case"], driver.events, evidence.artifacts)
             result["outcome"] = "failed" if errors else CASES[cell["case"]]
-        with phase(client, durations, "evidence"):
+        with record.phase("evidence", (client,)):
             if hasattr(driver, "collect"):
                 driver.collect()
         result["evidence_ok"] = True
         result["error"] = None
     except BaseException as exc:
-        interrupted = isinstance(exc, KeyboardInterrupt)
-        result["outcome"] = (
-            "harness_error" if isinstance(exc, (ProtocolError, OSError)) else "failed"
-        )
-        result["error"] = f"{type(exc).__name__}: {exc}"
+        record.fail(exc)
     finally:
         if driver and not result["evidence_ok"] and hasattr(driver, "collect"):
             try:
-                with phase(client, durations, "evidence"):
+                with record.phase("evidence", (client,)):
                     driver.collect()
                 result["evidence_ok"] = True
             except Exception as exc:
                 result["evidence_error"] = str(exc)
-        cleanup_start = time.monotonic()
-        if "server_start" not in durations:
-            durations["server_start"] = (cleanup_start - began) * 1000
+        record.advance("cleanup")
         cleanup_errors = []
         if client:
             client.phase = "cleanup"
@@ -388,36 +354,18 @@ def attempt(config, cell, directory, fixtures, adapter):
                     )
             except Exception as exc:
                 cleanup_errors.append(str(exc))
-        durations["cleanup"] = (time.monotonic() - cleanup_start) * 1000
+        record.advance(None)
         result["cleanup_ok"] = not cleanup_errors
         result["cleanup_errors"] = cleanup_errors
         result["assertion_errors"] = errors
-        result["wall_ms"] = (time.monotonic() - began) * 1000
+        record.capture_wall()
         result["events"] = driver.events if driver else []
         result["artifacts"] = evidence.artifacts if evidence else {}
         result["artifact_references"] = evidence.references if evidence else []
         file_reads = getattr(driver, "file_reads", [])
         result["file_reads"] = file_reads
-        result["phases"] = phase_totals(
-            (client.calls if client else []) + file_reads, durations
-        )
-        result["interrupted"] = interrupted
-        write_json(
-            directory / "timing.json",
-            {"wall_ms": result["wall_ms"], "durations": durations},
-        )
-        for path in directory.rglob("*"):
-            if path.is_file() and path.name != "result.json":
-                result["files"][path.relative_to(directory).as_posix()] = file_identity(
-                    path
-                )
-        if (
-            sum(v["bytes"] for v in result["files"].values())
-            > config["evidence_limit_bytes"]
-        ):
-            result["evidence_ok"] = False
-            result["error"] = "attempt evidence exceeds configured storage limit"
-        write_json(directory / "result.json", result)
+        record.record_calls(client.calls if client else [])
+        record.finalize()
     return result
 
 

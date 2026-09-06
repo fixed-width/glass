@@ -5,6 +5,7 @@ import time
 
 import application_cases as cases
 from android_session import Android
+from attempt_record import AttemptRecord
 import ios_publication
 from drivers.glass import Driver as Glass
 from evidence import Evidence, EvidenceError
@@ -12,11 +13,9 @@ from measurement import (
     canonical,
     digest,
     file_identity,
-    phase_totals,
     verify_files,
-    write_json,
 )
-from protocol import Client, ProtocolError
+from protocol import Client
 from native_sessions import create_session, prepare_display
 from validation import read_channel, validate_totals
 
@@ -285,14 +284,14 @@ class Fleet:
             )
             self.members[name] = UI(self, name, kind, session, client, evidence)
 
-    def phase(self, name):
-        for owned in self.owned.values():
-            if owned["client"]:
-                owned["client"].phase = name
+    @property
+    def clients(self):
+        return [owned["client"] for owned in self.owned.values() if owned["client"]]
 
     def close(self):
         errors = []
-        self.phase("cleanup")
+        for client in self.clients:
+            client.phase = "cleanup"
         for name, owned in reversed(list(self.owned.items())):
             client = owned["client"]
             if client:
@@ -331,41 +330,15 @@ class Fleet:
 
 
 def attempt(config, cell, directory):
-    directory.mkdir()
-    started = time.monotonic()
-    fleet = Fleet(
-        config, cell, directory, started + config["attempt_timeout_ms"] / 1000
+    record = AttemptRecord(
+        config, cell, directory, participants={}, file_reads=[], interrupted=False
     )
-    result = {
-        "schema_version": 1,
-        **cell,
-        "outcome": "harness_error",
-        "error": "attempt incomplete",
-        "cleanup_ok": False,
-        "evidence_ok": False,
-        "participants": {},
-        "events": [],
-        "files": {},
-        "phases": {},
-        "artifacts": {},
-        "file_reads": [],
-        "wall_ms": 0,
-        "interrupted": False,
-    }
-    write_json(directory / "result.json", result)
-    durations = {}
-    current_phase, phase_start = "server_start", started
-
-    def phase(name):
-        nonlocal current_phase, phase_start
-        now = time.monotonic()
-        durations[current_phase] = (now - phase_start) * 1000
-        current_phase, phase_start = name, now
-        fleet.phase(name)
+    result = record.result
+    fleet = Fleet(config, cell, directory, record.deadline)
 
     try:
         fleet.prepare()
-        phase("app_start")
+        record.advance("app_start", fleet.clients)
         for name, member in fleet.members.items():
             member.launch_application()
             fleet.records[name][
@@ -376,7 +349,7 @@ def attempt(config, cell, directory):
         )
         if setup_errors:
             raise EvidenceError("; ".join(setup_errors))
-        phase("task")
+        record.advance("task", fleet.clients)
         cases.execute(cell["case"], fleet)
         if cell["case"] == "ios-publication":
             result["outcome"], result["assertion_errors"] = ios_publication.evaluate(
@@ -387,27 +360,19 @@ def attempt(config, cell, directory):
             result["outcome"] = (
                 "failed" if result["assertion_errors"] else "task_completed"
             )
-        phase("evidence")
+        record.advance("evidence", fleet.clients)
         result.update(evidence_ok=True, error=None)
     except BaseException as exc:
-        result.update(
-            outcome=(
-                "harness_error"
-                if isinstance(exc, (ProtocolError, OSError))
-                else "failed"
-            ),
-            error=f"{type(exc).__name__}: {exc}",
-            interrupted=isinstance(exc, KeyboardInterrupt),
-        )
+        record.fail(exc)
     finally:
-        phase("cleanup")
+        record.advance("cleanup", fleet.clients)
         result["cleanup_errors"] = fleet.close()
         result["cleanup_ok"] = not result["cleanup_errors"]
-        durations["cleanup"] = (time.monotonic() - phase_start) * 1000
+        record.advance(None)
         calls = []
-        for name, record in fleet.records.items():
+        for name, participant in fleet.records.items():
             member = fleet.members.get(name)
-            record.update(
+            participant.update(
                 events=member.events if member else [],
                 artifacts=member.evidence.artifacts if member else {},
                 artifact_references=member.evidence.references if member else [],
@@ -417,21 +382,21 @@ def attempt(config, cell, directory):
             client = fleet.owned[name]["client"]
             if client:
                 calls.extend(client.calls)
-                record["process_cleanup"] = client.cleanup
+                participant["process_cleanup"] = client.cleanup
                 if client.fault:
                     result["evidence_ok"] = False
-                    record["evidence_error"] = client.fault
-                    record["evidence_ok"] = False
+                    participant["evidence_error"] = client.fault
+                    participant["evidence_ok"] = False
             for path in (directory / name).rglob("*"):
                 if path.is_file():
-                    record["files"][path.relative_to(directory / name).as_posix()] = (
-                        file_identity(path)
-                    )
+                    participant["files"][
+                        path.relative_to(directory / name).as_posix()
+                    ] = file_identity(path)
+        record.record_calls(calls)
+        record.capture_wall()
         result.update(
             participants=fleet.records,
             events=fleet.events,
-            phases=phase_totals(calls, durations),
-            wall_ms=(time.monotonic() - started) * 1000,
             tool_definitions_bytes=sum(
                 r.get("tool_definitions_bytes", 0) for r in fleet.records.values()
             ),
@@ -442,24 +407,7 @@ def attempt(config, cell, directory):
                 }
             ),
         )
-        write_json(
-            directory / "timing.json",
-            {"wall_ms": result["wall_ms"], "durations": durations},
-        )
-        for path in directory.rglob("*"):
-            if path.is_file() and path.name != "result.json":
-                result["files"][path.relative_to(directory).as_posix()] = file_identity(
-                    path
-                )
-        if (
-            sum(v["bytes"] for v in result["files"].values())
-            > config["evidence_limit_bytes"]
-        ):
-            result.update(
-                evidence_ok=False,
-                error="attempt evidence exceeds configured storage limit",
-            )
-        write_json(directory / "result.json", result)
+        record.finalize()
     return result
 
 
