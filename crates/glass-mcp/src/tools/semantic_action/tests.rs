@@ -809,6 +809,7 @@ fn semantic_failure(
         resolution: Some(resolution_report(timed_out_by)),
         actionability: actionability_report(),
         focus: None,
+        action_method: None,
         action_dispatch: DispatchStatus::NotDispatched,
         candidates,
         target: None,

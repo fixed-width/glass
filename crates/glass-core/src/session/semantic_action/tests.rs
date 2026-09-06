@@ -572,6 +572,64 @@ fn public_semantic_action_enums_have_stable_snake_case_labels() {
 }
 
 #[test]
+fn semantic_outcomes_and_errors_combine_both_mutation_phases() {
+    use DispatchStatus::{Dispatched, MayHaveDispatched, NotDispatched};
+
+    for (focus_dispatch, action_dispatch, expected) in [
+        (None, NotDispatched, false),
+        (Some(NotDispatched), NotDispatched, false),
+        (Some(Dispatched), NotDispatched, true),
+        (Some(MayHaveDispatched), NotDispatched, true),
+        (None, Dispatched, true),
+        (Some(NotDispatched), Dispatched, true),
+        (Some(Dispatched), Dispatched, true),
+        (Some(MayHaveDispatched), Dispatched, true),
+        (None, MayHaveDispatched, true),
+        (Some(NotDispatched), MayHaveDispatched, true),
+        (Some(Dispatched), MayHaveDispatched, true),
+        (Some(MayHaveDispatched), MayHaveDispatched, true),
+    ] {
+        let focus = focus_dispatch.map(|dispatch| MutationReport {
+            method: ActionMethod::NativeAction { actuated: None },
+            dispatch,
+            confirmation: ConfirmationStatus::Unconfirmed,
+        });
+        let outcome = SemanticActionOutcome {
+            target: ElementInfo::from_node(&fake_tree().root),
+            resolution: None,
+            actionability: ActionabilityReport::default(),
+            focus: focus.clone(),
+            action: MutationReport {
+                method: ActionMethod::Keyboard,
+                dispatch: action_dispatch,
+                confirmation: ConfirmationStatus::Unconfirmed,
+            },
+            bound: unbounded_action_deadline(None),
+        };
+        let mut error = empty_error(
+            SemanticActionFailureKind::ActionFailed,
+            "semantic action failed",
+            outcome.bound,
+            RetryGuidance::Reobserve,
+            None,
+        );
+        error.focus = focus;
+        error.action_dispatch = action_dispatch;
+
+        assert_eq!(
+            outcome.side_effects_may_have_occurred(),
+            expected,
+            "outcome: focus={focus_dispatch:?}, action={action_dispatch:?}"
+        );
+        assert_eq!(
+            error.side_effects_may_have_occurred(),
+            expected,
+            "error: focus={focus_dispatch:?}, action={action_dispatch:?}"
+        );
+    }
+}
+
+#[test]
 fn semantic_action_error_display_never_exposes_retained_payloads() {
     let error = SemanticActionError {
         kind: SemanticActionFailureKind::ActionFailed,
@@ -585,6 +643,7 @@ fn semantic_action_error_display_never_exposes_retained_payloads() {
             dispatch: DispatchStatus::MayHaveDispatched,
             confirmation: ConfirmationStatus::Unconfirmed,
         }),
+        action_method: Some(ActionMethod::Keyboard),
         action_dispatch: DispatchStatus::MayHaveDispatched,
         candidates: Vec::new(),
         target: None,
@@ -1876,6 +1935,13 @@ fn selector_pointer_known_occlusion_blocks_before_pointer_dispatch() {
 
     assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
     assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(
+        error.action_method,
+        Some(ActionMethod::Pointer {
+            native_fallback: None
+        })
+    );
+    assert!(!error.side_effects_may_have_occurred());
     assert_eq!(hit_calls.load(Ordering::Relaxed), 1);
     assert!(clicks.lock().unwrap().is_empty());
 }
@@ -2245,6 +2311,10 @@ fn native_mode_unsupported_is_proven_not_dispatched() {
     assert!(matches!(error.source, Some(GlassError::AxUnsupported)));
     assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
     assert!(clicks.lock().unwrap().is_empty());
+    assert_eq!(
+        error.action_method,
+        Some(ActionMethod::NativeAction { actuated: None })
+    );
 }
 
 #[test]
@@ -2586,6 +2656,10 @@ fn semantic_auto_click_never_falls_back_after_possible_native_dispatch() {
     assert_eq!(native_calls.load(Ordering::Relaxed), 1);
     assert_eq!(native_calls.load(Ordering::Relaxed).saturating_sub(1), 0);
     assert!(clicks.lock().unwrap().is_empty());
+    assert_eq!(
+        error.action_method,
+        Some(ActionMethod::NativeAction { actuated: None })
+    );
     assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
     assert_eq!(error.retry, RetryGuidance::DoNotRetry);
 }
@@ -2614,6 +2688,10 @@ fn semantic_native_mode_never_dispatches_pointer() {
 
     assert_eq!(native_calls.load(Ordering::Relaxed), 1);
     assert!(clicks.lock().unwrap().is_empty());
+    assert_eq!(
+        error.action_method,
+        Some(ActionMethod::NativeAction { actuated: None })
+    );
     assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
 }
 
@@ -2729,22 +2807,23 @@ fn semantic_pointer_click_refuses_the_same_known_hidden_target() {
 
 #[test]
 fn duplicate_semantic_click_dispatches_neither_native_nor_pointer() {
-    let tree = duplicate_button_tree("Save", 2);
-    let (mut glass, native_calls, clicks, _) =
-        click_mode_glass(vec![tree], InvokeBehavior::Succeed);
-    glass.start(&spec()).unwrap();
+    for mode in [ActionMode::Auto, ActionMode::Native, ActionMode::Pointer] {
+        let tree = duplicate_button_tree("Save", 2);
+        let (mut glass, native_calls, clicks, _) =
+            click_mode_glass(vec![tree], InvokeBehavior::Succeed);
+        glass.start(&spec()).unwrap();
 
-    let error = glass
-        .click_target_by(
-            &semantic_click_params(ActionMode::Auto, 0),
-            Deadline::UNBOUNDED,
-        )
-        .unwrap_err();
+        let error = glass
+            .click_target_by(&semantic_click_params(mode, 0), Deadline::UNBOUNDED)
+            .unwrap_err();
 
-    assert_eq!(native_calls.load(Ordering::Relaxed), 0);
-    assert!(clicks.lock().unwrap().is_empty());
-    assert_eq!(error.kind, SemanticActionFailureKind::AmbiguousTarget);
-    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+        assert_eq!(native_calls.load(Ordering::Relaxed), 0);
+        assert!(clicks.lock().unwrap().is_empty());
+        assert_eq!(error.kind, SemanticActionFailureKind::AmbiguousTarget);
+        assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+        assert_eq!(error.action_method, None);
+        assert!(!error.side_effects_may_have_occurred());
+    }
 }
 
 #[test]
@@ -2948,6 +3027,52 @@ fn semantic_public_click_audit_emits_exactly_one_record_on_native_fallback_and_f
 }
 
 #[test]
+fn auto_fallback_resolution_failure_retains_pointer_selection_without_dispatch() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let (mut glass, native_calls, clicks, _) = click_mode_glass(
+        vec![tree, duplicate_button_tree("Save", 2)],
+        InvokeBehavior::Unsupported,
+    );
+    let sink = RecordingSink::default();
+    glass.set_audit_sink(Box::new(sink.clone()));
+    glass.start(&spec()).unwrap();
+
+    let error = glass
+        .click_target(&semantic_click_params(ActionMode::Auto, 0))
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::AmbiguousTarget);
+    assert_eq!(
+        error.action_method,
+        Some(ActionMethod::Pointer {
+            native_fallback: Some("backend has no native action path".into()),
+        })
+    );
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert!(!error.side_effects_may_have_occurred());
+    assert_eq!(native_calls.load(Ordering::Relaxed), 1);
+    assert!(clicks.lock().unwrap().is_empty());
+    let audits = sink.1.lock().unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].method.as_deref(), Some("pointer"));
+    assert_eq!(
+        audits[0].native_fallback.as_deref(),
+        Some("backend has no native action path")
+    );
+    assert_eq!(audits[0].dispatch, "not_dispatched");
+    assert_eq!(audits[0].confirmation, "unconfirmed");
+    assert_eq!(audits[0].actuated_id, None);
+}
+
+#[test]
 fn failure_audit_auto_pointer_fallback_retains_the_resolved_target_and_selected_path() {
     let tree = actionable_button_tree(
         "Save account",
@@ -2980,6 +3105,13 @@ fn failure_audit_auto_pointer_fallback_retains_the_resolved_target_and_selected_
     assert_eq!(native_calls.load(Ordering::Relaxed), 1);
     assert_eq!(clicks.lock().unwrap().len(), 1);
     assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(
+        error.action_method,
+        Some(ActionMethod::Pointer {
+            native_fallback: Some("backend has no native action path".into()),
+        })
+    );
+    assert!(error.side_effects_may_have_occurred());
     assert_eq!(
         error.target.as_ref().map(|target| target.id),
         Some(AxNodeId(1))
@@ -3295,6 +3427,8 @@ fn semantic_set_value_does_not_retry_after_a_may_have_dispatched_transport_failu
     assert_eq!(walks.load(Ordering::Relaxed), 1);
     assert_eq!(set_log.lock().unwrap().len(), 1);
     assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(error.action_method, Some(ActionMethod::AccessibilityValue));
+    assert!(error.side_effects_may_have_occurred());
     assert_eq!(error.retry, RetryGuidance::DoNotRetry);
 }
 
@@ -3742,6 +3876,8 @@ fn targeted_type_never_types_when_focus_cannot_be_confirmed() {
     assert!(fixture.key_log.lock().unwrap().is_empty());
     assert_eq!(error.kind, SemanticActionFailureKind::FocusUnconfirmed);
     assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert_eq!(error.action_method, None);
+    assert!(error.side_effects_may_have_occurred());
     assert_eq!(error.retry, RetryGuidance::Reobserve);
     assert_eq!(
         error.focus,
@@ -3795,6 +3931,8 @@ fn targeted_type_never_dispatches_a_second_text_batch_after_possible_key_deliver
 
     assert_eq!(fixture.key_log.lock().unwrap().len(), 1);
     assert_eq!(error.action_dispatch, DispatchStatus::MayHaveDispatched);
+    assert_eq!(error.action_method, Some(ActionMethod::Keyboard));
+    assert!(error.side_effects_may_have_occurred());
     assert_eq!(error.retry, RetryGuidance::DoNotRetry);
     assert_eq!(
         error.focus.as_ref().map(|focus| focus.confirmation),

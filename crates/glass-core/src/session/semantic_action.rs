@@ -126,6 +126,14 @@ pub struct MutationReport {
     pub confirmation: ConfirmationStatus,
 }
 
+fn mutations_may_have_dispatched(
+    focus: Option<&MutationReport>,
+    action_dispatch: DispatchStatus,
+) -> bool {
+    action_dispatch != DispatchStatus::NotDispatched
+        || focus.is_some_and(|report| report.dispatch != DispatchStatus::NotDispatched)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActionDeadline {
     pub deadline: Deadline,
@@ -153,6 +161,13 @@ pub struct SemanticActionOutcome {
     pub focus: Option<MutationReport>,
     pub action: MutationReport,
     pub bound: ActionDeadline,
+}
+
+impl SemanticActionOutcome {
+    /// Whether focus or the requested action dispatched or may have dispatched.
+    pub fn side_effects_may_have_occurred(&self) -> bool {
+        mutations_may_have_dispatched(self.focus.as_ref(), self.action.dispatch)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +233,8 @@ pub struct SemanticActionError {
     pub resolution: Option<ResolutionReport>,
     pub actionability: ActionabilityReport,
     pub focus: Option<MutationReport>,
+    /// Selected method for the requested action, independent of whether it dispatched.
+    pub action_method: Option<ActionMethod>,
     pub action_dispatch: DispatchStatus,
     pub candidates: Vec<SemanticMatch>,
     /// The resolved element for failures that occur after unique target resolution.
@@ -238,6 +255,16 @@ impl std::fmt::Display for SemanticActionError {
 impl std::error::Error for SemanticActionError {}
 
 impl SemanticActionError {
+    /// Whether focus or the requested action dispatched or may have dispatched.
+    pub fn side_effects_may_have_occurred(&self) -> bool {
+        mutations_may_have_dispatched(self.focus.as_ref(), self.action_dispatch)
+    }
+
+    fn with_action_method(mut self: Box<Self>, method: ActionMethod) -> Box<Self> {
+        self.action_method = Some(method);
+        self
+    }
+
     fn with_target(mut self: Box<Self>, target: ElementInfo) -> Box<Self> {
         self.target = Some(Box::new(target));
         self
@@ -389,6 +416,7 @@ fn empty_error(
         resolution: None,
         actionability: ActionabilityReport::default(),
         focus: None,
+        action_method: None,
         action_dispatch: DispatchStatus::NotDispatched,
         candidates: Vec::new(),
         target: None,
@@ -528,6 +556,7 @@ fn classified_resolution_error(
         resolution: Some(report),
         actionability: ActionabilityReport::default(),
         focus: None,
+        action_method: None,
         action_dispatch: DispatchStatus::NotDispatched,
         candidates: observation.result.matches,
         target: None,
@@ -703,6 +732,7 @@ fn key_source_error(source: GlassError, focused: ConfirmedFocus) -> Box<Semantic
         source.bound_dispatch() == Some(crate::BoundDispatch::NotDispatched);
     let mut error = source_error(source, focused.bound);
     error.summary = "semantic targeted typing failed";
+    error.action_method = Some(ActionMethod::Keyboard);
     error.target = Some(Box::new(focused.element.clone()));
     error.resolution = Some(focused.resolution);
     error.actionability = focused.actionability;
@@ -741,6 +771,7 @@ fn actionability_error(
         resolution,
         actionability,
         focus: None,
+        action_method: None,
         action_dispatch: dispatch,
         candidates: Vec::new(),
         target: None,
@@ -842,6 +873,7 @@ fn set_value_source_error(
     };
     let mut error = source_error(source, bound);
     error.summary = "semantic set-value action failed";
+    error.action_method = Some(ActionMethod::AccessibilityValue);
     error.target = target.map(Box::new);
     error.resolution = resolution;
     error.actionability = actionability;
@@ -859,17 +891,6 @@ fn native_fallback_reason(source: &GlassError) -> String {
         GlassError::AxUnsupported => "backend has no native action path".into(),
         GlassError::AxActionUnavailable(_) => "element exposes no activation action".into(),
         _ => "native accessibility action did not dispatch".into(),
-    }
-}
-
-#[derive(Default)]
-struct ClickAuditContext {
-    method: Option<ActionMethod>,
-}
-
-impl ClickAuditContext {
-    fn selected(&mut self, method: ActionMethod) {
-        self.method = Some(method);
     }
 }
 
@@ -1506,16 +1527,15 @@ impl Glass {
         max_nodes: Option<usize>,
         sequence_deadline: Deadline,
         bound: ActionDeadline,
-        audit: &mut ClickAuditContext,
     ) -> SemanticActionResult<SemanticActionOutcome> {
         match target {
             ActionTarget::Id(id) => {
                 let actionability = self.legacy_click_actionability(*id, false);
-                audit.selected(ActionMethod::NativeAction { actuated: None });
                 let actuated = self
                     .try_native_invoke(*id, bound.deadline)
                     .map_err(|source| {
                         action_source_error(source, None, None, actionability, bound, true)
+                            .with_action_method(ActionMethod::NativeAction { actuated: None })
                     })?;
                 Ok(self.legacy_click_outcome(
                     *id,
@@ -1549,8 +1569,9 @@ impl Glass {
                         .is_none()
                     },
                 )?;
-                audit.selected(ActionMethod::NativeAction { actuated: None });
-                self.dispatch_native_click(resolved)
+                self.dispatch_native_click(resolved).map_err(|error| {
+                    error.with_action_method(ActionMethod::NativeAction { actuated: None })
+                })
             }
         }
     }
@@ -1562,17 +1583,16 @@ impl Glass {
         sequence_deadline: Deadline,
         bound: ActionDeadline,
         native_fallback: Option<String>,
-        audit: &mut ClickAuditContext,
     ) -> SemanticActionResult<SemanticActionOutcome> {
         match target {
             ActionTarget::Id(id) => {
                 let actionability = self.legacy_click_actionability(*id, true);
-                audit.selected(ActionMethod::Pointer {
-                    native_fallback: native_fallback.clone(),
-                });
                 self.click_element_pointer_only(*id, None, bound.deadline)
                     .map_err(|source| {
                         action_source_error(source, None, None, actionability, bound, true)
+                            .with_action_method(ActionMethod::Pointer {
+                                native_fallback: native_fallback.clone(),
+                            })
                     })?;
                 Ok(self.legacy_click_outcome(
                     *id,
@@ -1588,10 +1608,10 @@ impl Glass {
                     sequence_deadline,
                     bound,
                 )?;
-                audit.selected(ActionMethod::Pointer {
-                    native_fallback: native_fallback.clone(),
-                });
-                self.dispatch_pointer_click(resolved, native_fallback)
+                self.dispatch_pointer_click(resolved, native_fallback.clone())
+                    .map_err(|error| {
+                        error.with_action_method(ActionMethod::Pointer { native_fallback })
+                    })
             }
         }
     }
@@ -1630,9 +1650,7 @@ impl Glass {
         sequence_deadline: Deadline,
     ) -> SemanticActionResult<SemanticActionOutcome> {
         let started = std::time::Instant::now();
-        let mut audit = ClickAuditContext::default();
-        let result =
-            self.click_target_inner_with_audit(params.clone(), sequence_deadline, &mut audit);
+        let result = self.click_target_inner(params.clone(), sequence_deadline);
         let element = self.semantic_action_audit_element(&result, &params.target);
         let (method, native_fallback, actuated_id, dispatch, confirmation) = match &result {
             Ok(outcome) => {
@@ -1647,7 +1665,7 @@ impl Glass {
                 )
             }
             Err(error) => {
-                let (method, native_fallback, _) = click_audit_fields(audit.method.as_ref());
+                let (method, native_fallback, _) = click_audit_fields(error.action_method.as_ref());
                 (
                     method,
                     native_fallback,
@@ -1678,19 +1696,6 @@ impl Glass {
         params: ClickTargetParams,
         sequence_deadline: Deadline,
     ) -> SemanticActionResult<SemanticActionOutcome> {
-        self.click_target_inner_with_audit(
-            params,
-            sequence_deadline,
-            &mut ClickAuditContext::default(),
-        )
-    }
-
-    fn click_target_inner_with_audit(
-        &mut self,
-        params: ClickTargetParams,
-        sequence_deadline: Deadline,
-        audit: &mut ClickAuditContext,
-    ) -> SemanticActionResult<SemanticActionOutcome> {
         let bound = target_deadline(
             &params.target,
             params.timeout_ms,
@@ -1698,42 +1703,37 @@ impl Glass {
             sequence_deadline,
         )?;
         match params.mode {
-            ActionMode::Native => self.click_native_once(
-                &params.target,
-                params.max_nodes,
-                sequence_deadline,
-                bound,
-                audit,
-            ),
+            ActionMode::Native => {
+                self.click_native_once(&params.target, params.max_nodes, sequence_deadline, bound)
+            }
             ActionMode::Pointer => self.click_pointer_once(
                 &params.target,
                 params.max_nodes,
                 sequence_deadline,
                 bound,
                 None,
-                audit,
             ),
             ActionMode::Auto => match self.click_native_once(
                 &params.target,
                 params.max_nodes,
                 sequence_deadline,
                 bound,
-                audit,
             ) {
                 Ok(done) => Ok(done),
                 Err(error) if error.proves_pre_dispatch_native_unavailable() => {
                     let reason = error.safe_fallback_reason();
-                    audit.selected(ActionMethod::Pointer {
-                        native_fallback: Some(reason.clone()),
-                    });
                     self.click_pointer_once(
                         &params.target,
                         params.max_nodes,
                         sequence_deadline,
                         bound,
-                        Some(reason),
-                        audit,
+                        Some(reason.clone()),
                     )
+                    .map_err(|error| {
+                        error.with_action_method(ActionMethod::Pointer {
+                            native_fallback: Some(reason),
+                        })
+                    })
                 }
                 Err(error) => Err(error),
             },
