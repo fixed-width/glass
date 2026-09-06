@@ -180,6 +180,89 @@ impl ActionabilityReport {
         )
     }
 
+    pub(crate) fn evaluate_set_value(
+        target: &ElementInfo,
+        coverage: AxStateCoverage,
+        window: (u32, u32),
+        legacy_id: bool,
+    ) -> Self {
+        evaluate_actionability(
+            ActionabilityOperation::SetValue,
+            target,
+            coverage,
+            None,
+            window,
+            PointerHit::Inconclusive,
+            legacy_id,
+        )
+    }
+
+    pub(crate) fn evaluate_targeted_type(
+        target: &ElementInfo,
+        coverage: AxStateCoverage,
+        stable: Option<bool>,
+        window: (u32, u32),
+        pointer: bool,
+    ) -> Self {
+        evaluate_actionability(
+            if pointer {
+                ActionabilityOperation::PointerType
+            } else {
+                ActionabilityOperation::NativeType
+            },
+            target,
+            coverage,
+            stable,
+            window,
+            PointerHit::Inconclusive,
+            false,
+        )
+    }
+
+    /// Value/type resolution requires positive eligibility, even when unproven checks do not block.
+    pub(crate) fn eligible_for_resolution(&self) -> bool {
+        self.checks.iter().any(|check| {
+            check.name == ActionabilityCheckName::FocusEligible
+                && check.verdict == ActionabilityVerdict::Passed
+        }) && self.blocking().is_none()
+    }
+
+    pub(crate) fn record_targeted_type_eligibility(
+        &mut self,
+        target: &ElementInfo,
+        coverage: AxStateCoverage,
+    ) {
+        let check = ActionabilityCheck::new(
+            ActionabilityCheckName::FocusEligible,
+            targeted_type_eligibility(target, coverage),
+            true,
+            ActionabilitySource::NormalizedState,
+        );
+        if let Some(existing) = self
+            .checks
+            .iter_mut()
+            .find(|existing| existing.name == ActionabilityCheckName::FocusEligible)
+        {
+            *existing = check;
+        } else {
+            let position = self
+                .checks
+                .iter()
+                .position(|existing| existing.name == ActionabilityCheckName::Stable)
+                .unwrap_or(self.checks.len());
+            self.checks.insert(position, check);
+        }
+    }
+
+    pub(crate) fn record_focus_confirmation(&mut self, coverage: AxStateCoverage, confirmed: bool) {
+        self.push(ActionabilityCheck::new(
+            ActionabilityCheckName::Focused,
+            covered_flag(coverage.focused, confirmed),
+            true,
+            ActionabilitySource::ConfirmationPoll,
+        ));
+    }
+
     pub(crate) fn pass_backend_fingerprint(&mut self) {
         if let Some(check) = self
             .checks
@@ -210,25 +293,21 @@ pub enum PointerHit {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum ActionabilityOperation {
     NativeClick,
     PointerClick,
-    NativeFocus,
-    PointerFocus,
+    NativeType,
+    PointerType,
     SetValue,
 }
 
 impl ActionabilityOperation {
     fn uses_pointer(self) -> bool {
-        matches!(self, Self::PointerClick | Self::PointerFocus)
+        matches!(self, Self::PointerClick | Self::PointerType)
     }
 
     fn requires_focus_eligibility(self) -> bool {
-        matches!(
-            self,
-            Self::NativeFocus | Self::PointerFocus | Self::SetValue
-        )
+        matches!(self, Self::NativeType | Self::PointerType | Self::SetValue)
     }
 }
 
@@ -242,12 +321,15 @@ fn covered_flag(covered: bool, value: bool) -> ActionabilityVerdict {
     }
 }
 
-fn focus_eligibility(target: &ElementInfo, coverage: AxStateCoverage) -> ActionabilityVerdict {
-    if (coverage.focusable && target.states.focusable)
+fn targeted_type_eligibility(
+    target: &ElementInfo,
+    coverage: AxStateCoverage,
+) -> ActionabilityVerdict {
+    if matches!(target.role, AxRole::TextField | AxRole::TextArea)
         || (coverage.editable && target.states.editable)
     {
         ActionabilityVerdict::Passed
-    } else if coverage.focusable && coverage.editable {
+    } else if coverage.editable {
         ActionabilityVerdict::Failed
     } else {
         ActionabilityVerdict::Unproven
@@ -272,8 +354,7 @@ fn set_value_eligibility(target: &ElementInfo, coverage: AxStateCoverage) -> Act
     }
 }
 
-#[allow(private_interfaces)]
-pub(crate) fn evaluate_actionability(
+fn evaluate_actionability(
     operation: ActionabilityOperation,
     target: &ElementInfo,
     coverage: AxStateCoverage,
@@ -321,7 +402,7 @@ pub(crate) fn evaluate_actionability(
             if operation == ActionabilityOperation::SetValue {
                 set_value_eligibility(target, coverage)
             } else {
-                focus_eligibility(target, coverage)
+                targeted_type_eligibility(target, coverage)
             },
             state_required,
             source(ActionabilitySource::NormalizedState),
@@ -503,8 +584,7 @@ mod tests {
             visible: true,
             ..AxStateCoverage::NONE
         };
-        let report = evaluate_actionability(
-            ActionabilityOperation::NativeClick,
+        let report = ActionabilityReport::evaluate_click(
             &target(
                 AxRole::Button,
                 AxStates {
@@ -523,6 +603,7 @@ mod tests {
             Some(false),
             (100, 100),
             PointerHit::Other,
+            false,
             false,
         );
 
@@ -574,8 +655,7 @@ mod tests {
             visible: true,
             ..AxStateCoverage::NONE
         };
-        let report = evaluate_actionability(
-            ActionabilityOperation::PointerClick,
+        let report = ActionabilityReport::evaluate_click(
             &target(
                 AxRole::Button,
                 AxStates {
@@ -595,6 +675,7 @@ mod tests {
             (100, 100),
             PointerHit::Other,
             false,
+            true,
         );
 
         assert_eq!(
@@ -620,8 +701,7 @@ mod tests {
             visible: true,
             ..AxStateCoverage::NONE
         };
-        let report = evaluate_actionability(
-            ActionabilityOperation::PointerClick,
+        let report = ActionabilityReport::evaluate_click(
             &target(
                 AxRole::Button,
                 AxStates {
@@ -641,6 +721,7 @@ mod tests {
             (100, 100),
             PointerHit::Inconclusive,
             false,
+            true,
         );
 
         assert_eq!(report.blocking(), None);
@@ -700,79 +781,89 @@ mod tests {
     }
 
     #[test]
-    fn focus_requires_focusable_or_editable_when_that_fact_is_covered() {
+    fn value_and_type_actionability_insert_one_exact_eligibility_check_before_stability() {
+        let bounds = AxRect {
+            x: 10,
+            y: 10,
+            width: 80,
+            height: 20,
+        };
+        let editable = target(
+            AxRole::Button,
+            AxStates {
+                enabled: true,
+                visible: true,
+                editable: true,
+                ..AxStates::default()
+            },
+            Some(bounds),
+        );
         let coverage = AxStateCoverage {
             enabled: true,
-            focusable: true,
+            visible: true,
             editable: true,
+            checkable: true,
             ..AxStateCoverage::NONE
         };
-        let report = evaluate_actionability(
-            ActionabilityOperation::NativeFocus,
-            &target(
-                AxRole::Button,
-                AxStates {
-                    enabled: true,
-                    ..AxStates::default()
-                },
-                Some(AxRect {
-                    x: 10,
-                    y: 10,
-                    width: 20,
-                    height: 20,
-                }),
-            ),
-            coverage,
-            None,
-            (100, 100),
-            PointerHit::Inconclusive,
-            false,
-        );
 
-        assert_eq!(
-            report.blocking(),
-            Some(check(&report, ActionabilityCheckName::FocusEligible))
+        let semantic =
+            ActionabilityReport::evaluate_set_value(&editable, coverage, (100, 100), false);
+        let legacy = ActionabilityReport::evaluate_set_value(&editable, coverage, (100, 100), true);
+        let targeted = ActionabilityReport::evaluate_targeted_type(
+            &editable,
+            coverage,
+            Some(true),
+            (100, 100),
+            true,
         );
-        assert_eq!(
-            check(&report, ActionabilityCheckName::FocusEligible),
-            ActionabilityCheck::new(
-                ActionabilityCheckName::FocusEligible,
-                ActionabilityVerdict::Failed,
-                true,
-                ActionabilitySource::NormalizedState,
-            )
-        );
+        for (report, required, source) in [
+            (&semantic, true, ActionabilitySource::NormalizedState),
+            (&legacy, false, ActionabilitySource::LegacyCache),
+            (&targeted, true, ActionabilitySource::NormalizedState),
+        ] {
+            let positions = report
+                .checks
+                .iter()
+                .enumerate()
+                .filter(|(_, check)| check.name == ActionabilityCheckName::FocusEligible)
+                .collect::<Vec<_>>();
+            assert_eq!(positions.len(), 1);
+            let (position, check) = positions[0];
+            assert_eq!(
+                report.checks[position + 1].name,
+                ActionabilityCheckName::Stable
+            );
+            assert_eq!(check.verdict, ActionabilityVerdict::Passed);
+            assert_eq!(check.required, required);
+            assert_eq!(check.source, source);
+        }
     }
 
     #[test]
-    fn focus_eligibility_distinguishes_either_positive_fact_from_partial_negative_coverage() {
-        let cases = [
-            (true, true, false, false, ActionabilityVerdict::Passed),
-            (false, false, true, true, ActionabilityVerdict::Passed),
-            (true, false, false, false, ActionabilityVerdict::Unproven),
-            (false, false, true, false, ActionabilityVerdict::Unproven),
-            (true, false, true, false, ActionabilityVerdict::Failed),
-        ];
-
-        for (covers_focusable, focusable, covers_editable, editable, expected) in cases {
-            let coverage = AxStateCoverage {
-                focusable: covers_focusable,
-                editable: covers_editable,
-                ..AxStateCoverage::NONE
-            };
-            let element = target(
-                AxRole::Button,
-                AxStates {
-                    focusable,
-                    editable,
-                    ..AxStates::default()
+    fn focus_confirmation_discloses_coverage_and_observation_independently() {
+        for (covered, confirmed, expected) in [
+            (false, false, ActionabilityVerdict::Unproven),
+            (false, true, ActionabilityVerdict::Unproven),
+            (true, false, ActionabilityVerdict::Failed),
+            (true, true, ActionabilityVerdict::Passed),
+        ] {
+            let mut report = ActionabilityReport::default();
+            report.record_focus_confirmation(
+                AxStateCoverage {
+                    focused: covered,
+                    ..AxStateCoverage::NONE
                 },
-                None,
+                confirmed,
             );
             assert_eq!(
-                focus_eligibility(&element, coverage),
-                expected,
-                "coverage=({covers_focusable},{covers_editable}), state=({focusable},{editable})"
+                report.checks,
+                vec![ActionabilityCheck::new(
+                    ActionabilityCheckName::Focused,
+                    expected,
+                    true,
+                    ActionabilitySource::ConfirmationPoll,
+                )],
+                "covered={covered}, confirmed={confirmed}"
             );
         }
     }
@@ -827,8 +918,7 @@ mod tests {
         ];
 
         for (role, states) in cases {
-            let report = evaluate_actionability(
-                ActionabilityOperation::SetValue,
+            let report = ActionabilityReport::evaluate_set_value(
                 &target(
                     role,
                     states,
@@ -840,9 +930,7 @@ mod tests {
                     }),
                 ),
                 coverage,
-                None,
                 (100, 100),
-                PointerHit::Inconclusive,
                 false,
             );
             assert_eq!(report.blocking(), None, "role {role:?} was rejected");
@@ -880,10 +968,239 @@ mod tests {
                 },
                 None,
             );
+            let report =
+                ActionabilityReport::evaluate_set_value(&element, coverage, (100, 100), false);
             assert_eq!(
-                set_value_eligibility(&element, coverage),
+                check(&report, ActionabilityCheckName::FocusEligible).verdict,
                 expected,
                 "coverage=({covers_editable},{covers_checkable}), state=({editable},{checkable})"
+            );
+            assert_eq!(
+                report.eligible_for_resolution(),
+                expected == ActionabilityVerdict::Passed
+            );
+        }
+    }
+
+    #[test]
+    fn targeted_type_requires_text_role_or_covered_editability_in_both_modes() {
+        let cases = [
+            (
+                AxRole::Button,
+                true,
+                false,
+                true,
+                ActionabilityVerdict::Failed,
+            ),
+            (
+                AxRole::Button,
+                true,
+                false,
+                false,
+                ActionabilityVerdict::Unproven,
+            ),
+            (
+                AxRole::Button,
+                false,
+                true,
+                false,
+                ActionabilityVerdict::Unproven,
+            ),
+            (
+                AxRole::Button,
+                false,
+                true,
+                true,
+                ActionabilityVerdict::Passed,
+            ),
+            (
+                AxRole::TextField,
+                false,
+                false,
+                false,
+                ActionabilityVerdict::Passed,
+            ),
+            (
+                AxRole::TextArea,
+                false,
+                false,
+                false,
+                ActionabilityVerdict::Passed,
+            ),
+            (
+                AxRole::TextField,
+                false,
+                false,
+                true,
+                ActionabilityVerdict::Passed,
+            ),
+            (
+                AxRole::TextArea,
+                false,
+                false,
+                true,
+                ActionabilityVerdict::Passed,
+            ),
+        ];
+        for (role, focusable, editable, covered, verdict) in cases {
+            for pointer in [false, true] {
+                let report = ActionabilityReport::evaluate_targeted_type(
+                    &target(
+                        role,
+                        AxStates {
+                            enabled: true,
+                            visible: true,
+                            focusable,
+                            editable,
+                            ..AxStates::default()
+                        },
+                        Some(AxRect {
+                            x: 10,
+                            y: 10,
+                            width: 20,
+                            height: 20,
+                        }),
+                    ),
+                    AxStateCoverage {
+                        enabled: true,
+                        visible: true,
+                        focusable: true,
+                        editable: covered,
+                        ..AxStateCoverage::NONE
+                    },
+                    Some(true),
+                    (100, 100),
+                    pointer,
+                );
+                assert_eq!(
+                    check(&report, ActionabilityCheckName::FocusEligible),
+                    ActionabilityCheck::new(
+                        ActionabilityCheckName::FocusEligible,
+                        verdict,
+                        true,
+                        ActionabilitySource::NormalizedState,
+                    ),
+                    "{role:?}, focusable={focusable}, editable={editable}, covered={covered}, pointer={pointer}"
+                );
+                assert_eq!(
+                    report.eligible_for_resolution(),
+                    verdict == ActionabilityVerdict::Passed
+                );
+                for name in [
+                    ActionabilityCheckName::Visible,
+                    ActionabilityCheckName::Stable,
+                    ActionabilityCheckName::InWindow,
+                    ActionabilityCheckName::NonOccluded,
+                ] {
+                    assert_eq!(check(&report, name).required, pointer);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn value_and_type_resolution_still_refuse_a_disabled_eligible_target() {
+        let element = target(
+            AxRole::TextField,
+            AxStates {
+                editable: true,
+                ..AxStates::default()
+            },
+            None,
+        );
+        let coverage = AxStateCoverage {
+            enabled: true,
+            editable: true,
+            ..AxStateCoverage::NONE
+        };
+        for report in [
+            ActionabilityReport::evaluate_set_value(&element, coverage, (100, 100), false),
+            ActionabilityReport::evaluate_targeted_type(
+                &element,
+                coverage,
+                None,
+                (100, 100),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                check(&report, ActionabilityCheckName::FocusEligible).verdict,
+                ActionabilityVerdict::Passed
+            );
+            assert!(!report.eligible_for_resolution());
+            assert_eq!(
+                report.blocking(),
+                Some(check(&report, ActionabilityCheckName::Enabled))
+            );
+        }
+    }
+
+    #[test]
+    fn targeted_type_evidence_preserves_pointer_proofs_and_replaces_its_eligibility_check() {
+        let element = target(
+            AxRole::Button,
+            AxStates {
+                enabled: true,
+                visible: true,
+                editable: true,
+                ..AxStates::default()
+            },
+            Some(AxRect {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 20,
+            }),
+        );
+        let coverage = AxStateCoverage {
+            enabled: true,
+            visible: true,
+            editable: true,
+            ..AxStateCoverage::NONE
+        };
+        let mut pointer = ActionabilityReport::evaluate_click(
+            &element,
+            coverage,
+            Some(true),
+            (100, 100),
+            PointerHit::Other,
+            false,
+            true,
+        );
+        pointer.pass_backend_fingerprint();
+        for mut report in [pointer, ActionabilityReport::default()] {
+            let original = report.clone();
+            report.record_targeted_type_eligibility(&element, coverage);
+            let once = report.clone();
+            report.record_targeted_type_eligibility(&element, coverage);
+            assert_eq!(report, once);
+            assert_eq!(
+                check(&report, ActionabilityCheckName::FocusEligible).verdict,
+                ActionabilityVerdict::Passed
+            );
+            let remaining = report
+                .checks
+                .iter()
+                .copied()
+                .filter(|check| check.name != ActionabilityCheckName::FocusEligible)
+                .collect::<Vec<_>>();
+            assert_eq!(remaining, original.checks);
+            if let Some(stable) = report
+                .checks
+                .iter()
+                .position(|check| check.name == ActionabilityCheckName::Stable)
+            {
+                assert_eq!(
+                    report.checks[stable - 1].name,
+                    ActionabilityCheckName::FocusEligible
+                );
+            }
+            let mut ineligible = element.clone();
+            ineligible.states.editable = false;
+            report.record_targeted_type_eligibility(&ineligible, coverage);
+            assert_eq!(
+                check(&report, ActionabilityCheckName::FocusEligible).verdict,
+                ActionabilityVerdict::Failed
             );
         }
     }

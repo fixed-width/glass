@@ -3,8 +3,7 @@
 use super::a11y::SetValueExecution;
 use super::*;
 use crate::{
-    ActionabilityCheck, ActionabilityCheckName, ActionabilityReport, ActionabilitySource,
-    ActionabilityVerdict, AxStateCoverage, ScopeResolution, SemanticMatch, SemanticQuery,
+    ActionabilityReport, AxStateCoverage, ScopeResolution, SemanticMatch, SemanticQuery,
     SemanticQueryResult, SemanticSelector, SemanticState, Whose,
 };
 
@@ -612,141 +611,6 @@ fn ax_target(element: &ElementInfo) -> AxTarget {
     }
 }
 
-fn role_supports_set_value(element: &ElementInfo, coverage: AxStateCoverage) -> bool {
-    set_value_eligibility(element, coverage) == ActionabilityVerdict::Passed
-}
-
-fn set_value_eligibility(element: &ElementInfo, coverage: AxStateCoverage) -> ActionabilityVerdict {
-    if matches!(
-        element.role,
-        AxRole::ComboBox
-            | AxRole::Slider
-            | AxRole::SpinButton
-            | AxRole::ToggleButton
-            | AxRole::RadioButton
-            | AxRole::CheckBox
-    ) || (coverage.editable && element.states.editable)
-        || (coverage.checkable && element.states.checkable)
-    {
-        ActionabilityVerdict::Passed
-    } else if coverage.editable && coverage.checkable {
-        ActionabilityVerdict::Failed
-    } else {
-        ActionabilityVerdict::Unproven
-    }
-}
-
-fn set_value_actionability(
-    element: &ElementInfo,
-    coverage: AxStateCoverage,
-    window: (u32, u32),
-    legacy_id: bool,
-) -> ActionabilityReport {
-    let mut report = ActionabilityReport::evaluate_click(
-        element,
-        coverage,
-        None,
-        window,
-        crate::PointerHit::Inconclusive,
-        legacy_id,
-        false,
-    );
-    let source = if legacy_id {
-        ActionabilitySource::LegacyCache
-    } else {
-        ActionabilitySource::NormalizedState
-    };
-    let check = ActionabilityCheck::new(
-        ActionabilityCheckName::FocusEligible,
-        set_value_eligibility(element, coverage),
-        !legacy_id,
-        source,
-    );
-    let insert_at = report
-        .checks
-        .iter()
-        .position(|existing| existing.name == ActionabilityCheckName::Stable)
-        .unwrap_or(report.checks.len());
-    report.checks.insert(insert_at, check);
-    report
-}
-
-fn targeted_type_eligibility(
-    element: &ElementInfo,
-    coverage: AxStateCoverage,
-) -> ActionabilityVerdict {
-    if matches!(element.role, AxRole::TextField | AxRole::TextArea)
-        || (coverage.editable && element.states.editable)
-    {
-        ActionabilityVerdict::Passed
-    } else if coverage.editable {
-        ActionabilityVerdict::Failed
-    } else {
-        ActionabilityVerdict::Unproven
-    }
-}
-
-fn targeted_type_actionability(
-    element: &ElementInfo,
-    coverage: AxStateCoverage,
-    stable: Option<bool>,
-    window: (u32, u32),
-    pointer: bool,
-) -> ActionabilityReport {
-    let mut report = ActionabilityReport::evaluate_click(
-        element,
-        coverage,
-        stable,
-        window,
-        crate::PointerHit::Inconclusive,
-        false,
-        pointer,
-    );
-    insert_targeted_type_eligibility(&mut report, element, coverage);
-    report
-}
-
-fn insert_targeted_type_eligibility(
-    report: &mut ActionabilityReport,
-    element: &ElementInfo,
-    coverage: AxStateCoverage,
-) {
-    let insert_at = report
-        .checks
-        .iter()
-        .position(|check| check.name == ActionabilityCheckName::Stable)
-        .unwrap_or(report.checks.len());
-    report.checks.insert(
-        insert_at,
-        ActionabilityCheck::new(
-            ActionabilityCheckName::FocusEligible,
-            targeted_type_eligibility(element, coverage),
-            true,
-            ActionabilitySource::NormalizedState,
-        ),
-    );
-}
-
-fn record_focus_confirmation(
-    report: &mut ActionabilityReport,
-    coverage: AxStateCoverage,
-    confirmed: bool,
-) {
-    let verdict = if !coverage.focused {
-        ActionabilityVerdict::Unproven
-    } else if confirmed {
-        ActionabilityVerdict::Passed
-    } else {
-        ActionabilityVerdict::Failed
-    };
-    report.push(ActionabilityCheck::new(
-        ActionabilityCheckName::Focused,
-        verdict,
-        true,
-        ActionabilitySource::ConfirmationPoll,
-    ));
-}
-
 #[derive(Debug)]
 struct ConfirmedFocus {
     element: ElementInfo,
@@ -812,7 +676,7 @@ fn focus_unconfirmed_error(
     method: ActionMethod,
     bound: ActionDeadline,
 ) -> Box<SemanticActionError> {
-    record_focus_confirmation(&mut actionability, coverage, false);
+    actionability.record_focus_confirmation(coverage, false);
     let mut error = actionability_error(
         FailureSummary {
             kind: SemanticActionFailureKind::FocusUnconfirmed,
@@ -1906,7 +1770,7 @@ impl Glass {
                 let actionability = before
                     .as_ref()
                     .map(|(element, coverage, window)| {
-                        set_value_actionability(element, *coverage, *window, true)
+                        ActionabilityReport::evaluate_set_value(element, *coverage, *window, true)
                     })
                     .unwrap_or_default();
                 let execution =
@@ -1941,10 +1805,10 @@ impl Glass {
                         sequence_deadline,
                         bound,
                         |element, coverage| {
-                            role_supports_set_value(element, coverage)
-                                && set_value_actionability(element, coverage, window, false)
-                                    .blocking()
-                                    .is_none()
+                            ActionabilityReport::evaluate_set_value(
+                                element, coverage, window, false,
+                            )
+                            .eligible_for_resolution()
                         },
                     )
                     .map_err(|mut error| {
@@ -1954,14 +1818,19 @@ impl Glass {
                                 .first()
                                 .map(|candidate| candidate.element.clone());
                             if let Some(element) = element {
-                                error.actionability =
-                                    set_value_actionability(&element, coverage, window, false);
+                                error.actionability = ActionabilityReport::evaluate_set_value(
+                                    &element, coverage, window, false,
+                                );
                             }
                         }
                         error
                     })?;
-                let actionability =
-                    set_value_actionability(&resolved.element, resolved.coverage, window, false);
+                let actionability = ActionabilityReport::evaluate_set_value(
+                    &resolved.element,
+                    resolved.coverage,
+                    window,
+                    false,
+                );
                 let execution = self
                     .set_value_inner(resolved.element.id, text, resolved.bound.deadline)
                     .map_err(|source| {
@@ -1983,7 +1852,8 @@ impl Glass {
                 )
             }
         };
-        let mut actionability = set_value_actionability(&element, coverage, window, legacy_id);
+        let mut actionability =
+            ActionabilityReport::evaluate_set_value(&element, coverage, window, legacy_id);
         actionability.pass_backend_fingerprint();
         Ok(SemanticActionOutcome {
             target: element,
@@ -2163,10 +2033,10 @@ impl Glass {
                 sequence_deadline,
                 bound,
                 |element, coverage| {
-                    targeted_type_eligibility(element, coverage) == ActionabilityVerdict::Passed
-                        && targeted_type_actionability(element, coverage, None, window, false)
-                            .blocking()
-                            .is_none()
+                    ActionabilityReport::evaluate_targeted_type(
+                        element, coverage, None, window, false,
+                    )
+                    .eligible_for_resolution()
                 },
             )
             .map_err(|mut error| {
@@ -2176,13 +2046,19 @@ impl Glass {
                         .first()
                         .map(|candidate| candidate.element.clone())
                 {
-                    error.actionability =
-                        targeted_type_actionability(&element, coverage, None, window, false);
+                    error.actionability = ActionabilityReport::evaluate_targeted_type(
+                        &element, coverage, None, window, false,
+                    );
                 }
                 error
             })?;
-        let mut actionability =
-            targeted_type_actionability(&resolved.element, resolved.coverage, None, window, false);
+        let mut actionability = ActionabilityReport::evaluate_targeted_type(
+            &resolved.element,
+            resolved.coverage,
+            None,
+            window,
+            false,
+        );
         let actuated = self
             .try_native_focus(resolved.element.id, resolved.bound.deadline)
             .map_err(|source| {
@@ -2224,7 +2100,7 @@ impl Glass {
                     resolved.bound,
                 )
             })?;
-        record_focus_confirmation(&mut actionability, resolved.coverage, true);
+        actionability.record_focus_confirmation(resolved.coverage, true);
         Ok(ConfirmedFocus {
             element: confirmed,
             resolution: resolved.resolution,
@@ -2251,7 +2127,7 @@ impl Glass {
             sequence_deadline,
             bound,
         )?;
-        let mut pre_dispatch = targeted_type_actionability(
+        let mut pre_dispatch = ActionabilityReport::evaluate_targeted_type(
             &resolved.candidate.element,
             resolved.coverage,
             Some(true),
@@ -2283,7 +2159,9 @@ impl Glass {
             .dispatch_pointer_click(resolved, native_fallback)
             .map_err(|mut error| {
                 let focus_dispatch = error.action_dispatch;
-                insert_targeted_type_eligibility(&mut error.actionability, &element, coverage);
+                error
+                    .actionability
+                    .record_targeted_type_eligibility(&element, coverage);
                 error.focus = Some(MutationReport {
                     method: method.clone(),
                     dispatch: focus_dispatch,
@@ -2296,7 +2174,7 @@ impl Glass {
                 error
             })?;
         pre_dispatch = focused.actionability;
-        insert_targeted_type_eligibility(&mut pre_dispatch, &focused.target, coverage);
+        pre_dispatch.record_targeted_type_eligibility(&focused.target, coverage);
         let confirmed = self
             .confirm_focused_target(&target, focused.bound)
             .map_err(|error| {
@@ -2313,7 +2191,7 @@ impl Glass {
                     focused.bound,
                 )
             })?;
-        record_focus_confirmation(&mut pre_dispatch, coverage, true);
+        pre_dispatch.record_focus_confirmation(coverage, true);
         Ok(ConfirmedFocus {
             element: confirmed,
             resolution: focused
