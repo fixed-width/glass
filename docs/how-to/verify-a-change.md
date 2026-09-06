@@ -114,6 +114,12 @@ cargo test -p glass-wayland -- --include-ignored   # 61 tests; needs sway >= 1.1
 | Windows on-box validation (Sandboxie, clipboard shim) | a Windows box, driven by `scripts/test-windows.sh` |
 | Mutation testing | CI only; it is sharded there, and a local sweep saturates the machine |
 
+The Sandboxie clipboard tests also need the logged-in user's **interactive Windows session**,
+even though the probe has no GUI. From SSH, use the scheduled-task bridge in
+`tools/windows-validation/run-onbox.ps1`; running the test executable directly in SSH session 0
+can leave the boxed probe silent. Build `glass-clip-shim-windows` and its `clipprobe` example in
+the test's profile, and set `GLASS_CLIP_SHIM_DLL` in the scheduled process to that DLL.
+
 ## The scripts
 
 Fourteen run locally. One drives another machine.
