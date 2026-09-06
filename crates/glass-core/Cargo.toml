@@ -12,6 +12,7 @@ publish.workspace = true
 bench = false
 
 [dependencies]
+fearless_simd = "0.7.0"
 thiserror.workspace = true
 image.workspace = true
 serde = { workspace = true }

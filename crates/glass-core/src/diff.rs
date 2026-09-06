@@ -1,7 +1,6 @@
 use crate::error::{GlassError, Result};
 use crate::frame::{Frame, Region};
-use std::simd::cmp::{SimdOrd, SimdPartialOrd};
-use std::simd::{Simd, u8x32};
+use fearless_simd::{dispatch, prelude::*, u8x32};
 
 /// Axis-aligned bounding box of changed pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,6 +216,17 @@ pub fn diff_with_mask(
     tolerance: u8,
     mask: &IgnoreMask,
 ) -> Result<DiffResult> {
+    dispatch!(crate::simd_level(), simd => diff_with_mask_simd(simd, a, b, tolerance, mask))
+}
+
+#[inline(always)]
+fn diff_with_mask_simd<S: Simd>(
+    simd: S,
+    a: &Frame,
+    b: &Frame,
+    tolerance: u8,
+    mask: &IgnoreMask,
+) -> Result<DiffResult> {
     if a.width != b.width || a.height != b.height {
         return Err(GlassError::SizeMismatch {
             a: (a.width, a.height),
@@ -224,7 +234,7 @@ pub fn diff_with_mask(
         });
     }
     let row_bytes = a.width as usize * 4;
-    let tol_vec = Simd::splat(tolerance);
+    let tol_vec = u8x32::splat(simd, tolerance);
     let mut changed = 0u64;
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0u32, 0u32);
 
@@ -244,22 +254,34 @@ pub fn diff_with_mask(
                 col = chunk_end;
                 continue;
             }
-            let va = u8x32::from_slice(&ra[off..off + LANES]);
-            let vb = u8x32::from_slice(&rb[off..off + LANES]);
-            let d = va.simd_max(vb) - va.simd_min(vb);
-            if d.simd_gt(tol_vec).any() {
-                for px in 0..(LANES / 4) {
-                    let cx = col + px as u32;
-                    if masked_row && mask.is_ignored(cx, y) {
-                        continue;
+            let va = u8x32::from_slice(simd, &ra[off..off + LANES]);
+            let vb = u8x32::from_slice(simd, &rb[off..off + LANES]);
+            let d = va.max(vb) - va.min(vb);
+            let byte_changes = d.simd_gt(tol_vec);
+            if byte_changes.any_true() {
+                let byte_flags =
+                    byte_changes.select(u8x32::splat(simd, 255), u8x32::splat(simd, 0));
+                // Four byte predicates form one nonzero word per changed RGBA pixel.
+                let word_flags: fearless_simd::u32x8<S> = byte_flags.bitcast();
+                let mut bits = word_flags
+                    .simd_gt(fearless_simd::u32x8::splat(simd, 0))
+                    .to_bitmask() as u8;
+                if masked_row {
+                    let mut remaining = bits;
+                    while remaining != 0 {
+                        let px = remaining.trailing_zeros();
+                        remaining &= remaining - 1;
+                        if mask.is_ignored(col + px, y) {
+                            bits &= !(1 << px);
+                        }
                     }
-                    if pixel_changed(ra, rb, off + px * 4, tolerance) {
-                        changed += 1;
-                        min_x = min_x.min(cx);
-                        min_y = min_y.min(y);
-                        max_x = max_x.max(cx);
-                        max_y = max_y.max(y);
-                    }
+                }
+                if bits != 0 {
+                    changed += u64::from(bits.count_ones());
+                    min_x = min_x.min(col + bits.trailing_zeros());
+                    max_x = max_x.max(col + 7 - bits.leading_zeros());
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
                 }
             }
             off += LANES;
@@ -491,6 +513,17 @@ pub fn diff_perceptual_with_mask(
     threshold: f32,
     mask: &IgnoreMask,
 ) -> Result<DiffResult> {
+    dispatch!(crate::simd_level(), simd => diff_perceptual_with_mask_simd(simd, a, b, threshold, mask))
+}
+
+#[inline(always)]
+fn diff_perceptual_with_mask_simd<S: Simd>(
+    simd: S,
+    a: &Frame,
+    b: &Frame,
+    threshold: f32,
+    mask: &IgnoreMask,
+) -> Result<DiffResult> {
     if a.width != b.width || a.height != b.height {
         return Err(GlassError::SizeMismatch {
             a: (a.width, a.height),
@@ -522,7 +555,9 @@ pub fn diff_perceptual_with_mask(
                 col = chunk_end;
                 continue;
             }
-            if u8x32::from_slice(&ra[off..off + LANES]) != u8x32::from_slice(&rb[off..off + LANES])
+            if u8x32::from_slice(simd, &ra[off..off + LANES])
+                .simd_eq(u8x32::from_slice(simd, &rb[off..off + LANES]))
+                .any_false()
             {
                 for px in 0..(LANES / 4) as u32 {
                     let cx = col + px;
@@ -1618,12 +1653,44 @@ mod tests {
             let b = make(w, h, 7);
             let masks = mask_matrix(w, h);
             for (label, m) in masks {
-                for tol in [0u8, 10] {
-                    assert_eq!(
-                        diff_with_mask(&a, &b, tol, &m).unwrap(),
-                        reference_diff_masked(&a, &b, tol, &m),
-                        "{w}x{h} tol={tol} mask={label}"
-                    );
+                for tol in [0u8, 1, 10, 127, 254, 255] {
+                    let expected = reference_diff_masked(&a, &b, tol, &m);
+                    for level in [fearless_simd::Level::baseline(), crate::simd_level()] {
+                        assert_eq!(
+                            dispatch!(level, simd => diff_with_mask_simd(simd, &a, &b, tol, &m))
+                                .unwrap(),
+                            expected,
+                            "{level:?} {w}x{h} tol={tol} mask={label}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn simd_pixel_bits_match_scalar_for_every_channel_and_mask() {
+        let (w, h) = (17, 3);
+        let a = Frame::solid(w, h, [0; 4]);
+        for pattern in 0u16..=255 {
+            for channel in 0..4 {
+                let mut b = a.clone();
+                for (px, pixel) in b.pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    if pattern & (1 << (px % w as usize % 8)) != 0 {
+                        pixel[channel] = [1, 127, 128, 254, 255][px % 5];
+                    }
+                }
+                for (label, mask) in mask_matrix(w, h) {
+                    for tolerance in [0, 1, 127, 254, 255] {
+                        let expected = reference_diff_masked(&a, &b, tolerance, &mask);
+                        for level in [fearless_simd::Level::baseline(), crate::simd_level()] {
+                            assert_eq!(
+                                dispatch!(level, simd => diff_with_mask_simd(simd, &a, &b, tolerance, &mask)).unwrap(),
+                                expected,
+                                "{level:?} pattern={pattern:08b} channel={channel} tolerance={tolerance} mask={label}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1806,12 +1873,15 @@ mod tests {
             let a = make(w, h, 1);
             let b = make(w, h, 5);
             for (label, m) in mask_matrix(w, h) {
-                for thr in [0.02f32, 0.1, 0.4] {
-                    assert_eq!(
-                        diff_perceptual_with_mask(&a, &b, thr, &m).unwrap(),
-                        reference_perceptual_masked(&a, &b, thr, &m),
-                        "{w}x{h} thr={thr} mask={label}"
-                    );
+                for thr in [0.0f32, 0.02, 0.1, 0.4, 1.0] {
+                    let expected = reference_perceptual_masked(&a, &b, thr, &m);
+                    for level in [fearless_simd::Level::baseline(), crate::simd_level()] {
+                        assert_eq!(
+                            dispatch!(level, simd => diff_perceptual_with_mask_simd(simd, &a, &b, thr, &m)).unwrap(),
+                            expected,
+                            "{level:?} {w}x{h} thr={thr} mask={label}"
+                        );
+                    }
                 }
             }
         }
