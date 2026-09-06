@@ -64,6 +64,10 @@ fn convert<S: Simd, const SWAP: bool>(simd: S, src: &[u8], dst: &mut [u8]) {
     }
     // Scalar tail (< 8 pixels). A trailing run shorter than one pixel is left
     // untouched, matching the per-backend buffers (always whole `w*h*4` pixels).
+    debug_assert!(
+        src.len() - off < LANES,
+        "SIMD loop must consume every full chunk"
+    );
     while off + 4 <= src.len() {
         let (r, b) = if SWAP {
             (src[off + 2], src[off])
@@ -84,6 +88,10 @@ fn convert_in_place<S: Simd, const SWAP: bool>(simd: S, buf: &mut [u8]) {
     let buf = if !SWAP && simd.level().as_avx2().is_some() {
         // Align whole pixels to avoid split AVX2 accesses on 16-byte-aligned buffers.
         let prefix = (buf.as_ptr().align_offset(LANES) & !3).min(buf.len() / 4 * 4);
+        debug_assert!(
+            prefix < LANES,
+            "alignment prefix must be shorter than one SIMD chunk"
+        );
         let (head, rest) = buf.split_at_mut(prefix);
         let alpha = fearless_simd::u8x16::simd_from(
             simd,
