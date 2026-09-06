@@ -1,6 +1,6 @@
 use glass_core::{
     ActionMethod, ActionMode, ActionTarget, ActionabilityReport, AxNodeId, ClickTargetParams,
-    DispatchStatus, ElementInfo, MatchField, MatchTier, MutationReport, ResolutionReport,
+    ElementInfo, MatchField, MatchTier, MutationReport, ResolutionReport,
     SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_MAX_TIMEOUT_MS, ScopeResolution,
     SemanticActionError, SemanticActionFailureKind, SemanticActionOutcome, SemanticMatch,
     SetValueTargetParams, TypeTargetParams, Whose,
@@ -354,22 +354,6 @@ fn merge_object(target: &mut Value, source: Value) {
     target.extend(source);
 }
 
-pub(crate) fn mutation_provenance(
-    focus: Option<&MutationReport>,
-    action_dispatch: DispatchStatus,
-) -> (glass_core::BoundDispatch, bool) {
-    let may_have_dispatched = action_dispatch != DispatchStatus::NotDispatched
-        || focus.is_some_and(|report| report.dispatch != DispatchStatus::NotDispatched);
-    (
-        if may_have_dispatched {
-            glass_core::BoundDispatch::MayHaveDispatched
-        } else {
-            glass_core::BoundDispatch::NotDispatched
-        },
-        may_have_dispatched,
-    )
-}
-
 pub(crate) fn success_output(
     tool: &'static str,
     outcome: &SemanticActionOutcome,
@@ -440,11 +424,9 @@ fn semantic_category(error: &SemanticActionError) -> SafeErrorCategory {
 }
 
 fn failure_result(error: &SemanticActionError) -> Value {
-    let (_, side_effects_may_have_occurred) =
-        mutation_provenance(error.focus.as_ref(), error.action_dispatch);
     let mut result = json!({
         "dispatch": error.action_dispatch.as_str(),
-        "side_effects_may_have_occurred": side_effects_may_have_occurred,
+        "side_effects_may_have_occurred": error.side_effects_may_have_occurred(),
         "retry": error.retry.as_str(),
         "actionability": actionability_json(&error.actionability),
         "candidate_count": error.candidates.len(),
@@ -475,7 +457,11 @@ pub(crate) fn semantic_error(
             &json!({ "target": element_json(target, include_text) }).to_string(),
         ));
     }
-    let (bound_dispatch, _) = mutation_provenance(error.focus.as_ref(), error.action_dispatch);
+    let bound_dispatch = if error.side_effects_may_have_occurred() {
+        glass_core::BoundDispatch::MayHaveDispatched
+    } else {
+        glass_core::BoundDispatch::NotDispatched
+    };
     ContextualError {
         code: category.code(),
         message: category.summary().into(),

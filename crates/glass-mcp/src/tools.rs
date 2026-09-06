@@ -803,23 +803,20 @@ pub(crate) fn semantic_return_error(
     annotation: &str,
 ) -> ContextualError {
     let disclosure = semantic_action::success_output(tool, outcome, None, Vec::new());
+    let side_effects_may_have_occurred = outcome.side_effects_may_have_occurred();
     let mut contents = disclosure.0.into_iter();
     if let Some(OutContent::Envelope(envelope)) = contents.next() {
         let mut result = envelope.result;
-        let (_, side_effects_may_have_occurred) =
-            semantic_action::mutation_provenance(outcome.focus.as_ref(), outcome.action.dispatch);
         result["dispatch"] = json!(outcome.action.dispatch.as_str());
         result["side_effects_may_have_occurred"] = json!(side_effects_may_have_occurred);
         result["retry"] = json!("do_not_retry");
         error.result = Some(result);
     }
     error.siblings = contents.collect();
-    let (bound_dispatch, side_effects_may_have_occurred) =
-        semantic_action::mutation_provenance(outcome.focus.as_ref(), outcome.action.dispatch);
     error = if side_effects_may_have_occurred {
         error.after_dispatch()
     } else {
-        error.bound_dispatch = Some(bound_dispatch);
+        error.bound_dispatch = Some(BoundDispatch::NotDispatched);
         error
     };
     error.annotate(annotation)
