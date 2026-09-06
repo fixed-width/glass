@@ -238,7 +238,8 @@ fn set_clipboard_data(fmt: u32, h: HANDLE) -> HANDLE {
         if h.0.is_null() {
             return HANDLE::default(); // delayed rendering unsupported
         }
-        if let Some(bytes) = read_bytes_from_hglobal(HGLOBAL(h.0)) {
+        // SAFETY: the intercepted call lends its initialized clipboard data for this synchronous copy.
+        if let Some(bytes) = unsafe { read_bytes_from_hglobal(HGLOBAL(h.0)) } {
             let key = key_of(fmt);
             PENDING.with(|p| {
                 let mut v = p.borrow_mut();

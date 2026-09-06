@@ -4,29 +4,36 @@
 //! cross-compiles to `x86_64-pc-windows-gnu` so this is compile-checked on any host.
 
 use core::ffi::c_void;
+use std::marker::PhantomData;
 
 use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
 use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+    GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
+
+#[cfg(test)]
+mod tests;
 
 /// RAII lock over a moveable `HGLOBAL`: `GlobalLock` on construction, `GlobalUnlock` on drop. The
 /// byte view is bounded by `GlobalSize`, so reads cannot run past the allocation.
 ///
 /// Borrows — does not own — the handle; freeing is a separate concern (see [`OwnedHGlobal`], or the
 /// system taking ownership after `SetClipboardData`).
-pub struct HGlobalLock {
+pub struct HGlobalLock<'a> {
     h: HGLOBAL,
     ptr: *mut c_void,
     len: usize,
+    _borrow: PhantomData<&'a [u8]>,
 }
 
-impl HGlobalLock {
+impl<'a> HGlobalLock<'a> {
     /// Lock `h`, returning `None` if `GlobalLock` fails (null).
     ///
     /// # Safety
-    /// `h` must be a valid `HGLOBAL` (from `GlobalAlloc`, or a clipboard data handle for a global
-    /// format) that stays valid for the lifetime of the returned guard.
+    /// `h` must be a valid `HGLOBAL` whose entire `GlobalSize` is initialized. Its owner must
+    /// keep it alive for `'a` and prevent mutation while byte views are live, including through
+    /// other locks: `GlobalLock` pins memory but does not provide exclusive access. Prefer [`OwnedHGlobal::lock`] for
+    /// allocations owned by Rust; borrowed clipboard data must be tied to the open clipboard.
     pub unsafe fn new(h: HGLOBAL) -> Option<Self> {
         // SAFETY: caller guarantees `h` is valid. GlobalLock pins the moveable block, returning a
         // pointer to it or null on failure.
@@ -36,27 +43,27 @@ impl HGlobalLock {
         }
         // SAFETY: `h` is locked; GlobalSize reports its allocated byte length (0 on error).
         let len = unsafe { GlobalSize(h) };
-        Some(Self { h, ptr, len })
+        let lock = Self {
+            h,
+            ptr,
+            len,
+            _borrow: PhantomData,
+        };
+        // Rust slices cannot exceed isize::MAX, even if the allocator accepts a larger block.
+        (len <= isize::MAX as usize).then_some(lock)
     }
 
     /// The locked block as a byte slice, bounded by `GlobalSize`.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `ptr` is the locked, non-null base; `len` is the GlobalSize byte length. The slice
-        // borrows `self`, so it cannot outlive the lock that keeps the block pinned.
+        // SAFETY: construction guarantees initialized, immutable storage of `len <= isize::MAX`
+        // bytes at the locked non-null base; the slice cannot outlive this lock or its owner.
         unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
-    }
-
-    /// The locked block as a mutable byte slice. Internal: only [`OwnedHGlobal::from_bytes`] writes.
-    pub(crate) fn as_mut_bytes(&mut self) -> &mut [u8] {
-        // SAFETY: as `as_bytes`; `&mut self` proves we hold the only reference to the block.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
     }
 }
 
-impl Drop for HGlobalLock {
+impl Drop for HGlobalLock<'_> {
     fn drop(&mut self) {
-        // SAFETY: we took the matching lock in `new`. For a GMEM_MOVEABLE block the result is
-        // informational (Err only when the lock count reaches 0), so we ignore it.
+        // SAFETY: this guard took one lock in `new`; dropping it releases that lock.
         let _ = unsafe { GlobalUnlock(self.h) };
     }
 }
@@ -68,21 +75,39 @@ pub struct OwnedHGlobal {
 }
 
 impl OwnedHGlobal {
-    /// Allocate a `GMEM_MOVEABLE` block holding exactly `bytes`. `None` on alloc/lock failure (any
-    /// partial allocation is freed before returning).
+    /// Allocate a `GMEM_MOVEABLE` block containing `bytes`, with any allocator padding zeroed.
+    /// `None` on alloc/lock failure (any partial allocation is freed before returning).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        // SAFETY: GlobalAlloc(GMEM_MOVEABLE, n) is the canonical moveable allocation; Err on failure.
-        let h = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }.ok()?;
+        // SAFETY: the flags request moveable, initialized storage; Err on failure.
+        let h = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len()) }.ok()?;
         let owned = Self { h };
         {
-            // SAFETY: `h` was just returned by GlobalAlloc, so it is valid.
-            let mut lock = unsafe { HGlobalLock::new(owned.h) }?; // on None, `owned` drops -> free
-            // GlobalAlloc may round the block UP, so the locked slice can be longer than requested;
-            // copy into the exact prefix (a whole-slice copy_from_slice would panic on a mismatch).
-            lock.as_mut_bytes()[..bytes.len()].copy_from_slice(bytes);
-            // `lock` drops here -> GlobalUnlock.
+            // SAFETY: this fresh allocation is initialized and has no aliases. This private lock
+            // exposes no byte references while we fill it, and drops before the owner escapes.
+            let lock = unsafe { HGlobalLock::new(owned.h) }?;
+            if bytes.len() > lock.len {
+                return None;
+            }
+            // SAFETY: the new allocation is disjoint from `bytes`, uniquely accessed, and large
+            // enough for this prefix; zero-initialized padding remains unchanged.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), lock.ptr.cast(), bytes.len()) };
         }
         Some(owned)
+    }
+
+    /// Borrow the initialized allocation for reading, keeping it alive until the lock drops.
+    ///
+    /// ```compile_fail
+    /// use glass_clip_shim_windows::OwnedHGlobal;
+    /// let memory = OwnedHGlobal::from_bytes(b"clipboard").unwrap();
+    /// let lock = memory.lock().unwrap();
+    /// drop(memory);
+    /// assert_eq!(&lock.as_bytes()[..9], b"clipboard");
+    /// ```
+    pub fn lock(&self) -> Option<HGlobalLock<'_>> {
+        // SAFETY: from_bytes initializes the whole allocation; the shared borrow prevents
+        // dropping or transferring it, and safe APIs expose no mutable access.
+        unsafe { HGlobalLock::new(self.h) }
     }
 
     /// The raw handle, for APIs that need it (e.g. `HANDLE(h.0)` for `SetClipboardData`).

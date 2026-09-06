@@ -276,13 +276,16 @@ pub(crate) fn store_get_all() -> Vec<(FormatKey, Vec<u8>)> {
 // ---------------------------------------------------------------------------------------------
 
 /// Copy the full contents of an app-provided `HGLOBAL` to a `Vec<u8>` (bounded by `GlobalSize`).
-pub(crate) fn read_bytes_from_hglobal(h: HGLOBAL) -> Option<Vec<u8>> {
-    // SAFETY: `h` is an app-provided clipboard data handle, valid for this call.
+///
+/// # Safety
+/// The caller must keep `h` and its initialized contents valid and immutable for this call.
+pub(crate) unsafe fn read_bytes_from_hglobal(h: HGLOBAL) -> Option<Vec<u8>> {
+    // SAFETY: the caller guarantees the allocation and its contents remain valid during the copy.
     let lock = unsafe { HGlobalLock::new(h) }?;
     Some(lock.as_bytes().to_vec())
 }
 
-/// Allocate a `GMEM_MOVEABLE` `HGLOBAL` holding exactly `bytes`. Caller caches + frees it.
+/// Allocate a `GMEM_MOVEABLE` `HGLOBAL` containing `bytes` and zeroed padding. Caller caches + frees it.
 pub(crate) fn alloc_hglobal_bytes(bytes: &[u8]) -> Option<HGLOBAL> {
     // Caller owns + frees the returned handle, so relinquish ownership with `into_raw`.
     Some(OwnedHGlobal::from_bytes(bytes)?.into_raw())
