@@ -585,6 +585,7 @@ async fn cancelled_request_keeps_the_workers_later_outcome() {
     // A following worker job is a barrier for the cancelled job's completion.
     harness.call("glass_logs", json!({})).await;
     let (_root, _path, report) = harness.finish().await;
+    assert!(report.complete, "{report:?}");
     let events: Vec<_> = report
         .events
         .iter()

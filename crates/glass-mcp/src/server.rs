@@ -89,13 +89,7 @@ fn traced_call_result(
 ) -> CallToolResult {
     let (output, is_error, _metadata, response_pin) = applied.into_parts();
     if let Some(trace) = trace {
-        trace.output(
-            "response_constructed",
-            &output,
-            is_error,
-            target_access,
-            store,
-        );
+        trace.response_constructed(&output, is_error, target_access, store);
     }
     let content = output
         .0
@@ -300,7 +294,7 @@ impl GlassServer {
                         let mut g = worker_glass.blocking_lock();
                         execution += 1;
                         if let Some(trace) = &trace {
-                            trace.record("execution_started", serde_json::json!({"execution_order": execution, "session": session, "backend": g.active_backend()}));
+                            trace.execution_started(execution, session, g.active_backend());
                         }
                         let mut outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut g)))
@@ -320,7 +314,7 @@ impl GlassServer {
                             session = Some(execution);
                         }
                         if let Some(trace) = &trace {
-                            trace.record("session_context", serde_json::json!({"session": session, "backend": g.active_backend()}));
+                            trace.session_context(session, g.active_backend());
                             trace.logical_outcome(&outcome);
                         }
                         let _ = reply.send(outcome);
@@ -456,7 +450,7 @@ impl GlassServer {
         };
         let Some(jobs) = &self.jobs else {
             if let Some(trace) = &trace {
-                trace.record("worker_unavailable", serde_json::json!({}));
+                trace.worker_unavailable();
             }
             return Ok(traced_call_result(
                 self.output_policy.apply(fallback()),
@@ -470,7 +464,7 @@ impl GlassServer {
             .is_err()
         {
             if let Some(trace) = &trace {
-                trace.record("worker_unavailable", serde_json::json!({}));
+                trace.worker_unavailable();
             }
             return Ok(traced_call_result(
                 self.output_policy.apply(fallback()),
@@ -1121,7 +1115,7 @@ impl ServerHandler for GlassServer {
             .as_ref()
             .and_then(|trace| trace.begin_call(&request.name, self.trace_client));
         if let Some(trace) = &trace {
-            trace.record("argument_size", serde_json::json!({"compact_json_bytes": crate::trace::argument_bytes(&request.arguments)}));
+            trace.argument_size(&request.arguments);
         }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let mut result = if let Some(call) = trace {
@@ -1130,7 +1124,7 @@ impl ServerHandler for GlassServer {
                 .scope(call.clone(), self.tool_router.call(tcc))
                 .await;
             if !call.has_valid_arguments() {
-                call.record("router_rejection", serde_json::json!({"category": "tool_or_arguments_rejected", "raw_arguments": "excluded"}));
+                call.router_rejection();
             }
             guard.complete();
             result

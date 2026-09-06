@@ -5,6 +5,66 @@ use super::config::*;
 
 pub(super) const SCHEMA: &str = "glass.trace.v1";
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum EventKind {
+    Inventory,
+    ClientCreated,
+    Shutdown,
+    CallReceived,
+    ArgumentSize,
+    Arguments,
+    ExecutionStarted,
+    SessionContext,
+    LogicalOutcome,
+    ResponseConstructed,
+    RequestAbandoned,
+    RouterRejection,
+    WorkerUnavailable,
+    ResourceRead,
+    TraceClosed,
+    #[serde(untagged)]
+    Unknown(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CallRole {
+    Start,
+    Outcome,
+    Other,
+}
+
+impl EventKind {
+    pub fn call_role(&self) -> CallRole {
+        match self {
+            Self::CallReceived => CallRole::Start,
+            Self::LogicalOutcome | Self::RouterRejection | Self::WorkerUnavailable => {
+                CallRole::Outcome
+            }
+            Self::Inventory
+            | Self::ClientCreated
+            | Self::Shutdown
+            | Self::ArgumentSize
+            | Self::Arguments
+            | Self::ExecutionStarted
+            | Self::SessionContext
+            | Self::ResponseConstructed
+            | Self::RequestAbandoned
+            | Self::ResourceRead
+            | Self::TraceClosed
+            | Self::Unknown(_) => CallRole::Other,
+        }
+    }
+}
+
+fn deserialize_event_kind<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<EventKind, D::Error> {
+    // v1 accepts string kinds only, including unknown names.
+    let name = String::deserialize(deserializer)?;
+    EventKind::deserialize(serde::de::value::StrDeserializer::new(&name))
+}
+
 pub(super) fn digest(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
@@ -49,7 +109,8 @@ pub(super) struct Evidence {
 pub(super) struct Event {
     pub seq: u64,
     pub elapsed_us: u64,
-    pub kind: String,
+    #[serde(deserialize_with = "deserialize_event_kind")]
+    pub kind: EventKind,
     pub call: Option<u64>,
     pub client: u64,
     pub data: serde_json::Value,
