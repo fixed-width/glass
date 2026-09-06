@@ -846,111 +846,6 @@ fn planned_pointer_input_requires_every_coordinate_to_be_strictly_inside_the_win
 }
 
 #[test]
-fn value_and_type_actionability_insert_one_exact_eligibility_check_before_stability() {
-    let bounds = AxRect {
-        x: 10,
-        y: 10,
-        width: 80,
-        height: 20,
-    };
-    let editable = test_element(
-        AxRole::Button,
-        AxStates {
-            enabled: true,
-            visible: true,
-            editable: true,
-            ..AxStates::default()
-        },
-        bounds,
-    );
-    let coverage = AxStateCoverage {
-        enabled: true,
-        visible: true,
-        editable: true,
-        checkable: true,
-        ..AxStateCoverage::NONE
-    };
-
-    let semantic = set_value_actionability(&editable, coverage, (100, 100), false);
-    let legacy = set_value_actionability(&editable, coverage, (100, 100), true);
-    let targeted = targeted_type_actionability(&editable, coverage, Some(true), (100, 100), true);
-    for (report, required, source) in [
-        (&semantic, true, ActionabilitySource::NormalizedState),
-        (&legacy, false, ActionabilitySource::LegacyCache),
-        (&targeted, true, ActionabilitySource::NormalizedState),
-    ] {
-        let positions = report
-            .checks
-            .iter()
-            .enumerate()
-            .filter(|(_, check)| check.name == ActionabilityCheckName::FocusEligible)
-            .collect::<Vec<_>>();
-        assert_eq!(positions.len(), 1);
-        let (position, check) = positions[0];
-        assert_eq!(
-            report.checks[position + 1].name,
-            ActionabilityCheckName::Stable
-        );
-        assert_eq!(check.verdict, ActionabilityVerdict::Passed);
-        assert_eq!(check.required, required);
-        assert_eq!(check.source, source);
-    }
-
-    let unsupported = test_element(AxRole::Button, AxStates::default(), bounds);
-    assert_eq!(
-        targeted_type_eligibility(&unsupported, AxStateCoverage::NONE),
-        ActionabilityVerdict::Unproven
-    );
-    assert_eq!(
-        targeted_type_eligibility(
-            &unsupported,
-            AxStateCoverage {
-                editable: true,
-                ..AxStateCoverage::NONE
-            }
-        ),
-        ActionabilityVerdict::Failed
-    );
-    assert_eq!(
-        targeted_type_eligibility(
-            &test_element(AxRole::TextArea, AxStates::default(), bounds),
-            AxStateCoverage::NONE
-        ),
-        ActionabilityVerdict::Passed
-    );
-}
-
-#[test]
-fn focus_confirmation_discloses_coverage_and_observation_independently() {
-    for (covered, confirmed, expected) in [
-        (false, false, ActionabilityVerdict::Unproven),
-        (false, true, ActionabilityVerdict::Unproven),
-        (true, false, ActionabilityVerdict::Failed),
-        (true, true, ActionabilityVerdict::Passed),
-    ] {
-        let mut report = ActionabilityReport::default();
-        record_focus_confirmation(
-            &mut report,
-            AxStateCoverage {
-                focused: covered,
-                ..AxStateCoverage::NONE
-            },
-            confirmed,
-        );
-        assert_eq!(
-            report.checks,
-            vec![ActionabilityCheck::new(
-                ActionabilityCheckName::Focused,
-                expected,
-                true,
-                ActionabilitySource::ConfirmationPoll,
-            )],
-            "covered={covered}, confirmed={confirmed}"
-        );
-    }
-}
-
-#[test]
 fn dispatch_and_retry_provenance_distinguish_pre_dispatch_from_uncertain_effects() {
     let may_have = GlassError::Backend("focus transport failed".into());
     assert_eq!(
@@ -3760,6 +3655,61 @@ fn targeted_type_keeps_retry_safe_when_pointer_focus_proves_no_dispatch() {
 }
 
 #[test]
+fn focus_confirmation_without_state_coverage_reads_once_even_with_a_wait_budget() {
+    let tree = targeted_type_field_tree("Account name", true);
+    let target = ax_target(&ElementInfo::from_node(&tree.root.children[0]));
+    let mut fixture = targeted_type_glass(
+        vec![tree],
+        InvokeBehavior::Succeed,
+        AxStateCoverage {
+            focused: false,
+            ..full_state_coverage()
+        },
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+    let bound = ActionDeadline {
+        deadline: Deadline::from_millis(SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS),
+        owner: Some(Whose::Callee),
+        allow_wait: true,
+    };
+
+    let error = fixture
+        .glass
+        .confirm_focused_target(&target, bound)
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::FocusUnconfirmed);
+    assert_eq!(fixture.walks.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn focus_confirmation_with_state_coverage_waits_for_a_focused_read() {
+    let tree = targeted_type_field_tree("Account name", false);
+    let target = ax_target(&ElementInfo::from_node(&tree.root.children[0]));
+    let mut fixture = targeted_type_glass(
+        vec![tree, targeted_type_field_tree("Account name", true)],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+    let bound = ActionDeadline {
+        deadline: Deadline::from_millis(SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS),
+        owner: Some(Whose::Callee),
+        allow_wait: true,
+    };
+
+    let confirmed = fixture
+        .glass
+        .confirm_focused_target(&target, bound)
+        .unwrap();
+
+    assert!(confirmed.states.focused);
+    assert_eq!(fixture.walks.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn targeted_type_never_types_when_focus_cannot_be_confirmed() {
     let secret = "never expose this text";
     let mut fixture = targeted_type_glass(
@@ -3984,6 +3934,41 @@ fn targeted_type_reacquires_a_renumbered_focused_field_by_identity() {
             .and_then(|tree| tree.find(focused_id))
             .is_some_and(|node| node.states.focused)
     );
+}
+
+#[test]
+fn targeted_type_preserves_text_role_eligibility_when_editable_is_reported_false() {
+    for role in [AxRole::TextField, AxRole::TextArea] {
+        let trees = [false, true]
+            .into_iter()
+            .map(|focused| {
+                let mut tree = targeted_type_field_tree("Account name", focused);
+                let field = &mut tree.root.children[0];
+                field.role = role;
+                field.states.editable = false;
+                field.states.focusable = false;
+                tree
+            })
+            .collect();
+        let mut fixture =
+            targeted_type_glass(trees, InvokeBehavior::Succeed, full_state_coverage(), false);
+        fixture.glass.start(&spec()).unwrap();
+
+        let outcome = fixture
+            .glass
+            .type_target(
+                &targeted_type_params("Account name", ActionMode::Native, 0),
+                "typed once",
+            )
+            .unwrap();
+
+        assert_eq!(outcome.target.role, role);
+        assert_eq!(fixture.focus_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            fixture.key_log.lock().unwrap().as_slice(),
+            &[KeyEvent::Text("typed once".into())]
+        );
+    }
 }
 
 #[test]

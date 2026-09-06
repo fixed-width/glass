@@ -743,7 +743,8 @@ mod tests {
             pointer_batches: Arc::clone(&pointer_batches),
             key_batches: Arc::clone(&key_batches),
         };
-        let replies = successful_tree_replies(&field_json("old"), 32);
+        // Two stability samples and one focus-confirmation read.
+        let replies = successful_tree_replies(&field_json("old"), 3);
         let mut glass = scripted_glass(replies, Arc::clone(&reader_hid), platform);
         glass.start(&test_spec()).expect("start scripted session");
 
@@ -752,14 +753,14 @@ mod tests {
                 &glass_core::TypeTargetParams {
                     target: selector_target("inputField", Vec::new()),
                     focus_mode: glass_core::ActionMode::Pointer,
-                    timeout_ms: 350,
+                    timeout_ms: glass_core::SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS,
                     max_nodes: None,
                 },
                 "must not dispatch",
             )
             .expect_err("idb publishes no focused state, so typing must be refused");
 
-        assert_eq!(pointer_batches.lock().unwrap().len(), 1);
+        assert_eq!(pointer_batches.lock().unwrap().len(), 1, "{error:?}");
         assert!(key_batches.lock().unwrap().is_empty());
         assert!(reader_hid.lock().unwrap().is_empty());
         assert_eq!(
