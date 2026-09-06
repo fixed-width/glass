@@ -11,9 +11,10 @@
 //! finalized on a real Windows box; the detour table is authored complete so that on-box
 //! work is debugging, not authoring.
 
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::sync::OnceLock;
 
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HGLOBAL};
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, HGLOBAL};
 use windows::Win32::Security::RevertToSelf;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING, ReadFile, WriteFile,
@@ -31,6 +32,9 @@ use crate::proto::{self, FormatKey, Request, Response};
 mod dataobject;
 mod detour_impl;
 mod ole;
+
+#[cfg(test)]
+mod tests;
 
 // Standard Win32 clipboard format ids (stable ABI).
 pub(crate) const CF_TEXT: u32 = 1;
@@ -102,18 +106,13 @@ pub(crate) fn init() {
 
 /// Open the pipe, write `frame(req.encode())`, read one framed `Response`. `None` on any failure.
 fn rpc(req: Request) -> Option<Response> {
-    let pipe = PIPE.get()?;
-    let h = open_pipe(pipe)?;
-    let resp = (|| {
-        let body = proto::frame(&req.encode());
-        write_all(h, &body)?;
-        read_response(h)
-    })();
-    // SAFETY: `h` is a valid handle returned by CreateFileW and not used after this call.
-    unsafe {
-        let _ = CloseHandle(h);
-    }
-    resp
+    exchange(open_pipe(PIPE.get()?)?, req)
+}
+
+fn exchange(pipe: OwnedHandle, req: Request) -> Option<Response> {
+    let body = proto::frame(&req.encode());
+    write_all(pipe.as_handle(), &body)?;
+    read_response(pipe.as_handle())
 }
 
 /// `CreateFileW` the named pipe for read+write, retrying briefly. Returns `None` if it cannot be
@@ -125,7 +124,7 @@ fn rpc(req: Request) -> Option<Response> {
 /// fail. We use the standard named-pipe client pattern: on failure, `WaitNamedPipe` for an instance
 /// (and back off briefly if the pipe is momentarily absent), then retry — bounded so a genuinely
 /// down server still fails soft rather than hanging.
-fn open_pipe(path: &str) -> Option<HANDLE> {
+fn open_pipe(path: &str) -> Option<OwnedHandle> {
     // Connect to the host as THIS PROCESS, not a thread impersonation. clipboard-win (arboard) wraps
     // the app's `CloseClipboard` in `ImpersonateAnonymousToken`/`RevertToSelf` (a crbug/441834
     // mitigation), and our `CloseClipboard` detour — which ships the copy via this pipe — runs inside
@@ -153,7 +152,8 @@ fn open_pipe(path: &str) -> Option<HANDLE> {
             )
         };
         if let Ok(h) = opened {
-            return Some(h);
+            // SAFETY: CreateFileW succeeded, transferring a new pipe handle to its sole owner.
+            return Some(unsafe { OwnedHandle::from_raw_handle(h.0) });
         }
         // Instance busy → WaitNamedPipe blocks until one frees (up to 100ms). Instance momentarily
         // absent → it returns Err fast, so back off ~10ms to avoid a tight spin, then retry.
@@ -167,13 +167,19 @@ fn open_pipe(path: &str) -> Option<HANDLE> {
 }
 
 /// Write the whole buffer, looping over partial writes. `Some(())` on success.
-fn write_all(h: HANDLE, buf: &[u8]) -> Option<()> {
+fn write_all(h: BorrowedHandle<'_>, buf: &[u8]) -> Option<()> {
     let mut off = 0usize;
     while off < buf.len() {
         let mut written: u32 = 0;
         // SAFETY: `h` is valid; the slice is in-bounds; `written` is a live out-param.
         unsafe {
-            WriteFile(h, Some(&buf[off..]), Some(&mut written), None).ok()?;
+            WriteFile(
+                HANDLE(h.as_raw_handle()),
+                Some(&buf[off..]),
+                Some(&mut written),
+                None,
+            )
+            .ok()?;
         }
         if written == 0 {
             return None; // pipe closed mid-write
@@ -184,7 +190,7 @@ fn write_all(h: HANDLE, buf: &[u8]) -> Option<()> {
 }
 
 /// Read a 4-byte LE length prefix, then that many bytes, then `Response::decode`.
-fn read_response(h: HANDLE) -> Option<Response> {
+fn read_response(h: BorrowedHandle<'_>) -> Option<Response> {
     let mut len_buf = [0u8; 4];
     read_exact(h, &mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
@@ -197,13 +203,19 @@ fn read_response(h: HANDLE) -> Option<Response> {
 }
 
 /// Loop `ReadFile` until `buf` is full. `None` on short read (EOF) or error.
-fn read_exact(h: HANDLE, buf: &mut [u8]) -> Option<()> {
+fn read_exact(h: BorrowedHandle<'_>, buf: &mut [u8]) -> Option<()> {
     let mut off = 0usize;
     while off < buf.len() {
         let mut read: u32 = 0;
         // SAFETY: `h` is valid; the destination slice is in-bounds; `read` is a live out-param.
         unsafe {
-            ReadFile(h, Some(&mut buf[off..]), Some(&mut read), None).ok()?;
+            ReadFile(
+                HANDLE(h.as_raw_handle()),
+                Some(&mut buf[off..]),
+                Some(&mut read),
+                None,
+            )
+            .ok()?;
         }
         if read == 0 {
             return None; // EOF before the buffer was filled

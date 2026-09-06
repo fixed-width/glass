@@ -360,6 +360,8 @@ pub(crate) const INTERNAL_ENV: &[&str] = &[
     "GLASS_LISTPIDS_TEST_DELAY_MS",
     "GLASS_LISTPIDS_TEST_OUTPUT",
     "GLASS_LISTPIDS_TEST_PID_FILE",
+    // Runs the Windows token-handle leak probe in its own process, isolated from parallel tests.
+    "GLASS_TOKEN_HANDLE_PROBE",
     // The three the glass-wayland test harness passes to the app it launches
     // (glass-wayland/src/testw.rs): which windows to map, whether to ignore a close request, and
     // whether to be an X11 client. Read only by that fixture, never by glass.

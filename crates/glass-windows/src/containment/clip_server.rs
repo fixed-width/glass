@@ -6,6 +6,7 @@
 //! we [`PrivateClipboard::apply`] and answer. The boxed `glass_clip_shim_windows` DLL is the client.
 //! Sandboxie's `OpenPipePath` lets the box reach this host pipe (always applied).
 
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -15,7 +16,7 @@ use glass_clip_shim_windows::proto::{self, Request, Response};
 use glass_clip_shim_windows::store::PrivateClipboard;
 use glass_core::{GlassError, Result};
 
-use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
@@ -25,6 +26,9 @@ use windows::Win32::System::Pipes::{
 };
 use windows::core::BOOL;
 use windows::core::PCWSTR;
+
+#[cfg(test)]
+mod tests;
 
 /// SDDL for the pipe DACL: Everyone (WD) + SYSTEM generic-all. Everyone is required merely so the
 /// box's client can *connect*: with `KeepTokenIntegrity=y` the Sandboxie token's access check is
@@ -83,7 +87,7 @@ impl ClipServer {
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         let wide = to_wide(&self.pipe_path);
-        // SAFETY: opening our own pipe by name to release the accept loop; handle closed immediately.
+        // SAFETY: the name stays live through the call; a successful self-connect is owned and closed immediately.
         unsafe {
             use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
             use windows::Win32::Storage::FileSystem::{
@@ -98,7 +102,7 @@ impl ClipServer {
                 FILE_FLAGS_AND_ATTRIBUTES(0),
                 None,
             ) {
-                let _ = CloseHandle(h);
+                drop(OwnedHandle::from_raw_handle(h.0));
             }
         }
         if let Some(t) = self.thread.take() {
@@ -177,6 +181,8 @@ fn accept_loop(
         if pipe == INVALID_HANDLE_VALUE {
             break;
         }
+        // SAFETY: CreateNamedPipeW returned a valid new handle, transferred to its sole owner.
+        let pipe = unsafe { OwnedHandle::from_raw_handle(pipe.0) };
         // SAFETY: blocks until a client connects (or our self-poke in stop()).
         // A client that connects in the gap between CreateNamedPipeW and
         // ConnectNamedPipe makes the call return FALSE + ERROR_PIPE_CONNECTED —
@@ -184,15 +190,14 @@ fn accept_loop(
         // `.is_ok()` alone would silently drop the client (its read-back then
         // comes back empty — the flaky-empty-readback class). Treat it as
         // connected.
-        let connected = match unsafe { ConnectNamedPipe(pipe, None) } {
+        let connected = match unsafe { ConnectNamedPipe(HANDLE(pipe.as_raw_handle()), None) } {
             Ok(()) => true,
             Err(e) => e.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0),
         };
         if stop.load(Ordering::Relaxed) {
-            // SAFETY: closing the instance handle we own.
+            // SAFETY: the server owns this instance; it closes when the loop scope ends.
             unsafe {
-                let _ = DisconnectNamedPipe(pipe);
-                let _ = CloseHandle(pipe);
+                let _ = DisconnectNamedPipe(HANDLE(pipe.as_raw_handle()));
             }
             break;
         }
@@ -200,12 +205,11 @@ fn accept_loop(
             if pids.1.is_empty() || pids.0.elapsed() > Duration::from_millis(500) {
                 pids = (Instant::now(), box_pids(&dir, &box_name));
             }
-            serve_one(pipe, &store, &pids.1);
+            serve_one(pipe.as_handle(), &store, &pids.1);
         }
         // SAFETY: done with this instance.
         unsafe {
-            let _ = DisconnectNamedPipe(pipe);
-            let _ = CloseHandle(pipe);
+            let _ = DisconnectNamedPipe(HANDLE(pipe.as_raw_handle()));
         }
     }
     // SAFETY: free the SD allocated by ConvertStringSecurityDescriptor…; psd.0 is the pointer
@@ -235,17 +239,19 @@ fn box_pids(dir: &str, box_name: &str) -> Vec<u32> {
 /// owner-only DACL); this membership check is the real boundary. We look up the client PID
 /// (`GetNamedPipeClientProcessId`) and require it to be in the box's `/listpids` set — so an
 /// ordinary local process that guessed the per-box pipe name is rejected. Fail closed on any error.
-fn client_in_box(pipe: HANDLE, box_pids: &[u32]) -> bool {
+fn client_in_box(pipe: BorrowedHandle<'_>, box_pids: &[u32]) -> bool {
     let mut pid = 0u32;
     // SAFETY: writes the connected client's PID into `pid`; returns Err if there is no client.
-    if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) }.is_err() || pid == 0 {
+    if unsafe { GetNamedPipeClientProcessId(HANDLE(pipe.as_raw_handle()), &mut pid) }.is_err()
+        || pid == 0
+    {
         return false;
     }
     box_pids.contains(&pid)
 }
 
 /// Read one length-prefixed request, apply it, write the length-prefixed response.
-fn serve_one(pipe: HANDLE, store: &PrivateClipboard, box_pids: &[u32]) {
+fn serve_one(pipe: BorrowedHandle<'_>, store: &PrivateClipboard, box_pids: &[u32]) {
     let Some(body) = read_frame(pipe) else { return };
     // Authorization: only a process inside our Sandboxie box is served — the DACL merely lets the
     // box connect; this is the boundary against any other local process (see [`client_in_box`]).
@@ -262,13 +268,18 @@ fn serve_one(pipe: HANDLE, store: &PrivateClipboard, box_pids: &[u32]) {
     // the bytes. Without it, the caller's DisconnectNamedPipe can fire first and DISCARD the unread
     // response (the read-back then comes back empty), which is timing-dependent and flaky.
     unsafe {
-        let _ = WriteFile(pipe, Some(&out), Some(&mut written as *mut u32), None);
-        let _ = FlushFileBuffers(pipe);
+        let _ = WriteFile(
+            HANDLE(pipe.as_raw_handle()),
+            Some(&out),
+            Some(&mut written as *mut u32),
+            None,
+        );
+        let _ = FlushFileBuffers(HANDLE(pipe.as_raw_handle()));
     }
 }
 
 /// Read a 4-byte LE length then exactly that many bytes. None on any short/failed read.
-fn read_frame(pipe: HANDLE) -> Option<Vec<u8>> {
+fn read_frame(pipe: BorrowedHandle<'_>) -> Option<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     if !read_exact(pipe, &mut len_buf) {
         return None;
@@ -284,14 +295,14 @@ fn read_frame(pipe: HANDLE) -> Option<Vec<u8>> {
     Some(body)
 }
 
-fn read_exact(pipe: HANDLE, buf: &mut [u8]) -> bool {
+fn read_exact(pipe: BorrowedHandle<'_>, buf: &mut [u8]) -> bool {
     let mut off = 0usize;
     while off < buf.len() {
         let mut read = 0u32;
         // SAFETY: reading into buf[off..] on a connected pipe instance we own.
         let ok = unsafe {
             ReadFile(
-                pipe,
+                HANDLE(pipe.as_raw_handle()),
                 Some(&mut buf[off..]),
                 Some(&mut read as *mut u32),
                 None,

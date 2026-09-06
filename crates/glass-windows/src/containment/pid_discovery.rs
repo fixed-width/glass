@@ -314,20 +314,19 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        // SAFETY: OpenProcess receives a numeric PID written by the child. Any returned handle is
-        // closed immediately and is used only to ask whether the process is still active.
+        // SAFETY: the child's numeric PID is queried through an owned process handle and a live output buffer.
         let still_active = unsafe {
-            use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+            use windows::Win32::Foundation::{HANDLE, STILL_ACTIVE};
             use windows::Win32::System::Threading::{
                 GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
             };
             match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
                 Ok(handle) => {
+                    let handle = OwnedHandle::from_raw_handle(handle.0);
                     let mut exit_code = 0;
-                    let active = GetExitCodeProcess(handle, &mut exit_code).is_ok()
-                        && exit_code == STILL_ACTIVE.0 as u32;
-                    let _ = CloseHandle(handle);
-                    active
+                    GetExitCodeProcess(HANDLE(handle.as_raw_handle()), &mut exit_code).is_ok()
+                        && exit_code == STILL_ACTIVE.0 as u32
                 }
                 Err(_) => false,
             }
