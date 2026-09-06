@@ -1,7 +1,8 @@
 //! On-box deterministic validation of the private-clipboard hook. `#[ignore]`d — it needs
 //! Sandboxie running, the built `glass_clip_shim_windows.dll` (path in `GLASS_CLIP_SHIM_DLL`), and the built
-//! `clipprobe` example. No GUI / interactive desktop is needed: the probe only calls user32
-//! clipboard APIs, so it runs over SSH. Run on the box with:
+//! `clipprobe` example. Run in the logged-in user's interactive Windows session. From SSH,
+//! use a scheduled task with an interactive logon, as in `tools/windows-validation/run-onbox.ps1`;
+//! direct execution in SSH session 0 can produce no boxed probe output. In the interactive session:
 //! ```text
 //!   set GLASS_CLIP_SHIM_DLL=C:\Users\<user>\glass\target\release\glass_clip_shim_windows.dll
 //!   cargo test -p glass-windows --release private_clipboard_isolation -- --ignored --nocapture

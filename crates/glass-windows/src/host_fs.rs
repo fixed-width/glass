@@ -3,8 +3,7 @@ use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::os::windows::io::AsRawHandle;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Component;
 use std::path::Path;
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -793,43 +792,43 @@ fn with_current_user_sid<T>(
 ) -> glass_core::Result<T> {
     use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    let mut token = HANDLE::default();
-    // SAFETY: The current process pseudo-handle and token output pointer are valid.
-    unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+    // SAFETY: the pseudo-handle and output are valid; success transfers a new token handle to its sole owner.
+    let token = unsafe {
+        let mut handle = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle)
             .map_err(|error| backend_error("open current user token", error))?;
-    }
-    let result = (|| {
-        let mut needed = 0;
-        // SAFETY: The owned token handle supports the documented zero-length query.
-        unsafe {
-            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
-        }
-        if needed < std::mem::size_of::<TOKEN_USER>() as u32 || needed > 65536 {
-            return Err(GlassError::Backend(
-                "invalid current user token size".into(),
-            ));
-        }
-        let mut user = vec![0_usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
-        // SAFETY: Pointer-aligned storage fits TOKEN_USER and its SID; both buffers outlive comparison.
-        unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                Some(user.as_mut_ptr().cast()),
-                needed,
-                &mut needed,
-            )
-            .map_err(|error| backend_error("read current user token", error))?;
-            let user = &*user.as_ptr().cast::<TOKEN_USER>();
-            inspect(user.User.Sid)
-        }
-    })();
-    // SAFETY: OpenProcessToken returned this owned handle; no later code uses it.
+        OwnedHandle::from_raw_handle(handle.0)
+    };
+    let mut needed = 0;
+    // SAFETY: The owned token handle supports the documented zero-length query.
     unsafe {
-        let _ = windows::Win32::Foundation::CloseHandle(token);
+        let _ = GetTokenInformation(
+            HANDLE(token.as_raw_handle()),
+            TokenUser,
+            None,
+            0,
+            &mut needed,
+        );
     }
-    result
+    if needed < std::mem::size_of::<TOKEN_USER>() as u32 || needed > 65536 {
+        return Err(GlassError::Backend(
+            "invalid current user token size".into(),
+        ));
+    }
+    let mut user = vec![0_usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+    // SAFETY: pointer-aligned storage fits TOKEN_USER and its SID and remains live through inspection.
+    let sid = unsafe {
+        GetTokenInformation(
+            HANDLE(token.as_raw_handle()),
+            TokenUser,
+            Some(user.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )
+        .map_err(|error| backend_error("read current user token", error))?;
+        (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid
+    };
+    inspect(sid)
 }
 
 /// Reports whether a filesystem object has the protected owner-and-SYSTEM DACL used by Glass.
@@ -1155,6 +1154,52 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    #[test]
+    fn current_user_token_is_closed_on_error_and_unwind() {
+        const PROBE_ENV: &str = "GLASS_TOKEN_HANDLE_PROBE";
+        if std::env::var_os(PROBE_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host_fs::tests::current_user_token_is_closed_on_error_and_unwind",
+                    "--nocapture",
+                ])
+                .env(PROBE_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "token handle probe failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        fn handle_count() -> u32 {
+            use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+            let mut count = 0;
+            // SAFETY: the current-process pseudo-handle and writable count are valid for the query.
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }.unwrap();
+            count
+        }
+
+        // Isolate the count from parallel tests and warm up token queries and panic reporting.
+        with_current_user_sid(|_| Ok(())).unwrap();
+        let _ = std::panic::catch_unwind(|| panic!("warm up panic reporting"));
+        let before = handle_count();
+
+        let result: glass_core::Result<()> =
+            with_current_user_sid(|_| Err(GlassError::Backend("inspection failed".into())));
+        assert!(result.is_err());
+        assert_eq!(handle_count(), before, "error return leaked a token handle");
+
+        let result = std::panic::catch_unwind(|| {
+            with_current_user_sid::<()>(|_| panic!("inspection panicked"))
+        });
+        assert!(result.is_err());
+        assert_eq!(handle_count(), before, "unwinding leaked a token handle");
+    }
     fn descriptor_bytes(sddl: &str) -> Vec<u8> {
         let sddl = wide_text(sddl);
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
