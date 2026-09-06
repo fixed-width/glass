@@ -5,9 +5,6 @@ for it is built by a web engine (Chromium, WebKit, Gecko) sitting inside the app
 schedule, not by the toolkit glass reads everywhere else. That difference is why web content gets
 its own page rather than a line in the roles reference.
 
-For choosing between renderer tests and external application tests, see
-[Glass and Playwright](glass-and-playwright.md).
-
 ## Publication is not tied to the page load
 
 A web engine does not necessarily build its accessibility tree when the page loads. What was read
@@ -91,6 +88,11 @@ older case that isn't specific to web content at all:
 - **No accessibility elements at all** (`empty_guidance`) is the pre-existing case for any app that
   publishes no tree — canvas apps, toolkits that need a11y turned on. It is not web-specific, and a
   page can also fall into it if the surrounding app itself exposes nothing.
+
+The [build → see → interact → debug loop](the-loop.md) checks the application's result across
+native and web-rendered controls. For example, an account rename succeeds when the account list
+shows the expected new name. A click acknowledgement, an opened dialog or a populated accessibility
+tree alone does not establish that result.
 
 ## Readings, by platform
 
