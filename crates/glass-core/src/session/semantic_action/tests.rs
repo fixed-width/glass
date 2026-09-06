@@ -3655,6 +3655,61 @@ fn targeted_type_keeps_retry_safe_when_pointer_focus_proves_no_dispatch() {
 }
 
 #[test]
+fn focus_confirmation_without_state_coverage_reads_once_even_with_a_wait_budget() {
+    let tree = targeted_type_field_tree("Account name", true);
+    let target = ax_target(&ElementInfo::from_node(&tree.root.children[0]));
+    let mut fixture = targeted_type_glass(
+        vec![tree],
+        InvokeBehavior::Succeed,
+        AxStateCoverage {
+            focused: false,
+            ..full_state_coverage()
+        },
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+    let bound = ActionDeadline {
+        deadline: Deadline::from_millis(SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS),
+        owner: Some(Whose::Callee),
+        allow_wait: true,
+    };
+
+    let error = fixture
+        .glass
+        .confirm_focused_target(&target, bound)
+        .unwrap_err();
+
+    assert_eq!(error.kind, SemanticActionFailureKind::FocusUnconfirmed);
+    assert_eq!(fixture.walks.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn focus_confirmation_with_state_coverage_waits_for_a_focused_read() {
+    let tree = targeted_type_field_tree("Account name", false);
+    let target = ax_target(&ElementInfo::from_node(&tree.root.children[0]));
+    let mut fixture = targeted_type_glass(
+        vec![tree, targeted_type_field_tree("Account name", true)],
+        InvokeBehavior::Succeed,
+        full_state_coverage(),
+        false,
+    );
+    fixture.glass.start(&spec()).unwrap();
+    let bound = ActionDeadline {
+        deadline: Deadline::from_millis(SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS),
+        owner: Some(Whose::Callee),
+        allow_wait: true,
+    };
+
+    let confirmed = fixture
+        .glass
+        .confirm_focused_target(&target, bound)
+        .unwrap();
+
+    assert!(confirmed.states.focused);
+    assert_eq!(fixture.walks.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn targeted_type_never_types_when_focus_cannot_be_confirmed() {
     let secret = "never expose this text";
     let mut fixture = targeted_type_glass(

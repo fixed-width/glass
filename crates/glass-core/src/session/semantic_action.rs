@@ -1944,7 +1944,8 @@ impl Glass {
                 _ => None,
             }
         };
-        if !deadline.allow_wait {
+        // More snapshots cannot confirm a state the backend does not cover.
+        if !coverage.focused || !deadline.allow_wait {
             let tree = self
                 .a11y_resnapshot_for_wait(deadline.deadline)
                 .map_err(|source| source_error(source, deadline))?;
