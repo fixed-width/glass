@@ -89,6 +89,11 @@ older case that isn't specific to web content at all:
   publishes no tree — canvas apps, toolkits that need a11y turned on. It is not web-specific, and a
   page can also fall into it if the surrounding app itself exposes nothing.
 
+The [build → see → interact → debug loop](the-loop.md) checks the application's result across
+native and web-rendered controls. For example, an account rename succeeds when the account list
+shows the expected new name. A click acknowledgement, an opened dialog or a populated accessibility
+tree alone does not establish that result.
+
 ## Readings, by platform
 
 Every claim below is what a specific engine build did on the date read, not a fact about the

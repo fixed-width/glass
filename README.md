@@ -74,10 +74,6 @@ For a canvas or custom-rendered app with no accessibility tree, drive it by pixe
 text, so routine checks between screenshots cost no vision tokens. Why the loop is shaped this way:
 [the build → see → interact → debug loop](docs/explanation/the-loop.md).
 
-For large windows, request `glass_screenshot {"max_width":1280}` or combine a crop with a size bound.
-The [image size controls](docs/how-to/capture-a-smaller-image.md) report native source coordinates and
-returned dimensions; visual comparisons still use native pixels.
-
 `glass_click_element` tries the platform's native accessibility action first — AT-SPI `Action` on
 Linux, UI Automation patterns on Windows, `AXPress` on macOS, and `ACTION_CLICK` on Android when
 the optional on-device accessibility companion is installed — which actuates elements that are
