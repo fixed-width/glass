@@ -4205,7 +4205,7 @@ mod session_tests {
     //! connection, so there is nothing underneath them to fake; [`crate::testw`] launches a
     //! private session and observes it over a connection the backend does not own.
     use std::collections::VecDeque;
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::os::unix::net::UnixStream;
 
     use super::*;

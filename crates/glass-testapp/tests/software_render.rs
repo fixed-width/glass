@@ -55,7 +55,7 @@ fn is_uniform(frame: &glass_core::Frame) -> bool {
     let Some(first) = frame.pixels.get(0..4) else {
         return true;
     };
-    frame.pixels.chunks_exact(4).all(|px| px == first)
+    frame.pixels.as_chunks::<4>().0.iter().all(|px| px == first)
 }
 
 enum RenderOutcome {

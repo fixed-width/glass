@@ -54,7 +54,7 @@ cargo test -p glass-wayland -- --include-ignored  # + its 64 sway-backed unit te
 ./scripts/test-wayland.sh [name]          # Wayland suite (needs sway >=1.12)
 ./scripts/test-a11y.sh [name]             # AT-SPI suite
 ```
-The workspace is pinned to nightly via `rust-toolchain.toml`.
+The workspace is pinned to stable Rust via `rust-toolchain.toml`.
 
 Those cover Linux. They do **not** compile `cfg(target_os = "macos")` or `cfg(windows)` code, so on
 a change to a platform crate they report clean without having looked at it —

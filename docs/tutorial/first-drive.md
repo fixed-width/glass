@@ -33,7 +33,7 @@ From a clone of the glass repo, build the server:
 cargo build --release -p glass-mcp
 ```
 
-This produces `target/release/glass-mcp`. The first build pulls the pinned nightly toolchain
+This produces `target/release/glass-mcp`. The first build pulls the pinned stable Rust toolchain
 automatically, so it may take a few minutes; later builds are fast. You don't build the demo app
 yourself — in Step 3 your agent builds it *through* glass, which is the whole point.
 

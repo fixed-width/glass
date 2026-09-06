@@ -318,7 +318,7 @@ fn parse_directory_records(bytes: &[u8]) -> Result<Vec<DirectoryEntryRecord>, Ho
             .filter(|end| *end <= bytes.len())
             .ok_or(HostFsError::Integrity)?;
         let mut units = Vec::with_capacity(name_bytes / 2);
-        for pair in bytes[offset + fixed..end].chunks_exact(2) {
+        for pair in bytes[offset + fixed..end].as_chunks::<2>().0 {
             units.push(u16::from_le_bytes([pair[0], pair[1]]));
         }
         let name = std::ffi::OsString::from_wide(&units);

@@ -34,10 +34,8 @@ windows = { version = "0.62", features = [
 # `windows::core` is only an alias, not that crate name). Depend on `windows-core` directly — same
 # 0.62.2 the umbrella `windows` pins, so the COM/IUnknown types unify with the ones above.
 windows-core = "0.62"
-# Inline detours. License verified permissive in this task's Step 6 (MIT/BSD); IAT fallback documented.
-# `static-detour` enables the `static_detour!` macro (the type-safe detour table); it pulls in the
-# `nightly` feature — fine, the workspace is pinned to nightly (rust-toolchain.toml).
-retour = { version = "0.3", features = ["static-detour"] }
+# Typed inline detours; GenericDetour works without nightly features.
+retour = "0.3"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62", features = ["Win32_System_WindowsProgramming"] }

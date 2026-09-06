@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Measure test coverage with cargo-llvm-cov (nightly toolchain, picked up
+# Measure test coverage with cargo-llvm-cov (pinned toolchain, picked up
 # automatically via rust-toolchain.toml).
 #
 # Why this wrapper rather than a bare `cargo llvm-cov`: glass's most security- and

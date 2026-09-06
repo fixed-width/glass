@@ -18,8 +18,7 @@ three backends, so name the crate with `-p` to flamegraph one.
 
 Pixel normalization and frame comparison use `fearless_simd`, with CPU features detected once
 and cached. On x86 this selects the available SSE2, SSE4.2, AVX2, or AVX-512 backend; AArch64 uses NEON.
-The core SIMD code works on stable Rust. The workspace still pins nightly for the Windows
-clipboard shim's `retour` static detours.
+The workspace uses stable Rust, including the Windows clipboard shim's typed `retour` detours.
 
 When comparing portable builds, clear local CPU-specific flags (such as `target-cpu=native` or
 `target-cpu=haswell`), so both builds target the same baseline:

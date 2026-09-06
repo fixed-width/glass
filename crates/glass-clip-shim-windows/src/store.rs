@@ -77,7 +77,9 @@ impl PrivateClipboard {
     pub fn get_text(&self) -> Option<String> {
         let bytes = self.get(&FormatKey::Standard(CF_UNICODETEXT))?;
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         Some(crate::text::utf16_nul_to_string(&units))
