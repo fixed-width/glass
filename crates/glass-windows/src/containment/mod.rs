@@ -100,9 +100,7 @@ mod imp {
                 Containment::Unconfined => {
                     let mut cmd = crate::process::build_command(spec);
                     let mut app = crate::process::spawn_suspended_in_job(&mut cmd, spec.sandbox)?;
-                    // Wired before `resume`, so the app's first lines are not missed. `abandon`
-                    // rather than `?` alone: the app is still suspended, and nothing else would
-                    // ever terminate it or close its Job.
+                    // Wire readers before resume; abandon waits for termination on setup failure.
                     if let Err(e) = app.tap_logs(&logs) {
                         app.abandon();
                         return Err(GlassError::AppNotStarted(format!(

@@ -6,16 +6,11 @@
 //! only then closes the job handle, which is the backstop for whatever did not go (see
 //! [`LaunchedApp::kill`] and [`crate::teardown`]).
 //!
-//! The FFI here is a verbatim port of the validated
-//! `tools/windows-validation/src/proc.rs` probe (proven on real hardware): the
-//! CREATE_SUSPENDED spawn, then `CreateJobObjectW` with
-//! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and `AssignProcessToJobObject`, then resume;
-//! plus the Toolhelp thread enum with `ResumeThread`, and the Toolhelp parent-link
-//! descendant walk. It is restructured into reusable lib types but the unsafe bodies
-//! are unchanged. The `PostMessageW` close request in [`request_close`] is not from that
-//! probe — it was added later, with its own on-box evidence.
+//! Kernel handles are owned by `OwnedHandle`; queries borrow them. Dropping an abandoned
+//! launch closes its job, while explicit teardown closes it after the graceful-close wait.
 
 use std::ffi::c_void;
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -24,7 +19,7 @@ use glass_core::Stream;
 use glass_core::{AppSpec, Deadline, GlassError, Result, SandboxLevel, TEARDOWN_BUDGET};
 
 use crate::teardown::{CloseStep, close_wait_step};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HANDLE, LPARAM, WPARAM};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
     TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -104,17 +99,10 @@ pub(crate) fn build_command(spec: &AppSpec) -> Command {
     cmd
 }
 
-/// A Windows kernel HANDLE wrapped to be Send. Kernel handles are process-global and
-/// usable from any thread (not thread-affine), so sending one across threads is sound.
-pub(crate) struct SendHandle(pub HANDLE);
-// SAFETY: a Windows kernel HANDLE is a process-global value, valid from any thread; we
-// only ever CloseHandle it. It is not thread-affine (unlike a window's message queue).
-unsafe impl Send for SendHandle {}
-
 /// A launched app: its CREATE_SUSPENDED-in-a-Job root process. Closing `job` (the last
 /// handle) terminates the entire tree via JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
 pub(crate) struct LaunchedApp {
-    job: SendHandle,
+    job: OwnedHandle,
     child: Child,
     /// The app's stdout/stderr readers, ended by `kill`. The app's write ends are inherited by
     /// everything it spawns, so an EOF-only reader parks on a survivor's pipe, holding a thread
@@ -153,19 +141,8 @@ impl LaunchedApp {
     }
 
     /// Terminate a launch that never started, closing the Job handle with it.
-    ///
-    /// `LaunchedApp` releases the Job only in [`LaunchedApp::kill`], and neither `SendHandle` nor
-    /// `Child` frees anything on drop — so a launch abandoned between `spawn_suspended_in_job` and
-    /// `resume` sits `CREATE_SUSPENDED` and alive for the life of this process, its Job handle
-    /// leaked and `KILL_ON_JOB_CLOSE` therefore never firing. The root has never run, so it has no
-    /// children; `spawn_suspended_in_job`'s own error arm reasons the same way.
-    ///
-    /// Any tap already started is ended by the drop that follows the kill.
     pub(crate) fn abandon(mut self) {
-        // SAFETY: closing the last job handle terminates anything left in the tree.
-        unsafe {
-            let _ = CloseHandle(self.job.0);
-        }
+        drop(self.job);
         let _ = self.child.kill();
         let _ = self.child.wait(); // reap, so an abandoned launch leaves no zombie
     }
@@ -178,7 +155,7 @@ impl LaunchedApp {
     /// The Job's authoritative (kernel-tracked) PID set. Captures launcher-handoff
     /// children a Toolhelp parent-link walk can miss; empty on any query failure.
     pub(crate) fn job_pids(&self) -> Vec<u32> {
-        job_pids(self.job.0)
+        job_pids(self.job.as_handle())
     }
 
     /// Non-blocking check whether the root process has already exited (mirrors the X11
@@ -198,10 +175,8 @@ impl LaunchedApp {
     pub(crate) fn kill(mut self) -> Closed {
         let asked = request_close(&self.live_pids());
         let closed_itself = self.await_close(asked.posted);
-        // SAFETY: closing the last job handle terminates the entire tree (KILL_ON_JOB_CLOSE).
-        unsafe {
-            let _ = CloseHandle(self.job.0);
-        }
+        // Close the job before waiting for the root or draining inherited log pipes.
+        drop(self.job);
         let _ = self.child.kill(); // belt-and-suspenders: ensure the root is terminated so wait() can't block
         let _ = self.child.wait(); // reap the now-terminated root; avoids a zombie
         // Terminated first, so each tap's final drain sees what the app wrote on the way out.
@@ -220,7 +195,7 @@ impl LaunchedApp {
     /// so a union could put an unrelated application's window in the destructive set. Discovery can
     /// afford that risk because it only ever reads.
     fn live_pids(&self) -> Vec<u32> {
-        job_pids_checked(self.job.0).unwrap_or_else(|| descendant_pids(self.pid()))
+        job_pids_checked(self.job.as_handle()).unwrap_or_else(|| descendant_pids(self.pid()))
     }
 
     /// Poll until the tree has closed itself or [`CLOSE_GRACE`] is spent, per
@@ -240,7 +215,7 @@ impl LaunchedApp {
         let deadline = Instant::now() + CLOSE_GRACE;
         loop {
             let root_exited = matches!(self.child.try_wait(), Ok(Some(_)));
-            let job_live = job_pids_checked(self.job.0).map(|pids| !pids.is_empty());
+            let job_live = job_pids_checked(self.job.as_handle()).map(|pids| !pids.is_empty());
             if Instant::now() >= deadline {
                 return false;
             }
@@ -358,7 +333,7 @@ pub(crate) fn spawn_suspended_in_job(
     let root = child.id();
     match build_kill_on_close_job(root, level) {
         Ok(job) => Ok(LaunchedApp {
-            job: SendHandle(job),
+            job,
             child,
             taps: Vec::new(),
         }),
@@ -377,66 +352,59 @@ pub(crate) fn spawn_suspended_in_job(
 /// Create a job and assign `root` to it, applying the Job-limit set for `level`
 /// (kill-on-close + crash-dialog suppression always; an active-process cap for `Default`).
 /// Closes every handle it acquires on its own error paths; returns the job handle on success.
-fn build_kill_on_close_job(root: u32, level: SandboxLevel) -> Result<HANDLE> {
+fn build_kill_on_close_job(root: u32, level: SandboxLevel) -> Result<OwnedHandle> {
     let cfg = crate::jobcfg::job_config(level);
-    // SAFETY: each FFI result is checked; every handle acquired here is closed on the
-    // error path before returning, and `proc` is always closed before a successful return.
-    // The process is suspended, so it has created no children yet — assigning it now
-    // captures the entire future tree.
-    unsafe {
-        let job = CreateJobObjectW(None, windows::core::PCWSTR::null())
+    // SAFETY: no pointers are borrowed; success transfers a new job handle to its sole owner.
+    let job = unsafe {
+        let handle = CreateJobObjectW(None, windows::core::PCWSTR::null())
             .map_err(|e| GlassError::AppNotStarted(format!("CreateJobObjectW: {e}")))?;
-        let mut limit_flags = JOB_OBJECT_LIMIT(0);
-        if cfg.kill_on_close {
-            limit_flags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        }
-        if cfg.suppress_crash_dialog {
-            limit_flags |= JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-        }
-        let mut basic = JOBOBJECT_BASIC_LIMIT_INFORMATION {
-            LimitFlags: limit_flags,
-            ..Default::default()
-        };
-        if let Some(limit) = cfg.active_process_limit {
-            basic.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-            basic.ActiveProcessLimit = limit;
-        }
-        let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-            BasicLimitInformation: basic,
-            ..Default::default()
-        };
-        if let Err(e) = SetInformationJobObject(
-            job,
+        OwnedHandle::from_raw_handle(handle.0)
+    };
+    let mut limit_flags = JOB_OBJECT_LIMIT(0);
+    if cfg.kill_on_close {
+        limit_flags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    }
+    if cfg.suppress_crash_dialog {
+        limit_flags |= JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+    }
+    let mut basic = JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        LimitFlags: limit_flags,
+        ..Default::default()
+    };
+    if let Some(limit) = cfg.active_process_limit {
+        basic.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        basic.ActiveProcessLimit = limit;
+    }
+    let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        BasicLimitInformation: basic,
+        ..Default::default()
+    };
+    // SAFETY: the job is owned and `info` matches the class and size for this synchronous call.
+    unsafe {
+        SetInformationJobObject(
+            HANDLE(job.as_raw_handle()),
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const c_void,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ) {
-            let _ = CloseHandle(job);
-            return Err(GlassError::AppNotStarted(format!(
-                "SetInformationJobObject: {e}"
-            )));
-        }
-        let proc = match OpenProcess(
+        )
+    }
+    .map_err(|e| GlassError::AppNotStarted(format!("SetInformationJobObject: {e}")))?;
+    // SAFETY: scalar arguments only; success transfers a new process handle to its sole owner.
+    let process = unsafe {
+        let handle = OpenProcess(
             PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION,
             false,
             root,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = CloseHandle(job);
-                return Err(GlassError::AppNotStarted(format!("OpenProcess: {e}")));
-            }
-        };
-        if let Err(e) = AssignProcessToJobObject(job, proc) {
-            let _ = CloseHandle(proc);
-            let _ = CloseHandle(job);
-            return Err(GlassError::AppNotStarted(format!(
-                "AssignProcessToJobObject: {e}"
-            )));
-        }
-        let _ = CloseHandle(proc);
-        Ok(job)
+        )
+        .map_err(|e| GlassError::AppNotStarted(format!("OpenProcess: {e}")))?;
+        OwnedHandle::from_raw_handle(handle.0)
+    };
+    // SAFETY: both handles remain owned; the root is still suspended, before it can fork children.
+    unsafe {
+        AssignProcessToJobObject(HANDLE(job.as_raw_handle()), HANDLE(process.as_raw_handle()))
     }
+    .map_err(|e| GlassError::AppNotStarted(format!("AssignProcessToJobObject: {e}")))?;
+    Ok(job)
 }
 
 /// One process snapshot entry: (pid, parent pid).
@@ -445,8 +413,7 @@ struct Proc {
     ppid: u32,
 }
 
-/// Snapshot every process as (pid, parent pid). Verbatim port of proc.rs::snapshot
-/// (the exe name is dropped — descendant discovery only needs the parent links).
+/// Snapshot every process as (pid, parent pid) for descendant discovery.
 fn snapshot_by(deadline: Deadline) -> Result<Vec<Proc>> {
     if deadline.has_passed() {
         return Err(GlassError::deadline_not_started(
@@ -454,41 +421,42 @@ fn snapshot_by(deadline: Deadline) -> Result<Vec<Proc>> {
         ));
     }
     let mut out = Vec::new();
-    // SAFETY: standard Toolhelp snapshot walk; handle closed before return.
-    unsafe {
-        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
-            Ok(h) => h,
+    // SAFETY: scalar arguments only; success transfers a new snapshot handle to its sole owner.
+    let snap = unsafe {
+        let handle = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(handle) => handle,
             Err(_) => return Ok(out),
         };
-        if deadline.has_passed() {
-            let _ = CloseHandle(snap);
-            return Err(GlassError::caller_deadline_elapsed(
-                "Windows accessibility process discovery",
-            ));
-        }
-        let mut e = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        if Process32FirstW(snap, &mut e).is_ok() {
-            loop {
-                if deadline.has_passed() {
-                    let _ = CloseHandle(snap);
-                    return Err(GlassError::caller_deadline_elapsed(
-                        "Windows accessibility process discovery",
-                    ));
-                }
-                out.push(Proc {
-                    pid: e.th32ProcessID,
-                    ppid: e.th32ParentProcessID,
-                });
-                if Process32NextW(snap, &mut e).is_err() {
-                    break;
-                }
+        OwnedHandle::from_raw_handle(handle.0)
+    };
+    if deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed(
+            "Windows accessibility process discovery",
+        ));
+    }
+    let mut e = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the snapshot is owned and `e` is initialized with the required structure size.
+    if unsafe { Process32FirstW(HANDLE(snap.as_raw_handle()), &mut e) }.is_ok() {
+        loop {
+            if deadline.has_passed() {
+                return Err(GlassError::caller_deadline_elapsed(
+                    "Windows accessibility process discovery",
+                ));
+            }
+            out.push(Proc {
+                pid: e.th32ProcessID,
+                ppid: e.th32ParentProcessID,
+            });
+            // SAFETY: the snapshot and writable entry remain live throughout enumeration.
+            if unsafe { Process32NextW(HANDLE(snap.as_raw_handle()), &mut e) }.is_err() {
+                break;
             }
         }
-        let _ = CloseHandle(snap);
     }
+    drop(snap);
     if deadline.has_passed() {
         Err(GlassError::caller_deadline_elapsed(
             "Windows accessibility process discovery",
@@ -532,7 +500,7 @@ pub(crate) fn descendant_pids_by(root: u32, deadline: Deadline) -> Result<Vec<u3
 
 /// [`job_pids_checked`], flattening an unreadable pid-set to an empty one — for callers that
 /// only need a list to search and treat "couldn't ask" and "nothing there" alike.
-pub(crate) fn job_pids(job: HANDLE) -> Vec<u32> {
+pub(crate) fn job_pids(job: BorrowedHandle<'_>) -> Vec<u32> {
     job_pids_checked(job).unwrap_or_default()
 }
 
@@ -543,7 +511,7 @@ pub(crate) fn job_pids(job: HANDLE) -> Vec<u32> {
 /// `Some(vec![])` ("the job is empty, the tree is gone"). Teardown turns on that difference:
 /// reading an unreadable pid-set as "gone" would let [`LaunchedApp::await_close`] terminate a
 /// handed-off app's children on the first poll, immediately after asking them to close.
-pub(crate) fn job_pids_checked(job: HANDLE) -> Option<Vec<u32>> {
+pub(crate) fn job_pids_checked(job: BorrowedHandle<'_>) -> Option<Vec<u32>> {
     // JOBOBJECT_BASIC_PROCESS_ID_LIST is variable-length: { NumberOfAssignedProcesses: u32,
     // NumberOfProcessIdsInList: u32, ProcessIdList: [usize; 1] (flexible) }. Size the buffer
     // for `cap` pids and grow on failure (too-small buffer), capped to avoid a pathological loop.
@@ -552,12 +520,12 @@ pub(crate) fn job_pids_checked(job: HANDLE) -> Option<Vec<u32>> {
         let bytes = std::mem::size_of::<u32>() * 2 + cap * std::mem::size_of::<usize>();
         let mut buf = vec![0u8; bytes];
         // SAFETY: buf is `bytes` long; QueryInformationJobObject writes at most that many bytes into
-        // it and records the count in the header. `job` is a valid job handle we own. We read the
+        // it and records the count in the header. `job` remains borrowed throughout the call. We read the
         // buffer back only via the safe parse_job_pid_list (from_ne_bytes) — no typed pointer is ever
         // formed over `buf`, so its (byte) alignment is irrelevant.
         let ok = unsafe {
             QueryInformationJobObject(
-                Some(job),
+                Some(HANDLE(job.as_raw_handle())),
                 JobObjectBasicProcessIdList,
                 buf.as_mut_ptr() as *mut c_void,
                 bytes as u32,
@@ -576,42 +544,129 @@ pub(crate) fn job_pids_checked(job: HANDLE) -> Option<Vec<u32>> {
 }
 
 /// Resume every thread of `pid` — a CREATE_SUSPENDED process has one suspended main
-/// thread. Verbatim port of proc.rs::resume_process.
+/// thread.
 fn resume_process(pid: u32) {
-    // SAFETY: Toolhelp thread snapshot; each opened thread handle is closed.
-    unsafe {
-        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) {
-            Ok(h) => h,
+    // SAFETY: scalar arguments only; success transfers a new snapshot handle to its sole owner.
+    let snap = unsafe {
+        let handle = match CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) {
+            Ok(handle) => handle,
             Err(_) => return,
         };
-        let mut te = THREADENTRY32 {
-            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-            ..Default::default()
-        };
-        if Thread32First(snap, &mut te).is_ok() {
-            loop {
-                if te.th32OwnerProcessID == pid
-                    && let Ok(h) = OpenThread(THREAD_SUSPEND_RESUME, false, te.th32ThreadID)
-                {
-                    ResumeThread(h);
-                    let _ = CloseHandle(h);
-                }
-                if Thread32Next(snap, &mut te).is_err() {
-                    break;
-                }
+        OwnedHandle::from_raw_handle(handle.0)
+    };
+    let mut te = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the snapshot is owned and `te` is initialized with the required structure size.
+    if unsafe { Thread32First(HANDLE(snap.as_raw_handle()), &mut te) }.is_ok() {
+        loop {
+            // SAFETY: OpenThread receives only scalar arguments from the snapshot.
+            if te.th32OwnerProcessID == pid
+                && let Ok(handle) =
+                    unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, te.th32ThreadID) }
+            {
+                // SAFETY: OpenThread succeeded, transferring a new handle to its sole owner.
+                let thread = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+                // SAFETY: the owned thread handle has THREAD_SUSPEND_RESUME access.
+                unsafe { ResumeThread(HANDLE(thread.as_raw_handle())) };
+            }
+            // SAFETY: the snapshot and writable entry remain live throughout enumeration.
+            if unsafe { Thread32Next(HANDLE(snap.as_raw_handle()), &mut te) }.is_err() {
+                break;
             }
         }
-        let _ = CloseHandle(snap);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+    struct ProcessProbe(OwnedHandle);
+
+    impl ProcessProbe {
+        fn new(app: &LaunchedApp) -> Self {
+            Self(app.child.as_handle().try_clone_to_owned().unwrap())
+        }
+
+        fn wait(&self, milliseconds: u32) -> windows::Win32::Foundation::WAIT_EVENT {
+            // SAFETY: the owned child process handle remains live throughout the wait.
+            unsafe { WaitForSingleObject(HANDLE(self.0.as_raw_handle()), milliseconds) }
+        }
+    }
+
+    impl Drop for ProcessProbe {
+        fn drop(&mut self) {
+            // SAFETY: this handle belongs only to our fixture child; clean up even after a failed assertion.
+            unsafe {
+                let _ = TerminateProcess(HANDLE(self.0.as_raw_handle()), 1);
+            }
+            self.wait(5000);
+        }
+    }
+
+    fn suspended_fixture() -> LaunchedApp {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--list",
+            "--exact",
+            "process::tests::app_spawn_is_suspended_without_a_console_window",
+        ]);
+        spawn_suspended_in_job(&mut cmd, SandboxLevel::Off).unwrap()
+    }
 
     #[test]
     fn app_spawn_is_suspended_without_a_console_window() {
         assert_ne!(APP_CREATION_FLAGS & CREATE_SUSPENDED.0, 0);
         assert_ne!(APP_CREATION_FLAGS & CREATE_NO_WINDOW.0, 0);
+    }
+
+    #[test]
+    fn dropping_launch_terminates_suspended_process() {
+        let app = suspended_fixture();
+        let process = ProcessProbe::new(&app);
+        assert!(app.job_pids().contains(&app.pid()));
+        assert_eq!(process.wait(0), WAIT_TIMEOUT);
+
+        drop(app);
+
+        assert_eq!(process.wait(5000), WAIT_OBJECT_0);
+    }
+
+    #[test]
+    fn abandon_terminates_suspended_process() {
+        let app = suspended_fixture();
+        let process = ProcessProbe::new(&app);
+
+        app.abandon();
+
+        assert_eq!(process.wait(0), WAIT_OBJECT_0);
+    }
+
+    #[test]
+    fn kill_terminates_suspended_process() {
+        let app = suspended_fixture();
+        let process = ProcessProbe::new(&app);
+
+        let closed = app.kill();
+
+        assert_eq!(closed, Closed::TerminatedUnasked { refused: 0 });
+        assert_eq!(process.wait(0), WAIT_OBJECT_0);
+    }
+
+    #[test]
+    fn resume_allows_suspended_process_to_exit() {
+        let app = suspended_fixture();
+        let process = ProcessProbe::new(&app);
+        assert_eq!(process.wait(0), WAIT_TIMEOUT);
+
+        app.resume();
+
+        assert_eq!(process.wait(5000), WAIT_OBJECT_0);
+        app.kill();
     }
 }
