@@ -11,8 +11,10 @@ mod store;
 pub(crate) use capture::{ACTIVE_CALL, RequestGuard, arguments, current_call, start_arguments};
 pub use config::TraceConfig;
 pub use inspect::{export, inspect, print_inspection};
-pub(crate) use recorder::{CallTrace, TraceRecorder, argument_bytes};
+pub(crate) use recorder::{CallTrace, TraceRecorder};
 
+#[cfg(test)]
+mod event_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

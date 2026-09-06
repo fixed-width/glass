@@ -7,6 +7,7 @@ use crate::output_policy::ToolCallOutcome;
 
 use super::CallTrace;
 use super::config::MAX_PAYLOAD_BYTES;
+use super::format::EventKind;
 use super::recorder::evidence;
 
 tokio::task_local! {
@@ -52,7 +53,7 @@ pub(crate) fn start_arguments(args: &crate::params::StartArgs) {
 impl CallTrace {
     pub fn logical_outcome(&self, outcome: &ToolCallOutcome) {
         self.output(
-            "logical_outcome",
+            EventKind::LogicalOutcome,
             &outcome.output,
             outcome.is_error,
             outcome.target_access,
@@ -60,9 +61,25 @@ impl CallTrace {
         );
     }
 
-    pub fn output(
+    pub fn response_constructed(
         &self,
-        kind: &str,
+        output: &ToolOutput,
+        is_error: bool,
+        access: TargetAccess,
+        store: Option<&ArtifactStore>,
+    ) {
+        self.output(
+            EventKind::ResponseConstructed,
+            output,
+            is_error,
+            access,
+            store,
+        );
+    }
+
+    fn output(
+        &self,
+        kind: EventKind,
         output: &ToolOutput,
         is_error: bool,
         access: TargetAccess,
@@ -105,7 +122,7 @@ impl CallTrace {
 
     pub fn resource_read(&self, result: &Result<rmcp::model::ReadResourceResult, rmcp::ErrorData>) {
         self.capture(
-            "resource_read",
+            EventKind::ResourceRead,
             json!({"is_error": result.is_err()}),
             |capture| {
                 if let Ok(result) = result {
@@ -140,7 +157,10 @@ impl CallTrace {
                 }
             },
         );
-        self.record("logical_outcome", json!({"is_error": result.is_err()}));
+        self.record(
+            EventKind::LogicalOutcome,
+            json!({"is_error": result.is_err()}),
+        );
     }
 }
 
@@ -165,7 +185,7 @@ impl Drop for RequestGuard {
     fn drop(&mut self) {
         if !self.completed {
             self.call.record(
-                "request_abandoned",
+                EventKind::RequestAbandoned,
                 json!({"execution_outcome": "observe_worker_outcome"}),
             );
         }

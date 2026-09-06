@@ -1,7 +1,8 @@
+use super::format::EventKind;
 use super::*;
 use serde_json::json;
 
-fn start_recorder(root: &tempfile::TempDir) -> TraceRecorder {
+pub(super) fn start_recorder(root: &tempfile::TempDir) -> TraceRecorder {
     TraceRecorder::start(
         &TraceConfig::new(root.path().to_owned(), None).unwrap(),
         crate::tool_profile::ToolProfile::Full,
@@ -70,14 +71,20 @@ async fn shutdown_waits_for_admitted_capture_before_closing_the_journal() {
     let (release, release_rx) = std::sync::mpsc::sync_channel(1);
     let producer = recorder.clone();
     let thread = std::thread::spawn(move || {
-        producer.record("capture_in_progress", None, 0, json!({}), |capture| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            capture.bytes(
-                super::recorder::evidence("late", "text/plain", "glass", None),
-                b"completed capture",
-            );
-        })
+        producer.record(
+            EventKind::Unknown("capture_in_progress".into()),
+            None,
+            0,
+            json!({}),
+            |capture| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                capture.bytes(
+                    super::recorder::evidence("late", "text/plain", "glass", None),
+                    b"completed capture",
+                );
+            },
+        )
     });
     entered
         .recv_timeout(std::time::Duration::from_secs(2))
@@ -110,12 +117,24 @@ async fn queue_and_call_limits_preserve_inspectable_prefixes() {
         recorder.idle().await;
         if queue_limit {
             let (entered, release) = recorder.pause_next_write();
-            recorder.record("queue_probe", None, 0, json!({}), |_| {});
+            recorder.record(
+                EventKind::Unknown("queue_probe".into()),
+                None,
+                0,
+                json!({}),
+                |_| {},
+            );
             entered
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap();
             for _ in 0..super::config::MAX_PENDING_EVENTS + 2 {
-                recorder.record("queue_probe", None, 0, json!({}), |_| {});
+                recorder.record(
+                    EventKind::Unknown("queue_probe".into()),
+                    None,
+                    0,
+                    json!({}),
+                    |_| {},
+                );
             }
             assert_eq!(recorder.status()["state"], "limited");
             release.send(()).unwrap();
@@ -140,7 +159,13 @@ async fn concurrent_and_cancelled_close_wait_for_the_writer() {
     let recorder = start_recorder(&root);
     recorder.idle().await;
     let (entered, release) = recorder.pause_next_write();
-    recorder.record("close_probe", None, 0, json!({}), |_| {});
+    recorder.record(
+        EventKind::Unknown("close_probe".into()),
+        None,
+        0,
+        json!({}),
+        |_| {},
+    );
     entered
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
@@ -165,7 +190,13 @@ async fn stalled_writer_shutdown_is_bounded_and_never_claims_completeness() {
     let recorder = start_recorder(&root);
     recorder.idle().await;
     let (entered, release) = recorder.pause_next_write();
-    recorder.record("stall_probe", None, 0, json!({}), |_| {});
+    recorder.record(
+        EventKind::Unknown("stall_probe".into()),
+        None,
+        0,
+        json!({}),
+        |_| {},
+    );
     entered
         .recv_timeout(std::time::Duration::from_secs(2))
         .unwrap();
@@ -190,7 +221,7 @@ async fn retained_trace_exports_after_writer_stops() {
         TraceRecorder::start(&config, crate::tool_profile::ToolProfile::Full, "test").unwrap();
     let call = recorder.begin_call("glass_type", 1).unwrap();
     call.arguments(&json!({"text": "hello"}));
-    call.record("logical_outcome", json!({"is_error": false}));
+    call.record(EventKind::LogicalOutcome, json!({"is_error": false}));
     assert!(inspect(recorder.path()).is_err());
     recorder.close().await;
     let report = inspect(recorder.path()).unwrap();
@@ -258,12 +289,16 @@ async fn total_limit_preserves_prefix_and_exports_an_incomplete_bundle() {
     recorder.idle().await;
     let call = recorder.begin_call("glass_screenshot", 1).unwrap();
     call.arguments(&json!({}));
-    call.capture("logical_outcome", json!({"is_error": false}), |capture| {
-        capture.bytes(
-            super::recorder::evidence("image", "image/webp", "untrusted_application", Some(0)),
-            &vec![3; limit as usize],
-        );
-    });
+    call.capture(
+        EventKind::LogicalOutcome,
+        json!({"is_error": false}),
+        |capture| {
+            capture.bytes(
+                super::recorder::evidence("image", "image/webp", "untrusted_application", Some(0)),
+                &vec![3; limit as usize],
+            );
+        },
+    );
     recorder.idle().await;
     assert_eq!(recorder.status()["state"], "limited");
     recorder.close().await;
@@ -305,16 +340,20 @@ async fn oversized_payload_is_omitted_whole_and_later_small_evidence_survives() 
     .unwrap();
     let call = recorder.begin_call("glass_test", 1).unwrap();
     call.arguments(&json!({}));
-    call.capture("logical_outcome", json!({"is_error": false}), |capture| {
-        capture.bytes(
-            super::recorder::evidence("large", "text/plain", "untrusted_application", Some(0)),
-            &vec![b'x'; super::config::MAX_PAYLOAD_BYTES + 1],
-        );
-        capture.bytes(
-            super::recorder::evidence("small", "text/plain", "untrusted_application", Some(1)),
-            b"later evidence",
-        );
-    });
+    call.capture(
+        EventKind::LogicalOutcome,
+        json!({"is_error": false}),
+        |capture| {
+            capture.bytes(
+                super::recorder::evidence("large", "text/plain", "untrusted_application", Some(0)),
+                &vec![b'x'; super::config::MAX_PAYLOAD_BYTES + 1],
+            );
+            capture.bytes(
+                super::recorder::evidence("small", "text/plain", "untrusted_application", Some(1)),
+                b"later evidence",
+            );
+        },
+    );
     recorder.close().await;
     let report = inspect(recorder.path()).unwrap();
     assert_eq!(report.exit_code(), 2);

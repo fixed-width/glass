@@ -9,7 +9,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::config::*;
-use super::format::{Event, Manifest, Payload, SCHEMA, digest};
+use super::format::{CallRole, Event, EventKind, Manifest, Payload, SCHEMA, digest};
 use super::fs;
 
 const MAX_INDEX_BYTES: usize = 8 * 1024 * 1024;
@@ -131,7 +131,7 @@ fn validate(path: &Path) -> anyhow::Result<Validated> {
     let mut index_truncated = false;
     let mut omissions = 0_u64;
     let mut total_bytes = manifest_bytes.len() as u64 + journal_length;
-    let mut last_kind = String::new();
+    let mut last_kind = None;
     loop {
         let mut line = Vec::new();
         let size = reader
@@ -157,21 +157,20 @@ fn validate(path: &Path) -> anyhow::Result<Validated> {
             "invalid trace event ordering"
         );
         ensure!(
-            event.kind.len() <= 64 && event.evidence.len() <= 128,
+            !matches!(&event.kind, EventKind::Unknown(name) if name.len() > 64)
+                && event.evidence.len() <= 128,
             "trace event metadata exceeds limits"
         );
         if let Some(call) = event.call {
             ensure!(call != 0 && call <= MAX_CALLS, "invalid trace call ID");
-            if event.kind == "call_received" {
+            let role = event.kind.call_role();
+            if role == CallRole::Start {
                 ensure!(calls.insert(call), "duplicate trace call ID");
                 unfinished.insert(call);
             } else {
                 ensure!(calls.contains(&call), "event refers to an unknown call");
             }
-            if matches!(
-                event.kind.as_str(),
-                "logical_outcome" | "router_rejection" | "worker_unavailable"
-            ) {
+            if role == CallRole::Outcome {
                 ensure!(outcomes.insert(call), "duplicate call execution outcome");
                 unfinished.remove(&call);
             }
@@ -223,7 +222,7 @@ fn validate(path: &Path) -> anyhow::Result<Validated> {
         } else {
             index_truncated = true;
         }
-        last_kind = event.kind;
+        last_kind = Some(event.kind);
         journal_hash.update(&line);
         journal_bytes += line.len() as u64;
     }
@@ -235,7 +234,10 @@ fn validate(path: &Path) -> anyhow::Result<Validated> {
                 && manifest.journal_sha256.as_deref() == Some(&journal_digest),
             "journal integrity mismatch"
         );
-        ensure!(last_kind == "trace_closed", "final trace event missing");
+        ensure!(
+            last_kind == Some(EventKind::TraceClosed),
+            "final trace event missing"
+        );
         ensure!(
             manifest.calls == calls.len() as u64,
             "trace call count mismatch"

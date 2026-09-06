@@ -95,7 +95,7 @@ contain original bytes; JSON argument/envelope payloads contain normalized seria
 Resource links also retain their full MCP descriptor in a `resource_descriptor` JSON payload,
 associated with the same block index as the retained resource body.
 
-Events distinguish `call_received`, `arguments`, `execution_started`, `session_context`,
+Events distinguish `call_received`, `argument_size`, `arguments`, `execution_started`, `session_context`,
 `logical_outcome`, `response_constructed`, `request_abandoned`, `router_rejection`,
 `worker_unavailable`, and `resource_read`. Inventory, local client creation, shutdown and the
 terminal `trace_closed` are separate control events. Execution ordinals are distinct from receipt

@@ -10,7 +10,7 @@ use serde_json::json;
 
 use super::TraceConfig;
 use super::config::*;
-use super::format::{Event, Evidence, Limits, Manifest, SCHEMA};
+use super::format::{CallRole, Event, EventKind, Evidence, Limits, Manifest, SCHEMA};
 use super::{fs, store::Store};
 
 const RECORDING: u8 = 0;
@@ -301,7 +301,7 @@ impl TraceRecorder {
             done: done_rx,
             next_client: AtomicU64::new(1),
         }));
-        recorder.record("inventory", None, 0, json!({}), |capture| {
+        recorder.record(EventKind::Inventory, None, 0, json!({}), |capture| {
             capture.json(evidence("tools_and_instructions", "application/json", "glass", None), &json!({
                 "tools": crate::server::tool_inventory(profile), "instructions": profile.instructions(),
             }));
@@ -321,13 +321,13 @@ impl TraceRecorder {
     }
     pub fn new_client(&self) -> u64 {
         let client = self.0.next_client.fetch_add(1, Ordering::Relaxed);
-        self.record("client_created", None, client, json!({}), |_| {});
+        self.record(EventKind::ClientCreated, None, client, json!({}), |_| {});
         client
     }
 
     pub fn shutdown_event(&self, status: &str) {
         self.record(
-            "shutdown",
+            EventKind::Shutdown,
             None,
             0,
             json!({"status": status, "host_hook_confirmation": "not_reported"}),
@@ -358,7 +358,7 @@ impl TraceRecorder {
             return None;
         }
         self.record(
-            "call_received",
+            EventKind::CallReceived,
             Some(call),
             client,
             json!({"tool": tool.chars().take(128).collect::<String>()}),
@@ -379,7 +379,7 @@ impl TraceRecorder {
 
     pub(super) fn record(
         &self,
-        kind: &str,
+        kind: EventKind,
         call: Option<u64>,
         client: u64,
         data: serde_json::Value,
@@ -403,7 +403,7 @@ impl TraceRecorder {
             event: Event {
                 seq: 0,
                 elapsed_us: elapsed(&self.0.shared),
-                kind: kind.into(),
+                kind,
                 call,
                 client,
                 data,
@@ -539,7 +539,7 @@ fn writer(mut store: Store, receiver: mpsc::Receiver<Pending>, shared: &Shared) 
     let terminal = Event {
         seq: 0,
         elapsed_us: elapsed(shared),
-        kind: "trace_closed".into(),
+        kind: EventKind::TraceClosed,
         call: None,
         client: 0,
         data: json!({"unfinished_calls": unfinished, "writer_timed_out": shared.timed_out.load(Ordering::Acquire)}),
@@ -606,15 +606,15 @@ fn write_pending(
     }
     if store.event(event.clone(), false)? {
         if let Some(call) = event.call {
-            match event.kind.as_str() {
-                "call_received" => {
+            match event.kind.call_role() {
+                CallRole::Start => {
                     unfinished.insert(call);
                     store.manifest.calls += 1;
                 }
-                "logical_outcome" | "router_rejection" | "worker_unavailable" => {
+                CallRole::Outcome => {
                     unfinished.remove(&call);
                 }
-                _ => {}
+                CallRole::Other => {}
             }
         }
     } else {
@@ -634,14 +634,51 @@ pub(crate) struct CallTrace {
 }
 
 impl CallTrace {
-    pub fn record(&self, kind: &str, data: serde_json::Value) {
+    pub fn execution_started(
+        &self,
+        execution_order: u64,
+        session: Option<u64>,
+        backend: Option<&str>,
+    ) {
+        self.record(
+            EventKind::ExecutionStarted,
+            json!({"execution_order": execution_order, "session": session, "backend": backend}),
+        );
+    }
+
+    pub fn session_context(&self, session: Option<u64>, backend: Option<&str>) {
+        self.record(
+            EventKind::SessionContext,
+            json!({"session": session, "backend": backend}),
+        );
+    }
+
+    pub fn argument_size(&self, arguments: &impl Serialize) {
+        self.record(
+            EventKind::ArgumentSize,
+            json!({"compact_json_bytes": argument_bytes(arguments)}),
+        );
+    }
+
+    pub fn router_rejection(&self) {
+        self.record(
+            EventKind::RouterRejection,
+            json!({"category": "tool_or_arguments_rejected", "raw_arguments": "excluded"}),
+        );
+    }
+
+    pub fn worker_unavailable(&self) {
+        self.record(EventKind::WorkerUnavailable, json!({}));
+    }
+
+    pub(super) fn record(&self, kind: EventKind, data: serde_json::Value) {
         self.recorder
             .record(kind, Some(self.id), self.client, data, |_| {});
     }
 
     pub fn arguments(&self, value: &impl Serialize) {
         self.valid_arguments.store(true, Ordering::Release);
-        self.capture("arguments", json!({}), |capture| {
+        self.capture(EventKind::Arguments, json!({}), |capture| {
             capture.json(
                 evidence("arguments", "application/json", "caller", None),
                 value,
@@ -655,7 +692,7 @@ impl CallTrace {
 
     pub fn arguments_unavailable(&self) {
         self.valid_arguments.store(true, Ordering::Release);
-        self.capture("arguments", json!({}), |capture| {
+        self.capture(EventKind::Arguments, json!({}), |capture| {
             capture.omission(
                 evidence("arguments", "application/json", "caller", None),
                 "argument_capture_unavailable",
@@ -665,7 +702,7 @@ impl CallTrace {
 
     pub(super) fn capture(
         &self,
-        kind: &str,
+        kind: EventKind,
         data: serde_json::Value,
         capture: impl FnOnce(&mut Capture<'_>),
     ) {
@@ -676,7 +713,7 @@ impl CallTrace {
 
 struct Counter(usize);
 
-pub(crate) fn argument_bytes(value: &impl Serialize) -> Option<u64> {
+fn argument_bytes(value: &impl Serialize) -> Option<u64> {
     let mut counter = Counter(0);
     serde_json::to_writer(&mut counter, value).ok()?;
     u64::try_from(counter.0).ok()
