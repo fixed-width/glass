@@ -12,7 +12,7 @@ cd glass
 cargo build --release -p glass-mcp        # → target/release/glass-mcp
 ```
 
-glass pins a nightly toolchain in `rust-toolchain.toml`, which rustup installs automatically on the
+glass pins a stable Rust toolchain in `rust-toolchain.toml`, which rustup installs automatically on the
 first build — there's no toolchain to choose. On every platform the build also needs **`cmake` and a
 C compiler** on `PATH`: the TLS stack behind `glass-mcp update` compiles `aws-lc-sys` from C sources
 (`apt install cmake build-essential`, or the equivalent for your distro). On **macOS**, building

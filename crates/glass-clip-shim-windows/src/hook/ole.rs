@@ -8,7 +8,6 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use retour::static_detour;
 use windows::Win32::Foundation::{S_FALSE, S_OK};
 use windows::Win32::System::Com::{
     DATADIR_GET, FORMATETC, IDataObject, IStream, STREAM_SEEK_SET, TYMED_HGLOBAL, TYMED_ISTREAM,
@@ -19,6 +18,7 @@ use windows::core::{HRESULT, Interface};
 use crate::proto::{FormatKey, MAX_ITEM_BYTES, MAX_TOTAL_BYTES};
 
 use super::dataobject::StoreDataObject;
+use super::detour::Detour;
 use super::{
     key_of, ole32_proc, read_bytes_from_hglobal, store_empty, store_get_all, store_seq,
     store_set_all,
@@ -29,12 +29,10 @@ type FnOleGet = unsafe extern "system" fn(*mut *mut c_void) -> HRESULT;
 type FnOleFlush = unsafe extern "system" fn() -> HRESULT;
 type FnOleIsCurrent = unsafe extern "system" fn(*mut c_void) -> HRESULT;
 
-static_detour! {
-    static OleSetClipboardHook: unsafe extern "system" fn(*mut c_void) -> HRESULT;
-    static OleGetClipboardHook: unsafe extern "system" fn(*mut *mut c_void) -> HRESULT;
-    static OleFlushClipboardHook: unsafe extern "system" fn() -> HRESULT;
-    static OleIsCurrentClipboardHook: unsafe extern "system" fn(*mut c_void) -> HRESULT;
-}
+static OLE_SET_CLIPBOARD_HOOK: Detour<FnOleSet> = Detour::new();
+static OLE_GET_CLIPBOARD_HOOK: Detour<FnOleGet> = Detour::new();
+static OLE_FLUSH_CLIPBOARD_HOOK: Detour<FnOleFlush> = Detour::new();
+static OLE_IS_CURRENT_CLIPBOARD_HOOK: Detour<FnOleIsCurrent> = Detour::new();
 
 thread_local! {
     /// (last `OleSetClipboard` object pointer, store seq right after that SetAll) — for
@@ -147,7 +145,7 @@ unsafe fn marshal(data: &IDataObject) -> Vec<(FormatKey, Vec<u8>)> {
     out
 }
 
-fn ole_set_clipboard(p: *mut c_void) -> HRESULT {
+unsafe extern "system" fn ole_set_clipboard(p: *mut c_void) -> HRESULT {
     catch_unwind(AssertUnwindSafe(|| {
         if p.is_null() {
             store_empty();
@@ -166,7 +164,7 @@ fn ole_set_clipboard(p: *mut c_void) -> HRESULT {
     .unwrap_or(S_OK)
 }
 
-fn ole_get_clipboard(pp: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn ole_get_clipboard(pp: *mut *mut c_void) -> HRESULT {
     catch_unwind(AssertUnwindSafe(|| {
         if pp.is_null() {
             return S_OK;
@@ -180,12 +178,12 @@ fn ole_get_clipboard(pp: *mut *mut c_void) -> HRESULT {
     .unwrap_or(S_OK)
 }
 
-fn ole_flush_clipboard() -> HRESULT {
+unsafe extern "system" fn ole_flush_clipboard() -> HRESULT {
     // We've eagerly stored; flush is a no-op. (Do not call the real OLE — we substitute it.)
     S_OK
 }
 
-fn ole_is_current_clipboard(p: *mut c_void) -> HRESULT {
+unsafe extern "system" fn ole_is_current_clipboard(p: *mut c_void) -> HRESULT {
     catch_unwind(AssertUnwindSafe(|| {
         let (last_p, last_seq) = LAST_SET.with(|c| c.get());
         if !p.is_null() && p as isize == last_p && store_seq() == last_seq {
@@ -199,38 +197,25 @@ fn ole_is_current_clipboard(p: *mut c_void) -> HRESULT {
 
 /// Resolve + enable the 4 ole32 detours. Fail-soft (a missing export is skipped).
 pub(super) fn install_ole() {
-    // SAFETY: each `ole32_proc` returns the export's absolute address, transmuted to its exact ABI;
-    // retour initialize/enable are unsafe by contract; every step is fallible and stays fail-soft.
+    // SAFETY: ole32_proc resolves live exports with the exact signatures below. Initialization
+    // runs once during DLL injection, before the app resumes calling these APIs. Each replacement
+    // implements its export's calling contract and remains loaded with the shim.
     unsafe {
         if let Some(p) = ole32_proc(b"OleSetClipboard\0") {
-            let t: FnOleSet = std::mem::transmute(p);
-            if OleSetClipboardHook.initialize(t, ole_set_clipboard).is_ok() {
-                let _ = OleSetClipboardHook.enable();
-            }
+            let target: FnOleSet = std::mem::transmute(p);
+            let _ = OLE_SET_CLIPBOARD_HOOK.install(target, ole_set_clipboard);
         }
         if let Some(p) = ole32_proc(b"OleGetClipboard\0") {
-            let t: FnOleGet = std::mem::transmute(p);
-            if OleGetClipboardHook.initialize(t, ole_get_clipboard).is_ok() {
-                let _ = OleGetClipboardHook.enable();
-            }
+            let target: FnOleGet = std::mem::transmute(p);
+            let _ = OLE_GET_CLIPBOARD_HOOK.install(target, ole_get_clipboard);
         }
         if let Some(p) = ole32_proc(b"OleFlushClipboard\0") {
-            let t: FnOleFlush = std::mem::transmute(p);
-            if OleFlushClipboardHook
-                .initialize(t, ole_flush_clipboard)
-                .is_ok()
-            {
-                let _ = OleFlushClipboardHook.enable();
-            }
+            let target: FnOleFlush = std::mem::transmute(p);
+            let _ = OLE_FLUSH_CLIPBOARD_HOOK.install(target, ole_flush_clipboard);
         }
         if let Some(p) = ole32_proc(b"OleIsCurrentClipboard\0") {
-            let t: FnOleIsCurrent = std::mem::transmute(p);
-            if OleIsCurrentClipboardHook
-                .initialize(t, ole_is_current_clipboard)
-                .is_ok()
-            {
-                let _ = OleIsCurrentClipboardHook.enable();
-            }
+            let target: FnOleIsCurrent = std::mem::transmute(p);
+            let _ = OLE_IS_CURRENT_CLIPBOARD_HOOK.install(target, ole_is_current_clipboard);
         }
     }
 }

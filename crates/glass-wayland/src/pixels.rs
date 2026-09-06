@@ -100,7 +100,12 @@ fn unpack24(
     for y in 0..h {
         let s = &src[y * stride..y * stride + row];
         let d = &mut out[y * dst_row..y * dst_row + dst_row];
-        for (px, dst) in s.chunks_exact(3).zip(d.chunks_exact_mut(4)) {
+        for (px, dst) in s
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(d.as_chunks_mut::<4>().0.iter_mut())
+        {
             let (r, b) = match order {
                 SourceOrder::Bgr => (px[2], px[0]),
                 SourceOrder::Rgb => (px[0], px[2]),

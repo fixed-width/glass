@@ -299,15 +299,17 @@ fn scroll_evidence(p: &mut WindowsPlatform, geo: &WindowGeometry) -> (Vec<String
 }
 
 fn is_blank(px: &[u8]) -> bool {
-    match px.chunks_exact(4).next() {
-        Some(first) => px.chunks_exact(4).all(|c| c == first),
+    match px.as_chunks::<4>().0.first() {
+        Some(first) => px.as_chunks::<4>().0.iter().all(|c| c == first),
         None => true,
     }
 }
 
 fn changed(a: &[u8], b: &[u8]) -> usize {
-    a.chunks_exact(4)
-        .zip(b.chunks_exact(4))
+    a.as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<4>().0.iter())
         .filter(|(x, y)| x != y)
         .count()
 }

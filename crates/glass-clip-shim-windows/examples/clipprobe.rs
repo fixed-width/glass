@@ -222,7 +222,9 @@ fn run_multi() -> i32 {
         let text_rb = read_global_bytes(cf_text)
             .map(|b| {
                 let units: Vec<u16> = b
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
@@ -491,7 +493,9 @@ impl windows::Win32::System::Com::IDataObject_Impl for ProbeData_Impl {
 #[cfg(windows)]
 fn utf16_to_string(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());

@@ -65,7 +65,9 @@ mod tests {
 
     /// Scalar reference: BGRX -> RGBA with alpha forced to 255.
     fn reference(data: &[u8]) -> Vec<u8> {
-        data.chunks_exact(4)
+        data.as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[2], p[1], p[0], 255])
             .collect()
     }

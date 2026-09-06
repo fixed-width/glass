@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # rustup installs the pinned toolchain + rustfmt from rust-toolchain.toml,
-      # so CI formats with the same nightly the build uses.
+      # so CI formats with the same toolchain the build uses.
       - name: Install pinned toolchain
         run: rustup show
       - run: cargo fmt --all --check
@@ -39,7 +39,7 @@ jobs:
       - name: Test interaction benchmark
         run: python3 -m unittest discover -s tools/interaction-bench/tests
       # rustup auto-installs the pinned toolchain + components from
-      # rust-toolchain.toml (single source of truth for the nightly).
+      # rust-toolchain.toml (single source of truth for the toolchain).
       - name: Install pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -151,7 +151,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # rustup auto-installs the pinned toolchain + components from
-      # rust-toolchain.toml (single source of truth for the nightly).
+      # rust-toolchain.toml (single source of truth for the toolchain).
       - name: Install pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1

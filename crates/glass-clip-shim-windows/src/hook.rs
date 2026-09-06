@@ -30,6 +30,7 @@ use windows::Win32::System::DataExchange::{GetClipboardFormatNameW, RegisterClip
 use crate::proto::{self, FormatKey, Request, Response};
 
 mod dataobject;
+mod detour;
 mod detour_impl;
 mod ole;
 
@@ -295,7 +296,9 @@ pub(crate) fn alloc_hglobal_bytes(bytes: &[u8]) -> Option<HGLOBAL> {
 pub(crate) fn unicode_to_codepage(utf16_bytes: &[u8], oem: bool) -> Vec<u8> {
     use windows::Win32::Globalization::{CP_ACP, CP_OEMCP, WideCharToMultiByte};
     let units: Vec<u16> = utf16_bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     let cp = if oem { CP_OEMCP } else { CP_ACP };

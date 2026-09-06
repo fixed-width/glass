@@ -1,4 +1,4 @@
-//! The `retour` static-detour table for the user32 clipboard APIs.
+//! The `retour` typed detours for the user32 clipboard APIs.
 //!
 //! Each detour mirrors the exact Win32 ABI of its export (raw newtypes, `extern "system"`), is
 //! resolved to an absolute address via `GetProcAddress` (so *every* call site in the process is
@@ -12,13 +12,13 @@
 
 use std::cell::{Cell, RefCell};
 
-use retour::static_detour;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, HGDIOBJ};
 use windows::core::BOOL;
 
 use crate::proto::FormatKey;
 
+use super::detour::Detour;
 use super::{
     CF_BITMAP, CF_DIBV5, CF_LOCALE, CF_OEMTEXT, CF_TEXT, alloc_hglobal_bytes, id_of, key_of,
     locale_blob, read_bytes_from_hglobal, store_empty, store_get_bytes, store_list, store_seq,
@@ -37,17 +37,15 @@ type FnCountClipboardFormats = unsafe extern "system" fn() -> i32;
 type FnEnumClipboardFormats = unsafe extern "system" fn(u32) -> u32;
 type FnGetClipboardSequenceNumber = unsafe extern "system" fn() -> u32;
 
-static_detour! {
-    static OpenClipboardHook: unsafe extern "system" fn(HWND) -> BOOL;
-    static CloseClipboardHook: unsafe extern "system" fn() -> BOOL;
-    static EmptyClipboardHook: unsafe extern "system" fn() -> BOOL;
-    static SetClipboardDataHook: unsafe extern "system" fn(u32, HANDLE) -> HANDLE;
-    static GetClipboardDataHook: unsafe extern "system" fn(u32) -> HANDLE;
-    static IsClipboardFormatAvailableHook: unsafe extern "system" fn(u32) -> BOOL;
-    static CountClipboardFormatsHook: unsafe extern "system" fn() -> i32;
-    static EnumClipboardFormatsHook: unsafe extern "system" fn(u32) -> u32;
-    static GetClipboardSequenceNumberHook: unsafe extern "system" fn() -> u32;
-}
+static OPEN_CLIPBOARD_HOOK: Detour<FnOpenClipboard> = Detour::new();
+static CLOSE_CLIPBOARD_HOOK: Detour<FnCloseClipboard> = Detour::new();
+static EMPTY_CLIPBOARD_HOOK: Detour<FnEmptyClipboard> = Detour::new();
+static SET_CLIPBOARD_DATA_HOOK: Detour<FnSetClipboardData> = Detour::new();
+static GET_CLIPBOARD_DATA_HOOK: Detour<FnGetClipboardData> = Detour::new();
+static IS_CLIPBOARD_FORMAT_AVAILABLE_HOOK: Detour<FnIsClipboardFormatAvailable> = Detour::new();
+static COUNT_CLIPBOARD_FORMATS_HOOK: Detour<FnCountClipboardFormats> = Detour::new();
+static ENUM_CLIPBOARD_FORMATS_HOOK: Detour<FnEnumClipboardFormats> = Detour::new();
+static GET_CLIPBOARD_SEQUENCE_NUMBER_HOOK: Detour<FnGetClipboardSequenceNumber> = Detour::new();
 
 /// What kind of resource the cached handle is, so it is freed via the right Win32 destructor.
 #[derive(Clone, Copy, PartialEq)]
@@ -194,7 +192,7 @@ fn make_bitmap_handle(dib: &[u8]) -> Option<HANDLE> {
 // invariant, even though the closures touch raw pointers / thread-local `Cell`s.
 
 /// `OpenClipboard(hwnd)` → mark open; always succeed. Never touches the real clipboard.
-fn open_clipboard(_hwnd: HWND) -> BOOL {
+unsafe extern "system" fn open_clipboard(_hwnd: HWND) -> BOOL {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         free_cached_handle();
         CLIP_OPEN.with(|c| c.set(true));
@@ -205,7 +203,7 @@ fn open_clipboard(_hwnd: HWND) -> BOOL {
 
 /// `CloseClipboard()` → mark closed; commit the pending multi-format copy as one atomic `SetAll`
 /// (one transaction / one seq bump); free the cached handle. Always succeed.
-fn close_clipboard() -> BOOL {
+unsafe extern "system" fn close_clipboard() -> BOOL {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         CLIP_OPEN.with(|c| c.set(false));
         let items = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
@@ -219,7 +217,7 @@ fn close_clipboard() -> BOOL {
 }
 
 /// `EmptyClipboard()` → drop any pending copy, clear the host store, free the cached handle.
-fn empty_clipboard() -> BOOL {
+unsafe extern "system" fn empty_clipboard() -> BOOL {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         PENDING.with(|p| p.borrow_mut().clear());
         store_empty();
@@ -233,7 +231,7 @@ fn empty_clipboard() -> BOOL {
 /// set (committed atomically on `CloseClipboard`). Returns `h` (the contract: the clipboard now
 /// "owns" it; we keep the store as the source of truth). `h == NULL` is delayed rendering — out of
 /// scope (OLE apps covered separately in 2a-ii): skip, no change.
-fn set_clipboard_data(fmt: u32, h: HANDLE) -> HANDLE {
+unsafe extern "system" fn set_clipboard_data(fmt: u32, h: HANDLE) -> HANDLE {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if h.0.is_null() {
             return HANDLE::default(); // delayed rendering unsupported
@@ -255,7 +253,7 @@ fn set_clipboard_data(fmt: u32, h: HANDLE) -> HANDLE {
 /// `GetClipboardData(fmt)` → resolve the format's bytes (stored verbatim or synthesized), then hand
 /// back a handle the app needn't free (we free on next open/empty/close): a GDI `HBITMAP` for
 /// `CF_BITMAP`, otherwise a fresh `HGLOBAL`. NULL if unavailable or the pipe is down.
-fn get_clipboard_data(fmt: u32) -> HANDLE {
+unsafe extern "system" fn get_clipboard_data(fmt: u32) -> HANDLE {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let key = key_of(fmt);
         let Some(bytes) = resolve_bytes(fmt, &key) else {
@@ -276,7 +274,7 @@ fn get_clipboard_data(fmt: u32) -> HANDLE {
 }
 
 /// `IsClipboardFormatAvailable(fmt)` → TRUE iff `fmt` is among the stored/synthesizable formats.
-fn is_clipboard_format_available(fmt: u32) -> BOOL {
+unsafe extern "system" fn is_clipboard_format_available(fmt: u32) -> BOOL {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         BOOL(available_ids().contains(&fmt) as i32)
     }))
@@ -284,7 +282,7 @@ fn is_clipboard_format_available(fmt: u32) -> BOOL {
 }
 
 /// `CountClipboardFormats()` → the number of stored/synthesizable formats.
-fn count_clipboard_formats() -> i32 {
+unsafe extern "system" fn count_clipboard_formats() -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         available_ids().len() as i32
     }))
@@ -293,7 +291,7 @@ fn count_clipboard_formats() -> i32 {
 
 /// `EnumClipboardFormats(prev)` → walk the stored/synthesizable formats in order: `0` yields the
 /// first; otherwise the one after `prev`; `0` again at the end of the list.
-fn enum_clipboard_formats(prev: u32) -> u32 {
+unsafe extern "system" fn enum_clipboard_formats(prev: u32) -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let ids = available_ids();
         match prev {
@@ -310,7 +308,7 @@ fn enum_clipboard_formats(prev: u32) -> u32 {
 }
 
 /// `GetClipboardSequenceNumber()` → the host store's sequence number (bumps on every set/empty).
-fn get_clipboard_sequence_number() -> u32 {
+unsafe extern "system" fn get_clipboard_sequence_number() -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(store_seq)).unwrap_or(0)
 }
 
@@ -320,89 +318,47 @@ fn get_clipboard_sequence_number() -> u32 {
 /// unresolved/uninitialisable export is logged-by-omission and skipped, never panicking (a panic
 /// across the FFI boundary in `InjectDllMain` would take down the boxed app).
 pub(super) fn install() {
-    // SAFETY (whole block): each `user32_proc` returns the absolute address of the named export,
-    // which we transmute to that export's exact ABI signature (verified against windows-rs `link!`
-    // declarations). `retour`'s `initialize` then trampolines the target and routes calls to our
-    // hook; `enable` patches the prologue. Both are `unsafe` by contract. Every step is fallible
-    // and we `let _ =` / `if let` to stay fail-soft — we never unwrap across the FFI boundary.
+    // SAFETY: user32_proc resolves live exports with the exact signatures below. Initialization
+    // runs once during DLL injection, before the app resumes calling these APIs. Each replacement
+    // implements its export's calling contract and remains loaded with the shim.
     unsafe {
         if let Some(p) = user32_proc(b"OpenClipboard\0") {
             let target: FnOpenClipboard = std::mem::transmute(p);
-            if OpenClipboardHook.initialize(target, open_clipboard).is_ok() {
-                let _ = OpenClipboardHook.enable();
-            }
+            let _ = OPEN_CLIPBOARD_HOOK.install(target, open_clipboard);
         }
         if let Some(p) = user32_proc(b"CloseClipboard\0") {
             let target: FnCloseClipboard = std::mem::transmute(p);
-            if CloseClipboardHook
-                .initialize(target, close_clipboard)
-                .is_ok()
-            {
-                let _ = CloseClipboardHook.enable();
-            }
+            let _ = CLOSE_CLIPBOARD_HOOK.install(target, close_clipboard);
         }
         if let Some(p) = user32_proc(b"EmptyClipboard\0") {
             let target: FnEmptyClipboard = std::mem::transmute(p);
-            if EmptyClipboardHook
-                .initialize(target, empty_clipboard)
-                .is_ok()
-            {
-                let _ = EmptyClipboardHook.enable();
-            }
+            let _ = EMPTY_CLIPBOARD_HOOK.install(target, empty_clipboard);
         }
         if let Some(p) = user32_proc(b"SetClipboardData\0") {
             let target: FnSetClipboardData = std::mem::transmute(p);
-            if SetClipboardDataHook
-                .initialize(target, set_clipboard_data)
-                .is_ok()
-            {
-                let _ = SetClipboardDataHook.enable();
-            }
+            let _ = SET_CLIPBOARD_DATA_HOOK.install(target, set_clipboard_data);
         }
         if let Some(p) = user32_proc(b"GetClipboardData\0") {
             let target: FnGetClipboardData = std::mem::transmute(p);
-            if GetClipboardDataHook
-                .initialize(target, get_clipboard_data)
-                .is_ok()
-            {
-                let _ = GetClipboardDataHook.enable();
-            }
+            let _ = GET_CLIPBOARD_DATA_HOOK.install(target, get_clipboard_data);
         }
         if let Some(p) = user32_proc(b"IsClipboardFormatAvailable\0") {
             let target: FnIsClipboardFormatAvailable = std::mem::transmute(p);
-            if IsClipboardFormatAvailableHook
-                .initialize(target, is_clipboard_format_available)
-                .is_ok()
-            {
-                let _ = IsClipboardFormatAvailableHook.enable();
-            }
+            let _ =
+                IS_CLIPBOARD_FORMAT_AVAILABLE_HOOK.install(target, is_clipboard_format_available);
         }
         if let Some(p) = user32_proc(b"CountClipboardFormats\0") {
             let target: FnCountClipboardFormats = std::mem::transmute(p);
-            if CountClipboardFormatsHook
-                .initialize(target, count_clipboard_formats)
-                .is_ok()
-            {
-                let _ = CountClipboardFormatsHook.enable();
-            }
+            let _ = COUNT_CLIPBOARD_FORMATS_HOOK.install(target, count_clipboard_formats);
         }
         if let Some(p) = user32_proc(b"EnumClipboardFormats\0") {
             let target: FnEnumClipboardFormats = std::mem::transmute(p);
-            if EnumClipboardFormatsHook
-                .initialize(target, enum_clipboard_formats)
-                .is_ok()
-            {
-                let _ = EnumClipboardFormatsHook.enable();
-            }
+            let _ = ENUM_CLIPBOARD_FORMATS_HOOK.install(target, enum_clipboard_formats);
         }
         if let Some(p) = user32_proc(b"GetClipboardSequenceNumber\0") {
             let target: FnGetClipboardSequenceNumber = std::mem::transmute(p);
-            if GetClipboardSequenceNumberHook
-                .initialize(target, get_clipboard_sequence_number)
-                .is_ok()
-            {
-                let _ = GetClipboardSequenceNumberHook.enable();
-            }
+            let _ =
+                GET_CLIPBOARD_SEQUENCE_NUMBER_HOOK.install(target, get_clipboard_sequence_number);
         }
     }
     super::ole::install_ole();
