@@ -16,6 +16,19 @@ cargo bench $PKGS -- --baseline main
 would reject criterion's `--save-baseline` / `--baseline` flags). The `pixels` bench exists in all
 three backends, so name the crate with `-p` to flamegraph one.
 
+Pixel normalization and frame comparison use `fearless_simd`, with CPU features detected once
+and cached. On x86 this selects the available SSE2, SSE4.2, AVX2, or AVX-512 backend; AArch64 uses NEON.
+The core SIMD code works on stable Rust. The workspace still pins nightly for the Windows
+clipboard shim's `retour` static detours.
+
+When comparing portable builds, clear local CPU-specific flags (such as `target-cpu=native` or
+`target-cpu=haswell`), so both builds target the same baseline:
+
+```bash
+env -u CARGO_ENCODED_RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS RUSTFLAGS='' \
+  cargo +stable bench -p glass-core --locked
+```
+
 Profile a hot path as a flamegraph (needs
 [`cargo install flamegraph`](https://github.com/flamegraph-rs/flamegraph) and
 `kernel.perf_event_paranoid <= 1`):

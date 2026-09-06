@@ -243,7 +243,6 @@ mod test_support;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::session::test_support::*;
 
     #[test]

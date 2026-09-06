@@ -1,4 +1,3 @@
-#![feature(portable_simd)]
 //! glass-core: platform-agnostic core for the glass UI-automation harness.
 //!
 //! No OS/windowing types appear here; every backend detail lives behind the
@@ -132,3 +131,9 @@ pub use session::{
     SetValueTargetParams, TypeTargetParams, WaitElementOutcome, WaitElementParams, WaitLogOutcome,
     WaitLogParams, WaitRegionOutcome, WaitRegionParams, WaitStableOutcome, WaitStableParams,
 };
+
+fn simd_level() -> fearless_simd::Level {
+    static LEVEL: std::sync::LazyLock<fearless_simd::Level> =
+        std::sync::LazyLock::new(fearless_simd::Level::new);
+    *LEVEL
+}
