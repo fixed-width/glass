@@ -430,25 +430,18 @@ async fn ime_form_proof(client: Peer<RoleClient>, fixture: String) {
     )
     .await;
 
-    assert_eq!(result["status"], json!("completed"), "{all_text}");
-    assert_eq!(result["executed"], json!(4), "{all_text}");
+    assert_eq!(result.as_object().unwrap().len(), 2, "{all_text}");
     assert!(result["elapsed_ms"].is_number(), "{all_text}");
     let steps = result["steps"].as_array().expect("four batch steps");
     assert_eq!(steps.len(), 4, "{all_text}");
-    for (index, (step, action)) in steps
-        .iter()
-        .zip([
-            "set_value",
-            "wait_for_element",
-            "click_element",
-            "wait_for_element",
-        ])
-        .enumerate()
-    {
-        assert_eq!(step["index"], json!(index), "{all_text}");
-        assert_eq!(step["status"], json!("completed"), "{all_text}");
-        assert_eq!(step["action"], json!(action), "{all_text}");
+    for step in steps {
+        assert_eq!(step.as_object().unwrap().len(), 2, "{all_text}");
+        assert!(step["result"].is_object(), "{all_text}");
+        assert!(step["content_blocks"].is_array(), "{all_text}");
     }
+    assert_eq!(steps[0]["result"]["id"], json!(name_id), "{all_text}");
+    assert_eq!(steps[1]["result"]["matched"], json!(true), "{all_text}");
+    assert_eq!(steps[3]["result"]["matched"], json!(true), "{all_text}");
     assert_eq!(
         steps[2]["result"]["method"],
         json!("native-action"),

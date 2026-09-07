@@ -116,7 +116,7 @@ glass_do {
     { "action": "type", "text": "hello glass" }
   ]
 }
-// → { "executed": 3 }
+// → ok:true; result.steps contains three ordered results
 ```
 
 The **Text:** field now reads `hello glass`.

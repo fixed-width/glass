@@ -1076,7 +1076,7 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Run one action or fixed static ordered actions: click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element. Maximum 64 actions and 65536 compact argument bytes. timeout_ms defaults to 30000; range 1 through 120000; one deadline includes terminal observations. Fail-fast on action errors, deadline or unmatched batched predicates; standalone predicates remain soft. Inspect completed, failed, unexecuted and terminal_steps before recovery. Preflight invalid_sequence has no step outcomes. Terminal settle/diff/screenshot runs after actions; terminal failure retains completed action outcomes. No branching, bindings, loops, retries or generated steps. Semantic targets resolve fresh; targeted type requires confirmed focus; set_value requires confirmation. Never replay completed or possibly dispatched mutations; observe after uncertainty."
+        description = "Run one action or fixed static ordered actions: click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element. Maximum 64 actions and 65536 compact argument bytes. timeout_ms defaults to 30000; range 1 through 120000; one deadline includes terminal observations. Fail-fast on action errors, deadline or unmatched batched predicates; standalone predicates remain soft. Success without then returns ordered steps with result and content_blocks; ok:true means all actions completed. Failures and then retain completed, failed, unexecuted and terminal_steps; inspect before recovery. Preflight invalid_sequence has no step outcomes. Terminal settle/diff/screenshot runs after actions; terminal failure retains completed action outcomes. No branching, bindings, loops, retries or generated steps. Semantic targets resolve fresh; targeted type requires confirmed focus; set_value requires confirmation. Never replay completed or possibly dispatched mutations; observe after uncertainty."
     )]
     async fn glass_do(
         &self,
@@ -1679,6 +1679,8 @@ mod tests {
             "Fail-fast",
             "action errors, deadline or unmatched batched predicates",
             "standalone predicates remain soft",
+            "ordered steps with result and content_blocks",
+            "ok:true means all",
             "completed, failed, unexecuted and terminal_steps",
             "Preflight invalid_sequence has no step outcomes",
             "Terminal settle/diff/screenshot",
@@ -1706,6 +1708,8 @@ mod tests {
         for instructions in [&full, &lean] {
             for required in [
                 "Batch known work; observe before choosing dependent steps",
+                "ordered steps with result and content_blocks",
+                "ok:true means all",
                 "completed, failed, unexecuted and terminal_steps",
                 "unmatched predicate",
                 "Post-write uncertainty is terminal",

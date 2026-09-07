@@ -50,7 +50,8 @@ pub(crate) const SHARED_INSTRUCTIONS: &str = "Glass drives external native GUI a
     types. Input dispatch does not prove runtime state. Post-write uncertainty is terminal: observe before \
     recovery; never blindly replay an action or completed sequence after possible dispatch.\n\n\
     glass_do runs one action or a fixed known sequence. Batch known work; observe before choosing dependent \
-    steps. Inspect completed, failed, unexecuted and terminal_steps outcomes. Batched wait_for_element and \
+    steps. Success without then returns ordered steps with result and content_blocks; ok:true means all \
+    actions completed. Failures and then retain completed, failed, unexecuted and terminal_steps outcomes. Batched wait_for_element and \
     scroll_to_element fail the sequence on an unmatched predicate; standalone predicates time out softly. \
     A settle step may complete with settled:false; the overall sequence deadline still fails execution.\n\n\
     glass_screenshot provides current visual evidence when semantics are insufficient. Input and region \

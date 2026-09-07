@@ -79,8 +79,7 @@ async fn glass_do_semantic_form_completes_in_one_action_call() {
     )
     .await;
 
-    assert_eq!(call.result["status"], serde_json::json!("completed"));
-    assert_eq!(call.result["executed"], serde_json::json!(6));
+    assert_eq!(call.result.as_object().unwrap().len(), 2);
     assert!(
         call.result["elapsed_ms"].is_number(),
         "glass_do result must include numeric elapsed_ms: {}",
@@ -90,19 +89,14 @@ async fn glass_do_semantic_form_completes_in_one_action_call() {
         .as_array()
         .expect("glass_do result must contain steps");
     assert_eq!(steps.len(), 6, "unexpected glass_do steps: {steps:?}");
-    let expected_actions = [
-        "click_element",
-        "type",
-        "wait_for_element",
-        "set_value",
-        "wait_for_element",
-        "click_element",
-    ];
-    for (index, (step, action)) in steps.iter().zip(expected_actions).enumerate() {
-        assert_eq!(step["index"], serde_json::json!(index));
-        assert_eq!(step["status"], serde_json::json!("completed"));
-        assert_eq!(step["action"], serde_json::json!(action));
+    for step in steps {
+        assert_eq!(step.as_object().unwrap().len(), 2);
+        assert!(step["result"].is_object());
+        assert!(step["content_blocks"].is_array());
     }
+    assert_eq!(steps[2]["result"]["matched"], serde_json::json!(true));
+    assert_eq!(steps[3]["result"]["id"], serde_json::json!(slider_id));
+    assert_eq!(steps[4]["result"]["matched"], serde_json::json!(true));
     assert_eq!(
         steps[0]["result"]["method"],
         serde_json::json!("native-action")
