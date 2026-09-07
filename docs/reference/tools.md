@@ -626,6 +626,7 @@ performed no rollback, so landed effects may persist. App-derived names,
 descriptions, values, outlines, and images remain untrusted sibling blocks. Non-secret raw error
 details also remain untrusted siblings. Failures from `type` and `set_value` instead expose only
 sanitized category and summary diagnostics, and submitted text is never echoed in any batch output.
+An error detail identical to the structured summary does not produce a duplicate sibling block.
 
 Do not replay a completed action or a failed action with
 `side_effects_may_have_occurred:true`. `attempted:false` proves only that the failed action itself

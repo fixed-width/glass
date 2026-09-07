@@ -330,10 +330,11 @@ fn step_failure(
         _ => &error.message,
     };
     let content_start = siblings.len() + 1;
-    let content_count = error.siblings.len() + 1;
     siblings.append(&mut error.siblings);
-    siblings.push(OutContent::untrusted_observation(detail));
-    let content_blocks = (content_start..content_start + content_count).collect();
+    if detail != error.safe_summary {
+        siblings.push(OutContent::untrusted_observation(detail));
+    }
+    let content_blocks = (content_start..siblings.len() + 1).collect();
     steps.push(StepOutcome::Failed {
         index,
         action: action.kind(),

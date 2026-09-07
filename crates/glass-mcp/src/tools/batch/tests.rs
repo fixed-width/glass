@@ -719,6 +719,11 @@ fn type_secret_failure_preserves_no_active_session_without_echoing_input() {
         envelope(&error)["outcome"]["steps"][0]["error"]["category"],
         "no_active_session"
     );
+    assert_eq!(
+        envelope(&error)["outcome"]["steps"][0]["content_blocks"],
+        json!([])
+    );
+    assert_eq!(error.0.len(), 1);
     assert_secret_absent(&error, secret);
 }
 
@@ -2797,7 +2802,7 @@ fn sequence_deadline_after_focus_prevents_type_and_marks_side_effects_possible()
     assert_eq!(step["side_effects_may_have_occurred"], true);
     assert_eq!(step["result"]["dispatch"], "not_dispatched");
     assert_eq!(step["result"]["focus"]["dispatch"], "dispatched");
-    assert_eq!(step["content_blocks"], json!([1, 2]));
+    assert_eq!(step["content_blocks"], json!([1]));
     assert_eq!(*events.lock().unwrap(), vec!["focus"]);
     assert!(!output_text(&error).contains("secret"));
 }
@@ -2831,8 +2836,8 @@ fn semantic_failure_keeps_resolution_actionability_dispatch_and_content_blocks()
     assert!(step["result"]["resolution"].is_object());
     assert!(step["result"]["actionability"].is_array());
     assert_eq!(step["result"]["dispatch"], "not_dispatched");
-    assert_eq!(step["content_blocks"], json!([1, 2]));
-    assert_eq!(error.0.len(), 3);
+    assert_eq!(step["content_blocks"], json!([1]));
+    assert_eq!(error.0.len(), 2);
     assert!(output_text(&error).contains("Save"));
     assert!(events.lock().unwrap().is_empty());
 }
