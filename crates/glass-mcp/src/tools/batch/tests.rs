@@ -719,6 +719,11 @@ fn type_secret_failure_preserves_no_active_session_without_echoing_input() {
         envelope(&error)["outcome"]["steps"][0]["error"]["category"],
         "no_active_session"
     );
+    assert_eq!(
+        envelope(&error)["outcome"]["steps"][0]["content_blocks"],
+        json!([])
+    );
+    assert_eq!(error.0.len(), 1);
     assert_secret_absent(&error, secret);
 }
 
@@ -2031,7 +2036,7 @@ fn click(x: i32, y: i32) -> Action {
 }
 
 #[test]
-fn success_retains_existing_fields_and_adds_every_step_result() {
+fn success_without_then_omits_bookkeeping_and_retains_every_step_result() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
     let out = do_actions(
@@ -2062,8 +2067,7 @@ fn success_retains_existing_fields_and_adds_every_step_result() {
         vec!["click(10,20)", "type(alice)", "key(Tab)"]
     );
     let result = assert_envelope(&out, "glass_do");
-    assert_eq!(result["status"], "completed");
-    assert_eq!(result["executed"], json!(3));
+    assert_eq!(result.as_object().unwrap().len(), 2);
     assert!(result["elapsed_ms"].is_u64());
     assert!(result.get("then").is_none());
     assert!(result.get("terminal_steps").is_none());
@@ -2071,15 +2075,15 @@ fn success_retains_existing_fields_and_adds_every_step_result() {
     assert_eq!(
         result["steps"],
         json!([
-            {"status":"completed","index":0,"action":"click","result":{},"content_blocks":[]},
-            {"status":"completed","index":1,"action":"type","result":{},"content_blocks":[]},
-            {"status":"completed","index":2,"action":"key","result":{},"content_blocks":[]},
+            {"result":{},"content_blocks":[]},
+            {"result":{},"content_blocks":[]},
+            {"result":{},"content_blocks":[]},
         ])
     );
 }
 
 #[test]
-fn type_return_snapshot_is_retained_in_content_blocks() {
+fn successful_steps_keep_observations_in_response_order() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let frame = Frame::solid(100, 100, [0, 0, 0, 255]);
     let mut g = started_a11y(
@@ -2090,25 +2094,43 @@ fn type_return_snapshot_is_retained_in_content_blocks() {
     let out = do_actions(
         &mut g,
         &DoArgs {
-            actions: vec![Action::Type(TypeArgs {
-                target: None,
-                focus_mode: None,
-                timeout_ms: None,
-                max_nodes: None,
-                text: "hi".into(),
-                return_: Some("snapshot".into()),
-            })],
+            actions: vec![
+                Action::Type(TypeArgs {
+                    target: None,
+                    focus_mode: None,
+                    timeout_ms: None,
+                    max_nodes: None,
+                    text: "hi".into(),
+                    return_: Some("snapshot".into()),
+                }),
+                Action::Key(KeyArgs {
+                    chord: "Tab".into(),
+                }),
+                parsed_action(r#"{"action":"wait_for_element","name":"Save","timeout_ms":0}"#),
+            ],
             then: None,
             timeout_ms: None,
             encoded_argument_bytes: 0,
         },
     )
     .unwrap();
-    assert_eq!(*log.lock().unwrap(), vec!["type(hi)"]);
+    assert_eq!(*log.lock().unwrap(), vec!["type(hi)", "key(Tab)"]);
     let result = assert_envelope(&out, "glass_do");
-    assert_eq!(result["executed"], json!(1));
+    assert_eq!(result["steps"].as_array().unwrap().len(), 3);
+    assert_eq!(result["steps"][1], json!({"result":{},"content_blocks":[]}));
+    assert_eq!(result["steps"][2]["result"]["matched"], true);
+    assert_eq!(result["steps"][2]["content_blocks"], json!([2]));
     assert_eq!(result["steps"][0]["content_blocks"], json!([1]));
-    assert_eq!(out.0.len(), 2, "snapshot outline is retained as a sibling");
+    assert_eq!(
+        out.0.len(),
+        3,
+        "snapshot and matched node are retained as siblings"
+    );
+    let OutContent::Text(matched) = &out.0[2] else {
+        panic!("matched node sibling must be text");
+    };
+    assert!(matched.as_str().contains("untrusted content"));
+    assert!(matched.as_str().contains("Save"));
     let OutContent::Text(snapshot) = &out.0[1] else {
         panic!("snapshot sibling must be text");
     };
@@ -2143,7 +2165,7 @@ fn type_action_with_return_none_is_allowed() {
     .unwrap();
     assert_eq!(*log.lock().unwrap(), vec!["type(hi)"]);
     let result = assert_envelope(&out, "glass_do");
-    assert_eq!(result["executed"], json!(1));
+    assert_eq!(result["steps"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -2178,6 +2200,10 @@ fn action_failure_is_structured_and_lists_unexecuted_steps() {
     );
     assert!(!err.contains("coordinate (100,10)"));
     assert_eq!(error["outcome"]["executed"], 1);
+    assert_eq!(
+        error["outcome"]["steps"][0],
+        json!({"status":"completed","index":0,"action":"click","result":{},"content_blocks":[]})
+    );
     assert_eq!(error["outcome"]["steps"][2]["status"], "unexecuted");
     assert_eq!(
         *log.lock().unwrap(),
@@ -2641,10 +2667,7 @@ fn semantic_actions_delegate_and_retain_standalone_results() {
     .unwrap();
     assert_eq!(*log.lock().unwrap(), vec!["click(20,20)"]);
     let result = assert_envelope(&out, "glass_do");
-    assert_eq!(result["steps"][0]["action"], "click_element");
-    assert_eq!(result["steps"][1]["action"], "set_value");
-    assert_eq!(result["steps"][2]["action"], "wait_for_element");
-    assert_eq!(result["steps"][3]["action"], "scroll_to_element");
+    assert_eq!(result["steps"].as_array().unwrap().len(), 4);
     assert_eq!(
         result["steps"][0]["result"]
             .as_object()
@@ -2708,7 +2731,13 @@ fn semantic_step_selector_resolves_at_execution_time() {
     )
     .unwrap();
 
-    assert_eq!(assert_envelope(&output, "glass_do")["executed"], 2);
+    assert_eq!(
+        assert_envelope(&output, "glass_do")["steps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert!(changed.load(Ordering::SeqCst));
     assert_eq!(*events.lock().unwrap(), vec!["click(1,1)", "click_element"]);
     assert_eq!(
@@ -2733,7 +2762,13 @@ fn semantic_step_timeout_is_bounded_by_the_earlier_sequence_deadline() {
     )
     .unwrap();
 
-    assert_eq!(assert_envelope(&output, "glass_do")["executed"], 1);
+    assert_eq!(
+        assert_envelope(&output, "glass_do")["steps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let deadline = accessibility_deadlines.lock().unwrap()[0];
     let remaining = deadline.remaining().unwrap();
     assert!(remaining <= Duration::from_millis(100));
@@ -2755,7 +2790,13 @@ fn semantic_step_uses_its_ten_second_default_inside_a_longer_sequence() {
     )
     .unwrap();
 
-    assert_eq!(assert_envelope(&output, "glass_do")["executed"], 1);
+    assert_eq!(
+        assert_envelope(&output, "glass_do")["steps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let deadline = accessibility_deadlines.lock().unwrap()[0];
     let remaining = deadline.remaining().unwrap();
     assert!(remaining <= Duration::from_secs(10));
@@ -2797,7 +2838,7 @@ fn sequence_deadline_after_focus_prevents_type_and_marks_side_effects_possible()
     assert_eq!(step["side_effects_may_have_occurred"], true);
     assert_eq!(step["result"]["dispatch"], "not_dispatched");
     assert_eq!(step["result"]["focus"]["dispatch"], "dispatched");
-    assert_eq!(step["content_blocks"], json!([1, 2]));
+    assert_eq!(step["content_blocks"], json!([1]));
     assert_eq!(*events.lock().unwrap(), vec!["focus"]);
     assert!(!output_text(&error).contains("secret"));
 }
@@ -2831,8 +2872,8 @@ fn semantic_failure_keeps_resolution_actionability_dispatch_and_content_blocks()
     assert!(step["result"]["resolution"].is_object());
     assert!(step["result"]["actionability"].is_array());
     assert_eq!(step["result"]["dispatch"], "not_dispatched");
-    assert_eq!(step["content_blocks"], json!([1, 2]));
-    assert_eq!(error.0.len(), 3);
+    assert_eq!(step["content_blocks"], json!([1]));
+    assert_eq!(error.0.len(), 2);
     assert!(output_text(&error).contains("Save"));
     assert!(events.lock().unwrap().is_empty());
 }
@@ -4215,7 +4256,13 @@ fn invalid_sequence_accepts_exact_action_limit() {
         },
     )
     .unwrap();
-    assert_eq!(assert_envelope(&out, "glass_do")["executed"], MAX_ACTIONS);
+    assert_eq!(
+        assert_envelope(&out, "glass_do")["steps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        MAX_ACTIONS
+    );
 }
 
 #[test]
@@ -4233,7 +4280,7 @@ fn exactly_maximum_sequence_timeout_is_accepted() {
     .unwrap();
     let maximum_result = assert_envelope(&output, "glass_do");
 
-    assert_eq!(maximum_result["status"], "completed");
+    assert_eq!(maximum_result["steps"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -4249,7 +4296,13 @@ fn omitted_sequence_timeout_records_about_thirty_seconds() {
         },
     )
     .unwrap();
-    assert_eq!(assert_envelope(&output, "glass_do")["status"], "completed");
+    assert_eq!(
+        assert_envelope(&output, "glass_do")["steps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let default_remaining = deadlines.lock().unwrap()[0]
         .remaining()
         .expect("the omitted sequence timeout must still be bounded");

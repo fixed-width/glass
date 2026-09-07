@@ -215,8 +215,8 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
         }
     }
 
-    let mut result = json!({ "status": "completed", "executed": n, "steps": steps });
-    if let Some(then) = &a.then {
+    let mut result = if let Some(then) = &a.then {
+        let mut result = json!({ "status": "completed", "executed": n, "steps": steps });
         match run_then(glass, then, context, siblings.len() + 1) {
             Ok(mut terminal) => {
                 result["then"] = terminal.meta;
@@ -250,7 +250,21 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
                 ));
             }
         }
-    }
+        result
+    } else {
+        let steps: Vec<_> = steps
+            .into_iter()
+            .map(|step| match step {
+                StepOutcome::Completed {
+                    result,
+                    content_blocks,
+                    ..
+                } => json!({ "result": result, "content_blocks": content_blocks }),
+                _ => unreachable!("successful sequence contains only completed steps"),
+            })
+            .collect();
+        json!({ "steps": steps })
+    };
     result["elapsed_ms"] = json!(started.elapsed().as_millis());
     Ok(ToolOutput::result_with("glass_do", result, siblings))
 }
@@ -330,10 +344,11 @@ fn step_failure(
         _ => &error.message,
     };
     let content_start = siblings.len() + 1;
-    let content_count = error.siblings.len() + 1;
     siblings.append(&mut error.siblings);
-    siblings.push(OutContent::untrusted_observation(detail));
-    let content_blocks = (content_start..content_start + content_count).collect();
+    if detail != error.safe_summary {
+        siblings.push(OutContent::untrusted_observation(detail));
+    }
+    let content_blocks = (content_start..siblings.len() + 1).collect();
     steps.push(StepOutcome::Failed {
         index,
         action: action.kind(),

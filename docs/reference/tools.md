@@ -614,11 +614,19 @@ Once execution starts, the sequence is fail-fast. In a batch, `wait_for_element`
 `scroll_to_element` returning
 `matched:false` fails the sequence; the standalone tools keep their soft `{matched:false}` result.
 
-On success, `result` contains `{status, executed, steps, elapsed_ms, then?, terminal_steps?}`.
-`steps` records each action's index, discriminator, `completed` status, trusted result, and any
-zero-based references into the MCP content blocks.
+On success without `then`, `result` contains `{steps, elapsed_ms}`. Each ordered step contains
+`{result, content_blocks}`: its trusted result and zero-based references into the MCP content
+blocks. `ok:true` means all requested actions completed; array position identifies the action in
+the request. The completed count is `steps.length`. The redundant outer `status` and `executed`
+and per-step `index`, `action`, and `status` fields are omitted.
 
-Failed execution remains an MCP error with `is_error:true`. `executed` counts only successfully
+Success with `then` retains `{status, executed, steps, elapsed_ms, then, terminal_steps}`.
+Its action steps retain `index`, `action`, and `status:"completed"` alongside `result` and
+`content_blocks`. Earlier versions also used this detailed action shape for success without
+`then`; clients reading both versions can use the ordered step results in either format.
+
+Failed execution remains an MCP error with `is_error:true`. Its `outcome` retains `status`,
+`executed`, and each step's `index`, `action`, and `status`. `executed` counts only successfully
 completed actions. The failed step records `attempted`, `side_effects_may_have_occurred`,
 optional `result?` evidence produced before the failure, `error.{code,summary,category?}`, and
 `content_blocks`; later steps use `status:"unexecuted"`. `effects_rolled_back:false` means Glass
@@ -626,6 +634,7 @@ performed no rollback, so landed effects may persist. App-derived names,
 descriptions, values, outlines, and images remain untrusted sibling blocks. Non-secret raw error
 details also remain untrusted siblings. Failures from `type` and `set_value` instead expose only
 sanitized category and summary diagnostics, and submitted text is never echoed in any batch output.
+An error detail identical to the structured summary does not produce a duplicate sibling block.
 
 Do not replay a completed action or a failed action with
 `side_effects_may_have_occurred:true`. `attempted:false` proves only that the failed action itself
