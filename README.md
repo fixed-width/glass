@@ -48,9 +48,8 @@ finish. (`glass-mcp doctor` checks your environment if anything's off.)
 
 ## The loop in practice
 
-Point an agent at a GUI app and it runs the whole cycle itself. When the app exposes an accessibility
-tree, the agent resolves each intended unique widget immediately before acting and confirms each step
-from text, with no per-step screenshot or carried element id:
+An agent can fill in a form, click Save, and check that the app reports success. When the app exposes
+an accessibility tree, the agent works with named controls and verifies changes from text:
 
 ```jsonc
 glass_start { "run": ["python3", "app.py"] }
@@ -67,33 +66,13 @@ glass_logs
 ```
 
 Use `glass_find_elements` to inspect candidates when the intended target is not unique or known well
-enough to act on directly. Use `glass_a11y_snapshot` for broad structural diagnosis.
+enough to act on directly. Use `glass_a11y_snapshot` to explore the app's controls. See the
+[tool reference](docs/reference/tools.md#glass_click_element) for click modes and platform behavior.
 
 For a canvas or custom-rendered app with no accessibility tree, drive it by pixels instead —
 `glass_screenshot`, `glass_click {x,y}`, and `glass_diff`, which returns `changed_pct` + a `bbox` as
 text, so routine checks between screenshots cost no vision tokens. Why the loop is shaped this way:
 [the build → see → interact → debug loop](docs/explanation/the-loop.md).
-
-`glass_click_element` tries the platform's native accessibility action first — AT-SPI `Action` on
-Linux, UI Automation patterns on Windows, `AXPress` on macOS, and `ACTION_CLICK` on Android when
-the optional on-device accessibility companion is installed — which actuates elements that are
-occluded or scrolled off-screen and, on macOS, without moving the cursor. Not every control
-exposes one (some toolkit checkbuttons expose no action even on a backend that otherwise
-supports it), so the click falls back to a synthetic pointer click at the element's center when
-it doesn't. Where a control's label is a separate element from the control itself, as in Jetpack
-Compose, Android resolves to the enclosing control that would have handled the tap. iOS and
-Android's companion-free `uiautomator` reader always use the pointer path. The result's `method`
-field (`native-action`/`pointer`) says which path actually ran for that click, with
-`native_fallback` explaining why when it fell back — the source of truth per click, not the
-backend alone — and `actuated_id` naming the element actually clicked when it isn't the one you
-named. On the backends that attempt it, the native path re-checks the element against
-the live tree, so a click whose element no longer matches errors instead of clicking stale
-coordinates; the pointer-only paths have no such live check.
-
-Selector clicks resolve uniquely and disclose which checks were passed, failed, or unavailable.
-Forced pointer mode waits for stable in-window bounds and refuses a target known to be disabled,
-hidden, moving, off-window, or occluded. Native accessibility actions can legitimately actuate a
-covered or off-screen control, so geometry and occlusion are optional disclosures on that path.
 
 To review a run after the app stops, opt into [session evidence recording](docs/how-to/record-session-evidence.md)
 with `--trace-dir`. Glass retains tool inputs and requested results in bounded storage, then
