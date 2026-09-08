@@ -36,6 +36,9 @@ const LEAN_TOOLS: &[&str] = &[
 
 pub(crate) const SHARED_INSTRUCTIONS: &str = "Glass drives external native GUI apps. One active session: \
     glass_start launches and captures logs; glass_stop ends it. Check glass_capabilities for runtime support.\n\n\
+    Prefer glass_do whenever at least two upcoming actions or verification waits are already known. \
+    Example: write a known field, click Apply, then wait for the expected state, each with its own selector. \
+    Batch known work; observe before choosing dependent steps.\n\n\
     Use semantic targets first: give a unique intended target directly to an action. Use glass_find_elements \
     for approximate or duplicate candidates, glass_a11y_snapshot for broad structure. A target is a \
     case-insensitive substring query over name, description and non-secure value, with optional role and \
@@ -49,8 +52,8 @@ pub(crate) const SHARED_INSTRUCTIONS: &str = "Glass drives external native GUI a
     requires backend confirmation; targeted type confirms focus then types once. Unconfirmed focus never \
     types. Input dispatch does not prove runtime state. Post-write uncertainty is terminal: observe before \
     recovery; never blindly replay an action or completed sequence after possible dispatch.\n\n\
-    glass_do runs one action or a fixed known sequence. Batch known work; observe before choosing dependent \
-    steps. Success without then returns ordered steps with result and content_blocks; ok:true means all \
+    glass_do runs one action or a fixed known sequence. Success without then returns ordered steps with \
+    result and content_blocks; ok:true means all \
     actions completed. Failures and then retain completed, failed, unexecuted and terminal_steps outcomes. Batched wait_for_element and \
     scroll_to_element fail the sequence on an unmatched predicate; standalone predicates time out softly. \
     A settle step may complete with settled:false; the overall sequence deadline still fails execution.\n\n\
@@ -76,9 +79,8 @@ impl ToolProfile {
     pub(crate) fn instructions(self) -> String {
         let routing = match self {
             Self::Full => {
-                "Profile: full. All tools are available. Prefer glass_do whenever at least two \
-                upcoming actions or verification waits are already known. Standalone action tools support \
-                steps chosen after observing new state."
+                "Profile: full. All tools are available. Standalone action tools support steps chosen \
+                after observing new state."
             }
             Self::Lean => {
                 "Profile: lean. Use glass_do even for a single action: for example \
