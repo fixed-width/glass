@@ -529,6 +529,8 @@ fn set_value_tool_ok_and_errors() {
     .unwrap_err();
     let err = structured_error(&err, "glass_set_value");
     assert_eq!(err["error"]["code"], "stale_element");
+    assert_eq!(err["result"]["dispatch"], "not_dispatched");
+    assert_eq!(err["result"]["side_effects_may_have_occurred"], false);
 }
 
 #[test]
@@ -744,6 +746,12 @@ fn click_element_tool_ok_and_errors() {
     .unwrap_err();
     let err = structured_error(&err, "glass_click_element");
     assert_eq!(err["error"]["code"], "stale_element");
+    assert_eq!(err["result"]["dispatch"], "not_dispatched");
+    assert_eq!(err["result"]["side_effects_may_have_occurred"], false);
+    let summary = err["error"]["summary"].as_str().unwrap();
+    assert!(summary.contains("not dispatched"), "{summary}");
+    assert!(summary.contains("fresh glass_a11y_snapshot"), "{summary}");
+    assert!(summary.contains("current ID"), "{summary}");
 }
 
 #[test]

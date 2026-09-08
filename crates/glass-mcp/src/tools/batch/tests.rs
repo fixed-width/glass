@@ -2921,6 +2921,59 @@ fn standalone_and_batch_semantic_click_results_match_except_for_sequence_fields(
 }
 
 #[test]
+fn stale_id_failure_keeps_completed_batch_steps_and_stops_remaining_actions() {
+    for set_value in [false, true] {
+        let platform = FakePlatform::new(100, 100);
+        let events = platform.events.clone();
+        let mut glass = started_a11y(platform);
+        let stale = if set_value {
+            Action::SetValue(SetValueArgs {
+                id: Some(99),
+                target: None,
+                timeout_ms: None,
+                max_nodes: None,
+                text: "private input".into(),
+                return_: None,
+            })
+        } else {
+            Action::ClickElement(ClickElementArgs {
+                id: Some(99),
+                target: None,
+                mode: None,
+                timeout_ms: None,
+                max_nodes: None,
+                return_: None,
+            })
+        };
+        let output = do_actions(
+            &mut glass,
+            &do_args(
+                vec![
+                    Action::Key(KeyArgs {
+                        chord: "Tab".into(),
+                    }),
+                    stale,
+                    Action::Key(KeyArgs {
+                        chord: "Return".into(),
+                    }),
+                ],
+                1_000,
+            ),
+        )
+        .unwrap_err();
+        let envelope = envelope(&output);
+        let steps = &envelope["outcome"]["steps"];
+        assert_eq!(steps[0]["status"], "completed");
+        assert_eq!(steps[1]["error"]["code"], "stale_element");
+        assert_eq!(steps[1]["attempted"], false);
+        assert_eq!(steps[1]["side_effects_may_have_occurred"], false);
+        assert_eq!(steps[2]["status"], "unexecuted");
+        assert_eq!(*events.lock().unwrap(), vec!["key(Tab)"]);
+        assert_secret_absent(&output, "private input");
+    }
+}
+
+#[test]
 fn click_element_stale_target_stops_with_structured_detail() {
     let mut g = started_a11y(FakePlatform::new(100, 100));
     let err = error_text(
@@ -2951,8 +3004,8 @@ fn click_element_stale_target_stops_with_structured_detail() {
     let step = &error["outcome"]["steps"][0];
     assert_eq!(error["error"]["code"], "stale_element");
     assert_eq!(step["action"], "click_element");
-    assert_eq!(step["attempted"], true);
-    assert_eq!(step["side_effects_may_have_occurred"], true);
+    assert_eq!(step["attempted"], false);
+    assert_eq!(step["side_effects_may_have_occurred"], false);
     assert!(step.get("result").is_none());
     assert_eq!(error["outcome"]["steps"][1]["status"], "unexecuted");
 }

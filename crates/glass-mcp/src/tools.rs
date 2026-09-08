@@ -174,6 +174,18 @@ impl SafeErrorCategory {
         }
     }
 
+    fn summary_for_dispatch(self, dispatch: Option<BoundDispatch>) -> &'static str {
+        match (self, dispatch) {
+            (Self::StaleElement, Some(BoundDispatch::NotDispatched)) => {
+                "element is stale or missing; this action was not dispatched. Take a fresh glass_a11y_snapshot and retry with the current ID or a semantic target"
+            }
+            (Self::StaleElement, _) => {
+                "element is stale or missing; this action may already have happened. Inspect current state before retrying; do not replay completed actions"
+            }
+            _ => self.summary(),
+        }
+    }
+
     fn post_write_summary(self) -> &'static str {
         match self {
             Self::TransportFailure => {
@@ -232,7 +244,7 @@ impl ContextualError {
             safe_summary: if post_write {
                 category.post_write_summary()
             } else {
-                category.summary()
+                category.summary_for_dispatch(bound_dispatch)
             },
             sequence_deadline_exceeded: error.bound_owner() == Some(glass_core::Whose::Caller),
             bound_dispatch,
@@ -279,7 +291,16 @@ impl ContextualError {
     }
 
     pub fn after_dispatch(mut self) -> Self {
+        let message_was_summary = self.message == self.safe_summary;
         self.bound_dispatch = Some(BoundDispatch::MayHaveDispatched);
+        self.safe_summary = if self.post_write {
+            self.category.post_write_summary()
+        } else {
+            self.category.summary_for_dispatch(self.bound_dispatch)
+        };
+        if message_was_summary {
+            self.message = self.safe_summary.into();
+        }
         self
     }
 
@@ -844,14 +865,7 @@ pub(crate) fn click_element_with(
             if semantic {
                 semantic_action::semantic_error("glass_click_element", error)
             } else {
-                let message = error.to_string();
-                match error.source {
-                    Some(source) => ContextualError::from_caller_bound(source, context),
-                    None => ContextualError::from_caller_bound(
-                        glass_core::GlassError::Backend(message),
-                        context,
-                    ),
-                }
+                semantic_action::id_error(error, context)
             }
         })?;
     let action_context = ToolContext {
@@ -926,17 +940,7 @@ pub(crate) fn set_value_with(
             if semantic {
                 semantic_action::semantic_error("glass_set_value", error)
             } else {
-                let message = error.to_string();
-                match error.source {
-                    Some(source) => {
-                        ContextualError::from_caller_bound(source, context).scrub_message()
-                    }
-                    None => ContextualError::from_caller_bound(
-                        glass_core::GlassError::Backend(message),
-                        context,
-                    )
-                    .scrub_message(),
-                }
+                semantic_action::id_error(error, context).scrub_message()
             }
         })?;
     let action_context = ToolContext {

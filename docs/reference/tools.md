@@ -827,6 +827,12 @@ follow as siblings (the legend untrusted-wrapped), per the image ordering above.
 substring over accessible name, description, and non-secure value, `role` uses Glass's normalized
 roles, and every supplied field and state is AND-combined. Secure values are never searched.
 
+An ID missing from the current snapshot returns `stale_element` with `dispatch:"not_dispatched"`.
+Take a fresh `glass_a11y_snapshot` and retry with the current ID or a semantic target. In `glass_do`,
+that failed step is unattempted and later steps are unexecuted; earlier completed steps remain
+completed. A stale-element failure after possible dispatch instead requires inspecting the current
+state before retrying, including when the action succeeded but its return observation failed.
+
 A selector action performs fresh reads until exactly one target exists in exactly one optional
 scope. It refuses zero matches as `no_match`, duplicate targets as `ambiguous_target`, duplicate
 scopes as `ambiguous_scope`, and a truncated, unreadable, or withheld tree as `incomplete_tree` when

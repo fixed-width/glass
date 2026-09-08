@@ -67,6 +67,9 @@ do, most of which run from any host.
   named feature branch for the issue or task.
 - If work began on `master`, move the changes to a feature branch before committing. Do not advance
   local `master` with task commits.
+- Include a user-facing `CHANGELOG.md` entry under `[Unreleased]` in the same PR as each behavior
+  change, as required by [the stability policy](docs/reference/stability.md). Reuse the existing
+  Added, Changed, or Fixed heading; omit internal refactors, CI, and test-only changes.
 
 ## Invariants
 

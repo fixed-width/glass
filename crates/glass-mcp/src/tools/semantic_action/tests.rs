@@ -1314,12 +1314,95 @@ fn semantic_set_value_uncertainty_requires_observation_before_keyboard_recovery(
 }
 
 #[test]
+fn id_error_preserves_action_focus_and_source_dispatch_evidence() {
+    for (action_dispatch, focus_dispatch, source, expected) in [
+        (
+            DispatchStatus::NotDispatched,
+            None,
+            GlassError::NoAxSnapshot,
+            BoundDispatch::NotDispatched,
+        ),
+        (
+            DispatchStatus::NotDispatched,
+            None,
+            GlassError::AxElementNotFound(99),
+            BoundDispatch::NotDispatched,
+        ),
+        (
+            DispatchStatus::MayHaveDispatched,
+            None,
+            GlassError::AxElementChanged(4),
+            BoundDispatch::MayHaveDispatched,
+        ),
+        (
+            DispatchStatus::NotDispatched,
+            Some(DispatchStatus::Dispatched),
+            GlassError::AxElementGone(4),
+            BoundDispatch::MayHaveDispatched,
+        ),
+        (
+            DispatchStatus::NotDispatched,
+            None,
+            GlassError::AxElementChanged(4).after_dispatch(),
+            BoundDispatch::MayHaveDispatched,
+        ),
+    ] {
+        let mut failure =
+            semantic_failure(SemanticActionFailureKind::ActionFailed, None, None, vec![]);
+        failure.action_dispatch = action_dispatch;
+        failure.focus = focus_dispatch.map(|dispatch| MutationReport {
+            method: ActionMethod::NativeAction { actuated: None },
+            dispatch,
+            confirmation: ConfirmationStatus::Unconfirmed,
+        });
+        failure.source = Some(source);
+        let contextual = super::id_error(failure, ToolContext::UNBOUNDED);
+        assert_eq!(contextual.bound_dispatch, Some(expected));
+        let summary = contextual.safe_summary;
+        if expected == BoundDispatch::NotDispatched {
+            assert!(
+                summary.contains("not dispatched") && summary.contains("current ID"),
+                "{summary}"
+            );
+        } else {
+            assert!(
+                summary.contains("Inspect current state before retrying"),
+                "{summary}"
+            );
+            assert!(!summary.contains("not dispatched"), "{summary}");
+        }
+    }
+}
+
+#[test]
+fn stale_return_observation_after_dispatch_does_not_claim_the_action_was_refused() {
+    let contextual = ContextualError::from_core(
+        GlassError::NoAxSnapshot.before_dispatch(),
+        ToolContext::UNBOUNDED,
+    )
+    .scrub_message()
+    .after_dispatch();
+    assert_eq!(
+        contextual.bound_dispatch,
+        Some(BoundDispatch::MayHaveDispatched)
+    );
+    assert!(
+        contextual
+            .safe_summary
+            .contains("Inspect current state before retrying")
+    );
+    assert!(!contextual.message.contains("not dispatched"));
+}
+
+#[test]
 fn structured_backend_stale_and_deadline_errors_do_not_format_backend_source() {
     let mut stale = semantic_failure(SemanticActionFailureKind::ActionFailed, None, None, vec![]);
     stale.source = Some(GlassError::AxElementChanged(4));
     let stale = semantic_error("glass_click_element", stale);
     assert_eq!(stale.code, "stale_element");
     assert_eq!(stale.category, SafeErrorCategory::StaleElement);
+    assert!(stale.safe_summary.contains("not dispatched"));
+    assert!(stale.safe_summary.contains("fresh glass_a11y_snapshot"));
 
     for (kind, owner, code) in [
         (
