@@ -239,6 +239,18 @@ Choose the strongest check for the claim: exact text uses `glass_wait_for_elemen
 `description` and/or `role` plus `value`; dialog dismissal uses `condition:"disappears"`;
 canvas change uses `glass_wait_for_region`; animation completion uses `glass_wait_stable`.
 
+Inspect images already returned by a diff, region wait, settle or batch before requesting another
+screenshot. Reuse an image when it shows the detail and context needed for the claim and the app
+has not changed since capture. Capture again when the image is absent, too tightly cropped or
+downscaled to judge, when surrounding context matters, or when newer state is needed. Choose a
+region or full window according to the missing evidence.
+
+For example, save a blank-canvas baseline before drawing, then use `glass_diff` with
+`include_image:true`. Change statistics establish a pixel difference; inspect the returned current
+crop to verify the stroke's color and shape. If that crop adequately shows the requested red
+diagonal stroke, it supplies the visual proof without an additional full-window screenshot.
+Statistics alone do not prove color or design, and a crop cannot establish facts outside its bounds.
+
 ### `glass_screenshot`
 
 Capture current visual evidence from the app window, or an optional sub-rectangle, as a lossless

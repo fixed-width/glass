@@ -564,7 +564,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Capture current visual evidence as lossless WebP, not semantic state or transition completion. Off-display captures are clipped: returned dimensions disclose the actual size; fully off-screen surfaces error. Optional window_id observes without switching the active window."
+        description = "Capture current visual evidence as lossless WebP, not semantic state or transition completion. Reuse returned images unless detail/context is missing or state changed. Off-display clips (size reported); fully off-screen errors. window_id observes without switching."
     )]
     async fn glass_screenshot(
         &self,
@@ -795,7 +795,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Compare current pixels with a named baseline; returns change stats and bbox. A single comparison does not establish transition completion or quiescence. Use glass_wait_for_region to wait; include_image:true returns the changed crop only when pixels differ."
+        description = "Compare current pixels with a named baseline: change stats and bbox, not transition completion or quiescence (use glass_wait_for_region to wait). include_image:true returns a changed crop only if pixels differ; inspect it for color/design before recapturing."
     )]
     async fn glass_diff(
         &self,
