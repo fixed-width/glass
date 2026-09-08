@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::params::{Action, ActionModeArg, ClickElementArgs, SetValueArgs, TypeArgs};
 use crate::tools::find::semantic_target;
 use crate::tools::{
-    ContextualError, OutContent, SafeErrorCategory, ToolOutput, validate_return,
+    ContextualError, OutContent, SafeErrorCategory, ToolContext, ToolOutput, validate_return,
     validate_settle_args,
 };
 
@@ -440,6 +440,23 @@ fn failure_result(error: &SemanticActionError) -> Value {
     result
 }
 
+pub(crate) fn id_error(
+    error: impl Into<Box<SemanticActionError>>,
+    context: ToolContext,
+) -> ContextualError {
+    let error = error.into();
+    let may_have_dispatched = error.side_effects_may_have_occurred();
+    let message = error.to_string();
+    let source = error.source.unwrap_or(GlassError::Backend(message));
+    // The action layer knows whether it reached dispatch; retain stronger source evidence too.
+    let source = if may_have_dispatched || source.set_value_failed_after_writing() {
+        source.after_dispatch()
+    } else {
+        source.before_dispatch()
+    };
+    ContextualError::from_caller_bound(source, context)
+}
+
 pub(crate) fn semantic_error(
     tool: &'static str,
     error: impl Into<Box<SemanticActionError>>,
@@ -450,10 +467,15 @@ pub(crate) fn semantic_error(
         .source
         .as_ref()
         .is_some_and(GlassError::set_value_failed_after_writing);
+    let bound_dispatch = if error.side_effects_may_have_occurred() {
+        glass_core::BoundDispatch::MayHaveDispatched
+    } else {
+        glass_core::BoundDispatch::NotDispatched
+    };
     let safe_summary = if post_write {
         category.post_write_summary()
     } else {
-        category.summary()
+        category.summary_for_dispatch(Some(bound_dispatch))
     };
     let include_text = tool != "glass_type";
     let mut siblings = Vec::new();
@@ -466,11 +488,6 @@ pub(crate) fn semantic_error(
             &json!({ "target": element_json(target, include_text) }).to_string(),
         ));
     }
-    let bound_dispatch = if error.side_effects_may_have_occurred() {
-        glass_core::BoundDispatch::MayHaveDispatched
-    } else {
-        glass_core::BoundDispatch::NotDispatched
-    };
     ContextualError {
         code: category.code(),
         message: safe_summary.into(),
