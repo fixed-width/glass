@@ -315,40 +315,44 @@ async fn set_value_async(
     let path = node.inner().path().to_owned();
     // Numeric/range widgets go through Value only (see `writes_value_only`): a GtkSpinButton
     // also exposes EditableText, but writing its entry buffer doesn't commit to the adjustment.
-    // Text widgets prefer EditableText, falling back to Value for anything numeric that lacks it.
-    // The builder `.ok()` chaining mirrors the working ComponentProxy build in `extents`.
+    // Text widgets require EditableText; an editable state alone does not promise that interface.
     if writes_editable_text(role) {
-        let editable = atspi::proxy::editable_text::EditableTextProxy::builder(&conn)
-            .destination(dest.clone())
-            .ok()
-            .and_then(|b| b.path(path.clone()).ok());
-        if let Some(b) = editable
-            && let Ok(et) = b.build().await
+        if !node
+            .get_interfaces()
+            .await
+            .map_err(bus_err)?
+            .contains(atspi_common::Interface::EditableText)
         {
-            // The baseline for the confirmation below: without one, only an exact read-back
-            // confirms.
-            let before = read_text(&node, &conn).await;
-            match dispatch
-                .dispatch_async(async { et.set_text_contents(text).await.map_err(bus_err) })
-                .await
-            {
-                Ok(true) => {
-                    return confirm_write(
-                        &node,
-                        &conn,
-                        WrittenVia::EditableText,
-                        before,
-                        text,
-                        target.id.0,
-                        ctx.deadline,
-                    )
-                    .await;
-                }
-                // EditableText is present but rejected the write — don't try Value.
-                Ok(false) => return Err(GlassError::AxElementNotEditable(target.id.0)),
-                Err(error) => return Err(error),
-            }
+            return Err(GlassError::AxElementNotEditable(target.id.0));
         }
+        let et = atspi::proxy::editable_text::EditableTextProxy::builder(&conn)
+            .destination(dest)
+            .map_err(bus_err)?
+            .path(path)
+            .map_err(bus_err)?
+            .build()
+            .await
+            .map_err(bus_err)?;
+        let before = read_text(&node, &conn).await;
+        return match dispatch
+            .dispatch_async(async { et.set_text_contents(text).await.map_err(bus_err) })
+            .await
+        {
+            Ok(true) => {
+                confirm_write(
+                    &node,
+                    &conn,
+                    WrittenVia::EditableText,
+                    before,
+                    text,
+                    target.id.0,
+                    ctx.deadline,
+                )
+                .await
+            }
+            Ok(false) => Err(GlassError::AxElementNotEditable(target.id.0)),
+            Err(error) => Err(error),
+        };
     }
     if writes_value_only(role, text)
         && let Ok(v) = text.parse::<f64>()
