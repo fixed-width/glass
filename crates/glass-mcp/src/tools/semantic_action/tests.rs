@@ -1447,8 +1447,18 @@ fn structured_type_failure_excludes_submitted_payload_from_blocks_and_artifacts(
     assert_forced_artifacts_exclude_payload(output, "glass_type", SENTINEL);
 }
 
-pub(crate) fn targeted_type_snapshot_output_for_server(sentinel: &str) -> crate::tools::ToolOutput {
+pub(crate) fn targeted_type_snapshot_output_for_server(
+    sentinel: &str,
+    submitted: &str,
+    secure_value: &str,
+) -> crate::tools::ToolOutput {
     let mut tree = semantic_control_tree(AxRole::TextField, "Account", Some(sentinel), true);
+    let mut password = tree.root.children[0].clone();
+    password.name = Some("Password".into());
+    password.value = Some(secure_value.into());
+    password.states.secure = true;
+    password.states.focused = false;
+    tree.root.children.push(password);
     tree.root.children.extend((0..600).map(|index| AxNode {
         id: AxNodeId(0),
         role: AxRole::Label,
@@ -1476,7 +1486,7 @@ pub(crate) fn targeted_type_snapshot_output_for_server(sentinel: &str) -> crate:
     let args: TypeArgs = serde_json::from_value(serde_json::json!({
         "target": {"query": "Account", "role": "TextField"},
         "focus_mode": "native",
-        "text": sentinel,
+        "text": submitted,
         "timeout_ms": 1_000,
         "max_nodes": 0,
         "return": "snapshot",
@@ -1486,16 +1496,101 @@ pub(crate) fn targeted_type_snapshot_output_for_server(sentinel: &str) -> crate:
 }
 
 #[test]
-fn targeted_type_snapshot_clears_submitted_and_coincident_text_before_output_policy() {
+fn targeted_type_snapshot_preserves_observed_text_without_synthesizing_submitted_text() {
     const SENTINEL: &str = "TARGETED_TYPE_SNAPSHOT_SENTINEL_ef317";
-    let output = targeted_type_snapshot_output_for_server(SENTINEL);
-    assert!(output.text_bytes() > crate::output_policy::MAX_TEXT_BYTES);
-    assert!(
-        output
-            .render_text_blocks()
-            .iter()
-            .all(|block| !block.contains(SENTINEL))
-    );
+    const SECURE: &str = "TARGETED_TYPE_SECURE_SENTINEL_85f3";
+    for submitted in [SENTINEL, "REQUEST_ONLY_SENTINEL_0ea8"] {
+        let output = targeted_type_snapshot_output_for_server(SENTINEL, submitted, SECURE);
+        assert!(output.text_bytes() > crate::output_policy::MAX_TEXT_BYTES);
+        let blocks = output.render_text_blocks();
+        assert!(!blocks[0].contains(SENTINEL));
+        assert!(!blocks[1].contains(SENTINEL));
+        assert!(blocks[2].contains(&format!("value=\"{SENTINEL}\"")));
+        assert!(blocks[2].contains("value=<redacted>"));
+        assert!(blocks.iter().all(|block| !block.contains(SECURE)));
+        if submitted != SENTINEL {
+            assert!(blocks.iter().all(|block| !block.contains(submitted)));
+        }
+    }
+}
+
+#[test]
+fn targeted_type_snapshot_matches_independent_observation_and_redacts_secure_values() {
+    for batch in [false, true] {
+        let mut tree =
+            semantic_control_tree(AxRole::TextField, "Account", Some("app read-back"), true);
+        tree.root.children[0].description = Some("Account description".into());
+        let mut number = tree.root.children[0].clone();
+        number.role = AxRole::SpinButton;
+        number.name = Some("Value".into());
+        number.value = Some("42".into());
+        number.states.focused = false;
+        let mut password = tree.root.children[0].clone();
+        password.name = Some("Password".into());
+        password.description = None;
+        password.value = Some("SECURE_VALUE_SENTINEL_6583".into());
+        password.states.secure = true;
+        password.states.focused = false;
+        tree.root.children.extend([number, password]);
+        tree.assign_ids();
+        let (mut glass, counters, _) = started_instrumented_glass_with(
+            tree,
+            AxStateCoverage {
+                focused: true,
+                ..semantic_control_coverage()
+            },
+            None,
+        );
+        let args: TypeArgs = serde_json::from_value(serde_json::json!({
+            "target": {"query": "Account", "role": "TextField"},
+            "focus_mode": "native",
+            "text": "REQUEST_ONLY_SENTINEL_99af",
+            "return": "snapshot",
+        }))
+        .unwrap();
+        let output = if batch {
+            do_actions(
+                &mut glass,
+                &DoArgs {
+                    actions: vec![Action::Type(args)],
+                    then: None,
+                    timeout_ms: Some(5_000),
+                    encoded_argument_bytes: 0,
+                },
+            )
+            .unwrap()
+        } else {
+            type_text(&mut glass, &args).unwrap()
+        };
+        {
+            let calls = counters.calls.lock().unwrap();
+            assert_eq!(calls.iter().filter(|call| **call == "key").count(), 1);
+            assert!(
+                calls.iter().rposition(|call| *call == "a11y_snapshot")
+                    > calls.iter().position(|call| *call == "key")
+            );
+        }
+        let fresh = crate::tools::a11y_snapshot(
+            &mut glass,
+            &crate::params::A11ySnapshotArgs { max_nodes: None },
+        )
+        .unwrap();
+        let attached = output.text_block(2).expect("attached snapshot");
+        let independent = fresh.text_block(1).expect("independent snapshot");
+        assert_eq!(
+            untrusted_body(&attached.body),
+            untrusted_body(&independent.body),
+            "batch={batch}"
+        );
+        assert!(attached.body.contains("Account description"));
+        assert!(attached.body.contains("value=\"app read-back\""));
+        assert!(attached.body.contains("value=\"42\""));
+        assert!(attached.body.contains("value=<redacted>"));
+        for block in output.render_text_blocks() {
+            assert!(!block.contains("REQUEST_ONLY_SENTINEL_99af"));
+            assert!(!block.contains("SECURE_VALUE_SENTINEL_6583"));
+        }
+    }
 }
 
 fn assert_forced_artifacts_exclude_payload(

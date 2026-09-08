@@ -289,7 +289,7 @@ pub struct TypeArgs {
     #[schemars(range(min = 0, max = 120000))]
     pub timeout_ms: Option<u64>,
     pub max_nodes: Option<u32>,
-    /// none (default): no observation; settle: text-only visual stability; snapshot: settle and refresh/fold the accessibility tree.
+    /// none (default): no observation; settle: text-only visual stability; snapshot: settle and read the current accessibility tree, including app-visible text, with secure values redacted.
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }

@@ -34,6 +34,7 @@ internal refactors, CI, or test-only changes.
 - Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
 
 ### Fixed
+- Targeted `glass_type` with `return:"snapshot"` now returns current app-visible names, descriptions, and editable values instead of silently clearing all text. Standalone and batched typing use the same snapshot rendering as `glass_a11y_snapshot`, including secure-value redaction; action metadata and errors still do not echo submitted text.
 - `glass_click_element` and `glass_set_value` now report `not_dispatched` when an ID is missing from the current accessibility snapshot and advise taking a fresh snapshot before retrying with the current ID or a semantic target. Stale failures after possible dispatch advise inspecting state before retrying. In `glass_do`, a refused stale-ID step is unattempted, earlier completed steps remain completed, and later steps remain unexecuted.
 - On Linux, `glass_set_value` now detects controls that do not expose accessibility text editing before attempting a write. The error directs agents to focus the field and use keyboard input instead of repeating `glass_set_value`; failures where a write may already have landed still require observing state before recovery.
 - `glass_do` no longer repeats an error detail in a separate content block when it is identical to the structured error summary.

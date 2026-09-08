@@ -719,7 +719,6 @@ fn resolve_return_with(
     glass: &mut Glass,
     ret: Option<&str>,
     context: ToolContext,
-    include_application_text: bool,
 ) -> Result<ReturnObservation, ContextualError> {
     if !context.allow_wait && matches!(ret, Some("settle" | "snapshot")) {
         let category = if context.owner == Some(glass_core::Whose::Caller) {
@@ -782,13 +781,9 @@ fn resolve_return_with(
             }
             // Reuse the session's current limits so a fold after a raised/unbounded snapshot
             // isn't silently re-truncated to the default cap.
-            let mut tree = glass
+            let tree = glass
                 .a11y_resnapshot(context.deadline)
                 .map_err(|e| ContextualError::from_core(e, context))?;
-            if !include_application_text {
-                tree.subject = None;
-                scrub_ax_text(&mut tree.root);
-            }
             // Same shape as `a11y_snapshot`: the app-derived outline stays untrusted-wrapped;
             // glass's own steers are separate trusted blocks, not baked into that body.
             let body = glass_core::outline::render_compact(&tree);
@@ -806,16 +801,6 @@ fn resolve_return_with(
         Some(o) => Err(ContextualError::validation(format!(
             "unknown return '{o}' (use none/settle/snapshot)"
         ))),
-    }
-}
-
-fn scrub_ax_text(node: &mut glass_core::AxNode) {
-    node.raw_role.clear();
-    node.name = None;
-    node.description = None;
-    node.value = None;
-    for child in &mut node.children {
-        scrub_ax_text(child);
     }
 }
 
@@ -874,20 +859,18 @@ pub(crate) fn click_element_with(
         allow_wait: outcome.bound.allow_wait,
     };
     let (observed, extra, timed_out_by) =
-        resolve_return_with(glass, a.return_.as_deref(), action_context, true).map_err(
-            |error| {
-                if semantic {
-                    semantic_return_error(
-                        "glass_click_element",
-                        &outcome,
-                        error,
-                        "click was dispatched; return observe failed",
-                    )
-                } else {
-                    error.after_dispatch()
-                }
-            },
-        )?;
+        resolve_return_with(glass, a.return_.as_deref(), action_context).map_err(|error| {
+            if semantic {
+                semantic_return_error(
+                    "glass_click_element",
+                    &outcome,
+                    error,
+                    "click was dispatched; return observe failed",
+                )
+            } else {
+                error.after_dispatch()
+            }
+        })?;
     let output = if semantic {
         semantic_action::success_output("glass_click_element", &outcome, observed, extra)
     } else {
@@ -949,23 +932,21 @@ pub(crate) fn set_value_with(
         allow_wait: outcome.bound.allow_wait,
     };
     let (observed, extra, timed_out_by) =
-        resolve_return_with(glass, a.return_.as_deref(), action_context, true).map_err(
-            |error| {
-                let error = if semantic {
-                    semantic_return_error(
-                        "glass_set_value",
-                        &outcome,
-                        error,
-                        "set-value return observe failed",
-                    )
-                } else {
-                    error.after_dispatch()
-                };
-                error
-                    .scrub_message()
-                    .annotate("set-value return observe failed")
-            },
-        )?;
+        resolve_return_with(glass, a.return_.as_deref(), action_context).map_err(|error| {
+            let error = if semantic {
+                semantic_return_error(
+                    "glass_set_value",
+                    &outcome,
+                    error,
+                    "set-value return observe failed",
+                )
+            } else {
+                error.after_dispatch()
+            };
+            error
+                .scrub_message()
+                .annotate("set-value return observe failed")
+        })?;
     let output = if semantic {
         semantic_action::success_output("glass_set_value", &outcome, observed, extra)
     } else {
