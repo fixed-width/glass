@@ -505,6 +505,12 @@ single keyboard dispatch separately. Untargeted typing retains its existing empt
 form also includes `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`, exactly as
 for `glass_click_element`.
 
+An explicit `return:"snapshot"` returns the same current app-visible names, descriptions, and bounded
+editable values as `glass_a11y_snapshot`, including text the app displays after typing. Secure values
+remain redacted. The requested observation stays in untrusted content blocks and, when oversized,
+read-only output artifacts. Action metadata, target/candidate details, and errors do not echo the
+submitted type text. This applies to standalone typing and `glass_do` type steps.
+
 ### `glass_key`
 
 Press a key chord.
@@ -633,7 +639,9 @@ optional `result?` evidence produced before the failure, `error.{code,summary,ca
 performed no rollback, so landed effects may persist. App-derived names,
 descriptions, values, outlines, and images remain untrusted sibling blocks. Non-secret raw error
 details also remain untrusted siblings. Failures from `type` and `set_value` instead expose only
-sanitized category and summary diagnostics, and submitted text is never echoed in any batch output.
+sanitized category and summary diagnostics; action metadata and error details never echo submitted
+text. Explicit observations can contain text read from the app, with the same secure-value redaction
+as standalone observations.
 An error detail identical to the structured summary does not produce a duplicate sibling block.
 
 Do not replay a completed action or a failed action with

@@ -1891,11 +1891,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn targeted_type_snapshot_resource_never_persists_submitted_or_coincident_text() {
+    async fn targeted_type_snapshot_resource_preserves_observed_text_and_redacts_secure_values() {
         const SENTINEL: &str = "SERVER_TARGETED_TYPE_SNAPSHOT_SENTINEL_76b1";
+        const SECURE: &str = "SERVER_TARGETED_TYPE_SECURE_SENTINEL_f280";
         let output = crate::tools::semantic_action::tests::targeted_type_snapshot_output_for_server(
-            SENTINEL,
+            SENTINEL, SENTINEL, SECURE,
         );
+        let expected_snapshot = output.render_text_blocks()[2].clone();
         assert!(output.text_bytes() > crate::output_policy::MAX_TEXT_BYTES);
         let root = tempfile::tempdir().unwrap();
         let store = ArtifactStore::for_test(root.path(), 1 << 20).unwrap();
@@ -1930,7 +1932,7 @@ mod tests {
                 .content
                 .iter()
                 .filter_map(|content| content.as_text())
-                .all(|text| !text.text.contains(SENTINEL))
+                .all(|text| !text.text.contains(SECURE))
         );
         let links = result
             .content
@@ -1941,14 +1943,22 @@ mod tests {
             !links.is_empty(),
             "oversized targeted type snapshot externalized"
         );
+        let mut recovered_snapshot = false;
         for link in links {
             let resource = server.read_resource_for_test(&link.uri).unwrap();
             assert_eq!(resource.contents.len(), 1);
             let ResourceContents::TextResourceContents { text, .. } = &resource.contents[0] else {
                 panic!("expected text resource")
             };
-            assert!(!text.contains(SENTINEL));
+            assert!(!text.contains(SECURE));
+            if text == &expected_snapshot {
+                recovered_snapshot = true;
+            }
         }
+        assert!(
+            recovered_snapshot,
+            "the exact observed snapshot remains readable"
+        );
     }
 
     #[test]
