@@ -95,6 +95,17 @@ On Debian/Ubuntu, install the full AT-SPI suite's fixtures with
 
 Pass a substring to run one test.
 
+The egui text-write recovery test also needs the workspace-excluded fixture:
+
+```bash
+cargo build --release --manifest-path crates/glass-fixture-egui/Cargo.toml
+cargo test -p glass-a11y-linux --test egui -- --ignored
+```
+
+Set `GLASS_EGUI_FIXTURE` to use an already-built fixture at another path. This test checks that a
+missing text-write interface refuses before dispatch, keyboard input recovers, and numeric
+accessibility writes still work.
+
 The X11 and Wayland **backend crates** also keep their display-backed unit tests behind
 `#[ignore]`, and no harness script runs those — if you changed `glass-x11` or `glass-wayland`,
 the command above covers the end-to-end suite but not them:

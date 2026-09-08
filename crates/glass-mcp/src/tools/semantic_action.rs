@@ -1,6 +1,6 @@
 use glass_core::{
     ActionMethod, ActionMode, ActionTarget, ActionabilityReport, AxNodeId, ClickTargetParams,
-    ElementInfo, MatchField, MatchTier, MutationReport, ResolutionReport,
+    ElementInfo, GlassError, MatchField, MatchTier, MutationReport, ResolutionReport,
     SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_MAX_TIMEOUT_MS, ScopeResolution,
     SemanticActionError, SemanticActionFailureKind, SemanticActionOutcome, SemanticMatch,
     SetValueTargetParams, TypeTargetParams, Whose,
@@ -446,6 +446,15 @@ pub(crate) fn semantic_error(
 ) -> ContextualError {
     let error = error.into();
     let category = semantic_category(&error);
+    let post_write = error
+        .source
+        .as_ref()
+        .is_some_and(GlassError::set_value_failed_after_writing);
+    let safe_summary = if post_write {
+        category.post_write_summary()
+    } else {
+        category.summary()
+    };
     let include_text = tool != "glass_type";
     let mut siblings = Vec::new();
     if !error.candidates.is_empty() {
@@ -464,14 +473,14 @@ pub(crate) fn semantic_error(
     };
     ContextualError {
         code: category.code(),
-        message: category.summary().into(),
+        message: safe_summary.into(),
         category,
-        safe_summary: category.summary(),
+        safe_summary,
         sequence_deadline_exceeded: category == SafeErrorCategory::SequenceDeadlineExceeded,
         bound_dispatch: Some(bound_dispatch),
         result: Some(failure_result(&error)),
         siblings,
-        post_write: false,
+        post_write,
     }
 }
 

@@ -899,6 +899,12 @@ element, clears it and types, then reads the element back to confirm — up to t
 field may commit a frame or two later. Errors if the element isn't editable, changed since the
 snapshot, does not hold the requested value afterwards, or the app exposes no accessibility tree.
 
+On Linux, a text field can advertise `editable` while exposing no AT-SPI `EditableText` interface
+(for example, egui/AccessKit). Glass checks that interface before attempting the write and returns
+`not_editable` with `dispatch:"not_dispatched"`. Do not repeat `set_value` for that field: focus it
+with `glass_click_element`, select existing text with `glass_key` if replacing it, then use
+`glass_type` and verify the value. The corresponding `glass_do` actions follow the same rule.
+
 The does-not-hold error names both values — what you asked for and what the element holds — because
 three outcomes look alike without them. An element that **transformed** the write holds your text in
 another form and writing again will not change that: a field that reformats (`"1234567890"` becoming

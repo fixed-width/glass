@@ -532,6 +532,115 @@ fn set_value_tool_ok_and_errors() {
 }
 
 #[test]
+fn set_value_without_writable_accessibility_value_guides_keyboard_recovery() {
+    struct KeyboardOnlyText(glass_core::AxTree);
+    impl glass_core::Accessibility for KeyboardOnlyText {
+        fn snapshot(
+            &mut self,
+            _: &glass_core::AxContext,
+        ) -> glass_core::Result<glass_core::AxTree> {
+            Ok(self.0.clone())
+        }
+
+        fn state_coverage(&self) -> glass_core::AxStateCoverage {
+            glass_core::AxStateCoverage {
+                enabled: true,
+                visible: true,
+                focusable: true,
+                editable: true,
+                ..glass_core::AxStateCoverage::NONE
+            }
+        }
+
+        fn set_value(
+            &mut self,
+            _: &glass_core::AxContext,
+            target: &glass_core::AxTarget,
+            _: &str,
+        ) -> glass_core::Result<()> {
+            Err(glass_core::GlassError::AxElementNotEditable(target.id.0).before_dispatch())
+        }
+    }
+
+    for semantic in [false, true] {
+        for batched in [false, true] {
+            let mut tree = fake_tree();
+            let field = &mut tree.root.children[0];
+            field.role = glass_core::AxRole::TextField;
+            field.name = Some("Text".into());
+            field.states.editable = true;
+            field.states.visible = true;
+            let dir = tempfile::tempdir().unwrap();
+            let mut glass = Glass::new(
+                Box::new(move |_| {
+                    Ok(glass_core::Backend {
+                        platform: Box::new(FakePlatform::new(100, 100)),
+                        accessibility: Some(Box::new(KeyboardOnlyText(tree.clone()))),
+                    })
+                }),
+                "x11".into(),
+                glass_core::BaselineStore::new(dir.path().join("baselines")),
+                100,
+            );
+            start(&mut glass, &start_args()).unwrap();
+            a11y_snapshot(&mut glass, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+            let target = if semantic {
+                json!({"target": {"query": "Text", "role": "TextField"}, "text": "private input"})
+            } else {
+                json!({"id": 1, "text": "private input"})
+            };
+            let args: SetValueArgs = serde_json::from_value(target).unwrap();
+            let output = if batched {
+                do_actions(
+                    &mut glass,
+                    &DoArgs {
+                        actions: vec![
+                            Action::SetValue(args),
+                            Action::Key(KeyArgs {
+                                chord: "Return".into(),
+                            }),
+                        ],
+                        then: None,
+                        timeout_ms: None,
+                        encoded_argument_bytes: 0,
+                    },
+                )
+                .unwrap_err()
+            } else {
+                set_value(&mut glass, &args).unwrap_err()
+            };
+            let blocks = output.render_text_blocks();
+            let envelope: serde_json::Value = serde_json::from_str(&blocks[0]).unwrap();
+            let failure = if batched {
+                assert_eq!(envelope["outcome"]["steps"][1]["status"], "unexecuted");
+                &envelope["outcome"]["steps"][0]
+            } else {
+                &envelope
+            };
+            assert_eq!(failure["error"]["category"], "not_editable", "{envelope}");
+            let summary = failure["error"]["summary"].as_str().unwrap();
+            assert!(summary.contains("do not retry set_value"), "{summary}");
+            assert!(
+                summary.contains("click_element") && summary.contains("type"),
+                "{summary}"
+            );
+            let result = if batched { failure } else { &failure["result"] };
+            assert_eq!(
+                result["side_effects_may_have_occurred"], false,
+                "{envelope}"
+            );
+            if !batched {
+                assert_eq!(result["dispatch"], "not_dispatched", "{envelope}");
+                if semantic {
+                    assert_eq!(result["retry"], "correct_request", "{envelope}");
+                }
+            }
+            assert!(!blocks.join("\n").contains("private input"));
+        }
+    }
+}
+
+#[test]
 fn set_value_tool_rejects_uneditable_and_stale() {
     let spec = AppSpec {
         build: None,

@@ -1281,6 +1281,39 @@ fn caller_owned_or_expired_semantic_context_uses_sequence_deadline_and_keeps_evi
 }
 
 #[test]
+fn semantic_set_value_uncertainty_requires_observation_before_keyboard_recovery() {
+    for source in [
+        GlassError::AxElementNotEditable(4),
+        GlassError::Backend("APP CONTROLLED BACKEND DETAIL".into()),
+    ] {
+        let mut failure =
+            semantic_failure(SemanticActionFailureKind::ActionFailed, None, None, vec![]);
+        failure.source = Some(GlassError::write_unconfirmed_because(
+            4,
+            "APP CONTROLLED WRITE DETAIL",
+            source,
+        ));
+        failure.action_dispatch = DispatchStatus::MayHaveDispatched;
+        failure.retry = RetryGuidance::DoNotRetry;
+        let contextual = semantic_error("glass_set_value", failure);
+        assert!(contextual.post_write);
+        let output = erase_semantic_context("glass_set_value", Err(contextual)).unwrap_err();
+        let envelope = error_envelope(&output);
+        let summary = envelope["error"]["summary"].as_str().unwrap();
+        assert!(summary.contains("re-snapshot"), "{summary}");
+        assert!(!summary.contains("click_element"), "{summary}");
+        assert_eq!(envelope["result"]["dispatch"], "may_have_dispatched");
+        assert_eq!(envelope["result"]["retry"], "do_not_retry");
+        assert!(
+            !output
+                .render_text_blocks()
+                .join("\n")
+                .contains("APP CONTROLLED")
+        );
+    }
+}
+
+#[test]
 fn structured_backend_stale_and_deadline_errors_do_not_format_backend_source() {
     let mut stale = semantic_failure(SemanticActionFailureKind::ActionFailed, None, None, vec![]);
     stale.source = Some(GlassError::AxElementChanged(4));

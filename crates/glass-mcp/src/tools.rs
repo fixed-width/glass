@@ -135,7 +135,9 @@ impl SafeErrorCategory {
             Self::UnsupportedMode => "semantic action mode is unsupported",
             Self::NoActiveSession => "no active session",
             Self::StaleElement => "element is stale or missing",
-            Self::NotEditable => "element is not editable",
+            Self::NotEditable => {
+                "element has no writable accessibility value; do not retry set_value. For text input, focus with click_element, select existing text with key if replacing it, then type; use the glass_* tools or glass_do actions"
+            }
             Self::InvalidValue => "element expects a boolean value",
             Self::OptionNotFound => "requested option was not found",
             Self::UnsupportedAccessibility => "accessibility operation is unsupported",
