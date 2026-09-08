@@ -415,8 +415,7 @@ pub struct WaitForLogArgs {
     pub contains: String,
     /// "stdout", "stderr", or "both" (default).
     pub stream: Option<String>,
-    /// Start scanning from this cursor (from a prior glass_logs). Omit to match
-    /// only lines emitted after this call.
+    /// Cursor after draining logs before the action; 0 includes retained history. Omit for future lines only.
     pub cursor: Option<u64>,
     /// Poll interval (default 100ms).
     pub interval_ms: Option<u64>,

@@ -435,17 +435,29 @@ takes the same `region`.
 
 ### `glass_wait_for_log`
 
-Block until a log line containing `contains` appears, then return it as text.
+Wait for a log line containing `contains`, starting at the chosen cursor.
+
+After an action has returned, use `glass_logs` to inspect buffered output, or pass `cursor:0`
+to this tool to match retained history. Omitting the cursor watches only lines emitted after
+the wait starts, so it can miss a fast startup or an action that already logged its result.
+
+For a repeated event, drain `glass_logs` **before** acting: resume with each returned cursor
+until a read returns fewer than `max_lines` lines. Save that final cursor, perform the action,
+then pass the saved cursor to `glass_wait_for_log`. This catches output produced during the
+action without accepting an older occurrence as proof of the new action. Reading after the
+action and using that new cursor can skip the very event you wanted to verify.
 
 - `contains` (string, **required**, non-empty) — substring to wait for.
 - `stream` (string) — `"stdout"`, `"stderr"`, or `"both"` (default).
-- `cursor` (integer) — start scanning from this cursor (from a prior `glass_logs`) to catch a line
-  emitted just before the call; omit to match only lines emitted after it.
+- `cursor` (integer) — scan from this position, including lines already buffered there. Use a
+  cursor saved after draining logs before the action to verify its new event, or `0` for all retained history.
+  Omit to match only lines emitted after the wait starts. Old lines can age out of the buffer.
 - `interval_ms` (integer, default 100) — poll interval.
 - `timeout_ms` (integer, default 10000) — returns `{matched:false}` on timeout.
 
 Returns `{matched, cursor, elapsed_ms}`, plus `note` on a default-cursor timeout when the substring
-was already in the log before this call — it points you at `cursor:0`. On a match, the matched line
+was already in the log before this call. Follow its buffered-read advice; repeating the wait
+without a cursor still watches only future lines. On a match, the matched line
 (`{seq, stream, text}`) rides as an untrusted sibling text block, since log output is app-controlled;
 no sibling on timeout. Resume reading from the returned `cursor`.
 
@@ -1040,6 +1052,10 @@ Store / notarized) can't be redirected and returns Unsupported.
 ### `glass_logs`
 
 Read captured stdout/stderr log lines with a resumable cursor.
+
+Use this to inspect output from an action that has already returned. To verify a future
+occurrence with `glass_wait_for_log`, drain the buffered pages and save the final cursor
+before performing the action. A page limited by `max_lines` can leave older output unread.
 
 - `contains` (string) — return only lines containing this substring.
 - `stream` (string) — `"stdout"`, `"stderr"`, or `"both"` (default).

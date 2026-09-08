@@ -34,6 +34,7 @@ internal refactors, CI, or test-only changes.
 - Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
 
 ### Fixed
+- Log tool guidance now directs verification of completed actions to buffered output and explains saving a cursor before repeated events. The already-buffered timeout note discourages repeating a wait that watches only future lines.
 - Restored `glass_do` batching cues in standalone action descriptions and early shared instructions, so agents discovering tools can choose one call for two or more known steps and pause when later steps depend on new observations.
 - Targeted `glass_type` with `return:"snapshot"` now returns current app-visible names, descriptions, and editable values instead of silently clearing all text. Standalone and batched typing use the same snapshot rendering as `glass_a11y_snapshot`, including secure-value redaction; action metadata and errors still do not echo submitted text.
 - `glass_click_element` and `glass_set_value` now report `not_dispatched` when an ID is missing from the current accessibility snapshot and advise taking a fresh snapshot before retrying with the current ID or a semantic target. Stale failures after possible dispatch advise inspecting state before retrying. In `glass_do`, a refused stale-ID step is unattempted, earlier completed steps remain completed, and later steps remain unexecuted.

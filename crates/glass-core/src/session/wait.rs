@@ -858,10 +858,7 @@ impl Glass {
                 note: None,
             },
             None => {
-                // The default cursor is the buffer end at call start, so a line emitted
-                // *before* this call (e.g. a fast-boot "ready") is skipped and we time out.
-                // If the substring is already in the buffer before our start cursor, say so
-                // rather than failing silently — point the caller at cursor:0.
+                // Explain a default-cursor timeout when a match predates the wait.
                 let note = if params.cursor.is_none() {
                     let (earlier, _) = s.logs.read(0, 1, stream, Some(&contains));
                     earlier
@@ -870,8 +867,10 @@ impl Glass {
                         .filter(|l| l.seq < start_cursor)
                         .map(|l| {
                             format!(
-                                "{contains:?} was already in the log at seq {} (before this call); \
-                                 pass cursor:0 to match already-buffered lines",
+                                "{contains:?} was already in the log at seq {} (before this call). \
+                                 Read buffered output with glass_logs or cursor:0; repeating a wait \
+                                 without cursor only watches future lines. Before a later action, \
+                                 drain glass_logs and pass its final cursor to the wait.",
                                 l.seq
                             )
                         })
@@ -3762,6 +3761,37 @@ mod tests {
             note.contains("seq 0"),
             "note should cite the buffered seq, got: {note}"
         );
+    }
+
+    #[test]
+    fn wait_for_log_pre_action_cursor_skips_prior_occurrences_after_paged_read() {
+        let platform = FakePlatform::new(10, 10).with_log_batches(vec![
+            vec![(Stream::Stdout, "export complete"); 3],
+            vec![],
+            vec![],
+            vec![(Stream::Stdout, "export complete")],
+        ]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+
+        let (first_page, cursor) = g.logs(0, 2, None, None).unwrap();
+        assert_eq!(first_page.len(), 2);
+        let (last_page, cursor) = g.logs(cursor, 2, None, None).unwrap();
+        assert_eq!(last_page.len(), 1);
+        assert_eq!(cursor, 3);
+
+        let outcome = g
+            .wait_for_log(&WaitLogParams {
+                contains: "export complete".into(),
+                stream: None,
+                cursor: Some(cursor),
+                interval_ms: 0,
+                timeout_ms: 0,
+            })
+            .unwrap();
+        assert!(outcome.matched);
+        assert_eq!(outcome.line.unwrap().seq, 3);
+        assert_eq!(outcome.cursor, 4);
     }
 
     #[test]
