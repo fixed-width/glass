@@ -19,9 +19,6 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
-### Fixed
-- Concurrent artifact publications no longer race retention accounting or rollback on Windows, preventing valid responses from failing when another response changes the artifact directory.
-
 ### Added
 - Optional `max_width`/`max_height` shrink screenshots and settle/diff/region-wait image attachments, with source rectangles, returned dimensions and scaling metadata. Baseline verification and input coordinates remain in native pixels.
 - Optional `--trace-dir` retains supplied tool inputs and requested results in a bounded private session trace. Offline `trace inspect` and `trace export` validate and package evidence after the server stops, with explicit omissions and unchanged tool execution when recording reaches a limit or fails.
@@ -31,8 +28,19 @@ internal refactors, CI, or test-only changes.
 - Tool responses now share an 8 KiB text ceiling, with oversized logical blocks recoverable exactly through read-only `glass-artifact://` MCP resources backed by secure, ephemeral server-process artifacts.
 
 ### Changed
+- Successful `glass_do` calls without `then` now return compact ordered steps containing `result` and `content_blocks`, plus total `elapsed_ms`. Redundant `status`, `executed`, `index`, and `action` fields are omitted; use array order and `steps.length` to identify and count completed actions. Failures and calls with `then` retain their detailed outcomes.
+- Source builds now use stable Rust instead of nightly; rustup installs the toolchain pinned in `rust-toolchain.toml` automatically.
 - Shortened MCP tool and parameter guidance and centralized cross-tool instructions while retaining action limits, mutation warnings and existing tool contracts. Capability reports identify the selected tool profile and link only to its exposed tools.
 - Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
+
+### Fixed
+- `glass_click_element` and `glass_set_value` now report `not_dispatched` when an ID is missing from the current accessibility snapshot and advise taking a fresh snapshot before retrying with the current ID or a semantic target. Stale failures after possible dispatch advise inspecting state before retrying. In `glass_do`, a refused stale-ID step is unattempted, earlier completed steps remain completed, and later steps remain unexecuted.
+- On Linux, `glass_set_value` now detects controls that do not expose accessibility text editing before attempting a write. The error directs agents to focus the field and use keyboard input instead of repeating `glass_set_value`; failures where a write may already have landed still require observing state before recovery.
+- `glass_do` no longer repeats an error detail in a separate content block when it is identical to the structured error summary.
+- Targeted `glass_type` no longer spends its focus-confirmation timeout polling a backend that cannot report focused state, such as the iOS Simulator reader. It reports unconfirmed focus after one confirmation read and sends no text.
+- On Windows, releasing an abandoned launch now terminates its suspended app even when explicit teardown was skipped.
+- On Windows, overlapping clipboard operations in one server process now fail cleanly, and an operation interrupted by a panic releases the clipboard so later reads and writes can proceed.
+- Concurrent artifact publications no longer race retention accounting or rollback on Windows, preventing valid responses from failing when another response changes the artifact directory.
 
 ## [1.7.0] - 2026-08-31
 
