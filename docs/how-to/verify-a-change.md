@@ -100,11 +100,15 @@ The egui text-write recovery test also needs the workspace-excluded fixture:
 ```bash
 cargo build --release --manifest-path crates/glass-fixture-egui/Cargo.toml
 cargo test -p glass-a11y-linux --test egui -- --ignored
+cargo test -p glass-mcp --lib consecutive_inputs_preserve_clicks_and_final_text_in_batches_and_standalone -- --ignored
 ```
 
 Set `GLASS_EGUI_FIXTURE` to use an already-built fixture at another path. This test checks that a
 missing text-write interface refuses before dispatch, keyboard input recovers, and numeric
 accessibility writes still work.
+
+The MCP egui test checks consecutive coordinate clicks and typing followed by Apply, both as
+standalone tools and in `glass_do`. It starts its own Xvfb display and private accessibility bus.
 
 The X11 and Wayland **backend crates** also keep their display-backed unit tests behind
 `#[ignore]`, and no harness script runs those — if you changed `glass-x11` or `glass-wayland`,

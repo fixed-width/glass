@@ -46,6 +46,10 @@ const XT_BTN_RELEASE: u8 = 5; // ButtonRelease
 const XT_KEY_PRESS: u8 = 2; // KeyPress
 const XT_KEY_RELEASE: u8 = 3; // KeyRelease
 
+// Separate input actions so frame-based clients can consume a click or final character
+// before a later action moves the pointer or changes focus.
+const INPUT_ACTION_DWELL: Duration = Duration::from_millis(50);
+
 fn modifier_keycodes_dispatched(keycodes: &[u8]) -> bool {
     !keycodes.is_empty()
 }
@@ -607,6 +611,19 @@ impl X11Platform {
         self.conn
             .flush()
             .map_err(|e| GlassError::Backend(format!("flush: {e}")))
+    }
+
+    fn finish_input_by(&self, dispatch: &X11Dispatch, deadline: Deadline) -> Result<()> {
+        self.commit()?;
+        if dispatch.sent.get() {
+            std::thread::sleep(
+                deadline
+                    .remaining()
+                    .unwrap_or(INPUT_ACTION_DWELL)
+                    .min(INPUT_ACTION_DWELL),
+            );
+        }
+        Ok(())
     }
 
     /// Intern an atom by name (small helper for the multi-window scans).
@@ -1707,7 +1724,7 @@ impl Platform for X11Platform {
                     return Err(crate::unsupported_multi_touch());
                 }
             }
-            self.commit()
+            self.finish_input_by(dispatch, deadline)
         })
     }
 
@@ -1741,7 +1758,7 @@ impl Platform for X11Platform {
                     glass_core::run_chord_by(&mut sink, deadline)?;
                 }
             }
-            self.commit()
+            self.finish_input_by(dispatch, deadline)
         })
     }
 
@@ -3610,6 +3627,46 @@ mod display_tests {
             vec![(3, 30, 40), (3, 30, 40)],
             "a double right-click is button 3 twice, at the point asked for"
         );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn input_dwell_deadline_keeps_dispatched_clicks_released() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        let error = plat
+            .send_pointer_by(
+                &PointerEvent::Click {
+                    x: 30,
+                    y: 40,
+                    button: glass_core::MouseButton::Left,
+                    count: 1,
+                    modifiers: vec![],
+                },
+                Deadline::from_millis(25),
+            )
+            .expect_err("deadline expires during post-input dwell");
+
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        let events = x.drain_events(Duration::from_millis(50));
+        assert!(events.iter().any(|event| matches!(event, x11rb::protocol::Event::ButtonPress(button) if button.detail == 1)));
+        assert!(events.iter().any(|event| matches!(event, x11rb::protocol::Event::ButtonRelease(button) if button.detail == 1)));
+        let pointer = plat.conn.query_pointer(win).unwrap().reply().unwrap();
+        assert!(!pointer.mask.contains(KeyButMask::BUTTON1));
     }
 
     #[test]
