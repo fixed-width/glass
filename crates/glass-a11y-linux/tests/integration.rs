@@ -1394,6 +1394,9 @@ fn scroll_to_element_reaches_a_virtualized_offscreen_row() {
 
     // The returned id is from the final snapshot → click it and confirm the fixture
     // selected exactly that row (via its stdout).
+    let (_, cursor) = glass
+        .logs(0, usize::MAX, None, None)
+        .expect("pre-click log cursor");
     glass
         .click_element(elem.id)
         .expect("click the realized row");
@@ -1401,12 +1404,12 @@ fn scroll_to_element_reaches_a_virtualized_offscreen_row() {
         .wait_for_log(&glass_core::WaitLogParams {
             contains: "SELECTED Row 060".into(),
             stream: None,
-            cursor: None,
+            cursor: Some(cursor),
             interval_ms: 100,
             timeout_ms: 4000,
         })
         .expect("wait_for_log");
-    assert!(seen.matched, "click did not select Row 060");
+    assert!(seen.matched, "click did not select Row 060: {seen:?}");
     glass.stop().expect("stop");
 }
 
