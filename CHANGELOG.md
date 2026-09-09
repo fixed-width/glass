@@ -28,6 +28,7 @@ internal refactors, CI, or test-only changes.
 - Tool responses now share an 8 KiB text ceiling, with oversized logical blocks recoverable exactly through read-only `glass-artifact://` MCP resources backed by secure, ephemeral server-process artifacts.
 
 ### Changed
+- Restored the earlier `glass_do` discovery guidance, removing batching redirects from standalone tool descriptions and the opening shared instructions. Batching remains available in both profiles.
 - Successful `glass_do` calls without `then` now return compact ordered steps containing `result` and `content_blocks`, plus total `elapsed_ms`. Redundant `status`, `executed`, `index`, and `action` fields are omitted; use array order and `steps.length` to identify and count completed actions. Failures and calls with `then` retain their detailed outcomes.
 - Source builds now use stable Rust instead of nightly; rustup installs the toolchain pinned in `rust-toolchain.toml` automatically.
 - Shortened MCP tool and parameter guidance and centralized cross-tool instructions while retaining action limits, mutation warnings and existing tool contracts. Capability reports identify the selected tool profile and link only to its exposed tools.
@@ -35,7 +36,6 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 - Log tool guidance now directs verification of completed actions to buffered output and explains saving a cursor before repeated events. The already-buffered timeout note discourages repeating a wait that watches only future lines.
-- Restored `glass_do` batching cues in standalone action descriptions and early shared instructions, so agents discovering tools can choose one call for two or more known steps and pause when later steps depend on new observations.
 - Targeted `glass_type` with `return:"snapshot"` now returns current app-visible names, descriptions, and editable values instead of silently clearing all text. Standalone and batched typing use the same snapshot rendering as `glass_a11y_snapshot`, including secure-value redaction; action metadata and errors still do not echo submitted text.
 - `glass_click_element` and `glass_set_value` now report `not_dispatched` when an ID is missing from the current accessibility snapshot and advise taking a fresh snapshot before retrying with the current ID or a semantic target. Stale failures after possible dispatch advise inspecting state before retrying. In `glass_do`, a refused stale-ID step is unattempted, earlier completed steps remain completed, and later steps remain unexecuted.
 - On Linux, `glass_set_value` now detects controls that do not expose accessibility text editing before attempting a write. The error directs agents to focus the field and use keyboard input instead of repeating `glass_set_value`; failures where a write may already have landed still require observing state before recovery.
