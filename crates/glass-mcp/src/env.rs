@@ -351,6 +351,8 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
 /// no production reader, so it would otherwise be flagged dead code in a non-test build.
 #[cfg(test)]
 pub(crate) const INTERNAL_ENV: &[&str] = &[
+    // Selects an already-built egui fixture for live input tests.
+    "GLASS_EGUI_FIXTURE",
     // Not actually an environment variable: the X11 CLIPBOARD-selection transfer atom name
     // interned in glass-x11/src/clipboard.rs (`b"GLASS_CLIP"`). It shares the `GLASS_` prefix
     // the guard test scans for, so it needs an entry here even though `std::env::var` never

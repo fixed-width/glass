@@ -246,6 +246,7 @@ impl eframe::App for Fixture {
                 wrap_in_pane(ui, |ui| {
                     if ui.button("Apply").clicked() {
                         log("[fixture] apply");
+                        log(&format!("[fixture] applied_text={}", self.text));
                     }
                 });
             });

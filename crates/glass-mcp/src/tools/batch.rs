@@ -598,3 +598,6 @@ fn run_then(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod egui_tests;
