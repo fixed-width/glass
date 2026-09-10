@@ -34,6 +34,7 @@ internal refactors, CI, or test-only changes.
 - Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
 
 ### Fixed
+- On Linux, pointer action checks recognize null accessibility parent properties. A hit on an unrelated container now reports the failed actionability check instead of a misleading backend transport failure.
 
 - Linux accessibility sessions keep a registry listener active between operations, preventing Electron crashes when a short-lived reader disconnects during keyboard input. Accessibility property reads also avoid bulk `GetAll` requests that can abort Electron on numeric fields.
 - Native Wayland apps receive a valid keyboard map before launch, preventing Electron from crashing on startup before the first keyboard action.

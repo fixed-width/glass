@@ -925,6 +925,23 @@ async fn pointer_accessible<'a>(
         .map_err(|e| pointer_reference_error(format!("accessible proxy: {e}")))
 }
 
+async fn pointer_parent(deadline: Deadline, proxy: &AccessibleProxy<'_>) -> Result<ObjectRefOwned> {
+    // atspi's property-value conversion loses the null ObjectRef variant.
+    let (name, path): (String, zbus::zvariant::OwnedObjectPath) = pointer_bus_call(
+        deadline,
+        "accessible parent",
+        proxy.inner().get_property("Parent"),
+    )
+    .await?;
+    if path.as_str() == "/org/a11y/atspi/null" {
+        return Ok(ObjectRefOwned::new(atspi_common::ObjectRef::Null));
+    }
+    Ok(ObjectRefOwned::new(atspi_common::ObjectRef::Owned {
+        name: name.try_into().map_err(pointer_reference_error)?,
+        path: path.into_inner(),
+    }))
+}
+
 async fn pointer_component<'a>(
     ctx: &AxContext,
     conn: &'a zbus::Connection,
@@ -1089,8 +1106,7 @@ async fn containing_window_root(
         if is_window_coordinate_root(role) {
             return Ok(current);
         }
-        let parent =
-            pointer_bus_call(ctx.deadline, "target ancestor parent", proxy.parent()).await?;
+        let parent = pointer_parent(ctx.deadline, &proxy).await?;
         if parent.is_null() {
             return Err(pointer_reference_error(
                 "target has no containing window, frame, or dialog",
@@ -1113,8 +1129,7 @@ async fn first_interactable_ancestor(
     let mut seen = vec![current.clone()];
     for _ in 0..ctx.limits.depth {
         let current_proxy = pointer_accessible(conn, &current).await?;
-        let parent =
-            pointer_bus_call(ctx.deadline, "ancestor parent", current_proxy.parent()).await?;
+        let parent = pointer_parent(ctx.deadline, &current_proxy).await?;
         if parent.is_null() {
             return Ok(None);
         }
@@ -1167,7 +1182,7 @@ async fn classify_pointer_hit(
         if map_role(role).is_interactable() {
             return Ok(PointerHit::Other);
         }
-        let parent = pointer_bus_call(ctx.deadline, "hit parent", current_proxy.parent()).await?;
+        let parent = pointer_parent(ctx.deadline, &current_proxy).await?;
         if parent.is_null() {
             return Ok(PointerHit::Other);
         }
@@ -1608,6 +1623,92 @@ mod tests {
     use atspi_common::ObjectRef;
 
     use super::*;
+
+    struct ParentProperty {
+        name: String,
+        path: zbus::zvariant::OwnedObjectPath,
+    }
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl ParentProperty {
+        fn get_role(&self) -> u32 {
+            atspi_common::Role::Panel as u32
+        }
+
+        #[zbus(property)]
+        fn parent(&self) -> (String, zbus::zvariant::OwnedObjectPath) {
+            (self.name.clone(), self.path.clone())
+        }
+    }
+
+    #[test]
+    #[ignore = "starts a private D-Bus; run via scripts/test-a11y.sh"]
+    fn pointer_parent_reads_null_valid_and_malformed_properties() {
+        let bus = glass_dbus_linux::PrivateBus::start().expect("private bus");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let service = zbus::connection::Builder::address(bus.a11y_bus_address())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let client = zbus::connection::Builder::address(bus.a11y_bus_address())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            for (name, path, succeeds) in [
+                ("", "/org/a11y/atspi/null", true),
+                (":1.42", "/org/a11y/atspi/accessible/root", true),
+                ("", "/org/a11y/atspi/accessible/root", false),
+                ("not a bus name", "/org/a11y/atspi/accessible/root", false),
+            ] {
+                let node_path = "/org/a11y/atspi/accessible/parent_test";
+                service.object_server().at(node_path, ParentProperty {
+                    name: name.into(),
+                    path: path.try_into().unwrap(),
+                }).await.unwrap();
+                let proxy = AccessibleProxy::builder(&client)
+                    .cache_properties(zbus::proxy::CacheProperties::No)
+                    .destination(service.unique_name().unwrap()).unwrap()
+                    .path(node_path).unwrap().build().await.unwrap();
+                let result = pointer_parent(Deadline::from_millis(1000), &proxy).await;
+                assert_eq!(result.is_ok(), succeeds, "parent ({name:?}, {path:?}): {result:?}");
+                if succeeds {
+                    let parent = result.unwrap();
+                    assert_eq!(parent.is_null(), path == "/org/a11y/atspi/null");
+                    assert_eq!(parent.path_as_str(), path);
+                    assert_eq!(parent.name_as_str(), (!name.is_empty()).then_some(name));
+                    if parent.is_null() {
+                        let ctx = AxContext {
+                            pids: vec![],
+                            window: glass_core::WindowGeometry::default(),
+                            window_handle: None,
+                            a11y_bus_addr: None,
+                            limits: glass_core::WalkLimits::DEFAULT,
+                            deadline: Deadline::from_millis(1000),
+                        };
+                        let target = ObjectRefOwned::from_static_str_unchecked(
+                            ":1.42", "/org/a11y/atspi/accessible/target",
+                        );
+                        let hit = ObjectRefOwned::new(ObjectRef::Owned {
+                            name: service.unique_name().unwrap().clone().into(),
+                            path: node_path.try_into().unwrap(),
+                        });
+                        assert_eq!(
+                            classify_pointer_hit(&ctx, &client, &target, None, hit).await.unwrap(),
+                            PointerHit::Other,
+                            "an unrelated panel with no parent is a hit mismatch, not a transport error",
+                        );
+                    }
+                }
+                service.object_server().remove::<ParentProperty, _>(node_path).await.unwrap();
+            }
+        });
+    }
 
     struct NumericProperties(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
