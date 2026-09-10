@@ -51,6 +51,8 @@ const _: () = assert!(
 );
 
 const INPUT_SETTLE: Duration = Duration::from_millis(8);
+// Give frame-based clients time to consume an action before another changes its target or focus.
+const INPUT_ACTION_DWELL: Duration = Duration::from_millis(50);
 
 fn clamped_budget(deadline: Deadline, own: Duration, now: Instant) -> (Duration, Whose) {
     deadline.budget(own, now)
@@ -62,6 +64,17 @@ struct WaylandDispatch(Cell<bool>);
 impl WaylandDispatch {
     fn mark(&self) {
         self.0.set(true);
+    }
+
+    fn finish_input_by(&self, deadline: Deadline) {
+        if self.0.get() {
+            std::thread::sleep(
+                deadline
+                    .remaining()
+                    .unwrap_or(INPUT_ACTION_DWELL)
+                    .min(INPUT_ACTION_DWELL),
+            );
+        }
     }
 
     fn deadline_error(&self, op: &str) -> GlassError {
@@ -2706,6 +2719,7 @@ impl Platform for WaylandPlatform {
                 .conn
                 .flush()
                 .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+            dispatch.finish_input_by(deadline);
             Ok(())
         })
     }
@@ -2757,6 +2771,7 @@ impl Platform for WaylandPlatform {
                 .conn
                 .flush()
                 .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+            dispatch.finish_input_by(deadline);
             Ok(())
         })
     }
@@ -5228,6 +5243,66 @@ mod session_tests {
             lines.iter().any(|l| l.ends_with("25 15")),
             "the point must be relative to the window, not the output: {lines:#?}"
         );
+    }
+
+    #[test]
+    fn input_action_dwell_obeys_the_caller_deadline_after_dispatch() {
+        let deadline = Deadline::from_millis(40);
+        let error = run_wayland_call_by(deadline, "pointer input", |dispatch| {
+            dispatch.mark();
+            dispatch.finish_input_by(deadline);
+            Ok(())
+        })
+        .expect_err("action spacing spends the caller's remaining budget");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn input_action_without_dispatch_does_not_spend_the_dwell() {
+        let deadline = Deadline::from_millis(40);
+        run_wayland_call_by(deadline, "empty input", |dispatch| {
+            dispatch.finish_input_by(deadline);
+            Ok(())
+        })
+        .expect("an empty action needs no pacing");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor; needs sway and Mesa"]
+    fn input_action_dwell_deadline_keeps_dispatched_clicks_released() {
+        let mut s = Launch::new().start_mapped();
+        let error = s
+            .platform()
+            .send_pointer_by(
+                &PointerEvent::Click {
+                    x: 20,
+                    y: 20,
+                    button: glass_core::MouseButton::Left,
+                    count: 1,
+                    modifiers: vec![],
+                },
+                Deadline::from_millis(60),
+            )
+            .expect_err("deadline expires during action spacing");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        let lines = s.wait_for_log_sequence(&[" 272 1", " 272 0"]);
+        assert!(
+            lines.iter().any(|line| line.ends_with(" 272 1")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.ends_with(" 272 0")),
+            "{lines:?}"
+        );
+        assert!(s.platform().active.as_ref().unwrap().input_poison.is_none());
     }
 
     #[test]
