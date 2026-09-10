@@ -1534,6 +1534,21 @@ fn open_session(
     let pointer =
         vp_manager.create_virtual_pointer_with_output(Some(&seat), Some(&output), &qh, ());
     let keyboard = vk_manager.create_virtual_keyboard(&seat, &qh, ());
+    // A client can receive modifiers as soon as it maps, before any input action.
+    let initial_keymap = crate::keyboard::build_keymap(&[]);
+    let mut initial_keymap_file = tempfile::tempfile().map_err(GlassError::Io)?;
+    initial_keymap_file
+        .write_all(initial_keymap.as_bytes())
+        .map_err(GlassError::Io)?;
+    initial_keymap_file
+        .write_all(&[0])
+        .map_err(GlassError::Io)?;
+    keyboard.keymap(
+        1,
+        initial_keymap_file.as_fd(),
+        keymap_wire_len(&initial_keymap)?,
+    );
+    roundtrip_until(&conn, &mut queue, &mut state, deadline, "initial keymap")?;
 
     // The sway IPC socket appears in the private runtime dir alongside the wayland
     // socket; retry briefly in case it lands a moment later.
@@ -4235,6 +4250,13 @@ mod session_tests {
     const SCRIPTED_X_WINDOW_2: u32 = 0x201;
     const STALLED_X_REPLY: Duration = Duration::from_secs(1);
     const X_REPLY_DEADLINE: Duration = Duration::from_millis(50);
+
+    #[test]
+    #[ignore = "starts a private compositor and native client; needs sway and Mesa"]
+    fn a_native_client_receives_a_keymap_before_any_input_action() {
+        let mut session = Launch::new().start();
+        session.wait_for_log("keyboard: initial keymap valid=true");
+    }
 
     fn scripted_x_recovery(
         missing_before: &[u32],
