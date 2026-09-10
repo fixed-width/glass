@@ -15,10 +15,10 @@ use crate::{Deadline, GlassError};
 pub const TYPE_DWELL: Duration = Duration::from_millis(60);
 
 /// The per-backend primitive that [`run_type`] sequences. `character` must be
-/// **self-committed**: it performs the backend's commit barrier before returning — Windows
-/// one `SendInput`, X11 `XFlush`, Wayland a compositor roundtrip — so each keystroke is
-/// delivered before the next. A picky or heavy client (e.g. a browser) silently drops
-/// keystrokes that are merely queued and committed once at the end.
+/// **self-committed**: it submits the character before returning — Windows one `SendInput`,
+/// X11 `XFlush`, Wayland a compositor roundtrip. This does not acknowledge app consumption;
+/// backends also pace characters and completed actions where needed. A heavy client can drop
+/// keystrokes that are queued and committed only once at the end.
 pub trait TypeSink {
     /// Press and release one character, committing before returning.
     fn character(&mut self, c: char) -> crate::Result<()>;

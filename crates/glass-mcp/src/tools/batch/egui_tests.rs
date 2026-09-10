@@ -47,35 +47,150 @@ fn actions(glass: &mut Glass, input: Vec<Value>, batched: bool) {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 #[ignore = "needs private Xvfb/AT-SPI and a built glass-fixture-egui"]
 fn consecutive_inputs_preserve_clicks_and_final_text_in_batches_and_standalone() {
+    consecutive_inputs("x11", false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "needs headless sway/AT-SPI and a built glass-fixture-egui"]
+fn wayland_consecutive_inputs_preserve_clicks_and_final_text() {
+    consecutive_inputs("wayland", false);
+    consecutive_inputs("wayland", true);
+}
+
+#[test]
+#[cfg(windows)]
+#[ignore = "needs an interactive Windows desktop and a built glass-fixture-egui"]
+fn windows_consecutive_inputs_preserve_clicks_and_final_text() {
+    // SAFETY: one-time DPI setup for this dedicated on-box test process.
+    #[allow(unsafe_code)]
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    consecutive_inputs("windows", false);
+}
+
+#[cfg(target_os = "linux")]
+struct PausedApp {
+    pid: rustix::process::Pid,
+    resume: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl PausedApp {
+    fn new(pid_file: &std::path::Path, fixture: &std::path::Path) -> Self {
+        use rustix::process::{Pid, Signal, kill_process};
+        let raw: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let pid = Pid::from_raw(raw).unwrap();
+        assert_eq!(
+            std::fs::read_link(format!("/proc/{raw}/exe")).unwrap(),
+            fixture.canonicalize().unwrap(),
+            "only suspend the fixture launched by this test"
+        );
+        kill_process(pid, Signal::STOP).unwrap();
+        let mut paused = Self { pid, resume: None };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{raw}/stat")).unwrap();
+            if stat.rsplit_once(')').unwrap().1.split_whitespace().next() == Some("T") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fixture did not stop");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        paused.resume = Some(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            kill_process(pid, Signal::CONT).unwrap();
+        }));
+        paused
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PausedApp {
+    fn drop(&mut self) {
+        let _ = rustix::process::kill_process(self.pid, rustix::process::Signal::CONT);
+        if let Some(resume) = self.resume.take() {
+            let _ = resume.join();
+        }
+    }
+}
+
+fn consecutive_inputs(backend: &'static str, stall: bool) {
     let fixture = std::env::var_os("GLASS_EGUI_FIXTURE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../glass-fixture-egui/target/release/glass-fixture-egui")
+                .join("../glass-fixture-egui/target/release")
+                .join(format!(
+                    "glass-fixture-egui{}",
+                    std::env::consts::EXE_SUFFIX
+                ))
         });
     assert!(fixture.is_file(), "build the egui fixture: {fixture:?}");
     let dir = tempfile::tempdir().unwrap();
-    let xvfb = glass_x11::Xvfb::start("1280x800x24").unwrap();
-    let display = xvfb.display.clone();
+    #[cfg(target_os = "linux")]
+    let xvfb = (backend == "x11").then(|| glass_x11::Xvfb::start("1280x800x24").unwrap());
+    #[cfg(target_os = "linux")]
+    let display = xvfb.as_ref().map(|xvfb| xvfb.display.clone());
     let mut glass = Glass::new(
         Box::new(move |_| {
-            Ok(Backend {
-                platform: Box::new(glass_x11::X11Platform::connect(Some(&display))?),
+            #[cfg(target_os = "linux")]
+            let backend = Backend {
+                platform: match backend {
+                    "x11" => Box::new(glass_x11::X11Platform::connect(display.as_deref())?),
+                    "wayland" => Box::new(glass_wayland::WaylandPlatform::new()?),
+                    _ => unreachable!(),
+                },
                 accessibility: Some(Box::new(glass_a11y_linux::LinuxA11y::new())),
-            })
+            };
+            #[cfg(windows)]
+            let backend = Backend {
+                platform: Box::new(glass_windows::WindowsPlatform::new()?),
+                accessibility: Some(Box::new(glass_a11y_windows::WindowsA11y::new())),
+            };
+            Ok(backend)
         }),
-        "x11".into(),
+        backend.into(),
         BaselineStore::new(dir.path().join("baselines")),
         1000,
     );
+    let fixture_run = vec![fixture.to_string_lossy().into_owned()];
+    #[cfg(target_os = "linux")]
+    let pid_file = dir.path().join("fixture.pid");
+    #[cfg(target_os = "linux")]
+    let fixture_run = if stall {
+        let launcher = dir.path().join("launch.sh");
+        std::fs::write(&launcher, "echo $$ > \"$1\"\nexec \"$2\"\n").unwrap();
+        vec![
+            "sh".into(),
+            launcher.to_string_lossy().into_owned(),
+            pid_file.to_string_lossy().into_owned(),
+            fixture.to_string_lossy().into_owned(),
+        ]
+    } else {
+        fixture_run
+    };
     glass
         .start(&AppSpec {
             build: None,
-            run: vec![fixture.to_string_lossy().into_owned()],
+            run: fixture_run,
             cwd: None,
-            env: vec![("LIBGL_ALWAYS_SOFTWARE".into(), "1".into())],
+            env: if backend == "x11" {
+                vec![("LIBGL_ALWAYS_SOFTWARE".into(), "1".into())]
+            } else {
+                vec![]
+            },
             window_hint: None,
             timeout_ms: 10_000,
             sandbox: SandboxLevel::Off,
@@ -110,6 +225,8 @@ fn consecutive_inputs_preserve_clicks_and_final_text_in_batches_and_standalone()
         for batched in [false, true] {
             let (_, cursor) = glass.logs(0, 1000, None, None).unwrap();
             let text = format!("sequence-{repetition}-{batched}.json");
+            #[cfg(target_os = "linux")]
+            let paused = stall.then(|| PausedApp::new(&pid_file, &fixture));
             actions(
                 &mut glass,
                 vec![
@@ -122,6 +239,8 @@ fn consecutive_inputs_preserve_clicks_and_final_text_in_batches_and_standalone()
                 ],
                 batched,
             );
+            #[cfg(target_os = "linux")]
+            drop(paused);
             let deadline = Instant::now() + Duration::from_secs(2);
             let applied = format!("[fixture] applied_text={text}");
             let lines = loop {
@@ -146,7 +265,7 @@ fn consecutive_inputs_preserve_clicks_and_final_text_in_batches_and_standalone()
                         .filter(|line| !line.starts_with("[fixture] key "))
                         .collect();
                     failures.push(format!(
-                        "batch={batched} repetition={repetition}: missing {expected}; {outcomes:?}"
+                        "backend={backend} stall={stall} batch={batched} repetition={repetition}: missing {expected}; {outcomes:?}"
                     ));
                 }
             }

@@ -766,6 +766,7 @@ pub(crate) fn send_pointer_by(
                 return Err(crate::unsupported_multi_touch());
             }
         }
+        dispatch.finish_input_by(deadline);
         Ok(())
     })
 }
@@ -807,6 +808,9 @@ pub(crate) fn send_key_by(active_hwnd: isize, event: &KeyEvent, deadline: Deadli
                 };
                 glass_core::run_chord_by(&mut sink, deadline)?;
             }
+        }
+        if !matches!(event, KeyEvent::Text(text) if text.is_empty()) {
+            dispatch.finish_input_by(deadline);
         }
         Ok(())
     })

@@ -34,6 +34,8 @@ internal refactors, CI, or test-only changes.
 - Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
 
 ### Fixed
+
+- Wayland and Windows input now allow 50 ms after dispatched pointer and keyboard actions before returning, bounded by the caller deadline. This keeps rapid standalone calls and `glass_do` sequences from changing the click target or focus before a frame-based app consumes the previous action. Deadline expiry preserves possible-dispatch reporting; app transitions still require checking the expected state.
 - X11 input now allows 50 ms after each dispatched pointer or keyboard action before returning, bounded by the caller deadline. This prevents rapid action sequences from combining clicks or a final typed character with a later focus change in the same UI frame. Both standalone input tools and `glass_do` use the same pacing; successful dispatch still requires verifying the app's expected state.
 - Log tool guidance now directs verification of completed actions to buffered output and explains saving a cursor before repeated events. The already-buffered timeout note discourages repeating a wait that watches only future lines.
 - Restored `glass_do` batching cues in standalone action descriptions and early shared instructions, so agents discovering tools can choose one call for two or more known steps and pause when later steps depend on new observations.

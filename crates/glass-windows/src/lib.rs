@@ -43,6 +43,10 @@ pub use host_fs::{
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
 pub const BACKEND: &str = "windows";
 
+// Match X11 action spacing for clients that consume input once per UI frame.
+#[cfg(any(windows, test))]
+const INPUT_ACTION_DWELL: std::time::Duration = std::time::Duration::from_millis(50);
+
 #[cfg(any(windows, test))]
 #[derive(Default)]
 struct WindowsDispatch(std::cell::Cell<bool>);
@@ -51,6 +55,17 @@ struct WindowsDispatch(std::cell::Cell<bool>);
 impl WindowsDispatch {
     fn mark(&self) {
         self.0.set(true);
+    }
+
+    fn finish_input_by(&self, deadline: glass_core::Deadline) {
+        if self.0.get() {
+            std::thread::sleep(
+                deadline
+                    .remaining()
+                    .unwrap_or(INPUT_ACTION_DWELL)
+                    .min(INPUT_ACTION_DWELL),
+            );
+        }
     }
 
     fn deadline_error(&self, op: &str) -> glass_core::GlassError {
@@ -597,6 +612,32 @@ mod deadline_tests {
             std::thread::sleep(Duration::from_millis(10));
             Ok(())
         }
+    }
+
+    #[test]
+    fn input_action_dwell_obeys_the_caller_deadline_after_dispatch() {
+        let deadline = Deadline::from_millis(40);
+        let error = run_windows_call_by(deadline, "pointer input", |dispatch| {
+            dispatch.mark();
+            dispatch.finish_input_by(deadline);
+            Ok(())
+        })
+        .expect_err("action spacing spends the caller's remaining budget");
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn input_action_without_dispatch_does_not_spend_the_dwell() {
+        let deadline = Deadline::from_millis(40);
+        run_windows_call_by(deadline, "empty input", |dispatch| {
+            dispatch.finish_input_by(deadline);
+            Ok(())
+        })
+        .expect("an empty action needs no pacing");
     }
 
     #[test]

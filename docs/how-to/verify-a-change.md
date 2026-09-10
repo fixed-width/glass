@@ -101,14 +101,28 @@ The egui text-write recovery test also needs the workspace-excluded fixture:
 cargo build --release --manifest-path crates/glass-fixture-egui/Cargo.toml
 cargo test -p glass-a11y-linux --test egui -- --ignored
 cargo test -p glass-mcp --lib consecutive_inputs_preserve_clicks_and_final_text_in_batches_and_standalone -- --ignored
+cargo test -p glass-mcp --lib wayland_consecutive_inputs_preserve_clicks_and_final_text -- --ignored
 ```
 
 Set `GLASS_EGUI_FIXTURE` to use an already-built fixture at another path. This test checks that a
 missing text-write interface refuses before dispatch, keyboard input recovers, and numeric
 accessibility writes still work.
 
-The MCP egui test checks consecutive coordinate clicks and typing followed by Apply, both as
-standalone tools and in `glass_do`. It starts its own Xvfb display and private accessibility bus.
+The MCP egui tests check consecutive coordinate clicks and typing followed by Apply, both as
+standalone tools and in `glass_do`. They start their own Xvfb display or headless sway compositor
+and private accessibility bus. The Wayland test also pauses its owned fixture for 40 ms before
+each sequence to check input consumption after a brief app stall.
+
+The same app-outcome regression runs on a Windows host in its interactive desktop session:
+
+```powershell
+cargo build --release --manifest-path crates/glass-fixture-egui/Cargo.toml
+cargo test -p glass-mcp --lib windows_consecutive_inputs_preserve_clicks_and_final_text -- --ignored --test-threads=1
+```
+
+Set `GLASS_EGUI_FIXTURE` to override the fixture executable on Windows as well. Build over SSH
+if needed, then run the test executable through the scheduled-task bridge described below so
+input and capture have access to the interactive session.
 
 The X11 and Wayland **backend crates** also keep their display-backed unit tests behind
 `#[ignore]`, and no harness script runs those — if you changed `glass-x11` or `glass-wayland`,
