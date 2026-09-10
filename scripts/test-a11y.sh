@@ -50,6 +50,7 @@ export XDG_RUNTIME_DIR="$A11Y_TEST_RUNTIME"
 # org.a11y.Status.ScreenReaderEnabled advertisement that accesskit-based apps gate on) run
 # under the same throwaway XDG_RUNTIME_DIR isolation.
 cargo test -p glass-dbus-linux --lib -- --ignored --test-threads=1 "$TEST_FILTER"
+cargo test -p glass-a11y-linux --lib -- --ignored --test-threads=1 "$TEST_FILTER"
 cargo test -p glass-a11y-linux --test integration -- --ignored --test-threads=1 "${SKIP_ARGS[@]}" "$TEST_FILTER"
 # Its own binary, so the environment it mutates is nothing else's (see the file's header).
 cargo test -p glass-a11y-linux --test launcher_override -- --ignored "$TEST_FILTER"

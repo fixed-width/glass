@@ -6,6 +6,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod registry;
+
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -37,6 +39,9 @@ pub struct PrivateBus {
     atspi: Child,
     session_bus_address: String,
     a11y_bus_address: String,
+    // Last-client disconnects can remove Chromium's ATK key listener inside its callback.
+    // Keep one registration alive until the private bus itself has been stopped.
+    _registry: registry::RegistryClient,
     #[expect(dead_code, reason = "RAII: keep the dbus-daemon stdout pipe open")]
     dbus_stdout: ChildStdout,
     // at-spi-bus-launcher writes its socket under $XDG_RUNTIME_DIR/at-spi/; a private
@@ -149,12 +154,16 @@ impl PrivateBus {
             }
         };
 
-        match resolve_a11y_address(&session_bus_address) {
-            Ok(a11y_bus_address) => Ok(PrivateBus {
+        let resolved = resolve_a11y_address(&session_bus_address).and_then(|address| {
+            registry::RegistryClient::start(&address).map(|client| (address, client))
+        });
+        match resolved {
+            Ok((a11y_bus_address, registry)) => Ok(PrivateBus {
                 dbus,
                 atspi,
                 session_bus_address,
                 a11y_bus_address,
+                _registry: registry,
                 dbus_stdout,
                 runtime_dir,
             }),
@@ -1059,6 +1068,63 @@ mod tests {
         let b = PrivateBus::start().expect("bus b");
         assert_ne!(a.session_bus_address(), b.session_bus_address());
         assert_ne!(a.runtime_dir(), b.runtime_dir());
+    }
+
+    #[test]
+    #[ignore = "spawns a private AT-SPI registry; run via scripts/test-a11y.sh"]
+    fn registry_client_survives_reader_disconnects_and_releases_its_registration() {
+        let bus = PrivateBus::start().expect("private bus");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let observer = atspi::AccessibilityConnection::from_address(
+                bus.a11y_bus_address().try_into().unwrap(),
+            )
+            .await
+            .expect("observer connection");
+            let registry = atspi::proxy::registry::RegistryProxy::new(observer.connection())
+                .await
+                .unwrap();
+            let initial = registry.registered_events().await.unwrap();
+            assert_eq!(
+                initial.len(),
+                1,
+                "a listener must exist before launching an app"
+            );
+            assert_eq!(initial[0].1, "Object::");
+
+            for _ in 0..4 {
+                let reader = registry::RegistryClient::start(bus.a11y_bus_address())
+                    .expect("temporary client");
+                assert_eq!(registry.registered_events().await.unwrap().len(), 2);
+                drop(reader);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while registry.registered_events().await.unwrap() != initial {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the temporary registration must close while the session listener remains");
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "spawns a private bus without a registry service; run via scripts/test-a11y.sh"]
+    fn missing_registry_fails_startup_without_a_successful_client() {
+        let bus = PrivateBus::start().expect("private bus");
+        let error = match registry::RegistryClient::start(bus.session_bus_address()) {
+            Ok(_) => panic!("the session bus does not host the AT-SPI registry"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("AT-SPI registry client"),
+            "{error}"
+        );
+        let _working = registry::RegistryClient::start(bus.a11y_bus_address())
+            .expect("a failed start must not prevent a later connection");
     }
 
     /// The private session bus must expose NO auto-activatable services. glass spawns

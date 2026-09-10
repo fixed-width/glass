@@ -326,6 +326,7 @@ async fn set_value_async(
             return Err(GlassError::AxElementNotEditable(target.id.0));
         }
         let et = atspi::proxy::editable_text::EditableTextProxy::builder(&conn)
+            .cache_properties(zbus::proxy::CacheProperties::No)
             .destination(dest)
             .map_err(bus_err)?
             .path(path)
@@ -358,6 +359,7 @@ async fn set_value_async(
         && let Ok(v) = text.parse::<f64>()
     {
         let value_proxy = atspi::proxy::value::ValueProxy::builder(&conn)
+            .cache_properties(zbus::proxy::CacheProperties::No)
             .destination(dest)
             .ok()
             .and_then(|b| b.path(path).ok());
@@ -673,6 +675,7 @@ async fn try_action(
     let dest = node.inner().destination().to_owned();
     let path = node.inner().path().to_owned();
     let Some(action) = atspi::proxy::action::ActionProxy::builder(conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .destination(dest)
         .ok()
         .and_then(|b| b.path(path).ok())
@@ -929,6 +932,7 @@ async fn pointer_component<'a>(
 ) -> Result<ComponentProxy<'a>> {
     let identity = required_object_identity(object)?;
     let builder = ComponentProxy::builder(conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .destination(identity.bus_name)
         .map_err(|e| pointer_reference_error(format!("component destination: {e}")))?
         .path(identity.object_path)
@@ -1285,6 +1289,7 @@ async fn focus_text_editor(
     let dest = node.inner().destination().to_owned();
     let path = node.inner().path().to_owned();
     let builder = ComponentProxy::builder(conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .destination(dest)
         .map_err(|_| GlassError::AxActionUnavailable(id))?
         .path(path)
@@ -1473,6 +1478,7 @@ async fn extents(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Option
     let dest = proxy.inner().destination().to_owned();
     let path = proxy.inner().path().to_owned();
     let comp = ComponentProxy::builder(conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .destination(dest)
         .ok()?
         .path(path)
@@ -1516,6 +1522,7 @@ async fn read_value(
 /// [`read_back_confirms`] must never mistake for a value.
 async fn read_text(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Option<String> {
     let text = atspi::proxy::text::TextProxy::builder(conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .destination(proxy.inner().destination().to_owned())
         .ok()?
         .path(proxy.inner().path().to_owned())
@@ -1531,6 +1538,7 @@ async fn read_text(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Opti
 /// `None` when the interface is absent or the call failed.
 async fn read_number(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Option<String> {
     let val = atspi::proxy::value::ValueProxy::builder(conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .destination(proxy.inner().destination().to_owned())
         .ok()?
         .path(proxy.inner().path().to_owned())
@@ -1600,6 +1608,97 @@ mod tests {
     use atspi_common::ObjectRef;
 
     use super::*;
+
+    struct NumericProperties(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[zbus::interface(name = "org.a11y.atspi.Value")]
+    impl NumericProperties {
+        #[zbus(property)]
+        fn current_value(&self) -> f64 {
+            42.0
+        }
+
+        #[zbus(property)]
+        fn minimum_value(&self) -> zbus::fdo::Result<f64> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(zbus::fdo::Error::NotSupported("unused property".into()))
+        }
+    }
+
+    struct TextProperties(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[zbus::interface(name = "org.a11y.atspi.Text")]
+    impl TextProperties {
+        #[zbus(property)]
+        fn character_count(&self) -> i32 {
+            5
+        }
+
+        #[zbus(property)]
+        fn caret_offset(&self) -> zbus::fdo::Result<i32> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(zbus::fdo::Error::NotSupported("unused property".into()))
+        }
+
+        fn get_text(&self, start: i32, end: i32) -> String {
+            assert_eq!((start, end), (0, 5));
+            "hello".into()
+        }
+    }
+
+    #[test]
+    #[ignore = "starts a private D-Bus and AT-SPI registry; run via scripts/test-a11y.sh"]
+    fn value_reads_do_not_request_unrelated_properties() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let bus = glass_dbus_linux::PrivateBus::start().expect("private bus");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let unrequested_reads = Arc::new(AtomicUsize::new(0));
+            let path = "/org/a11y/atspi/accessible/properties";
+            let service = zbus::connection::Builder::address(bus.a11y_bus_address())
+                .unwrap()
+                .serve_at(path, NumericProperties(Arc::clone(&unrequested_reads)))
+                .unwrap()
+                .serve_at(path, TextProperties(Arc::clone(&unrequested_reads)))
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let client = zbus::connection::Builder::address(bus.a11y_bus_address())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let accessible = AccessibleProxy::builder(&client)
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .destination(service.unique_name().unwrap())
+                .unwrap()
+                .path(path)
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                read_number(&accessible, &client).await.as_deref(),
+                Some("42")
+            );
+            assert_eq!(
+                read_text(&accessible, &client).await.as_deref(),
+                Some("hello")
+            );
+            assert_eq!(
+                unrequested_reads.load(Ordering::SeqCst),
+                0,
+                "GetAll reaches unrelated toolkit getters"
+            );
+        });
+    }
 
     #[test]
     fn linux_reader_declares_every_state_fact_its_atspi_mapping_populates() {

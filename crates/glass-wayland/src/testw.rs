@@ -495,6 +495,7 @@ mod app {
         ignores_close: bool,
         pointer: Option<wl_pointer::WlPointer>,
         keyboard: Option<wl_keyboard::WlKeyboard>,
+        saw_keymap: bool,
         redraw: bool,
     }
 
@@ -547,7 +548,7 @@ mod app {
 
     impl Dispatch<wl_keyboard::WlKeyboard, ()> for App {
         fn event(
-            _: &mut Self,
+            app: &mut Self,
             _: &wl_keyboard::WlKeyboard,
             event: wl_keyboard::Event,
             _: &(),
@@ -555,6 +556,22 @@ mod app {
             _: &QueueHandle<Self>,
         ) {
             match event {
+                wl_keyboard::Event::Keymap { format, fd, size } if !app.saw_keymap => {
+                    use std::io::Read as _;
+
+                    app.saw_keymap = true;
+                    let mut contents = Vec::new();
+                    let read = std::fs::File::from(fd)
+                        .take(u64::from(size))
+                        .read_to_end(&mut contents);
+                    let valid =
+                        matches!(format.into_result(), Ok(wl_keyboard::KeymapFormat::XkbV1))
+                            && read.is_ok()
+                            && contents.len() == size as usize
+                            && contents.starts_with(b"xkb_keymap")
+                            && contents.last() == Some(&0);
+                    echo(format!("keyboard: initial keymap valid={valid}"));
+                }
                 wl_keyboard::Event::Key { key, state, .. } => echo(format!(
                     "input: key {key} {}",
                     state.into_result().map(|s| s as u32).unwrap_or(0)
@@ -722,6 +739,7 @@ mod app {
             ignores_close: std::env::var_os(super::IGNORES_CLOSE).is_some(),
             pointer: None,
             keyboard: None,
+            saw_keymap: false,
             redraw: false,
         };
         // Keep every proxy alive for the process's lifetime: dropping a wl_surface destroys the
