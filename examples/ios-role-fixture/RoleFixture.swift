@@ -235,6 +235,18 @@ final class WebViewController: UIViewController {
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        configurationForConnecting session: UISceneSession,
+        options: UIScene.ConnectionOptions
+    ) -> UISceneConfiguration {
+        let configuration = UISceneConfiguration(name: "Default", sessionRole: session.role)
+        configuration.delegateClass = SceneDelegate.self
+        return configuration
+    }
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
 
     /// The screen to show, as an index into the tab controller.
@@ -272,10 +284,12 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         }
     }
 
-    func application(
-        _ application: UIApplication,
-        didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?
-    ) -> Bool {
+    func scene(
+        _ scene: UIScene,
+        willConnectTo session: UISceneSession,
+        options: UIScene.ConnectionOptions
+    ) {
+        guard let windowScene = scene as? UIWindowScene else { return }
         let controls = UINavigationController(rootViewController: ControlsViewController())
         controls.tabBarItem = UITabBarItem(title: "Controls", image: nil, tag: 0)
         let collection = CollectionViewController()
@@ -292,10 +306,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         tabs.viewControllers = [controls, collection, swiftui, web]
         tabs.selectedIndex = Self.requestedTab()
 
-        let window = UIWindow(frame: UIScreen.main.bounds)
+        let window = UIWindow(windowScene: windowScene)
         window.rootViewController = tabs
         window.makeKeyAndVisible()
         self.window = window
-        return true
     }
 }

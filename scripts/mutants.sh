@@ -200,7 +200,10 @@ planned=$(list_count "${scope[@]}")
 if [ "$planned" -eq 0 ] && [ -n "$diff_file" ] && [ -s "$diff_file" ]; then
     # `+++ b/<path>` names each file the diff writes to; a deletion names /dev/null
     # and drops out with the `.rs` filter.
-    mapfile -t touched < <(
+    touched=()
+    while IFS= read -r file; do
+        touched+=("$file")
+    done < <(
         sed -n 's|^+++ b/||p' "$diff_file" | grep -E '\.rs$' | sort -u
     )
     if [ "${#touched[@]}" -gt 0 ]; then

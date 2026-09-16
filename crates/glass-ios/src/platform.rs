@@ -115,17 +115,10 @@ const LAUNCH_STDERR_DEVICE_PATH: &str = "/tmp/glass-launch-stderr.txt";
 /// Swift `fatalError` (its message, then the trap) without turning an error into a log dump.
 const LAUNCH_FAILURE_LOG_LINES: usize = 4;
 
-/// How long after launch an app that is going to abort has actually gone.
-///
-/// Measured on a Simulator: an app that rejects a launch argument and calls `fatalError`
-/// disappears from `ps` about 465 ms after `simctl launch` returns, repeatably. The window is set
-/// above that so the check is not a race, and it is spent rather than assumed: the work between
-/// launch and check is a screenshot, plus one scale RPC when a driver is present, which does not
-/// reliably cover it.
-///
-/// A window can only ever bound "died at startup"; an app that exits later is a running app that
-/// stopped, which the next operation reports.
-const LAUNCH_DEATH_WINDOW: Duration = Duration::from_millis(750);
+/// Minimum observation window after `simctl launch`: iOS 27 startup assertions and Swift
+/// `fatalError` exits were observed about two seconds after it returned, beyond the old 750 ms
+/// check. This bounds startup detection; it cannot detect an app that exits after the check.
+const LAUNCH_DEATH_WINDOW: Duration = Duration::from_secs(3);
 
 /// The tail of what the app wrote to stderr, read from the simulator's filesystem.
 ///
