@@ -34,6 +34,7 @@ internal refactors, CI, or test-only changes.
 - Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
 
 ### Fixed
+- iOS value writes allow the keyboard to appear before typing and revalidate the field against its unchanged surrounding form when the focusing tap shifts the layout. Stale fields, changed values, ambiguous matches, and unproven layout changes still refuse the write.
 - On Linux, pointer action checks recognize null accessibility parent properties. A hit on an unrelated container now reports the failed actionability check instead of a misleading backend transport failure.
 
 - Linux accessibility sessions keep a registry listener active between operations, preventing Electron crashes when a short-lived reader disconnects during keyboard input. Accessibility property reads also avoid bulk `GetAll` requests that can abort Electron on numeric fields.

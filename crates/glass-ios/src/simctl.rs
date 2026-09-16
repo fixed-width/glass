@@ -317,9 +317,7 @@ mod tests {
     ///   GLASS_IOS_UDID=<booted udid> \
     ///     cargo test -p glass-ios --lib -- --ignored --nocapture a_spawned_command
     ///
-    /// `simctl spawn <udid> /bin/sleep` is a real call into a real simulator that never answers,
-    /// which is what the budget tests above cannot exercise. In-crate because `simctl` is a private
-    /// module, and a test is not a reason to widen the crate's public surface.
+    /// A filtered log stream stays open without filling the captured output buffer.
     #[test]
     #[ignore = "requires a booted simulator + GLASS_IOS_UDID"]
     fn a_spawned_command_that_never_answers_dies_at_its_budget() {
@@ -328,13 +326,24 @@ mod tests {
 
         let started = std::time::Instant::now();
         let err = Simctl::new()
-            // Absolute path: `spawn` runs the binary INSIDE the simulator, where a bare `sleep`
-            // is not on the path and fails instantly with ENOENT rather than hanging.
-            .run(&["spawn", &udid, "/bin/sleep", "100"])
+            // Resolve the simulator's log tool; an absolute path selects a host executable.
+            .run(&[
+                "spawn",
+                &udid,
+                "log",
+                "stream",
+                "--predicate",
+                "processIdentifier == 0",
+            ])
             .expect_err("a call that outlives its budget must fail, not return");
         let waited = started.elapsed();
         println!("waited {waited:?} against a {budget:?} budget; error: {err}");
 
+        assert_eq!(err.bound(), Some(glass_core::BoundKind::TimedOut), "{err}");
+        assert!(
+            waited >= budget,
+            "ended before the {budget:?} budget: {waited:?}"
+        );
         assert!(
             waited < budget + Duration::from_secs(5),
             "waited {waited:?}, past the {budget:?} budget — the bound did not fire"

@@ -4,7 +4,7 @@
 //! input, and finally reads the element back and reports the write as not applied if it does not
 //! hold the text.
 use glass_core::accessibility::{
-    Accessibility, AxContext, AxNodeId, AxRect, AxTarget, AxTree, Located, PointerHit,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, Located, PointerHit,
 };
 use std::time::Duration;
 
@@ -161,16 +161,29 @@ impl IosA11y {
     fn describe(&mut self, ctx: &AxContext, phase: SemanticPhase) -> Result<(AxTree, f64)> {
         phase.require(ctx.deadline)?;
         let (scale, phase) = self.scale(ctx.deadline, phase)?;
-        let (json, phase) = phase
-            .finish_snapshot_rpc(ctx.deadline, self.client.describe_all_rpc_by(ctx.deadline))?;
-        let tree = phase.run(ctx.deadline, || {
-            let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
-            tree.assign_ids();
-            Ok(tree)
-        })?;
-        phase.require(ctx.deadline)?;
-        Ok((tree, scale))
+        Ok((
+            describe_at_scale(self.client.as_ref(), ctx, scale, phase)?,
+            scale,
+        ))
     }
+}
+
+fn describe_at_scale(
+    client: &dyn IosA11yClient,
+    ctx: &AxContext,
+    scale: f64,
+    phase: SemanticPhase,
+) -> Result<AxTree> {
+    phase.require(ctx.deadline)?;
+    let (json, phase) =
+        phase.finish_snapshot_rpc(ctx.deadline, client.describe_all_rpc_by(ctx.deadline))?;
+    let tree = phase.run(ctx.deadline, || {
+        let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
+        tree.assign_ids();
+        Ok(tree)
+    })?;
+    phase.require(ctx.deadline)?;
+    Ok(tree)
 }
 
 /// Locate `target` in a tree described for the write and return its window-relative pixel bounds —
@@ -206,6 +219,150 @@ fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
     }
     node.bounds
         .ok_or(GlassError::AxElementNotClickable(target.id.0))
+}
+
+// The simulator acknowledges the tap before the keyboard is ready to consume keys.
+const FOCUS_SETTLE: Duration = Duration::from_millis(700);
+
+fn prepare_after_focus(
+    client: &dyn IosA11yClient,
+    ctx: &AxContext,
+    scale: f64,
+    before: &AxTree,
+    target: &AxTarget,
+) -> Result<AxTarget> {
+    std::thread::sleep(bounded_sleep_at(
+        ctx.deadline,
+        FOCUS_SETTLE,
+        std::time::Instant::now(),
+    ));
+    let mut previous: Option<AxTarget> = None;
+    let mut last_error = GlassError::AxElementChanged(target.id.0);
+    for attempt in 0..6 {
+        let after = describe_at_scale(
+            client,
+            ctx,
+            scale,
+            SemanticPhase::SetValue { dispatched: true },
+        )?;
+        let candidate = target_after_focus(before, &after, target);
+        SemanticPhase::SetValue { dispatched: true }.require(ctx.deadline)?;
+        match candidate {
+            Ok(next) => {
+                if previous
+                    .as_ref()
+                    .is_some_and(|last| last.bounds == next.bounds)
+                {
+                    return Ok(next);
+                }
+                previous = Some(next);
+            }
+            Err(error) => {
+                previous = None;
+                last_error = error;
+            }
+        }
+        if attempt < 5 {
+            std::thread::sleep(bounded_sleep_at(
+                ctx.deadline,
+                Duration::from_millis(100),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+    Err(last_error)
+}
+
+fn target_after_focus(before: &AxTree, after: &AxTree, target: &AxTarget) -> Result<AxTarget> {
+    if let Ok(bounds) = verify(after, target) {
+        return Ok(AxTarget {
+            bounds: Some(bounds),
+            ..target.clone()
+        });
+    }
+    if !before.can_prove_absence() || !after.can_prove_absence() || target.name.is_none() {
+        return Err(target.drift_error(after));
+    }
+    let Some(node) = after.find_first(|node| target.matches(node.role, node.name.as_deref()))
+    else {
+        return Err(target.drift_error(after));
+    };
+    if after
+        .find_first(|other| {
+            other.id != node.id && target.matches(other.role, other.name.as_deref())
+        })
+        .is_some()
+        || !node.states.editable
+        || !target.value_consistent(node.value.as_deref())
+    {
+        return Err(target.drift_error(after));
+    }
+    let (Some(old), Some(new)) = (target.bounds, node.bounds) else {
+        return Err(target.drift_error(after));
+    };
+    let delta = (
+        i64::from(new.x) - i64::from(old.x),
+        i64::from(new.y) - i64::from(old.y),
+    );
+    let mut anchors = 0;
+    if !same_shifted_form(&before.root, &after.root, target, delta, &mut anchors) || anchors < 2 {
+        return Err(target.drift_error(after));
+    }
+    Ok(AxTarget {
+        id: node.id,
+        bounds: node.bounds,
+        ..target.clone()
+    })
+}
+
+// Only our focusing tap may rebase geometry, with the unchanged form corroborating its move.
+fn same_shifted_form(
+    before: &AxNode,
+    after: &AxNode,
+    target: &AxTarget,
+    delta: (i64, i64),
+    anchors: &mut usize,
+) -> bool {
+    if before.role != after.role
+        || before.raw_role != after.raw_role
+        || before.name != after.name
+        || before.value != after.value
+        || before.description != after.description
+        || before.states != after.states
+        || before.children.len() > after.children.len()
+    {
+        return false;
+    }
+    if before.children.is_empty() {
+        let (Some(old), Some(new)) = (before.bounds, after.bounds) else {
+            return false;
+        };
+        // UIKit's point-to-pixel rounding can change an edge by one scaled point.
+        let shifted = (i64::from(new.x) - i64::from(old.x) - delta.0).abs() <= 4
+            && (i64::from(new.y) - i64::from(old.y) - delta.1).abs() <= 4
+            && (i64::from(new.width) - i64::from(old.width)).abs() <= 4
+            && (i64::from(new.height) - i64::from(old.height)).abs() <= 4;
+        // An unchanged label may rewrap as keyboard avoidance redistributes the space.
+        if !shifted && (before.role != glass_core::AxRole::Label || before.states.editable) {
+            return false;
+        }
+        if shifted && before.name.is_some() && !target.matches(before.role, before.name.as_deref())
+        {
+            *anchors += 1;
+        }
+    }
+    before
+        .children
+        .iter()
+        .zip(&after.children)
+        .all(|(old, new)| same_shifted_form(old, new, target, delta, anchors))
+        && after.children[before.children.len()..]
+            .iter()
+            .all(|node| !contains_editable(node))
+}
+
+fn contains_editable(node: &AxNode) -> bool {
+    node.states.editable || node.children.iter().any(contains_editable)
 }
 
 /// How long to let the app commit typed text before each read-back attempt. Generous next to a
@@ -249,18 +406,20 @@ fn clear_and_type_keys(injector: &IdbInjector, text: &str) -> Result<Vec<proto::
 ///
 /// The second send's failure is post-dispatch: the batch clears before it types, so a stream dying
 /// part-way through leaves the field emptied with the text lost.
-fn dispatch_write(
+fn dispatch_write<T>(
     send: &mut dyn FnMut(Vec<proto::HidEvent>) -> Result<()>,
+    prepare: &mut dyn FnMut() -> Result<T>,
     injector: &IdbInjector,
     tap: &PointerEvent,
     target_id: u32,
     text: &str,
     deadline: Deadline,
-) -> Result<()> {
+) -> Result<T> {
     require_set_value_time(deadline, false)?;
     let keys = clear_and_type_keys(injector, text)?;
     require_set_value_time(deadline, false)?;
     send(injector.pointer_events(tap)?)?;
+    let prepared = prepare().map_err(GlassError::after_dispatch)?;
     require_set_value_time(deadline, true)?;
     send(keys).map_err(|e| {
         if e.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched) {
@@ -280,7 +439,7 @@ fn dispatch_write(
             error,
         ));
     }
-    Ok(())
+    Ok(prepared)
 }
 
 fn require_set_value_time(deadline: Deadline, dispatched: bool) -> Result<()> {
@@ -312,10 +471,12 @@ impl Accessibility for IosA11y {
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         let before_dispatch = SemanticPhase::SetValue { dispatched: false };
         before_dispatch.require(ctx.deadline)?;
-        // One describe serves both the guard and the injector's scale — no second read before the
-        // keystrokes go out.
         let (tree, scale) = self.describe(ctx, before_dispatch)?;
         let bounds = before_dispatch.run(ctx.deadline, || verify(&tree, target))?;
+        let tap_target = AxTarget {
+            bounds: Some(bounds),
+            ..target.clone()
+        };
         let (cx, cy) = before_dispatch.run(ctx.deadline, || {
             bounds
                 .clamped_center(ctx.window.width, ctx.window.height)
@@ -331,11 +492,10 @@ impl Accessibility for IosA11y {
             count: 1,
             modifiers: vec![],
         };
-        // The tap keeps its own call: a delay here is harmless where one inside the keystrokes
-        // loses the text.
-        let client = &self.client;
-        dispatch_write(
+        let client = self.client.as_ref();
+        let write_target = dispatch_write(
             &mut |events| client.hid_by(events, ctx.deadline),
+            &mut || prepare_after_focus(client, ctx, scale, &tree, &tap_target),
             &injector,
             &tap,
             target.id.0,
@@ -361,7 +521,7 @@ impl Accessibility for IosA11y {
                 .map_err(|e| post_write_error(target, e))?;
             match after_dispatch
                 .run(ctx.deadline, || {
-                    verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED)
+                    verify_typed_write(&after, &write_target, text, TAP_MAY_HAVE_MISSED)
                 })
                 .map_err(|e| post_write_error(target, e))
             {
@@ -787,7 +947,7 @@ mod tests {
     fn semantic_set_value_resolves_fresh_input_field_and_keeps_two_hid_calls() {
         let reader_hid = Arc::new(Mutex::new(Vec::new()));
         let platform = HidPlatform::default();
-        let mut replies = successful_tree_replies(&field_json("old"), 2);
+        let mut replies = successful_tree_replies(&field_json("old"), 4);
         replies.extend(successful_tree_replies(&field_json("updated"), 4));
         let mut glass = scripted_glass(replies, Arc::clone(&reader_hid), platform);
         glass.start(&test_spec()).expect("start scripted session");
@@ -799,7 +959,7 @@ mod tests {
                         "inputField",
                         Vec::new(),
                     )),
-                    timeout_ms: Some(1_000),
+                    timeout_ms: Some(2_000),
                     max_nodes: None,
                 },
                 "updated",
@@ -1172,6 +1332,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn focus_settling_uses_the_caller_deadline_and_starts_no_late_read() {
+        let client = ScriptedClient::new(vec![], vec![]);
+        let ctx = ctx(Deadline::at(
+            std::time::Instant::now() + Duration::from_millis(10),
+        ));
+        let error = prepare_after_focus(&client, &ctx, 2.0, &focus_form(420), &matching_target())
+            .unwrap_err();
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+    }
+
     fn leaf(id: u32, role: AxRole, name: &str, r: AxRect) -> AxNode {
         AxNode {
             id: AxNodeId(id),
@@ -1239,6 +1415,160 @@ mod tests {
         }
     }
 
+    fn focus_form(y: i32) -> AxTree {
+        let field = leaf(0, AxRole::TextField, "Note", AxRect { y, ..FIELD });
+        let mut title = leaf(0, AxRole::Label, "Title", AxRect { y: y - 80, ..FIELD });
+        title.states.editable = false;
+        let mut save = leaf(0, AxRole::Button, "Save", AxRect { y: y + 80, ..FIELD });
+        save.states.editable = false;
+        tree_with(vec![field, title, save])
+    }
+
+    #[test]
+    fn focusing_can_translate_an_unchanged_form_before_the_write() {
+        let before = focus_form(420);
+        let mut after = focus_form(120);
+        let mut key = leaf(0, AxRole::Button, "q", AxRect { y: 650, ..FIELD });
+        key.states.editable = false;
+        after.root.children.push(key);
+        after.assign_ids();
+        let target = AxTarget {
+            bounds: before.find(AxNodeId(1)).unwrap().bounds,
+            ..matching_target()
+        };
+
+        assert!(
+            verify(&after, &target).is_err(),
+            "the caller's old geometry is stale"
+        );
+        let refreshed = target_after_focus(&before, &after, &target).unwrap();
+        after.find_mut(AxNodeId(1)).unwrap().value = Some("written".into());
+        verify_typed_write(&after, &refreshed, "written", TAP_MAY_HAVE_MISSED).unwrap();
+        assert!(verify_typed_write(&after, &target, "written", TAP_MAY_HAVE_MISSED).is_err());
+    }
+
+    #[test]
+    fn focus_revalidation_refuses_a_field_that_moves_without_its_form() {
+        let before = focus_form(420);
+        let mut after = focus_form(420);
+        after
+            .find_mut(AxNodeId(1))
+            .unwrap()
+            .bounds
+            .as_mut()
+            .unwrap()
+            .y = 120;
+        let target = AxTarget {
+            bounds: before.find(AxNodeId(1)).unwrap().bounds,
+            ..matching_target()
+        };
+
+        assert!(matches!(
+            target_after_focus(&before, &after, &target),
+            Err(GlassError::AxElementChanged(1))
+        ));
+    }
+
+    #[test]
+    fn a_rewrapped_label_cannot_serve_as_a_translation_anchor() {
+        let before = focus_form(420);
+        let mut after = focus_form(120);
+        after.find_mut(AxNodeId(2)).unwrap().bounds = Some(AxRect {
+            width: 200,
+            height: 20,
+            ..FIELD
+        });
+        let target = AxTarget {
+            bounds: before.find(AxNodeId(1)).unwrap().bounds,
+            ..matching_target()
+        };
+        assert!(
+            target_after_focus(&before, &after, &target).is_err(),
+            "only Save still corroborates the move"
+        );
+
+        let mut before = before;
+        let mut extra = leaf(0, AxRole::Button, "Cancel", AxRect { y: 600, ..FIELD });
+        extra.states.editable = false;
+        before.root.children.push(extra.clone());
+        extra.bounds.as_mut().unwrap().y -= 300;
+        after.root.children.push(extra);
+        before.assign_ids();
+        after.assign_ids();
+        target_after_focus(&before, &after, &target).unwrap();
+    }
+
+    #[test]
+    fn focus_revalidation_refuses_changed_or_incomplete_forms() {
+        let before = focus_form(420);
+        let target = AxTarget {
+            bounds: before.find(AxNodeId(1)).unwrap().bounds,
+            ..matching_target()
+        };
+        for case in ["value", "peer", "duplicate", "incomplete", "new_field"] {
+            let mut after = focus_form(120);
+            match case {
+                "value" => after.find_mut(AxNodeId(1)).unwrap().value = Some("another row".into()),
+                "peer" => after.find_mut(AxNodeId(2)).unwrap().name = Some("Another screen".into()),
+                "duplicate" => after
+                    .root
+                    .children
+                    .push(leaf(0, AxRole::TextField, "Note", FIELD)),
+                "incomplete" => after.unreadable = 1,
+                "new_field" => {
+                    after
+                        .root
+                        .children
+                        .push(leaf(0, AxRole::TextField, "Modal input", FIELD))
+                }
+                _ => unreachable!(),
+            }
+            after.assign_ids();
+            assert!(
+                target_after_focus(&before, &after, &target).is_err(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_revalidation_needs_surrounding_controls_to_prove_a_large_move() {
+        let before = tree_with(vec![leaf(0, AxRole::TextField, "Note", FIELD)]);
+        let after = tree_with(vec![leaf(
+            0,
+            AxRole::TextField,
+            "Note",
+            AxRect { y: 420, ..FIELD },
+        )]);
+        assert!(target_after_focus(&before, &after, &matching_target()).is_err());
+    }
+
+    #[test]
+    fn a_failed_focus_revalidation_sends_no_clear_or_text() {
+        let injector = IdbInjector::new(2.0);
+        let mut sent = Vec::new();
+        let error = dispatch_write(
+            &mut recording_send(&mut sent),
+            &mut || Err::<(), _>(GlassError::AxElementChanged(1)),
+            &injector,
+            &a_tap(),
+            1,
+            "must not type",
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+        assert_eq!(sent, vec![injector.pointer_events(&a_tap()).unwrap()]);
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(matches!(error.cause(), GlassError::AxElementChanged(1)));
+        assert!(
+            !error.set_value_failed_after_writing(),
+            "only the focus tap was sent"
+        );
+    }
+
     /// A `send` that records what it was handed instead of reaching a device, so a test can assert
     /// how many calls the write made — the property glass#363 turns on.
     fn recording_send(
@@ -1268,6 +1598,7 @@ mod tests {
         let mut log = Vec::new();
         dispatch_write(
             &mut recording_send(&mut log),
+            &mut || Ok(()),
             &injector,
             &a_tap(),
             1,
@@ -1292,6 +1623,7 @@ mod tests {
         };
         let err = dispatch_write(
             &mut send,
+            &mut || Ok(()),
             &injector,
             &a_tap(),
             1,
@@ -1322,6 +1654,7 @@ mod tests {
         };
         let err = dispatch_write(
             &mut send,
+            &mut || Ok(()),
             &injector,
             &a_tap(),
             7,
@@ -1350,6 +1683,7 @@ mod tests {
         let mut log = Vec::new();
         let err = dispatch_write(
             &mut recording_send(&mut log),
+            &mut || Ok(()),
             &injector,
             &a_tap(),
             1,
@@ -1380,8 +1714,16 @@ mod tests {
             Ok(())
         };
 
-        let error = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi", deadline)
-            .expect_err("the keystrokes must not begin after the shared deadline expires");
+        let error = dispatch_write(
+            &mut send,
+            &mut || Ok(()),
+            &injector,
+            &a_tap(),
+            1,
+            "hi",
+            deadline,
+        )
+        .expect_err("the keystrokes must not begin after the shared deadline expires");
 
         assert_eq!(sends, 1, "the keystroke batch started after expiry");
         assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
@@ -1408,8 +1750,16 @@ mod tests {
             }
         };
 
-        let error = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi", Deadline::UNBOUNDED)
-            .expect_err("the second HID was refused after the focus tap landed");
+        let error = dispatch_write(
+            &mut send,
+            &mut || Ok(()),
+            &injector,
+            &a_tap(),
+            1,
+            "hi",
+            Deadline::UNBOUNDED,
+        )
+        .expect_err("the second HID was refused after the focus tap landed");
 
         assert_eq!(error.bound_owner(), Some(Whose::Caller));
         assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
@@ -1436,8 +1786,16 @@ mod tests {
             }
         };
 
-        let error = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi", Deadline::UNBOUNDED)
-            .expect_err("the caller-owned HID timeout may have interrupted the value mutation");
+        let error = dispatch_write(
+            &mut send,
+            &mut || Ok(()),
+            &injector,
+            &a_tap(),
+            1,
+            "hi",
+            Deadline::UNBOUNDED,
+        )
+        .expect_err("the caller-owned HID timeout may have interrupted the value mutation");
 
         assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
         assert_eq!(
