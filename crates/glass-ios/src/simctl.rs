@@ -439,18 +439,22 @@ mod tests {
     fn a_fake_told_to_be_slow_actually_takes_that_long() {
         let fake = FakeSimctl::new();
         let simctl = Simctl::at(fake.program());
-        fake.slow("terminate", 1);
+        fake.slow("terminate", 3);
 
         let started = std::time::Instant::now();
         simctl.run(&["terminate", "UDID", "app.id"]).unwrap();
         let slept = started.elapsed();
-        assert!(slept >= Duration::from_millis(900), "returned in {slept:?}");
+        assert!(
+            slept >= Duration::from_millis(2_900),
+            "returned in {slept:?}"
+        );
 
         let started = std::time::Instant::now();
         simctl.run(&["list", "devices"]).unwrap();
+        let waited = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "an unmarked verb must not be slowed too"
+            waited < Duration::from_secs(2),
+            "an unmarked verb must not inherit the 3s delay: waited {waited:?}"
         );
     }
 

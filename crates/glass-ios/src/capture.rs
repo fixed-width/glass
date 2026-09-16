@@ -150,10 +150,11 @@ mod tests {
 
     #[test]
     fn png_decode_finishing_after_the_caller_deadline_is_not_success() {
+        let bytes = png(2, 2);
         let deadline = Deadline::from_millis(100);
         let decoded = std::cell::Cell::new(false);
 
-        let error = decode_png_with(&png(2, 2), deadline, || {
+        let error = decode_png_with(&bytes, deadline, || {
             decoded.set(true);
             while !deadline.has_passed() {
                 std::thread::yield_now();

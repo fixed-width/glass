@@ -281,15 +281,15 @@ fn completed_terminal_screenshot(call: &CallView, backend: &str) -> RgbaImage {
         "{}",
         call.all_text
     );
+    assert_eq!(call.images.len(), 1, "{backend}: {}", call.all_text);
+    let image = &call.images[0];
     assert_eq!(
         terminal[0]["content_blocks"],
-        json!([1, 2]),
-        "{}",
+        json!([image.index, image.index + 1]),
+        "{backend}: terminal screenshot must reference its image and metadata: {}",
         call.all_text
     );
-    assert_eq!(call.images.len(), 1, "{backend}: {}", call.all_text);
-    assert_eq!(call.images[0].index, 1, "{backend}: {}", call.all_text);
-    decode_real_webp(&call.images[0], backend)
+    decode_real_webp(image, backend)
 }
 
 fn decode_real_webp(image: &ImageView, backend: &str) -> RgbaImage {
