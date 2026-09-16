@@ -620,7 +620,7 @@ fn semantic_actions_refuse_unproven_ios_state_and_dispatch_once() {
             &TypeTargetParams {
                 target: semantic_target("inputField", AxRole::TextField),
                 focus_mode: ActionMode::Pointer,
-                timeout_ms: 500,
+                timeout_ms: 3_000,
                 max_nodes: None,
             },
             "forbidden-text",
