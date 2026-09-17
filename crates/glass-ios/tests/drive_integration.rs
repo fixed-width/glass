@@ -457,7 +457,7 @@ fn semantic_actions_refuse_unproven_ios_state_and_dispatch_once() {
             &save.actionability.checks,
             ActionabilityCheckName::NonOccluded
         ),
-        ActionabilityVerdict::Unproven
+        ActionabilityVerdict::Passed
     );
     assert_eq!(
         check_verdict(&save.actionability.checks, ActionabilityCheckName::Visible),
@@ -659,6 +659,110 @@ fn semantic_actions_refuse_unproven_ios_state_and_dispatch_once() {
     );
 
     glass.stop().expect("stop semantic fixture");
+}
+
+#[test]
+#[ignore = "on-box only: needs Xcode, idb_companion, a booted Simulator and GLASS_IOS_APP"]
+fn semantic_pointer_occlusion_refuses_covers_and_proves_positive_taps() {
+    let app = std::env::var("GLASS_IOS_APP").expect("set GLASS_IOS_APP to GlassFixture.app");
+    for distinct in [false, true] {
+        let (mut glass, _, pointer_events, key_events) = semantic_fixture_session();
+        let mut spec = semantic_fixture_spec(app.clone());
+        spec.run.push("--occlusion".into());
+        if distinct {
+            spec.run.push("--occlusion-distinct".into());
+        }
+        let window = glass.start(&spec).expect("start occlusion fixture");
+        let initial = fresh_until(&mut glass, 30, |tree| {
+            named_value(tree, "occlusionCounters").as_deref() == Some("target=0 cover=0 positive=0")
+        });
+        assert_eq!(
+            named_value(&initial, "occlusionCounters").as_deref(),
+            Some("target=0 cover=0 positive=0")
+        );
+        let target_bounds = find_named(&initial.root, "coveredButton")
+            .and_then(|node| node.bounds)
+            .expect("covered bounds");
+        let cover_bounds = find_named(&initial.root, "coverButton")
+            .and_then(|node| node.bounds)
+            .expect("cover bounds");
+        let (x, y) = target_bounds
+            .clamped_center(window.width, window.height)
+            .unwrap();
+        assert!(
+            i64::from(x) >= i64::from(cover_bounds.x)
+                && i64::from(x) < i64::from(cover_bounds.x) + i64::from(cover_bounds.width)
+        );
+        assert!(
+            i64::from(y) >= i64::from(cover_bounds.y)
+                && i64::from(y) < i64::from(cover_bounds.y) + i64::from(cover_bounds.height)
+        );
+        assert_eq!(target_bounds == cover_bounds, !distinct);
+
+        let covered = glass.click_target(&pointer_click("coveredButton", AxRole::Button, 5_000));
+        // Observe actual handlers even when the old implementation dispatches the wrong tap.
+        std::thread::sleep(Duration::from_millis(350));
+        let observed = glass.a11y_snapshot(None).expect("post-click counters");
+        let refusal = match covered {
+            Err(refusal) => refusal,
+            Ok(outcome) => panic!(
+                "covered pointer action dispatched: {outcome:?}; counters={:?}",
+                named_value(&observed, "occlusionCounters")
+            ),
+        };
+        assert_eq!(refusal.kind, SemanticActionFailureKind::NotActionable);
+        assert_eq!(refusal.action_dispatch, DispatchStatus::NotDispatched);
+        assert_eq!(
+            check_verdict(
+                &refusal.actionability.checks,
+                ActionabilityCheckName::NonOccluded
+            ),
+            ActionabilityVerdict::Failed
+        );
+        assert_eq!(
+            named_value(&observed, "occlusionCounters").as_deref(),
+            Some("target=0 cover=0 positive=0")
+        );
+        assert!(pointer_events.lock().unwrap().is_empty());
+
+        for (index, (name, expected)) in [
+            ("coverButton", "target=0 cover=1 positive=0"),
+            ("positiveButton", "target=0 cover=1 positive=1"),
+            ("coveredButton", "target=1 cover=1 positive=1"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let clicked = glass
+                .click_target(&pointer_click(name, AxRole::Button, 5_000))
+                .expect("positive pointer action");
+            assert_eq!(clicked.action.dispatch, DispatchStatus::Dispatched);
+            assert_eq!(
+                check_verdict(
+                    &clicked.actionability.checks,
+                    ActionabilityCheckName::NonOccluded
+                ),
+                ActionabilityVerdict::Passed
+            );
+            assert_eq!(pointer_events.lock().unwrap().len(), index + 1);
+            let observed = fresh_until(&mut glass, 20, |tree| {
+                named_value(tree, "occlusionCounters").as_deref() == Some(expected)
+            });
+            assert_eq!(
+                named_value(&observed, "occlusionCounters").as_deref(),
+                Some(expected)
+            );
+            std::thread::sleep(Duration::from_millis(350));
+            let quiet = glass.a11y_snapshot(None).expect("quiet counters");
+            assert_eq!(
+                named_value(&quiet, "occlusionCounters").as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(key_events.lock().unwrap().is_empty());
+        println!("IOS_OCCLUSION_PASS distinct={distinct}");
+        glass.stop().expect("stop occlusion fixture");
+    }
 }
 
 /// The page's own elements, by the accessible name each carries on a platform that exposes web

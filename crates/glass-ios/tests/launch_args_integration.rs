@@ -17,8 +17,8 @@
 //!   cargo test -p glass-ios --test launch_args_integration -- --ignored --nocapture
 //! ```
 //!
-//! A separate variable from `GLASS_IOS_APP` on purpose: the sibling integration tests drive
-//! `examples/ios-fixture/`, which has no launch-argument surface to check.
+//! A separate variable from `GLASS_IOS_APP`: this test selects the role fixture's tabs, while
+//! the sibling integration tests drive `examples/ios-fixture/`.
 
 #![cfg(unix)]
 

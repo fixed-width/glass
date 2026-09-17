@@ -24,6 +24,7 @@ mod idb;
 mod injector;
 mod logs;
 mod platform;
+mod pointer;
 mod simctl;
 mod target;
 

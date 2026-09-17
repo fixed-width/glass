@@ -10,7 +10,7 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ idb § | ✓ AX |
 | Semantic state coverage | All selector states, plus focus and editable | All selector states, plus focus and editable | UIAutomator: all except expanded; companion schema 2: no selected or expanded | Enabled, checkable, and editable; no reliable visible, selected, expanded, or focused proof | Enabled, checkable, focus, and editable; no universal visible, selected, or expanded proof |
 | Explicit native focus | ✓ AT-SPI | ✓ UIA SetFocus | ◑ companion accessibility click; UIAutomator uses pointer focus | – pointer only; focus cannot be confirmed from idb | ✓ AXFocused |
-| Pointer occlusion proof | ✓ AT-SPI hit test | ✓ UIA element-from-point | ◑ unproven | ◑ unproven | ✓ AX element-at-position |
+| Pointer occlusion proof | ✓ AT-SPI hit test | ✓ UIA element-from-point | ◑ unproven | ◑ idb point query with unique identifiers | ✓ AX element-at-position |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | ✓ the Simulator | ✓ ‡ |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | ✓ headless simctl boot | 🚧 |
 
@@ -118,8 +118,11 @@ isolation boundary.
 
 The idb accessibility schema does not publish reliable `visible`, `focused`, or `focusable` facts.
 The outline retains a legacy approximate visible flag, but explicit visible/hidden selectors refuse
-as unproven, pointer visibility and occlusion are disclosed as unproven, and targeted typing stops
-after an unconfirmed pointer focus without sending text.
+as unproven, pointer visibility is disclosed as unproven, and targeted typing stops after an
+unconfirmed pointer focus without sending text. Pointer occlusion uses idb's point query and a
+fresh tree: the target and hit must have unique process-scoped accessibility identifiers, with
+matching identity and geometry. Missing or repeated identifiers and inconclusive point results
+leave occlusion unproven.
 
 **‡ macOS** capture, input, windows, clipboard, and logs are built and CI-tested (ScreenCaptureKit
 capture, CGEvent input, AXUIElement windows). Containment is Seatbelt (`sandbox_init`): filesystem and

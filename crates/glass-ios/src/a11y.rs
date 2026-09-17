@@ -21,6 +21,8 @@ use crate::injector::IdbInjector;
 trait IosA11yClient: Send {
     fn describe_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<proto::ScreenDimensions>;
     fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String>;
+    fn describe_point_rpc_by(&self, point: proto::Point, deadline: Deadline)
+    -> SnapshotRpc<String>;
     fn hid_by(&self, events: Vec<proto::HidEvent>, deadline: Deadline) -> Result<()>;
 }
 
@@ -31,6 +33,14 @@ impl IosA11yClient for IdbClient {
 
     fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String> {
         IdbClient::describe_all_rpc_by(self, deadline)
+    }
+
+    fn describe_point_rpc_by(
+        &self,
+        point: proto::Point,
+        deadline: Deadline,
+    ) -> SnapshotRpc<String> {
+        IdbClient::describe_point_rpc_by(self, point, deadline)
     }
 
     fn hid_by(&self, events: Vec<proto::HidEvent>, deadline: Deadline) -> Result<()> {
@@ -550,11 +560,36 @@ impl Accessibility for IosA11y {
 
     fn pointer_target_at(
         &mut self,
-        _ctx: &AxContext,
-        _target: &AxTarget,
-        _point: (i32, i32),
+        ctx: &AxContext,
+        target: &AxTarget,
+        point: (i32, i32),
     ) -> Result<PointerHit> {
-        Ok(PointerHit::Inconclusive)
+        let phase = SemanticPhase::Snapshot { dispatched: false };
+        phase.require(ctx.deadline)?;
+        if point.0 < 0
+            || point.1 < 0
+            || point.0 as u32 >= ctx.window.width
+            || point.1 as u32 >= ctx.window.height
+        {
+            return Err(GlassError::AxElementNotClickable(target.id.0));
+        }
+        let (scale, phase) = self.scale(ctx.deadline, phase)?;
+        let (hit, phase) = phase.finish_snapshot_rpc(
+            ctx.deadline,
+            self.client.describe_point_rpc_by(
+                proto::Point {
+                    x: f64::from(point.0) / scale,
+                    y: f64::from(point.1) / scale,
+                },
+                ctx.deadline,
+            ),
+        )?;
+        phase.require(ctx.deadline)?;
+        let (tree, phase) = phase
+            .finish_snapshot_rpc(ctx.deadline, self.client.describe_all_rpc_by(ctx.deadline))?;
+        phase.run(ctx.deadline, || {
+            crate::pointer::classify(&tree, &hit, scale, ctx, target)
+        })
     }
 }
 
@@ -570,10 +605,12 @@ mod tests {
     type ScaleRpc =
         Box<dyn FnOnce(Deadline) -> SnapshotRpc<proto::ScreenDimensions> + Send + 'static>;
     type TreeRpc = Box<dyn FnOnce(Deadline) -> SnapshotRpc<String> + Send + 'static>;
+    type PointRpc = Box<dyn FnOnce(proto::Point, Deadline) -> SnapshotRpc<String> + Send>;
 
     struct ScriptedClient {
         scale: Mutex<VecDeque<ScaleRpc>>,
         tree: Mutex<VecDeque<TreeRpc>>,
+        point: Mutex<VecDeque<PointRpc>>,
         hid: Option<Arc<Mutex<Vec<Vec<proto::HidEvent>>>>>,
     }
 
@@ -619,6 +656,7 @@ mod tests {
             Self {
                 scale: Mutex::new(scale.into()),
                 tree: Mutex::new(tree.into()),
+                point: Mutex::new(VecDeque::new()),
                 hid: None,
             }
         }
@@ -631,12 +669,25 @@ mod tests {
             Self {
                 scale: Mutex::new(scale.into()),
                 tree: Mutex::new(tree.into()),
+                point: Mutex::new(VecDeque::new()),
                 hid: Some(hid),
             }
         }
     }
 
     impl IosA11yClient for ScriptedClient {
+        fn describe_point_rpc_by(
+            &self,
+            point: proto::Point,
+            deadline: Deadline,
+        ) -> SnapshotRpc<String> {
+            self.point
+                .lock()
+                .expect("point script lock")
+                .pop_front()
+                .expect("one scripted point RPC")(point, deadline)
+        }
+
         fn describe_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<proto::ScreenDimensions> {
             self.scale
                 .lock()
@@ -662,10 +713,174 @@ mod tests {
         }
     }
 
+    const POINTER_JSON: &str = r#"{"pid":42,"role":"AXButton","AXUniqueId":"Target","enabled":true,"frame":{"x":20,"y":30,"width":80,"height":30},"children":[]}"#;
+
+    fn pointer_target() -> AxTarget {
+        AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::Button,
+            name: Some("Target".into()),
+            bounds: Some(AxRect {
+                x: 40,
+                y: 60,
+                width: 160,
+                height: 60,
+            }),
+            value: None,
+        }
+    }
+
+    #[test]
+    fn pointer_query_uses_device_points_and_revalidates_after_the_hit() {
+        let queried = Arc::new(AtomicBool::new(false));
+        let queried_at_point = Arc::clone(&queried);
+        let client = ScriptedClient {
+            point: Mutex::new(VecDeque::from([Box::new(
+                move |point: proto::Point, deadline: Deadline| {
+                    assert!(!deadline.has_passed());
+                    assert_eq!((point.x, point.y), (60.5, 49.5));
+                    queried_at_point.store(true, Ordering::SeqCst);
+                    SnapshotRpc::dispatched(Ok(POINTER_JSON.into()))
+                },
+            ) as PointRpc])),
+            ..ScriptedClient::new(
+                vec![Box::new(|_| SnapshotRpc::dispatched(Ok(dimensions())))],
+                vec![Box::new(move |_| {
+                    assert!(queried.load(Ordering::SeqCst));
+                    SnapshotRpc::dispatched(Ok(POINTER_JSON.into()))
+                })],
+            )
+        };
+        let mut reader = IosA11y {
+            client: Box::new(client),
+            scale: None,
+        };
+        assert_eq!(
+            reader
+                .pointer_target_at(
+                    &ctx(Deadline::from_millis(5_000)),
+                    &pointer_target(),
+                    (121, 99)
+                )
+                .unwrap(),
+            PointerHit::Target
+        );
+    }
+
+    #[test]
+    fn spent_pointer_deadline_starts_no_rpc() {
+        let mut reader = scripted_a11y(Vec::new(), Vec::new(), None);
+        let error = reader
+            .pointer_target_at(&ctx(Deadline::from_millis(0)), &pointer_target(), (100, 90))
+            .unwrap_err();
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn off_window_pointer_starts_no_rpc() {
+        let mut reader = scripted_a11y(Vec::new(), Vec::new(), None);
+        assert!(matches!(
+            reader.pointer_target_at(&ctx(Deadline::UNBOUNDED), &pointer_target(), (-1, 90)),
+            Err(GlassError::AxElementNotClickable(1))
+        ));
+    }
+
+    #[test]
+    fn point_transport_failure_is_not_downgraded_to_unproven() {
+        let client = ScriptedClient {
+            point: Mutex::new(VecDeque::from([Box::new(|_, _| {
+                SnapshotRpc::dispatched(Err(GlassError::Backend("point transport failed".into())))
+            }) as PointRpc])),
+            ..ScriptedClient::new(Vec::new(), Vec::new())
+        };
+        let mut reader = IosA11y {
+            client: Box::new(client),
+            scale: Some(2.0),
+        };
+        let error = reader
+            .pointer_target_at(&ctx(Deadline::UNBOUNDED), &pointer_target(), (100, 90))
+            .unwrap_err();
+        assert!(error.to_string().contains("point transport failed"));
+    }
+
+    #[test]
+    fn point_rpc_expiry_does_not_start_the_tree_revalidation() {
+        for expiry in [RpcExpiry::BeforeCall, RpcExpiry::AfterCall] {
+            let called = Arc::new(AtomicBool::new(false));
+            let rpc = expiring_rpc(
+                "idb accessibility_info at point",
+                expiry,
+                Arc::clone(&called),
+                Ok(POINTER_JSON.into()),
+            );
+            let client = ScriptedClient {
+                point: Mutex::new(VecDeque::from([
+                    Box::new(move |_, deadline| rpc(deadline)) as PointRpc
+                ])),
+                ..ScriptedClient::new(Vec::new(), Vec::new())
+            };
+            let mut reader = IosA11y {
+                client: Box::new(client),
+                scale: Some(2.0),
+            };
+            let error = reader
+                .pointer_target_at(
+                    &ctx(Deadline::from_millis(5_000)),
+                    &pointer_target(),
+                    (100, 90),
+                )
+                .unwrap_err();
+            assert_eq!(error.bound_owner(), Some(Whose::Caller));
+            assert_eq!(
+                called.load(Ordering::SeqCst),
+                matches!(expiry, RpcExpiry::AfterCall)
+            );
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum RpcExpiry {
         BeforeCall,
         AfterCall,
+    }
+
+    #[test]
+    fn tree_rpc_expiry_after_a_point_query_cannot_return_a_hit_verdict() {
+        for expiry in [RpcExpiry::BeforeCall, RpcExpiry::AfterCall] {
+            let called = Arc::new(AtomicBool::new(false));
+            let tree = expiring_rpc(
+                "idb accessibility_info",
+                expiry,
+                Arc::clone(&called),
+                Ok(POINTER_JSON.into()),
+            );
+            let client = ScriptedClient {
+                point: Mutex::new(VecDeque::from([Box::new(|_, _| {
+                    SnapshotRpc::dispatched(Ok(POINTER_JSON.into()))
+                }) as PointRpc])),
+                ..ScriptedClient::new(Vec::new(), vec![tree])
+            };
+            let mut reader = IosA11y {
+                client: Box::new(client),
+                scale: Some(2.0),
+            };
+            let error = reader
+                .pointer_target_at(
+                    &ctx(Deadline::from_millis(5_000)),
+                    &pointer_target(),
+                    (100, 90),
+                )
+                .unwrap_err();
+            assert_eq!(error.bound_owner(), Some(Whose::Caller));
+            assert_eq!(
+                called.load(Ordering::SeqCst),
+                matches!(expiry, RpcExpiry::AfterCall)
+            );
+        }
     }
 
     fn expiring_rpc<T: Send + 'static>(
@@ -858,11 +1073,16 @@ mod tests {
 
     fn scripted_glass(
         trees: Vec<TreeRpc>,
+        points: Vec<PointRpc>,
         reader_hid: Arc<Mutex<Vec<Vec<proto::HidEvent>>>>,
         platform: HidPlatform,
     ) -> glass_core::Glass {
+        let client = ScriptedClient {
+            point: Mutex::new(points.into()),
+            ..ScriptedClient::with_hid_log(Vec::new(), trees, reader_hid)
+        };
         let a11y = IosA11y {
-            client: Box::new(ScriptedClient::with_hid_log(Vec::new(), trees, reader_hid)),
+            client: Box::new(client),
             scale: Some(1.0),
         };
         let mut backend = Some(glass_core::Backend {
@@ -903,9 +1123,11 @@ mod tests {
             pointer_batches: Arc::clone(&pointer_batches),
             key_batches: Arc::clone(&key_batches),
         };
-        // Two stability samples and one focus-confirmation read.
-        let replies = successful_tree_replies(&field_json("old"), 3);
-        let mut glass = scripted_glass(replies, Arc::clone(&reader_hid), platform);
+        // Two stability samples, one hit-test rewalk, and one focus-confirmation read.
+        let replies = successful_tree_replies(&field_json("old"), 4);
+        let points: Vec<PointRpc> =
+            vec![Box::new(|_, _| SnapshotRpc::dispatched(Ok("null".into())))];
+        let mut glass = scripted_glass(replies, points, Arc::clone(&reader_hid), platform);
         glass.start(&test_spec()).expect("start scripted session");
 
         let error = glass
@@ -949,7 +1171,7 @@ mod tests {
         let platform = HidPlatform::default();
         let mut replies = successful_tree_replies(&field_json("old"), 4);
         replies.extend(successful_tree_replies(&field_json("updated"), 4));
-        let mut glass = scripted_glass(replies, Arc::clone(&reader_hid), platform);
+        let mut glass = scripted_glass(replies, Vec::new(), Arc::clone(&reader_hid), platform);
         glass.start(&test_spec()).expect("start scripted session");
 
         let outcome = glass
@@ -991,7 +1213,8 @@ mod tests {
                 pointer_batches: Arc::clone(&pointer_batches),
                 key_batches: Arc::clone(&key_batches),
             };
-            let mut glass = scripted_glass(Vec::new(), Arc::clone(&reader_hid), platform);
+            let mut glass =
+                scripted_glass(Vec::new(), Vec::new(), Arc::clone(&reader_hid), platform);
             glass.start(&test_spec()).expect("start scripted session");
 
             let error = glass
