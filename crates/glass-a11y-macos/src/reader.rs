@@ -178,10 +178,8 @@ impl Accessibility for MacosA11y {
                 "AX hit-test coordinate is not representable".into(),
             ));
         }
-        let &pid = ctx.pids.first().ok_or(GlassError::WindowNotFound)?;
-        let app = deadline.observe(|| ffi::app_element(pid as i32))?;
-        let hit = deadline
-            .observe(|| ffi::element_at_position(&app, global_x as f32, global_y as f32))??;
+        let hit =
+            deadline.observe(|| ffi::element_at_position(global_x as f32, global_y as f32))??;
         let Some(hit) = hit else {
             return Ok(PointerHit::Inconclusive);
         };
