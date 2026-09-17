@@ -10,7 +10,7 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ idb § | ✓ AX |
 | Semantic state coverage | All selector states, plus focus and editable | All selector states, plus focus and editable | UIAutomator: all except expanded; companion schema 2: no selected or expanded | Enabled, checkable, and editable; no reliable visible, selected, expanded, or focused proof | Enabled, checkable, focus, and editable; no universal visible, selected, or expanded proof |
 | Explicit native focus | ✓ AT-SPI | ✓ UIA SetFocus | ◑ companion accessibility click; UIAutomator uses pointer focus | – pointer only; focus cannot be confirmed from idb | ✓ AXFocused |
-| Pointer occlusion proof | ✓ AT-SPI hit test | ✓ UIA element-from-point | ◑ unproven | ◑ idb point query with unique identifiers | ✓ AX element-at-position |
+| Pointer occlusion proof | ✓ AT-SPI hit test | ✓ UIA element-from-point | ◑ companion can reject covering windows; within-window unproven | ◑ idb point query with unique identifiers | ✓ AX element-at-position |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | ✓ the Simulator | ✓ ‡ |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | ✓ headless simctl boot | 🚧 |
 
@@ -100,6 +100,13 @@ companion APKs are rejected before a tree read, and Glass selects the UIAutomato
 That fallback does not expose Compose-rich nodes or native value replacement, cannot prove
 `expanded`, uses pointer focus, and cannot prove pointer occlusion. Upgrade the companion APK to use
 its native click/focus path, explicit visible/focused/focusable/password facts, and `ACTION_SET_TEXT`.
+
+With a companion implementing `pointer_window` version 1, Android 13 (API 33) and newer can reject
+a semantic pointer action when a higher touchable application, input-method, or accessibility-overlay
+window covers its tap point on the default display. This check reads a fresh tree and window stack
+without injecting input. A clear window stack does not prove the control unobstructed: within-window
+occlusion remains `unproven`, as do older Android versions, older companions, and the UIAutomator
+reader. System windows outside those types and focused covering windows are not classified.
 
 **§ iOS** is Simulator-only — macOS host required (`xcrun`/`simctl` ship with Xcode). Capture,
 clipboard, and logs work over `simctl`; pointer/keyboard input (tap, type, swipe, scroll) and the

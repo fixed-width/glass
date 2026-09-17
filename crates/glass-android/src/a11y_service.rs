@@ -305,6 +305,7 @@ pub(crate) fn tree_from_json(
 /// A `tree` reply: the tree, and the window it came from when the companion names one.
 struct TreeReply {
     tree: Value,
+    pointer_window: Option<Value>,
     /// The package the companion actually answered about, when it names one. `None` either
     /// on an older companion that predates this field, or on a current one that cannot name
     /// the active window on this platform/state — either way, absent is not a mismatch.
@@ -440,9 +441,28 @@ impl ServiceClient {
     /// The bound covers the reconnect-and-re-send too, so one call cannot cost two socket
     /// timeouts against a caller who asked for less than one (glass#338).
     fn tree_within(&self, package: &str, deadline: Deadline) -> Result<TreeReply> {
-        let r = self
-            .call(json!({"op": "tree", "package": package}), deadline)
-            .map_err(CallFailure::into_error)?;
+        self.tree_at_point(package, None, deadline)
+    }
+
+    fn tree_at_point(
+        &self,
+        package: &str,
+        point: Option<(i32, i32)>,
+        deadline: Deadline,
+    ) -> Result<TreeReply> {
+        let mut request = json!({"op": "tree", "package": package});
+        if let Some((x, y)) = point {
+            request["pointer_point"] = json!({"x": x, "y": y});
+        }
+        let r = self.call(request, deadline).map_err(|failure| {
+            let sent = !failure.nothing_sent();
+            let error = failure.into_error();
+            if sent && error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched) {
+                error.after_dispatch()
+            } else {
+                error
+            }
+        })?;
         let tree = r
             .get("tree")
             .cloned()
@@ -450,6 +470,7 @@ impl ServiceClient {
         validate_node_schema(&tree)?;
         Ok(TreeReply {
             tree,
+            pointer_window: r.get("pointer_window").cloned(),
             package: r.get("package").and_then(Value::as_str).map(str::to_owned),
         })
     }
@@ -877,11 +898,29 @@ impl Accessibility for ServiceA11y {
 
     fn pointer_target_at(
         &mut self,
-        _ctx: &AxContext,
-        _target: &AxTarget,
-        _point: (i32, i32),
+        ctx: &AxContext,
+        target: &AxTarget,
+        point: (i32, i32),
     ) -> Result<PointerHit> {
-        Ok(PointerHit::Inconclusive)
+        require_semantic_time(ctx.deadline, "Android pointer occlusion", false)?;
+        let Some(screen_point) = crate::window_occlusion::screen_point(ctx, target, point) else {
+            return Ok(PointerHit::Inconclusive);
+        };
+        let reply = self
+            .client
+            .tree_at_point(&self.package, Some(screen_point), ctx.deadline)?;
+        require_semantic_time(ctx.deadline, "Android pointer occlusion", true)?;
+        let tree = tree_from_json(&reply.tree, &ctx.window, ctx.limits)?.tree;
+        let hit = crate::window_occlusion::classify(
+            &tree,
+            target,
+            &self.package,
+            reply.package.as_deref(),
+            screen_point,
+            reply.pointer_window.as_ref(),
+        )?;
+        require_semantic_time(ctx.deadline, "Android pointer occlusion", true)?;
+        Ok(hit)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -6016,5 +6055,204 @@ mod tests {
             ],
             "the guard's read, the write, and the read-back"
         );
+    }
+
+    fn pointer_fixture() -> (Value, AxTarget) {
+        let mut raw = device_tree();
+        raw["children"][1]["enabled"] = json!(true);
+        let raw = with_refs(&raw);
+        let tree = tree_from_json(&raw, &win(), WalkLimits::DEFAULT)
+            .unwrap()
+            .tree;
+        let target = target_named(&tree, "Save");
+        (
+            json!({"ok":true,"package":"com.fixture","tree":raw,
+            "pointer_window":{"version":1,"x":200,"y":230,"window_id":10,
+                "display_id":0,"occluding_window_id":20}}),
+            target,
+        )
+    }
+
+    fn pointer_reader(
+        reply: Value,
+        delay: std::time::Duration,
+    ) -> (
+        ServiceA11y,
+        Arc<Mutex<Vec<Value>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let thread = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            writeln!(socket, r#"{{"hello":{{"proto":1,"node_schema":2}}}}"#).unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                return;
+            }
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let mut reply = reply;
+            reply["id"] = request["id"].clone();
+            recorded.lock().unwrap().push(request);
+            std::thread::sleep(delay);
+            let _ = writeln!(socket, "{reply}");
+        });
+        let client = ServiceClient::connect(port).unwrap();
+        (ServiceA11y::new(client, "com.fixture".into()), seen, thread)
+    }
+
+    #[test]
+    fn pointer_window_read_translates_coordinates_and_never_sends_an_action() {
+        let (reply, target) = pointer_fixture();
+        let (mut reader, seen, thread) = pointer_reader(reply, std::time::Duration::ZERO);
+        assert_eq!(
+            reader
+                .pointer_target_at(&ctx(), &target, (200, 130))
+                .unwrap(),
+            PointerHit::Other
+        );
+        thread.join().unwrap();
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["op"], "tree");
+        assert_eq!(requests[0]["pointer_point"], json!({"x":200,"y":230}));
+    }
+
+    #[test]
+    fn no_window_cover_or_old_companion_never_proves_the_control_clear() {
+        let (reply, target) = pointer_fixture();
+        let mut variants = Vec::new();
+        let mut old = reply.clone();
+        old.as_object_mut().unwrap().remove("pointer_window");
+        variants.push(old);
+        let mut clear = reply.clone();
+        clear["pointer_window"]
+            .as_object_mut()
+            .unwrap()
+            .remove("occluding_window_id");
+        variants.push(clear);
+        for (field, value) in [
+            ("display_id", 1),
+            ("window_id", -1),
+            ("occluding_window_id", -1),
+            ("occluding_window_id", 10),
+            ("version", 2),
+        ] {
+            let mut variant = reply.clone();
+            variant["pointer_window"][field] = json!(value);
+            variants.push(variant);
+        }
+        let mut unnamed = reply.clone();
+        unnamed.as_object_mut().unwrap().remove("package");
+        variants.push(unnamed);
+        for reply in variants {
+            let (mut reader, _, thread) = pointer_reader(reply, std::time::Duration::ZERO);
+            assert_eq!(
+                reader
+                    .pointer_target_at(&ctx(), &target, (200, 130))
+                    .unwrap(),
+                PointerHit::Inconclusive
+            );
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn pointer_window_read_rejects_target_or_app_drift() {
+        let (reply, target) = pointer_fixture();
+        for variant in 0..4 {
+            let mut changed = reply.clone();
+            match variant {
+                0 => changed["package"] = json!("com.other"),
+                1 => changed["tree"]["children"][1]["desc"] = json!("Different"),
+                2 => changed["tree"]["children"][1]["bounds"]["x"] = json!(1),
+                _ => changed["tree"]["children"][1]["enabled"] = json!(false),
+            }
+            let (mut reader, _, thread) = pointer_reader(changed, std::time::Duration::ZERO);
+            assert!(matches!(
+                reader.pointer_target_at(&ctx(), &target, (200, 130)),
+                Err(GlassError::AxElementChanged(_))
+            ));
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn wrong_point_malformed_evidence_and_provider_errors_are_not_hidden() {
+        let (reply, target) = pointer_fixture();
+        for variant in 0..3 {
+            let mut changed = reply.clone();
+            match variant {
+                0 => changed["pointer_window"]["x"] = json!(201),
+                1 => changed["pointer_window"]["occluding_window_id"] = json!("20"),
+                _ => changed = json!({"ok":false,"error":"window provider unavailable"}),
+            }
+            let (mut reader, _, thread) = pointer_reader(changed, std::time::Duration::ZERO);
+            assert!(
+                reader
+                    .pointer_target_at(&ctx(), &target, (200, 130))
+                    .is_err()
+            );
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn outside_target_off_window_overflow_and_expired_deadline_send_no_read() {
+        let (reply, target) = pointer_fixture();
+        let (mut reader, seen, thread) = pointer_reader(reply, std::time::Duration::ZERO);
+        for point in [
+            (-1, 130),
+            (200, -1),
+            (200, 2300),
+            (1080, 130),
+            (400, 130),
+            (200, 160),
+        ] {
+            assert_eq!(
+                reader.pointer_target_at(&ctx(), &target, point).unwrap(),
+                PointerHit::Inconclusive
+            );
+        }
+        let mut overflow = ctx();
+        overflow.window.x = i32::MAX;
+        assert_eq!(
+            reader
+                .pointer_target_at(&overflow, &target, (200, 130))
+                .unwrap(),
+            PointerHit::Inconclusive
+        );
+        let mut expired = ctx();
+        expired.deadline = Deadline::at(std::time::Instant::now());
+        let error = reader
+            .pointer_target_at(&expired, &target, (200, 130))
+            .unwrap_err();
+        assert_generic_semantic_caller_timeout(&error, glass_core::BoundDispatch::NotDispatched);
+        drop(reader);
+        thread.join().unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pointer_window_reply_cannot_outlive_the_caller_deadline() {
+        let (reply, target) = pointer_fixture();
+        let (mut reader, seen, thread) =
+            pointer_reader(reply, std::time::Duration::from_millis(150));
+        let mut bounded = ctx();
+        bounded.deadline =
+            Deadline::at(std::time::Instant::now() + std::time::Duration::from_millis(30));
+        let error = reader
+            .pointer_target_at(&bounded, &target, (200, 130))
+            .unwrap_err();
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        thread.join().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }

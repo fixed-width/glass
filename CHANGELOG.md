@@ -34,6 +34,7 @@ internal refactors, CI, or test-only changes.
 - Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
 
 ### Fixed
+- Android semantic pointer actions can now refuse a covering touchable window before dispatch when using a companion with window-occlusion support on Android 13 or newer. Within-window occlusion and older companions remain `unproven`.
 - iOS pointer actions now query the accessibility element at the tap point and refuse proven covers before dispatch. Missing or duplicate accessibility identifiers remain `unproven`.
 - macOS pointer action checks now detect accessible controls in covering windows from other applications, refusing the click before dispatch.
 - Linux accessibility bounds now account for the reported top-level window origin, keeping Firefox Wayland pointer clicks aligned with captured pixels while preserving accessibility hit testing.

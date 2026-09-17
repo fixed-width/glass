@@ -81,3 +81,33 @@ Semantics Android carries outside the widget class — `CollectionInfo`, `Collec
 `isHeading` — reach neither reader: the `uiautomator` dump has no attribute for them, and the
 service reader parses only class, text, description and bounds. Those cells stay `gap` rather than
 `n/a`, because closing them is glass's own work; this fixture cannot show them either way.
+
+## Occlusion
+
+`OcclusionActivity` exposes Covered action, Cover action, Positive action, and a counter label
+(`target=N cover=N positive=N`). Positive action removes the cover. Its default mode puts two
+buttons at identical bounds. An intent extra selects `none`, `narrow`, `view-pass`, `hidden`,
+`delegate`, `window`, `window-narrow`, or `window-pass`:
+
+```bash
+adb shell am start -S -n tech.fixedwidth.glassrolefixture/.OcclusionActivity --es mode window
+```
+
+`view-pass` reports a clickable button but declines touch events; `hidden` intercepts taps while
+omitted from accessibility. `delegate` installs a parent touch delegate over the target's bounds.
+These modes expose the limits of inferring input delivery from an accessibility tree.
+
+The separate-window modes also have launch aliases for Glass's component-only launch interface:
+`.OcclusionWindow`, `.OcclusionWindowNarrow`, and `.OcclusionWindowPass`. The last uses
+`FLAG_NOT_TOUCHABLE`. Run the regression with a booted emulator and a companion built with
+`pointer_window` version 1 support (API 33+):
+
+```bash
+GLASS_ANDROID_A11Y_APK=/path/to/a11y-debug.apk \
+GLASS_ANDROID_ROLE_FIXTURE_APK="$PWD/examples/android-role-fixture/build/role-fixture.apk" \
+  cargo test -p glass-android --test occlusion_loop -- --ignored --nocapture
+```
+
+The test checks zero dispatch and unchanged counters for both covering-window sizes, successful
+taps through the untouchable window, and restored target clicks after removing the cover. It is
+run separately from `scripts/test-android.sh`, which uses the pinned released companion.
