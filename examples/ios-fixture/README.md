@@ -13,6 +13,11 @@ accessibility snapshot alone:
 It also prints `GLASS_FIXTURE_LAUNCHED` from `App.init` — before the first frame — which is
 what the launch-time log capture test asserts on.
 
+Launch with `--occlusion` for a UIKit screen with overlapping `coveredButton` and `coverButton`
+controls and independent activation counts in `occlusionCounters`. Add `--occlusion-distinct`
+for a narrower cover over the target center. `positiveButton` increments its own counter and
+removes the cover, allowing the test to verify that the underlying target becomes clickable.
+
 ## Build
 
 Requires the full Xcode and an iOS Simulator runtime (macOS only):

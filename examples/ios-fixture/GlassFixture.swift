@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import os
 
 private let log = Logger(subsystem: "tech.fixedwidth.glassfixture", category: "fixture")
@@ -17,7 +18,70 @@ struct GlassFixtureApp: App {
     }
 
     var body: some Scene {
-        WindowGroup { ContentView() }
+        WindowGroup {
+            if ProcessInfo.processInfo.arguments.contains("--occlusion") {
+                OcclusionContentView().ignoresSafeArea()
+            } else {
+                ContentView()
+            }
+        }
+    }
+}
+
+struct OcclusionContentView: UIViewRepresentable {
+    func makeUIView(context: Context) -> OcclusionControls { OcclusionControls() }
+    func updateUIView(_ view: OcclusionControls, context: Context) {}
+}
+
+final class OcclusionControls: UIView {
+    private let counters = UILabel()
+    private let cover = UIButton(type: .system)
+    private var targetCount = 0
+    private var coverCount = 0
+    private var positiveCount = 0
+
+    init() {
+        super.init(frame: .zero)
+        backgroundColor = .systemBackground
+        counters.frame = CGRect(x: 40, y: 90, width: 330, height: 40)
+        counters.accessibilityIdentifier = "occlusionCounters"
+        addSubview(counters)
+
+        let target = UIButton(type: .system)
+        target.frame = CGRect(x: 40, y: 180, width: 240, height: 50)
+        target.setTitle("Covered", for: .normal)
+        target.accessibilityIdentifier = "coveredButton"
+        target.backgroundColor = .systemYellow
+        target.addTarget(self, action: #selector(onTarget), for: .touchUpInside)
+        addSubview(target)
+
+        cover.frame = ProcessInfo.processInfo.arguments.contains("--occlusion-distinct")
+            ? CGRect(x: 120, y: 180, width: 80, height: 50) : target.frame
+        cover.setTitle("Cover", for: .normal)
+        cover.accessibilityIdentifier = "coverButton"
+        cover.backgroundColor = .systemBlue
+        cover.addTarget(self, action: #selector(onCover), for: .touchUpInside)
+        addSubview(cover)
+
+        let positive = UIButton(type: .system)
+        positive.frame = CGRect(x: 40, y: 280, width: 240, height: 50)
+        positive.setTitle("Positive / remove cover", for: .normal)
+        positive.accessibilityIdentifier = "positiveButton"
+        positive.addTarget(self, action: #selector(onPositive), for: .touchUpInside)
+        addSubview(positive)
+        updateCounters()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    private func updateCounters() {
+        counters.text = "target=\(targetCount) cover=\(coverCount) positive=\(positiveCount)"
+    }
+    @objc private func onTarget() { targetCount += 1; updateCounters() }
+    @objc private func onCover() { coverCount += 1; updateCounters() }
+    @objc private func onPositive() {
+        positiveCount += 1
+        cover.isHidden = true
+        updateCounters()
     }
 }
 

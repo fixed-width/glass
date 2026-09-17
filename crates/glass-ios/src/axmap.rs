@@ -8,7 +8,7 @@
 //! - role in `role` (AX-prefixed, e.g. `AXButton`; the sibling `type` field holds the
 //!   un-prefixed form `Button` and is not used here), and its `subrole`, present on every node and
 //!   null where there is none — a `UISwitch` is the case that carries one (`AXSwitch`),
-//! - stable id in `AXUniqueId`, display label in `AXLabel`, value in `AXValue`.
+//! - app-supplied identifier in `AXUniqueId`, display label in `AXLabel`, value in `AXValue`.
 //!   The id becomes the node `name` when present; a non-editable element's `AXLabel`
 //!   is then surfaced as its `value` so the visible text is not lost,
 //! - frame in the structured `frame` object `{x, y, width, height}` — note the
@@ -124,6 +124,17 @@ pub fn build_tree(
     window: &WindowGeometry,
     limits: WalkLimits,
 ) -> Result<AxTree> {
+    build_tree_observing(json, scale, window, limits, &mut |_| {})
+}
+
+/// Visit provider metadata in the same pre-order as the mapped nodes, excluding the synthetic root.
+pub(crate) fn build_tree_observing(
+    json: &str,
+    scale: f64,
+    window: &WindowGeometry,
+    limits: WalkLimits,
+    observe: &mut impl FnMut(&Value),
+) -> Result<AxTree> {
     let v: Value = serde_json::from_str(json)
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("idb a11y JSON parse: {e}")))?;
     let mut budget = WalkBudget::with_limits(limits);
@@ -135,11 +146,11 @@ pub fn build_tree(
                 if !budget.may_visit_sibling(i) {
                     break;
                 }
-                out.push(map_node(n, scale, 0, &mut budget));
+                out.push(map_node(n, scale, 0, &mut budget, observe));
             }
             out
         }
-        obj @ Value::Object(_) => vec![map_node(obj, scale, 0, &mut budget)],
+        obj @ Value::Object(_) => vec![map_node(obj, scale, 0, &mut budget, observe)],
         _ => {
             return Err(GlassError::AccessibilityUnavailable(
                 "idb a11y JSON: unexpected root".into(),
@@ -182,8 +193,15 @@ fn checkable_checked(role: AxRole, ax_value: Option<&str>) -> (bool, bool) {
     }
 }
 
-fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxNode {
+fn map_node(
+    n: &Value,
+    scale: f64,
+    depth: usize,
+    budget: &mut WalkBudget,
+    observe: &mut impl FnMut(&Value),
+) -> AxNode {
     budget.visit();
+    observe(n);
     // Read a string field, collapsing both a JSON `null` (missing/non-string) and an
     // empty string to `None` so absent and blank values are treated alike.
     let s = |k: &str| {
@@ -256,7 +274,7 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
                 if !budget.may_visit_sibling(i) {
                     break;
                 }
-                out.push(map_node(c, scale, depth + 1, budget));
+                out.push(map_node(c, scale, depth + 1, budget, observe));
             }
             out
         }
@@ -723,7 +741,7 @@ mod tests {
         for _ in 0..glass_core::MAX_NODES {
             budget.visit();
         }
-        let _ = map_node(&leaf, 1.0, 0, &mut budget);
+        let _ = map_node(&leaf, 1.0, 0, &mut budget, &mut |_| {});
         assert!(budget.truncation().is_none());
     }
 

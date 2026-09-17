@@ -873,6 +873,12 @@ actionability entry reports a `passed`, `failed`, or `unproven` verdict, whether
 and its evidence `source`. Actionability refusal is `not_actionable`; changed bounds that never
 settle return `unstable_target`; unavailable requested paths return `unsupported_mode`.
 
+On iOS, the point query is reconciled with a fresh tree using unique, process-scoped
+accessibility identifiers. Missing or repeated identifiers, incomplete trees, and inconclusive
+point results leave `non_occluded` as `unproven`; they do not independently prevent dispatch.
+Accessibility hit testing cannot guarantee detection of a visible cover omitted from the
+accessibility representation.
+
 Results distinguish dispatch from application effect. Click reports whether input dispatched and
 requires a separate observation for the resulting app state. Set-value succeeds only after backend
 value confirmation; uncertainty after a possible write is terminal and must not be retried. Targeted

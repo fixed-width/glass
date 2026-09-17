@@ -50,6 +50,9 @@ pub(crate) trait IdbSnapshotRpcBoundary: std::fmt::Debug + Send + Sync {
     fn now(&self) -> Instant;
     fn describe(&self) -> Result<proto::ScreenDimensions>;
     fn describe_all(&self) -> Result<String>;
+    fn describe_point(&self, _point: proto::Point) -> Result<String> {
+        panic!("unexpected point query")
+    }
 }
 
 /// Type-state gate kept immediately beside the actual snapshot gRPC invocation.
@@ -398,9 +401,10 @@ impl IdbClient {
         Instant::now()
     }
 
-    async fn call_describe_all(
+    async fn call_accessibility_info(
         &self,
         mut client: CompanionServiceClient<Channel>,
+        point: Option<proto::Point>,
         op: &'static str,
         ends: Instant,
         timeout: Duration,
@@ -408,10 +412,13 @@ impl IdbClient {
     ) -> Result<String> {
         #[cfg(test)]
         if let Some(boundary) = self.snapshot_rpc_boundary.as_deref() {
-            return boundary.describe_all();
+            return match point {
+                Some(point) => boundary.describe_point(point),
+                None => boundary.describe_all(),
+            };
         }
         let req = proto::AccessibilityInfoRequest {
-            point: None,
+            point,
             format: proto::accessibility_info_request::Format::Nested as i32,
         };
         let outcome = tokio::time::timeout_at(
@@ -459,7 +466,33 @@ impl IdbClient {
     }
 
     pub(crate) fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String> {
-        let op = "idb accessibility_info";
+        self.accessibility_rpc_by(None, deadline)
+    }
+
+    /// Query the accessible element at a screen point in logical points.
+    pub(crate) fn describe_point_rpc_by(
+        &self,
+        point: proto::Point,
+        deadline: Deadline,
+    ) -> SnapshotRpc<String> {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return SnapshotRpc::before_dispatch(GlassError::Backend(
+                "idb accessibility point is not finite".into(),
+            ));
+        }
+        self.accessibility_rpc_by(Some(point), deadline)
+    }
+
+    fn accessibility_rpc_by(
+        &self,
+        point: Option<proto::Point>,
+        deadline: Deadline,
+    ) -> SnapshotRpc<String> {
+        let op = if point.is_some() {
+            "idb accessibility_info at point"
+        } else {
+            "idb accessibility_info"
+        };
         let gate = match SnapshotRpcGate::new(deadline, RPC_TIMEOUT, op) {
             Ok(gate) => gate,
             Err(error) => return SnapshotRpc::before_dispatch(error),
@@ -473,7 +506,7 @@ impl IdbClient {
         let client = self.client.clone();
         self.rt.block_on(gate.run_with_clock(
             || self.snapshot_rpc_now(),
-            || self.call_describe_all(client, op, ends, timeout, whose),
+            || self.call_accessibility_info(client, point, op, ends, timeout, whose),
         ))
     }
 
@@ -571,6 +604,7 @@ mod tests {
         Gate,
         Describe,
         AccessibilityInfo,
+        PointQuery { x_bits: u64, y_bits: u64 },
         Finish,
     }
 
@@ -612,6 +646,14 @@ mod tests {
         fn describe_all(&self) -> Result<String> {
             self.record(SnapshotRpcEvent::AccessibilityInfo);
             Ok("[]".into())
+        }
+
+        fn describe_point(&self, point: proto::Point) -> Result<String> {
+            self.record(SnapshotRpcEvent::PointQuery {
+                x_bits: point.x.to_bits(),
+                y_bits: point.y.to_bits(),
+            });
+            Ok("null".into())
         }
     }
 
@@ -799,6 +841,66 @@ mod tests {
                 SnapshotRpcEvent::Finish,
             ]
         );
+    }
+
+    #[test]
+    fn point_queries_preserve_coordinates_and_the_rpc_deadline_gate() {
+        for expires in [false, true] {
+            let now = Instant::now();
+            let end = now + Duration::from_secs(1);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let boundary = RecordingSnapshotRpcBoundary {
+                observations: Mutex::new(VecDeque::from([
+                    (SnapshotRpcEvent::Gate, now),
+                    (SnapshotRpcEvent::Finish, if expires { end } else { now }),
+                ])),
+                events: Arc::clone(&events),
+            };
+            let client = IdbClient::for_snapshot_test(Box::new(boundary));
+            let result = client
+                .describe_point_rpc_by(proto::Point { x: 60.5, y: 49.5 }, Deadline::at(end))
+                .into_result();
+            if expires {
+                let error = result.unwrap_err();
+                assert_eq!(error.bound_owner(), Some(Whose::Caller));
+                assert_eq!(
+                    error.bound_dispatch(),
+                    Some(glass_core::BoundDispatch::MayHaveDispatched)
+                );
+            } else {
+                assert_eq!(result.unwrap(), "null");
+            }
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    SnapshotRpcEvent::Gate,
+                    SnapshotRpcEvent::PointQuery {
+                        x_bits: 60.5_f64.to_bits(),
+                        y_bits: 49.5_f64.to_bits()
+                    },
+                    SnapshotRpcEvent::Finish
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_point_or_spent_deadline_starts_no_point_rpc() {
+        let client = IdbClient::for_test();
+        assert!(matches!(
+            client.describe_point_rpc_by(
+                proto::Point {
+                    x: f64::NAN,
+                    y: 1.0
+                },
+                Deadline::UNBOUNDED
+            ),
+            SnapshotRpc::BeforeDispatch(_)
+        ));
+        assert!(matches!(
+            client.describe_point_rpc_by(proto::Point { x: 1.0, y: 1.0 }, Deadline::from_millis(0)),
+            SnapshotRpc::BeforeDispatch(_)
+        ));
     }
 
     #[test]
