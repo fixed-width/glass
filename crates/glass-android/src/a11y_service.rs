@@ -6114,6 +6114,7 @@ mod tests {
                 .unwrap(),
             PointerHit::Other
         );
+        drop(reader);
         thread.join().unwrap();
         let requests = seen.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -6156,6 +6157,7 @@ mod tests {
                     .unwrap(),
                 PointerHit::Inconclusive
             );
+            drop(reader);
             thread.join().unwrap();
         }
     }
@@ -6176,6 +6178,7 @@ mod tests {
                 reader.pointer_target_at(&ctx(), &target, (200, 130)),
                 Err(GlassError::AxElementChanged(_))
             ));
+            drop(reader);
             thread.join().unwrap();
         }
     }
@@ -6196,6 +6199,7 @@ mod tests {
                     .pointer_target_at(&ctx(), &target, (200, 130))
                     .is_err()
             );
+            drop(reader);
             thread.join().unwrap();
         }
     }
@@ -6237,6 +6241,25 @@ mod tests {
     }
 
     #[test]
+    fn pointer_window_request_expiring_before_dispatch_keeps_its_provenance() {
+        let (reply, _) = pointer_fixture();
+        let (reader, seen, thread) = pointer_reader(reply, std::time::Duration::ZERO);
+        let error = reader
+            .client
+            .tree_at_point(
+                "com.fixture",
+                Some((200, 230)),
+                Deadline::at(std::time::Instant::now()),
+            )
+            .err()
+            .expect("an expired read must fail before dispatch");
+        assert_generic_semantic_caller_timeout(&error, glass_core::BoundDispatch::NotDispatched);
+        drop(reader);
+        thread.join().unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn pointer_window_reply_cannot_outlive_the_caller_deadline() {
         let (reply, target) = pointer_fixture();
         let (mut reader, seen, thread) =
@@ -6252,6 +6275,7 @@ mod tests {
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::MayHaveDispatched)
         );
+        drop(reader);
         thread.join().unwrap();
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
