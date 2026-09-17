@@ -879,6 +879,12 @@ point results leave `non_occluded` as `unproven`; they do not independently prev
 Accessibility hit testing cannot guarantee detection of a visible cover omitted from the
 accessibility representation.
 
+On Android 13 or newer, an updated accessibility companion can report `non_occluded=failed` when
+a higher touchable window covers the tap point. It never reports `passed`: Android's accessibility
+tree cannot establish which view inside a window receives a tap. Without covering-window evidence,
+including with older companions and the UIAutomator reader, the result remains `unproven` and does
+not independently prevent dispatch. See [platform limits](platforms.md).
+
 Results distinguish dispatch from application effect. Click reports whether input dispatched and
 requires a separate observation for the resulting app state. Set-value succeeds only after backend
 value confirmation; uncertainty after a possible write is terminal and must not be retried. Targeted

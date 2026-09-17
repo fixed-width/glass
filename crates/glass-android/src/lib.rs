@@ -21,6 +21,7 @@ mod platform;
 mod screencap;
 mod sdk;
 mod target;
+mod window_occlusion;
 
 pub use a11y::AndroidA11y;
 pub use a11y_service::{A11yServiceRegistry, ServiceA11y, a11y_apk};

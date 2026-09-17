@@ -10,5 +10,9 @@
         </activity>
         <activity android:name=".WebActivity" android:exported="true" />
         <activity android:name=".InteractionActivity" android:exported="true" />
+        <activity android:name=".OcclusionActivity" android:exported="true" />
+        <activity-alias android:name=".OcclusionWindow" android:targetActivity=".OcclusionActivity" android:exported="true" />
+        <activity-alias android:name=".OcclusionWindowNarrow" android:targetActivity=".OcclusionActivity" android:exported="true" />
+        <activity-alias android:name=".OcclusionWindowPass" android:targetActivity=".OcclusionActivity" android:exported="true" />
     </application>
 </manifest>
