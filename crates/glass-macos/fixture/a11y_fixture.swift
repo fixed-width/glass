@@ -43,6 +43,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var movementStep: CGFloat = 20
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--occlusion-cover") {
+            let cover = NSButton(title: "External cover", target: self, action: #selector(onExternalCover))
+            cover.frame = window.contentView!.bounds
+            cover.isBordered = false
+            cover.setAccessibilityLabel("External cover")
+            window.contentView!.addSubview(cover)
+            window.level = .floating
+            window.title = "glass external cover"
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            emit("EXTERNAL_COVER_READY")
+            return
+        }
+
         let save = NSButton(title: "Save", target: self, action: #selector(onSave))
         save.frame = NSRect(x: 20, y: 140, width: 80, height: 32)
         save.setAccessibilityLabel("Save")
@@ -197,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func onOccludedSemantic() { emit("OCCLUDED_CLICKED") }
     @objc func onOccluder() { emit("OCCLUDER_CLICKED") }
+    @objc func onExternalCover() { emit("EXTERNAL_COVER_CLICKED") }
 
     @objc func moveSemantic() {
         guard let moving = movingSemantic else { return }

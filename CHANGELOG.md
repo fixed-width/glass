@@ -34,6 +34,7 @@ internal refactors, CI, or test-only changes.
 - Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
 
 ### Fixed
+- macOS pointer action checks now detect accessible controls in covering windows from other applications, refusing the click before dispatch.
 - Linux accessibility bounds now account for the reported top-level window origin, keeping Firefox Wayland pointer clicks aligned with captured pixels while preserving accessibility hit testing.
 - Linux pointer actions retry transiently empty accessibility hit tests before dispatch, allowing newly started Firefox sessions to identify covering controls. Retries respect the action deadline and reject targets whose identity or geometry changes.
 - iOS launch checks allow startup failures on iOS 27 time to surface before reporting a successful session, including when running without an input companion.

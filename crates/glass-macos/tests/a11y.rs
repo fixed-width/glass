@@ -749,6 +749,144 @@ mod macos_main {
         }
     }
 
+    fn run_cross_app_occlusion_checks(fixture_bin: &std::path::Path) -> Result<(), String> {
+        use glass_core::{
+            ActionMode, ActionTarget, ActionabilityCheckName, ActionabilityVerdict, DispatchStatus,
+            SemanticActionFailureKind,
+        };
+
+        let mut target = glass_with_a11y();
+        let mut cover = glass_with_a11y();
+        let click = |name: &str| glass_core::ClickTargetParams {
+            target: ActionTarget::Semantic(semantic_target(AxRole::Button, name, vec![])),
+            mode: ActionMode::Pointer,
+            timeout_ms: Some(5_000),
+            max_nodes: None,
+        };
+        let mut spec = AppSpec {
+            build: None,
+            run: vec![fixture_bin.to_string_lossy().into_owned()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 8_000,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        };
+        let target_window = target
+            .start(&spec)
+            .map_err(|error| format!("cross-app target start: {error}"))?;
+        let mut cover_running = false;
+        let result = (|| {
+            await_exact_log_arrival(&mut target, 0, "MOVING_SETTLED", 1)?;
+            let uncovered = target
+                .click_target(&click("Semantic Save"))
+                .map_err(|error| format!("uncovered target click: {error}"))?;
+            if actionability_verdict(
+                &uncovered.actionability,
+                ActionabilityCheckName::NonOccluded,
+            ) != ActionabilityVerdict::Passed
+            {
+                return Err(format!("uncovered target was not proven: {uncovered:?}"));
+            }
+            await_exact_log_count(&mut target, 0, "SEMANTIC_SAVE", 1)?;
+            let tree = target
+                .a11y_snapshot(None)
+                .map_err(|error| error.to_string())?;
+            let bounds = find_by_name(&tree.root, "Semantic Save")
+                .and_then(|node| node.bounds)
+                .ok_or("target has no Semantic Save bounds")?;
+            let point = bounds
+                .clamped_center(target_window.width, target_window.height)
+                .ok_or("target center is off-window")?;
+
+            spec.run.push("--occlusion-cover".into());
+            let cover_window = cover
+                .start(&spec)
+                .map_err(|error| format!("cross-app cover start: {error}"))?;
+            cover_running = true;
+            await_exact_log_arrival(&mut cover, 0, "EXTERNAL_COVER_READY", 1)?;
+            let tree = cover
+                .a11y_snapshot(None)
+                .map_err(|error| error.to_string())?;
+            let cover_bounds = find_by_name(&tree.root, "External cover")
+                .and_then(|node| node.bounds)
+                .ok_or("cover has no button bounds")?;
+            let cover_x =
+                i64::from(target_window.x) + i64::from(point.0) - i64::from(cover_window.x);
+            let cover_y =
+                i64::from(target_window.y) + i64::from(point.1) - i64::from(cover_window.y);
+            if cover_x < i64::from(cover_bounds.x)
+                || cover_y < i64::from(cover_bounds.y)
+                || cover_x >= i64::from(cover_bounds.x) + i64::from(cover_bounds.width)
+                || cover_y >= i64::from(cover_bounds.y) + i64::from(cover_bounds.height)
+            {
+                return Err("external cover does not overlap the target center".into());
+            }
+
+            let cursor = log_cursor(&mut target)?;
+            let refusal = match target.click_target(&click("Semantic Save")) {
+                Err(refusal) => refusal,
+                Ok(outcome) => {
+                    await_exact_log_count(&mut target, cursor, "SEMANTIC_SAVE", 0)?;
+                    await_exact_log_count(&mut cover, 0, "EXTERNAL_COVER_CLICKED", 1)?;
+                    return Err(format!(
+                        "target click activated another application's cover: {outcome:?}"
+                    ));
+                }
+            };
+            if refusal.kind != SemanticActionFailureKind::NotActionable
+                || refusal.action_dispatch != DispatchStatus::NotDispatched
+                || actionability_verdict(
+                    &refusal.actionability,
+                    ActionabilityCheckName::NonOccluded,
+                ) != ActionabilityVerdict::Failed
+            {
+                return Err(format!("unexpected cross-app refusal: {refusal:?}"));
+            }
+            await_exact_log_count(&mut target, cursor, "SEMANTIC_SAVE", 0)?;
+            await_exact_log_count(&mut cover, 0, "EXTERNAL_COVER_CLICKED", 0)?;
+
+            let cover_click = cover
+                .click_target(&click("External cover"))
+                .map_err(|error| format!("external cover positive click: {error}"))?;
+            if actionability_verdict(
+                &cover_click.actionability,
+                ActionabilityCheckName::NonOccluded,
+            ) != ActionabilityVerdict::Passed
+            {
+                return Err(format!("cover click was not proven: {cover_click:?}"));
+            }
+            await_exact_log_count(&mut cover, 0, "EXTERNAL_COVER_CLICKED", 1)?;
+            cover_running = false;
+            cover
+                .stop()
+                .map_err(|error| format!("cover stop: {error}"))?;
+
+            let restored = target
+                .click_target(&click("Semantic Save"))
+                .map_err(|error| format!("restored target click: {error}"))?;
+            if actionability_verdict(&restored.actionability, ActionabilityCheckName::NonOccluded)
+                != ActionabilityVerdict::Passed
+            {
+                return Err(format!("restored target was not proven: {restored:?}"));
+            }
+            await_exact_log_count(&mut target, cursor, "SEMANTIC_SAVE", 1)?;
+            println!("A11Y_CROSS_APP_OCCLUSION_PASS");
+            Ok(())
+        })();
+
+        let cover_stop = if cover_running {
+            cover.stop().map_err(|error| format!("cover stop: {error}"))
+        } else {
+            Ok(())
+        };
+        let target_stop = target
+            .stop()
+            .map_err(|error| format!("target stop: {error}"));
+        result.and(cover_stop).and(target_stop)
+    }
+
     pub(super) fn run() {
         // Prefer a pre-built fixture (the granted run supplies `GLASS_A11Y_FIXTURE_BIN`);
         // otherwise build it here, skipping cleanly if `swiftc` is unavailable.
@@ -803,6 +941,10 @@ mod macos_main {
                     fail(format!("stop_app: {error}"));
                 }
                 if let Err(error) = run_semantic_checks(&fixture_bin) {
+                    cleanup_dir(&fixture_dir);
+                    fail(error);
+                }
+                if let Err(error) = run_cross_app_occlusion_checks(&fixture_bin) {
                     cleanup_dir(&fixture_dir);
                     fail(error);
                 }

@@ -365,14 +365,13 @@ fn element_at_position_by(
     Ok(Some(unsafe { CFRetained::from_raw(raw) }))
 }
 
-/// Return the application element at a point in global AX coordinates.
-pub(crate) fn element_at_position(
-    app: &AXUIElement,
-    x: f32,
-    y: f32,
-) -> Result<Option<CFRetained<AXUIElement>>> {
-    element_at_position_by(x, y, |x, y, raw| unsafe {
-        app.copy_element_at_position(x, y, raw)
+/// Return the frontmost element across applications at a point in global AX coordinates.
+pub(crate) fn element_at_position(x: f32, y: f32) -> Result<Option<CFRetained<AXUIElement>>> {
+    // SAFETY: the binding guarantees a live system-wide accessibility element.
+    let desktop = unsafe { AXUIElement::new_system_wide() };
+    element_at_position_by(x, y, |x, y, raw| {
+        // SAFETY: `desktop` is live and `raw` is a valid AXUIElement out-pointer.
+        unsafe { desktop.copy_element_at_position(x, y, raw) }
     })
 }
 
