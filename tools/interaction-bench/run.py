@@ -192,6 +192,8 @@ def load_config(path, registry):
             )
         excluded.add(key)
     configure_applications(config)
+    if config["backend"] == "wayland":
+        config["app_env"] = {"WLR_RENDERER": "pixman", **config.get("app_env", {})}
     return config
 
 

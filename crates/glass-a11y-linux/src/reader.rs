@@ -233,7 +233,8 @@ async fn snapshot_async(ctx: &AxContext) -> Result<AxTree> {
         .map_err(bus_err)?;
 
     let mut budget = WalkBudget::with_limits(ctx.limits);
-    let root_node = Box::pin(walk(&app, &zbus_conn, 0, &mut budget)).await?;
+    let mut root_node = Box::pin(walk(&app, &zbus_conn, 0, &mut budget)).await?;
+    crate::coordinates::normalize_tree(&mut root_node);
     let mut tree = AxTree::new(root_node);
     tree.truncated = budget.truncation();
     tree.unreadable = budget.unreadable();
@@ -862,6 +863,60 @@ fn classify_hit_reference(
 }
 
 const POINTER_HIT_OP: &str = "pointer hit probe";
+const POINTER_HIT_POLL: Duration = Duration::from_millis(10);
+const POINTER_HIT_RETRY_BUDGET: Duration = Duration::from_millis(250);
+
+async fn retry_pointer_hit<S: PartialEq, F, Fut>(
+    deadline: Deadline,
+    id: AxNodeId,
+    mut probe: F,
+) -> Result<PointerHit>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(S, PointerHit)>>,
+{
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started(POINTER_HIT_OP));
+    }
+    let (original, mut hit) = probe().await?;
+    // Firefox's first hit query can activate cache domains and return null until they arrive.
+    let (end, whose) = deadline.resolve(std::time::Instant::now() + POINTER_HIT_RETRY_BUDGET);
+    let end = tokio::time::Instant::from_std(end);
+    while hit == PointerHit::Inconclusive {
+        tokio::time::sleep_until((tokio::time::Instant::now() + POINTER_HIT_POLL).min(end)).await;
+        if tokio::time::Instant::now() >= end {
+            return match whose {
+                Whose::Caller => Err(GlassError::caller_deadline_elapsed(POINTER_HIT_OP)),
+                Whose::Callee => Ok(PointerHit::Inconclusive),
+            };
+        }
+        let (current, next_hit) =
+            tokio::time::timeout_at(end, probe())
+                .await
+                .map_err(|_| match whose {
+                    Whose::Caller => GlassError::caller_deadline_elapsed(POINTER_HIT_OP),
+                    Whose::Callee => pointer_reference_error("hit query exceeded the retry budget"),
+                })??;
+        if current != original {
+            return Err(GlassError::AxElementChanged(id.0));
+        }
+        hit = next_hit;
+    }
+    if deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed(POINTER_HIT_OP));
+    }
+    Ok(hit)
+}
+
+#[derive(PartialEq)]
+struct PointerTargetIdentity {
+    object: ObjectRefOwned,
+    window: ObjectRefOwned,
+    origin: crate::coordinates::WindowOrigin,
+    ancestor: Option<ObjectRefOwned>,
+    bounds: Option<AxRect>,
+    states: glass_core::AxStates,
+}
 
 fn pointer_reference_error(detail: impl std::fmt::Display) -> GlassError {
     GlassError::AccessibilityUnavailable(format!("AT-SPI pointer hit probe failed: {detail}"))
@@ -1095,6 +1150,7 @@ async fn containing_window_root(
 ) -> Result<ObjectRefOwned> {
     let mut current = target_ref.clone();
     let mut seen = Vec::new();
+    let mut window = None;
     for _ in 0..=ctx.limits.depth {
         validate_strict_reference(&current, "target ancestry object")?;
         if seen.contains(&current) {
@@ -1104,20 +1160,25 @@ async fn containing_window_root(
         let proxy = pointer_accessible(conn, &current).await?;
         let role = pointer_bus_call(ctx.deadline, "target ancestor role", proxy.get_role()).await?;
         if is_window_coordinate_root(role) {
-            return Ok(current);
+            window = Some(current.clone());
+        }
+        if role == atspi_common::Role::Application {
+            break;
         }
         let parent = pointer_parent(ctx.deadline, &proxy).await?;
         if parent.is_null() {
-            return Err(pointer_reference_error(
-                "target has no containing window, frame, or dialog",
-            ));
+            break;
         }
         current = parent;
+        if seen.len() > ctx.limits.depth {
+            return Err(pointer_reference_error(format!(
+                "target ancestry exceeded the configured depth limit ({})",
+                ctx.limits.depth
+            )));
+        }
     }
-    Err(pointer_reference_error(format!(
-        "target ancestry exceeded the configured depth limit ({})",
-        ctx.limits.depth
-    )))
+    window
+        .ok_or_else(|| pointer_reference_error("target has no containing window, frame, or dialog"))
 }
 
 async fn first_interactable_ancestor(
@@ -1203,41 +1264,106 @@ async fn pointer_target_at_async(
         return Err(GlassError::deadline_not_started(POINTER_HIT_OP));
     }
     let (app_ref, conn) = find_app_strict(ctx).await?;
-    let app = pointer_accessible(&conn, &app_ref).await?;
+    retry_pointer_hit(ctx.deadline, target.id, || {
+        pointer_hit_once(ctx, target, point, &app_ref, &conn)
+    })
+    .await
+}
+
+async fn pointer_hit_once(
+    ctx: &AxContext,
+    target: &AxTarget,
+    point: (i32, i32),
+    app_ref: &ObjectRefOwned,
+    conn: &zbus::Connection,
+) -> Result<(PointerTargetIdentity, PointerHit)> {
+    let app = pointer_accessible(conn, app_ref).await?;
     let mut budget = WalkBudget::with_limits(ctx.limits);
     let target_ref = Box::pin(find_nth_strict(
         ctx,
-        &app_ref,
+        app_ref,
         &app,
-        &conn,
+        conn,
         0,
         target.id.0,
         &mut budget,
     ))
     .await?
     .ok_or(GlassError::AxElementChanged(target.id.0))?;
-    let target_proxy = pointer_accessible(&conn, &target_ref).await?;
+    let target_proxy = pointer_accessible(conn, &target_ref).await?;
     let role =
         map_role(pointer_bus_call(ctx.deadline, "target role", target_proxy.get_role()).await?);
     let name = nonempty(pointer_bus_call(ctx.deadline, "target name", target_proxy.name()).await?);
     if !target.matches(role, name.as_deref()) {
         return Err(GlassError::AxElementChanged(target.id.0));
     }
+    let root_ref = containing_window_root(ctx, conn, &target_ref).await?;
+    let component = pointer_component(ctx, conn, &root_ref).await?;
+    let (root_x, root_y, root_width, root_height) = pointer_bus_call(
+        ctx.deadline,
+        "window bounds",
+        component.get_extents(CoordType::Window),
+    )
+    .await?;
+    if root_width <= 0 || root_height <= 0 {
+        return Err(pointer_reference_error(
+            "containing window has no usable bounds",
+        ));
+    }
+    let origin = crate::coordinates::WindowOrigin::from_bounds(AxRect {
+        x: root_x,
+        y: root_y,
+        width: root_width as u32,
+        height: root_height as u32,
+    });
+    let target_component = pointer_component(ctx, conn, &target_ref).await?;
+    let (x, y, width, height) = pointer_bus_call(
+        ctx.deadline,
+        "target bounds",
+        target_component.get_extents(CoordType::Window),
+    )
+    .await?;
+    let bounds = (width > 0 && height > 0)
+        .then_some(AxRect {
+            x,
+            y,
+            width: width as u32,
+            height: height as u32,
+        })
+        .and_then(|bounds| origin.normalize(bounds));
+    if !target.bounds_consistent(bounds, 0) {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    let states = map_states(
+        &pointer_bus_call(ctx.deadline, "target states", target_proxy.get_state()).await?,
+    );
 
     let accepted_ancestor = if role.is_interactable() {
         None
     } else {
-        first_interactable_ancestor(ctx, &conn, &target_ref).await?
+        first_interactable_ancestor(ctx, conn, &target_ref).await?
     };
-    let root_ref = containing_window_root(ctx, &conn, &target_ref).await?;
-    let component = pointer_component(ctx, &conn, &root_ref).await?;
+    let point = origin.provider_point(point).ok_or_else(|| {
+        pointer_reference_error("hit point exceeds the provider's coordinate range")
+    })?;
     let hit = pointer_bus_call(
         ctx.deadline,
         "GetAccessibleAtPoint",
         component.get_accessible_at_point(point.0, point.1, CoordType::Window),
     )
     .await?;
-    classify_pointer_hit(ctx, &conn, &target_ref, accepted_ancestor.as_ref(), hit).await
+    let hit = classify_pointer_hit(ctx, conn, &target_ref, accepted_ancestor.as_ref(), hit).await?;
+    Ok((
+        PointerTargetIdentity {
+            object: target_ref,
+            window: root_ref,
+            origin,
+            ancestor: accepted_ancestor,
+            bounds,
+            states,
+        },
+        hit,
+    ))
 }
 
 const FOCUS_CONFIRM_POLL: Duration = Duration::from_millis(10);
@@ -1624,21 +1750,293 @@ mod tests {
 
     use super::*;
 
+    fn pointer_identity() -> PointerTargetIdentity {
+        PointerTargetIdentity {
+            object: ObjectRefOwned::from_static_str_unchecked(":1.42", "/target"),
+            window: ObjectRefOwned::from_static_str_unchecked(":1.42", "/window"),
+            origin: crate::coordinates::WindowOrigin::from_bounds(AxRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
+            ancestor: None,
+            bounds: Some(AxRect {
+                x: 10,
+                y: 20,
+                width: 30,
+                height: 40,
+            }),
+            states: glass_core::AxStates {
+                enabled: true,
+                visible: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn pointer_hit_retries_null_until_target_or_cover_is_known() {
+        for expected in [
+            PointerHit::Target,
+            PointerHit::AcceptedAncestor,
+            PointerHit::Other,
+        ] {
+            let mut hits =
+                [PointerHit::Inconclusive, PointerHit::Inconclusive, expected].into_iter();
+            let mut calls = 0;
+            let hit = retry_pointer_hit(Deadline::UNBOUNDED, AxNodeId(1), || {
+                calls += 1;
+                std::future::ready(Ok((pointer_identity(), hits.next().expect("extra probe"))))
+            })
+            .await
+            .unwrap();
+            assert_eq!(hit, expected);
+            assert_eq!(calls, 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn pointer_hit_does_not_retry_a_conclusive_result() {
+        for expected in [PointerHit::Target, PointerHit::Other] {
+            let mut calls = 0;
+            let hit = retry_pointer_hit(Deadline::UNBOUNDED, AxNodeId(1), || {
+                calls += 1;
+                std::future::ready(Ok((pointer_identity(), expected)))
+            })
+            .await
+            .unwrap();
+            assert_eq!(hit, expected);
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn pointer_hit_persistent_null_stays_inconclusive_after_a_bounded_wait() {
+        let mut calls = 0;
+        let hit = tokio::time::timeout(
+            Duration::from_secs(2),
+            retry_pointer_hit(Deadline::UNBOUNDED, AxNodeId(1), || {
+                calls += 1;
+                std::future::ready(Ok((pointer_identity(), PointerHit::Inconclusive)))
+            }),
+        )
+        .await
+        .expect("retry budget must end even without a caller deadline")
+        .unwrap();
+        assert_eq!(hit, PointerHit::Inconclusive);
+        assert!(calls > 1);
+    }
+
+    #[tokio::test]
+    async fn pointer_hit_retry_rejects_changed_identity_geometry_ancestry_and_state() {
+        let mut changed_object = pointer_identity();
+        changed_object.object = ObjectRefOwned::from_static_str_unchecked(":1.42", "/replacement");
+        let mut moved = pointer_identity();
+        moved.bounds.as_mut().unwrap().x += 1;
+        let mut reparented = pointer_identity();
+        reparented.window = ObjectRefOwned::from_static_str_unchecked(":1.42", "/another_window");
+        let mut ancestor = pointer_identity();
+        ancestor.ancestor = Some(ObjectRefOwned::from_static_str_unchecked(
+            ":1.42",
+            "/new_ancestor",
+        ));
+        let mut disabled = pointer_identity();
+        disabled.states.enabled = false;
+        let mut changed_origin = pointer_identity();
+        changed_origin.origin = crate::coordinates::WindowOrigin::from_bounds(AxRect {
+            x: 26,
+            y: 23,
+            width: 100,
+            height: 100,
+        });
+        for changed in [
+            changed_object,
+            moved,
+            reparented,
+            ancestor,
+            disabled,
+            changed_origin,
+        ] {
+            let mut readings = [
+                (pointer_identity(), PointerHit::Inconclusive),
+                (changed, PointerHit::Target),
+            ]
+            .into_iter();
+            let error = retry_pointer_hit(Deadline::UNBOUNDED, AxNodeId(7), || {
+                std::future::ready(Ok(readings
+                    .next()
+                    .expect("must stop at the changed target")))
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(error, GlassError::AxElementChanged(7)), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pointer_hit_errors_do_not_become_unknown_or_trigger_more_retries() {
+        for after_null in [false, true] {
+            let mut calls = 0;
+            let error = retry_pointer_hit(Deadline::UNBOUNDED, AxNodeId(1), || {
+                calls += 1;
+                std::future::ready(if after_null && calls == 1 {
+                    Ok((pointer_identity(), PointerHit::Inconclusive))
+                } else {
+                    Err(pointer_reference_error("transport failed"))
+                })
+            })
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("transport failed"));
+            assert_eq!(calls, if after_null { 2 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
+    async fn pointer_hit_expired_caller_never_starts_a_probe() {
+        let mut calls = 0;
+        let error = retry_pointer_hit(Deadline::from_millis(0), AxNodeId(1), || {
+            calls += 1;
+            std::future::ready(Ok(((), PointerHit::Target)))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 0);
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+    }
+
+    #[tokio::test]
+    async fn pointer_hit_caller_expiry_during_wait_does_not_allow_unknown_dispatch() {
+        let mut calls = 0;
+        let error = retry_pointer_hit(Deadline::from_millis(5), AxNodeId(1), || {
+            calls += 1;
+            std::future::ready(Ok((pointer_identity(), PointerHit::Inconclusive)))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+    }
+
+    #[tokio::test]
+    async fn pointer_hit_hung_retry_is_an_error_at_either_deadline() {
+        for caller in [Deadline::from_millis(100), Deadline::UNBOUNDED] {
+            let mut calls = 0;
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                retry_pointer_hit(caller, AxNodeId(1), || {
+                    calls += 1;
+                    let first = calls == 1;
+                    async move {
+                        if first {
+                            Ok((pointer_identity(), PointerHit::Inconclusive))
+                        } else {
+                            std::future::pending().await
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("pending query must be cancelled within the retry budget")
+            .unwrap_err();
+            assert_eq!(calls, 2);
+            if caller.instant().is_some() {
+                assert_eq!(error.bound_owner(), Some(Whose::Caller));
+            } else {
+                assert!(error.to_string().contains("retry budget"));
+            }
+        }
+    }
+
     struct ParentProperty {
         name: String,
         path: zbus::zvariant::OwnedObjectPath,
+        role: atspi_common::Role,
     }
 
     #[zbus::interface(name = "org.a11y.atspi.Accessible")]
     impl ParentProperty {
         fn get_role(&self) -> u32 {
-            atspi_common::Role::Panel as u32
+            self.role as u32
         }
 
         #[zbus(property)]
         fn parent(&self) -> (String, zbus::zvariant::OwnedObjectPath) {
             (self.name.clone(), self.path.clone())
         }
+    }
+
+    #[test]
+    #[ignore = "starts a private D-Bus; run via scripts/test-a11y.sh"]
+    fn pointer_coordinates_use_the_outer_window_not_an_embedded_dialog() {
+        use atspi_common::Role;
+        let bus = glass_dbus_linux::PrivateBus::start().expect("private bus");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let service = zbus::connection::Builder::address(bus.a11y_bus_address())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let client = zbus::connection::Builder::address(bus.a11y_bus_address())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let name = service.unique_name().unwrap().as_str();
+            for (path, parent, role) in [
+                ("/target", "/dialog", Role::Button),
+                ("/dialog", "/window", Role::Dialog),
+                ("/window", "/app", Role::Frame),
+                ("/app", "/org/a11y/atspi/null", Role::Application),
+            ] {
+                service
+                    .object_server()
+                    .at(
+                        path,
+                        ParentProperty {
+                            name: name.into(),
+                            path: parent.try_into().unwrap(),
+                            role,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let target = ObjectRefOwned::new(ObjectRef::Owned {
+                name: service.unique_name().unwrap().clone().into(),
+                path: "/target".try_into().unwrap(),
+            });
+            let mut ctx = AxContext {
+                pids: vec![],
+                window: glass_core::WindowGeometry::default(),
+                window_handle: None,
+                a11y_bus_addr: None,
+                limits: glass_core::WalkLimits::DEFAULT,
+                deadline: Deadline::from_millis(1000),
+            };
+            assert_eq!(
+                containing_window_root(&ctx, &client, &target)
+                    .await
+                    .unwrap()
+                    .path_as_str(),
+                "/window"
+            );
+            ctx.limits.depth = 1;
+            assert!(
+                containing_window_root(&ctx, &client, &target)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("depth limit")
+            );
+        });
     }
 
     #[test]
@@ -1670,6 +2068,7 @@ mod tests {
                 service.object_server().at(node_path, ParentProperty {
                     name: name.into(),
                     path: path.try_into().unwrap(),
+                    role: atspi_common::Role::Panel,
                 }).await.unwrap();
                 let proxy = AccessibleProxy::builder(&client)
                     .cache_properties(zbus::proxy::CacheProperties::No)

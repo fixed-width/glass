@@ -13,7 +13,7 @@
 //! which of the two a browser reads), and `flag` passes the Chromium-family
 //! `--force-renderer-accessibility` switch instead. Unset is the baseline reading.
 //!
-//! With `GLASS_WEB_PROBE_BROWSERS` unset both tests print a skip line and return, so an
+//! With `GLASS_WEB_PROBE_BROWSERS` unset the browser tests print a skip line and return, so an
 //! `--include-ignored` run never needs a browser.
 //!
 //! A probe, not a mapping test: it prints evidence and does not assert what a browser ought to
@@ -24,6 +24,9 @@
 //! same answer on every engine. Each backend's `Drop` impl tears its session down even through a
 //! panic, so failures are collected per (backend, browser, lever) and the test panics once at the
 //! end, after every browser it started has already been stopped.
+//!
+//! The cold-start regression test also asserts that the first pointer action detects a cover
+//! before any hit query can warm the browser's accessibility cache.
 
 #![cfg(target_os = "linux")]
 
@@ -811,4 +814,227 @@ fn wayland_browsers() {
     let mut failures = Vec::new();
     run_probes("wayland", &mut failures);
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+fn cold_browsers_refuse_covered_first_pointer_action(backend: &str) {
+    let Ok(browsers) = std::env::var(BROWSERS_VAR) else {
+        println!("skipped: set {BROWSERS_VAR}");
+        return;
+    };
+    for browser in browsers
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        for geometry in ["occluded", "occluded-distinct"] {
+            let profile = tempfile::tempdir().expect("fresh profile");
+            prepare_profile(browser, profile.path());
+            let mut spec = browser_spec(browser, profile.path(), Lever::from_env());
+            *spec.run.last_mut().unwrap() = format!(
+                "file://{}/../../examples/interaction-fixture/index.html?case={geometry}",
+                env!("CARGO_MANIFEST_DIR"),
+            );
+            spec.window_hint.as_mut().unwrap().title = Some("Interaction fixture".into());
+            if backend == "wayland" {
+                spec.env.push(("WLR_RENDERER".into(), "pixman".into()));
+                spec.env.push(("MOZ_ENABLE_WAYLAND".into(), "1".into()));
+                spec.env.push(("GDK_BACKEND".into(), "wayland".into()));
+                if !is_gecko(browser) {
+                    spec.run.insert(1, "--ozone-platform=wayland".into());
+                }
+            }
+            let mut glass = glass_for(backend);
+            glass.start(&spec).expect("isolated browser launch");
+            let click = |name: &str| ClickTargetParams {
+                target: ActionTarget::Semantic(SemanticTarget {
+                    target: SemanticSelector::new(Some(name.into()), Some(AxRole::Button), vec![])
+                        .unwrap(),
+                    within: Some(
+                        SemanticSelector::new(
+                            Some("Interaction fixture".into()),
+                            Some(AxRole::Document),
+                            vec![],
+                        )
+                        .unwrap(),
+                    ),
+                }),
+                mode: ActionMode::Pointer,
+                timeout_ms: Some(20_000),
+                max_nodes: None,
+            };
+            let refusal = glass
+                .click_target(&click("Covered action"))
+                .expect_err("the first pointer action in a fresh browser must detect the cover");
+            assert_eq!(refusal.kind, SemanticActionFailureKind::NotActionable);
+            assert_eq!(refusal.action_dispatch, DispatchStatus::NotDispatched);
+            assert_eq!(
+                actionability_verdict(&refusal.actionability, ActionabilityCheckName::NonOccluded),
+                ActionabilityVerdict::Failed
+            );
+            let check_count = |glass: &mut Glass, name: &str, expected: &str| {
+                assert!(
+                    glass
+                        .wait_for_element(&WaitElementParams {
+                            name: Some(name.into()),
+                            description: None,
+                            role: Some(AxRole::TextField),
+                            value: Some(expected.into()),
+                            value_contains: None,
+                            condition: ElementCondition::Appears,
+                            interval_ms: 25,
+                            timeout_ms: 1000,
+                        })
+                        .expect("counter read")
+                        .matched,
+                    "{browser}/{geometry}: {name} must be {expected}"
+                );
+            };
+            std::thread::sleep(Duration::from_millis(350));
+            check_count(&mut glass, "Action count", "0");
+            check_count(&mut glass, "Cover count", "0");
+            let positive = glass
+                .click_target(&click("Cover action"))
+                .expect("uncovered button remains clickable");
+            assert_eq!(positive.action.dispatch, DispatchStatus::Dispatched);
+            assert_eq!(
+                actionability_verdict(&positive.actionability, ActionabilityCheckName::NonOccluded),
+                ActionabilityVerdict::Passed
+            );
+            check_count(&mut glass, "Cover count", "1");
+            check_count(&mut glass, "Action count", "0");
+            glass.stop().expect("stop owned browser");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a browser and the a11y prerequisites; set GLASS_WEB_PROBE_BROWSERS"]
+fn x11_cold_browsers_refuse_covered_first_pointer_action() {
+    cold_browsers_refuse_covered_first_pointer_action("x11");
+}
+
+#[test]
+#[ignore = "needs headless sway and a browser; set GLASS_WEB_PROBE_BROWSERS"]
+fn wayland_cold_browsers_refuse_covered_first_pointer_action() {
+    cold_browsers_refuse_covered_first_pointer_action("wayland");
+}
+
+fn browser_form_pointer_coordinates(backend: &str) {
+    use glass_core::WindowOp;
+    let Ok(browsers) = std::env::var(BROWSERS_VAR) else {
+        println!("skipped: set {BROWSERS_VAR}");
+        return;
+    };
+    for browser in browsers.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let profile = tempfile::tempdir().unwrap();
+        prepare_profile(browser, profile.path());
+        let mut spec = browser_spec(browser, profile.path(), Lever::from_env());
+        *spec.run.last_mut().unwrap() = format!(
+            "file://{}/../../examples/interaction-fixture/index.html?case=large-form",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+        spec.window_hint.as_mut().unwrap().title = Some("Interaction fixture".into());
+        if backend == "wayland" {
+            spec.env.push(("WLR_RENDERER".into(), "pixman".into()));
+            spec.env.push(("MOZ_ENABLE_WAYLAND".into(), "1".into()));
+            spec.env.push(("GDK_BACKEND".into(), "wayland".into()));
+            if !is_gecko(browser) {
+                spec.run.insert(1, "--ozone-platform=wayland".into());
+            }
+        }
+        let target = |name: &str, role| SemanticTarget {
+            target: SemanticSelector::new(Some(name.into()), Some(role), vec![]).unwrap(),
+            within: Some(
+                SemanticSelector::new(
+                    Some("Interaction fixture".into()),
+                    Some(AxRole::Document),
+                    vec![],
+                )
+                .unwrap(),
+            ),
+        };
+        let mut glass = glass_for(backend);
+        glass.start(&spec).expect("isolated browser launch");
+        assert!(
+            glass
+                .wait_for_element(&WaitElementParams {
+                    name: Some("Fixture ready".into()),
+                    description: None,
+                    role: Some(AxRole::TextField),
+                    value: Some("ready".into()),
+                    value_contains: None,
+                    condition: ElementCondition::Appears,
+                    interval_ms: 25,
+                    timeout_ms: 20_000,
+                })
+                .expect("fixture readiness")
+                .matched
+        );
+        glass
+            .type_target(
+                &TypeTargetParams {
+                    target: target("Account name", AxRole::TextField),
+                    focus_mode: ActionMode::Native,
+                    timeout_ms: 20_000,
+                    max_nodes: None,
+                },
+                "Ada",
+            )
+            .expect("type account name");
+        for (index, (x, y, width, height)) in [(140, 57, 1000, 786), (80, 100, 800, 600)]
+            .into_iter()
+            .enumerate()
+        {
+            glass
+                .window(&WindowOp::Resize { width, height })
+                .expect("resize");
+            glass.window(&WindowOp::Move { x, y }).expect("move");
+            let clicked = glass
+                .click_target(&ClickTargetParams {
+                    target: ActionTarget::Semantic(target("Save account", AxRole::Button)),
+                    mode: ActionMode::Pointer,
+                    timeout_ms: Some(20_000),
+                    max_nodes: None,
+                })
+                .expect("pointer save after move/resize");
+            assert_eq!(
+                actionability_verdict(&clicked.actionability, ActionabilityCheckName::NonOccluded),
+                ActionabilityVerdict::Passed
+            );
+            for (name, value) in [
+                ("Saved value", "Ada".to_owned()),
+                ("Submission count", (index + 1).to_string()),
+            ] {
+                assert!(
+                    glass
+                        .wait_for_element(&WaitElementParams {
+                            name: Some(name.into()),
+                            description: None,
+                            role: Some(AxRole::TextField),
+                            value: Some(value.clone()),
+                            value_contains: None,
+                            condition: ElementCondition::Appears,
+                            interval_ms: 25,
+                            timeout_ms: 2000,
+                        })
+                        .expect("read form result")
+                        .matched,
+                    "{backend}/{browser}: {name} must be {value}"
+                );
+            }
+        }
+        glass.stop().expect("stop owned browser");
+    }
+}
+
+#[test]
+#[ignore = "needs an isolated browser; set GLASS_WEB_PROBE_BROWSERS"]
+fn x11_browser_form_pointer_coordinates_survive_move_and_resize() {
+    browser_form_pointer_coordinates("x11");
+}
+
+#[test]
+#[ignore = "needs headless sway and a browser; set GLASS_WEB_PROBE_BROWSERS"]
+fn wayland_browser_form_pointer_coordinates_survive_move_and_resize() {
+    browser_form_pointer_coordinates("wayland");
 }
