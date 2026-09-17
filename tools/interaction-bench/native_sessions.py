@@ -95,6 +95,7 @@ def prepare_display(session, config, directory):
         return display
     if config.get("backend") == "wayland":
         session.env["GLASS_SWAY"] = config["sway"]
+        session.env["WLR_RENDERER"] = config["app_env"]["WLR_RENDERER"]
         width, height = config["display"]
         session.env["GLASS_WAYLAND_SCREEN"] = f"{width}x{height}"
     return None

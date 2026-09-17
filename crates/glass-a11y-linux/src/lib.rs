@@ -5,6 +5,7 @@
 
 #![cfg(target_os = "linux")]
 
+mod coordinates;
 mod events;
 mod mapping;
 mod reader;

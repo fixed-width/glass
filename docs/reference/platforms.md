@@ -14,6 +14,11 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | ✓ the Simulator | ✓ ‡ |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | ✓ headless simctl boot | 🚧 |
 
+Occlusion checks use the platform's accessibility hit test. A covering element omitted from that
+tree can still intercept physical input even when the hit test reports the target. Linux retries
+empty hit results for up to 250 ms within the action deadline, revalidating the target on each read;
+an unchanged, persistently empty result remains `unproven`.
+
 **Transport:** MCP over **stdio** (default, all platforms) or **network HTTP** (`glass-mcp serve
 --http`, all platforms) — the network transport is behind the default-on `network` cargo feature (a
 `--no-default-features` build is stdio-only).

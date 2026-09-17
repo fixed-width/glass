@@ -51,9 +51,11 @@ The minimum configuration is `{"browser":"/absolute/path/firefox"}`. Defaults:
 | `optional_cases`, `exclusions` | Empty; every scheduled case is required |
 
 `browser_args` appends declared browser launch flags. `app_env` supplies declared target environment
-overrides. Linux runs use a fresh profile, display, private session bus and runtime directory per
-attempt. Native desktop runs launch owned applications in the logged-in GUI session. It stops after cleanup failure or
-interruption and records the remaining scheduled attempts as skipped.
+overrides. Wayland defaults `app_env.WLR_RENDERER` to `pixman` and records it in the configuration;
+an explicit renderer overrides it. This keeps the compositor's renderer compatible with the runner's
+software-rendering environment. Linux runs use a fresh profile, display, private session bus and runtime
+directory per attempt. Native desktop runs launch owned applications in the logged-in GUI session. It
+stops after cleanup failure or interruption and records the remaining scheduled attempts as skipped.
 
 Every driver entry has `id`, `adapter`, and an executable argument array `command`. The public runner
 registers only `glass`; another contributor tool can call `main(registry)` with an additional adapter.

@@ -13,6 +13,44 @@ import run as runner
 
 
 class RunnerTests(unittest.TestCase):
+    def test_wayland_renderer_is_frozen_in_config_with_explicit_overrides(self):
+        from types import SimpleNamespace
+        from native_sessions import prepare_display
+
+        for backend, declared, expected in (
+            ("wayland", {}, "pixman"),
+            ("wayland", {"WLR_RENDERER": "gles2"}, "gles2"),
+            ("x11", {}, None),
+        ):
+            with (
+                self.subTest(backend=backend, declared=declared),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory) / "config.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "backend": backend,
+                            "browser": sys.executable,
+                            "sway": sys.executable,
+                            "app_env": declared,
+                            "drivers": [
+                                {
+                                    "id": "glass",
+                                    "adapter": "glass",
+                                    "command": [sys.executable],
+                                }
+                            ],
+                        }
+                    )
+                )
+                config = load_config(path, {"glass": GlassDriver})
+                self.assertEqual(config["app_env"].get("WLR_RENDERER"), expected)
+                if backend == "wayland":
+                    session = SimpleNamespace(env={"WLR_RENDERER": "inherited"})
+                    prepare_display(session, config, Path(directory))
+                    self.assertEqual(session.env["WLR_RENDERER"], expected)
+
     def test_cleanup_failure_halts_remaining_schedule_and_optional_skips_are_explicit(
         self,
     ):

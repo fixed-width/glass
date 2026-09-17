@@ -34,6 +34,8 @@ internal refactors, CI, or test-only changes.
 - Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
 
 ### Fixed
+- Linux accessibility bounds now account for the reported top-level window origin, keeping Firefox Wayland pointer clicks aligned with captured pixels while preserving accessibility hit testing.
+- Linux pointer actions retry transiently empty accessibility hit tests before dispatch, allowing newly started Firefox sessions to identify covering controls. Retries respect the action deadline and reject targets whose identity or geometry changes.
 - iOS launch checks allow startup failures on iOS 27 time to surface before reporting a successful session, including when running without an input companion.
 - iOS value writes allow the keyboard to appear before typing and revalidate the field against its unchanged surrounding form when the focusing tap shifts the layout. Stale fields, changed values, ambiguous matches, and unproven layout changes still refuse the write.
 - On Linux, pointer action checks recognize null accessibility parent properties. A hit on an unrelated container now reports the failed actionability check instead of a misleading backend transport failure.
