@@ -28,6 +28,7 @@ x11rb.workspace = true
 rustix.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = { workspace = true, features = ["shape"] }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 

@@ -25,6 +25,7 @@ pub mod platform;
 // it records the external file, so the harness itself never gets mutated.
 #[cfg(test)]
 mod testx;
+mod window_hit;
 pub mod xvfb;
 pub use platform::X11Platform;
 pub use xvfb::Xvfb;

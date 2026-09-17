@@ -281,6 +281,7 @@ pub struct WindowInfo {
     pub title: Option<String>,
     pub class: Option<String>,
     pub geometry: WindowGeometry,
+    /// The window selected for Glass capture/input, which need not have OS keyboard focus.
     pub active: bool,
 }
 
@@ -506,6 +507,20 @@ pub trait Platform {
     /// backends that address a11y by bus (Linux) leave it unset.
     fn active_window_handle(&self) -> Option<i64> {
         None
+    }
+
+    /// Whether another native window intercepts this active-window-relative point.
+    /// This is a read-only check: do not move the pointer, focus, or raise a window.
+    /// `false` supplies no additional occlusion evidence; it does not prove a control clear.
+    fn pointer_window_occluded_by(
+        &mut self,
+        _point: (i32, i32),
+        deadline: crate::Deadline,
+    ) -> Result<bool> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("pointer window probe"));
+        }
+        Ok(false)
     }
 
     /// Whether this backend reports a checkable element's a11y frame as the whole containing
@@ -939,6 +954,22 @@ mod tests {
     #[test]
     fn default_active_window_handle_is_unset() {
         assert_eq!(MinimalPlatform.active_window_handle(), None);
+    }
+
+    #[test]
+    fn default_window_probe_supplies_no_evidence_and_rejects_an_expired_deadline() {
+        assert!(
+            !MinimalPlatform
+                .pointer_window_occluded_by((10, 20), crate::Deadline::UNBOUNDED)
+                .unwrap()
+        );
+        let error = MinimalPlatform
+            .pointer_window_occluded_by((10, 20), crate::Deadline::from_millis(0))
+            .unwrap_err();
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::NotDispatched)
+        );
     }
 
     #[test]

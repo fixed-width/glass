@@ -34,6 +34,7 @@ internal refactors, CI, or test-only changes.
 - Contained Linux launches now require Bubblewrap support for `--unshare-pid`, private `--proc`, and `--json-status-fd`; launch fails closed with upgrade guidance when the installed Bubblewrap lacks them.
 
 ### Fixed
+- X11 semantic pointer actions now refuse covering windows from other applications before input dispatch, respecting window stacking and input-shaped holes. Wayland window enumeration preserves Glass's selected window when another window takes keyboard focus.
 - Android semantic pointer actions can now refuse a covering touchable window before dispatch when using a companion with window-occlusion support on Android 13 or newer. Within-window occlusion and older companions remain `unproven`.
 - iOS pointer actions now query the accessibility element at the tap point and refuse proven covers before dispatch. Missing or duplicate accessibility identifiers remain `unproven`.
 - macOS pointer action checks now detect accessible controls in covering windows from other applications, refusing the click before dispatch.

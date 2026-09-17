@@ -19,6 +19,12 @@ tree can still intercept physical input even when the hit test reports the targe
 empty hit results for up to 250 ms within the action deadline, revalidating the target on each read;
 an unchanged, persistently empty result remains `unproven`.
 
+X11 additionally checks the X server's window stack and input regions before semantic pointer
+dispatch, including covers from other applications and windows reparented by a window manager.
+Wayland's AT-SPI check is scoped to the target window: Sway's public IPC does not expose the input
+regions needed to distinguish an intercepting external window from a pass-through one. A successful
+within-window accessibility hit does not prove that another Wayland surface cannot intercept input.
+
 **Transport:** MCP over **stdio** (default, all platforms) or **network HTTP** (`glass-mcp serve
 --http`, all platforms) — the network transport is behind the default-on `network` cargo feature (a
 `--no-default-features` build is stdio-only).

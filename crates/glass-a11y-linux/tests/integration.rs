@@ -131,6 +131,117 @@ fn focus_fixture_spec() -> AppSpec {
     spec
 }
 
+#[test]
+#[ignore = "needs private Xvfb, AT-SPI, and GTK3; run via scripts/test-a11y.sh"]
+fn cross_window_occlusion_refuses_covers_but_allows_input_shaped_holes() {
+    use glass_core::{
+        ActionMode, ActionTarget, ActionabilityCheckName, ActionabilityVerdict, AxRole,
+        DispatchStatus, SemanticActionFailureKind,
+    };
+
+    struct StoppedGlass(Glass);
+    impl Drop for StoppedGlass {
+        fn drop(&mut self) {
+            let _ = self.0.stop();
+        }
+    }
+    fn await_value(path: &std::path::Path, expected: &str) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::fs::read_to_string(path).ok().as_deref() == Some(expected) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "{} never became {expected}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    struct Cover(std::process::Child);
+    impl Drop for Cover {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let command = directory.path().join("command");
+    let cover_state = directory.path().join("cover-state");
+    let target_count = directory.path().join("target-count");
+    let cover_count = directory.path().join("cover-count");
+    std::fs::write(&command, "hide").unwrap();
+    let mut spec = fixture_spec();
+    spec.run = vec![
+        "python3".into(),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cross_window_fixture.py"
+        )
+        .into(),
+        directory.path().display().to_string(),
+    ];
+    spec.window_hint.as_mut().unwrap().title = Some("Glass cross-window target".into());
+    let mut session = StoppedGlass(glass_x11_with_a11y());
+    let glass = &mut session.0;
+    glass.start(&spec).unwrap();
+    await_a11y_ready(glass);
+    await_value(&target_count, "0");
+    let params = glass_core::ClickTargetParams {
+        target: ActionTarget::Semantic(semantic_target(AxRole::Button, "Covered action", vec![])),
+        mode: ActionMode::Pointer,
+        timeout_ms: Some(5000),
+        max_nodes: None,
+    };
+    glass.click_target(&params).unwrap();
+    let mut count = 1;
+    await_value(&target_count, &count.to_string());
+    for width in ["400", "100"] {
+        std::fs::write(&command, "cover").unwrap();
+        let _ = std::fs::remove_file(&cover_state);
+        let environment = std::fs::read_to_string(directory.path().join("environment")).unwrap();
+        let cover = Cover(
+            std::process::Command::new("python3")
+                .args([spec.run[1].as_str(), spec.run[2].as_str(), width])
+                .envs(
+                    environment
+                        .lines()
+                        .map(|line| line.split_once('=').unwrap()),
+                )
+                .env("GDK_BACKEND", "x11")
+                .spawn()
+                .unwrap(),
+        );
+        await_value(&cover_state, "cover");
+        let error = glass
+            .click_target(&params)
+            .expect_err("a separate window must block the semantic click");
+        assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+        assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+        assert_eq!(
+            actionability_verdict(&error.actionability, ActionabilityCheckName::NonOccluded),
+            ActionabilityVerdict::Failed
+        );
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            std::fs::read_to_string(&target_count).unwrap(),
+            count.to_string()
+        );
+        assert_eq!(std::fs::read_to_string(&cover_count).unwrap(), "0");
+        std::fs::write(&command, "pass").unwrap();
+        await_value(&cover_state, "pass");
+        glass.click_target(&params).unwrap();
+        count += 1;
+        await_value(&target_count, &count.to_string());
+        assert_eq!(std::fs::read_to_string(&cover_count).unwrap(), "0");
+        drop(cover);
+        glass.click_target(&params).unwrap();
+        count += 1;
+        await_value(&target_count, &count.to_string());
+    }
+}
+
 /// How long a fixture gets to publish its tree — this bounds a hang, it does not pace anything.
 const A11Y_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
