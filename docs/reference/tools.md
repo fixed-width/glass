@@ -879,6 +879,10 @@ point results leave `non_occluded` as `unproven`; they do not independently prev
 Accessibility hit testing cannot guarantee detection of a visible cover omitted from the
 accessibility representation.
 
+X11 also checks native window stacking and input regions, refusing a point intercepted by another
+window without moving the pointer or changing focus. Wayland's accessibility hit test remains scoped
+to the target window; it does not establish that another application's surface is clear of the point.
+
 On Android 13 or newer, an updated accessibility companion can report `non_occluded=failed` when
 a higher touchable window covers the tap point. It never reports `passed`: Android's accessibility
 tree cannot establish which view inside a window receives a tap. Without covering-window evidence,

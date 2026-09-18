@@ -2866,7 +2866,7 @@ impl Platform for WaylandPlatform {
                     title: w.title.clone(),
                     class: w.class.clone(),
                     geometry: rect_to_geom(&w.rect),
-                    active: w.focused,
+                    active: session.active.as_deref() == Some(w.identifier.as_str()),
                 });
             }
             Ok(out)
@@ -5128,7 +5128,7 @@ mod session_tests {
         assert_eq!(
             first.iter().filter(|w| w.active).count(),
             1,
-            "exactly one window is focused"
+            "exactly one window is selected"
         );
         let again = s.platform().list_windows().expect("list again");
         let ids = |ws: &[WindowInfo]| {
@@ -5158,6 +5158,45 @@ mod session_tests {
             s.focused_title().as_deref(),
             target.title.as_deref(),
             "the compositor must actually have moved focus"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor; needs sway and Mesa"]
+    fn external_focus_does_not_change_the_selected_window_in_enumeration() {
+        let mut s = Launch::new()
+            .windows(&["one:app-one:200x100", "two:app-two:150x120"])
+            .start();
+        s.until("both windows to map", |s| s.windows().len() == 2);
+        let selected = s
+            .platform()
+            .list_windows()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.active)
+            .unwrap();
+        let other = s
+            .windows()
+            .into_iter()
+            .find(|w| w.title != selected.title)
+            .unwrap();
+        s.platform()
+            .active
+            .as_mut()
+            .unwrap()
+            .ipc
+            .run_command_by(
+                &format!("[con_id={}] focus", other.con_id),
+                Deadline::UNBOUNDED,
+            )
+            .unwrap();
+        assert_eq!(s.focused_title(), other.title);
+        let listed = s.platform().list_windows().unwrap();
+        assert_eq!(listed.iter().filter(|w| w.active).count(), 1);
+        assert_eq!(listed.iter().find(|w| w.active).unwrap().id, selected.id);
+        assert_eq!(
+            s.platform().window(&WindowOp::Geometry).unwrap(),
+            selected.geometry
         );
     }
 

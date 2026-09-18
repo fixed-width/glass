@@ -1609,6 +1609,22 @@ impl Platform for X11Platform {
         })
     }
 
+    fn pointer_window_occluded_by(
+        &mut self,
+        point: (i32, i32),
+        deadline: Deadline,
+    ) -> Result<bool> {
+        self.run_window_call_by(
+            deadline,
+            "X11 pointer window probe",
+            |platform, dispatch| {
+                let target = platform.require_window()?;
+                dispatch.mark();
+                crate::window_hit::occluded(&platform.conn, platform.root, target, point, deadline)
+            },
+        )
+    }
+
     fn send_pointer_by(&mut self, event: &PointerEvent, deadline: Deadline) -> Result<()> {
         glass_core::validate_pointer_input(event)?;
         run_x11_call_by(deadline, "pointer input", |dispatch| {
@@ -2727,6 +2743,194 @@ mod display_tests {
 
     /// A pid no window on a fresh private display can be carrying.
     const OTHER_PID: u32 = 999_999;
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn window_probe_respects_stacking_input_shapes_and_never_moves_the_pointer() {
+        use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};
+        let x = TestX::start();
+        let target = x
+            .window()
+            .at(100, 80)
+            .sized(200, 100)
+            .watching_input()
+            .create();
+        let mut platform = x.platform();
+        platform.window = Some(target);
+        let pointer = x.pointer();
+        assert!(
+            !platform
+                .pointer_window_occluded_by((50, 40), Deadline::UNBOUNDED)
+                .unwrap()
+        );
+        let cover = x
+            .window()
+            .at(100, 80)
+            .sized(100, 100)
+            .watching_input()
+            .create();
+        assert!(
+            platform
+                .pointer_window_occluded_by((50, 40), Deadline::UNBOUNDED)
+                .unwrap()
+        );
+        assert!(
+            !platform
+                .pointer_window_occluded_by((150, 40), Deadline::UNBOUNDED)
+                .unwrap()
+        );
+        platform
+            .conn
+            .shape_rectangles(SO::SET, SK::INPUT, ClipOrdering::UNSORTED, cover, 0, 0, &[])
+            .unwrap()
+            .check()
+            .unwrap();
+        assert!(
+            !platform
+                .pointer_window_occluded_by((50, 40), Deadline::UNBOUNDED)
+                .unwrap()
+        );
+        platform
+            .conn
+            .shape_rectangles(
+                SO::SET,
+                SK::INPUT,
+                ClipOrdering::UNSORTED,
+                cover,
+                0,
+                0,
+                &[Rectangle {
+                    x: 20,
+                    y: 20,
+                    width: 20,
+                    height: 20,
+                }],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        for (point, blocked) in [
+            ((20, 20), true),
+            ((39, 39), true),
+            ((19, 20), false),
+            ((40, 20), false),
+            ((20, 19), false),
+            ((20, 40), false),
+        ] {
+            assert_eq!(
+                platform
+                    .pointer_window_occluded_by(point, Deadline::UNBOUNDED)
+                    .unwrap(),
+                blocked,
+                "{point:?}"
+            );
+        }
+        assert_eq!(x.pointer(), pointer);
+        assert!(clicks_seen(&x).is_empty());
+        x.destroy(cover);
+        assert!(
+            !platform
+                .pointer_window_occluded_by((50, 40), Deadline::UNBOUNDED)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn window_probe_checks_each_ancestor_of_a_reparented_client() {
+        let x = TestX::start();
+        let frame = x.window().at(100, 80).sized(220, 120).create();
+        let target = x.window().sized(200, 100).create();
+        let mut platform = x.platform();
+        platform
+            .conn
+            .reparent_window(target, frame, 10, 10)
+            .unwrap()
+            .check()
+            .unwrap();
+        platform.window = Some(target);
+        assert!(
+            !platform
+                .pointer_window_occluded_by((50, 40), Deadline::UNBOUNDED)
+                .unwrap()
+        );
+        let sibling = x.window().sized(100, 100).create();
+        platform
+            .conn
+            .reparent_window(sibling, frame, 10, 10)
+            .unwrap()
+            .check()
+            .unwrap();
+        assert!(
+            platform
+                .pointer_window_occluded_by((50, 40), Deadline::UNBOUNDED)
+                .unwrap()
+        );
+        x.destroy(sibling);
+        let cover = x.window().at(100, 80).sized(220, 120).create();
+        assert!(
+            platform
+                .pointer_window_occluded_by((50, 40), Deadline::UNBOUNDED)
+                .unwrap()
+        );
+        x.destroy(cover);
+        assert!(
+            !platform
+                .pointer_window_occluded_by((50, 40), Deadline::UNBOUNDED)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn window_probe_propagates_missing_windows_range_errors_and_deadlines() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        assert!(matches!(
+            platform.pointer_window_occluded_by((0, 0), Deadline::UNBOUNDED),
+            Err(GlassError::WindowNotFound)
+        ));
+        let target = x.window().create();
+        platform.window = Some(target);
+        for point in [(i32::MAX, 0), (0, i32::MAX)] {
+            assert!(
+                platform
+                    .pointer_window_occluded_by(point, Deadline::UNBOUNDED)
+                    .is_err()
+            );
+        }
+        let error = platform
+            .pointer_window_occluded_by((10, 10), Deadline::from_millis(0))
+            .unwrap_err();
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        x.destroy(target);
+        assert!(
+            platform
+                .pointer_window_occluded_by((10, 10), Deadline::UNBOUNDED)
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn window_probe_cannot_wait_out_a_stalled_x_server() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        platform.window = Some(x.window().create());
+        let paused = PausedXServer::new(x.server_pid());
+        let error = platform
+            .pointer_window_occluded_by((10, 10), Deadline::from_millis(40))
+            .unwrap_err();
+        assert!(
+            !paused.resume(),
+            "the probe outlived its deadline and needed rescue"
+        );
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+    }
 
     #[test]
     #[ignore = "starts a real X server; needs Xvfb"]

@@ -21,6 +21,7 @@ pub(crate) type CaptureWindowLog = Arc<Mutex<Vec<(WindowId, Option<Region>)>>>;
 /// Every deadline handed to a fake platform capture.
 pub(crate) type CaptureDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
 pub(crate) type InputDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
+type WindowProbeLog = Arc<Mutex<Vec<((i32, i32), Deadline)>>>;
 
 /// The last `AxContext` a fake `Accessibility` was called with — see
 /// [`FakeAccessibility::ctx_log`].
@@ -45,6 +46,8 @@ pub(crate) struct FakePlatform {
     capture_log: Arc<Mutex<Vec<Option<Region>>>>,
     capture_deadline_log: Option<CaptureDeadlineLog>,
     pointer_deadline_log: Option<InputDeadlineLog>,
+    window_occlusion: Option<Result<bool>>,
+    window_probe_log: Option<WindowProbeLog>,
     key_deadline_log: Option<InputDeadlineLog>,
     pid_deadline_log: Option<PidDeadlineLog>,
     capture_delay: Option<Duration>,
@@ -101,6 +104,16 @@ pub(crate) struct FakePlatform {
 }
 
 impl FakePlatform {
+    pub(crate) fn with_window_occlusion(
+        mut self,
+        result: Result<bool>,
+        log: WindowProbeLog,
+    ) -> Self {
+        self.window_occlusion = Some(result);
+        self.window_probe_log = Some(log);
+        self
+    }
+
     pub(crate) fn new(width: u32, height: u32) -> Self {
         Self {
             geometry: WindowGeometry {
@@ -303,6 +316,17 @@ impl FakePlatform {
 }
 
 impl Platform for FakePlatform {
+    fn pointer_window_occluded_by(
+        &mut self,
+        point: (i32, i32),
+        deadline: Deadline,
+    ) -> Result<bool> {
+        if let Some(log) = &self.window_probe_log {
+            log.lock().unwrap().push((point, deadline));
+        }
+        self.window_occlusion.take().unwrap_or(Ok(false))
+    }
+
     fn configure_protected_host_paths(
         &mut self,
         paths: &[ProtectedHostPath],

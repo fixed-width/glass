@@ -1947,6 +1947,88 @@ fn selector_pointer_known_occlusion_blocks_before_pointer_dispatch() {
 }
 
 #[test]
+fn another_window_overrides_an_accessibility_hit_without_dispatching_input() {
+    for hit in [
+        PointerHit::Target,
+        PointerHit::AcceptedAncestor,
+        PointerHit::Inconclusive,
+    ] {
+        let tree = actionable_button_tree(
+            "Save",
+            AxRect {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 20,
+            },
+        );
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let probes = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100)
+            .with_click_log(clicks.clone())
+            .with_window_occlusion(Ok(true), probes.clone());
+        let (mut glass, _, _, _) = pointer_glass(platform, vec![tree.clone(), tree], hit, false);
+        glass.start(&spec()).unwrap();
+        let deadline = Deadline::from_millis(2000);
+        let error = glass
+            .click_target_inner(
+                pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
+                deadline,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, SemanticActionFailureKind::NotActionable);
+        assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+        assert!(
+            error
+                .actionability
+                .checks
+                .iter()
+                .any(|check| check.name == ActionabilityCheckName::NonOccluded
+                    && check.verdict == ActionabilityVerdict::Failed)
+        );
+        assert!(!error.side_effects_may_have_occurred());
+        assert!(clicks.lock().unwrap().is_empty());
+        assert_eq!(*probes.lock().unwrap(), vec![((20, 20), deadline)]);
+    }
+}
+
+#[test]
+fn a_window_probe_error_does_not_fall_back_to_the_accessibility_hit() {
+    let tree = actionable_button_tree(
+        "Save",
+        AxRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        },
+    );
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let platform = FakePlatform::new(100, 100)
+        .with_click_log(clicks.clone())
+        .with_window_occlusion(
+            Err(GlassError::Backend("window probe unavailable".into())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+    let (mut glass, _, _, _) = pointer_glass(
+        platform,
+        vec![tree.clone(), tree],
+        PointerHit::Target,
+        false,
+    );
+    glass.start(&spec()).unwrap();
+    let error = glass
+        .click_target_inner(
+            pointer_params(ActionTarget::Semantic(semantic_target("Save")), None),
+            Deadline::UNBOUNDED,
+        )
+        .unwrap_err();
+    assert_eq!(error.action_dispatch, DispatchStatus::NotDispatched);
+    assert!(!error.side_effects_may_have_occurred());
+    assert!(clicks.lock().unwrap().is_empty());
+}
+
+#[test]
 fn selector_pointer_inconclusive_occlusion_dispatches_once_and_discloses_unproven() {
     let tree = actionable_button_tree(
         "Save",

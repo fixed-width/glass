@@ -1258,6 +1258,14 @@ impl Glass {
             .as_mut()
             .ok_or(GlassError::AxUnsupported)?
             .pointer_target_at(&ctx, target, point)?;
+        let hit = if active
+            .platform
+            .pointer_window_occluded_by(point, deadline)?
+        {
+            crate::PointerHit::Other
+        } else {
+            hit
+        };
         active.pump();
         Ok(hit)
     }
