@@ -188,7 +188,7 @@ public class MainActivity extends Activity {
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View view) {
-                        startSemanticMovement();
+                        startSemanticMovement(2000);
                     }
                 });
         root.addView(restart, matchWrap());
@@ -260,12 +260,12 @@ public class MainActivity extends Activity {
                 new Runnable() {
                     @Override
                     public void run() {
-                        startSemanticMovement();
+                        startSemanticMovement(300);
                     }
                 });
     }
 
-    private void startSemanticMovement() {
+    private void startSemanticMovement(final long durationMs) {
         final int generation = ++semanticMovementGeneration;
         final long started = SystemClock.uptimeMillis();
         final float distance = dp(120);
@@ -276,9 +276,9 @@ public class MainActivity extends Activity {
                     public void run() {
                         if (generation != semanticMovementGeneration) return;
                         long elapsed = SystemClock.uptimeMillis() - started;
-                        float fraction = Math.min(1f, elapsed / 300f);
+                        float fraction = Math.min(1f, elapsed / (float) durationMs);
                         movingSemantic.setTranslationX(distance * fraction);
-                        if (elapsed < 300) movingSemantic.postDelayed(this, 16);
+                        if (elapsed < durationMs) movingSemantic.postDelayed(this, 16);
                     }
                 });
     }
