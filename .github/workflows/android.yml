@@ -107,7 +107,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
+          cache: ${{ steps.fixture-cache.outputs.cache-hit != 'true' && 'gradle' || '' }}
 
       - name: Build the fixture APK (cache miss only)
         id: fixture-build
