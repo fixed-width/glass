@@ -1545,12 +1545,14 @@ fn scroll_to_element_reports_unmatched_for_an_absent_row() {
             direction: Some(glass_core::ScrollDirection::Down),
             anchor: Some(anchor),
             step: glass_core::SCROLL_TO_DEFAULT_STEP,
-            timeout_ms: glass_core::SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            // A complete sweep can exceed the default action budget on CI.
+            timeout_ms: 60_000,
         })
         .expect("scroll_to_element");
     assert!(!out.matched, "Row 999 must not match; {out:?}");
     assert!(out.element.is_none());
     assert!(out.reversed, "should have swept both ends; {out:?}");
+    assert_eq!(out.timed_out_by, None, "sweep must finish; {out:?}");
     glass.stop().expect("stop");
 }
 

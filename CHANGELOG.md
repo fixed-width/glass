@@ -19,6 +19,8 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-09-20
+
 ### Added
 - Optional `max_width`/`max_height` shrink screenshots and settle/diff/region-wait image attachments, with source rectangles, returned dimensions and scaling metadata. Baseline verification and input coordinates remain in native pixels.
 - Optional `--trace-dir` retains supplied tool inputs and requested results in a bounded private session trace. Offline `trace inspect` and `trace export` validate and package evidence after the server stops, with explicit omissions and unchanged tool execution when recording reaches a limit or fails.
@@ -1263,7 +1265,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/fixed-width/glass/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/fixed-width/glass/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/fixed-width/glass/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/fixed-width/glass/compare/v1.4.0...v1.5.0

@@ -29,7 +29,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  AGENT_TAG: v0.6.0
+  AGENT_TAG: v0.8.0
   API_LEVEL: '34'
   EMULATOR_TARGET: google_apis
   EMULATOR_ARCH: x86_64
@@ -102,13 +102,12 @@ jobs:
           ref: ${{ env.AGENT_TAG }}
           path: agent-src
 
-      - name: Set up JDK 17 for the fixture build (cache miss only)
-        if: steps.fixture-cache.outputs.cache-hit != 'true'
+      - name: Set up JDK 17 for the fixture builds
         uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
+          cache: ${{ steps.fixture-cache.outputs.cache-hit != 'true' && 'gradle' || '' }}
 
       - name: Build the fixture APK (cache miss only)
         id: fixture-build
@@ -132,12 +131,23 @@ jobs:
           test -f "$apk"
           echo "GLASS_ANDROID_FIXTURE_APK=$apk" >> "$GITHUB_ENV"
 
+      - name: Build the role fixture
+        env:
+          BUILD_TOOLS: '34.0.0'
+          ANDROID_PLATFORM: android-34
+        run: |
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0"
+          ./examples/android-role-fixture/build.sh
+          echo "GLASS_ANDROID_ROLE_FIXTURE_APK=$PWD/examples/android-role-fixture/build/role-fixture.apk" >> "$GITHUB_ENV"
+
       - name: Build the device suite's test binaries
         # Ahead of every step that can have an emulator running. A build beside a booted AVD ANRs
         # the device (glass#439).
         run: ./scripts/test-android.sh --build-only
 
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: platform-tools
 
       - name: Define the AVD
         # Created, not restored from a cache: a cached snapshot resumes mid-churn, the state
@@ -171,7 +181,9 @@ jobs:
           # mid-suite glass would quietly boot its own and the remaining tests would pass against
           # a different device.
           GLASS_ANDROID_LIFECYCLE: attach
-        run: ./scripts/ci-android-suite.sh
+        run: |
+          "$GLASS_ADB" install -r "$GLASS_ANDROID_ROLE_FIXTURE_APK"
+          ./scripts/ci-android-suite.sh
 
       - name: Stop the emulator
         if: always()
@@ -231,6 +243,8 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: platform-tools
 
       - name: Install the system image and define an AVD, without booting it
         run: |

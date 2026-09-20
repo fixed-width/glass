@@ -639,7 +639,7 @@ async fn android_semantic_actions_are_conservative_and_exactly_once() {
     .await;
     let movement_started = std::time::Instant::now();
     let mut movement_samples = Vec::new();
-    while movement_started.elapsed() < Duration::from_millis(500) {
+    while movement_started.elapsed() < Duration::from_secs(3) {
         let outline = snapshot_outline(&client).await;
         movement_samples.push((
             movement_started.elapsed(),
@@ -655,7 +655,7 @@ async fn android_semantic_actions_are_conservative_and_exactly_once() {
             break;
         }
     }
-    println!("Android 300ms movement samples: {movement_samples:?}");
+    println!("Android restarted movement samples: {movement_samples:?}");
     assert!(
         movement_samples
             .iter()
@@ -663,7 +663,7 @@ async fn android_semantic_actions_are_conservative_and_exactly_once() {
             .collect::<std::collections::HashSet<_>>()
             .len()
             > 1,
-        "the 300ms fixture motion produced no observed bounds change: {movement_samples:?}"
+        "the restarted fixture motion produced no observed bounds change: {movement_samples:?}"
     );
 
     let moving = call(
