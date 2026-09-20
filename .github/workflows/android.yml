@@ -138,6 +138,8 @@ jobs:
         run: ./scripts/test-android.sh --build-only
 
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: platform-tools
 
       - name: Define the AVD
         # Created, not restored from a cache: a cached snapshot resumes mid-churn, the state
@@ -231,6 +233,8 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: platform-tools
 
       - name: Install the system image and define an AVD, without booting it
         run: |
