@@ -24,6 +24,38 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::util::{WinInfo, enum_top_windows, extended_frame_bounds, find_by_title, window_rect};
 
+/// A hinted window outside the launched process set, retained across active-window changes.
+pub(crate) struct ExternalWindow {
+    raw: isize,
+    pid: u32,
+}
+
+impl ExternalWindow {
+    pub(crate) fn new(window: &WinInfo) -> Self {
+        Self {
+            raw: window.raw,
+            pid: window.pid,
+        }
+    }
+
+    pub(crate) fn verify_stopped(&self) -> Result<()> {
+        let mut pid = 0;
+        // SAFETY: read-only query; a destroyed window returns zero. Check the owner too,
+        // since Windows can reuse a window handle after the adopted window closes.
+        let thread =
+            unsafe { GetWindowThreadProcessId(crate::util::raw_to_hwnd(self.raw), Some(&mut pid)) };
+        if thread != 0 && pid == self.pid {
+            return Err(GlassError::Backend(format!(
+                "partial stop: adopted window {:#x} (pid {}) is still open outside the launched \
+                 process set; Glass released the launched app but left this window and its owner \
+                 untouched. Close the external window explicitly if desired; the session has ended",
+                self.raw, self.pid
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// A DWM frame `RECT` (left/top/right/bottom, physical pixels) as window geometry.
 pub(crate) fn rect_to_geometry(r: RECT) -> WindowGeometry {
     WindowGeometry {
