@@ -5,7 +5,9 @@
 // exercised by the Linux unit tests, so off-Windows non-test builds see them as dead.
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use glass_core::{Check, CheckStatus};
+use std::sync::Mutex;
+
+use glass_core::{Check, CheckStatus, ProbeFailure};
 
 // ---- pure, Linux-testable ----
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,7 +28,7 @@ pub(crate) enum DpiAwareness {
 
 pub(crate) struct DoctorFacts {
     pub session: SessionKind,
-    pub wgc_supported: bool,
+    pub wgc_supported: Result<bool, ProbeFailure>,
     pub dpi: DpiAwareness,
     pub build: Option<u32>, // Windows build number; None = couldn't determine
 }
@@ -60,15 +62,36 @@ pub(crate) fn build_checks(f: &DoctorFacts) -> Vec<Check> {
         ),
     });
     // 2. WGC
-    v.push(if f.wgc_supported {
-        Check::new("Windows.Graphics.Capture", CheckStatus::Ok, "supported")
-    } else {
-        Check::new(
+    v.push(match &f.wgc_supported {
+        Ok(true) => Check::new("Windows.Graphics.Capture", CheckStatus::Ok, "supported"),
+        Ok(false) => Check::new(
             "Windows.Graphics.Capture",
             CheckStatus::Fail,
             "not supported on this system",
         )
-        .with_remedy("WGC needs Windows 10 1903+ with a GPU or WARP software renderer")
+        .with_remedy("WGC needs Windows 10 1903+ with a GPU or WARP software renderer"),
+        Err(failure) => Check::new(
+            "Windows.Graphics.Capture",
+            CheckStatus::Fail,
+            format!(
+                "could not determine support: {}",
+                failure.detail("Windows.Graphics.Capture")
+            ),
+        )
+        .with_remedy(match failure {
+            ProbeFailure::Vanished => {
+                "the WGC probe thread panicked; check glass's stderr and rerun glass doctor; \
+                 report the panic if it recurs"
+            }
+            ProbeFailure::NotStarted(_) => {
+                "the WGC probe could not start; resolve the resource error in the detail and \
+                 rerun glass doctor"
+            }
+            _ => {
+                "rerun glass doctor to retry the WGC probe; if it still fails, check the Windows \
+                 error in the detail and ensure glass runs in an interactive desktop session"
+            }
+        }),
     });
     // 3. DPI awareness (per-monitor = physical pixels; system/unaware = virtualized coords)
     v.push(match f.dpi {
@@ -309,42 +332,60 @@ fn gather_session() -> SessionKind {
 
 /// Whether Windows.Graphics.Capture is usable on this system (the real capability gate).
 ///
-/// Probed once, on a thread this function owns. `IsSupported` activates a WinRT runtime class on
+/// Successful answers are cached; failed probes are retried on the next call.
+/// `IsSupported` activates a WinRT runtime class on
 /// whatever thread calls it, and doing that on a borrowed thread that later exits faults with
 /// `STATUS_ACCESS_VIOLATION`: `cargo test --workspace` on Windows crashed the `glass-mcp` test
 /// binary about half the time, libtest giving each test its own short-lived thread. Caching alone
 /// does not fix it — one activation on a borrowed thread is enough — so the apartment is
 /// initialized and torn down here, on a thread whose lifetime is bounded by the `join` below.
 #[cfg(windows)]
-fn gather_wgc() -> bool {
-    use std::sync::OnceLock;
-    static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(probe_wgc)
+fn gather_wgc() -> Result<bool, ProbeFailure> {
+    static SUPPORTED: Mutex<Option<bool>> = Mutex::new(None);
+    gather_wgc_with(&SUPPORTED, probe_wgc)
 }
 
-/// The WGC probe, on its own COM-initialized thread. Separate from [`gather_wgc`] so the caching
-/// and the apartment handling read apart.
+/// Serialize probes on owned threads, caching only completed capability answers.
+fn gather_wgc_with(
+    cache: &Mutex<Option<bool>>,
+    probe: impl FnOnce() -> Result<bool, ProbeFailure> + Send + 'static,
+) -> Result<bool, ProbeFailure> {
+    let mut cached = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(supported) = *cached {
+        return Ok(supported);
+    }
+    let supported = std::thread::Builder::new()
+        .name("glass-wgc-probe".into())
+        .spawn(probe)
+        .map_err(|e| ProbeFailure::NotStarted(e.to_string()))?
+        .join()
+        .map_err(|_| ProbeFailure::Vanished)??;
+    *cached = Some(supported);
+    Ok(supported)
+}
+
+/// Runs only on the owned thread created by [`gather_wgc_with`].
 #[cfg(windows)]
-fn probe_wgc() -> bool {
+fn probe_wgc() -> Result<bool, ProbeFailure> {
     use windows::Graphics::Capture::GraphicsCaptureSession;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
-    std::thread::spawn(|| {
-        // SAFETY: takes only scalars and borrows nothing. The thread it initializes is created
-        // here and joined below, so the apartment cannot outlive its pairing with the
-        // `CoUninitialize`.
-        let entered = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        // Safe: `IsSupported` is a WinRT projection, not an FFI call.
-        let supported = GraphicsCaptureSession::IsSupported().unwrap_or(false);
-        if entered.is_ok() {
-            // SAFETY: balances the `CoInitializeEx` above on this same thread. Gated on
-            // `is_ok`, so it runs for S_OK and S_FALSE but never for `RPC_E_CHANGED_MODE`,
-            // where this thread entered no apartment to leave.
+
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            // SAFETY: constructed only after successful CoInitializeEx on this same thread;
+            // balances S_OK and S_FALSE, including when the probe unwinds.
             unsafe { CoUninitialize() };
         }
-        supported
-    })
-    .join()
-    .unwrap_or(false)
+    }
+
+    // SAFETY: initializes COM on our owned probe thread; no borrowed pointers.
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+        .ok()
+        .map_err(|e| ProbeFailure::Failed(format!("CoInitializeEx: {e}")))?;
+    let _apartment = Apartment;
+    GraphicsCaptureSession::IsSupported()
+        .map_err(|e| ProbeFailure::Failed(format!("GraphicsCaptureSession::IsSupported: {e}")))
 }
 
 /// Port of the validated PMv2 probe: classify the thread's DPI-awareness context.
@@ -396,11 +437,154 @@ fn gather_build() -> Option<u32> {
 mod tests {
     use super::*;
 
+    fn wgc_check(wgc_supported: Result<bool, ProbeFailure>) -> Check {
+        build_checks(&DoctorFacts {
+            session: SessionKind::Console,
+            wgc_supported,
+            dpi: DpiAwareness::PerMonitorV2,
+            build: Some(26100),
+        })
+        .into_iter()
+        .find(|c| c.name == "Windows.Graphics.Capture")
+        .unwrap()
+    }
+
+    #[test]
+    fn wgc_unsupported_has_os_and_renderer_remedy() {
+        let check = wgc_check(Ok(false));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.detail, "not supported on this system");
+        assert!(check.remedy.unwrap().contains("Windows 10 1903+"));
+    }
+
+    #[test]
+    fn wgc_error_preserves_hresult_and_offers_retry() {
+        let check = wgc_check(Err(ProbeFailure::Failed(
+            "GraphicsCaptureSession::IsSupported: Class not registered (0x80040154)".into(),
+        )));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.detail.contains("could not determine support"));
+        assert!(
+            check
+                .detail
+                .contains("IsSupported: Class not registered (0x80040154)")
+        );
+        let remedy = check.remedy.unwrap();
+        assert!(remedy.contains("retry"));
+        assert!(!remedy.contains("1903"));
+    }
+
+    #[test]
+    fn wgc_panic_names_thread_and_stderr() {
+        let check = wgc_check(Err(ProbeFailure::Vanished));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.detail.contains("thread unwound"));
+        let remedy = check.remedy.unwrap();
+        assert!(remedy.contains("panicked"));
+        assert!(remedy.contains("stderr"));
+        assert!(!remedy.contains("1903"));
+    }
+
+    #[test]
+    fn wgc_start_failure_names_resource_error() {
+        let check = wgc_check(Err(ProbeFailure::NotStarted("thread limit".into())));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.detail.contains("could not start"));
+        assert!(check.detail.contains("thread limit"));
+        let remedy = check.remedy.unwrap();
+        assert!(remedy.contains("resource error"));
+        assert!(!remedy.contains("1903"));
+    }
+
+    #[test]
+    fn wgc_caches_both_supported_and_unsupported_answers() {
+        for supported in [true, false] {
+            let cache = Mutex::new(None);
+            assert_eq!(
+                gather_wgc_with(&cache, move || Ok(supported)),
+                Ok(supported)
+            );
+            assert_eq!(
+                gather_wgc_with(&cache, || panic!("cached answer must not probe again")),
+                Ok(supported)
+            );
+        }
+    }
+
+    #[test]
+    fn wgc_retries_errors_until_a_capability_answer_is_cached() {
+        let cache = Mutex::new(None);
+        for _ in 0..2 {
+            let error = ProbeFailure::Failed("activation failed (0x80040154)".into());
+            let expected = error.clone();
+            assert_eq!(gather_wgc_with(&cache, move || Err(error)), Err(expected));
+        }
+        assert_eq!(gather_wgc_with(&cache, || Ok(true)), Ok(true));
+        assert_eq!(
+            gather_wgc_with(&cache, || panic!("successful retry must be cached")),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn wgc_retries_after_probe_thread_panics() {
+        let cache = Mutex::new(None);
+        assert_eq!(
+            gather_wgc_with(&cache, || panic!("injected WGC probe panic")),
+            Err(ProbeFailure::Vanished)
+        );
+        assert_eq!(gather_wgc_with(&cache, || Ok(true)), Ok(true));
+        assert_eq!(
+            gather_wgc_with(&cache, || panic!("successful retry must be cached")),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn wgc_probes_on_an_owned_thread() {
+        let caller = std::thread::current().id();
+        assert_eq!(
+            gather_wgc_with(&Mutex::new(None), move || {
+                assert_ne!(std::thread::current().id(), caller);
+                Ok(true)
+            }),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn concurrent_wgc_calls_share_one_successful_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let cache = Arc::new(Mutex::new(None));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let calls = Arc::clone(&calls);
+                let ready = Arc::clone(&ready);
+                std::thread::spawn(move || {
+                    ready.wait();
+                    gather_wgc_with(&cache, move || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(true)
+                    })
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), Ok(true));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn session0_fails_with_remedy() {
         let f = DoctorFacts {
             session: SessionKind::Session0,
-            wgc_supported: true,
+            wgc_supported: Ok(true),
             dpi: DpiAwareness::PerMonitorV2,
             build: Some(26100),
         };
@@ -415,7 +599,7 @@ mod tests {
         assert_eq!(
             build_checks(&DoctorFacts {
                 session: SessionKind::Console,
-                wgc_supported: true,
+                wgc_supported: Ok(true),
                 dpi: DpiAwareness::PerMonitorV2,
                 build: Some(17763)
             })
@@ -428,7 +612,7 @@ mod tests {
         assert_eq!(
             build_checks(&DoctorFacts {
                 session: SessionKind::Console,
-                wgc_supported: true,
+                wgc_supported: Ok(true),
                 dpi: DpiAwareness::PerMonitorV2,
                 build: Some(18362)
             })
@@ -444,7 +628,7 @@ mod tests {
     fn all_green_when_healthy() {
         let f = DoctorFacts {
             session: SessionKind::Console,
-            wgc_supported: true,
+            wgc_supported: Ok(true),
             dpi: DpiAwareness::PerMonitorV2,
             build: Some(26100),
         };
