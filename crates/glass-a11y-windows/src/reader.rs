@@ -1,6 +1,6 @@
 //! `WindowsA11y`: the UI Automation `Accessibility` reader. Runs each bounded call on a detached,
-//! COM-isolated thread (`glass_core::A11yThread`), finds the app's top-level window by PID
-//! (geometry fallback), and walks the bounded Control view into an `AxTree`. Never returns a stub:
+//! COM-isolated thread (`glass_core::A11yThread`), binds to the adopted window handle,
+//! and walks the bounded Control view into an `AxTree`. Never returns a stub:
 //! failures are `AccessibilityUnavailable`.
 
 use std::time::{Duration, Instant};
@@ -10,11 +10,14 @@ use glass_core::{
     AxTree, ChangeSignal, Deadline, GlassError, PointerHit, Result, WalkBudget, Whose,
     normalize_description, normalize_name, read_back_confirms, write_took_no_effect,
 };
+use uiautomation::core::UICacheRequest;
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
     UITogglePattern, UIValuePattern,
 };
-use uiautomation::types::{ExpandCollapseState, Handle, Rect, ToggleState};
+use uiautomation::types::{
+    ElementMode, ExpandCollapseState, Handle, Rect, ToggleState, TreeScope, UIProperty,
+};
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
 
 /// Every bounded call runs on a fresh detached thread: UIA is COM and thread-affine, so it must
@@ -201,6 +204,51 @@ fn may_request_parent(depth: usize, depth_limit: usize) -> bool {
     depth < depth_limit
 }
 
+#[derive(Clone, Copy)]
+enum ReadMode {
+    Current,
+    Cached,
+}
+
+impl ReadMode {
+    fn read<T, R>(
+        self,
+        object: &T,
+        current: fn(&T) -> uiautomation::Result<R>,
+        cached: fn(&T) -> uiautomation::Result<R>,
+    ) -> uiautomation::Result<R> {
+        match self {
+            Self::Current => current(object),
+            Self::Cached => cached(object),
+        }
+    }
+}
+
+fn snapshot_cache(automation: &UIAutomation, deadline: Deadline) -> Result<UICacheRequest> {
+    required_com(deadline, "configure UIA snapshot cache", || {
+        let cache = automation.create_cache_request()?;
+        // Element scope bounds each fetch; Full keeps the reference needed for the next step.
+        cache.set_tree_scope(TreeScope::Element)?;
+        // Live references also preserve the control-type-gated pattern reads used by actions.
+        cache.set_element_mode(ElementMode::Full)?;
+        for property in [
+            UIProperty::ControlType,
+            UIProperty::Name,
+            UIProperty::HelpText,
+            UIProperty::FrameworkId,
+            UIProperty::BoundingRectangle,
+            UIProperty::IsEnabled,
+            UIProperty::IsOffscreen,
+            UIProperty::HasKeyboardFocus,
+            UIProperty::IsKeyboardFocusable,
+            UIProperty::IsPassword,
+        ] {
+            cache.add_property(property)?;
+        }
+        Ok(cache)
+    })
+}
+
 fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     // UIAutomation::new() initializes COM (MTA) on this thread.
     let automation = required_com(ctx.deadline, "initialize UI Automation", UIAutomation::new)?;
@@ -209,17 +257,18 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     })?;
     let window = find_app_window(&automation, ctx)?;
 
-    let origin = (ctx.window.x, ctx.window.y);
+    let walk = SnapshotWalk {
+        walker,
+        cache: snapshot_cache(&automation, ctx.deadline)?,
+        origin: (ctx.window.x, ctx.window.y),
+        window_size: (ctx.window.width, ctx.window.height),
+        deadline: ctx.deadline,
+    };
+    let window = required_com(ctx.deadline, "cache UIA snapshot root", || {
+        window.build_updated_cache(&walk.cache)
+    })?;
     let mut budget = WalkBudget::with_limits(ctx.limits);
-    let root_node = walk(
-        &walker,
-        &window,
-        origin,
-        (ctx.window.width, ctx.window.height),
-        0,
-        &mut budget,
-        ctx.deadline,
-    )?;
+    let root_node = walk.walk(&window, 0, &mut budget)?;
     let mut tree = AxTree::new(root_node);
     tree.truncated = budget.truncation();
     tree.unreadable = budget.unreadable();
@@ -270,95 +319,105 @@ fn step(
 /// Recursively build a normalized node, bounded by [`WalkBudget`] (node count, nesting depth,
 /// and per-level sibling scan) so a pathological tree can't burn the reader's whole ceiling
 /// with no tree to show for it.
-fn walk(
-    walker: &UITreeWalker,
-    el: &UIElement,
+struct SnapshotWalk {
+    walker: UITreeWalker,
+    cache: UICacheRequest,
     origin: (i32, i32),
     window_size: (u32, u32),
-    depth: usize,
-    budget: &mut WalkBudget,
     deadline: Deadline,
-) -> Result<AxNode> {
-    budget.visit();
-    let ct_id =
-        required_com(deadline, "read UIA control type", || el.get_control_type())? as i32 as u32;
-    // `canonical_name` knows every documented control type, mapped or not, so the numeric form
-    // is reached only by a vendor-defined or future id — still reported, never dropped.
-    let raw_role = crate::mapping::canonical_name(ct_id)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("UIA:{ct_id}"));
-    let framework = framework_id(el, ct_id, deadline)?;
-    let name = nonempty(required_com(deadline, "read UIA name", || el.get_name())?);
-    let description = normalize_description(&help_text(el, ct_id, deadline)?, name.as_deref());
-    let bounds = window_relative_bounds(el, origin, deadline)?;
-    let (mut facts, value) = gather(el, ct_id, deadline)?;
-    facts.offscreen |= bounds_are_offscreen(bounds, window_size);
-    let states = crate::mapping::map_states(&facts);
-
-    let mut children = Vec::new();
-    // Resolved before the gate: a childless node must never be reported truncated for
-    // declining to explore a list that was already empty.
-    let first_child = step(deadline, "read first UIA child", budget, || {
-        walker.get_first_child(el)
-    })?;
-    // Tests only whether a first child exists before applying the traversal budget. Offscreen
-    // elements remain in the normalized tree with `visible = false`; semantic actionability must
-    // be able to prove and refuse them rather than making them indistinguishable from absence.
-    if first_child.is_some() && budget.may_explore_children(depth) {
-        // A virtualized list of thousands (or a cyclic `get_next_sibling`
-        // chain) would otherwise scan this level forever. `MAX_SIBLINGS` bounds the
-        // per-level scan regardless of how many are skipped.
-        let mut child = first_child;
-        let mut siblings = 0usize;
-        while let Some(c) = child {
-            // Checked before processing each child (not after) so the child that merely
-            // completes the tree doesn't get mistaken for one the walk declined to visit.
-            if !budget.may_visit_sibling(siblings) {
-                break;
-            }
-            siblings += 1;
-            children.push(walk(
-                walker,
-                &c,
-                origin,
-                window_size,
-                depth + 1,
-                budget,
-                deadline,
-            )?);
-            child = step(deadline, "read next UIA sibling", budget, || {
-                walker.get_next_sibling(&c)
-            })?;
-        }
-    }
-
-    Ok(AxNode {
-        id: AxNodeId(0), // assigned by glass_core::AxTree::assign_ids
-        role: crate::mapping::map_role_with_framework(ct_id, facts.checkable, framework.as_deref()),
-        raw_role,
-        name,
-        description,
-        value,
-        states,
-        bounds,
-        children,
-    })
 }
 
-/// Fetch `el`'s UIA Toggle pattern, gated by control type (Button/CheckBox/MenuItem/
-/// SplitButton — the only types that carry it) so this never issues a live cross-process
-/// `get_pattern` call for a control that cannot support it. One fetch answers two questions:
-/// `StateFacts::checkable` is this pattern's mere *presence* (the control exposes on/off
-/// semantics at all, independent of whether the current state is also readable), and
-/// `map_role`'s rule that a toggle-capable `Button` — a formatting-bar button, say — is a
-/// `ToggleButton` rather than a plain one keys off the same presence. Shared by `gather` and
-/// the verify-fingerprint role lookups in `run_set_value`/`run_invoke`, so a node maps to the
-/// same role regardless of which path reads it, and only one COM round-trip is spent per node
-/// either way — the same reason the value-pattern probe below fetches once for two facts.
-///
-/// An unsupported pattern is the binding's explicit non-failure sentinel (`Error::code() == 0`),
-/// which [`optional_pattern`] maps to `None`. Every real HRESULT failure propagates so a transient
-/// provider error cannot silently change the node's role or state.
+impl SnapshotWalk {
+    fn walk(&self, el: &UIElement, depth: usize, budget: &mut WalkBudget) -> Result<AxNode> {
+        let Self {
+            walker,
+            origin,
+            window_size,
+            deadline,
+            ..
+        } = self;
+        let (origin, window_size, deadline) = (*origin, *window_size, *deadline);
+        budget.visit();
+        let ct_id = required_com(deadline, "read UIA control type", || {
+            el.get_cached_control_type()
+        })? as i32 as u32;
+        // `canonical_name` knows every documented control type, mapped or not, so the numeric form
+        // is reached only by a vendor-defined or future id — still reported, never dropped.
+        let raw_role = crate::mapping::canonical_name(ct_id)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("UIA:{ct_id}"));
+        let framework = framework_id(el, ct_id, deadline, ReadMode::Cached)?;
+        let name = nonempty(required_com(deadline, "read UIA name", || {
+            el.get_cached_name()
+        })?);
+        let description = normalize_description(&help_text(el, ct_id, deadline)?, name.as_deref());
+        let bounds = window_relative_bounds(el, origin, deadline, ReadMode::Cached)?;
+        let (mut facts, value) = gather(el, ct_id, deadline, ReadMode::Cached)?;
+        facts.offscreen |= bounds_are_offscreen(bounds, window_size);
+        let states = crate::mapping::map_states(&facts);
+
+        let mut children = Vec::new();
+        // Resolved before the gate: a childless node must never be reported truncated for
+        // declining to explore a list that was already empty.
+        // At a limit, probe existence without fetching properties for a node we won't visit.
+        let cache_child = !budget.nodes_exhausted()
+            && !budget.depth_exhausted(depth)
+            && budget.max_siblings() > 0;
+        let first_child = step(deadline, "read first UIA child", budget, || {
+            if cache_child {
+                walker.get_first_child_build_cache(el, &self.cache)
+            } else {
+                walker.get_first_child(el)
+            }
+        })?;
+        // Tests only whether a first child exists before applying the traversal budget. Offscreen
+        // elements remain in the normalized tree with `visible = false`; semantic actionability must
+        // be able to prove and refuse them rather than making them indistinguishable from absence.
+        if first_child.is_some() && budget.may_explore_children(depth) {
+            // A virtualized list of thousands (or a cyclic `get_next_sibling`
+            // chain) would otherwise scan this level forever. `MAX_SIBLINGS` bounds the
+            // per-level scan regardless of how many are skipped.
+            let mut child = first_child;
+            let mut siblings = 0usize;
+            while let Some(c) = child {
+                // Checked before processing each child (not after) so the child that merely
+                // completes the tree doesn't get mistaken for one the walk declined to visit.
+                if !budget.may_visit_sibling(siblings) {
+                    break;
+                }
+                siblings += 1;
+                children.push(self.walk(&c, depth + 1, budget)?);
+                let cache_sibling = !budget.nodes_exhausted() && siblings < budget.max_siblings();
+                child = step(deadline, "read next UIA sibling", budget, || {
+                    if cache_sibling {
+                        walker.get_next_sibling_build_cache(&c, &self.cache)
+                    } else {
+                        walker.get_next_sibling(&c)
+                    }
+                })?;
+            }
+        }
+
+        Ok(AxNode {
+            id: AxNodeId(0), // assigned by glass_core::AxTree::assign_ids
+            role: crate::mapping::map_role_with_framework(
+                ct_id,
+                facts.checkable,
+                framework.as_deref(),
+            ),
+            raw_role,
+            name,
+            description,
+            value,
+            states,
+            bounds,
+            children,
+        })
+    }
+}
+
+/// Toggle availability determines both checkable state and the Button/ToggleButton role.
+/// Use the same control-type gate for snapshots and live action fingerprints.
 fn toggle_pattern(
     el: &UIElement,
     ct_id: u32,
@@ -380,6 +439,7 @@ fn gather(
     el: &UIElement,
     ct_id: u32,
     deadline: Deadline,
+    mode: ReadMode,
 ) -> Result<(crate::mapping::StateFacts, Option<String>)> {
     // Fetch the Toggle pattern once: its mere presence is `checkable` (the control exposes
     // on/off semantics at all), independent of whether we can also read its current state.
@@ -463,40 +523,42 @@ fn gather(
     let editable =
         matches!(ct_id, 50003 | 50004 | 50030) && readonly.map(|ro| !ro).unwrap_or(false);
     let facts = crate::mapping::StateFacts {
-        enabled: required_com(deadline, "read UIA enabled state", || el.is_enabled())?,
-        offscreen: required_com(deadline, "read UIA offscreen state", || el.is_offscreen())?,
+        enabled: required_com(deadline, "read UIA enabled state", || {
+            mode.read(el, UIElement::is_enabled, UIElement::is_cached_enabled)
+        })?,
+        offscreen: required_com(deadline, "read UIA offscreen state", || {
+            mode.read(el, UIElement::is_offscreen, UIElement::is_cached_offscreen)
+        })?,
         focused: required_com(deadline, "read UIA focused state", || {
-            el.has_keyboard_focus()
+            mode.read(
+                el,
+                UIElement::has_keyboard_focus,
+                UIElement::has_cached_keyboard_focus,
+            )
         })?,
         focusable: required_com(deadline, "read UIA focusable state", || {
-            el.is_keyboard_focusable()
+            mode.read(
+                el,
+                UIElement::is_keyboard_focusable,
+                UIElement::is_cached_keyboard_focusable,
+            )
         })?,
         selected,
         toggled_on,
         expanded,
         editable,
-        secure: required_com(deadline, "read UIA password state", || el.is_password())?,
+        secure: required_com(deadline, "read UIA password state", || {
+            mode.read(el, UIElement::is_password, UIElement::is_cached_password)
+        })?,
         checkable,
     };
     Ok((facts, value))
 }
 
-/// `el`'s UIA `HelpText` — the tooltip, and the secondary label the outline renders as
-/// `desc="…"`. Costs one cross-process property read per node.
-///
-/// A failed read degrades to no description, since one unreadable property must not fail a whole
-/// snapshot, but it logs first. The caller deadline is still checked immediately before the COM
-/// read, so a detached worker cannot start this optional read after its budget expires.
-/// It matters more here than the `.ok()` on a pattern probe: `CurrentHelpText` answers an *unset*
-/// property with an empty string, so every `Err` is a genuine COM failure — a stale element, a hung
-/// or disconnected provider, a denied cross-integrity read — never "the app set no help text".
-///
-/// `FullDescription` is UIA's other secondary label; `uiautomation` 0.25 exposes no accessor for it
-/// (only `UIProperty::FullDescription` through `get_property_value`), and no probed app was
-/// observed carrying one.
+/// Optional cached tooltip/secondary label. Failed reads are logged and omit the description.
 fn help_text(el: &UIElement, ct_id: u32, deadline: Deadline) -> Result<String> {
     ensure_com_deadline(deadline, "read UIA help text")?;
-    Ok(el.get_help_text().unwrap_or_else(|e| {
+    Ok(el.get_cached_help_text().unwrap_or_else(|e| {
         eprintln!(
             "glass-a11y-windows: HelpText read failed on control type {ct_id} \
              (HRESULT {:#010x}: {e}); treating the element as having no description",
@@ -511,9 +573,14 @@ fn window_relative_bounds(
     el: &UIElement,
     origin: (i32, i32),
     deadline: Deadline,
+    mode: ReadMode,
 ) -> Result<Option<AxRect>> {
     let r: Rect = required_com(deadline, "read UIA bounding rectangle", || {
-        el.get_bounding_rectangle()
+        mode.read(
+            el,
+            UIElement::get_bounding_rectangle,
+            UIElement::get_cached_bounding_rectangle,
+        )
     })?;
     let (w, h) = (r.get_width(), r.get_height());
     if w <= 0 || h <= 0 {
@@ -542,19 +609,26 @@ fn nonempty(s: String) -> Option<String> {
     normalize_name(&s)
 }
 
-/// The element's UIA `FrameworkId`, which `map_role_with_framework` decides a `Document` on.
-/// Gated by control type like `toggle_pattern`: only 50030 is decided by it, so no other node
-/// spends a cross-process property read. Read per node, never per app — a browser's window
-/// element reports `Win32` while the page inside it carries the engine's id. An empty id yields
-/// `None`; a failed read propagates so it cannot silently change the mapped role.
-fn framework_id(el: &UIElement, ct_id: u32, deadline: Deadline) -> Result<Option<String>> {
+/// Only Document roles depend on FrameworkId; live action checks use the same mapping.
+fn framework_id(
+    el: &UIElement,
+    ct_id: u32,
+    deadline: Deadline,
+    mode: ReadMode,
+) -> Result<Option<String>> {
     if ct_id != 50030 {
         return Ok(None);
     }
     Ok(nonempty(required_com(
         deadline,
         "read UIA framework id",
-        || el.get_framework_id(),
+        || {
+            mode.read(
+                el,
+                UIElement::get_framework_id,
+                UIElement::get_cached_framework_id,
+            )
+        },
     )?))
 }
 
@@ -576,12 +650,17 @@ fn verify_target_fingerprint(el: &UIElement, ctx: &AxContext, target: &AxTarget)
     let role = crate::mapping::map_role_with_framework(
         ct_id,
         toggle_pattern(el, ct_id, ctx.deadline)?.is_some(),
-        framework_id(el, ct_id, ctx.deadline)?.as_deref(),
+        framework_id(el, ct_id, ctx.deadline, ReadMode::Current)?.as_deref(),
     );
     let name = nonempty(required_com(ctx.deadline, "read target UIA name", || {
         el.get_name()
     })?);
-    let bounds = window_relative_bounds(el, (ctx.window.x, ctx.window.y), ctx.deadline)?;
+    let bounds = window_relative_bounds(
+        el,
+        (ctx.window.x, ctx.window.y),
+        ctx.deadline,
+        ReadMode::Current,
+    )?;
     if !target.matches(role, name.as_deref())
         || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
     {
@@ -604,7 +683,7 @@ fn run_focus(ctx: &AxContext, target: &AxTarget, dispatch: &A11yMutationDispatch
     )?;
     let element = find_target(&walker, &root, ctx, target)?;
     let ct_id = verify_target_fingerprint(&element, ctx, target)?;
-    let (facts, _) = gather(&element, ct_id, ctx.deadline)?;
+    let (facts, _) = gather(&element, ct_id, ctx.deadline, ReadMode::Current)?;
     if !facts.focusable && !facts.editable {
         return Err(GlassError::AxActionUnavailable(target.id.0));
     }
@@ -694,7 +773,7 @@ fn run_pointer_target_at(
     let hit_role = crate::mapping::map_role_with_framework(
         hit_ct_id,
         toggle_pattern(&hit, hit_ct_id, ctx.deadline)?.is_some(),
-        framework_id(&hit, hit_ct_id, ctx.deadline)?.as_deref(),
+        framework_id(&hit, hit_ct_id, ctx.deadline, ReadMode::Current)?.as_deref(),
     );
     let target_ids = runtime_id_path(
         &automation,
@@ -1254,3 +1333,7 @@ mod tests {
         assert_eq!(budget.unreadable(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod cache_tests;
