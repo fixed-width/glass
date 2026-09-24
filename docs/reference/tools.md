@@ -213,6 +213,13 @@ An app that ignores the request, or blocks on a "save changes?" prompt, is termi
 a short grace, so `glass_stop` always completes. That case is reported on stderr rather than in the
 result, along with what to do about it where anything can be — the result stays `{}` either way.
 
+On Windows, a title/class hint can adopt a window owned by a process outside the launched process
+set, such as an Explorer folder served by the existing shell. Glass discloses this at launch:
+containment and process teardown do not cover that owner. Stop cleans up the launched app and ends
+the session, but leaves the external window and process untouched. If that window is still open,
+the call returns a backend error describing the partial stop instead of `{}`. Close the external
+window explicitly if desired. A window that has already closed does not cause an error.
+
 Two exceptions: a Windows app launched under Sandboxie containment (`sandbox` of `default` or
 `strict`) is terminated without being asked, because a close request from outside the box never
 reaches it; and an app with no window to ask is terminated immediately — one that opened none, or

@@ -199,7 +199,8 @@ mod backend {
     use crate::display::{DisplayProvider, ExistingDesktop};
     use crate::run_windows_call_by;
     use crate::windows::{
-        app_window_infos, find_app_window, focus_window, geometry_of, move_window, resize_window,
+        ExternalWindow, app_window_infos, find_app_window, focus_window, geometry_of, move_window,
+        resize_window,
     };
 
     /// The Windows `Platform` backend (v1: drives the interactive desktop).
@@ -218,6 +219,7 @@ mod backend {
         /// [`crate::util::raw_to_hwnd`] at the point of use. `None` until window
         /// discovery or `select_window` sets it.
         active_hwnd: Option<isize>,
+        external_window: Option<ExternalWindow>,
         protected_host_paths: Vec<ProtectedHostPath>,
     }
 
@@ -228,6 +230,7 @@ mod backend {
                 app: None,
                 logs: Arc::new(Mutex::new(Vec::new())),
                 active_hwnd: None,
+                external_window: None,
                 protected_host_paths: Vec::new(),
             })
         }
@@ -266,6 +269,17 @@ mod backend {
                     // A window passed the filter but has no DWM frame bounds yet (a transient
                     // splash destroyed mid-startup): don't fail — keep polling for the real one.
                     if let Some(r) = crate::util::extended_frame_bounds(w.hwnd()) {
+                        self.external_window = if pids.contains(&w.pid) {
+                            None
+                        } else {
+                            eprintln!(
+                                "glass: adopting window {:#x} (pid {}) outside the launched process \
+                                 set; launch containment and teardown do not cover this window's \
+                                 owner. Stop will leave it open and report an error if it survives",
+                                w.raw, w.pid
+                            );
+                            Some(ExternalWindow::new(&w))
+                        };
                         self.active_hwnd = Some(w.raw);
                         return Ok(crate::windows::rect_to_geometry(r));
                     }
@@ -347,6 +361,7 @@ mod backend {
                         let _ = app.kill();
                     }
                     self.active_hwnd = None;
+                    self.external_window = None;
                     Err(e)
                 }
             }
@@ -358,6 +373,9 @@ mod backend {
                 crate::process::disclose_teardown(app.kill());
             }
             self.active_hwnd = None;
+            if let Some(window) = self.external_window.take() {
+                window.verify_stopped()?;
+            }
             Ok(())
         }
 
@@ -543,8 +561,8 @@ mod backend {
 
     impl Drop for WindowsPlatform {
         fn drop(&mut self) {
-            if let Some(app) = self.app.take() {
-                crate::process::disclose_teardown(app.kill());
+            if let Err(error) = self.stop_app_by(glass_core::Deadline::UNBOUNDED) {
+                eprintln!("glass: {error}");
             }
         }
     }
