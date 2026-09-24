@@ -19,6 +19,9 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Changed
+- Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
+
 ## [1.8.0] - 2026-09-20
 
 ### Added

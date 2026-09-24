@@ -17,5 +17,8 @@ uiautomation = { version = "0.25", features = ["process", "event"] }
 # it, so `events.rs` builds its own automation object — hence `Win32_System_Com` as well.
 windows = { version = "0.62", features = ["Win32_UI_Accessibility", "Win32_System_Com"] }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
