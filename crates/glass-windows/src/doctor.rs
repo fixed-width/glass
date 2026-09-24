@@ -6,6 +6,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::sync::Mutex;
+use std::{io, process};
 
 use glass_core::{Check, CheckStatus, ProbeFailure};
 
@@ -144,14 +145,17 @@ pub(crate) fn build_checks(f: &DoctorFacts) -> Vec<Check> {
     v
 }
 
-/// Windows in-OS containment posture (Sandboxie) for the doctor. Pure → Linux-tested.
-/// `sandboxie_available` = Start.exe present + SbieSvc/SbieDrv running; `dir` = resolved
-/// Sandboxie dir; `prompt_global_on` = the global `PromptForInternetAccess` (Some(true) means
-/// strict would deadlock-then-fail-closed), `None` if unknown; `windows_sandbox` = VM-tier hint.
+#[derive(Debug)]
+pub(crate) enum PromptReadError {
+    QueryFailed(String),
+    UnexpectedValue(String),
+}
+
+/// Report Sandboxie posture, querying the global prompt only when the provider is available.
 pub(crate) fn build_sandbox_checks(
     sandboxie_available: bool,
     dir: &str,
-    prompt_global_on: Option<bool>,
+    query_prompt: impl FnOnce() -> Result<bool, PromptReadError>,
     windows_sandbox: bool,
 ) -> Vec<Check> {
     let mut v = Vec::new();
@@ -174,15 +178,17 @@ pub(crate) fn build_sandbox_checks(
         )
     });
     // strict no-egress gate
-    if let Some(true) = prompt_global_on {
-        v.push(
-            Check::new(
+    if sandboxie_available {
+        match query_prompt() {
+            Ok(true) => v.push(Check::new(
                 "strict (no-egress)",
                 CheckStatus::Warn,
                 "Sandboxie global PromptForInternetAccess=y would deadlock sandbox=strict (it fails closed instead)",
             )
-            .with_remedy("set Sandboxie's global PromptForInternetAccess to n"),
-        );
+            .with_remedy("set Sandboxie's global PromptForInternetAccess to n")),
+            Ok(false) => {}
+            Err(error) => v.push(prompt_read_error_check(dir, error)),
+        }
     }
     // VM tier pointer (separate, stronger deployment option)
     v.push(if windows_sandbox {
@@ -199,6 +205,30 @@ pub(crate) fn build_sandbox_checks(
         )
     });
     v
+}
+
+fn prompt_read_error_check(dir: &str, error: PromptReadError) -> Check {
+    let (detail, guidance) = match error {
+        PromptReadError::QueryFailed(reason) => (
+            format!(
+                "could not read Sandboxie global PromptForInternetAccess: {reason}; \
+                 sandbox=strict fails closed"
+            ),
+            "check the Sandboxie installation path and executable access, resolve the reported query error",
+        ),
+        PromptReadError::UnexpectedValue(value) => (
+            format!(
+                "could not verify Sandboxie global PromptForInternetAccess: \
+                 unexpected SbieIni.exe output \"{value}\"; strict compatibility is unknown"
+            ),
+            "inspect the returned setting value and resolve the unexpected query output",
+        ),
+    };
+    let exe = format!(r"{dir}\SbieIni.exe").replace('\'', "''");
+    Check::new("strict (no-egress)", CheckStatus::Warn, detail).with_remedy(format!(
+        "in PowerShell, run & '{exe}' query GlobalSettings PromptForInternetAccess \
+         as the same user running glass; {guidance}, then rerun glass doctor"
+    ))
 }
 
 /// Clipboard posture: with the hook DLL the contained app gets a PRIVATE clipboard isolated from
@@ -234,9 +264,8 @@ pub fn checks(_deep: bool) -> Vec<Check> {
 pub fn sandbox_checks() -> Vec<Check> {
     let dir = crate::containment::sandboxie_dir();
     let avail = crate::containment::available(&dir);
-    let prompt = gather_prompt_global(&dir);
     let ws = gather_windows_sandbox();
-    let mut v = build_sandbox_checks(avail, &dir, prompt, ws);
+    let mut v = build_sandbox_checks(avail, &dir, || gather_prompt_global(&dir), ws);
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()));
@@ -252,26 +281,54 @@ pub fn sandbox_checks() -> Vec<Check> {
     v
 }
 
-/// Read Sandboxie's global `PromptForInternetAccess` via `SbieIni.exe query GlobalSettings
-/// PromptForInternetAccess` (from `dir`). `Some(true)` if it trims to `y`/`Y`, `Some(false)`
-/// if it reads `n`/empty, `None` on any error (we never write `[GlobalSettings]`).
+/// Read the global setting without writing `[GlobalSettings]`.
 #[cfg(windows)]
-fn gather_prompt_global(dir: &str) -> Option<bool> {
-    let out = std::process::Command::new(format!(r"{dir}\SbieIni.exe"))
-        .args(["query", "GlobalSettings", "PromptForInternetAccess"])
-        .output()
-        .ok()?;
+fn gather_prompt_global(dir: &str) -> Result<bool, PromptReadError> {
+    gather_prompt_global_with(dir, process::Command::output)
+}
+
+fn gather_prompt_global_with(
+    dir: &str,
+    run: impl FnOnce(&mut process::Command) -> io::Result<process::Output>,
+) -> Result<bool, PromptReadError> {
+    let out = run(process::Command::new(format!(r"{dir}\SbieIni.exe")).args([
+        "query",
+        "GlobalSettings",
+        "PromptForInternetAccess",
+    ]))
+    .map_err(|error| {
+        PromptReadError::QueryFailed(format!("could not start SbieIni.exe: {error}"))
+    })?;
     if !out.status.success() {
-        return None;
+        return Err(PromptReadError::QueryFailed(format!(
+            "SbieIni.exe query returned {}; stderr: \"{}\"; stdout: \"{}\"",
+            out.status,
+            prompt_diagnostic(&out.stderr),
+            prompt_diagnostic(&out.stdout),
+        )));
     }
     let value = String::from_utf8_lossy(&out.stdout)
         .trim()
         .to_ascii_lowercase();
     match value.as_str() {
-        "y" => Some(true),
-        "n" | "" => Some(false),
-        _ => None,
+        "y" => Ok(true),
+        "n" | "" => Ok(false),
+        _ => Err(PromptReadError::UnexpectedValue(prompt_diagnostic(
+            &out.stdout,
+        ))),
     }
+}
+
+fn prompt_diagnostic(bytes: &[u8]) -> String {
+    const MAX: usize = 256;
+    let mut detail = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX)])
+        .trim()
+        .escape_debug()
+        .to_string();
+    if bytes.len() > MAX {
+        detail.push_str("...");
+    }
+    detail
 }
 
 /// Whether this host can run the Windows Sandbox VM tier. The optional feature installs
@@ -637,7 +694,7 @@ mod tests {
 
     #[test]
     fn sandbox_available_is_ok_and_names_dir() {
-        let v = build_sandbox_checks(true, r"C:\Program Files\Sandboxie", Some(false), false);
+        let v = build_sandbox_checks(true, r"C:\Program Files\Sandboxie", || Ok(false), false);
         let posture = v.iter().find(|c| c.name == "in-OS containment").unwrap();
         assert_eq!(posture.status, CheckStatus::Ok);
         assert!(posture.detail.contains(r"C:\Program Files\Sandboxie"));
@@ -647,24 +704,212 @@ mod tests {
 
     #[test]
     fn sandbox_unavailable_warns_with_remedy() {
-        let v = build_sandbox_checks(false, r"C:\Program Files\Sandboxie", None, false);
+        let v = build_sandbox_checks(
+            false,
+            r"C:\Program Files\Sandboxie",
+            || panic!("must not query an unavailable provider"),
+            false,
+        );
         let posture = v.iter().find(|c| c.name == "in-OS containment").unwrap();
         assert_eq!(posture.status, CheckStatus::Warn);
         assert!(posture.remedy.is_some());
         assert!(posture.detail.contains("fail closed"));
+        assert!(v.iter().all(|check| check.name != "strict (no-egress)"));
     }
 
     #[test]
     fn strict_egress_warns_when_global_prompt_on() {
-        let v = build_sandbox_checks(true, r"C:\Program Files\Sandboxie", Some(true), false);
+        let v = build_sandbox_checks(true, r"C:\Program Files\Sandboxie", || Ok(true), false);
         let egress = v.iter().find(|c| c.name == "strict (no-egress)").unwrap();
         assert_eq!(egress.status, CheckStatus::Warn);
         assert!(egress.remedy.is_some());
     }
 
     #[test]
+    fn strict_egress_warns_when_global_prompt_unreadable() {
+        let dir = r"C:\Users\O'Brien\Sandboxie";
+        let checks = build_sandbox_checks(
+            true,
+            dir,
+            || {
+                gather_prompt_global_with(dir, |_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Access denied (os error 5)",
+                    ))
+                })
+            },
+            false,
+        );
+        let egress = checks
+            .iter()
+            .find(|check| check.name == "strict (no-egress)")
+            .expect("unreadable setting must remain visible");
+        assert_eq!(egress.status, CheckStatus::Warn);
+        assert!(egress.detail.contains("could not start SbieIni.exe"));
+        assert!(egress.detail.contains("Access denied (os error 5)"));
+        assert!(egress.detail.contains("sandbox=strict fails closed"));
+        let remedy = egress.remedy.as_ref().unwrap();
+        assert!(remedy.contains(r"& 'C:\Users\O''Brien\Sandboxie\SbieIni.exe' query GlobalSettings PromptForInternetAccess"));
+        assert!(remedy.contains("same user"));
+        assert!(remedy.contains("rerun glass doctor"));
+        assert!(!remedy.contains("to n"));
+        let report =
+            glass_core::Diagnosis::new(vec![glass_core::Section::new("sandbox", None, checks)]);
+        assert_eq!(report.overall("windows"), CheckStatus::Warn);
+        assert_eq!(report.exit_code("windows"), 0);
+        assert!(
+            report
+                .render_text("windows")
+                .contains("Access denied (os error 5)")
+        );
+    }
+
+    fn prompt_output(code: u32, stdout: &[u8], stderr: &[u8]) -> process::Output {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            process::ExitStatus::from_raw((code as i32) << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            process::ExitStatus::from_raw(code)
+        };
+        process::Output {
+            status,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[test]
+    fn prompt_query_uses_resolved_executable_and_read_only_arguments() {
+        let enabled = gather_prompt_global_with(r"C:\Custom Sandboxie", |command| {
+            assert_eq!(command.get_program(), r"C:\Custom Sandboxie\SbieIni.exe");
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                ["query", "GlobalSettings", "PromptForInternetAccess"]
+            );
+            Ok(prompt_output(0, b"Y\r\n", b""))
+        })
+        .unwrap();
+        assert!(enabled);
+    }
+
+    #[test]
+    fn prompt_query_preserves_known_values_and_unset_setting() {
+        for (value, expected) in [
+            ("y", true),
+            (" Y\r\n", true),
+            ("n", false),
+            (" N\r\n", false),
+            ("", false),
+            (" \r\n\t", false),
+        ] {
+            let result =
+                gather_prompt_global_with("S", |_| Ok(prompt_output(0, value.as_bytes(), b"")));
+            assert_eq!(result.unwrap(), expected, "query output {value:?}");
+        }
+    }
+
+    #[test]
+    fn strict_egress_reports_query_exit_status_and_both_output_streams() {
+        for (stdout, stderr) in [
+            ("", "Access denied"),
+            ("configuration error", ""),
+            ("config error", "service error"),
+            ("", ""),
+        ] {
+            let status = prompt_output(5, b"", b"").status.to_string();
+            let checks = build_sandbox_checks(
+                true,
+                "S",
+                || {
+                    gather_prompt_global_with("S", |_| {
+                        Ok(prompt_output(5, stdout.as_bytes(), stderr.as_bytes()))
+                    })
+                },
+                false,
+            );
+            let check = checks
+                .iter()
+                .find(|check| check.name == "strict (no-egress)")
+                .unwrap();
+            assert_eq!(check.status, CheckStatus::Warn);
+            assert!(check.detail.contains(&status));
+            assert!(check.detail.contains(&format!("stderr: \"{stderr}\"")));
+            assert!(check.detail.contains(&format!("stdout: \"{stdout}\"")));
+            assert!(check.detail.contains("sandbox=strict fails closed"));
+            assert!(
+                check
+                    .remedy
+                    .as_ref()
+                    .unwrap()
+                    .contains("resolve the reported query error")
+            );
+        }
+    }
+
+    #[test]
+    fn strict_egress_reports_unexpected_output_without_claiming_launch_refusal() {
+        for value in [b"Maybe".as_slice(), b"y\r\nn", b"\xff"] {
+            let checks = build_sandbox_checks(
+                true,
+                "S",
+                || gather_prompt_global_with("S", |_| Ok(prompt_output(0, value, b""))),
+                false,
+            );
+            let check = checks
+                .iter()
+                .find(|check| check.name == "strict (no-egress)")
+                .unwrap();
+            assert_eq!(check.status, CheckStatus::Warn);
+            assert!(check.detail.contains("unexpected SbieIni.exe output"));
+            assert!(check.detail.contains(&prompt_diagnostic(value)));
+            assert!(check.detail.contains("strict compatibility is unknown"));
+            assert!(!check.detail.contains("fails closed"));
+            let remedy = check.remedy.as_ref().unwrap();
+            assert!(remedy.contains("query GlobalSettings PromptForInternetAccess"));
+            assert!(remedy.contains("inspect the returned setting value"));
+            assert!(!remedy.contains("to n"));
+        }
+    }
+
+    #[test]
+    fn prompt_failure_output_is_bounded_and_escapes_control_characters() {
+        let mut output = b"\x1b[31merror\r\n".to_vec();
+        output.extend("é".repeat(300).as_bytes());
+        let checks = build_sandbox_checks(
+            true,
+            "S",
+            || gather_prompt_global_with("S", |_| Ok(prompt_output(1, &output, &output))),
+            false,
+        );
+        let check = checks
+            .iter()
+            .find(|check| check.name == "strict (no-egress)")
+            .unwrap();
+        assert!(!check.detail.contains('\x1b'));
+        assert!(!check.detail.contains('\n'));
+        assert!(check.detail.contains("\\r\\n"));
+        assert!(check.detail.contains("..."));
+        assert!(check.detail.len() < 1000);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prompt_query_reports_missing_executable_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = gather_prompt_global(dir.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(error, PromptReadError::QueryFailed(ref detail) if detail.contains("could not start SbieIni.exe"))
+        );
+    }
+
+    #[test]
     fn windows_sandbox_vm_tier_skip_when_absent() {
-        let v = build_sandbox_checks(true, r"C:\Program Files\Sandboxie", Some(false), false);
+        let v = build_sandbox_checks(true, r"C:\Program Files\Sandboxie", || Ok(false), false);
         let vm = v
             .iter()
             .find(|c| c.name == "Windows Sandbox (VM tier)")
@@ -674,7 +919,7 @@ mod tests {
 
     #[test]
     fn windows_sandbox_vm_tier_ok_when_present() {
-        let v = build_sandbox_checks(true, r"C:\Program Files\Sandboxie", Some(false), true);
+        let v = build_sandbox_checks(true, r"C:\Program Files\Sandboxie", || Ok(false), true);
         let vm = v
             .iter()
             .find(|c| c.name == "Windows Sandbox (VM tier)")
