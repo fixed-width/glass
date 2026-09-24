@@ -71,11 +71,20 @@ Through glass's own probe, which prints a role histogram per app:
 
 ```bash
 GLASS_A11Y_PROBE_APPS=tech.fixedwidth.glassrolefixture/.MainActivity \
-  cargo test -p glass-android --test role_probe -- --ignored --nocapture
+  cargo test -p glass-android --test role_probe -- --ignored --nocapture --test-threads=1
 ```
 
 That covers the `uiautomator` reader; add `GLASS_ANDROID_A11Y_APK=<path>` to run the same probe
-through the on-device accessibility service, which otherwise skips.
+through the on-device accessibility service, which otherwise skips. Run the two probes serially
+with `--test-threads=1` when they share a device.
+
+Both probes automatically require the Button pinned above the scrolling content to report
+`name="Save"` and `desc="Save changes"`. Rebuild and reinstall the fixture before probing.
+A missing or changed pair fails the test and names the reader's
+content-description arm, even if other nodes have descriptions. The fully qualified
+`tech.fixedwidth.glassrolefixture.MainActivity` activity name also enables this check. Other
+apps and fixture activities remain advisory: a zero count explains that the app may expose no
+descriptions or the reader may have regressed.
 
 Semantics Android carries outside the widget class — `CollectionInfo`, `CollectionItemInfo`,
 `isHeading` — reach neither reader: the `uiautomator` dump has no attribute for them, and the

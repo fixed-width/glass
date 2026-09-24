@@ -1,5 +1,4 @@
-//! Role-histogram PROBE for the Android half of the accessibility role-parity work — not a
-//! pass/fail assertion test. Launches whatever apps `GLASS_A11Y_PROBE_APPS` names (a
+//! Role-histogram probe for Android. Launches whatever apps `GLASS_A11Y_PROBE_APPS` names (a
 //! comma-separated list of `package/activity` components), snapshots each with the node cap
 //! lifted, and prints `glass_core::role_histogram`: every widget class the device actually
 //! reported, unmapped ([`glass_core::AxRole::Other`]) classes first. The project's rule is
@@ -7,11 +6,10 @@
 //! get a match arm for a class that showed up in output like this — so this file's job is to
 //! produce that evidence.
 //!
-//! It asserts exactly one thing *about* the evidence: a class glass does map must not come
-//! back `AxRole::Other`, which would mean the reader stopped feeding `axmap::class_to_role`
-//! what it reads (see [`MAPPED_CLASSES`]). Otherwise it fails a run only when an app could not
-//! be launched or snapshotted at all — a real breakage, distinct from an app simply exposing
-//! something unexpected. Which role a class *should* map to is never asserted here.
+//! It rejects failed launches/snapshots, thin trees, and mapped classes returned as
+//! `AxRole::Other` (see [`MAPPED_CLASSES`]). The role fixture's MainActivity also must report
+//! its Save button's name and description through each reader. Other targets' description
+//! counts remain advisory, including other activities in the fixture package.
 //!
 //! Both readers are probed, because both share one map and they do not see the same tree: the
 //! `uiautomator` dump is filtered to nodes marked important-for-accessibility, while the
@@ -23,7 +21,7 @@
 //! ```sh
 //! GLASS_ADB=/path/to/adb \
 //! GLASS_A11Y_PROBE_APPS=com.android.settings/.Settings \
-//!   cargo test -p glass-android --test role_probe -- --ignored --nocapture
+//!   cargo test -p glass-android --test role_probe -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! The service probe additionally needs `GLASS_ANDROID_A11Y_APK` pointing at the built
@@ -125,9 +123,7 @@ const MAPPED_CLASSES: &[&str] = &[
     "androidx.viewpager.widget.ViewPager",
 ];
 
-/// Every [`MAPPED_CLASSES`] bucket in `tree` that came back [`AxRole::Other`], described — the
-/// one thing a histogram can check without becoming brittle about which app exposes what.
-/// Everything else the probe prints is evidence for a human, not a pass/fail claim.
+/// Every [`MAPPED_CLASSES`] bucket in `tree` that came back [`AxRole::Other`].
 fn mapped_class_violations(label: &str, tree: &AxTree) -> Vec<String> {
     role_histogram(tree)
         .into_iter()
@@ -153,6 +149,32 @@ fn thin_tree_violation(label: &str, tree: &AxTree) -> Option<String> {
              foreground, or a system alert was covering the screen. Whatever this run printed \
              is not evidence; retry, raising {SETTLE_MS_VAR} if the app is slow to populate.",
             tree.count
+        )
+    })
+}
+
+fn fixture_description_violation(component: &str, reader: &str, tree: &AxTree) -> Option<String> {
+    let (package, activity) = component.split_once('/')?;
+    if package != "tech.fixedwidth.glassrolefixture"
+        || !matches!(
+            activity,
+            ".MainActivity" | "tech.fixedwidth.glassrolefixture.MainActivity"
+        )
+    {
+        return None;
+    }
+    let census = glass_core::description_census(tree);
+    let found = census.samples.iter().any(|sample| {
+        sample.raw_role == "android.widget.Button"
+            && sample.name.as_deref() == Some("Save")
+            && sample.description == "Save changes"
+    });
+    (!found).then(|| {
+        format!(
+            "{component} ({reader}): content-description arm did not report the fixture's \
+             Button name=\"Save\" desc=\"Save changes\"; check axmap::labels and the reader's \
+             text/content-description inputs. Described nodes: {:?}",
+            census.samples
         )
     })
 }
@@ -235,7 +257,6 @@ fn uiautomator_role_histogram_probe() {
     let mut platform =
         AndroidPlatform::from_env(&EmulatorRegistry::new(), &agents).expect("attach to a device");
     let mut violations = Vec::new();
-    let mut described = 0usize;
 
     for component in &targets {
         let window = platform
@@ -261,23 +282,17 @@ fn uiautomator_role_histogram_probe() {
             "{}",
             description_census_report(component, &tree, DescriptionSourcing::Sourced)
         );
-        described += glass_core::description_census(&tree).described();
         violations.extend(thin_tree_violation(component, &tree));
         violations.extend(mapped_class_violations(component, &tree));
+        violations.extend(fixture_description_violation(
+            component,
+            "uiautomator",
+            &tree,
+        ));
 
         platform.stop_app().expect("stop_app");
     }
 
-    // The census prints without a caveat now that this reader sources the field, so a reader
-    // regressed to `description: None` would print a plausible zero for every app and this probe
-    // would pass silently. The app list is the caller's, so this is a note, not a failure.
-    if described == 0 {
-        println!(
-            "\nNOTE: no app in this run reported a single described node — either these apps \
-             give every element one label, or the reader stopped sourcing it (see the \
-             `description` binding in axmap::labels, which both readers route through)"
-        );
-    }
     assert!(violations.is_empty(), "{}", violations.join("\n"));
 }
 
@@ -316,7 +331,6 @@ fn service_role_histogram_probe() {
     let _restore = common::RestoreServiceState(&registry);
     let mut a11y = ServiceA11y::new(client, String::new());
     let mut violations = Vec::new();
-    let mut described = 0usize;
 
     for component in &targets {
         let window = platform
@@ -342,24 +356,91 @@ fn service_role_histogram_probe() {
             "{}",
             description_census_report(&label, &tree, DescriptionSourcing::Sourced)
         );
-        described += glass_core::description_census(&tree).described();
         violations.extend(thin_tree_violation(&label, &tree));
         violations.extend(mapped_class_violations(&label, &tree));
+        violations.extend(fixture_description_violation(component, "service", &tree));
 
         platform.stop_app().expect("stop_app");
     }
 
     drop(platform);
-    // Same rationale as `uiautomator_role_histogram_probe` above: a silent zero is a note here,
-    // not a failure, since the app list is the caller's.
-    if described == 0 {
-        println!(
-            "\nNOTE: no app in this run reported a single described node — either these apps \
-             give every element one label, or the reader stopped sourcing it (see the \
-             `description` binding in axmap::labels, which both readers route through)"
-        );
-    }
     // `_restore` puts the device's accessibility settings back as it drops, after this
     // assertion has decided the run — on the failing path as much as the passing one.
     assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glass_core::{AxNode, AxNodeId, AxStates};
+
+    const FIXTURE: &str = "tech.fixedwidth.glassrolefixture/.MainActivity";
+
+    fn button(name: &str, description: Option<&str>) -> AxNode {
+        AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Button,
+            raw_role: "android.widget.Button".into(),
+            name: Some(name.into()),
+            description: description.map(str::to_string),
+            value: None,
+            states: AxStates::default(),
+            bounds: None,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn both_readers_accept_the_fixture_labels_and_full_activity_name() {
+        let mut root = button("wrapper", None);
+        root.children.push(button("Save", Some("Save changes")));
+        let tree = AxTree::new(root);
+        for component in [
+            FIXTURE,
+            "tech.fixedwidth.glassrolefixture/tech.fixedwidth.glassrolefixture.MainActivity",
+        ] {
+            for reader in ["uiautomator", "service"] {
+                assert!(fixture_description_violation(component, reader, &tree).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn missing_description_fails_each_reader_even_when_another_node_is_described() {
+        let mut save = button("Save", None);
+        save.children
+            .push(button("Other", Some("Unrelated description")));
+        let tree = AxTree::new(save);
+        for reader in ["uiautomator", "service"] {
+            let violation = fixture_description_violation(FIXTURE, reader, &tree).unwrap();
+            assert!(violation.contains(reader), "{violation}");
+            assert!(violation.contains("content-description arm"), "{violation}");
+            assert!(violation.contains("Save changes"), "{violation}");
+        }
+    }
+
+    #[test]
+    fn missing_button_and_changed_label_precedence_fail() {
+        for node in [
+            button("Other", None),
+            button("Save changes", Some("Save")),
+            button("Save", Some("Wrong description")),
+        ] {
+            let tree = AxTree::new(node);
+            assert!(fixture_description_violation(FIXTURE, "uiautomator", &tree).is_some());
+        }
+    }
+
+    #[test]
+    fn arbitrary_apps_and_other_fixture_activities_allow_no_descriptions() {
+        let tree = AxTree::new(button("Undescribed", None));
+        for component in [
+            "com.android.settings/.Settings",
+            "tech.fixedwidth.glassrolefixture.other/.MainActivity",
+            "tech.fixedwidth.glassrolefixture/.WebActivity",
+            "tech.fixedwidth.glassrolefixture/.OcclusionActivity",
+        ] {
+            assert!(fixture_description_violation(component, "service", &tree).is_none());
+        }
+    }
 }

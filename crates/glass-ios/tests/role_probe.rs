@@ -1,5 +1,4 @@
-//! Role-histogram PROBE for the iOS half of the accessibility role-parity work — not a
-//! pass/fail assertion test. Launches whatever apps `GLASS_A11Y_PROBE_APPS` names (a
+//! Role-histogram probe for iOS. Launches whatever apps `GLASS_A11Y_PROBE_APPS` names (a
 //! comma-separated list of bundle ids or `.app` paths — exactly what `AppSpec::run`'s first
 //! element accepts on this backend), snapshots each through `idb` with the node cap lifted,
 //! and prints `glass_core::role_histogram`: every AX role string the Simulator actually
@@ -8,11 +7,10 @@
 //! get a match arm for a token that showed up in output like this — so this file's job is to
 //! produce that evidence.
 //!
-//! It asserts exactly one thing *about* the evidence: a token glass does map must not come
-//! back `AxRole::Other`, which would mean the reader stopped feeding `axmap::ax_role` what it
-//! reads (see [`MAPPED_TOKENS`]). Otherwise it fails a run only when an app could not be
-//! launched or snapshotted at all — a real breakage, distinct from an app simply exposing
-//! something unexpected. Which role a token *should* map to is never asserted here.
+//! It rejects failed launches/snapshots, thin trees, and mapped tokens returned as
+//! `AxRole::Other` (see [`MAPPED_TOKENS`]). The role fixture's Controls screen also must
+//! report both its hint and displaced-label descriptions. Other targets' description
+//! counts remain advisory, including explicitly selected alternate fixture tabs.
 //!
 //! Ignored by default; run on a macOS host with a booted Simulator and `idb_companion`
 //! available:
@@ -115,9 +113,7 @@ const MAPPED_TOKENS: &[&str] = &[
 // `AXGenericElement` is deliberately absent: it carries no role, so `Other` with the token
 // preserved is the correct outcome, and a probe run that reports it is reporting the truth.
 
-/// Every [`MAPPED_TOKENS`] bucket in `tree` that came back [`AxRole::Other`], described — the
-/// one thing a histogram can check without becoming brittle about which app exposes what.
-/// Everything else the probe prints is evidence for a human, not a pass/fail claim.
+/// Every [`MAPPED_TOKENS`] bucket in `tree` that came back [`AxRole::Other`].
 fn mapped_token_violations(label: &str, tree: &AxTree) -> Vec<String> {
     role_histogram(tree)
         .into_iter()
@@ -145,6 +141,51 @@ fn thin_tree_violation(label: &str, tree: &AxTree) -> Option<String> {
             tree.count
         )
     })
+}
+
+fn fixture_description_violations(
+    label: &str,
+    bundle_id: &str,
+    tab: Option<&str>,
+    tree: &AxTree,
+) -> Vec<String> {
+    if bundle_id != "tech.fixedwidth.glassrolefixture"
+        || matches!(tab, Some("collection" | "swiftui" | "web"))
+    {
+        return Vec::new();
+    }
+    let census = glass_core::description_census(tree);
+    [
+        (
+            "help/accessibilityHint",
+            "AXButton",
+            "the-hinted-button",
+            "Saves and closes the sheet",
+        ),
+        (
+            "displaced AXLabel",
+            "AXTextField",
+            "the-described-field",
+            "Search query",
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, role, name, description)| {
+        !census.samples.iter().any(|sample| {
+            sample.raw_role == *role
+                && sample.name.as_deref() == Some(*name)
+                && sample.description == *description
+        })
+    })
+    .map(|(arm, role, name, description)| {
+        format!(
+            "{label} (idb): {arm} arm did not report the fixture's \
+             {role} name={name:?} desc={description:?}; check axmap::map_node and the \
+             Controls screen. Described nodes: {:?}",
+            census.samples
+        )
+    })
+    .collect()
 }
 
 /// Print `role_histogram(tree)` as one line per `(token, role)` bucket — unmapped
@@ -196,7 +237,7 @@ fn role_histogram_probe() {
     let mut platform =
         IosPlatform::from_env(&registry).expect("from_env: resolve/boot a Simulator");
     let mut violations = Vec::new();
-    let mut described = 0usize;
+    let fixture_tab = std::env::var("SIMCTL_CHILD_ROLE_FIXTURE_TAB").ok();
 
     for target in targets {
         let spec = AppSpec {
@@ -237,9 +278,20 @@ fn role_histogram_probe() {
             "{}",
             description_census_report(target, &tree, DescriptionSourcing::Sourced)
         );
-        described += glass_core::description_census(&tree).described();
         violations.extend(thin_tree_violation(target, &tree));
         violations.extend(mapped_token_violations(target, &tree));
+        // iOS window titles carry the resolved bundle id, including launches via .app paths.
+        let windows = platform.list_windows().expect("list_windows");
+        let bundle_id = windows
+            .first()
+            .and_then(|window| window.title.as_deref())
+            .expect("iOS window has the launched bundle id as its title");
+        violations.extend(fixture_description_violations(
+            target,
+            bundle_id,
+            fixture_tab.as_deref(),
+            &tree,
+        ));
 
         // Inside the loop: `start_app` overwrites the platform's stored running app without
         // terminating the previous one, so stopping only after the loop would leave every
@@ -247,14 +299,107 @@ fn role_histogram_probe() {
         platform.stop_app().expect("stop_app");
     }
 
-    // Same rationale as the Android role-histogram probes' role_probe.rs: a silent zero is a
-    // note here, not a failure, since the app list is the caller's.
-    if described == 0 {
-        println!(
-            "\nNOTE: no app in this run reported a single described node — either these apps \
-             give every element one label, or the reader stopped sourcing it (see the \
-             `description` binding in axmap::map_node)"
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glass_core::{AxNode, AxNodeId, AxStates};
+
+    const FIXTURE: &str = "tech.fixedwidth.glassrolefixture";
+
+    fn node(role: AxRole, raw_role: &str, name: &str, description: Option<&str>) -> AxNode {
+        AxNode {
+            id: AxNodeId(0),
+            role,
+            raw_role: raw_role.into(),
+            name: Some(name.into()),
+            description: description.map(str::to_string),
+            value: None,
+            states: AxStates::default(),
+            bounds: None,
+            children: Vec::new(),
+        }
+    }
+
+    fn fixture_tree() -> AxTree {
+        let mut root = node(AxRole::Window, "AXWindow", "fixture", None);
+        root.children = vec![
+            node(
+                AxRole::Button,
+                "AXButton",
+                "the-hinted-button",
+                Some("Saves and closes the sheet"),
+            ),
+            node(
+                AxRole::TextField,
+                "AXTextField",
+                "the-described-field",
+                Some("Search query"),
+            ),
+        ];
+        AxTree::new(root)
+    }
+
+    #[test]
+    fn both_description_sources_pass_for_bundle_ids_and_resolved_app_paths() {
+        let tree = fixture_tree();
+        for target in [FIXTURE, "/tmp/renamed-fixture.app"] {
+            for tab in [None, Some("controls")] {
+                assert!(fixture_description_violations(target, FIXTURE, tab, &tree).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn each_missing_arm_fails_while_the_other_remains_described() {
+        for (index, arm) in [(0, "help/accessibilityHint"), (1, "displaced AXLabel")] {
+            let mut tree = fixture_tree();
+            tree.root.children[index].description = None;
+            let violations = fixture_description_violations(FIXTURE, FIXTURE, None, &tree);
+            assert_eq!(violations.len(), 1, "{violations:?}");
+            assert!(violations[0].contains(arm), "{violations:?}");
+        }
+    }
+
+    #[test]
+    fn missing_controls_report_both_arms_despite_an_unrelated_description() {
+        let tree = AxTree::new(node(AxRole::Button, "AXButton", "Other", Some("Unrelated")));
+        let violations = fixture_description_violations(FIXTURE, FIXTURE, None, &tree);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(
+            violations[0].contains("help/accessibilityHint"),
+            "{violations:?}"
+        );
+        assert!(
+            violations[1].contains("displaced AXLabel"),
+            "{violations:?}"
         );
     }
-    assert!(violations.is_empty(), "{}", violations.join("\n"));
+
+    #[test]
+    fn swapped_descriptions_do_not_satisfy_either_arm() {
+        let mut tree = fixture_tree();
+        tree.root.children[0].description = Some("Search query".into());
+        tree.root.children[1].description = Some("Saves and closes the sheet".into());
+        assert_eq!(
+            fixture_description_violations(FIXTURE, FIXTURE, None, &tree).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn arbitrary_apps_and_explicit_alternate_tabs_allow_no_descriptions() {
+        let tree = AxTree::new(node(AxRole::Window, "AXWindow", "Undescribed", None));
+        for bundle_id in [
+            "com.apple.Preferences",
+            "tech.fixedwidth.glassrolefixture.other",
+        ] {
+            assert!(fixture_description_violations(bundle_id, bundle_id, None, &tree).is_empty());
+        }
+        for tab in ["collection", "swiftui", "web"] {
+            assert!(fixture_description_violations(FIXTURE, FIXTURE, Some(tab), &tree).is_empty());
+        }
+    }
 }

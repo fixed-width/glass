@@ -6,8 +6,9 @@
 //!
 //! [`AxNode::description`] exists on every backend, but a reader that leaves it `None` makes
 //! the count zero by construction, for every app — a fact about glass, not about the platform.
-//! Only a caller knows which of the two it has, so [`description_census_report`] takes a
-//! [`DescriptionSourcing`] and prints it beside the number.
+//! [`DescriptionSourcing`] records the reader's intended support, not proof that it works.
+//! [`description_census_report`] qualifies every zero; probes of known described fixtures
+//! must also check their expected descriptions to detect reader regressions.
 
 use std::fmt::Write as _;
 
@@ -41,10 +42,11 @@ impl DescriptionCensus {
     }
 }
 
-/// Whether the reader that produced a tree sources [`AxNode::description`] at all.
+/// Whether the reader is intended to source [`AxNode::description`].
+/// This declaration does not verify that any source still works.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptionSourcing {
-    /// The reader reads its platform's secondary label, so the count describes the app.
+    /// The reader implements its platform's secondary label; a zero is still ambiguous.
     Sourced,
     /// The reader leaves `description: None`, so the count is 0 for every app.
     Unsourced,
@@ -72,9 +74,8 @@ pub fn description_census(tree: &AxTree) -> DescriptionCensus {
 /// The census as a printable block: one summary line, then one line per sample. Returns a
 /// `String` rather than printing so a caller that saves a report can fold it in.
 ///
-/// `sourcing` says on the summary line which kind of zero this is: a reader that leaves the
-/// field `None` counts zero on every app, which unqualified reads as a finding about the
-/// platform.
+/// A zero from a `Sourced` reader may reflect the app or a reader regression. An `Unsourced`
+/// reader cannot observe descriptions at all. Both caveats appear on the summary line.
 pub fn description_census_report(
     label: &str,
     tree: &AxTree,
@@ -82,6 +83,9 @@ pub fn description_census_report(
 ) -> String {
     let census = description_census(tree);
     let caveat = match sourcing {
+        DescriptionSourcing::Sourced if census.described() == 0 => {
+            " (no descriptions observed: the app may expose none, or the reader may have stopped sourcing them; validate with a known described fixture)"
+        }
         DescriptionSourcing::Sourced => "",
         DescriptionSourcing::Unsourced => {
             " (this backend's reader leaves description: None, so the count is 0 whatever the app exposes)"
@@ -223,6 +227,17 @@ mod tests {
             "the qualifier must sit on the number's own line: {report}"
         );
         assert!(report.contains("description: None"), "{report}");
+    }
+
+    #[test]
+    fn a_zero_from_a_sourcing_reader_is_qualified_on_the_count_line() {
+        let tree = tree_of(vec![described("push button", Some("Save"), None)]);
+        let report = description_census_report("app", &tree, DescriptionSourcing::Sourced);
+        assert_eq!(
+            report,
+            "app: 0 of 2 nodes described (no descriptions observed: the app may expose none, \
+             or the reader may have stopped sourcing them; validate with a known described fixture)\n"
+        );
     }
 
     #[test]
