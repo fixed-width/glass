@@ -23,6 +23,7 @@ internal refactors, CI, or test-only changes.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 
 ### Fixed
+- On Windows, `glass doctor` now warns when Sandboxie's global network prompt setting cannot be read or returns unexpected output, preserving the query failure details and providing a command to diagnose it.
 - On Windows, `glass_stop` now reports a partial-stop error when a window adopted outside the launched process set remains open. Launch reports that ownership boundary, and stop leaves the external window and its process untouched.
 - Windows doctor checks now distinguish WGC probe errors and panics from unsupported capture, preserve Windows error details, and retry failed probes on later calls.
 
