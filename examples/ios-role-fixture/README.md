@@ -100,6 +100,14 @@ GLASS_A11Y_PROBE_APPS="$PWD/build/RoleFixture.app" \
 The probe launches the app without arguments, so it reads the Controls screen. It splits
 `GLASS_A11Y_PROBE_APPS` on commas and passes each element as a whole app, so an argument cannot be
 added there — set `SIMCTL_CHILD_ROLE_FIXTURE_TAB` in its environment to probe another screen.
+For the Controls screen, the probe automatically requires both `the-hinted-button` with
+`desc="Saves and closes the sheet"` (the `help`/accessibility-hint arm) and `the-described-field`
+with `desc="Search query"` (the displaced-`AXLabel` arm). Each missing or changed description
+fails the test independently, even when other nodes have descriptions. The check uses the
+launched bundle id, so both bundle-id and `.app`-path targets work, including renamed bundles.
+Other apps and explicitly selected `collection`, `swiftui`, or `web` tabs remain advisory;
+a zero count explains that the app may expose no descriptions or the reader may have regressed.
+
 Driving the app with a launch argument through glass is what
 `crates/glass-ios/tests/launch_args_integration.rs` does (`GLASS_IOS_ROLE_FIXTURE` points it at
 this app's `.app`).

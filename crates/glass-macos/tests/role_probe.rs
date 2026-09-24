@@ -296,11 +296,7 @@ mod macos_main {
         if !failures.is_empty() {
             fail(failures.join("\n\n"));
         }
-        // Not a failure: which apps carry `AXHelp` is up to the apps, and the caller chooses them
-        // (System Settings really does report none). But the census now prints without a caveat,
-        // so a reader regressed to `description: None` would print a plausible zero for every app
-        // and this probe would pass silently. Say it once, at the end, where a whole-run zero is
-        // visible as one claim rather than N app facts.
+        // Whole-run context supplements each zero-count caveat; caller-selected apps may lack AXHelp.
         if described == 0 {
             println!(
                 "\nNOTE: no app in this run reported a single described node — either these apps \

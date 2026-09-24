@@ -113,7 +113,6 @@ public class MainActivity extends Activity {
         Button described = new Button(this);
         described.setText("Save");
         described.setContentDescription("Save changes");
-        root.addView(described, matchWrap());
 
         // A hint and nothing else: no content description, and no resource name (this fixture has
         // no resources file), so it stays unnamed. Through the on-device service its hint arrives
@@ -124,7 +123,13 @@ public class MainActivity extends Activity {
 
         ScrollView scroller = new ScrollView(this);
         scroller.addView(root);
-        setContentView(scroller);
+        // Keep the description probe's positive control visible even when the screen scrolls.
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.addView(described, matchWrap());
+        screen.addView(scroller, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        setContentView(screen);
     }
 
     /** Controls used by the semantic-action device acceptance suite. */

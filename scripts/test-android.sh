@@ -24,8 +24,8 @@
 #
 # Two files are deliberately absent from the target list below:
 #
-#   role_probe   — prints a widget-class histogram for a human and needs GLASS_A11Y_PROBE_APPS to
-#                  name app components; a green run carries no information.
+#   role_probe   — needs GLASS_A11Y_PROBE_APPS to name components; checks descriptions when the
+#                  role fixture's MainActivity is included and prints advisory counts for other apps.
 #   managed_avd  — requires NO emulator running, so it cannot share a run with tests that need a
 #                  booted device. scripts/test-android-lifecycle.sh runs it instead.
 #
