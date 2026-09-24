@@ -22,6 +22,9 @@ internal refactors, CI, or test-only changes.
 ### Changed
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 
+### Fixed
+- Windows doctor checks now distinguish WGC probe errors and panics from unsupported capture, preserve Windows error details, and retry failed probes on later calls.
+
 ## [1.8.0] - 2026-09-20
 
 ### Added
