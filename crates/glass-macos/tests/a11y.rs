@@ -268,6 +268,16 @@ mod macos_main {
             }
         }
 
+        for (name, checked) in [("Enable", false), ("Active", true)] {
+            let node = find_by_name(&tree.root, name)
+                .ok_or_else(|| format!("no {name:?} toggle in tree:\n{outline}"))?;
+            if !node.states.checkable || node.states.checked != checked || node.value.is_some() {
+                return Err(format!(
+                    "{name:?} should be checkable, checked={checked}, and have no text value: {node:?}"
+                ));
+            }
+        }
+
         // `raw_role` must be the platform's own AX role token, not `AXRoleDescription`'s
         // localized human phrase ("button" / "bouton"): the fixture's Save button is an
         // NSButton, which reports exactly `AXButton` on every machine and every locale.

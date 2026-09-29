@@ -31,7 +31,7 @@ use std::ptr::NonNull;
 use crate::doctor::SystemWideProbe;
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFNumberType, CFRetained, CFString, CFType, CGPoint, CGSize,
+    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGSize,
 };
 
 use glass_core::{GlassError, Result};
@@ -271,26 +271,45 @@ pub(crate) fn attribute_bool_checked(el: &AXUIElement, attr_name: &str) -> Resul
     })
 }
 
-fn attribute_i64_checked_by(
-    attr_name: &str,
-    call: impl FnOnce(NonNull<*const CFType>) -> AXError,
-) -> Result<Option<i64>> {
-    let Some(value) = copy_attribute_checked_by(attr_name, call)? else {
-        return Ok(None);
-    };
-    let Some(num) = value.downcast_ref::<CFNumber>() else {
-        return Ok(None);
-    };
-    let mut out: i64 = 0;
-    // SAFETY: `num` was downcast-verified and `out` matches `SInt64Type`.
-    let ok = unsafe { num.value(CFNumberType::SInt64Type, (&mut out as *mut i64).cast()) };
-    Ok(ok.then_some(out))
+/// Snapshot text and checked-state input decoded from the same copied attribute.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct AttributeValue {
+    pub(crate) text: Option<String>,
+    pub(crate) number: Option<i64>,
 }
 
-/// Read an integer AX attribute while preserving genuine AX failures.
-pub(crate) fn attribute_i64_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<i64>> {
+impl AttributeValue {
+    fn from_cf(value: &CFType) -> Self {
+        if let Some(text) = value.downcast_ref::<CFString>() {
+            let text = text.to_string();
+            Self {
+                text: (!text.is_empty()).then_some(text),
+                number: None,
+            }
+        } else {
+            Self {
+                text: None,
+                number: value.downcast_ref::<CFNumber>().and_then(CFNumber::as_i64),
+            }
+        }
+    }
+}
+
+fn attribute_value_checked_by(
+    attr_name: &str,
+    call: impl FnOnce(NonNull<*const CFType>) -> AXError,
+) -> Result<AttributeValue> {
+    Ok(copy_attribute_checked_by(attr_name, call)?
+        .as_deref()
+        .map(AttributeValue::from_cf)
+        .unwrap_or_default())
+}
+
+/// Read once for both snapshot text and numeric state, preserving genuine AX failures.
+pub(crate) fn attribute_value_checked(el: &AXUIElement, attr_name: &str) -> Result<AttributeValue> {
     let attr = CFString::from_str(attr_name);
-    attribute_i64_checked_by(attr_name, |raw| unsafe {
+    // SAFETY: `el` is live and `raw` is the wrapper's valid local out-param slot.
+    attribute_value_checked_by(attr_name, |raw| unsafe {
         el.copy_attribute_value(&attr, raw)
     })
 }
@@ -551,14 +570,14 @@ fn ax_err(context: &str, err: AXError) -> GlassError {
 #[cfg(test)]
 mod tests {
     use super::{
-        attr, attribute_bool_checked_by, attribute_i64_checked_by, element_at_position_by,
-        is_absent_error, is_settable_checked_by, parent_by, probe_system_wide_attr, same_element,
-        set_bool_attribute_by,
+        AttributeValue, attr, attribute_bool_checked_by, attribute_value_checked_by,
+        element_at_position_by, is_absent_error, is_settable_checked_by, parent_by,
+        probe_system_wide_attr, same_element, set_bool_attribute_by,
     };
     use crate::doctor::SystemWideProbe;
     use glass_core::GlassError;
     use objc2_application_services::{AXError, AXUIElement};
-    use objc2_core_foundation::{CFBoolean, CFRetained};
+    use objc2_core_foundation::{CFBoolean, CFNumber, CFRetained, CFString, CFType};
     use std::cell::Cell;
 
     // There is deliberately no live "the probe answers" test: on a granted process it answers and
@@ -655,15 +674,97 @@ mod tests {
     }
 
     #[test]
-    fn attribute_i64_checked_distinguishes_absence_from_real_ax_failure() {
-        assert_eq!(
-            attribute_i64_checked_by(attr::VALUE, |_| AXError::AttributeUnsupported)
-                .expect("absence is a normal state"),
-            None
-        );
-        let error = attribute_i64_checked_by(attr::VALUE, |_| AXError::InvalidUIElement)
-            .expect_err("a stale AX element must propagate");
-        assert!(error.to_string().contains("AXValue"), "{error}");
+    fn attribute_value_checked_distinguishes_absence_from_real_ax_failure() {
+        for absent in [AXError::AttributeUnsupported, AXError::NoValue] {
+            assert_eq!(
+                attribute_value_checked_by(attr::VALUE, |_| absent)
+                    .expect("absence is a normal state"),
+                AttributeValue::default()
+            );
+        }
+        for failure in [
+            AXError::InvalidUIElement,
+            AXError::CannotComplete,
+            AXError::Failure,
+        ] {
+            let error = attribute_value_checked_by(attr::VALUE, |_| failure)
+                .expect_err("a failed AX read must propagate");
+            assert!(error.to_string().contains("AXValue"), "{error}");
+        }
+    }
+
+    #[test]
+    fn attribute_value_checked_rejects_success_with_null() {
+        let error = attribute_value_checked_by(attr::VALUE, |_| AXError::Success)
+            .expect_err("AX success without a copied value must fail");
+        assert!(error.to_string().contains("null"), "{error}");
+    }
+
+    #[test]
+    fn numeric_snapshot_values_use_one_copy_and_never_become_text() {
+        use crate::mapping::checkable_checked;
+        use glass_core::AxRole;
+
+        for (number, state) in [
+            (0, (true, false)),
+            (1, (true, true)),
+            (2, (false, false)),
+            (-1, (false, false)),
+        ] {
+            let source = CFNumber::new_i64(number);
+            let copied = CFRetained::into_raw(source.clone());
+            let calls = Cell::new(0);
+            let value = attribute_value_checked_by(attr::VALUE, |out| {
+                calls.set(calls.get() + 1);
+                // SAFETY: `out` is a valid result slot; `copied` transfers a +1 CFNumber ref.
+                unsafe { out.as_ptr().write(copied.as_ptr().cast()) };
+                AXError::Success
+            })
+            .expect("the copied number is readable");
+
+            assert_eq!(calls.get(), 1);
+            assert_eq!(value.text, None);
+            assert_eq!(value.number, Some(number));
+            for role in [AxRole::CheckBox, AxRole::RadioButton, AxRole::ToggleButton] {
+                assert_eq!(
+                    checkable_checked(role, value.number),
+                    state,
+                    "{role:?}: {number}"
+                );
+            }
+            assert_eq!(
+                checkable_checked(AxRole::Slider, value.number),
+                (false, false)
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_strings_preserve_nonempty_text_without_parsing_numbers() {
+        for (text, expected) in [
+            ("hello", Some("hello")),
+            ("1", Some("1")),
+            (" ", Some(" ")),
+            ("", None),
+        ] {
+            let source = CFString::from_str(text);
+            assert_eq!(
+                AttributeValue::from_cf(&source),
+                AttributeValue {
+                    text: expected.map(str::to_owned),
+                    number: None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_values_with_the_wrong_type_or_lossy_numbers_are_unreadable() {
+        let fraction = CFNumber::new_f64(0.5);
+        let values: [&CFType; 2] = [CFBoolean::new(true), &fraction];
+        for value in values {
+            assert_eq!(AttributeValue::from_cf(value), AttributeValue::default());
+        }
     }
 
     #[test]
