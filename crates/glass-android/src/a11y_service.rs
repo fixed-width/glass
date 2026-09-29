@@ -2128,10 +2128,9 @@ mod tests {
             "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package signatures do not \
              match newer version; ignoring!]",
         );
-        let fresh = Answer::Silent;
-        let mismatched = FakeAdb::scripted(&[
-            ("install *", vec![&stale_ok, &fresh]),
-            ("*", vec![&Answer::Silent]),
+        let mismatched = FakeAdb::scripted(vec![
+            ("install *", vec![stale_ok, Answer::Silent]),
+            ("*", vec![Answer::Silent]),
         ]);
         install_service(mismatched.adb(), "/opt/glass/glass-a11y.apk")
             .expect("a signature mismatch is recovered from");

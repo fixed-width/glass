@@ -297,6 +297,7 @@ pub(crate) fn a_failed_call(argv: &[&str], said: &str) -> GlassError {
 /// What the fake adb does for one invocation it matches.
 #[cfg(test)]
 #[cfg(unix)]
+#[derive(Clone)]
 pub(crate) enum Answer {
     /// Exit 0, writing these bytes on stdout.
     Says(Vec<u8>),
@@ -312,7 +313,8 @@ pub(crate) enum Answer {
     /// Exit 0 having said nothing, like `am force-stop` on success.
     Silent,
     /// Stay up rather than returning, like the backgrounded `adb shell` that holds the on-device
-    /// agent open. Writes its pid to `linger.pid` so a test can watch for it being killed.
+    /// agent open. Writes its pid to `r{rule}_{answer}.pid` (zero-based indices) so a test can
+    /// watch for it being killed.
     Lingers,
 }
 
@@ -364,7 +366,7 @@ while IFS='\t' read -r glob answers stem; do
             [ \"$n\" -ge \"$answers\" ] && n=$((answers - 1))
             code=$(cat \"$dir/${stem}_$n.code\")
             if [ \"$code\" = linger ]; then
-                printf '%s' \"$$\" > \"$dir/linger.pid\"
+                printf '%s' \"$$\" > \"$dir/${stem}_$n.pid\"
                 # `exec` so the shell BECOMES the sleep: `$$` then names the process that is
                 # actually killed, and there is no grandchild to outlive it.
                 exec sleep 30
@@ -386,16 +388,19 @@ impl FakeAdb {
     /// The glob is matched against the whole argv joined by spaces, as adb received it: that is
     /// *after* `-s <serial>` is prefixed, so a rule for a serial-bound call has to allow for it.
     pub(crate) fn new(rules: &[(&str, Answer)]) -> FakeAdb {
-        let scripted: Vec<(&str, Vec<&Answer>)> =
-            rules.iter().map(|(g, a)| (*g, vec![a])).collect();
-        FakeAdb::scripted(&scripted)
+        FakeAdb::scripted(rules.iter().map(|(g, a)| (*g, vec![a.clone()])).collect())
     }
 
     /// [`FakeAdb::new`], but each rule steps through a sequence: the k'th call matching that glob
     /// gets the k'th answer, and the last answer repeats — a device changes under the caller.
-    pub(crate) fn scripted(rules: &[(&str, Vec<&Answer>)]) -> FakeAdb {
+    pub(crate) fn scripted(rules: Vec<(&str, Vec<Answer>)>) -> FakeAdb {
         use std::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);
+
+        assert!(
+            !rules.iter().rev().skip(1).any(|(glob, _)| *glob == "*"),
+            "a `*` rule answers everything after it; put it last"
+        );
 
         let dir = std::env::temp_dir().join(format!(
             "glass-fake-adb-{}-{}",
@@ -405,7 +410,7 @@ impl FakeAdb {
         std::fs::create_dir_all(&dir).expect("create the fake adb's directory");
 
         let mut rendered = String::new();
-        for (i, (glob, answers)) in rules.iter().enumerate() {
+        for (i, (glob, answers)) in rules.into_iter().enumerate() {
             assert!(!answers.is_empty(), "rule {glob:?} answers nothing");
             let stem = format!("r{i}");
             for (k, answer) in answers.iter().enumerate() {
@@ -443,11 +448,7 @@ impl FakeAdb {
 
     /// The argv of every invocation so far, in order, joined by spaces.
     pub(crate) fn calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.dir.join("calls"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
+        self.read("calls").lines().map(str::to_string).collect()
     }
 
     /// The caller deadline attached to every invocation, in call order.
@@ -499,9 +500,21 @@ impl FakeAdb {
         write_executable(&self.dir, name, script)
     }
 
-    /// A file in this fake's directory, for a stand-in tool that records what it was asked.
+    /// Write a file in this fake's directory for a stand-in tool to read.
+    pub(crate) fn write(&self, name: &str, contents: impl AsRef<[u8]>) {
+        let path = self.dir.join(name);
+        std::fs::write(&path, contents)
+            .unwrap_or_else(|e| panic!("write the fake adb's {}: {e}", path.display()));
+    }
+
+    /// Read a file in this fake's directory, or return empty if it does not exist yet.
     pub(crate) fn read(&self, name: &str) -> String {
-        std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+        let path = self.dir.join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => panic!("read the fake adb's {}: {e}", path.display()),
+        }
     }
 }
 
@@ -949,8 +962,10 @@ mod tests {
     fn a_scripted_rule_steps_through_its_answers_and_then_repeats_the_last() {
         use super::{Answer, FakeAdb};
 
-        let (empty, one) = (Answer::says("none\n"), Answer::says("one\n"));
-        let fake = FakeAdb::scripted(&[("devices", vec![&empty, &one])]);
+        let fake = FakeAdb::scripted(vec![(
+            "devices",
+            vec![Answer::says("none\n"), Answer::says("one\n")],
+        )]);
         let adb = fake.adb();
 
         assert_eq!(adb.run(["devices"]).unwrap(), "none\n");
@@ -961,6 +976,103 @@ mod tests {
             "the last answer repeats"
         );
         assert_eq!(fake.calls().len(), 3);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[should_panic(expected = "a `*` rule answers everything after it; put it last")]
+    fn a_catch_all_rule_cannot_hide_later_rules() {
+        use super::{Answer, FakeAdb};
+
+        FakeAdb::scripted(vec![
+            ("*", vec![Answer::Silent]),
+            ("devices", vec![Answer::says("one\n")]),
+        ]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_prefix_wildcard_can_precede_a_catch_all_rule() {
+        use super::{Answer, FakeAdb};
+
+        let fake = FakeAdb::new(&[
+            ("*settings get secure enabled", Answer::says("enabled\n")),
+            ("*", Answer::says("fallback\n")),
+        ]);
+        let adb = fake.adb().with_serial("emulator-5554");
+
+        assert_eq!(
+            adb.run(["shell", "settings", "get", "secure", "enabled"])
+                .unwrap(),
+            "enabled\n"
+        );
+        assert_eq!(adb.run(["devices"]).unwrap(), "fallback\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_and_empty_recordings_are_read_as_empty() {
+        use super::FakeAdb;
+
+        let fake = FakeAdb::scripted(vec![]);
+        assert!(fake.calls().is_empty());
+        assert_eq!(fake.read("boots"), "");
+
+        fake.write("calls", "");
+        fake.write("boots", "");
+        assert!(fake.calls().is_empty());
+        assert_eq!(fake.read("boots"), "");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[should_panic(expected = "read the fake adb's")]
+    fn an_unreadable_recording_is_not_treated_as_absent() {
+        use super::FakeAdb;
+
+        let fake = FakeAdb::scripted(vec![]);
+        std::fs::create_dir(fake.dir.join("boots")).unwrap();
+        fake.read("boots");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[should_panic(expected = "read the fake adb's")]
+    fn a_corrupt_call_log_cannot_pass_a_negative_assertion() {
+        use super::FakeAdb;
+
+        let fake = FakeAdb::scripted(vec![]);
+        fake.write("calls", [0xff]);
+        assert!(!fake.called("uninstall"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lingering_answers_record_separate_pids_for_each_rule_and_step() {
+        use super::{Answer, FakeAdb};
+        use glass_core::Deadline;
+
+        let fake = FakeAdb::scripted(vec![
+            ("first", vec![Answer::Lingers, Answer::Lingers]),
+            ("second", vec![Answer::Lingers]),
+        ]);
+        for command in ["first", "first", "second"] {
+            let error = fake
+                .adb()
+                .run_until([command], Deadline::from_millis(1_000))
+                .expect_err("a lingering answer must time out");
+            assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        }
+
+        let pids: std::collections::HashSet<u32> = ["r0_0.pid", "r0_1.pid", "r1_0.pid"]
+            .map(|name| fake.read(name).parse().expect("a recorded child pid"))
+            .into_iter()
+            .collect();
+        assert_eq!(
+            pids.len(),
+            3,
+            "every answer must retain its own child's pid"
+        );
     }
 
     #[test]

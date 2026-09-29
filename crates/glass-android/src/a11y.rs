@@ -2503,11 +2503,17 @@ exec "$real" "$@"
         use glass_core::{Backend, BaselineStore, Glass, PlatformFactory, SandboxLevel};
 
         let alice = Answer::says(one_field_holding("Alice"));
-        let zara = Answer::says(one_field_holding("Zara"));
-        let written = Answer::says(one_field_holding("updated"));
-        let fake = FakeAdb::scripted(&[
-            ("*shell cat*", vec![&alice, &alice, &zara, &written]),
-            ("*", vec![&Answer::Silent]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*shell cat*",
+                vec![
+                    alice.clone(),
+                    alice,
+                    Answer::says(one_field_holding("Zara")),
+                    Answer::says(one_field_holding("updated")),
+                ],
+            ),
+            ("*", vec![Answer::Silent]),
         ]);
         let (bin, delegate) = fail_next_adb_spawn_after(&fake, "input keycombination");
         let backend = Backend {
@@ -2578,10 +2584,16 @@ exec "$real" "$@"
         // Old text on the first read-back, new on the second: the IME is still settling, which
         // is when a single read would call a good write failed.
         let before = Answer::says(one_field_holding("hello"));
-        let after = Answer::says(one_field_holding("world"));
-        let fake = FakeAdb::scripted(&[
-            ("*shell cat*", vec![&before, &before, &after]),
-            ("*", vec![&Answer::Silent]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*shell cat*",
+                vec![
+                    before.clone(),
+                    before,
+                    Answer::says(one_field_holding("world")),
+                ],
+            ),
+            ("*", vec![Answer::Silent]),
         ]);
 
         let mut reader = AndroidA11y::for_adb(fake.adb().clone());
@@ -2696,9 +2708,13 @@ exec "$real" "$@"
         use crate::adb::{Answer, FakeAdb};
         use glass_core::Accessibility;
 
-        let stuck = Answer::says(one_field_holding("hello"));
-        let fake =
-            FakeAdb::scripted(&[("*shell cat*", vec![&stuck]), ("*", vec![&Answer::Silent])]);
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*shell cat*",
+                vec![Answer::says(one_field_holding("hello"))],
+            ),
+            ("*", vec![Answer::Silent]),
+        ]);
 
         let mut reader = AndroidA11y::for_adb(fake.adb().clone());
         let ctx = AxContext {
@@ -2747,12 +2763,16 @@ exec "$real" "$@"
         use glass_core::Accessibility;
 
         // Three reads, in order: the pre-write locate, then the two verify attempts that disagree.
-        let locate = Answer::says(one_field_holding("old"));
-        let mid = Answer::says(one_field_holding("hel"));
-        let settled = Answer::says(one_field_holding("Hello"));
-        let fake = FakeAdb::scripted(&[
-            ("*shell cat*", vec![&locate, &mid, &settled]),
-            ("*", vec![&Answer::Silent]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*shell cat*",
+                vec![
+                    Answer::says(one_field_holding("old")),
+                    Answer::says(one_field_holding("hel")),
+                    Answer::says(one_field_holding("Hello")),
+                ],
+            ),
+            ("*", vec![Answer::Silent]),
         ]);
 
         let mut reader = AndroidA11y::for_adb(fake.adb().clone());
