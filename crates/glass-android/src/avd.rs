@@ -565,17 +565,22 @@ mod tests {
         // The emulator is not there for the first two, so the boot is genuinely waited out
         // rather than answered by the very first look.
         let none = Answer::says("List of devices attached\n\n");
-        let up = Answer::says("List of devices attached\nemulator-5554\tdevice\n\n");
-        let booted = Answer::says("1\n");
-        let fake = FakeAdb::scripted(&[
-            ("devices", vec![&none, &none, &up]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "devices",
+                vec![
+                    none.clone(),
+                    none,
+                    Answer::says("List of devices attached\nemulator-5554\tdevice\n\n"),
+                ],
+            ),
             (
                 "-s emulator-5554 shell getprop sys.boot_completed",
-                vec![&booted],
+                vec![Answer::says("1\n")],
             ),
         ]);
         let emulator = fake.alongside("emulator", crate::adb::FAKE_EMULATOR_SCRIPT);
-        std::fs::write(emulator.parent().unwrap().join("avds"), "Pixel_6\nglass\n").unwrap();
+        fake.write("avds", "Pixel_6\nglass\n");
 
         let get = |k: &str| match k {
             "GLASS_EMULATOR" => Some(emulator.to_string_lossy().into_owned()),
@@ -598,10 +603,12 @@ mod tests {
     fn booting_gives_up_when_the_device_never_appears() {
         use crate::adb::{Answer, FakeAdb};
 
-        let none = Answer::says("List of devices attached\n\n");
-        let fake = FakeAdb::scripted(&[("devices", vec![&none])]);
+        let fake = FakeAdb::scripted(vec![(
+            "devices",
+            vec![Answer::says("List of devices attached\n\n")],
+        )]);
         let emulator = fake.alongside("emulator", crate::adb::FAKE_EMULATOR_SCRIPT);
-        std::fs::write(emulator.parent().unwrap().join("avds"), "glass\n").unwrap();
+        fake.write("avds", "glass\n");
 
         let get = |k: &str| match k {
             "GLASS_EMULATOR" => Some(emulator.to_string_lossy().into_owned()),
@@ -628,7 +635,7 @@ mod tests {
 
         let fake = FakeAdb::new(&[("devices", Answer::says("List of devices attached\n\n"))]);
         let emulator = fake.alongside("emulator", crate::adb::FAKE_EMULATOR_SCRIPT);
-        std::fs::write(emulator.parent().unwrap().join("avds"), "Pixel_6\nglass\n").unwrap();
+        fake.write("avds", "Pixel_6\nglass\n");
 
         let get = |k: &str| match k {
             "GLASS_EMULATOR" => Some(emulator.to_string_lossy().into_owned()),

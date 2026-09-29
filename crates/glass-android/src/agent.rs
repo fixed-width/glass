@@ -1352,13 +1352,13 @@ mod tests {
         use crate::adb::{Answer, FakeAdb, still_running};
 
         let (agent_port, _) = fake_agent(HELLO, vec![OK]);
-        let forwarded = Answer::says(format!("{agent_port}\n"));
-        let (lingers, silent) = (Answer::Lingers, Answer::Silent);
-        // Specific rules first: the catch-all would otherwise answer everything.
-        let fake = FakeAdb::scripted(&[
-            ("forward tcp:0 *", vec![&forwarded]),
-            ("shell CLASSPATH=*", vec![&lingers]),
-            ("*", vec![&silent]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "forward tcp:0 *",
+                vec![Answer::says(format!("{agent_port}\n"))],
+            ),
+            ("shell CLASSPATH=*", vec![Answer::Lingers]),
+            ("*", vec![Answer::Silent]),
         ]);
         // Any path will do: nothing checks the jar exists before pushing it.
         let jar = fake.adb().bin().to_string();
@@ -1390,7 +1390,7 @@ mod tests {
         );
 
         // The launch is a child that stays up; killing it is what SIGHUPs the device process.
-        let child = fake.wait_read("linger.pid", Duration::from_secs(5));
+        let child = fake.wait_read("r1_0.pid", Duration::from_secs(5));
         assert!(!child.is_empty(), "the launch should still be running");
         assert!(still_running(&child));
 
@@ -1410,11 +1410,10 @@ mod tests {
         // app_process — per attempt.
         use crate::adb::{Answer, FakeAdb, still_running};
 
-        let (lingers, quiet) = (Answer::Lingers, Answer::says(""));
-        let fake = FakeAdb::scripted(&[
-            ("forward tcp:0 *", vec![&quiet]),
-            ("shell CLASSPATH=*", vec![&lingers]),
-            ("*", vec![&Answer::Silent]),
+        let fake = FakeAdb::scripted(vec![
+            ("forward tcp:0 *", vec![Answer::says("")]),
+            ("shell CLASSPATH=*", vec![Answer::Lingers]),
+            ("*", vec![Answer::Silent]),
         ]);
         let jar = fake.adb().bin().to_string();
         let get = move |k: &str| match k {
@@ -1428,7 +1427,7 @@ mod tests {
             .expect_err("a forward that names no port cannot be connected to");
         assert!(err.to_string().contains("no port"), "{err}");
 
-        let child = fake.wait_read("linger.pid", Duration::from_secs(5));
+        let child = fake.wait_read("r1_0.pid", Duration::from_secs(5));
         assert!(!child.is_empty(), "the launch should have happened");
         assert!(!still_running(&child), "the failed launch leaked its child");
     }

@@ -872,18 +872,17 @@ mod platform_tests {
         // The activity is up before its window is laid out, so the first dump legitimately
         // shows nothing. A deadline computed backwards makes that first look the answer.
         let empty = Answer::says("");
-        let windows = Answer::says(WINDOWS);
-        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
-        let pid = Answer::says("4321\n");
-        let silent = Answer::Silent;
-        let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&launch_reply]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "shell am start *",
+                vec![Answer::says("Starting: Intent {...}\nStatus: ok\n")],
+            ),
             (
                 "shell dumpsys window windows",
-                vec![&empty, &empty, &windows],
+                vec![empty.clone(), empty, Answer::says(WINDOWS)],
             ),
-            ("shell pidof *", vec![&pid]),
-            ("*", vec![&silent]),
+            ("shell pidof *", vec![Answer::says("4321\n")]),
+            ("*", vec![Answer::Silent]),
         ]);
 
         let mut platform = platform_over(&fake);
@@ -896,12 +895,13 @@ mod platform_tests {
     #[test]
     #[cfg(unix)]
     fn a_window_that_never_appears_ends_the_launch_rather_than_the_wait_going_on() {
-        let empty = Answer::says("");
-        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
-        let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&launch_reply]),
-            ("shell dumpsys window windows", vec![&empty]),
-            ("*", vec![&Answer::Silent]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "shell am start *",
+                vec![Answer::says("Starting: Intent {...}\nStatus: ok\n")],
+            ),
+            ("shell dumpsys window windows", vec![Answer::says("")]),
+            ("*", vec![Answer::Silent]),
         ]);
 
         let mut platform = platform_over(&fake);
@@ -942,12 +942,13 @@ mod platform_tests {
     #[test]
     #[cfg(unix)]
     fn a_launch_whose_window_never_appears_does_not_leave_the_app_running() {
-        let empty = Answer::says("");
-        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
-        let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&launch_reply]),
-            ("shell dumpsys window windows", vec![&empty]),
-            ("*", vec![&Answer::Silent]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "shell am start *",
+                vec![Answer::says("Starting: Intent {...}\nStatus: ok\n")],
+            ),
+            ("shell dumpsys window windows", vec![Answer::says("")]),
+            ("*", vec![Answer::Silent]),
         ]);
 
         let mut platform = platform_over(&fake);
@@ -1073,15 +1074,19 @@ mod platform_tests {
     #[test]
     #[cfg(unix)]
     fn android_screencap_uses_adb_run_bytes_until() {
-        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
         let windows = Answer::says(WINDOWS);
-        let pid = Answer::says("4321\n");
-        let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&launch_reply]),
-            ("shell dumpsys window windows", vec![&windows, &windows]),
-            ("shell pidof *", vec![&pid]),
-            ("exec-out screencap", vec![&Answer::Lingers]),
-            ("*", vec![&Answer::Silent]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "shell am start *",
+                vec![Answer::says("Starting: Intent {...}\nStatus: ok\n")],
+            ),
+            (
+                "shell dumpsys window windows",
+                vec![windows.clone(), windows],
+            ),
+            ("shell pidof *", vec![Answer::says("4321\n")]),
+            ("exec-out screencap", vec![Answer::Lingers]),
+            ("*", vec![Answer::Silent]),
         ]);
         let mut platform = started(&fake);
 
@@ -1106,21 +1111,21 @@ mod platform_tests {
     #[test]
     #[cfg(unix)]
     fn android_refresh_uses_the_capture_caller_deadline() {
-        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
-        let windows = Answer::says(WINDOWS);
-        let pid = Answer::says("4321\n");
-        let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&launch_reply]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "shell am start *",
+                vec![Answer::says("Starting: Intent {...}\nStatus: ok\n")],
+            ),
             (
                 "shell dumpsys window windows",
-                vec![&windows, &Answer::Lingers],
+                vec![Answer::says(WINDOWS), Answer::Lingers],
             ),
-            ("shell pidof *", vec![&pid]),
+            ("shell pidof *", vec![Answer::says("4321\n")]),
             (
                 "exec-out screencap",
-                vec![&Answer::says(frame_bytes(1080, 2400))],
+                vec![Answer::says(frame_bytes(1080, 2400))],
             ),
-            ("*", vec![&Answer::Silent]),
+            ("*", vec![Answer::Silent]),
         ]);
         let mut platform = started(&fake);
 
@@ -1151,7 +1156,6 @@ mod platform_tests {
     fn the_window_is_re_read_before_a_capture_so_a_move_is_not_missed() {
         // The cached geometry is from launch; a rotation or a layout change moves the window
         // under it, and cropping to a stale rect captures the wrong pixels.
-        let windows = Answer::says(WINDOWS);
         let moved = Answer::says(concat!(
             "  Window #1 Window{bbb222 u0 com.example.app/com.example.app.MyDialog}:
 ",
@@ -1160,15 +1164,21 @@ mod platform_tests {
             "    mFrame=[0,0][600,400] isOnScreen=true
 ",
         ));
-        let started_ok = Answer::says("Starting: Intent {...}\nStatus: ok\n");
-        let pid = Answer::says("4321\n");
-        let shot = Answer::says(frame_bytes(1080, 2400));
-        let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&started_ok]),
-            ("shell dumpsys window windows", vec![&windows, &moved]),
-            ("shell pidof *", vec![&pid]),
-            ("exec-out screencap", vec![&shot]),
-            ("*", vec![&Answer::Silent]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "shell am start *",
+                vec![Answer::says("Starting: Intent {...}\nStatus: ok\n")],
+            ),
+            (
+                "shell dumpsys window windows",
+                vec![Answer::says(WINDOWS), moved],
+            ),
+            ("shell pidof *", vec![Answer::says("4321\n")]),
+            (
+                "exec-out screencap",
+                vec![Answer::says(frame_bytes(1080, 2400))],
+            ),
+            ("*", vec![Answer::Silent]),
         ]);
 
         let mut platform = platform_over(&fake);
@@ -1265,19 +1275,17 @@ mod platform_tests {
     #[test]
     #[cfg(unix)]
     fn large_window_list_parse_finishing_after_deadline_is_not_late_success() {
-        let launch_reply = Answer::says("Starting: Intent {...}\nStatus: ok\n");
-        let initial_windows = Answer::says(WINDOWS);
-        let large_windows = Answer::says(WINDOWS.repeat(512));
-        let pid = Answer::says("4321\n");
-        let silent = Answer::Silent;
-        let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&launch_reply]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "shell am start *",
+                vec![Answer::says("Starting: Intent {...}\nStatus: ok\n")],
+            ),
             (
                 "shell dumpsys window windows",
-                vec![&initial_windows, &large_windows],
+                vec![Answer::says(WINDOWS), Answer::says(WINDOWS.repeat(512))],
             ),
-            ("shell pidof *", vec![&pid]),
-            ("*", vec![&silent]),
+            ("shell pidof *", vec![Answer::says("4321\n")]),
+            ("*", vec![Answer::Silent]),
         ]);
         let mut platform = started(&fake).with_window_list_parse_delay(Duration::from_millis(30));
 
@@ -1298,15 +1306,20 @@ mod platform_tests {
     fn a_list_whose_selected_window_is_gone_falls_back_to_the_topmost() {
         // The dialog the session was driving has been dismissed. Marking nothing active would
         // leave the caller with a list it cannot act on.
-        let windows = Answer::says(WINDOWS);
-        let without = Answer::says(WINDOWS_WITHOUT_THE_DIALOG);
-        let started_ok = Answer::says("Starting: Intent {...}\nStatus: ok\n");
-        let pid = Answer::says("4321\n");
-        let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&started_ok]),
-            ("shell dumpsys window windows", vec![&windows, &without]),
-            ("shell pidof *", vec![&pid]),
-            ("*", vec![&Answer::Silent]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "shell am start *",
+                vec![Answer::says("Starting: Intent {...}\nStatus: ok\n")],
+            ),
+            (
+                "shell dumpsys window windows",
+                vec![
+                    Answer::says(WINDOWS),
+                    Answer::says(WINDOWS_WITHOUT_THE_DIALOG),
+                ],
+            ),
+            ("shell pidof *", vec![Answer::says("4321\n")]),
+            ("*", vec![Answer::Silent]),
         ]);
 
         let mut platform = platform_over(&fake);
@@ -1388,16 +1401,17 @@ mod platform_tests {
     #[test]
     #[cfg(unix)]
     fn accessibility_pid_discovery_kills_a_wedged_pidof_at_the_shared_deadline() {
-        let started_ok = Answer::says("Starting: Intent {...}\nStatus: ok\n");
-        let windows = Answer::says(WINDOWS);
-        let pid = Answer::says("4321\n");
-        let wedged = Answer::Lingers;
-        let silent = Answer::Silent;
-        let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&started_ok]),
-            ("shell dumpsys window windows", vec![&windows]),
-            ("shell pidof *", vec![&pid, &wedged]),
-            ("*", vec![&silent]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "shell am start *",
+                vec![Answer::says("Starting: Intent {...}\nStatus: ok\n")],
+            ),
+            ("shell dumpsys window windows", vec![Answer::says(WINDOWS)]),
+            (
+                "shell pidof *",
+                vec![Answer::says("4321\n"), Answer::Lingers],
+            ),
+            ("*", vec![Answer::Silent]),
         ]);
         let platform = started(&fake);
         let deadline = Deadline::from_millis(25);
@@ -1437,17 +1451,22 @@ mod platform_tests {
         // `pidof` lists every process of the package; the launch recorded only the first.
         assert_eq!(platform.app_pid(), Some(4321));
 
-        let started_ok = Answer::says("Starting: Intent {...}\nStatus: ok\n");
-        let windows = Answer::says(WINDOWS);
-        let one = Answer::says("4321\n");
-        let many = Answer::says("4321 4322 4323\n");
-        let none = Answer::says("\n");
-        let failed = Answer::fails("device offline");
-        let fake = FakeAdb::scripted(&[
-            ("shell am start *", vec![&started_ok]),
-            ("shell dumpsys window windows", vec![&windows]),
-            ("shell pidof *", vec![&one, &many, &none, &failed]),
-            ("*", vec![&Answer::Silent]),
+        let fake = FakeAdb::scripted(vec![
+            (
+                "shell am start *",
+                vec![Answer::says("Starting: Intent {...}\nStatus: ok\n")],
+            ),
+            ("shell dumpsys window windows", vec![Answer::says(WINDOWS)]),
+            (
+                "shell pidof *",
+                vec![
+                    Answer::says("4321\n"),
+                    Answer::says("4321 4322 4323\n"),
+                    Answer::says("\n"),
+                    Answer::fails("device offline"),
+                ],
+            ),
+            ("*", vec![Answer::Silent]),
         ]);
         let mut platform = platform_over(&fake);
         platform.start_app(&spec()).expect("the launch succeeds");

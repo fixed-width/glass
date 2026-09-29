@@ -738,11 +738,7 @@ mod tests {
 
         let fake = FakeAdb::new(&[("*", Answer::Silent)]);
         let emulator = fake.alongside("emulator", FAKE_EMULATOR_SCRIPT);
-        std::fs::write(
-            emulator.parent().expect("a parent").join("avds"),
-            "Pixel_6\nglass\n",
-        )
-        .unwrap();
+        fake.write("avds", "Pixel_6\nglass\n");
 
         assert_eq!(
             list_avds(

@@ -2128,10 +2128,9 @@ mod tests {
             "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package signatures do not \
              match newer version; ignoring!]",
         );
-        let fresh = Answer::Silent;
-        let mismatched = FakeAdb::scripted(&[
-            ("install *", vec![&stale_ok, &fresh]),
-            ("*", vec![&Answer::Silent]),
+        let mismatched = FakeAdb::scripted(vec![
+            ("install *", vec![stale_ok, Answer::Silent]),
+            ("*", vec![Answer::Silent]),
         ]);
         install_service(mismatched.adb(), "/opt/glass/glass-a11y.apk")
             .expect("a signature mismatch is recovered from");
@@ -5328,6 +5327,43 @@ mod tests {
             service_write_reading(&tree, &target, "new").expect("absence can be transient"),
             WriteReading::Missing
         );
+    }
+
+    #[test]
+    fn a_matching_value_in_another_app_does_not_confirm_a_write() {
+        for (package, acting_package) in [
+            (TreePackage::Echo, "com.example.app"),
+            (TreePackage::Omitted, "com.example.app"),
+            (
+                TreePackage::Other("com.foreground.app".into()),
+                "com.foreground.app",
+            ),
+        ] {
+            let initial = editable_field("old");
+            let (port, ops) = fake_service_ex(
+                vec![initial.clone(), editable_field("new")],
+                vec![OnAction::Ok],
+                vec![package, TreePackage::Other("com.other.app".into())],
+            );
+            let mut reader = impatient_writer(port);
+            let target = target_for(&built(&initial), AxNodeId(1));
+
+            let error = reader
+                .set_value(&ctx(), &target, "new")
+                .expect_err("a matching field in another app cannot verify this write");
+
+            assert!(
+                matches!(&error, GlassError::AxWriteUnconfirmed(1, reason)
+                    if reason.contains(&format!("from {acting_package} to com.other.app"))),
+                "{error}"
+            );
+            assert!(error.set_value_failed_after_writing(), "{error}");
+            assert_eq!(
+                ops_of(&ops),
+                ["conn1:tree", "conn1:set_text ref=1", "conn1:tree"],
+                "the write was sent once before the app changed"
+            );
+        }
     }
 
     #[test]
