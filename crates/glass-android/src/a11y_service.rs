@@ -5330,6 +5330,43 @@ mod tests {
     }
 
     #[test]
+    fn a_matching_value_in_another_app_does_not_confirm_a_write() {
+        for (package, acting_package) in [
+            (TreePackage::Echo, "com.example.app"),
+            (TreePackage::Omitted, "com.example.app"),
+            (
+                TreePackage::Other("com.foreground.app".into()),
+                "com.foreground.app",
+            ),
+        ] {
+            let initial = editable_field("old");
+            let (port, ops) = fake_service_ex(
+                vec![initial.clone(), editable_field("new")],
+                vec![OnAction::Ok],
+                vec![package, TreePackage::Other("com.other.app".into())],
+            );
+            let mut reader = impatient_writer(port);
+            let target = target_for(&built(&initial), AxNodeId(1));
+
+            let error = reader
+                .set_value(&ctx(), &target, "new")
+                .expect_err("a matching field in another app cannot verify this write");
+
+            assert!(
+                matches!(&error, GlassError::AxWriteUnconfirmed(1, reason)
+                    if reason.contains(&format!("from {acting_package} to com.other.app"))),
+                "{error}"
+            );
+            assert!(error.set_value_failed_after_writing(), "{error}");
+            assert_eq!(
+                ops_of(&ops),
+                ["conn1:tree", "conn1:set_text ref=1", "conn1:tree"],
+                "the write was sent once before the app changed"
+            );
+        }
+    }
+
+    #[test]
     fn a_write_that_never_lands_names_both_values_and_the_compose_no_op() {
         // The Compose no-op is a fact only this backend knows, and the verdict must also be one
         // the session reads as post-dispatch, or it keeps its cached value (glass#405).
