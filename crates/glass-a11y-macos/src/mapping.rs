@@ -182,11 +182,8 @@ pub fn map_states(f: &AxStateFacts) -> AxStates {
     }
 }
 
-/// Whether this role can carry a checked state, and so whether the reader should spend an AX
-/// round-trip reading its `AXValue`.
-///
-/// One list, not two: the reader gates its read on the same predicate [`checkable_checked`] judges
-/// with, because a second copy could be dropped with every test still green.
+/// Whether this role can carry a checked state. The reader uses the same predicate as
+/// [`checkable_checked`] to require a successful `AXValue` read for these roles.
 pub fn role_carries_checked(role: AxRole) -> bool {
     matches!(
         role,

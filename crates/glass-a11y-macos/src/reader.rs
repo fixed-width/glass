@@ -820,11 +820,18 @@ fn walk(
     // `mapping::labels`, where the rule — and which reads it declines to make — is unit-tested on
     // any host.
     let (name, description) = read_labels(el, deadline)?;
-    let value = deadline.observe(|| ffi::attribute_string(el, attr::VALUE))?;
+    let value = deadline.observe(|| ffi::attribute_value_checked(el, attr::VALUE))?;
+    // Toggle state propagates AX failures; snapshot text has always treated them as absent.
+    let value = if mapping::role_carries_checked(role) {
+        value?
+    } else {
+        value.unwrap_or_default()
+    };
     let bounds = window_relative_rect(el, scale, win, deadline)?;
     let states = mapping::map_states(&gather_states(
         el,
         role,
+        value.number,
         subrole.as_deref() == Some("AXSecureTextField"),
         deadline,
     )?);
@@ -876,7 +883,7 @@ fn walk(
         raw_role,
         name,
         description,
-        value,
+        value: value.text,
         states,
         bounds,
         children,
@@ -993,15 +1000,12 @@ fn window_relative_rect(
 fn gather_states(
     el: &AXUIElement,
     role: AxRole,
+    numeric_value: Option<i64>,
     secure: bool,
     deadline: SemanticDeadline,
 ) -> Result<AxStateFacts> {
-    // Only a checkbox/radio/switch carries a checked state, so read the numeric `AXValue` (an
-    // extra AX IPC round-trip) only for those roles — every other node skips it. `ToggleButton`
-    // is where a switch lands, whichever base role its toolkit gave it.
     let (checkable, checked) = if mapping::role_carries_checked(role) {
-        let value = deadline.observe(|| ffi::attribute_i64_checked(el, attr::VALUE))??;
-        if value.is_none() {
+        if numeric_value.is_none() {
             // A control of this role with no numeric value claims neither checked nor unchecked;
             // genuine AX failures have already propagated from the checked read.
             eprintln!(
@@ -1009,7 +1013,7 @@ fn gather_states(
                  it will report neither checked nor unchecked"
             );
         }
-        mapping::checkable_checked(role, value)
+        mapping::checkable_checked(role, numeric_value)
     } else {
         deadline.require()?;
         (false, false)
