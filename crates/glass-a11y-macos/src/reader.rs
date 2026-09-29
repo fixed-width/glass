@@ -20,7 +20,7 @@ use glass_core::coords::pixel_geometry_from_content_rect;
 use glass_core::platform::WindowGeometry;
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, GlassError,
-    PointerHit, Result, WalkBudget, normalize_name, read_back_confirms, write_took_no_effect,
+    PointerHit, Result, WalkBudget, read_back_confirms, write_took_no_effect,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
@@ -330,12 +330,10 @@ fn checked_role(el: &AXUIElement, deadline: SemanticDeadline) -> Result<AxRole> 
     let ax_role = deadline
         .observe(|| ffi::attribute_string_checked(el, attr::ROLE))??
         .unwrap_or_default();
-    let subrole = if mapping::subrole_matters(&ax_role) {
-        deadline.observe(|| ffi::attribute_string_checked(el, attr::SUBROLE))??
-    } else {
-        deadline.require()?;
-        None
-    };
+    deadline.require()?;
+    let subrole = mapping::subrole(&ax_role, || {
+        deadline.observe(|| ffi::attribute_string_checked(el, attr::SUBROLE))?
+    })?;
     Ok(mapping::map_role(&ax_role, subrole.as_deref()))
 }
 
@@ -702,10 +700,8 @@ fn select_window(
 }
 
 /// One of the label attributes a node's `name`/`description` come from (`AXTitle`,
-/// `AXDescription`, `AXHelp`), read through the *error-aware* [`ffi::attribute_string_checked`]
-/// and then folded to `None` when empty — exactly what [`ffi::attribute_string`] returns for a
-/// present-but-empty value, so `name` keeps the value it had before this reader sourced a
-/// description.
+/// `AXDescription`, `AXHelp`), read through the *error-aware* [`ffi::attribute_string_checked`].
+/// [`mapping::node_name`] and [`mapping::labels`] fold blank labels before deciding precedence.
 ///
 /// Checked for [`read_subrole`]'s reason: the direct read folds a genuine failure into the same
 /// `None` as an absent attribute, and since most nodes legitimately lack `AXHelp`, the dishonest
@@ -719,7 +715,7 @@ fn read_label(
     deadline: SemanticDeadline,
 ) -> Result<Option<String>> {
     match deadline.observe(|| ffi::attribute_string_checked(el, attr_name))? {
-        Ok(text) => Ok(text.and_then(|text| normalize_name(&text))),
+        Ok(text) => Ok(text),
         Err(err) => {
             eprintln!(
                 "glass-a11y-macos: {attr_name} read failed: {err}; treating the element as \
@@ -734,10 +730,7 @@ fn read_label(
 /// to come from the same reads, in the same order, that produced the name in the snapshot.
 fn read_name(el: &AXUIElement, deadline: SemanticDeadline) -> Result<Option<String>> {
     let title = read_label(el, attr::TITLE, deadline)?;
-    match title {
-        Some(title) => Ok(Some(title)),
-        None => read_label(el, attr::DESCRIPTION, deadline),
-    }
+    mapping::node_name(title, || read_label(el, attr::DESCRIPTION, deadline))
 }
 
 /// `el`'s `AXSubrole`, but only for the base roles whose subrole actually changes the mapped
@@ -767,20 +760,19 @@ fn read_subrole(
     ax_role: &str,
     deadline: SemanticDeadline,
 ) -> Result<Option<String>> {
-    if !mapping::subrole_matters(ax_role) {
-        deadline.require()?;
-        return Ok(None);
-    }
-    match deadline.observe(|| ffi::attribute_string_checked(el, attr::SUBROLE))? {
-        Ok(sub) => Ok(sub),
-        Err(err) => {
-            eprintln!(
-                "glass-a11y-macos: AXSubrole read failed for role={ax_role:?}: {err}; \
-                 treating the element as having no subrole"
-            );
-            Ok(None)
+    deadline.require()?;
+    mapping::subrole(ax_role, || {
+        match deadline.observe(|| ffi::attribute_string_checked(el, attr::SUBROLE))? {
+            Ok(sub) => Ok(sub),
+            Err(err) => {
+                eprintln!(
+                    "glass-a11y-macos: AXSubrole read failed for role={ax_role:?}: {err}; \
+                     treating the element as having no subrole"
+                );
+                Ok(None)
+            }
         }
-    }
+    })
 }
 
 fn read_labels(
@@ -788,19 +780,13 @@ fn read_labels(
     deadline: SemanticDeadline,
 ) -> Result<(Option<String>, Option<String>)> {
     let title = read_label(el, attr::TITLE, deadline)?;
-    if title.is_none() {
-        let description = read_label(el, attr::DESCRIPTION, deadline)?;
-        let help = read_label(el, attr::HELP, deadline)?;
-        return deadline.run(|| Ok(mapping::labels(title, || description, || help)));
-    }
-
-    let help = read_label(el, attr::HELP, deadline)?;
-    let description = if help.is_none() {
-        read_label(el, attr::DESCRIPTION, deadline)?
-    } else {
-        None
-    };
-    deadline.run(|| Ok(mapping::labels(title, || description, || help)))
+    deadline.run(|| {
+        mapping::labels(
+            title,
+            || read_label(el, attr::DESCRIPTION, deadline),
+            || read_label(el, attr::HELP, deadline),
+        )
+    })
 }
 
 /// Pre-order walk: build this element's [`AxNode`], then recurse into its (non-skipped)
@@ -827,34 +813,9 @@ fn walk(
         read_subrole(el, &ax_role, deadline)?
     };
     let role = mapping::map_role(&ax_role, subrole.as_deref());
-    // `raw_role` is normally the same AX role string `map_role` matched on — the token, not
-    // `AXRoleDescription`'s localized human phrase ("button" / "bouton"), which is useless as a
-    // mapping key. A subrole is appended (`"AXRow/AXOutlineRow"`) only when it *decided* the
-    // mapped role. Deliberately not appended otherwise: the gate reads a subrole for every
-    // button, and decorating them all would rename `AXButton` to `AXButton/AXCloseButton`
-    // across every window's controls and split the role histogram the probe prints.
-    //
-    // The fallback is conditional because that trade only holds while `AXRole` says something.
-    // A custom control reports a generic role — `AXUnknown`, or no `AXRole` at all — and puts
-    // what distinguishes it in `AXRoleDescription`, which is then the only descriptor there is.
-    // If both are absent `raw_role` stays empty: a "role unknown" signal, not a guaranteed
-    // field.
-    let raw_role = if ax_role.is_empty() || ax_role == "AXUnknown" {
-        deadline
-            .observe(|| ffi::attribute_string(el, attr::ROLE_DESCRIPTION))?
-            .unwrap_or(ax_role)
-    } else {
-        match &subrole {
-            Some(sub)
-                if !sub.is_empty()
-                    && mapping::map_role(&ax_role, Some(sub))
-                        != mapping::map_role(&ax_role, None) =>
-            {
-                format!("{ax_role}/{sub}")
-            }
-            _ => ax_role,
-        }
-    };
+    let raw_role = mapping::raw_role(ax_role, subrole.as_deref(), || {
+        deadline.observe(|| ffi::attribute_string(el, attr::ROLE_DESCRIPTION))
+    })?;
     // Which attribute names the node and which is left to describe it is decided in
     // `mapping::labels`, where the rule — and which reads it declines to make — is unit-tested on
     // any host.

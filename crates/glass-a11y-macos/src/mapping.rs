@@ -5,7 +5,9 @@
 //! `"AXButton"`/`"AXTextField"`/... constants; the reader passes the string so this
 //! module needs no macOS-only dependency.
 
-use glass_core::{AxRole, AxStateCoverage, AxStates, normalize_description};
+use glass_core::{
+    AxRole, AxStateCoverage, AxStates, Result, normalize_description, normalize_name,
+};
 
 /// State fields backed by error-preserving AX reads in the macOS reader.
 pub const STATE_COVERAGE: AxStateCoverage = AxStateCoverage {
@@ -92,6 +94,17 @@ pub fn subrole_matters(ax_role: &str) -> bool {
             .any(|(_, _, bases)| bases.contains(&ax_role))
 }
 
+/// Read `AXSubrole` only when it can change the normalized role, preserving read errors.
+pub fn subrole(
+    ax_role: &str,
+    read: impl FnOnce() -> Result<Option<String>>,
+) -> Result<Option<String>> {
+    if !subrole_matters(ax_role) {
+        return Ok(None);
+    }
+    read()
+}
+
 /// Map an AX role string, plus its `AXSubrole` when the reader took one, to the normalized
 /// `AxRole`; unmapped roles become `AxRole::Other` (the reader keeps the token in `raw_role`).
 pub fn map_role(ax_role: &str, subrole: Option<&str>) -> AxRole {
@@ -114,6 +127,27 @@ pub fn map_role(ax_role: &str, subrole: Option<&str>) -> AxRole {
         .find(|(token, _)| *token == ax_role)
         .map(|(_, role)| *role)
         .unwrap_or(AxRole::Other)
+}
+
+/// Preserve the AX role token, appending a subrole only when it changes the mapped role.
+/// Irrelevant subroles stay undecorated so ordinary buttons do not split role histograms.
+/// Only an empty or `AXUnknown` role reads the localized `AXRoleDescription` fallback.
+pub fn raw_role(
+    ax_role: String,
+    subrole: Option<&str>,
+    read_description: impl FnOnce() -> Result<Option<String>>,
+) -> Result<String> {
+    if ax_role.is_empty() || ax_role == "AXUnknown" {
+        return Ok(read_description()?.unwrap_or(ax_role));
+    }
+    match subrole {
+        Some(sub)
+            if !sub.is_empty() && map_role(&ax_role, Some(sub)) != map_role(&ax_role, None) =>
+        {
+            Ok(format!("{ax_role}/{sub}"))
+        }
+        _ => Ok(ax_role),
+    }
 }
 
 /// Plain state facts the reader gathers from an AXUIElement (no objc2/AX types here, so
@@ -191,14 +225,20 @@ pub fn checkable_checked(role: AxRole, ax_value: Option<i64>) -> (bool, bool) {
 /// differently and reject an element that never moved. The reads themselves are still spelled at
 /// each site.
 ///
-/// Precondition: both labels arrive already empty-filtered — the reader's `read_label` folds `""`.
-/// A whitespace-only label is a name, matching the Windows and Linux readers' `nonempty`; the
-/// Android reader deliberately differs, counting a blank label as absent.
+/// Empty and whitespace-only labels are absent; meaningful spacing is preserved.
+/// Read errors, including deadline expiry, propagate without further reads.
 pub fn node_name(
     title: Option<String>,
-    read_description: impl FnOnce() -> Option<String>,
-) -> Option<String> {
-    title.or_else(read_description)
+    read_description: impl FnOnce() -> Result<Option<String>>,
+) -> Result<Option<String>> {
+    match label(title) {
+        Some(title) => Ok(Some(title)),
+        None => Ok(label(read_description()?)),
+    }
+}
+
+fn label(text: Option<String>) -> Option<String> {
+    text.and_then(|text| normalize_name(&text))
 }
 
 /// A node's `(name, description)`, decided together because which attribute is left to describe a
@@ -210,19 +250,23 @@ pub fn node_name(
 /// that has help text, so only a read count catches the edit. The reader is one-shot: whichever
 /// slot spends it, the other finds it gone.
 ///
-/// The returned description is normalized — blank, or a repeat of `name`, becomes `None`. An
-/// `AXHelp` that normalizes away does not fall back to `AXDescription`, because retrying it would
-/// spend the read this gate exists to save.
+/// Blank labels are absent before precedence is decided; a description repeating `name` is
+/// dropped afterward without retrying `AXDescription`.
 pub fn labels(
     title: Option<String>,
-    read_description: impl FnOnce() -> Option<String>,
-    read_help: impl FnOnce() -> Option<String>,
-) -> (Option<String>, Option<String>) {
+    read_description: impl FnOnce() -> Result<Option<String>>,
+    read_help: impl FnOnce() -> Result<Option<String>>,
+) -> Result<(Option<String>, Option<String>)> {
     let mut unread_description = Some(read_description);
-    let name = node_name(title, || unread_description.take().and_then(|read| read()));
-    let secondary = read_help().or_else(|| unread_description.take().and_then(|read| read()));
+    let name = node_name(title, || {
+        unread_description.take().map_or(Ok(None), |read| read())
+    })?;
+    let secondary = match label(read_help()?) {
+        Some(help) => Some(help),
+        None => label(unread_description.take().map_or(Ok(None), |read| read())?),
+    };
     let description = secondary.and_then(|raw| normalize_description(&raw, name.as_deref()));
-    (name, description)
+    Ok((name, description))
 }
 
 #[cfg(test)]
@@ -489,6 +533,107 @@ mod tests {
     }
 
     #[test]
+    fn irrelevant_roles_never_read_a_subrole() {
+        for ax_role in ROLE_TOKENS
+            .iter()
+            .map(|(token, _)| *token)
+            .chain(["AXUnknown", "AXCustom", ""])
+            .filter(|role| !matches!(*role, "AXRow" | "AXButton" | "AXCheckBox"))
+        {
+            let result = subrole(ax_role, || {
+                panic!("unexpected AXSubrole read for {ax_role}")
+            });
+            assert_eq!(result.unwrap(), None, "{ax_role}");
+        }
+    }
+
+    #[test]
+    fn relevant_roles_read_the_subrole_once_and_preserve_it() {
+        for ax_role in ["AXRow", "AXButton", "AXCheckBox"] {
+            for value in [None, Some(""), Some("AXSwitch"), Some("AXOutlineRow")] {
+                let mut reads = 0;
+                let result = subrole(ax_role, || {
+                    reads += 1;
+                    Ok(value.map(str::to_string))
+                });
+                assert_eq!(reads, 1, "{ax_role} {value:?}");
+                assert_eq!(result.unwrap().as_deref(), value, "{ax_role}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_subrole_read_error_is_preserved() {
+        let error = subrole("AXRow", || {
+            Err(glass_core::GlassError::caller_deadline_elapsed("AXSubrole"))
+        })
+        .unwrap_err();
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+    }
+
+    #[test]
+    fn raw_roles_decorate_only_subroles_that_change_the_mapping() {
+        let cases = [
+            ("AXRow", Some("AXOutlineRow"), "AXRow/AXOutlineRow"),
+            ("AXButton", Some("AXSwitch"), "AXButton/AXSwitch"),
+            ("AXCheckBox", Some("AXSwitch"), "AXCheckBox/AXSwitch"),
+            ("AXButton", Some("AXCloseButton"), "AXButton"),
+            ("AXButton", Some("AXToggle"), "AXButton"),
+            ("AXRow", Some("AXTableRow"), "AXRow"),
+            ("AXRow", Some("AXSwitch"), "AXRow"),
+            ("AXTextField", Some("AXSecureTextField"), "AXTextField"),
+            ("AXButton", Some(""), "AXButton"),
+            ("AXButton", None, "AXButton"),
+            ("AXCustom", Some("AXSwitch"), "AXCustom"),
+        ];
+        for (role, subrole, expected) in cases {
+            let raw = raw_role(role.into(), subrole, || {
+                panic!("unexpected AXRoleDescription read for {role}")
+            })
+            .unwrap();
+            assert_eq!(raw, expected);
+        }
+    }
+
+    #[test]
+    fn concrete_roles_never_read_a_localized_role_description() {
+        for role in ROLE_TOKENS
+            .iter()
+            .map(|(token, _)| *token)
+            .chain(["AXCustom"])
+        {
+            assert_eq!(
+                raw_role(role.into(), None, || panic!("unexpected read for {role}")).unwrap(),
+                role
+            );
+        }
+    }
+
+    #[test]
+    fn generic_roles_read_the_fallback_once_and_keep_the_token_if_absent() {
+        for role in ["", "AXUnknown"] {
+            for description in [None, Some("custom control"), Some("bouton")] {
+                let reads = Cell::new(0);
+                let raw =
+                    raw_role(role.into(), Some("AXSwitch"), counted(description, &reads)).unwrap();
+                assert_eq!(reads.get(), 1, "{role:?} {description:?}");
+                assert_eq!(raw, description.unwrap_or(role));
+            }
+        }
+    }
+
+    #[test]
+    fn a_raw_role_fallback_error_is_preserved() {
+        let error = raw_role("AXUnknown".into(), None, || {
+            Err(glass_core::GlassError::caller_deadline_elapsed(
+                "AXRoleDescription",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+    }
+
+    #[test]
     fn observed_tokens_map() {
         // Every token here was observed in a stock-app probe run. Nothing is mapped that a
         // real app did not emit.
@@ -538,16 +683,16 @@ mod tests {
     fn counted<'a>(
         text: Option<&'a str>,
         calls: &'a Cell<usize>,
-    ) -> impl FnOnce() -> Option<String> + 'a {
+    ) -> impl FnOnce() -> Result<Option<String>> + 'a {
         move || {
             calls.set(calls.get() + 1);
-            text.map(str::to_string)
+            Ok(text.map(str::to_string))
         }
     }
 
     /// The same reader without the counter, for the tests that judge only the returned pair.
-    fn reader(text: Option<&str>) -> impl FnOnce() -> Option<String> + '_ {
-        move || text.map(str::to_string)
+    fn reader(text: Option<&str>) -> impl FnOnce() -> Result<Option<String>> + '_ {
+        move || Ok(text.map(str::to_string))
     }
 
     #[test]
@@ -556,7 +701,8 @@ mod tests {
             Some("Save".to_string()),
             reader(Some("a description")),
             reader(Some("Saves the document")),
-        );
+        )
+        .unwrap();
         assert_eq!(name.as_deref(), Some("Save"));
         assert_eq!(description.as_deref(), Some("Saves the document"));
     }
@@ -567,14 +713,16 @@ mod tests {
             Some("Save".to_string()),
             reader(Some("Saves the document")),
             reader(None),
-        );
+        )
+        .unwrap();
         assert_eq!(name.as_deref(), Some("Save"));
         assert_eq!(description.as_deref(), Some("Saves the document"));
     }
 
     #[test]
     fn an_untitled_node_is_named_by_its_description() {
-        let (name, description) = labels(None, reader(Some("Close")), reader(Some("Closes it")));
+        let (name, description) =
+            labels(None, reader(Some("Close")), reader(Some("Closes it"))).unwrap();
         assert_eq!(name.as_deref(), Some("Close"));
         assert_eq!(description.as_deref(), Some("Closes it"));
     }
@@ -589,46 +737,52 @@ mod tests {
             Some("Save".to_string()),
             counted(Some("a description"), &reads),
             reader(Some("Saves the document")),
-        );
+        )
+        .unwrap();
         assert_eq!(reads.get(), 0, "AXDescription must not be read at all here");
         assert_eq!(name.as_deref(), Some("Save"));
         assert_eq!(description.as_deref(), Some("Saves the document"));
     }
 
     #[test]
-    fn a_whitespace_only_help_is_dropped_without_retrying_the_description() {
-        // The description is present and must stay unread: the fallback fires on an absent
-        // `AXHelp`, not on one that normalizes away.
+    fn a_whitespace_only_help_falls_back_to_the_description() {
+        let reads = Cell::new(0);
         let (name, description) = labels(
             Some("Save".to_string()),
-            reader(Some("Saves the document")),
+            counted(Some("Saves the document"), &reads),
             reader(Some("   ")),
-        );
+        )
+        .unwrap();
+        assert_eq!(reads.get(), 1);
         assert_eq!(name.as_deref(), Some("Save"));
-        assert_eq!(description, None);
+        assert_eq!(description.as_deref(), Some("Saves the document"));
     }
 
     #[test]
     fn a_help_that_repeats_the_name_is_dropped_without_retrying_the_description() {
+        let reads = Cell::new(0);
         let (name, description) = labels(
             Some("Save".to_string()),
-            reader(Some("Saves the document")),
+            counted(Some("Saves the document"), &reads),
             reader(Some("Save")),
-        );
+        )
+        .unwrap();
+        assert_eq!(reads.get(), 0);
         assert_eq!(name.as_deref(), Some("Save"));
         assert_eq!(description, None);
     }
 
     #[test]
-    fn a_whitespace_only_title_still_names_the_node() {
-        // Pinned rather than trimmed: the Android reader counts a blank label as absent, so this
-        // is a live divergence between backends, not a rule this function gets to settle.
+    fn a_whitespace_only_title_falls_back_to_the_description() {
+        let reads = Cell::new(0);
         let (name, description) = labels(
             Some("   ".to_string()),
-            reader(Some("a description")),
+            counted(Some("a description"), &reads),
             reader(Some("Closes it")),
-        );
-        assert_eq!(name.as_deref(), Some("   "));
+        )
+        .unwrap();
+        assert_eq!(reads.get(), 1);
+        assert_eq!(name.as_deref(), Some("a description"));
         assert_eq!(description.as_deref(), Some("Closes it"));
     }
 
@@ -650,7 +804,7 @@ mod tests {
         ];
         for (title, description, help, want_name, want_description) in cases {
             let (name, got_description) =
-                labels(title.map(str::to_string), reader(description), reader(help));
+                labels(title.map(str::to_string), reader(description), reader(help)).unwrap();
             assert_eq!(
                 (name.as_deref(), got_description.as_deref()),
                 (want_name, want_description),
@@ -665,12 +819,15 @@ mod tests {
         // `walk` recorded through `labels`; a divergence would reject an element that never moved.
         // Blank labels are in the loop because a trim added to one side and not the other is the
         // realistic way the two drift.
-        for title in [Some("t"), Some("   "), None] {
-            for description in [Some("d"), Some("  "), None] {
-                for help in [Some("h"), None] {
+        for title in [Some("t"), Some("  t  "), Some(""), Some("   "), None] {
+            for description in [Some("d"), Some("  d  "), Some(""), Some("  "), None] {
+                for help in [Some("h"), Some(""), Some(" \t\n"), None] {
                     let walked =
-                        labels(title.map(str::to_string), reader(description), reader(help)).0;
-                    let fingerprint = node_name(title.map(str::to_string), reader(description));
+                        labels(title.map(str::to_string), reader(description), reader(help))
+                            .unwrap()
+                            .0;
+                    let fingerprint =
+                        node_name(title.map(str::to_string), reader(description)).unwrap();
                     assert_eq!(
                         walked, fingerprint,
                         "title={title:?} description={description:?} help={help:?}"
@@ -685,9 +842,111 @@ mod tests {
         // `set_value` and `invoke` pay this read on the element they are about to act on.
         let reads = Cell::new(0);
         assert_eq!(
-            node_name(Some("Save".to_string()), counted(Some("d"), &reads)).as_deref(),
+            node_name(Some("Save".to_string()), counted(Some("d"), &reads))
+                .unwrap()
+                .as_deref(),
             Some("Save")
         );
         assert_eq!(reads.get(), 0);
+    }
+
+    #[test]
+    fn blank_labels_are_absent_in_every_slot() {
+        for blank in [None, Some(""), Some(" \t\n"), Some("\u{2003}")] {
+            let (name, description) =
+                labels(blank.map(str::to_string), reader(blank), reader(blank)).unwrap();
+            assert_eq!((name, description), (None, None), "{blank:?}");
+
+            let (name, description) = labels(
+                Some("Save".into()),
+                reader(Some("Saves the document")),
+                reader(blank),
+            )
+            .unwrap();
+            assert_eq!(name.as_deref(), Some("Save"));
+            assert_eq!(description.as_deref(), Some("Saves the document"));
+        }
+    }
+
+    #[test]
+    fn meaningful_label_spacing_survives_in_names() {
+        for title in [Some("  Save \t".into()), None] {
+            let (name, description) = labels(
+                title,
+                reader(Some("  Save \t")),
+                reader(Some("  Saves the document \t")),
+            )
+            .unwrap();
+            assert_eq!(name.as_deref(), Some("  Save \t"));
+            assert_eq!(description.as_deref(), Some("Saves the document"));
+        }
+    }
+
+    #[test]
+    fn label_reads_keep_their_order_and_never_repeat_the_description() {
+        for title in [None, Some(""), Some(" \t"), Some("Save")] {
+            for help in [None, Some(""), Some(" \t"), Some("Help")] {
+                let reads = std::cell::RefCell::new(Vec::new());
+                labels(
+                    title.map(str::to_string),
+                    || {
+                        reads.borrow_mut().push("description");
+                        Ok(Some("Description".into()))
+                    },
+                    || {
+                        reads.borrow_mut().push("help");
+                        Ok(help.map(str::to_string))
+                    },
+                )
+                .unwrap();
+                let expected = match (title, help) {
+                    (Some("Save"), Some("Help")) => vec!["help"],
+                    (Some("Save"), _) => vec!["help", "description"],
+                    _ => vec!["description", "help"],
+                };
+                assert_eq!(*reads.borrow(), expected, "{title:?} {help:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_name_read_stops_before_reading_help() {
+        let error = labels(
+            None,
+            || {
+                Err(glass_core::GlassError::caller_deadline_elapsed(
+                    "AXDescription",
+                ))
+            },
+            || panic!("must not read help after a deadline error"),
+        )
+        .unwrap_err();
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+    }
+
+    #[test]
+    fn a_failed_help_read_stops_before_reading_the_fallback() {
+        let error = labels(
+            Some("Save".into()),
+            || panic!("must not read description after a deadline error"),
+            || Err(glass_core::GlassError::caller_deadline_elapsed("AXHelp")),
+        )
+        .unwrap_err();
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+    }
+
+    #[test]
+    fn a_failed_description_fallback_preserves_the_error() {
+        let error = labels(
+            Some("Save".into()),
+            || {
+                Err(glass_core::GlassError::caller_deadline_elapsed(
+                    "AXDescription",
+                ))
+            },
+            reader(None),
+        )
+        .unwrap_err();
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
     }
 }
