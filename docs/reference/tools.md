@@ -867,6 +867,8 @@ Finish decoding a response before issuing its dependent request. Reconstructed t
 The server retains one volatile baseline, bounded to 1 MiB of outline and owned metadata and
 16,384 lines. Unknown or superseded revisions recover with a fresh full read. Session/window,
 provider, process, limits, coordinate interpretation or disclosure changes require full output.
+Keep `max_nodes` consistent across observations and semantic actions to preserve limit continuity;
+an action's default limits can otherwise force a fresh full response.
 Selecting even the same window breaks continuity. Unknown or ambiguous scope returns
 `cacheable: false`. macOS currently attests selected-window scope plus root-selection uniqueness
 and scale during the fresh AX read. Other backends return `context_unproven` without retention.
