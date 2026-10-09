@@ -203,7 +203,7 @@ pub struct A11ySnapshotArgs {
 pub struct A11ySnapshotDiffArgs {
     /// Node cap; omit for default, 0 removes only the node cap.
     pub max_nodes: Option<u32>,
-    /// Caller-held revision; omit/null for full recovery. Nonempty ASCII, at most 128 bytes.
+    /// Caller-held nonempty ASCII revision (at most 128 bytes); omit/null for full recovery.
     #[schemars(length(min = 1, max = 128))]
     pub base_revision: Option<String>,
 }

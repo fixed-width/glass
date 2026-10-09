@@ -126,6 +126,32 @@ class SnapshotRevisionTests(unittest.TestCase):
             receiver.accept(3, failure)
         self.assertIs(receiver.baseline, baseline)
 
+    def test_corrupt_subject_disclosures_and_packet_shapes_preserve_baseline(self):
+        corrupt = []
+        missing = packet("fresh", "r2")
+        missing["envelope"]["result"]["completeness"]["subject_mismatch"] = True
+        corrupt.append(missing)
+        extra = packet("fresh", "r2")
+        extra["observations"][0]["subject"] = {"asked": "A", "actual": "B"}
+        corrupt.append(extra)
+        for field, value in [("envelope", []), ("observations", 1)]:
+            malformed = packet("fresh", "r2")
+            malformed[field] = value
+            corrupt.append(malformed)
+        malformed = packet("fresh", "r2")
+        malformed["envelope"]["result"]["output"] = 1
+        corrupt.append(malformed)
+        for malformed in corrupt:
+            receiver = self.establish()
+            baseline = receiver.baseline
+            receiver.begin(2)
+            with self.assertRaises(EvidenceError):
+                receiver.accept(2, malformed)
+            self.assertIs(receiver.baseline, baseline)
+            self.assertIsNone(receiver.pending)
+            receiver.begin(3)
+            receiver.accept(3, packet("recovered", "r3"))
+
     def test_noncacheable_full_is_verified_then_releases_local_baseline(self):
         receiver = self.establish()
         full = packet("scope unknown", "r2")

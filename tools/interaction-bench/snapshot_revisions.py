@@ -46,7 +46,7 @@ class SnapshotReceiver:
         requested_base = self.pending[1]
         try:
             candidate = self._validate(decoded, requested_base)
-        except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+        except (AttributeError, KeyError, TypeError, ValueError, UnicodeError) as exc:
             raise EvidenceError("invalid revision packet; recover with a full observation") from exc
         finally:
             self.pending = None
@@ -89,6 +89,8 @@ class SnapshotReceiver:
                 raise EvidenceError("invalid completeness count")
         if type(metadata["subject_mismatch"]) is not bool:
             raise EvidenceError("invalid subject disclosure")
+        if metadata["subject_mismatch"] != ("subject" in payload):
+            raise EvidenceError("subject disclosure does not match payload")
         truncation = metadata["truncated"]
         if truncation is not None and (
             not isinstance(truncation, dict)

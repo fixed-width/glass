@@ -509,8 +509,7 @@ pub trait Platform {
         None
     }
 
-    /// Selected window used by fresh geometry/accessibility reads, when the backend can attest it.
-    /// This is an observation episode, not proof of a native object's lifetime.
+    /// Selected window attested for fresh reads within an observation episode.
     fn observation_window_id(&self) -> Option<WindowId> {
         None
     }
