@@ -40,7 +40,9 @@ use glass_core::{
 };
 
 use crate::coords::pixel_to_global_point;
-use crate::input_deadline::{after_focus, require_payload_time, run_scroll_wheel_by};
+use crate::input_deadline::{
+    after_focus, require_payload_time, run_click_pairs_by, run_scroll_wheel_by,
+};
 use crate::keymap;
 
 /// Map a window-relative pixel coordinate to a global Quartz point, accounting for the
@@ -113,25 +115,24 @@ pub(crate) fn send_pointer_by(
             let flags = to_flags(modifiers);
             let cg_button = to_cg_button(button);
             let (down_ty, up_ty) = click_types(button);
-            // One down/up pair stamped with `clicks` in `kCGMouseEventClickState`, rather
-            // than `clicks` separate down/up pairs — the documented CGEvent technique for
-            // synthesizing a double/triple click.
-            let clicks = i64::from(count);
-            let down = mouse_event(source.as_deref(), down_ty, point, cg_button, flags)?;
-            CGEvent::set_integer_value_field(
-                Some(&down),
-                CGEventField::MouseEventClickState,
-                clicks,
-            );
-            let up = mouse_event(source.as_deref(), up_ty, point, cg_button, flags)?;
-            CGEvent::set_integer_value_field(Some(&up), CGEventField::MouseEventClickState, clicks);
-
-            require_payload_time(deadline)?;
-            post(&down);
-            let down_deadline = require_payload_time(deadline);
-            post(&up);
-            down_deadline?;
-            require_payload_time(deadline)?;
+            run_click_pairs_by(
+                deadline,
+                count,
+                |ordinal| {
+                    let down = mouse_event(source.as_deref(), down_ty, point, cg_button, flags)?;
+                    let up = mouse_event(source.as_deref(), up_ty, point, cg_button, flags)?;
+                    for event in [&down, &up] {
+                        CGEvent::set_integer_value_field(
+                            Some(event),
+                            CGEventField::MouseEventClickState,
+                            i64::from(ordinal),
+                        );
+                    }
+                    Ok((down, up))
+                },
+                |event| post(&event),
+                thread::sleep,
+            )?;
         }
         PointerEvent::Drag {
             from_x,

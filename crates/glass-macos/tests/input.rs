@@ -225,6 +225,31 @@ mod macos_main {
         assert_click_near(&click_logs, CLICK_TARGET, CLICK_TOLERANCE)?;
         println!("send_pointer(Click) OK");
 
+        for count in [2, 3] {
+            try_expect(
+                platform.send_pointer(&PointerEvent::Click {
+                    x: CLICK_TARGET.0,
+                    y: CLICK_TARGET.1,
+                    button: MouseButton::Left,
+                    count,
+                    modifiers: vec![],
+                }),
+                "send_pointer(multi-click)",
+            )?;
+            std::thread::sleep(ACTION_SETTLE);
+            let logs = platform.drain_logs();
+            let expected: Vec<String> = (1..=count).map(|ordinal| ordinal.to_string()).collect();
+            for prefix in ["click-count: ", "click-up-count: "] {
+                let observed = find_reported(&logs, prefix);
+                if observed != expected {
+                    return Err(format!(
+                        "{count}-click {prefix}: got {observed:?}, want {expected:?}"
+                    ));
+                }
+            }
+        }
+        println!("multi-click OK: exact paired click ordinals");
+
         // --- send_pointer(Scroll): record the scroll-wheel sign. dy=5 is glass's "scroll
         // the content DOWN" convention (see input.rs's module doc / glass-x11's
         // `scroll_button(5=down,4=up, dy)`). `MacScrollSink::wheel` posts `wheel1 = -dy`, but
