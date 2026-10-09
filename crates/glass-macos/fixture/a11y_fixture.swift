@@ -41,8 +41,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var movementTicks = 0
     var movementTimer: Timer?
     var movementStep: CGFloat = 20
+    var identityChildren: [NSView] = []
+
+    func startIdentityFixture() {
+        let content = window.contentView!
+        for (index, name) in ["Insert sibling", "Duplicate target", "Drift target"].enumerated() {
+            let action = [#selector(insertIdentitySibling), #selector(duplicateIdentityTarget), #selector(onIdentityTarget)][index]
+            let button = NSButton(title: name, target: self, action: action)
+            button.frame = NSRect(x: 20, y: 350 - index * 60, width: 160, height: 32)
+            content.addSubview(button)
+            identityChildren.append(button)
+        }
+        let field = NSTextField(string: "before")
+        field.frame = NSRect(x: 20, y: 120, width: 200, height: 24)
+        field.setAccessibilityLabel("Drift field")
+        content.addSubview(field)
+        identityChildren.append(field)
+        content.setAccessibilityChildren(NSAccessibility.unignoredChildren(from: identityChildren))
+        window.title = "glass identity fixture"
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func insertIdentitySibling() {
+        let label = NSTextField(labelWithString: "Inserted sibling")
+        label.frame = NSRect(x: 300, y: 50, width: 150, height: 20)
+        window.contentView!.addSubview(label)
+        identityChildren.insert(label, at: 0)
+        window.contentView!.setAccessibilityChildren(NSAccessibility.unignoredChildren(from: identityChildren))
+        emit("IDENTITY_SIBLING_INSERTED")
+    }
+
+    @objc func duplicateIdentityTarget() {
+        let duplicate = NSButton(title: "Drift target", target: self, action: #selector(onIdentityTarget))
+        duplicate.frame = NSRect(x: 270, y: 230, width: 160, height: 32)
+        window.contentView!.addSubview(duplicate)
+        identityChildren.insert(duplicate, at: 0)
+        insertIdentitySibling()
+        emit("IDENTITY_TARGET_DUPLICATED")
+    }
+
+    @objc func onIdentityTarget() { emit("IDENTITY_TARGET_CLICKED") }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--identity-drift") {
+            startIdentityFixture()
+            return
+        }
         if CommandLine.arguments.contains("--occlusion-cover") {
             let cover = NSButton(title: "External cover", target: self, action: #selector(onExternalCover))
             cover.frame = window.contentView!.bounds
