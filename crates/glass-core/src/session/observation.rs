@@ -188,6 +188,59 @@ mod tests {
     }
 
     #[test]
+    fn current_generation_allows_publication_and_invalidated_generation_refuses_it() {
+        let epoch = ObservationEpoch::default();
+        let generation = epoch.generation();
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            epoch.if_current(&generation, || {
+                calls.set(calls.get() + 1);
+                42
+            }),
+            Some(42)
+        );
+        epoch.invalidate();
+        assert_eq!(
+            epoch.if_current(&generation, || {
+                calls.set(calls.get() + 1);
+                7
+            }),
+            None
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(epoch.if_current(&epoch.generation(), || 9), Some(9));
+    }
+
+    #[test]
+    fn ordinary_snapshot_preserves_a_known_observation_episode() {
+        let mut glass = glass_with_a11y(platform(), fake_tree());
+        glass.start(&spec()).unwrap();
+        let first = glass.a11y_observation(None).unwrap().context.unwrap();
+        glass.a11y_snapshot(None).unwrap();
+        assert_eq!(glass.observation_epoch().generation(), first.generation);
+        assert_eq!(
+            glass.a11y_observation(None).unwrap().context.unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn geometry_reads_preserve_continuity_and_resize_attempts_break_it() {
+        let mut glass = glass_with_a11y(platform(), fake_tree());
+        glass.start(&spec()).unwrap();
+        let first = glass.a11y_observation(None).unwrap().context.unwrap();
+        glass.window(&WindowOp::Geometry).unwrap();
+        assert_eq!(glass.observation_epoch().generation(), first.generation);
+        glass
+            .window(&WindowOp::Resize {
+                width: 100,
+                height: 100,
+            })
+            .unwrap();
+        assert_ne!(glass.observation_epoch().generation(), first.generation);
+    }
+
+    #[test]
     fn selection_attempts_break_continuity_even_for_equal_geometry_and_failure() {
         let mut glass = glass_with_a11y(platform(), fake_tree());
         glass.start(&spec()).unwrap();
