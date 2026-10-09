@@ -66,6 +66,7 @@ use objc2::rc::Retained;
 use objc2_app_kit::{
     NSApplication, NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration,
 };
+use objc2_core_graphics::CGEvent;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 
 use glass_core::{GlassError, Result};
@@ -249,6 +250,31 @@ pub(crate) fn launch_bundle(bundle: &Path, args: &[String], timeout_ms: u64) -> 
 pub(crate) fn terminate_app(pid: i32) -> bool {
     NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
         .is_some_and(|app| app.terminate())
+}
+
+pub(crate) fn set_keyboard_unicode(event: &CGEvent, character: char) {
+    let mut buffer = [0_u16; 2];
+    let units = character.encode_utf16(&mut buffer);
+    // SAFETY: the initialized UTF-16 slice stays alive for this synchronous copying call.
+    unsafe {
+        CGEvent::keyboard_set_unicode_string(Some(event), units.len() as _, units.as_ptr());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn keyboard_unicode(event: &CGEvent) -> Vec<u16> {
+    let mut buffer = [0_u16; 2];
+    let mut length = 0;
+    // SAFETY: the output pointers reference initialized storage with the stated capacity.
+    unsafe {
+        CGEvent::keyboard_get_unicode_string(
+            Some(event),
+            buffer.len() as _,
+            &mut length,
+            buffer.as_mut_ptr(),
+        );
+    }
+    buffer[..length as usize].to_vec()
 }
 
 #[cfg(test)]

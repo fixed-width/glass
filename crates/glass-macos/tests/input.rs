@@ -199,6 +199,16 @@ mod macos_main {
         assert_typed(&key_logs, "hello")?;
         println!("send_key OK: fixture reported the typed characters in order");
 
+        for text in ["é漢🧪", "e\u{301}👩\u{200d}💻"] {
+            try_expect(
+                platform.send_key(&KeyEvent::Text(text.into())),
+                "send_key(Unicode text)",
+            )?;
+            std::thread::sleep(ACTION_SETTLE);
+            assert_typed(&platform.drain_logs(), text)?;
+        }
+        println!("Unicode input OK: BMP, supplementary, combining and joined characters");
+
         // --- send_pointer(Click): click a known pixel, assert the fixture reported that
         // pixel back (within tolerance) — the pixel -> point -> global -> CGEvent -> back
         // round trip. ---
